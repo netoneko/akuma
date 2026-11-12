@@ -240,6 +240,82 @@ impl Default for UserCtx {
     }
 }
 
+/// The head of a core's per-CPU block: the words read through `gs` before
+/// anything else can be trusted. `syscall_entry` reads `current_uctx` and
+/// `scratch` with no stack; `akuma_cpu::percpu` reads `index` and
+/// `current_task` (`gs:[24]`, `gs:[32]`) for every core-id and tid lookup.
+///
+/// A kernel's per-CPU block embeds this as its **first** field, so the base
+/// [`install_percpu`] writes is both the head and the block. Owning the type
+/// here is what makes that write safe: the base can only be a `&'static`
+/// `PerCpuHead`, whose layout the readers are pinned to below.
+#[repr(C)]
+pub struct PerCpuHead {
+    /// Address of this head. `gs:[0]`.
+    self_ptr: core::sync::atomic::AtomicU64,
+    /// The running task's `*mut UserCtx`. `gs:[8]`. The scheduler repoints it
+    /// on every switch; the entry stubs refuse it null.
+    pub current_uctx: core::sync::atomic::AtomicU64,
+    /// One word of scratch for the syscall stub. `gs:[16]`.
+    scratch: core::sync::atomic::AtomicU64,
+    /// This core's index. `gs:[24]`, written by [`install_percpu`] (and by a BSP
+    /// preparing an AP). Every reader bounds-checks it.
+    pub index: core::sync::atomic::AtomicU32,
+    /// This core's LAPIC id. `gs:[28]`; read by no assembly, it fills the gap.
+    pub lapic_id: core::sync::atomic::AtomicU32,
+    /// The scheduler task slot running on this core. `gs:[32]`.
+    pub current_task: core::sync::atomic::AtomicUsize,
+}
+
+const _: () = {
+    assert!(core::mem::offset_of!(PerCpuHead, self_ptr) == 0);
+    assert!(core::mem::offset_of!(PerCpuHead, current_uctx) == PERCPU_CURRENT_UCTX);
+    assert!(core::mem::offset_of!(PerCpuHead, scratch) == PERCPU_SCRATCH);
+    // `akuma_cpu::percpu::core_id` / `current_tid`.
+    assert!(core::mem::offset_of!(PerCpuHead, index) == 24);
+    assert!(core::mem::offset_of!(PerCpuHead, current_task) == 32);
+};
+
+impl PerCpuHead {
+    #[must_use]
+    pub const fn new() -> Self {
+        use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize};
+        Self {
+            self_ptr: AtomicU64::new(0),
+            current_uctx: AtomicU64::new(0),
+            scratch: AtomicU64::new(0),
+            index: AtomicU32::new(0),
+            lapic_id: AtomicU32::new(0),
+            current_task: AtomicUsize::new(0),
+        }
+    }
+
+    /// This core's index, as [`install_percpu`] recorded it.
+    #[must_use]
+    pub fn index(&self) -> u32 {
+        self.index.load(core::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Default for PerCpuHead {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Point this core's `%gs` at `head`, recording `index` in it, and zero
+/// `IA32_KERNEL_GS_BASE` (the user's half of the pair; a fresh core has no
+/// user yet).
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
+pub fn install_percpu(head: &'static PerCpuHead, index: u32) {
+    use core::sync::atomic::Ordering;
+    let addr = core::ptr::from_ref::<PerCpuHead>(head) as u64;
+    head.self_ptr.store(addr, Ordering::Relaxed);
+    head.index.store(index, Ordering::Relaxed);
+    switch::set_gs_base(addr);
+    let _ = akuma_cpu::msr::set_user_gs_base(0);
+}
+
 /// Why [`enter`] or [`enter_forked`] would not enter ring 3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refused {
@@ -679,6 +755,15 @@ akuma_usermode_unwind:
 
     /// `EFER.SCE`: without it, `syscall` raises `#UD`.
     const EFER_SCE: u64 = 1 << 0;
+
+    /// `IA32_GS_BASE := addr`, where `addr` is a `&'static PerCpuHead`.
+    pub fn set_gs_base(addr: u64) {
+        // SAFETY: `install_percpu`'s only caller passes the address of a
+        // `&'static PerCpuHead`, valid for the kernel's life and laid out as every
+        // `gs:` reader expects (the offset asserts above). Every per-CPU read
+        // dereferences this base; it can be no other pointer.
+        unsafe { msr::write(Msr::GsBase, addr) };
+    }
 
     pub fn install() {
         let star = akuma_gdt::star();

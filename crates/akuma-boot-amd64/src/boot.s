@@ -423,6 +423,11 @@ high_entry:
     call kmain
     jmp 2f
 3:
+    /* The loader's information-block address, for `mb2.rs`: the one writer of
+     * AKUMA_MB2_INFO_PHYS, so the claims made from the block rest on the address
+     * the loader gave rather than on an argument. A Rust static in the kernel's
+     * high image, which RIP-relative addressing reaches from here. */
+    movq %rdi, AKUMA_MB2_INFO_PHYS(%rip)
     call kmain_mb2
 
     /* kmain is `-> !`; this is the belt-and-braces halt if that ever changes. */

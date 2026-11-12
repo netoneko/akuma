@@ -40,6 +40,7 @@
 pub mod ap;
 #[cfg(target_arch = "x86_64")]
 pub mod shootdown;
+pub mod mb2;
 pub mod mem;
 pub mod paging;
 pub mod phys;

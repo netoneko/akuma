@@ -4,7 +4,7 @@
 
 ## Status (2026-11-12, late)
 
-37 -> 18 -> 7 -> 3.
+37 -> 18 -> 7 -> 3 -> 0.
 
 First pass (37 -> 18): the CR3 chain (9, checked `activate`), the scheduler self-test counters (2,
 atomics), the no-op waker (`Waker::noop`), `machine.rs` and the crash dump's memory peek
@@ -42,9 +42,22 @@ additions:
 - `smp.rs`'s `OFFSETS_PINNED` asserts the per-CPU offsets against the crate's
   `PERCPU_CURRENT_UCTX`/`PERCPU_SCRATCH`.
 
-Left (3): `multiboot2.rs` 2 (framebuffer window, `RamSpan` claim), `smp.rs` `GsBase`. Each is one
-claim about memory or a register made once at boot from firmware-supplied facts. Next: merge the
-crossing with `akuma-ring3-amd64` (Taoxichuan's), which has no unwind, fork entry or `UserCtx`.
+Fourth pass (3 -> 0):
+- `GS_BASE`: `akuma-usermode-amd64` owns `PerCpuHead`, the first 40 bytes of the per-CPU block (the
+  words its stub and `akuma_cpu::percpu` read through `gs`, offsets pinned there), and a safe
+  `install_percpu(&'static PerCpuHead, index)`. The kernel's `PerCpu` embeds it as field 0.
+- Framebuffer window and RAM-disk claim: `akuma_boot_amd64::mb2`. `boot.s` stores the information
+  block's address in `AKUMA_MB2_INFO_PHYS` on the way to `kmain_mb2` (its one writer); `mb2::take`
+  copies the block once, `mb2::framebuffer_window` maps the framebuffer it names once, and
+  `mb2::claim_first_module` claims the root module once, only if `mem::is_reserved` says
+  `init_reserving` kept the PMM off its pages. `kmain_mb2` halts if its argument disagrees with the
+  recorded address.
+
+`akuma-kernel-amd64` has no `unsafe` site. It does not `forbid(unsafe_code)`: two entry symbols
+(`ap_entry64`, `syscall_handler`) are `#[unsafe(no_mangle)]`, which the lint covers. Registering
+them as function pointers in the crates that call them would let it take the ban. Next after that:
+merge the crossing with `akuma-ring3-amd64` (Taoxichuan's).
+
 Still open from the soundness list: `read_val`'s `T: Copy + Default` still admits `bool` and `char`,
 which have invalid bit patterns; every caller passes an integer or an ABI struct, and a `UserPod`
 trait is the real fix.

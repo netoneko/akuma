@@ -108,31 +108,20 @@ pub const NO_CPU: u32 = u32::MAX;
 
 /// One core's private state.
 ///
-/// `repr(C)` because `syscall_entry` and `enter_user_mode` index the first
-/// three fields by hand as `gs:[0]`, `gs:[8]` and `gs:[16]`. Reordering them
-/// silently changes what that assembly reads; [`OFFSETS_PINNED`] fails the
-/// build if the offsets move. Everything is an atomic so the table can be a
+/// `repr(C)` with `head` first: `gs` points at the block, and everything read
+/// through `gs` lives in `akuma_usermode_amd64::PerCpuHead`, whose offsets that
+/// crate pins; [`OFFSETS_PINNED`] pins `head` at 0. Everything is an atomic so the table can be a
 /// plain `static`: a block is written by its own core, and by the BSP once
 /// before that core is started — never by two cores at once — so `Relaxed`
 /// is the right ordering everywhere except the `online` handshake.
 #[repr(C, align(64))]
 pub struct PerCpu {
-    /// Address of this block. Offset 0, `gs:[0]`: how kernel Rust finds its
-    /// own block with one load.
-    self_ptr: AtomicU64,
-    /// The running task's `UserCtx`. Offset 8, `gs:[8]` — what `syscall_entry`
-    /// reads before it has a stack.
-    current_uctx: AtomicU64,
-    /// One word of scratch for the syscall stubs. Offset 16, `gs:[16]`. Was a
-    /// global `SYSCALL_SCRATCH`, which two cores in `syscall_entry` at once
-    /// would have clobbered.
-    scratch: AtomicU64,
-    /// This core's index into [`PERCPU`]; 0 is the BSP.
-    index: AtomicU32,
-    /// This core's LAPIC id, as the MADT (and `lapic::apic_id`) report it.
-    lapic_id: AtomicU32,
-    /// The `sched` task slot running on this core.
-    current_task: AtomicUsize,
+    /// `gs:[0..40]`: the self pointer, the running task's `UserCtx`, the
+    /// syscall stub's scratch word, this core's index and LAPIC id, and the
+    /// running task slot. `akuma-usermode-amd64` owns the layout because its
+    /// assembly and `akuma_cpu::percpu` read it through `gs`; first, so the
+    /// base `install_percpu` writes is this block's.
+    head: akuma_usermode_amd64::PerCpuHead,
     /// The task slot that idles this core when nothing else is runnable. 0 (the
     /// boot task) on the BSP; a dedicated slot on every AP.
     idle_task: AtomicUsize,
@@ -150,12 +139,7 @@ pub struct PerCpu {
 impl PerCpu {
     const fn new() -> Self {
         Self {
-            self_ptr: AtomicU64::new(0),
-            current_uctx: AtomicU64::new(0),
-            scratch: AtomicU64::new(0),
-            index: AtomicU32::new(0),
-            lapic_id: AtomicU32::new(0),
-            current_task: AtomicUsize::new(0),
+            head: akuma_usermode_amd64::PerCpuHead::new(),
             idle_task: AtomicUsize::new(0),
             need_resched: AtomicBool::new(false),
             online: AtomicBool::new(false),
@@ -165,19 +149,11 @@ impl PerCpu {
     }
 }
 
-/// The assembly's view of [`PerCpu`], pinned at compile time.
-///
-/// `index` and `current_task` are also read cross-crate — `akuma_cpu::percpu`
-/// loads `gs:[24]`/`gs:[32]` for `current_core_id`/`current_tid` under
-/// `kernel_bkl_smp` — so those two offsets are a cross-crate contract, not
-/// just an assembly one. Moving either field means moving the offset in
-/// `akuma-cpu`'s `percpu` module in the same change.
+/// [`PerCpu`]'s head at offset 0, so the `gs` base is both. The head's own
+/// offsets (the syscall stub's `gs:[8]`/`gs:[16]`, `akuma_cpu::percpu`'s
+/// `gs:[24]`/`gs:[32]`) are pinned in `akuma-usermode-amd64`.
 const OFFSETS_PINNED: () = {
-    assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
-    assert!(core::mem::offset_of!(PerCpu, current_uctx) == akuma_usermode_amd64::PERCPU_CURRENT_UCTX);
-    assert!(core::mem::offset_of!(PerCpu, scratch) == akuma_usermode_amd64::PERCPU_SCRATCH);
-    assert!(core::mem::offset_of!(PerCpu, index) == 24);
-    assert!(core::mem::offset_of!(PerCpu, current_task) == 32);
+    assert!(core::mem::offset_of!(PerCpu, head) == 0);
 };
 
 static PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
@@ -192,18 +168,7 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 /// while the kernel runs, and a fresh core has no user yet. The scheduler keeps
 /// it current per task from then on (`UserCtx::gs_base`).
 fn install_percpu(idx: usize) {
-    let block = &PERCPU[idx];
-    let addr = core::ptr::from_ref::<PerCpu>(block) as u64;
-    block.self_ptr.store(addr, Ordering::Relaxed);
-    block.index.store(idx as u32, Ordering::Relaxed);
-    // SAFETY: `IA32_GS_BASE` is this core's per-CPU base. The block is a
-    // `static`, so the address is valid for the life of the kernel, and nothing
-    // reads `gs:` before this. Stays `unsafe` on purpose: `gs:` is dereferenced
-    // by every per-CPU read, so a wrong base is a wrong pointer, not a fault
-    // `akuma-cpu` could rule out.
-    unsafe { msr::write(Msr::GsBase, addr) };
-    // The program's half of the pair: no user yet, and 0 is canonical.
-    let _ = msr::set_user_gs_base(0);
+    akuma_usermode_amd64::install_percpu(&PERCPU[idx].head, idx as u32);
 }
 
 /// Has this core's `%gs` been pointed at a [`PerCpu`] yet?
@@ -234,14 +199,14 @@ fn this_cpu() -> &'static PerCpu {
 #[inline]
 #[must_use]
 pub fn cpu_index() -> usize {
-    this_cpu().index.load(Ordering::Relaxed) as usize
+    this_cpu().head.index.load(Ordering::Relaxed) as usize
 }
 
 /// [`cpu_index`] as the `u32` the networking runtime's `current_core_id` hook
 /// wants.
 #[must_use]
 pub fn cpu_index_u32() -> u32 {
-    this_cpu().index.load(Ordering::Relaxed)
+    this_cpu().head.index.load(Ordering::Relaxed)
 }
 
 /// Cores running the kernel right now.
@@ -261,7 +226,7 @@ pub fn ticks_on(idx: usize) -> u64 {
 /// indices below `online_cpus()`, which the bring-up filled in.
 #[must_use]
 pub fn lapic_id_of(idx: usize) -> u32 {
-    PERCPU.get(idx).map_or(0, |c| c.lapic_id.load(Ordering::Relaxed))
+    PERCPU.get(idx).map_or(0, |c| c.head.lapic_id.load(Ordering::Relaxed))
 }
 
 /// Count one timer tick on this core. Called from the timer vector.
@@ -272,22 +237,22 @@ pub fn this_cpu_tick() {
 /// The running task's `UserCtx`, or null before the scheduler is initialised.
 #[must_use]
 pub fn current_uctx() -> *mut UserCtx {
-    this_cpu().current_uctx.load(Ordering::Relaxed) as *mut UserCtx
+    this_cpu().head.current_uctx.load(Ordering::Relaxed) as *mut UserCtx
 }
 
 /// Repoint this core's `UserCtx` — the scheduler, on every switch.
 pub fn set_current_uctx(p: *mut UserCtx) {
-    this_cpu().current_uctx.store(p as u64, Ordering::Relaxed);
+    this_cpu().head.current_uctx.store(p as u64, Ordering::Relaxed);
 }
 
 /// The task slot running on this core.
 #[must_use]
 pub fn current_task() -> usize {
-    this_cpu().current_task.load(Ordering::Relaxed)
+    this_cpu().head.current_task.load(Ordering::Relaxed)
 }
 
 pub fn set_current_task(slot: usize) {
-    this_cpu().current_task.store(slot, Ordering::Relaxed);
+    this_cpu().head.current_task.store(slot, Ordering::Relaxed);
 }
 
 /// The slot that idles this core.
@@ -443,7 +408,7 @@ pub fn init_bsp() {
 
 /// Record the BSP's LAPIC id once the LAPIC is mapped.
 pub fn set_bsp_lapic_id(id: u32) {
-    PERCPU[0].lapic_id.store(id, Ordering::Relaxed);
+    PERCPU[0].head.lapic_id.store(id, Ordering::Relaxed);
 }
 
 use akuma_boot_amd64::ap::{self, AP_MB_CR3, AP_MB_ENTRY, AP_MB_INDEX, AP_MB_STACK, AP_STARTUP_VECTOR, mailbox_write};
@@ -522,8 +487,8 @@ pub fn start_secondaries(madt: Option<&Madt>, page: ap::TrampolinePage) -> usize
             continue;
         }
         let cpu = &PERCPU[idx];
-        cpu.lapic_id.store(id, Ordering::Relaxed);
-        cpu.index.store(idx as u32, Ordering::Relaxed);
+        cpu.head.lapic_id.store(id, Ordering::Relaxed);
+        cpu.head.index.store(idx as u32, Ordering::Relaxed);
 
         // The AP's stack; leaked, like every task stack — it is the idle task's
         // for the life of the kernel. The top is offset by one word so the
@@ -538,8 +503,8 @@ pub fn start_secondaries(madt: Option<&Madt>, page: ap::TrampolinePage) -> usize
             break;
         };
         cpu.idle_task.store(idle_slot, Ordering::Relaxed);
-        cpu.current_task.store(idle_slot, Ordering::Relaxed);
-        cpu.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
+        cpu.head.current_task.store(idle_slot, Ordering::Relaxed);
+        cpu.head.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
 
         mailbox_write(AP_MB_CR3, ap_root);
         mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);
@@ -640,8 +605,8 @@ fn start_late(idx: usize, id: u32) -> bool {
         return false;
     }
     let cpu = &PERCPU[idx];
-    cpu.lapic_id.store(id, Ordering::Relaxed);
-    cpu.index.store(idx as u32, Ordering::Relaxed);
+    cpu.head.lapic_id.store(id, Ordering::Relaxed);
+    cpu.head.index.store(idx as u32, Ordering::Relaxed);
     let stack = alloc::vec![0u8; AP_STACK_SIZE].leak();
     let stack_top = (stack.as_ptr() as usize + AP_STACK_SIZE) & !0xf;
     cpu.stack_top.store(stack_top as u64, Ordering::Relaxed);
@@ -649,8 +614,8 @@ fn start_late(idx: usize, id: u32) -> bool {
         return false;
     };
     cpu.idle_task.store(idle_slot, Ordering::Relaxed);
-    cpu.current_task.store(idle_slot, Ordering::Relaxed);
-    cpu.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
+    cpu.head.current_task.store(idle_slot, Ordering::Relaxed);
+    cpu.head.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
     mailbox_write(AP_MB_CR3, ap_root);
     mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);
     #[allow(function_casts_as_integer)]
@@ -740,7 +705,7 @@ pub fn kick_halted_core() {
             // `IF` off across the two ICR writes: an interrupt between them
             // that sends its own IPI would retarget this one.
             let flags = akuma_cpu::daif::save_and_mask_irq();
-            lapic::send_fixed(PERCPU[i].lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
+            lapic::send_fixed(PERCPU[i].head.lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
             // IF back exactly as it was (`restore` is the inverse of the save).
             akuma_cpu::daif::restore(flags);
             WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
@@ -761,7 +726,7 @@ pub fn kick_core(cpu: usize) {
     }
     // `IF` off across the two ICR writes (see `kick_halted_core`).
     let flags = akuma_cpu::daif::save_and_mask_irq();
-    lapic::send_fixed(PERCPU[cpu].lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
+    lapic::send_fixed(PERCPU[cpu].head.lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
     akuma_cpu::daif::restore(flags);
     WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
 }
@@ -1026,7 +991,7 @@ pub fn smoke_test(t: &mut Suite, expected_aps: usize, started: usize) {
 pub fn peer_snapshot(idx: usize) -> (usize, usize, bool, u64) {
     let b = &PERCPU[idx];
     (
-        b.current_task.load(Ordering::Relaxed),
+        b.head.current_task.load(Ordering::Relaxed),
         b.idle_task.load(Ordering::Relaxed),
         HALTED[idx].load(Ordering::Relaxed),
         b.ticks.load(Ordering::Relaxed),

@@ -125,11 +125,13 @@ dependencies = [
  "akuma-cpu",
  "akuma-machine-facts",
  "akuma-mem-policy",
+ "akuma-multiboot2",
  "akuma-pagetable",
  "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-pte-amd64",
+ "spinning_top",
 ]
 
 [[package]]

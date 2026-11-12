@@ -7,7 +7,9 @@ description = "The full amd64 kernel's ring-3 crossing: syscall entry stub, sysr
 [lints]
 workspace = true
 
-[dependencies]
+# Only the bare-metal x86_64 build has assembly or MSRs; the host pass
+# (tests, clippy) builds the layout alone.
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
 # `Msr::{Efer, Star, Lstar, Fmask}`: the closed MSR set; no `wrmsr` of its own.
 akuma-cpu = { path = "../akuma-cpu" }
 # `star()` and `USER_CS`/`USER_SS`: `sysretq` derives the user selectors from

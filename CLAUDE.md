@@ -78,8 +78,11 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `akuma-usermode-amd64` (2026-11-12) is the full amd64 kernel's **ring-3 crossing**: `syscall_entry`,
   `enter`/`enter_forked` (safe: the stubs refuse a non-user `rip` and a null per-CPU `UserCtx`),
   `unwind`, the STAR/LSTAR/FMASK install, and the `UserCtx` layout the assembly indexes (`kernel_rsp`
-  is private to it). Taoxichuan's counterpart is `akuma-ring3-amd64`; the two are to merge. **Never
-  put ring-3 entry assembly back in `crates/akuma-kernel-amd64/`.**
+  is private to it), plus `PerCpuHead`, the `gs`-read head of the per-CPU block, and the safe
+  `install_percpu` that points `GS_BASE` at one. Taoxichuan's counterpart is `akuma-ring3-amd64`; the
+  two are to merge. `akuma_boot_amd64::mb2` makes the multiboot2 claims (info block, framebuffer
+  window, RAM-disk module) from the address `boot.s` recorded. **`crates/akuma-kernel-amd64/` has no
+  `unsafe` site (2026-11-12); keep it at 0 — put the operation in the crate that owns the fact.**
   `akuma_cpu::msr` is the closed set of MSRs the kernel touches (`Msr` enum): reads
   safe, `write` unsafe (so the kernel's own `GS_BASE`, which every per-CPU read
   dereferences, stays `unsafe` at its one call site), and `set_fs_base`/`set_user_gs_base`

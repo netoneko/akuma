@@ -34,3 +34,6 @@ akuma-cpu = { path = "../akuma-cpu" }
 # The RAM-proportional heap-sizing fallback `mem.rs` retries with — pure, no deps, shared with
 # AArch64's `akuma-kernel-glue` (config flag sweep, 2026-11-11).
 akuma-mem-policy = { path = "../akuma-mem-policy" }
+# `mb2`: the information block parser, and the lock its one copy lives behind.
+akuma-multiboot2 = { path = "../akuma-multiboot2" }
+spinning_top = "0.3"

@@ -410,7 +410,30 @@ pub fn init_reserving(
         (akuma_pmm::free_count() * PAGE_SIZE / 1024 / 1024) as u64
     );
 
+    for (slot, r) in RESERVED.iter().zip(&taken[1..]) {
+        slot.0.store(r.0, core::sync::atomic::Ordering::Relaxed);
+        slot.1.store(r.1, core::sync::atomic::Ordering::Relaxed);
+    }
+    RESERVED_SET.store(true, core::sync::atomic::Ordering::Release);
     true
+}
+
+/// The spans [`init_reserving`] kept the PMM off, recorded once it succeeded.
+static RESERVED: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); 3] =
+    [const { (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)) }; 3];
+static RESERVED_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether `[start, end)` lies inside one span [`init_reserving`] kept from the
+/// PMM: memory no allocator will ever hand out. `false` before it has run.
+#[must_use]
+pub fn is_reserved(start: u64, end: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    RESERVED_SET.load(Ordering::Acquire)
+        && start < end
+        && RESERVED.iter().any(|(lo, hi)| {
+            let (lo, hi) = (lo.load(Ordering::Relaxed), hi.load(Ordering::Relaxed));
+            lo < hi && lo <= start && end <= hi
+        })
 }
 
 /// The RAM below this is not ours: the interrupt vector table, the BIOS data

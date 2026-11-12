@@ -39,14 +39,11 @@
 //! console is the serial port, and the `fbtrace` stand-in below gets what the
 //! screen would have.
 
-use akuma_primitives::mmio::MmioWindow;
 use akuma_multiboot2::BootInfo;
 use akuma_ryzen_amd64::{MAX_REGIONS, MachineDescription, MemRegion};
 
 use crate::serial;
 
-/// Where the boot page tables mirror all of physical memory.
-const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
 /// Bright white on blue, the attribute byte for the EGA text buffer
 /// (`akuma_boot_amd64::mem::ega_text_window`).
@@ -73,52 +70,9 @@ pub fn ega_text(row: usize, s: &str) {
     }
 }
 
-/// The firmware framebuffer of **this** boot: physical address and length, recorded by
-/// [`kmain_mb2`] from the information block GRUB handed over, before anything else could
-/// run. `0` length = none (no tag, not direct-colour, or above the physmap).
-static BOOT_FB_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-static BOOT_FB_LEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-/// Set once [`framebuffer_window`] has handed the window out.
-static BOOT_FB_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
-
-/// Record the framebuffer of the boot that actually happened. Private on purpose: a
-/// `BootInfo` can be built from any bytes, so only the one GRUB passed may decide what
-/// [`framebuffer_window`] maps.
-fn record_boot_framebuffer(info: &BootInfo<'_>) {
-    use core::sync::atomic::Ordering;
-    let Some(fb) = info.framebuffer() else { return };
-    if !matches!(fb.kind, akuma_multiboot2::FramebufferKind::Rgb) {
-        return;
-    }
-    let len = fb.size_bytes();
-    // A framebuffer above what boot.s maps cannot be written; refuse it rather than fault.
-    if len == 0 || fb.addr.checked_add(len).is_none_or(|end| end > crate::phys::PHYSMAP_LIMIT) {
-        return;
-    }
-    BOOT_FB_ADDR.store(fb.addr, Ordering::Relaxed);
-    BOOT_FB_LEN.store(len, Ordering::Release);
-}
-
-/// The firmware framebuffer as an MMIO window, **once** per boot; `None` without one, or
-/// on a second call.
-///
-/// The display driver's only way to the framebuffer. It cannot name an address: the
-/// window is the one [`record_boot_framebuffer`] took from this boot's information
-/// block, so safe code cannot point it at RAM.
-#[must_use]
-pub fn framebuffer_window() -> Option<MmioWindow> {
-    use core::sync::atomic::Ordering;
-    let len = BOOT_FB_LEN.load(Ordering::Acquire);
-    if len == 0 || BOOT_FB_TAKEN.swap(true, Ordering::AcqRel) {
-        return None;
-    }
-    let addr = BOOT_FB_ADDR.load(Ordering::Relaxed);
-    // SAFETY: the firmware's framebuffer, as GRUB reported it for this boot, checked by
-    // `record_boot_framebuffer` to lie entirely below `PHYSMAP_LIMIT`, which boot.s maps
-    // through the physmap. It is device memory no allocator owns, never freed or moved,
-    // and handed out once (`BOOT_FB_TAKEN`), so this is the only window over it.
-    Some(unsafe { MmioWindow::new((PHYSMAP_BASE + addr) as usize, len as usize) })
-}
+/// The firmware framebuffer as an MMIO window, once per boot: `akuma-boot-amd64`'s, which
+/// reads it from the information block at the address the loader passed.
+pub use akuma_boot_amd64::mb2::framebuffer_window;
 
 /// Where the bytes the framebuffer **would** get go when there is no
 /// framebuffer: QEMU's debug port, so a PVH boot (which has none) can show what
@@ -141,12 +95,6 @@ pub fn fb_trace_byte(byte: u8) {
     }
 }
 
-/// Largest multiboot2 information block this kernel reads (the clamp on its
-/// self-declared size).
-const MB2_INFO_MAX: usize = 64 * 1024;
-/// The information block's copy (see `kmain_mb2`).
-static MB2_INFO: spinning_top::Spinlock<[u8; MB2_INFO_MAX]> = spinning_top::Spinlock::new([0; MB2_INFO_MAX]);
-
 /// The GRUB/multiboot2 boot, from long mode on; the bin's `kmain_mb2` symbol calls it.
 ///
 /// Deliberately parallel to [`crate::kmain`], and in the same order, because
@@ -159,7 +107,6 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // lives in `akuma-kernel-tests-amd64` because this crate cannot depend on it. It only
     // stores function pointers, so it runs first, before anything it could depend on.
     before_main();
-    let info_phys = info.get();
     ega_text(0, "Akuma/amd64: multiboot2 entry reached");
     // Probe for a UART and configure it if one answers. This path never called
     // `serial::init` — the reference machine has no serial port — and got away
@@ -172,29 +119,31 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // this path the sink it wants is serial's framebuffer mirror.
     akuma_primitives::console::set_print_hook(serial::puts);
 
-    // GRUB's information block, copied out of the physmap once: its first u32
-    // is its own total size, clamped so a corrupt size field cannot make the
-    // copy run past the buffer. The copy outlives `drop_identity_map` and any
-    // later reuse of the low memory GRUB left it in; the guard is held for the
-    // rest of this function, which does not return.
-    let mut size = [0u8; 4];
-    if !akuma_phys::peek_ram(info, &mut size) {
-        ega_text(1, "FAIL: information block outside the physmap");
-        crate::halt();
-    }
-    let total = (u32::from_le_bytes(size) as usize).clamp(8, MB2_INFO_MAX);
-    let mut copy = MB2_INFO.lock();
-    if !akuma_phys::peek_ram(info, &mut copy[..total]) {
-        ega_text(1, "FAIL: information block runs past the physmap");
-        crate::halt();
-    }
-    let bytes: &[u8] = &copy[..total];
-
-    let Some(info) = BootInfo::new(bytes) else {
-        ega_text(1, "FAIL: information block too short");
-        crate::halt();
+    // GRUB's information block, copied out of the physmap once by
+    // `akuma_boot_amd64::mb2::take`, from the address `boot.s` recorded: the copy
+    // outlives `drop_identity_map` and any later reuse of the low memory GRUB
+    // left it in. `take` also records the framebuffer and root module the block
+    // names, for the two claims made from them later.
+    let boot = match akuma_boot_amd64::mb2::take() {
+        Ok(b) => b,
+        Err(e) => {
+            ega_text(
+                1,
+                match e {
+                    akuma_boot_amd64::mb2::InfoError::Absent => "FAIL: no information block",
+                    akuma_boot_amd64::mb2::InfoError::Outside => "FAIL: information block outside the physmap",
+                    akuma_boot_amd64::mb2::InfoError::Truncated => "FAIL: information block runs past the physmap",
+                    akuma_boot_amd64::mb2::InfoError::Short => "FAIL: information block too short",
+                },
+            );
+            crate::halt();
+        }
     };
-    record_boot_framebuffer(&info);
+    if boot.phys_span().0 != info.get() {
+        ega_text(1, "FAIL: information block address disagrees with boot.s");
+        crate::halt();
+    }
+    let info = boot.info();
     crate::boot::keep_cmdline(info.cmdline());
     // `nofb`: do not touch the framebuffer at all — for a machine run as a
     // headless test target (ryzen's reboot loop, `overlays/ryzen/`).
@@ -335,7 +284,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // The information block too: `info` — the command line, the module list —
     // is read for the rest of this function, long after the PMM starts
     // handing out frames, and nothing in the memory map marks its pages either.
-    let info_span = (info_phys, info_phys + bytes.len() as u64);
+    let info_span = boot.phys_span();
     if !crate::mem::init_reserving(&facts, &[reserved, info_span]) {
         serial::puts("\nAkuma/amd64 - memory bring-up FAILED\n");
         crate::halt();
@@ -384,11 +333,9 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     let want_usb =
         want_usb_root || info.cmdline().split_ascii_whitespace().any(|t| t == "usb");
     let mount_ram = || {
-        module
-            // SAFETY: the module's pages were reserved from the PMM above, so no
-            // allocator hands them out, and this closure is the only thing that
-            // names them; `claim` checks they lie inside the physmap.
-            .and_then(|m| unsafe { akuma_phys::RamSpan::claim(akuma_phys::PhysAddr::new(u64::from(m.start)), m.len()) })
+        // `mb2` claims the loader's module once, and only because `init_reserving`
+        // above kept the PMM off its pages.
+        akuma_boot_amd64::mb2::claim_first_module()
             .map(crate::ramdisk::RamDisk::new)
             .is_some_and(|rd| {
                 crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
@@ -446,7 +393,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // bring-up, not tests.
     let mb2_keep_out = || {
         [
-            (info_phys, info_phys + bytes.len() as u64),
+            boot.phys_span(),
             info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
         ]
     };
@@ -520,7 +467,7 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
             // start-info block but the information block this function is still
             // reading, or the root filesystem GRUB left in RAM.
             keep_out: [
-                (info_phys, info_phys + bytes.len() as u64),
+                boot.phys_span(),
                 info.first_module().map_or((0, 0), |m| (u64::from(m.start), u64::from(m.end))),
             ],
         },

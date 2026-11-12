@@ -1,16 +1,17 @@
 # Crate safety: which crates forbid `unsafe`
 
 **Grade: A** — regenerated 2026-11-12 (night) with `python3 scripts/cloc_akuma.py src crates`:
-**105 of 144 crates** forbid `unsafe`. 125926 of 127082 production lines (99.1%) sit outside any
+**105 of 144 crates** forbid `unsafe`. 126041 of 127197 production lines (99.1%) sit outside any
 `unsafe` block; 367 production sites across `crates/` (465 with tests), 0 inside enforced crates.
-`akuma-kernel-amd64` went 37 -> 3. The CR3 writes go through the checked
+`akuma-kernel-amd64` went 37 -> 0. The CR3 writes go through the checked
 `akuma_pagetable::amd64::activate`; the wake IPI is an `akuma-trap-amd64` kind; device reads use
-`MmioWindow`s; RAM reads `akuma_phys::peek_ram`; the RAM disk is an `akuma_phys::RamSpan`; the
-reset is `akuma_idt_amd64::reset_by_triple_fault`; the GDT/TSS are `akuma-percpu-gdt-amd64`'s;
-user copies are `akuma_user_access::copy_{from,to}_user_upper_half`; the AP trampoline is an
-`akuma_boot_amd64::ap::TrampolinePage`; and the ring-3 crossing is the new
-`akuma-usermode-amd64` (2 sites). Left: the framebuffer window, the RAM-disk claim and the
-`GS_BASE` write. Detail: [`AMD64_KERNEL_UNSAFE_AUDIT.md`](../archive/AMD64_KERNEL_UNSAFE_AUDIT.md).
+`MmioWindow`s; RAM reads `akuma_phys::peek_ram`; the reset is
+`akuma_idt_amd64::reset_by_triple_fault`; the GDT/TSS are `akuma-percpu-gdt-amd64`'s; user copies
+are `akuma_user_access::copy_{from,to}_user_upper_half`; the AP trampoline is an
+`akuma_boot_amd64::ap::TrampolinePage`; the ring-3 crossing and the per-CPU head are
+`akuma-usermode-amd64` (3 sites); and the multiboot2 framebuffer and RAM-disk claims are
+`akuma_boot_amd64::mb2`'s, made from the address `boot.s` recorded. It is not yet `forbid`: two
+entry symbols are `#[unsafe(no_mangle)]`. Detail: [`AMD64_KERNEL_UNSAFE_AUDIT.md`](../archive/AMD64_KERNEL_UNSAFE_AUDIT.md).
 
 The run before, 2026-11-12 (late): 376 production sites (474 with tests), `akuma-kernel-amd64` 18.
 
