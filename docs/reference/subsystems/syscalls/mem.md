@@ -195,8 +195,7 @@ All always-on (no `sc-*` gate; see [`../syscalls.md`](../syscalls.md) "The
   (`mmap_fixed_overlaps_kernel_va`, scales with `kernel_va_end()`) → `EINVAL`.
   Guards against Go's runtime committing heap arenas with `MAP_FIXED` onto the
   kernel's RAM identity map (silent corruption otherwise).
-- Bump allocator (`proc.memory.alloc_mmap`) exhausted for a non-fixed request
-  → `ENOMEM`.
+- No gap in the placement window for a non-fixed request (`vm_alloc_mmap`) → `ENOMEM`.
 - Eager frame batch alloc fails, and reclaim-and-retry also fails: a writable
   `MAP_SHARED` file-backed mapping → `ENOMEM` (must stay eager to track pages
   for writeback — no safe lazy fallback); everything else silently degrades
@@ -327,9 +326,9 @@ issues a real `dsb ish` + `isb`. Any other cmd → `EINVAL`.
 
 Whatever a `MAP_FIXED` mapping lands on is removed by glue's `unmap_range`, the function that
 is `munmap`'s body. That covers eager regions (clipped, frames freed from the live PTE, shared
-file pages written back), lazy regions and stray pages. The one difference is `recycle_va =
-false`: the range is not returned to the mmap free list, because the new mapping occupies it at
-once.
+file pages written back), lazy regions and stray pages. Then a `PROT_NONE` reservation takes the
+range until the new mapping is installed, so the placer cannot hand it to a `CLONE_VM` sibling
+in between.
 
 **Never clear a range by `unmap_page` alone.** It clears the PTE and nothing else. The frame
 stays in the ledger until exit, and the old `MmapRegion` stays in the list under the new one,
@@ -358,13 +357,22 @@ reclaiming, such a mapping fails with `ENOMEM` rather than silently
 downgrading to `MAP_PRIVATE` semantics (a downgrade some earlier `go build`
 traces logged — see Background).
 
-## Placement: the region list is kept in address order
+## Placement: one placer, over the region list
 
-The two kernels place a mapping differently and only one of them scans.
-**AArch64** places from a per-process bump cursor plus a free list
-(`ProcessMemory::next_mmap` / `free_regions`) and never looks at the region
-list for a gap. **amd64** has no cursor: `find_free_va` (`amd64/src/mm.rs`) is a
-first-fit scan over `mmap_regions`, which needs the list in address order.
+Both kernels place with `akuma_mmap::place::find_free_va_from`: first fit over
+`mmap_regions` from the per-process cursor (`ProcessMemory::next_mmap`), wrapping
+once to the window's base, never into the window's hole (AArch64's kernel RAM
+identity map, `[KERNEL_VA_START, kernel_va_end())`). A freed range is free again
+as soon as its regions are gone; **there is no free list**. AArch64's window is
+`ProcessMemory`'s `[mmap_base, mmap_limit)`; amd64's is still `[MMAP_BASE, MMAP_TOP)`
+until its `mmap` moves to glue.
+
+**Place and record in one hold.** `Process::vm_alloc_mmap` places under the region
+lock and inserts a `PROT_NONE` demand-paged reservation before releasing it; the
+mapping replaces it (`vm_install_region`, or a lazy push) or gives it back
+(`vm_release_reservation`). Placing without recording lets two threads of one
+process get the same range
+([`AKUMA_ONE_VA_PLACER.md`](../../../archive/AKUMA_ONE_VA_PLACER.md)).
 
 Since 2026-09-17 that order is an **invariant maintained by every writer, on
 both kernels**, and it is what lets every walk over the list be a binary search.
@@ -438,7 +446,7 @@ placement cursor:
 | first-fit from `MMAP_BASE` | 4.02 ns/region | 16 720 ns |
 | with the cursor | **1.65 ns/region** | **7 600 ns** |
 | Linux | flat | ~930 ns |
-| AArch64 (bump cursor + free list) | flat | ~1 400 ns |
+| AArch64 (bump cursor + free list, before 2026-11-12) | flat | ~1 400 ns |
 
 **Compare the shape across kernels, never the nanoseconds** — those arms ran
 under different hypervisors, and flat-vs-linear is the finding. The residual

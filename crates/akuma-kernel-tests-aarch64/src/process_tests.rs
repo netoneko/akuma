@@ -5051,8 +5051,8 @@ fn test_mm_bkl_drop() {
     // mmap/munmap round trip: an anonymous PROT_NONE mapping takes the lazy fast path
     // (`push_lazy_region`) — never installs a PTE — exercising `Process::vm_alloc_mmap`
     // (new this phase) for real. munmap on the returned address exercises
-    // `munmap_lazy_regions_in_range` + `Process::vm_free_mmap` (also new this phase) for
-    // real, freeing zero physical frames since the region was never faulted in.
+    // `munmap_lazy_regions_in_range` for real, freeing zero physical frames since the
+    // region was never faulted in.
     let mmap_ret = handle_syscall(nr::MMAP, &[0, 4096, 0, MAP_PRIVATE | MAP_ANONYMOUS, !0u64, 0]);
     if (mmap_ret as i64) <= 0 {
         fails += 1;

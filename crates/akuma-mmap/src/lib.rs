@@ -66,6 +66,7 @@ extern crate alloc;
 
 mod frame;
 pub mod holes;
+pub mod place;
 mod region;
 mod types;
 

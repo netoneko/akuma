@@ -8,13 +8,13 @@ use akuma_exec::process::MmapRegion;
 /// Correctness rests on the state `sys_mprotect`/`sys_madvise`/`sys_munmap`/
 /// `sys_mremap`/`sys_mmap` mutate already carrying its own fine-grained lock —
 /// `Process::as_lock` (page-table PTE edits, via `Process::with_address_space`),
-/// `Process::vm_lock` (`mmap_regions` AND the mmap free-list, via
-/// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`; lazy regions are in `mmap_regions` too), PMM/
+/// `Process::vm_lock` (`mmap_regions`, which is also what VA placement reads, via
+/// `vm_with_regions`/`vm_alloc_mmap`; lazy regions are in `mmap_regions` too), PMM/
 /// `FRAME_TRACKER` (never held across a yield), and `SHARED_FILE_MAPPINGS` — so
 /// the BKL is redundant for them. Two gaps this phase's audit found (a plain
-/// unguarded `ProcessMemory::free_regions`, and `sys_mmap`'s OOM/reclaim sweep
+/// unguarded mmap free list, since removed, and `sys_mmap`'s OOM/reclaim sweep
 /// mutating page tables with no address-space-lock hold) were closed as a
-/// prerequisite; see `Process::vm_alloc_mmap`/`vm_free_mmap` and
+/// prerequisite; see `Process::vm_alloc_mmap` and
 /// `reclaim_clean_file_pages`'s per-page `proc.address_space.lock()`.
 ///
 /// Unlike the VFS/net carve-outs, none of `as_lock`/`vm_lock`/
@@ -452,6 +452,7 @@ fn mmap_eager_to_lazy_fallback(
             // that identity has nothing to demand-page from.
             if inode == 0 || mount_id == 0 {
                 akuma_pmm::note_user_enomem("mmap/eager-file", len);
+                proc.vm_release_reservation(mmap_addr, pages * 4096);
                 return ENOMEM;
             }
             let source = akuma_exec::process::LazySource::file(
@@ -466,6 +467,7 @@ fn mmap_eager_to_lazy_fallback(
             return mmap_addr as u64;
         }
         akuma_pmm::note_user_enomem("mmap/eager-file", len);
+        proc.vm_release_reservation(mmap_addr, pages * 4096);
         return ENOMEM;
     }
     let count = akuma_exec::process::push_lazy_region(proc.tgid, mmap_addr, pages * 4096, page_flags);
@@ -535,9 +537,10 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         }
         if is_fixed {
             // Whatever was mapped here goes, exactly as `munmap` would remove
-            // it, but the range stays off the free list: the new mapping takes
-            // it at once.
-            unmap_range(proc, addr, pages * 4096, false);
+            // it, and a reservation takes its place so the placer cannot hand
+            // the range to a sibling while this call fills it.
+            unmap_range(proc, addr, pages * 4096);
+            proc.vm_install_region(MmapRegion::demand_paged(addr, pages, Some(akuma_exec::mmu::Prot::NONE)));
         }
         addr
     } else if let Some(a) = proc.vm_alloc_mmap(pages * 4096) { a } else {
@@ -646,6 +649,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 // tracked for writeback; the lazy fallback can't do that, so fail
                 // rather than silently drop writes.
                 akuma_pmm::note_user_enomem("mmap/shared-writable", len);
+                proc.vm_release_reservation(mmap_addr, pages * 4096);
                 return ENOMEM;
             } else {
                 // Still short of a contiguous eager batch: fall back to a lazy
@@ -656,6 +660,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
             }
         } else if is_shared_writable {
             akuma_pmm::note_user_enomem("mmap/shared-writable", len);
+            proc.vm_release_reservation(mmap_addr, pages * 4096);
             return ENOMEM;
         } else {
             return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
@@ -775,14 +780,8 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     // writeback), so this is the anonymous case only.
     let region = MmapRegion::owned_with_prot(mmap_addr, frames, page_prot);
     let region = if plan.shared_anon { region.shared_anon() } else { region };
-    // Inserted in address order, not appended: the region list is kept sorted so
-    // `munmap`'s clip-and-split and the fault path can binary-search it rather
-    // than walk it. `akuma_mmap::insert_region_sorted` documents the invariant
-    // (reached here through `akuma_exec`, which re-exports what that crate owns).
-    // This kernel places from a bump cursor plus a free list, so the cursor case
-    // lands at the end and the `insert` shifts nothing; only a reused hole moves
-    // anything, and that is the case the ordering exists to serve.
-    proc.vm_with_regions(|r| akuma_exec::process::insert_region_sorted(r, region));
+    // Over the reservation, in address order (`akuma_mmap::insert_region_sorted`).
+    proc.vm_install_region(region);
 
     mmap_addr as u64
 }
@@ -845,6 +844,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             } else {
                 for f in new_frames { akuma_exec::pmm::free_page_at(f, akuma_pmm::FreeSite::Mremap); }
                 akuma_pmm::note_user_enomem("mremap/frames", new_pages * 4096);
+                proc.vm_release_reservation(new_addr, new_pages * 4096);
                 return ENOMEM;
             }
         }
@@ -896,10 +896,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             Some(p) => MmapRegion::owned_with_prot(new_addr, new_frames, p),
             None => MmapRegion::owned(new_addr, new_frames),
         };
-        // Sorted insert — `mremap` lands its new region wherever the placer put
-        // it, which is not necessarily above every existing one. See the note at
-        // the `mmap` site above.
-        proc.vm_with_regions(|r| akuma_exec::process::insert_region_sorted(r, region));
+        proc.vm_install_region(region);
 
         let mut found_eager = false;
         // Remove the old region under the lock, then unmap/free its frames after
@@ -912,7 +909,6 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
             // owns no frames but has every page mapped, and using `frames.len()`
             // would leave those pages mapped while still recycling the VA range.
             let old_region_pages = old_region.pages;
-            let freed_size = old_region.len_bytes();
             let old_frames = old_region.frames;
             // Unmap + user-frame bookkeeping under `as_lock`; collect frames to free
             // and free them AFTER releasing the hold (free stays outside).
@@ -940,7 +936,6 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                 }
             });
             for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
-            proc.vm_free_mmap(old_addr, freed_size);
             found_eager = true;
         }
 
@@ -964,7 +959,6 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
                 }
             });
             for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::Mremap); }
-            proc.vm_free_mmap(old_addr, old_pages * 4096);
         }
 
         new_addr as u64
@@ -1437,18 +1431,15 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
     // preserved divergence, pinned by the crate's
     // `diverge_munmap_zero_length_unmaps_one_page`.
     let unmap_len = akuma_syscalls_mem::mmap::munmap_len(len);
-    unmap_range(proc, addr, unmap_len, true);
+    unmap_range(proc, addr, unmap_len);
     0
 }
 
 /// Remove every mapping in `[addr, addr + unmap_len)` from `proc`: eager
 /// regions (writing back a shared file mapping first), lazy regions, and any
 /// page mapped outside both, freeing their frames. `munmap`'s body, and what
-/// `MAP_FIXED` does to the range it lands on.
-///
-/// `recycle_va` returns the freed range to the mmap free list. `munmap` wants
-/// that; `MAP_FIXED` must not, since its new mapping occupies the range at
-/// once and a later `mmap` would be handed the same addresses.
+/// `MAP_FIXED` does to the range it lands on. The range is free address space
+/// again the moment its regions are gone: the placer reads the region list.
 ///
 /// `MAP_FIXED` used to clear the PTEs itself with `unmap_page`, which neither
 /// frees a frame nor drops it from the ledger, and it left the old eager
@@ -1456,7 +1447,7 @@ pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {
 /// until the process exited, and the list broke `akuma-mmap`'s no-overlap
 /// invariant (`userspace/forktest/c_stress/mapfixed.c`, 32 MB over 2000 rounds;
 /// `docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md`).
-fn unmap_range(proc: &akuma_exec::process::Process, addr: usize, unmap_len: usize, recycle_va: bool) {
+fn unmap_range(proc: &akuma_exec::process::Process, addr: usize, unmap_len: usize) {
 
     // Detach EVERY eager region overlapping the range, clipping partial ones at
     // both ends, under vm_lock (pure Vec ops only). The actual page unmap + frame
@@ -1542,9 +1533,6 @@ fn unmap_range(proc: &akuma_exec::process::Process, addr: usize, unmap_len: usiz
             let _ = akuma_exec::mmu::flush_tlb_range_all_asid(base, n, akuma_exec::mmu::TlbTarget::AllCores);
         });
         for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion); }
-        if recycle_va {
-            proc.vm_free_mmap(base, n * 4096);
-        }
     }
 
     // Lazy regions in the same range. Previously unreachable whenever an eager
@@ -1584,17 +1572,7 @@ fn unmap_range(proc: &akuma_exec::process::Process, addr: usize, unmap_len: usiz
                 let _ = akuma_exec::mmu::flush_tlb_range_all_asid(
                     freed_start, freed_pages, akuma_exec::mmu::TlbTarget::AllCores);
             });
-            let had_physical = !to_free.is_empty();
             for frame in to_free { akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapPartial); }
-            // Only recycle the VA range when physical pages were actually freed.
-            // Pure lazy (PROT_NONE, never demand-paged) regions must NOT be put
-            // back in free_regions: alloc_mmap prefers free_regions over
-            // next_mmap, which causes an infinite mmap→reject→munmap→same-addr
-            // loop (observed with Go's heap prober returning 0x100000000 60+
-            // times in succession).
-            if had_physical && recycle_va {
-                proc.vm_free_mmap(freed_start, freed_pages * 4096);
-            }
         }
         return;
     }

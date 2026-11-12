@@ -430,8 +430,9 @@ with IRQs masked, so there is no verdict to print.
   - **fork reads the leader's list**, whichever thread forks; the CoW child inherits it with
     `inherit_mmap_regions_for_cow_child`, lazy records included. A `CLONE_VM` thread's own list
     is empty and its faults resolve through the owner of the address space.
-- **mmap:** bump from `0x10000000`, first-fit into `free_regions` on munmap;
-  jumps over `kernel_va_end()`; MAP_FIXED may shatter a 2 MB block into L3.
+- **mmap:** first fit over the region list from a per-process cursor, wrapping once
+  (`akuma_mmap::place`, shared with amd64); jumps over `kernel_va_end()`; MAP_FIXED may
+  shatter a 2 MB block into L3.
 - **Lazy anonymous mmap:** `MAP_PRIVATE` > `MMAP_EAGER_MAX_PAGES`=16 → lazy
   region, zero-on-demand.
 - **Stack:** top ~`0x3FFFF000`; auto-sized (128 KB at ≤256 MB by default).

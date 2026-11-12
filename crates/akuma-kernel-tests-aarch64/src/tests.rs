@@ -89,7 +89,6 @@ pub fn run_memory_tests() -> bool {
 
     // Mmap subsystem tests
     run_test!(test_alloc_mmap_non_overlapping, "alloc_mmap_non_overlapping");
-    run_test!(test_alloc_mmap_free_region_recycling, "alloc_mmap_free_region_recycling");
     run_test!(test_lazy_region_push_lookup, "lazy_region_push_lookup");
     run_test!(test_lazy_region_munmap_full, "lazy_region_munmap_full");
     run_test!(test_lazy_region_munmap_prefix, "lazy_region_munmap_prefix");
@@ -169,9 +168,6 @@ pub fn run_memory_tests() -> bool {
     // mprotect IC IALLU optimization
     run_test!(test_mprotect_flag_update_with_cache_maintenance, "mprotect_flag_update_cache_maint");
 
-    // Bun crash reproduction: mimalloc arena trim sequence
-    run_test!(test_arena_trim_crash_pattern, "arena_trim_crash_pattern");
-    run_test!(test_multi_arena_trim_crash, "multi_arena_trim_crash");
     run_test!(test_mprotect_large_region_completes, "mprotect_large_region_completes");
 
     // mremap + lazy region handling
@@ -279,16 +275,12 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_shared_fd_table_arc_clone, "shared_fd_table_arc_clone");
     run_test!(test_shared_fd_table_deep_clone_for_fork, "shared_fd_table_deep_clone_fork");
     run_test!(test_sysinfo_reports_actual_ram, "sysinfo_reports_actual_ram");
-    run_test!(test_alloc_mmap_free_region_skips_kernel_hole, "alloc_mmap_free_region_kernel_hole");
 
     // Pipe write EPIPE regression tests (go build compile -V=full fix)
     run_test!(test_pipe_write_to_destroyed_pipe_returns_epipe, "pipe_write_destroyed_returns_epipe");
     run_test!(test_pipe_write_no_readers_returns_epipe, "pipe_write_no_readers_returns_epipe");
     run_test!(test_pipe_write_with_readers_succeeds, "pipe_write_with_readers_succeeds");
     run_test!(test_pipe_cloexec_cleanup_preserves_live_writer, "pipe_cloexec_preserves_writer");
-
-    // Regression: Go heap prober mmap-munmap loop + alloc_mmap race (go build WILD-IA crash)
-    run_test!(test_mmap_lazy_munmap_no_recycle, "mmap_lazy_munmap_no_recycle");
 
     // Signal frame layout tests (go build crash: corrupted SP/PSTATE after sigreturn)
     run_test!(test_signal_frame_uc_stack_offsets, "signal_frame_uc_stack_offsets");
@@ -2998,7 +2990,7 @@ fn test_alloc_mmap_non_overlapping() -> bool {
     let mut addrs = Vec::new();
     let sizes = [0x1000, 0x4000, 0x10000, 0x1000, 0x8000, 0x7F000];
     for &sz in &sizes {
-        if let Some(a) = mem.alloc_mmap(sz) { addrs.push((a, sz)) } else {
+        if let Some(a) = mem.place(&mut [], sz) { addrs.push((a, sz)) } else {
             crate::safe_print!(192, "  alloc_mmap returned None for size {:#x} (next={:#x} limit={:#x})\n",
                 sz, mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
             return false;
@@ -3022,41 +3014,6 @@ fn test_alloc_mmap_non_overlapping() -> bool {
     crate::safe_print!(64, "  {} allocations, all disjoint: {}\n", addrs.len(), ok);
     crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
     ok
-}
-
-/// Verify free_regions are reused before bump allocator advances
-fn test_alloc_mmap_free_region_recycling() -> bool {
-    console::print("\n[TEST] alloc_mmap: free region recycling\n");
-
-    let mem = akuma_exec::process::ProcessMemory::new(
-        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
-    );
-
-    let a1 = mem.alloc_mmap(0x4000).unwrap();
-    let _a2 = mem.alloc_mmap(0x4000).unwrap();
-    let bump_after = mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed);
-
-    mem.free_regions.lock().push((a1, 0x4000));
-
-    // Should reuse the freed region, not bump
-    let a3 = mem.alloc_mmap(0x2000).unwrap();
-    let ok1 = a3 == a1 && mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed) == bump_after;
-
-    // Remaining 0x2000 should also come from the split free region
-    let a4 = mem.alloc_mmap(0x2000).unwrap();
-    let ok2 = a4 == a1 + 0x2000;
-
-    // After free_regions exhausted, bump should advance
-    let a5 = mem.alloc_mmap(0x1000).unwrap();
-    let ok3 = a5 == bump_after; // bump_after is already a usize
-
-    let pass = ok1 && ok2 && ok3;
-    if !pass {
-        crate::safe_print!(192, "  a1={:#x} a3={:#x} a4={:#x} a5={:#x} bump={:#x}\n",
-            a1, a3, a4, a5, bump_after);
-    }
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
 }
 
 const TEST_PID: u32 = 9999;
@@ -3540,7 +3497,7 @@ fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
 
-    let base = mem.alloc_mmap(0x7F000).unwrap();
+    let base = mem.place(&mut [], 0x7F000).unwrap();
     let pages = 0x7F000 / 4096; // 127
 
     let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
@@ -3640,7 +3597,7 @@ fn test_mmap_does_not_overlap_identity_map() -> bool {
 
     for _ in 0..10 {
         let size = 0x1000;
-        let addr = mem.alloc_mmap(size);
+        let addr = mem.place(&mut [], size);
         if let Some(a) = addr {
             // Verify address is completely outside the kernel reserved range
             let end = a + size;
@@ -5464,236 +5421,6 @@ fn test_mprotect_large_region_completes() -> bool {
     true
 }
 
-/// Reproduce the mimalloc arena trim pattern that crashes bun.
-///
-/// Sequence observed in bun boot log (T180-T181):
-///   1. mmap 8GB (MAP_NORESERVE) → base=0xbc85d000, lazy region
-///   2. munmap entire 8GB         → lazy region removed, VA recycled
-///   3. mmap 0x851000 (small)     → first-fit returns same base
-///   4. access(base + 4GB)        → gap has no lazy region → SIGSEGV
-///
-/// This test verifies steps 1-3 at the metadata level, then asserts
-/// that lazy_region_lookup returns None for addresses in the gap
-/// (confirming the SIGSEGV is expected kernel behavior, not a bug).
-fn test_arena_trim_crash_pattern() -> bool {
-    console::print("\n[TEST] Bun crash: mimalloc arena trim (mmap 8GB → munmap → re-mmap small)\n");
-
-    let test_pid = akuma_exec::process::allocate_pid();
-    let _proc = LazyTestProcess::new(test_pid);
-
-    const LARGE_SIZE: usize = 0x2_0000_0000; // 8 GB
-    const SMALL_SIZE: usize = 0x851000;       // ~8.3 MB (matches bun trace)
-
-    // ProcessMemory with enough VA space: next_mmap at 0x8000_0000,
-    // stack/limit at 0x10_0000_0000 (64 GB ceiling).
-    let mem = akuma_exec::process::ProcessMemory::new(
-        0x1000_0000,       // code_end
-        0x10_0000_0000,    // stack_bottom (64 GB)
-        0x10_0001_0000,    // stack_top
-        0x8000_0000,       // next_mmap start
-    );
-
-    // Step 1: alloc_mmap(8GB) — simulates bun's MAP_NORESERVE mmap
-    let base = if let Some(a) = mem.alloc_mmap(LARGE_SIZE) { a } else {
-        crate::safe_print!(128, "  alloc_mmap(8GB) returned None\n");
-        return false;
-    };
-    akuma_exec::process::push_lazy_region(test_pid, base, LARGE_SIZE, 0);
-
-    // Verify midpoint is covered by the lazy region
-    let mid = base + LARGE_SIZE / 2;
-    let mid_covered = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, mid).is_some();
-
-    // Step 2: munmap entire 8GB — removes lazy region, recycles VA
-    let results = akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base, LARGE_SIZE);
-    let fully_removed = results.len() == 1;
-    mem.free_regions.lock().push((base, LARGE_SIZE));
-
-    // Verify midpoint is now uncovered
-    let mid_gone = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, mid).is_none();
-
-    // Step 3: alloc_mmap(0x851000) — first-fit should return same base
-    let small_base = if let Some(a) = mem.alloc_mmap(SMALL_SIZE) { a } else {
-        crate::safe_print!(128, "  alloc_mmap(small) returned None\n");
-        akuma_exec::process::clear_lazy_regions(test_pid);
-        return false;
-    };
-    let reused_base = small_base == base;
-    akuma_exec::process::push_lazy_region(test_pid, small_base, SMALL_SIZE, 0);
-
-    // Step 4: verify coverage — small region is covered, gap is not
-    let small_covered = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, small_base,
-    ).is_some();
-
-    // Address just past the small region — in the gap, would SIGSEGV
-    let gap_near = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, small_base + SMALL_SIZE + 0x1000,
-    ).is_none();
-
-    // Address near the far end of the old 8GB region — also in the gap
-    let gap_far = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, base + LARGE_SIZE - 0x1000,
-    ).is_none();
-
-    // The crash address from the boot log: base + ~4GB offset
-    let crash_analog = base + 0x1_0000_0000; // +4GB
-    let crash_addr_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, crash_analog,
-    ).is_none();
-
-    // Verify the remainder is in free_regions (available for future allocs)
-    let remainder_in_free = mem.free_regions.lock().iter().any(|&(start, size)| {
-        start == base + SMALL_SIZE && size == LARGE_SIZE - SMALL_SIZE
-    });
-
-    akuma_exec::process::clear_lazy_regions(test_pid);
-
-    let pass = mid_covered && fully_removed && mid_gone
-        && reused_base && small_covered
-        && gap_near && gap_far && crash_addr_uncovered
-        && remainder_in_free;
-
-    if !pass {
-        crate::safe_print!(256,
-            "  base=0x{:x} small_base=0x{:x}\n\
-             mid_covered={} fully_removed={} mid_gone={}\n\
-             reused_base={} small_covered={}\n\
-             gap_near={} gap_far={} crash_uncovered={}\n\
-             remainder_in_free={}\n",
-            base, small_base,
-            mid_covered, fully_removed, mid_gone,
-            reused_base, small_covered,
-            gap_near, gap_far, crash_addr_uncovered,
-            remainder_in_free,
-        );
-    }
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
-}
-
-/// Reproduces the exact bun crash from boot logs:
-///
-///   [mmap] pid=32 len=0x851000 prot=0x0 flags=0x22 = 0xbc85d000 (lazy, 18 regions)
-///   [DP] no lazy region for FAR=0x2346b2ad68 pid=32
-///   [Fault] Data abort from EL0 at FAR=0x2346b2ad68
-///
-/// Simulates 17 pre-existing lazy regions, then the full cycle:
-///   allocate 8 GB arena → munmap → small PROT_NONE re-mmap → verify crash address uncovered.
-fn test_multi_arena_trim_crash() -> bool {
-    console::print("\n[TEST] Bun multi-arena crash (18 regions, FAR=0x2346b2ad68 pattern)\n");
-
-    let test_pid = akuma_exec::process::allocate_pid();
-    let _proc = LazyTestProcess::new(test_pid);
-
-    let mem = akuma_exec::process::ProcessMemory::new(
-        0x1000_0000,
-        0x10_0000_0000,
-        0x10_0001_0000,
-        0x8000_0000,
-    );
-
-    // Phase 1: create 17 pre-existing lazy regions
-    let region_sizes: [usize; 17] = [
-        0x100000, 0x200000, 0x100000, 0x400000,
-        0x100000, 0x200000, 0x100000, 0x800000,
-        0x100000, 0x200000, 0x100000, 0x400000,
-        0x100000, 0x200000, 0x100000, 0x1000000,
-        0x200000,
-    ];
-    let mut region_bases: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
-
-    for &sz in &region_sizes {
-        let base = if let Some(a) = mem.alloc_mmap(sz) { a } else {
-            crate::safe_print!(64, "  alloc_mmap(0x{:x}) failed\n", sz);
-            akuma_exec::process::clear_lazy_regions(test_pid);
-            return false;
-        };
-        akuma_exec::process::push_lazy_region(test_pid, base, sz, 0);
-        region_bases.push(base);
-    }
-
-    let has_17 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 17;
-
-    // Phase 2: allocate 8 GB arena (becomes region 18)
-    const LARGE_SIZE: usize = 0x2_0000_0000;
-    let arena_base = if let Some(a) = mem.alloc_mmap(LARGE_SIZE) { a } else {
-        crate::safe_print!(64, "  alloc_mmap(8GB) failed\n");
-        akuma_exec::process::clear_lazy_regions(test_pid);
-        return false;
-    };
-    akuma_exec::process::push_lazy_region(test_pid, arena_base, LARGE_SIZE, 0);
-    let has_18 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 18;
-
-    // The crash address from the log was at ~5.9 GB offset into the arena
-    let crash_offset = 0x1_7800_0000_usize;
-    let crash_analog = arena_base + crash_offset;
-    let covered_before = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, crash_analog,
-    ).is_some();
-
-    // Phase 3: munmap entire 8 GB arena
-    let removed = akuma_exec::process::munmap_lazy_regions_in_range(
-        test_pid, arena_base, LARGE_SIZE,
-    );
-    mem.free_regions.lock().push((arena_base, LARGE_SIZE));
-    let arena_removed = removed.len() == 1;
-    let back_to_17 = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 17;
-
-    // Phase 4: small PROT_NONE re-mmap (0x851000, exact value from crash log)
-    const SMALL_SIZE: usize = 0x851000;
-    let small_base = if let Some(a) = mem.alloc_mmap(SMALL_SIZE) { a } else {
-        crate::safe_print!(64, "  alloc_mmap(small) failed\n");
-        akuma_exec::process::clear_lazy_regions(test_pid);
-        return false;
-    };
-    akuma_exec::process::push_lazy_region(test_pid, small_base, SMALL_SIZE, 0);
-    let reused_base = small_base == arena_base;
-    let has_18_again = akuma_exec::process::lazy_region_count_for_pid(test_pid) == 18;
-
-    // Phase 5: verify crash — analog of FAR=0x2346b2ad68 is now uncovered
-    let crash_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, crash_analog,
-    ).is_none();
-    let small_covered = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, small_base,
-    ).is_some();
-    let gap_start_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, small_base + SMALL_SIZE + 0x1000,
-    ).is_none();
-    let far_end_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(
-        test_pid, arena_base + LARGE_SIZE - 0x1000,
-    ).is_none();
-    let preexisting_intact = region_bases.iter().all(|&base| {
-        akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base).is_some()
-    });
-
-    akuma_exec::process::clear_lazy_regions(test_pid);
-
-    let pass = has_17 && has_18
-        && covered_before && arena_removed && back_to_17
-        && reused_base && has_18_again
-        && crash_uncovered && small_covered
-        && gap_start_uncovered && far_end_uncovered
-        && preexisting_intact;
-
-    if !pass {
-        crate::safe_print!(512,
-            "  17={} 18={} covered_before={} removed={} back17={}\n\
-             reused={} (arena=0x{:x} small=0x{:x}) 18again={}\n\
-             crash_uncov={} (0x{:x}) small_cov={} gap={} far={}\n\
-             preexist={}\n",
-            has_17, has_18, covered_before, arena_removed, back_to_17,
-            reused_base, arena_base, small_base, has_18_again,
-            crash_uncovered, crash_analog, small_covered,
-            gap_start_uncovered, far_end_uncovered,
-            preexisting_intact,
-        );
-    }
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
-}
-
 // ============================================================================
 // mremap + lazy region tests
 // ============================================================================
@@ -6076,8 +5803,8 @@ fn test_large_mmap_limit() -> bool {
     let arena_size = 1024 * 1024 * 1024;
     let gigacage_size = 64usize * 1024 * 1024 * 1024;
 
-    let arena_addr = mem.alloc_mmap(arena_size);
-    let gigacage_addr = mem.alloc_mmap(gigacage_size);
+    let arena_addr = mem.place(&mut [], arena_size);
+    let gigacage_addr = mem.place(&mut [], gigacage_size);
 
     match (arena_addr, gigacage_addr) {
         (Some(a1), Some(a2)) => {
@@ -6397,7 +6124,7 @@ fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
 
     // A 2-page alloc would straddle [KERNEL_VA_START-4096, KERNEL_VA_START+4096)
     // which enters the hole. The allocator must jump past KERNEL_VA_END.
-    let addr = if let Some(a) = mem.alloc_mmap(2 * 4096) { a } else {
+    let addr = if let Some(a) = mem.place(&mut [], 2 * 4096) { a } else {
         console::print("  alloc_mmap returned None unexpectedly\n");
         return false;
     };
@@ -6494,7 +6221,7 @@ fn test_mmap_space_covers_jsc_gigacage() -> bool {
     let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
 
     const ARENA_1GB: usize = 1024 * 1024 * 1024;
-    let addr_1g = mem.alloc_mmap(ARENA_1GB);
+    let addr_1g = mem.place(&mut [], ARENA_1GB);
     let pass_1g = addr_1g.is_some();
     if let Some(a) = addr_1g {
         crate::safe_print!(128, "  1 GB arena at {:#x}–{:#x} OK\n", a, a + ARENA_1GB);
@@ -6503,7 +6230,7 @@ fn test_mmap_space_covers_jsc_gigacage() -> bool {
     }
 
     const GIGACAGE_64GB: usize = 64 * 1024 * 1024 * 1024;
-    let addr_64g = mem.alloc_mmap(GIGACAGE_64GB);
+    let addr_64g = mem.place(&mut [], GIGACAGE_64GB);
     let pass_64g = addr_64g.is_some();
     if let Some(a) = addr_64g {
         crate::safe_print!(128, "  64 GB gigacage at {:#x}–{:#x} OK\n", a, a + GIGACAGE_64GB);
@@ -6672,7 +6399,7 @@ fn test_go_binary_va_exhaustion_scenario() -> bool {
 
     let mut large_all_ok = true;
     for i in 0..NUM_PROBES {
-        if let Some(addr) = mem_large.alloc_mmap(PROBE_SIZE) { mem_large.free_mmap(addr, PROBE_SIZE); } else {
+        if mem_large.place(&mut [], PROBE_SIZE).is_none() {
             crate::safe_print!(128, "  FAIL: large VA exhausted at probe {}\n", i);
             large_all_ok = false;
             break;
@@ -7711,7 +7438,7 @@ fn test_mmap_allocator_skips_full_kernel_range() -> bool {
     );
 
     for _ in 0..20 {
-        if let Some(addr) = mem.alloc_mmap(0x100_0000) { // 16MB chunks
+        if let Some(addr) = mem.place(&mut [], 0x100_0000) { // 16MB chunks
             if (0x4000_0000..0x8000_0000).contains(&addr) {
                 crate::safe_print!(96, "  FAIL: alloc_mmap returned {:#x} inside kernel range\n", addr);
                 pass = false;
@@ -7897,45 +7624,6 @@ fn test_sysinfo_reports_actual_ram() -> bool {
 
     let pass = total_bytes > 256 * 1024 * 1024;
     crate::safe_print!(128, "  PMM reports {} MB total RAM (should match sysinfo)\n", total_bytes / 1024 / 1024);
-    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
-    pass
-}
-
-/// Test: alloc_mmap free_region loop does not consume regions in the kernel VA hole.
-fn test_alloc_mmap_free_region_skips_kernel_hole() -> bool {
-    console::print("\n[TEST] alloc_mmap free_region skips kernel VA hole\n");
-
-    let mem = akuma_exec::process::ProcessMemory::new(
-        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
-    );
-
-    mem.free_regions.lock().push((0x5000_0000, 0x2000_0000));
-
-    let result = mem.alloc_mmap(0x1000);
-    let hole_consumed = mem.free_regions.lock().iter()
-        .all(|&(s, _)| !(0x4000_0000..0x8000_0000).contains(&s));
-
-    if let Some(addr) = result
-        && (0x4000_0000..0x8000_0000).contains(&addr) {
-            crate::safe_print!(128, "  FAIL: alloc_mmap returned addr 0x{:x} inside kernel VA hole\n", addr);
-            return false;
-        }
-
-    let region_preserved = mem.free_regions.lock().iter()
-        .any(|&(s, sz)| s == 0x5000_0000 && sz == 0x2000_0000);
-
-    if !region_preserved && !hole_consumed {
-        crate::safe_print!(128, "  WARN: kernel-hole region was consumed (bug if not fixed)\n");
-    }
-
-    let bump_result = mem.alloc_mmap(0x1000);
-    let pass = bump_result.is_some();
-    if let Some(addr) = bump_result
-        && (0x4000_0000..0x8000_0000).contains(&addr) {
-            crate::safe_print!(128, "  FAIL: bump returned addr 0x{:x} inside kernel VA hole\n", addr);
-            return false;
-        }
-
     crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
     pass
 }
@@ -8390,55 +8078,6 @@ fn test_siginfo_fields_set() -> bool {
     const SI_ADDR_OFFSET: usize = 16;
     if SI_SIGNO_OFFSET != 0 || SI_CODE_OFFSET != 8 || SI_ADDR_OFFSET != 16 {
         console::print("  FAIL: siginfo_t offset constants wrong\n");
-        return false;
-    }
-
-    console::print("  PASS\n");
-    true
-}
-
-/// Regression test: Go heap prober infinite mmap-munmap loop.
-///
-/// Go's `mallocinit` calls mmap(PROT_NONE) to probe for arena addresses.
-/// If the returned address doesn't suit it, Go calls munmap and retries.
-/// The bug: sys_munmap was adding pure-lazy (PROT_NONE, never demand-paged)
-/// regions back to free_regions. Since alloc_mmap scans free_regions FIRST,
-/// the exact same address was returned on every subsequent mmap call — a loop
-/// of 60+ identical addresses observed in the go-build crash log.
-///
-/// Fix (src/syscall/mem.rs): only push to free_regions when `had_physical`.
-/// This test exercises the ProcessMemory layer to confirm that NOT calling
-/// free_mmap after a lazy munmap causes the next alloc to advance past the
-/// freed range, never returning the same address twice in succession.
-fn test_mmap_lazy_munmap_no_recycle() -> bool {
-    console::print("\n[TEST] mmap lazy munmap does not recycle VA (Go heap prober fix)\n");
-
-    // Stack-top chosen to give plenty of mmap space without needing huge VA.
-    let mem = akuma_exec::process::ProcessMemory::new(
-        0x10000, 0x3000_0000, 0x3010_0000, 0,
-    );
-
-    // Step 1: alloc → simulated lazy munmap (no free_mmap called)
-    let a1 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: alloc_mmap failed\n"); return true; };
-    // Do NOT call mem.free_mmap(a1, ...) — this is the lazy-munmap path.
-
-    // Step 2: next alloc must be a DIFFERENT address.
-    let a2 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: second alloc_mmap failed\n"); return true; };
-
-    if a1 == a2 {
-        crate::safe_print!(128,
-            "  FAIL: alloc_mmap returned same addr=0x{:x} twice after lazy munmap\n", a1);
-        return false;
-    }
-
-    // Step 3: eager munmap (free_mmap called) → the address IS reused.
-    let b1 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: third alloc_mmap failed\n"); return true; };
-    mem.free_mmap(b1, 0x4000); // eager path: physical pages freed → recycle VA
-    let b2 = if let Some(a) = mem.alloc_mmap(0x4000) { a } else { console::print("  SKIP: fourth alloc_mmap failed\n"); return true; };
-
-    if b1 != b2 {
-        crate::safe_print!(128,
-            "  FAIL: eager freed region should be reused, got 0x{:x} != 0x{:x}\n", b2, b1);
         return false;
     }
 

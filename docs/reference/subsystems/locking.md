@@ -763,16 +763,16 @@ significant BKL holder).
 |---|---|---|
 | `sys_mprotect` (`mem.rs`) | after `proc` resolves | `Process::as_lock` (PTE flag edits); `LAZY_REGION_TABLE` |
 | `sys_madvise` (`mem.rs`) | after `proc` resolves, per match arm | `Process::as_lock` (prefault install / zero-mapped); `LAZY_REGION_TABLE`; PMM (`MADV_WILLNEED`'s batch alloc) |
-| `sys_munmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (region lookup/removal + free-list); `Process::as_lock` (PTE unmap); `SHARED_FILE_MAPPINGS`; `LAZY_REGION_TABLE`; PMM (frame free) |
+| `sys_munmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (region lookup/removal); `Process::as_lock` (PTE unmap); `SHARED_FILE_MAPPINGS`; `LAZY_REGION_TABLE`; PMM (frame free) |
 | `sys_mremap` (`mem.rs`) | after `proc` resolves once (not re-looked-up inside the window) | `Process::vm_lock`; `Process::as_lock`; `LAZY_REGION_TABLE`; PMM |
-| `sys_mmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (free-list alloc via `vm_alloc_mmap`); `Process::as_lock` (PTE install); `LAZY_REGION_TABLE`; PMM; `SHARED_FILE_MAPPINGS`; nested `VfsBklGuard` windows for on-disk fill (ledger depth-counted, safe to nest) |
+| `sys_mmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (placement + reservation via `vm_alloc_mmap`); `Process::as_lock` (PTE install); `LAZY_REGION_TABLE`; PMM; `SHARED_FILE_MAPPINGS`; nested `VfsBklGuard` windows for on-disk fill (ledger depth-counted, safe to nest) |
 
 Two gaps closed as a prerequisite (not present before this phase, not a "nothing to
 build" finding like net/vfs/process):
 
-- **`ProcessMemory::free_regions`/`alloc_mmap()`** was a plain unguarded `Vec` —
-  every mm syscall now goes through `Process::vm_alloc_mmap`/`vm_free_mmap`, which
-  fold it under the existing `vm_lock` (same IRQ-disabled, pure-bookkeeping
+- **`ProcessMemory`'s free list** was a plain unguarded `Vec` — it was folded under
+  `vm_lock`, and since 2026-11-12 it is gone: placement reads `mmap_regions` under
+  that lock (`Process::vm_alloc_mmap`) (same IRQ-disabled, pure-bookkeeping
   discipline `vm_lock` already enforces for `mmap_regions`).
 - **`sys_mmap`'s OOM/reclaim fallback** (`reclaim_clean_file_pages` →
   `try_evict_ro_page`) mutated page tables with no `as_lock` hold at all — fixed

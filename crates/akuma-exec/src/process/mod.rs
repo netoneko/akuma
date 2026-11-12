@@ -1074,8 +1074,7 @@ impl Process {
             // "three fresh locks on a shared address space" row — which flags this
             // as suspect precisely because the reason lives at one call site.
             //
-            // `mmap_regions`/`ProcessMemory::free_regions` each hold their own lock, both
-            // of which ARE per-`Process` (see the empty `mmap_regions` above), so a
+            // `mmap_regions` holds its own lock, which IS per-`Process` (see the empty `mmap_regions` above), so a
             // fresh lock is simply correct there.
             fault_mutex: Spinlock::new(BTreeMap::new()),
 
@@ -1109,37 +1108,40 @@ impl Process {
         })
     }
 
-    /// Allocate `size` bytes of mmap VA space, serialized by
-    /// [`ProcessMemory::free_regions`]'s own lock.
+    /// Place `size` bytes of mmap VA space and **reserve** it, in one hold of
+    /// the region lock: the placement is recorded as a `PROT_NONE` demand-paged
+    /// region before the lock is released, so a `CLONE_VM` sibling's placement
+    /// cannot take the same range while the caller allocates frames for it.
+    /// The caller then puts the real mapping over the reservation
+    /// ([`Process::vm_install_region`], or a lazy push, which replaces it), or
+    /// gives it back with [`Process::vm_release_reservation`].
     ///
-    /// That free list was, before the lock existed, a plain unguarded `Vec` —
-    /// exclusivity relied entirely on the BKL, which is both a gap for any future
-    /// BKL-free mm-syscall carve-out and a live bug: an IRQ preemption of a
-    /// CLONE_VM sibling thread mid-`alloc_mmap` can interleave a second thread's
-    /// `alloc_mmap`/`free_mmap` on the same `Vec`.
-    ///
-    /// It was closed by a `Spinlock<()>` named `vm_lock` sitting *beside* the data
-    /// — which gave real exclusion but no way to obtain `&mut`, so this method
-    /// reached around it with a cast from `&self`. The `Vec` is inside its own
-    /// lock as of 2026-09-01 and the cast is gone
-    /// (`docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis). The hold stays short for the
-    /// same reason as before: `alloc_mmap` is a pure bump-pointer/free-list
-    /// operation with no allocation, I/O or yield inside it.
-    ///
-    /// `next_mmap`'s own CAS (see [`ProcessMemory::alloc_mmap`]) still stands for
-    /// callers that can't take this lock, but every syscall-level caller should
-    /// go through this method.
+    /// A touch of a reserved page before that is a `PROT_NONE` fault, which is
+    /// right: nothing has been returned to userspace yet.
     pub fn vm_alloc_mmap(&self, size: usize) -> Option<usize> {
-        // `alloc_mmap` takes `&self` now and locks `free_regions` itself; the five
-        // other `ProcessMemory` fields it reads are immutable after `new()`.
-        with_irqs_disabled(|| self.memory.alloc_mmap(size))
+        self.vm_with_regions(|r| {
+            let base = self.memory.place(r, size)?;
+            akuma_mmap::insert_region_sorted(r, MmapRegion::demand_paged(base, size.div_ceil(crate::mmu::PAGE_SIZE), Some(crate::mmu::Prot::NONE)));
+            Some(base)
+        })
     }
 
-    /// Return `[start, start+size)` to the mmap free-list. Counterpart to
-    /// [`Process::vm_alloc_mmap`] — see that method's doc for why this is locked
-    /// at all.
-    pub fn vm_free_mmap(&self, start: usize, size: usize) {
-        with_irqs_disabled(|| self.memory.free_mmap(start, size));
+    /// Put an eager region in the list over whatever reservation (a lazy
+    /// region with no file) covers its range.
+    pub fn vm_install_region(&self, region: MmapRegion) {
+        let (start, end) = (region.start_va, region.start_va + region.len_bytes());
+        self.vm_with_regions(|r| {
+            let _ = akuma_mmap::detach_lazy_regions_in_range(r, start, end);
+            akuma_mmap::insert_region_sorted(r, region);
+        });
+    }
+
+    /// Give back a reservation [`Process::vm_alloc_mmap`] made, when the
+    /// mapping it was for failed.
+    pub fn vm_release_reservation(&self, start: usize, size: usize) {
+        self.vm_with_regions(|r| {
+            let _ = akuma_mmap::detach_lazy_regions_in_range(r, start, start + size);
+        });
     }
 
     /// Run `f` with `&mut UserAddressSpace` under this address space's lock (with
@@ -1305,7 +1307,7 @@ impl Process {
             }
         }
         // No lock and no IRQ masking: `brk` is an atomic, and since
-        // `mmap_regions`/`free_regions` moved inside their own locks there is no
+        // `mmap_regions` moved inside its own lock there is no
         // longer any other `vm_*` bookkeeping to order against. `vm_lock` — a
         // `Spinlock<()>` guarding nothing, which is what forced the old cast —
         // is gone. See `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis.
