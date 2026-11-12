@@ -1057,6 +1057,7 @@ dependencies = [
  "akuma-bkl",
  "akuma-boot",
  "akuma-config",
+ "akuma-cow",
  "akuma-cpu",
  "akuma-exec",
  "akuma-isolation",

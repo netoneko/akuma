@@ -2472,6 +2472,44 @@ impl UserAddressSpace {
         }
     }
 
+    /// `mprotect`'s page-table half: re-permission every **present** page in
+    /// `[start, end)` as `prot`, then flush the range once on every core.
+    /// Returns how many pages were rewritten.
+    ///
+    /// `keep_cow(va, pa)` answers whether the frame is still copy-on-write
+    /// shared; such a page is mapped [`without_write`](akuma_mmap::Prot::without_write)
+    /// so the first store faults and breaks the sharing (the caller asks the
+    /// PMM, which this crate deliberately does not). A page EL0 cannot touch is
+    /// left alone when `prot` is `NONE`, since there is nothing to take away.
+    /// The x86 twin has the same contract.
+    pub fn reprotect_present(
+        &mut self,
+        start: usize,
+        end: usize,
+        prot: akuma_mmap::Prot,
+        mut keep_cow: impl FnMut(usize, usize) -> bool,
+    ) -> usize {
+        let mut changed = 0usize;
+        let mut va = start & !(PAGE_SIZE - 1);
+        while va < end {
+            if let Some(entry) = self.read_l3_page_entry(va)
+                && (entry & flags::USER != 0 || !prot.is_none())
+            {
+                let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+                let p = if keep_cow(va, pa) { prot.without_write() } else { prot };
+                self.update_page_flags_inner(va, user_flags::to_pte(p), false);
+                changed += 1;
+            }
+            let Some(next) = va.checked_add(PAGE_SIZE) else { break };
+            va = next;
+        }
+        if changed > 0 {
+            let first = start & !(PAGE_SIZE - 1);
+            let _ = flush_tlb_range(first, (va - first) / PAGE_SIZE, TlbTarget::AllCores);
+        }
+        changed
+    }
+
     /// Raw L3 page descriptor for `va` (4KiB-aligned), if mapped at the final level.
     /// Used by kernel tests and diagnostics (e.g. verify `UXN` after `update_page_flags`).
     pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
@@ -3024,6 +3062,17 @@ fn x86_leaf_slot_in(root: u64, va: usize) -> Option<akuma_pagetable::Slot<'stati
 /// the kernel's shared upper half, which no user walk may touch.
 #[cfg(any(target_arch = "x86_64", test))]
 pub const USER_HALF_END: usize = 1 << 47;
+
+/// One past the last virtual address a syscall may name in a user range — the
+/// bound `mprotect`/`munmap` check before walking. x86_64: the low half
+/// ([`USER_HALF_END`]); above it is the kernel's shared upper half, which a
+/// walk of a user root would otherwise re-permission. AArch64: `TTBR0`'s
+/// 48-bit range (`T0SZ = 16`).
+#[cfg(target_arch = "x86_64")]
+pub const USER_VA_END: usize = USER_HALF_END;
+/// See the x86_64 twin.
+#[cfg(not(target_arch = "x86_64"))]
+pub const USER_VA_END: usize = 1 << 48;
 
 /// Bytes one page-table entry at `level` spans: 512 GiB, 1 GiB, 2 MiB, 4 KiB.
 ///
@@ -3832,6 +3881,32 @@ impl UserAddressSpace {
         f: impl FnMut(&FrameLedger, Leaf) -> LeafAction,
     ) -> usize {
         x86_walk_leaves(self.root as u64, &self.ledger, start, end, f)
+    }
+
+    /// `mprotect`'s page-table half — the AArch64 twin's contract, in one
+    /// descent: every present leaf in `[start, end)` becomes `prot`, or
+    /// `prot` without write and CoW-marked where `keep_cow(va, pa)` says the
+    /// frame is still shared. A leaf ring 3 cannot touch is re-permissioned
+    /// when *granting* (a `PROT_NONE` page is `KERNEL_RO` here, and skipping
+    /// it stranded Chromium's decommitted pages, 2026-10-09) and left alone
+    /// for `NONE`. The walk invalidates and shoots down what it edits.
+    pub fn reprotect_present(
+        &mut self,
+        start: usize,
+        end: usize,
+        prot: akuma_mmap::Prot,
+        mut keep_cow: impl FnMut(usize, usize) -> bool,
+    ) -> usize {
+        let mut changed = 0usize;
+        self.rewrite_leaves_in_range(start, end, |_ledger, leaf| {
+            if !leaf.prot.user && prot.is_none() {
+                return LeafAction::Keep;
+            }
+            changed += 1;
+            let cow = keep_cow(leaf.va, leaf.pa);
+            LeafAction::Reprotect(PteProt::from_region(if cow { prot.without_write() } else { prot }), cow)
+        });
+        changed
     }
 
 

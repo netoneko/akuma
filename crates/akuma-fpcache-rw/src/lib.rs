@@ -337,22 +337,6 @@ impl Generations {
     }
 }
 
-/// Should a present page be mapped **copy-on-write-marked** (read-only until a
-/// write breaks the sharing)?
-///
-/// `amd64/src/mm.rs::pte_prot_for`'s rule — a writable page whose frame is
-/// shared (`refs > 0`) is marked, so the first write copies — plus the exception
-/// it was missing: a page that is shared **by identity** (`MAP_SHARED`,
-/// anonymous or file) must never be marked, because "copy on write" is then
-/// precisely "stop sharing", the opposite of the flag. Before this, an
-/// `mprotect(PROT_READ)` then `mprotect(PROT_READ|PROT_WRITE)` over a forked
-/// `MAP_SHARED|MAP_ANONYMOUS` page re-marked it, and the next write split the
-/// parent from the child.
-#[must_use]
-pub const fn marks_cow(shared_by_identity: bool, writable: bool, refs: u16) -> bool {
-    !shared_by_identity && writable && refs > 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -583,13 +567,5 @@ mod tests {
         let before = g.read(12);
         g.bump(13);
         assert_eq!(g.read(12), before, "another bucket does not disturb this one");
-    }
-
-    #[test]
-    fn identity_shared_pages_are_never_cow_marked() {
-        assert!(marks_cow(false, true, 2), "a forked private page is marked");
-        assert!(!marks_cow(false, true, 0), "an unshared private page is not");
-        assert!(!marks_cow(false, false, 2), "a read-only page needs no mark");
-        assert!(!marks_cow(true, true, 2), "MAP_SHARED: shared by identity, never marked");
     }
 }

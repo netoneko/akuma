@@ -15,7 +15,9 @@ deferred there because it cannot be done one call at a time.*
 | 4a. `MmapRegion` can describe a demand-paged ELF segment | **done** (2026-11-12): `lazy` marker, `FileBacking::lead`, `page_span` |
 | 4b-i. a lazy file region is named by `(mount, inode)` | **done** (2026-11-12): no path in `LazySource`; inode-less files map eagerly |
 | 4b-ii. lazy regions join `mmap_regions` | **done** (2026-11-12): `LazyRegionMap`, `Process::lazy_regions`, `clone_lazy_regions`, `update_lazy_region_flags` and `propagate_lazy_regions_to_child` deleted; the `*lazy_region*` names are views over the one list. fork reads the leader's list (a worker's fork used to read its own, empty one); a thread's faults resolve through the address-space owner. A replacing push now releases the old file's pin. Gates: AArch64 HVF boot suite 318/326/324 (SMP 1/2/4, unchanged), `mem_suite` 12/12, `dynspawn` 0 divergences, `ext2probe` SPACE OK (100 % returned, pinned and unpinned), forktest stress, `futextest`/`thrchurn`/`sigprobe`, clean `-j4` self-host kernel build in the devbox VM (EXIT=0, 1m12s, tripwires 0) |
-| 5–6 | open |
+| 5a. `mprotect` is glue's on both kernels | **done** (2026-11-12): amd64's copy deleted; `UserAddressSpace::reprotect_present` on both walkers; amd64's CoW rule adopted, which fixed AArch64 granting a write to a forked private page (`cowprotect` probe, [`AKUMA_MPROTECT_CONVERGENCE.md`](../docs/archive/AKUMA_MPROTECT_CONVERGENCE.md)). Gates: `mem_suite` 13/13 on both, amd64 TCG suite SMP 1/2/4, AArch64 devbox self-host `-j4` EXIT=0 |
+| 5b. VA placement | open — blocks `munmap`: glue pushes freed ranges onto `ProcessMemory`'s free list, which amd64's region-gap placer never reads (and which grows without bound if nothing pops it). One placer first, then `munmap`/`mmap` |
+| 5c–6 | open |
 
 ## Goal
 

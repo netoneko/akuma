@@ -172,5 +172,21 @@ pub const fn needs_private_copy(present: bool, refs: u16) -> bool {
     present && refs >= 2
 }
 
+/// Should a present page be mapped **copy-on-write-marked** (read-only until a
+/// write breaks the sharing)?
+///
+/// `mprotect`'s rule — a writable page whose frame is
+/// shared (`refs > 0`) is marked, so the first write copies — plus the exception
+/// it was missing: a page that is shared **by identity** (`MAP_SHARED`,
+/// anonymous or file) must never be marked, because "copy on write" is then
+/// precisely "stop sharing", the opposite of the flag. Before this, an
+/// `mprotect(PROT_READ)` then `mprotect(PROT_READ|PROT_WRITE)` over a forked
+/// `MAP_SHARED|MAP_ANONYMOUS` page re-marked it, and the next write split the
+/// parent from the child.
+#[must_use]
+pub const fn marks_cow(shared_by_identity: bool, writable: bool, refs: u16) -> bool {
+    !shared_by_identity && writable && refs > 0
+}
+
 #[cfg(test)]
 mod tests;

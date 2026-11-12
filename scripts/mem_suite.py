@@ -115,6 +115,9 @@ PROBES = {
     # MAP_FIXED over a live mapping: the replaced pages must be freed, not held
     # until exit (`docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md`).
     "mapfixed":             ("", 300),
+    # mprotect after fork: a private page re-granted write stays copy-on-write,
+    # a MAP_SHARED one stays shared (`docs/archive/AKUMA_MPROTECT_CONVERGENCE.md`).
+    "cowprotect":           ("", 300),
 }
 
 SSH_BASE = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",

@@ -7,6 +7,7 @@ description = "The Linux syscall dispatcher and its per-family implementations"
 [dependencies]
 akuma-bkl = { path = "../akuma-bkl" }
 akuma-config = { path = "../akuma-config" }
+akuma-cow = { path = "../akuma-cow" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-isolation = { path = "../akuma-isolation", default-features = false }

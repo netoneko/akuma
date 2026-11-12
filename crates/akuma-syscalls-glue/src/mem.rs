@@ -1358,65 +1358,70 @@ pub fn membarrier_cmd(cmd: u32) -> u64 {
     }
 }
 
+/// `mprotect(addr, len, prot)`, both kernels.
+///
+/// The regions split on exactly the range (never record a sub-range's
+/// protection against a whole region: `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`),
+/// then every present page is re-permissioned by the walker's
+/// `reprotect_present`. A page whose frame is still copy-on-write shared is
+/// mapped without write (`akuma_cow::marks_cow`), so the first store breaks
+/// the sharing — unless the region is shared **by identity** (`MAP_SHARED`,
+/// anonymous or file), where CoW would mean "stop sharing". AArch64 used to
+/// grant the write in place, so a forked page `mprotect`-ed writable was
+/// written through to the parent (`docs/archive/AKUMA_MPROTECT_CONVERGENCE.md`).
 pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
-    if len == 0 { return 0; }
     if addr & 0xFFF != 0 { return EINVAL; }
-    let pages = len.div_ceil(4096);
-    // Two vocabularies, deliberately: `new_prot` is what a *region* records
-    // (neutral, `akuma-mmap`), `new_flags` is what a *page table* takes
-    // (AArch64 `AP_*`, `akuma-mmu`). They were one `u64` until 2026-09-06.
+    if len == 0 { return 0; }
+    let byte_len = len.div_ceil(4096) * 4096;
+    let Some(end) = addr.checked_add(byte_len).filter(|e| *e <= akuma_exec::mmu::USER_VA_END) else {
+        return EINVAL;
+    };
     let new_prot = akuma_exec::mmu::Prot::from_prot(prot);
-    let new_flags = akuma_exec::mmu::user_flags::to_pte(new_prot);
-    let adding_exec = prot & 0x4 != 0;
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
     if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
         akuma_primitives::tprint!(128, "[mprotect] pid={} owner={} addr=0x{:x} len=0x{:x} prot={:#x}\n",
-            current_pid, owner_pid, addr, pages * 4096, prot);
+            current_pid, owner_pid, addr, byte_len, prot);
     }
-    if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
-        let _mm_window = MmBklGuard::new();
-        // One list, lazy regions included: the split records the new protection
-        // on exactly the range, for the fault handler to map lazy pages with and
-        // to repair eager PTEs against.
-        akuma_exec::process::update_eager_region_flags(proc.tgid, addr, pages * 4096, new_prot);
-
-        // Update all page table entries with no_flush, then issue a single
-        // TLB range flush. Previously each update_page_flags call issued its
-        // own dsb+tlbi+dsb+isb, causing O(pages) expensive barrier sequences.
-        // Permission edits under `as_lock` (shared-kernel SMP). PTE edits only.
-        proc.with_address_space(|aspace| {
-            let mut any_updated = false;
-            for i in 0..pages {
-                let va = addr + i * 4096;
-                if aspace.is_mapped(va) {
-                    aspace.update_page_flags_no_flush(va, new_flags);
-                    any_updated = true;
-                }
+    let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) else { return ESRCH };
+    let _mm_window = MmBklGuard::new();
+    akuma_exec::process::update_eager_region_flags(proc.tgid, addr, byte_len, new_prot);
+    // The extents shared by identity, collected under the region hold and
+    // allocating only when there is one; almost every `mprotect` is a private
+    // allocator page and leaves this empty. Released before `as_lock`.
+    let identity_shared: Vec<(usize, usize)> = proc.vm_with_regions(|r| {
+        akuma_exec::process::regions_overlapping(r, addr, end)
+            .iter()
+            .filter(|r| r.shared_anon || r.shared_write.is_some())
+            .map(|r| (r.start_va, r.start_va + r.len_bytes()))
+            .collect()
+    });
+    let write = new_prot.is_write();
+    proc.with_address_space(|aspace| {
+        aspace.reprotect_present(addr, end, new_prot, |va, pa| {
+            let shared = identity_shared.iter().any(|&(a, b)| va >= a && va < b);
+            akuma_cow::marks_cow(shared, write, akuma_pmm::cow_ref_get(pa))
+        })
+    });
+    // A page gaining execute must not run stale instructions: AArch64's
+    // I-cache is not coherent with stores. x86's is.
+    #[cfg(target_arch = "aarch64")]
+    if prot & 0x4 != 0 {
+        let mut va = addr;
+        while va < end {
+            let mut off = 0usize;
+            while off < 4096 {
+                akuma_cpu::cache::dc_cvau(va + off);
+                off += 64;
             }
-            if any_updated {
-                let _ = akuma_exec::mmu::flush_tlb_range(addr, pages, akuma_exec::mmu::TlbTarget::AllCores);
-            }
-        });
-        if adding_exec {
-            for i in 0..pages {
-                let va = addr + i * 4096;
-                let mut off = 0usize;
-                while off < 4096 {
-                    akuma_cpu::cache::dc_cvau(va + off);
-                    off += 64;
-                }
-            }
-            akuma_cpu::barrier::dsb_ish();
-            akuma_cpu::cache::ic_iallu();
-            akuma_cpu::barrier::dsb_ish();
-            akuma_cpu::barrier::isb();
+            va += 4096;
         }
-        0
-    } else {
-        akuma_primitives::tprint!(128, "[mprotect] EINVAL: owner={} not found\n", owner_pid);
-        EINVAL
+        akuma_cpu::barrier::dsb_ish();
+        akuma_cpu::cache::ic_iallu();
+        akuma_cpu::barrier::dsb_ish();
+        akuma_cpu::barrier::isb();
     }
+    0
 }
 
 pub(super) fn sys_munmap(addr: usize, len: usize) -> u64 {

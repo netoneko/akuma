@@ -2420,87 +2420,6 @@ pub fn sys_msync(addr: u64, len: u64) -> u64 {
     0
 }
 
-/// `mprotect(addr, len, prot)`.
-///
-/// # This used to be `return 0`
-///
-/// Accept-and-do-nothing, because there was no region table to re-permission
-/// against. It meant a caller asking for *more* access than it had still saw the
-/// original mapping (harmless, since the original was never less permissive) and
-/// a caller asking for *less* was simply not honoured — which is every guard
-/// page every allocator installs, silently absent.
-///
-/// # It splits; it does not annotate
-///
-/// [`akuma_mmap::mprotect_eager_regions_in_range`] splits a region the range
-/// only partly covers rather than recording the new protection against the whole
-/// of it. Recording it against the whole was the bug that killed `rustc`
-/// mid-build on AArch64: a guard page `mprotect(PROT_NONE)`-ed inside a larger
-/// mapping recorded `NONE` for every page of it
-/// (`docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md`).
-pub fn sys_mprotect(addr: u64, len: u64, prot: u64) -> u64 {
-    if !addr.is_multiple_of(PAGE_SIZE) {
-        return errno::EINVAL;
-    }
-    let prot32 = prot as u32;
-    // RWX is granted here as in `sys_mmap` (see the note there): this is the
-    // call V8 makes on its code range.
-    if len == 0 {
-        return 0;
-    }
-    let start = addr as usize;
-    let byte_len = (len as usize).div_ceil(PAGE_SIZE as usize) * PAGE_SIZE as usize;
-    let Some(end) = start.checked_add(byte_len).filter(|e| *e <= USER_VA_LIMIT) else {
-        return errno::EINVAL;
-    };
-
-    let new_prot = Prot::from_prot(prot32);
-    // The extents in range that are shared **by identity** — `MAP_SHARED`,
-    // anonymous or file — whose present pages must never come back
-    // CoW-marked (`akuma_fpcache_rw::marks_cow`). Collected under the region
-    // hold, allocating only when there is one; almost every `mprotect` is a
-    // private allocator page and leaves this empty.
-    let Some(identity_shared) = usermode::with_current_regions(|regions| {
-        akuma_mmap::mprotect_eager_regions_in_range(regions, start, end, new_prot);
-        akuma_mmap::regions_overlapping(regions, start, end)
-            .iter()
-            .filter(|r| r.shared_anon || r.shared_write.is_some())
-            .map(|r| (r.start_va, r.start_va + r.len_bytes()))
-            .collect::<Vec<(usize, usize)>>()
-    }) else {
-        return errno::ESRCH;
-    };
-
-    // Then the pages that are already present. A lazy page has no PTE to change
-    // and does not need one — `fault_in` reads the region, which now says the
-    // new thing.
-    let _ = usermode::with_current_address_space(|uas| {
-        uas.rewrite_leaves_in_range(start, end, |_ledger, leaf| {
-            // A page ring 3 cannot touch is either a kernel page (nothing should
-            // map one in a user range) or **user memory a `PROT_NONE` hid**:
-            // `PteProt::from_region(NONE)` is `KERNEL_RO`, so `mprotect(NONE)`
-            // rewrites a present page to `user = false`. Skipping those when
-            // *granting* access stranded every such page: the region went back
-            // to RW and the page stayed inaccessible, so the next write was
-            // `#PF` protection / `SEGV_ACCERR` on memory the region said was
-            // writable. That is how Chromium's PartitionAlloc (decommit =
-            // `mprotect(NONE)`, recommit = `mprotect(RW)`) killed every renderer
-            // at its third document load (2026-10-09, `[sig!-at] region ...
-            // prot=Prot(3)`, `pte write=false user=false`). Granting is
-            // therefore allowed to re-permission them; only a request for NONE
-            // leaves an inaccessible page alone (there is nothing to take away).
-            if !leaf.prot.user && new_prot.is_none() {
-                return LeafAction::Keep;
-            }
-            let shared = identity_shared.iter().any(|&(a, b)| leaf.va >= a && leaf.va < b);
-            let want = PteProt::from_region(new_prot);
-            let cow = akuma_fpcache_rw::marks_cow(shared, want.write, akuma_pmm::cow_ref_get(leaf.pa));
-            LeafAction::Reprotect(if cow { PteProt { write: false, ..want } } else { want }, cow)
-        });
-    });
-    0
-}
-
 /// `mremap(old_addr, old_size, new_size, flags)` — x86_64 syscall 25.
 ///
 /// # It moves pages; it does not copy them
@@ -3060,8 +2979,19 @@ pub fn smoke_test(t: &mut Suite) {
     );
     t.check_eq(
         "mprotect: writable+executable is accepted (ESRCH here: no process, not EINVAL)",
-        sys_mprotect(0x1_0000_0000, 4096, u64::from(PROT_WRITE | PROT_EXEC)),
+        crate::usermode::to_glue(
+            akuma_syscalls_abi::Syscall::Mprotect,
+            [0x1_0000_0000, 4096, u64::from(PROT_WRITE | PROT_EXEC), 0, 0, 0],
+        ),
         errno::ESRCH,
+    );
+    t.check_eq(
+        "mprotect: a range into the kernel half is EINVAL, not a walk of it",
+        crate::usermode::to_glue(
+            akuma_syscalls_abi::Syscall::Mprotect,
+            [(USER_VA_LIMIT - 4096) as u64, 8192, 3, 0, 0, 0],
+        ),
+        errno::EINVAL,
     );
 
     // Every one of these runs during the boot self-tests, where there is no

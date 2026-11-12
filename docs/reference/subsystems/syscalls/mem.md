@@ -220,15 +220,22 @@ All always-on (no `sc-*` gate; see [`../syscalls.md`](../syscalls.md) "The
 `0` (not an errno) — brk's ABI has no failure return distinct from "brk
 didn't move", so there's nothing to signal.
 
-**`mprotect`** (`sys_mprotect`, `mem.rs:602`):
+**`mprotect`** (`sys_mprotect`, glue `mem.rs`; **both kernels** since 2026-11-12 — amd64
+dispatches it to glue):
+- `addr` misaligned → `EINVAL` (checked before `len`, so `mprotect(odd, 0)` is `EINVAL`).
 - `len == 0` → `0` (no-op success, matches Linux).
-- `addr` misaligned → `EINVAL`.
-- Owner process lookup fails → **`EINVAL`**, not `ESRCH`. This is
-  inconsistent with `mmap`/`munmap`'s `ESRCH` on the same failure — a
-  syscall-boundary quirk worth knowing if a newly-ported binary's mprotect
-  path behaves differently than its mmap path under the same condition.
-- Unmapped pages in the requested range are silently skipped (not an error);
-  only mapped pages get `update_page_flags`.
+- `addr + len` past `akuma_mmu::USER_VA_END` → `EINVAL`. On amd64 this is what stops a walk
+  of the kernel's shared upper half.
+- Owner process lookup fails → `ESRCH`, as `mmap`/`munmap`.
+- The regions split on exactly the range; then `UserAddressSpace::reprotect_present`
+  rewrites every **present** page (absent pages are not an error; a lazy page picks up the
+  new protection from its region when it faults).
+- **A page whose frame is still copy-on-write shared stays without write**
+  (`akuma_cow::marks_cow`), so the next store copies it — unless its region is shared *by
+  identity* (`shared_anon`, `shared_write`), where it is granted the write. Never grant a
+  write to a shared private frame from `mprotect`: the store lands in every holder
+  ([`AKUMA_MPROTECT_CONVERGENCE.md`](../../../archive/AKUMA_MPROTECT_CONVERGENCE.md); probe
+  `cowprotect` in `scripts/mem_suite.py`).
 
 **`munmap`** (`sys_munmap`, `mem.rs:654`): owner lookup fails → `ESRCH`.
 `addr`/`len` are page-rounded; unmapping an address with nothing mapped there

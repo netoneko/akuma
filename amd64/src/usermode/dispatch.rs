@@ -807,11 +807,9 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `new_address` and is deliberately not passed: this target does not
         // support `MREMAP_FIXED`, and the decision crate does not decode it.
         Syscall::Mremap => crate::mm::sys_mremap(a1, a2, a3, a4),
-        // `mprotect` — real since the region table landed (2026-09-07). It
-        // splits the regions the range crosses and re-permissions the pages
-        // that are present; see `mm::sys_mprotect` for why it was `return 0`
-        // for so long and what that cost.
-        Syscall::Mprotect => crate::mm::sys_mprotect(a1, a2, a3),
+        // `mprotect` is glue's, the one implementation both kernels run
+        // (`proposals/AKUMA_MM_CONVERGENCE.md` step 5).
+        Syscall::Mprotect => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         // `brk(addr)` — x86_64 12. This target has no program break (the
         // allocators are `mmap`-based and the arm was removed), so the row
         // decoded and fell into the silent default below: `ENOSYS`, an answer
