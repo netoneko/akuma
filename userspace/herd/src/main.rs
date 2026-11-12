@@ -27,7 +27,7 @@ use boxlib::json;
 use boxlib::spec::{self, box_id_for};
 use boxlib::sys;
 
-use herd::exit::{classify, classify_spawn_failure, Exit, Outcome, Policy};
+use herd::exit::{classify, classify_spawn_failure, next_streak, restart_delay_ms, Exit, Outcome, Policy};
 use herd::vm::{self, VmConfig};
 
 // ============================================================================
@@ -403,6 +403,12 @@ struct SupervisedProcess {
     stdout_fd: Option<u32>,
     state: ServiceState,
     restart_count: u32,
+    /// Quick failures in a row (`herd::exit::next_streak`): what stretches the
+    /// restart delay for a service that cannot stay up.
+    fail_streak: u32,
+    /// When the running instance started (uptime ms), to tell a quick failure
+    /// from one after a healthy run.
+    started_at_ms: Option<u64>,
     last_exit_code: Option<i32>,
     restart_at_ms: Option<u64>,
     /// Earliest time (ms) this service's INITIAL start is allowed, computed lazily
@@ -426,6 +432,8 @@ impl SupervisedProcess {
             stdout_fd: None,
             state: ServiceState::Stopped,
             restart_count: 0,
+            fail_streak: 0,
+            started_at_ms: None,
             last_exit_code: None,
             restart_at_ms: None,
             start_at_ms: None,
@@ -1415,6 +1423,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
                 svc.stdout_fd = Some(nonblocking_stdout(stdout_fd));
                 svc.state = ServiceState::Running;
                 svc.restart_at_ms = None;
+                svc.started_at_ms = Some(uptime() / 1000);
                 print("[herd] Started ");
                 print(name);
                 print(" (pid=");
@@ -1437,16 +1446,26 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
                 };
                 let outcome = classify_spawn_failure(policy, svc.restart_count);
                 svc.state = ServiceState::after(outcome);
+                svc.fail_streak = next_streak(svc.fail_streak, 0);
                 if outcome == Outcome::Restart {
                     svc.restart_count += 1;
-                    svc.restart_at_ms = Some(now_ms + svc.config.restart_delay_ms);
-                    print("[herd] Scheduling restart for ");
-                    print(name);
-                    print("\n");
+                    schedule_restart(svc, name, now_ms);
                 }
             }
         }
     }
+}
+
+/// Put `svc` in line for a restart after its backoff delay
+/// (`herd::exit::restart_delay_ms` of its `restart_delay_ms` and failure streak).
+fn schedule_restart(svc: &mut SupervisedProcess, name: &str, now_ms: u64) {
+    let delay = restart_delay_ms(svc.config.restart_delay_ms, svc.fail_streak);
+    svc.restart_at_ms = Some(now_ms + delay);
+    print("[herd] Scheduling restart for ");
+    print(name);
+    print(" in ");
+    print_dec(delay as usize);
+    print(" ms\n");
 }
 
 /// The answer to a control request: `ok` decides the CLI's exit status, `msg`
@@ -1625,6 +1644,7 @@ fn control_start(state: &mut HerdState, name: &str) -> Reply {
         });
     }
     svc.restart_count = 0;
+    svc.fail_streak = 0;
     let config = svc.config.clone();
     start_service(state, name, &config);
 
@@ -2021,6 +2041,8 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
 
             let outcome = classify(policy, svc.restart_count, how);
             svc.state = ServiceState::after(outcome);
+            let ran_ms = svc.started_at_ms.take().map_or(0, |t| now_ms.saturating_sub(t));
+            svc.fail_streak = next_streak(svc.fail_streak, ran_ms);
             match outcome {
                 // A oneshot service ran its single time: move it to the terminal
                 // Completed state (never restarted — start_stopped_services only
@@ -2033,10 +2055,7 @@ fn check_process_exits(state: &mut HerdState, now_ms: u64) {
                 }
                 Outcome::Restart => {
                     svc.restart_count += 1;
-                    svc.restart_at_ms = Some(now_ms + svc.config.restart_delay_ms);
-                    print("[herd] Scheduling restart for ");
-                    print(&name);
-                    print("\n");
+                    schedule_restart(svc, &name, now_ms);
                 }
                 Outcome::Failed => {
                     print("[herd] Service ");

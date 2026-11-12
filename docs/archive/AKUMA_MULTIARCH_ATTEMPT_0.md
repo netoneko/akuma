@@ -2737,7 +2737,11 @@ Open, found on the way and not changed here:
 
 - **herd retries a refused service forever.** On `server` its `console = true` service fails with
   `ENODEV` and is restarted every `restart_delay`: 69 times in a minute. herd should give up, or
-  back off, after repeated start failures.
+  back off, after repeated start failures. *Fixed 2026-11-12:* herd backs off. Each failure
+  within 30 s of the start, a failed spawn included, doubles `restart_delay` up to 60 s, and a
+  longer run resets it (`herd::exit::{next_streak, restart_delay_ms}`, host-tested). On `server`
+  with herd as init, 150 s gave 8 tries at 1, 2, 4, 8, 16, 32, 60 and 60 s; sshd started
+  normally.
 - **No job control on the amd64 serial console** (fixed in "Job control on the amd64 console" below). amd64 dispatches `setpgid`/`getpgid`/`getsid`
   to `pty::*_gated`, which are real only inside a pty session and the old accepted no-ops
   elsewhere. A busybox shell as init runs `sleep 30` "in" group 71 (its `TIOCSPGRP` sets the

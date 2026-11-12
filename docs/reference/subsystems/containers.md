@@ -123,7 +123,10 @@ clean exit or `restart = false` → `Exited` (stays down); else respawn after
 `restart_delay_ms`, up to `max_retries`, then `Failed`. A **failed spawn** (the
 process never ran) is treated the same way when `restart = true` — retried,
 not parked in `Failed`; with `restart = false` or `oneshot` it is `Failed`
-(`herd::exit::classify_spawn_failure`, host-tested). `herd status` lists the
+(`herd::exit::classify_spawn_failure`, host-tested). The delay backs off: each
+failure within 30 s of the start doubles `restart_delay_ms`, up to 60 s, and a
+longer run resets it (`herd::exit::restart_delay_ms`, host-tested), so a service
+the kernel refuses is tried about once a minute, not every second. `herd status` lists the
 enabled services (not their runtime state).
 
 **Control:** `herd start <svc>` / `herd stop <svc>` talk to the daemon over

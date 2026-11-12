@@ -86,7 +86,7 @@ restart       = true     # keep it running: restart after any exit (default true
 |---|---|---|---|
 | `command` | path | *(required)* | Executable to spawn. |
 | `args` | space-separated | *(none)* | Arguments passed after `command`. |
-| `restart_delay` | u64 ms | `1000` | Delay before a scheduled restart. |
+| `restart_delay` | u64 ms | `1000` | Delay before a scheduled restart. A service that keeps failing quickly backs off: each failure within 30 s of its start (a failed spawn counts) doubles the delay, up to 60 s (or `restart_delay`, if that is longer), and a run of 30 s or more starts it over (`herd::exit::restart_delay_ms`). |
 | `max_retries` | u32 | `0` | Max restarts before giving up; `0` = infinite. |
 | `restart` | bool | `true` | Whether to keep the service running: it is restarted after **any** exit, clean (`exit 0`) or not (before 2026-10-08 a clean exit was final even with `restart = true`, which left sshd and netwatch down on ryzen), **and whether to retry a failed spawn** (`[herd] Failed to start`): a supervised service whose first `spawn` fails is rescheduled after `restart_delay` up to `max_retries`, like a crash (before 2026-10-08 it went to the terminal `Failed` and stayed down until `herd start`). `restart = false` and `oneshot` keep `Failed`. Set `false` for services whose restart needs special handling (e.g. a `rump_server` whose kernel sysproxy channel must be re-established). |
 | `oneshot` | bool | `false` | Run exactly once: when the service exits (any code) it moves to the terminal `Completed` state and is never restarted. Overrides `restart`. A reboot runs it again. Use for boot-time one-off tasks. |
@@ -117,7 +117,7 @@ reboot):
 | Running | any exit with `restart = false` | Exited |
 | Running | exits (any code, or a signal), `restart`, retries left | PendingRestart |
 | Running | exits (any code, or a signal), `max_retries` reached | Failed |
-| PendingRestart | `restart_delay` elapsed | Running |
+| PendingRestart | the backoff delay (`restart_delay`, doubled per quick failure) elapsed | Running |
 | any | `herd stop` (process killed and reaped) | Halted |
 | Exited / Halted / Failed / Stopped | `herd start` | Running |
 | any | removed from `enabled/` at a config reload | stopped, reaped, dropped |
