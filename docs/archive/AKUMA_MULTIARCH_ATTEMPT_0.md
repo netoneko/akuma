@@ -2501,7 +2501,13 @@ row is not load-bearing for reaping; converging 301 means routing it to glue and
 
 Gates: clippy (AArch64; amd64 `headless`, `headless,no-tests`; amd64 tests crate; Taoxichuan);
 boot suites unchanged (amd64 TCG 823/833/833, AArch64 HVF 312/320/318); `sshd` sessions on
-both, which spawn their shells through 301.
+both, which spawn their shells through 301; amd64 ring-3 harness (`amd64_ring3_check.py`, 20
+sessions) OK.
+
+**On real silicon** (ryzen, Pop, QEMU 6.2 `-accel kvm -cpu host`, SMP=4, this kernel and the
+probe image built on the Mac): boot suite 833/0, and `auxvprobe` (both parities), `envmax`,
+`execenv`, `exeprobe`, `altstackexec` and the three `#!` cases all pass, as under TCG. Still not
+run: an amd64 self-host build.
 
 
 ### Slice 5: mm (deferred, 2026-11-11)
