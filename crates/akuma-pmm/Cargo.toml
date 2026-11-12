@@ -22,3 +22,8 @@ spinning_top = "0.3"
 # build), which is cheap but not free, and the diagnostics only earn their cost
 # while a memory question is open. Enable with `--features pmm-instr`.
 pmm-instr = []
+# The free and CoW-event ledgers (`src/ledger.rs`): rings of recent frees and reference
+# events that the premature-free and use-after-free reports print. OFF by default: a
+# store per free and per refcount change, and ~160 KB of `.bss`, for evidence read only
+# while a memory bug is being hunted. Off, the reports say "no record".
+pmm-forensics = []

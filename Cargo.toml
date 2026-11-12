@@ -252,6 +252,11 @@ leak-instr = ["akuma-kernel-glue/leak-instr"]
 # the 2026-09-03 2 GB self-host measurement.
 pmm-instr = ["akuma-kernel-glue/pmm-instr"]
 
+# `akuma-pmm`'s free and CoW-event ledgers, which the premature-free and UAF
+# reports print a frame's history from. OFF by default (a store per free and per
+# refcount change, ~160 KB of `.bss`); build with it while a memory bug is hunted.
+pmm-forensics = ["akuma-pmm/pmm-forensics"]
+
 syscall-debug-info = [
     "akuma-syscalls/debug-info",
     "akuma-syscalls-time/debug-info",

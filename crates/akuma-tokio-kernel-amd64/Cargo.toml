@@ -20,7 +20,7 @@ no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 trace-err = ["akuma-tokio-kernel-core/trace-err"]
 # The PMM's use-after-free instruments (`akuma_boot_amd64::mem::init`'s forensics flag):
 # freed frames sit in a quarantine, a premature free and a resurrected frame are reported.
-pmm-forensics = []
+pmm-forensics = ["akuma-pmm/pmm-forensics"]
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.

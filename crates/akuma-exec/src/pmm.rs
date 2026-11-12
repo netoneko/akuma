@@ -225,7 +225,7 @@ pub fn alloc_page_zeroed() -> Option<PhysFrame> {
 
 // The reserve stays re-exported (mem.rs + process_tests). `user_readahead_budget`
 // moved out with exceptions.rs (2026-09-01), which reads `akuma_pmm::` directly.
-pub use akuma_pmm::USER_PAGE_RESERVE;
+pub use akuma_pmm::{LEDGERS, USER_PAGE_RESERVE};
 
 /// Allocate a zeroed page for a **user** demand-paging fault. Returns `None`
 /// once free PMM has fallen to [`USER_PAGE_RESERVE`], so the caller treats it

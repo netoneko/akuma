@@ -76,8 +76,9 @@ syscall-debug-info = [
 #
 # Cost, which is why it is not default: every free poisons a page and parks it
 # in a 512-entry ring instead of returning it, and the premature-free check
-# walks for a surviving mapper on every free.
-pmm-forensics = []
+# walks for a surviving mapper on every free. It also compiles in `akuma-pmm`'s free and
+# CoW-event ledgers.
+pmm-forensics = ["akuma-pmm/pmm-forensics"]
 
 # `epoll_create1`/`epoll_ctl`/`epoll_pwait`. Forwards to glue's own gate of
 # the same name — `crates/akuma-syscalls-abi`'s table names the numbers on

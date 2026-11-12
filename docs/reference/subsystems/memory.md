@@ -48,7 +48,7 @@ filed against it was a signal-return defect, not CoW
 
 ```
 0x00400000   code (.text/.data/.bss)
-brk          heap (dynamic lazy region, grows up)
+brk          heap (mapped by set_brk, in no region, grows up)
 0x0a000000   VirtIO device pages (L2[80])
 0x10000000   mmap region (grows up; jumps over kernel_va_end())
 ~0x3FFFF000  user stack (grows down; auto-sized, 128 KB at ≤256 MB)
@@ -97,7 +97,7 @@ flowchart TB
     subgraph FREEPIPE["akuma_pmm::free_page_at(pa, tid, site)"]
         DEC{"cow_ref_dec(pa)<br/>Some(n) → n-1<br/>None → 0→0, LAST ⚠ W3"}
         KEEP["count still > 0:<br/>return — frame stays"]
-        UNTRK["untrack_frame + record_free_at<br/>(FreeSite ledger, 4096-slot ring)"]
+        UNTRK["untrack_frame + record_free_at<br/>(FreeSite ledger, 4096-slot ring;<br/>compiled only with pmm-forensics)"]
         PREM["report_premature_free<br/>⚠ OFF by default (perturbs the race) —<br/>poisoning a still-mapped frame is SILENT"]
         QPUSH["quarantine_push: POISON WRITTEN HERE<br/>0xFEEDFACEDEAD0000 ^ pa, whole page<br/>no ownership/bitmap check first ⚠ W4"]
         RING["512-slot ring, parked<br/>(bitmap still says allocated)"]

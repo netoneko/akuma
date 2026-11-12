@@ -6599,7 +6599,7 @@ fn test_uaf_quarantine_instrument() {
 
     // The ledger must name the freeing context, so an anomaly report can point at
     // a caller rather than a class.
-    assert!(crate::pmm::last_free_record(pa).is_some(),
+    assert!(!crate::pmm::LEDGERS || crate::pmm::last_free_record(pa).is_some(),
         "free ledger has no record for pa={pa:#x}");
 
     // The frame is poisoned, not zeroed: a stale owner reading it sees a value it
@@ -6863,7 +6863,7 @@ fn test_fork_cow_share_incs_once_per_frame() {
 /// the history. This pins that a normal share/unshare cycle is recorded, and that
 /// the counter it mirrors still round-trips.
 fn test_cow_ref_ledger_records_history() {
-    if !crate::config::COW_REF_LEDGER {
+    if !crate::config::COW_REF_LEDGER || !crate::pmm::LEDGERS {
         console::print("[Test] cow_ref_ledger SKIPPED (ledger disabled on this profile)\n");
         return;
     }
