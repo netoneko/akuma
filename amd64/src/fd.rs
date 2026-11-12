@@ -134,6 +134,7 @@
 //! 0/1/2. [`bind_stdio`] writes the three slots directly for that reason.
 
 use akuma_exec_core::process::FileDescriptor;
+use akuma_syscalls_abi::Syscall;
 // Named by this module's doc links and by nothing else since 4b batch 2d took
 // the last `KernelFile::new` with it — every descriptor this module hands out
 // for a file is now built by `akuma-syscalls-glue`. An intra-doc link resolves
@@ -530,6 +531,62 @@ pub fn is_nonblocking(fd: u64) -> bool {
     fd < MAX_FDS as u64 && cur_table().nonblock.lock().contains(&(fd as u32))
 }
 
+/// The fd family: every descriptor call the dispatcher does not keep for
+/// itself (`write`/`writev`, for the serial console; `poll_input_event`).
+///
+/// glue-amd64's [`dispatch_call`](akuma_syscalls_glue_amd64::dispatch_call)
+/// serves it, the same entry Taoxichuan uses, after [`kernel_task`] has taken
+/// what only this kernel has. The `sys_*` functions below are this call by
+/// name, for the self-tests.
+#[must_use]
+pub fn call(c: Syscall, a: [u64; 6]) -> u64 {
+    if let Some(r) = kernel_task(c, a) {
+        return r;
+    }
+    akuma_syscalls_glue_amd64::dispatch_call(c, a).unwrap_or(errno::ENOSYS)
+}
+
+/// The x86-only fd numbers (`poll` 7, `select` 23, `dup2` 33): glue-amd64's.
+#[must_use]
+pub fn legacy(nr: u64, a: [u64; 6]) -> u64 {
+    akuma_syscalls_glue_amd64::dispatch(nr, a).unwrap_or(errno::ENOSYS)
+}
+
+/// The by-number console: an **unbound** 0/1/2 is the serial line, which glue's
+/// table-driven arms cannot see. Only a task with no process (the boot suite's)
+/// or one whose stdio is unbound reaches it; a ring-3 process has 0/1/2 bound
+/// (`SharedFdTable::with_stdio`) and goes to glue.
+fn kernel_task(c: Syscall, a: [u64; 6]) -> Option<u64> {
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    let unbound_console = |fd: u64| console_end(fd).is_some() && !is_bound(fd);
+    let no_process = || crate::usermode::current_process().is_none();
+    match c {
+        // A terminal does not seek.
+        Syscall::Pread64 if a[2] != 0 && unbound_console(a[0]) => Some(errno::ESPIPE),
+        Syscall::Fstat if no_process() && unbound_console(a[0]) => Some(console_fstat(a[1])),
+        Syscall::Newfstatat
+            if a[3] & AT_EMPTY_PATH != 0
+                && no_process()
+                && unbound_console(a[0])
+                && crate::uaccess::read_val::<u8>(a[1]) == Some(0) =>
+        {
+            Some(console_fstat(a[2]))
+        }
+        // Glue has no `TerminalState` or channel for a task with no process.
+        Syscall::Ioctl if no_process() && (console_end(a[0]).is_some() || dev_node_of(a[0]) == Some("tty")) => {
+            console_ioctl(a[1], a[2])
+        }
+        _ => None,
+    }
+}
+
+/// `fstat` of the by-number console: a character device, `crw--w----`.
+fn console_fstat(statbuf: u64) -> u64 {
+    let g = akuma_syscalls_linux::Stat { st_mode: 0o020_620, st_nlink: 1, st_blksize: 4096, ..Default::default() };
+    let x = akuma_syscalls_abi::stat::to_x86_64(&g);
+    if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT }
+}
+
 /// `fcntl(fd, cmd, arg)` — **glue's arm** (4b batch 3c).
 ///
 /// A forward, kept as a named function because ~5 sites in `usermode.rs` (the
@@ -548,7 +605,7 @@ pub fn is_nonblocking(fd: u64) -> bool {
 // Its result is informational; callers that cannot act on it ignore it.
 #[allow(clippy::must_use_candidate)]
 pub fn sys_fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
-    akuma_syscalls_glue_amd64::fcntl(fd, cmd, arg)
+    call(Syscall::Fcntl, [fd, cmd, arg, 0, 0, 0])
 }
 
 /// Copy `len` bytes in from a user pointer.
@@ -615,7 +672,7 @@ pub fn trace_user_cstr(ptr: u64) {
 /// no virtio device behind it (the NVMe root on the metal).
 /// `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "fd: the policies are glue's".
 pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
-    akuma_syscalls_glue_amd64::openat(dirfd, path, flags_, mode)
+    call(Syscall::Openat, [dirfd, path, flags_, mode, 0, 0])
 }
 
 pub use akuma_syscalls_linux::flags::open as open_flags;
@@ -630,7 +687,7 @@ pub use akuma_syscalls_linux::flags::open as open_flags;
 /// arm started at [`FIRST_FILE_FD`] — the same "lowest available includes a
 /// closed 0/1/2" move `openat` made in batch 2d.
 pub fn sys_dup(fd: u64) -> u64 {
-    akuma_syscalls_glue::fs::sys_dup(fd as u32)
+    call(Syscall::Dup, [fd, 0, 0, 0, 0, 0])
 }
 
 /// `dup2(oldfd, newfd)` — x86_64 33, the legacy spelling asm-generic dropped.
@@ -639,14 +696,6 @@ pub fn sys_dup(fd: u64) -> u64 {
 /// first. The ceiling is glue's for both kernels since 2026-11-12.
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
     akuma_syscalls_glue_amd64::dup2(oldfd, newfd)
-}
-
-/// `dup3(oldfd, newfd, flags)` — x86_64 292. **Glue's arm** (4b batch 3c),
-/// which refuses `newfd >= RLIMIT_NOFILE` with `EBADF`. `O_CLOEXEC` in `flags` is
-/// honoured by glue; the bit is not one of the four `open(2)` flags that
-/// permute, so `flags` passes through raw.
-pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
-    akuma_syscalls_glue::fs::sys_dup3(oldfd as u32, newfd as u32, flags as u32)
 }
 
 /// `pipe2(fds, flags)` — x86_64 293 — and `pipe(fds)`, which is `pipe2` with
@@ -665,7 +714,7 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
 /// counter here and is now `akuma-pipes`' own.
 /// The machine-wide `ENFILE` ceiling is glue's `pipe::MAX_PIPES`, on both kernels.
 pub fn sys_pipe2(fds: u64, flags: u64) -> u64 {
-    akuma_syscalls_glue::pipe::sys_pipe2(fds, flags as u32)
+    call(Syscall::Pipe2, [fds, flags, 0, 0, 0, 0])
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
@@ -690,7 +739,7 @@ pub fn sys_pipe2(fds: u64, flags: u64) -> u64 {
 // callers routinely do.
 #[allow(clippy::must_use_candidate)]
 pub fn sys_close(fd: u64) -> u64 {
-    akuma_syscalls_glue::fs::sys_close(fd as u32)
+    call(Syscall::Close, [fd, 0, 0, 0, 0, 0])
 }
 
 /// `read(fd, buf, len)` — **`akuma-syscalls-glue`'s arm** (4b batch 3a), with
@@ -754,10 +803,7 @@ pub fn sys_close(fd: u64) -> u64 {
 ///   arm never did.
 #[must_use]
 pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
-    if len == 0 {
-        return 0;
-    }
-    akuma_syscalls_glue_amd64::read(fd, buf, len)
+    call(Syscall::Read, [fd, buf, len, 0, 0, 0])
 }
 
 /// `pread64(fd, buf, count, offset)` — x86_64 syscall 17. **Glue's arm**,
@@ -792,14 +838,7 @@ pub fn sys_read(fd: u64, buf: u64, len: u64) -> u64 {
 /// `0xFFFF_FFFF_FFFF_FFFF` used as a `usize` index would sail past every bound
 /// check by being larger than any file.
 pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
-    if len == 0 {
-        return 0;
-    }
-    // See the header: an unbound console end, which glue cannot see.
-    if console_end(fd).is_some() && !is_bound(fd) {
-        return errno::ESPIPE;
-    }
-    akuma_syscalls_glue_amd64::pread64(fd, buf, len, offset)
+    call(Syscall::Pread64, [fd, buf, len, offset, 0, 0])
 }
 
 /// Read from a file **by inode**, with no descriptor involved.
@@ -827,7 +866,7 @@ pub fn file_bytes_by_inode(mount_id: u32, inode: u32, offset: usize, dst: &mut [
 /// pipe, a socket or a `/dev` node just as well, since glue's arm dispatches on
 /// the descriptor and not on the name of this function.
 pub fn sys_write_file(fd: u64, buf: u64, len: u64) -> u64 {
-    akuma_syscalls_glue_amd64::write(fd, buf, len)
+    call(Syscall::Write, [fd, buf, len, 0, 0, 0])
 }
 
 /// Akuma's own `poll_input_event(buf, len, timeout_us)` — a **raw** keystroke.
@@ -966,18 +1005,7 @@ fn console_has_input() -> bool {
 ///   `EBADF` — glue separates the two, where this arm's console guard could
 ///   not.
 pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    akuma_syscalls_glue::fs::sys_lseek(
-        // Truncating rather than refusing a number past `u32`: glue's own
-        // dispatch spells `args[0] as u32`, so a folded arm must decode the
-        // register the same way the AArch64 kernel does or the two disagree
-        // about which fd `lseek(0x1_0000_0003, …)` names. It resolves to
-        // nothing in either case — `EBADF`.
-        fd as u32,
-        // Signed on the wire. A negative seek from `SEEK_CUR`/`SEEK_END` is
-        // legal and must not read as an enormous unsigned offset.
-        offset.cast_signed(),
-        whence as i32,
-    )
+    call(Syscall::Lseek, [fd, offset, whence, 0, 0, 0])
 }
 
 /// `getdents64(fd, dirp, count)` — **`akuma-syscalls-glue`'s arm** (4b batch
@@ -1004,7 +1032,7 @@ pub fn sys_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
 /// dropped**: `count` is a ring-3 number and it is that function's kernel
 /// allocation. Folding must not lose a bound.
 pub fn sys_getdents64(fd: u64, dirp: u64, count: u64) -> u64 {
-    akuma_syscalls_glue::fs::sys_getdents64(fd as u32, dirp, count as usize)
+    call(Syscall::Getdents64, [fd, dirp, count, 0, 0, 0])
 }
 
 /// The size of the x86_64 `struct stat` this target writes — 144 bytes, pinned
@@ -1045,20 +1073,7 @@ const STAT_SIZE: usize = core::mem::size_of::<akuma_syscalls_abi::stat::X8664>()
 /// failed on standard output: Bad file descriptor` after writing the whole
 /// pack.
 pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
-    // This kernel's own devices are `crate::chardev`'s, reached from glue's `fstat_fill`.
-    if crate::usermode::current_process().is_none() && console_end(fd).is_some() && !is_bound(fd) {
-        // `S_IFCHR | 0620`, size 0 — the answer the old `encode_stat` gave, in
-        // the x86_64 layout the converter also produces.
-        let g = akuma_syscalls_linux::Stat {
-            st_mode: 0o020_620,
-            st_nlink: 1,
-            st_blksize: 4096,
-            ..Default::default()
-        };
-        let x = akuma_syscalls_abi::stat::to_x86_64(&g);
-        return if crate::uaccess::write_val(statbuf, x) { 0 } else { errno::EFAULT };
-    }
-    akuma_syscalls_glue_amd64::fstat(fd, statbuf)
+    call(Syscall::Fstat, [fd, statbuf, 0, 0, 0, 0])
 }
 
 /// `statfs(path, buf)` — x86_64 137, **glue's arm** (4b batch 3b).
@@ -1069,14 +1084,14 @@ pub fn sys_fstat(fd: u64, statbuf: u64) -> u64 {
 /// target's was (`proc`, `tmpfs`, `overlay`), which `df` prints as the mount's
 /// type. `busybox df` calls it once per line it read from `/proc/mounts`.
 pub fn sys_statfs(path: u64, buf: u64) -> u64 {
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::sys_statfs(path, buf))
+    call(Syscall::Statfs, [path, buf, 0, 0, 0, 0])
 }
 
 /// `fstatfs(fd, buf)` — x86_64 138, **glue's arm** (4b batch 3b). A descriptor
 /// with no path (socket, pipe, stdio) reports the root mount, which is Linux's
 /// answer for an fd on a filesystem with no name to resolve.
 pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
-    akuma_syscalls_glue::fs::sys_fstatfs(fd as u32, buf)
+    call(Syscall::Fstatfs, [fd, buf, 0, 0, 0, 0])
 }
 
 /// `newfstatat(dirfd, path, statbuf, flags)` — and, via two thin shims in the
@@ -1090,14 +1105,7 @@ pub fn sys_fstatfs(fd: u64, buf: u64) -> u64 {
 /// — `Process::cwd`-relative; `/` until a `chdir` moves it (served since
 /// 2026-09-12).
 pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
-    // `AT_EMPTY_PATH` with an empty path is `fstat(dirfd)`, which on this
-    // kernel may be one of its own devices: asked here, by one byte, before
-    // glue-amd64 (whose own `fstat` knows only glue's descriptors).
-    const AT_EMPTY_PATH: u64 = 0x1000;
-    if flags & AT_EMPTY_PATH != 0 && crate::uaccess::read_val::<u8>(path) == Some(0) {
-        return sys_fstat(dirfd, statbuf);
-    }
-    akuma_syscalls_glue_amd64::newfstatat(dirfd, path, statbuf, flags)
+    call(Syscall::Newfstatat, [dirfd, path, statbuf, flags, 0, 0])
 }
 
 /// `statx(dirfd, path, flags, mask, buf)` — x86_64 332. **Glue's arm** (4b
@@ -1107,13 +1115,7 @@ pub fn sys_newfstatat(dirfd: u64, path: u64, statbuf: u64, flags: u64) -> u64 {
 /// `ENOSYS` — which a modern coreutils `stat` and Rust's `std::fs` both reach
 /// for before falling back to `newfstatat`.
 pub fn sys_statx(dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> u64 {
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::sys_statx(
-        dirfd as i32,
-        path,
-        flags as u32,
-        mask as u32,
-        buf,
-    ))
+    call(Syscall::Statx, [dirfd, path, flags, mask, buf, 0])
 }
 
 /// `poll(fds, nfds, timeout_ms)` — x86_64 syscall 7. **Glue's `ppoll` arm**
@@ -1156,29 +1158,6 @@ pub fn sys_statx(dirfd: u64, path: u64, flags: u64, mask: u64, buf: u64) -> u64 
 /// glue's map cannot know.
 pub fn sys_poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
     akuma_syscalls_glue_amd64::poll(fds, nfds, timeout_ms)
-}
-
-/// `ppoll(fds, nfds, *timespec, sigmask, sigsetsize)` — x86_64 271. **Glue's
-/// arm**, unconverted: the `struct timespec` read is glue's own
-/// (`akuma_syscalls_time::read_timeout_us`), which is the one place in the tree
-/// that decodes a poll timeout.
-///
-/// This used to fold the `timespec` down to *milliseconds* here and call
-/// [`sys_poll`], which threw away every sub-millisecond timeout — a `ppoll` of
-/// 500 µs became 0 and returned immediately. Nanoseconds survive now.
-///
-/// The `sigmask` is still ignored, on both kernels: glue takes it as `_sigmask`.
-/// A `ppoll` that atomically swaps the signal mask for the duration of the wait
-/// is the whole reason the call exists over `poll`, and neither kernel does it.
-/// Nothing in this tree passes a non-NULL mask, so it is a pinned divergence
-/// rather than a gap being closed here.
-pub fn sys_ppoll(fds: u64, nfds: u64, timeout: u64, sigmask: u64) -> u64 {
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::poll::sys_ppoll(
-        fds,
-        nfds as usize,
-        timeout,
-        sigmask,
-    ))
 }
 
 /// `select(nfds, readfds, writefds, exceptfds, timeout)` — x86_64 23. **Glue's
@@ -1278,16 +1257,7 @@ pub fn poll_console_state(fd: u32) -> Option<akuma_syscalls_poll::readiness::FdS
 /// permission enforcement anywhere else on this target, so answering anything
 /// finer would be inventing a result. `0` if it resolves, `-ENOENT` if not.
 pub fn sys_access(path: u64) -> u64 {
-    // **Glue's `faccessat2` arm** (4b batch 3c), from the root. The dispatcher
-    // routes the real `faccessat(2)` through `to_glue` so its `dirfd` is
-    // honoured; this spelling is `access(path)` and the kernel-side callers
-    // (`proc_consistency_check`) that want "does this path resolve".
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::sys_faccessat2(
-        (-100i64) as i32,
-        path,
-        0,
-        0,
-    ))
+    call(Syscall::Faccessat, [(-100i64) as u64, path, 0, 0, 0, 0])
 }
 
 /// `ioctl(fd, request, arg)` — this target's fake tty, then **glue's arm**
@@ -1380,20 +1350,7 @@ pub fn sys_access(path: u64) -> u64 {
 ///   suite already uses for it (4b batch 2b).
 #[must_use]
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    // A process's terminal ioctls are glue's, on both kernels (2026-11-12):
-    // `ENOTTY` when fd 0/1/2 are a pipe-backed channel, the real foreground
-    // process group, `TCSETSF`'s flush, `Termios::to_wire`'s 36-byte image, and
-    // the console's framebuffer resize through `console::resize_view`. This
-    // kernel's own devices are `crate::chardev`'s, reached from the same arm.
-    // What stays here is a task with **no process** (the boot suite's), which
-    // glue cannot serve: it has no `TerminalState` and no channel of its own.
-    if crate::usermode::current_process().is_none()
-        && (console_end(fd).is_some() || dev_node_of(fd) == Some("tty"))
-        && let Some(r) = console_ioctl(req, arg)
-    {
-        return r;
-    }
-    akuma_syscalls_glue::term::sys_ioctl(fd as u32, req as u32, arg)
+    call(Syscall::Ioctl, [fd, req, arg, 0, 0, 0])
 }
 
 /// The terminal subset answered for a **process-less** task's console fds.

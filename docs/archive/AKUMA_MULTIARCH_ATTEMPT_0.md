@@ -2611,6 +2611,22 @@ session the same. An amd64 ssh session has no pty at all, before and after this 
 `linux-abi` spawn ignores the pty flag (open). Clippy: AArch64, amd64 `headless` and
 `headless,no-tests`, the amd64 tests crate, Taoxichuan, host glue/abi crates, sshd.
 
+**Routing (2026-11-12, same day).** amd64's dispatcher reaches every descriptor call except
+`write`/`writev` through `fd::call`: glue-amd64's new `dispatch_call` (its `dispatch` for a call
+already decoded), after `fd::kernel_task`. That takes four cases, all the by-number console of a
+task with no process: `pread64` `ESPIPE`, `fstat` and `fstat`-by-`AT_EMPTY_PATH` as a character
+device, and `ioctl`'s `console_ioctl`. The legacy `poll`/`select`/`dup2` go to glue-amd64's
+`dispatch` by number. `readv` lost its amd64 copy, which was glue-amd64's arm verbatim. The
+`fd.rs` `sys_*` functions stay as the self-tests' names for `fd::call`; `sys_dup3` and
+`sys_ppoll` had no other caller and are gone. `write`/`writev` keep amd64's arm for the serial
+console. They join when the console's `write` is a chardev hook.
+
+Gates: amd64 TCG suite 829/839/835 at SMP 1/2/4, 0 failed (the 835 is `spawn_test` skipping
+its four stdio checks for a child that had already exited); ring-3 harness OK; `fdlimit` from an
+ssh session identical to Linux, `fdrefuse` and the shell smoke unchanged; clippy amd64
+`headless` and `headless,no-tests`, the amd64 tests crate, Taoxichuan (which runs glue-amd64),
+host glue-amd64. The AArch64 kernel is untouched by this step.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

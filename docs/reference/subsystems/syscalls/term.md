@@ -53,7 +53,7 @@ so concurrent sessions don't alias one `input_waker` slot) — see
 [`../ssh.md`](../ssh.md) "PTY / winsize" for why sshd must therefore target
 the child's state rather than its own.
 
-**One implementation for both kernels.** amd64's `fd::sys_ioctl` sends every
+**One implementation for both kernels.** amd64's `fd::call` sends every
 process here and keeps only a kernel task with no process (which has no
 `TerminalState` or channel for glue to read); a kernel must not
 answer a process's terminal ioctl itself. A kernel whose terminal has a size of

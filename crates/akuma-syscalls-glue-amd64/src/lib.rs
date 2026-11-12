@@ -79,7 +79,13 @@ pub fn dispatch(nr: u64, a: [u64; 6]) -> Option<u64> {
     if legacy.is_some() {
         return legacy;
     }
-    let call = Syscall::from_x86_64(nr)?;
+    dispatch_call(Syscall::from_x86_64(nr)?, a)
+}
+
+/// [`dispatch`] for a call the caller has already decoded: `None` when `call`
+/// is not in the fd family. amd64's dispatcher reaches its fd arms this way.
+#[must_use]
+pub fn dispatch_call(call: Syscall, a: [u64; 6]) -> Option<u64> {
     Some(match call {
         Syscall::Openat => openat(a[0], a[1], a[2], a[3]),
         Syscall::Read => read(a[0], a[1], a[2]),

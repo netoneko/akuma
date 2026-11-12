@@ -95,18 +95,18 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         // `ppoll` uses. An interactive `busybox sh` polls its stdin on every
         // keystroke; `ENOSYS` here was a forever-loop of "sh: poll: Function
         // not implemented".
-        7 => return crate::fd::sys_poll(a1, a2, a3),
+        7 => return crate::fd::legacy(nr, [a1, a2, a3, a4, a5, a6]),
         // `select(nfds, readfds, writefds, exceptfds, timeout)` — x86_64 23.
         // asm-generic has only `pselect6`. `apk` waits for post-connect socket
         // writability through this syscall; `ENOSYS` here wedged its TLS fetch
-        // mid-handshake (see `fd::sys_select`).
-        23 => return crate::fd::sys_select(a1, a2, a3, a4, a5),
+        // mid-handshake (glue-amd64's `select`).
+        23 => return crate::fd::legacy(nr, [a1, a2, a3, a4, a5, a6]),
         // `dup2` (33) — with `pipe` (22, in the fold) the legacy halves of the
         // four calls that make a shell a shell (`pipe2`/`dup3` are the neutral
         // pair). Every one of them was `ENOSYS` until 2026-09-06, which is why
         // `cmd | cmd` reported *can't create pipe* and `echo x > file` left a
         // zero-length file. Not a fold: `dup3` refuses `old == new`.
-        33 => return crate::fd::sys_dup2(a1, a2),
+        33 => return crate::fd::legacy(nr, [a1, a2, a3, a4, a5, a6]),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
         // once the address space is copied). asm-generic has neither: `clone`
@@ -478,11 +478,11 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
     let [a1, a2, a3, a4, a5, a6] = a;
     Some(match call {
         Syscall::Write => sys_write(a1, a2, a3),
-        Syscall::Read => crate::fd::sys_read(a1, a2, a3),
+        Syscall::Read => crate::fd::call(call, a),
         // `pread64(fd, buf, count, offset)` — a read that does not move the
         // cursor. Not dispatched at all until 2026-09-07: every `pread` on this
         // target was `ENOSYS`, which `mmapsum`'s reference arm hit at offset 0.
-        Syscall::Pread64 => crate::fd::sys_pread64(a1, a2, a3, a4),
+        Syscall::Pread64 => crate::fd::call(call, a),
         // `ftruncate(fd, length)`. The linker's output file is created by
         // opening it, sizing it with this, and mapping the result; without it
         // `rust-lld` reported `cannot open output file` for a file it had
@@ -527,8 +527,8 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // forward each segment; a short write on any segment stops the walk, as
         // `writev(2)` specifies.
         Syscall::Writev => sys_writev(a1, a2, a3),
-        Syscall::Readv => sys_readv(a1, a2, a3),
-        Syscall::Openat => crate::fd::sys_openat(a1, a2, a3, a4),
+        Syscall::Readv => crate::fd::call(call, a),
+        Syscall::Openat => crate::fd::call(call, a),
         // `chdir(path)` / `fchmod(fd, mode)` / `fchmodat(dirfd, path, mode)` —
         // **glue's arms, with no preamble** (2026-09-12). All three have been
         // implemented in `akuma-syscalls-glue` since before this port existed;
@@ -564,33 +564,32 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `current_process_shared()` first.
         // A device descriptor's release (the screen, the tap, wifi0's cursor) is
         // `crate::chardev::close`, which glue's `sys_close` calls.
-        Syscall::Close => to_glue(call, [a1, 0, 0, 0, 0, 0]),
-        // `lseek(fd, offset, whence)` — **glue's arm behind one preamble**
-        // (4b batch 3a): a `/dev` character node, which Linux seeks to the
-        // offset asked for and glue answers `0`/`ESPIPE` for. Not routed
-        // through `to_glue` for that reason — see `fd::sys_lseek`.
-        Syscall::Lseek => crate::fd::sys_lseek(a1, a2, a3),
-        Syscall::Fstat => crate::fd::sys_fstat(a1, a2),
-        Syscall::Ioctl => crate::fd::sys_ioctl(a1, a2, a3),
+        Syscall::Close => crate::fd::call(call, a),
+        // Every arm that reads `crate::fd::call` is glue-amd64's `dispatch_call`
+        // after the by-number console (2026-11-12); `write`/`writev` are the
+        // descriptor calls that keep an arm of this kernel's own.
+        Syscall::Lseek => crate::fd::call(call, a),
+        Syscall::Fstat => crate::fd::call(call, a),
+        Syscall::Ioctl => crate::fd::call(call, a),
         // `getdents64(fd, dirp, count)` — x86_64 217. `ls`/`find`.
         // **Served by glue** (4b batch 3a) with no preamble at all: the record
         // layout was already `akuma_syscalls_linux::dirent` and the snapshot
         // was already `KernelFile::dir_cache`, so the two arms differed only
         // in what this one got wrong (`/dev` nodes listed as `DT_REG`, no
         // up-front validation of `dirp`).
-        Syscall::Getdents64 => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        Syscall::Fcntl => crate::fd::sys_fcntl(a1, a2, a3),
+        Syscall::Getdents64 => crate::fd::call(call, a),
+        Syscall::Fcntl => crate::fd::call(call, a),
         // `statfs(path, buf)` / `fstatfs(fd, buf)` — x86_64 137 / 138. `busybox
         // df` reads `/proc/mounts` and then calls `statfs` once per line; with
         // neither of them it printed a header and nothing else. Both report the
         // mount that actually serves the path, out of `fs.rs`'s mount table,
         // rather than one set of hardcoded numbers for the whole kernel.
-        Syscall::Statfs => crate::fd::sys_statfs(a1, a2),
-        Syscall::Fstatfs => crate::fd::sys_fstatfs(a1, a2),
-        Syscall::Newfstatat => crate::fd::sys_newfstatat(a1, a2, a3, a4),
+        Syscall::Statfs => crate::fd::call(call, a),
+        Syscall::Fstatfs => crate::fd::call(call, a),
+        Syscall::Newfstatat => crate::fd::call(call, a),
         // `statx` — arch-neutral struct, so this is glue's arm with no
         // preamble. New on this target (4b batch 3b); was `ENOSYS`.
-        Syscall::Statx => crate::fd::sys_statx(a1, a2, a3, a4, a5),
+        Syscall::Statx => crate::fd::call(call, a),
         // `faccessat(dirfd, path, mode)` — glue's arm (4b batch 3c). The old
         // shim dropped `dirfd`; glue's `sys_faccessat2` honours it.
         Syscall::Faccessat => to_glue(call, [a1, a2, a3, 0, 0, 0]),
@@ -601,10 +600,10 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `dup(fd)` — x86_64 32. `apk` dups a reopened index fd during
         // signature-verification I/O setup; `ENOSYS` here made it report
         // `UNTRUSTED signature` over a fetch that was fine (see
-        // `fd::sys_dup`; the aarch64 twin is `APK_MISSING_SYSCALLS.md`).
-        Syscall::Dup => crate::fd::sys_dup(a1),
-        Syscall::Dup3 => crate::fd::sys_dup3(a1, a2, a3),
-        Syscall::Pipe2 => crate::fd::sys_pipe2(a1, a2),
+        // glue's `sys_dup`; the aarch64 twin is `APK_MISSING_SYSCALLS.md`).
+        Syscall::Dup => crate::fd::call(call, a),
+        Syscall::Dup3 => crate::fd::call(call, a),
+        Syscall::Pipe2 => crate::fd::call(call, a),
         // `mkdirat` (258) / `unlinkat` (263) / `renameat` (264) — **served by
         // glue** (4b step 2, batch 1: the path-only `*at` family). `apk`'s
         // cache write is a named `.tmp.<pid>` file plus a rename; without
@@ -696,10 +695,10 @@ fn poll(call: Syscall, a: [u64; 6]) -> Option<u64> {
         //
         // `pselect6` is dispatched for completeness, not because anything issues
         // it: x86_64 musl's `select()` compiles its `#ifdef SYS_select` branch
-        // and sends **23** (`fd::sys_select`), where aarch64 musl has no
+        // and sends **23** (glue-amd64's `select`), where aarch64 musl has no
         // `select` number at all and sends 72. A program calling
         // `syscall(SYS_pselect6, …)` by hand used to get `ENOSYS`.
-        Syscall::Ppoll => crate::fd::sys_ppoll(a1, a2, a3, a4),
+        Syscall::Ppoll => crate::fd::call(call, a),
         Syscall::Pselect6 => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         // `epoll_create1(flags)` / `epoll_ctl(epfd, op, fd, *event)` /
         // `epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize)`

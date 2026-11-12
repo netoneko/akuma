@@ -1211,14 +1211,6 @@ fn sys_writev(fd: u64, iov: u64, cnt: u64) -> u64 {
     akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, sys_write)
 }
 
-/// `readv(fd, iov, iovcnt)` — the mirror of [`sys_writev`].
-fn sys_readv(fd: u64, iov: u64, cnt: u64) -> u64 {
-    if let Some(r) = akuma_syscalls_glue::chardev::vectored(fd as u32, false, iov, cnt) {
-        return r;
-    }
-    akuma_syscalls_glue_amd64::vectored(fd, iov, cnt, crate::fd::sys_read)
-}
-
 /// `sysinfo(2)` — memory totals for `busybox free` / `top`. The struct layout
 /// is `akuma_syscalls_linux::proc::Sysinfo` (LP64, host-tested, shared with the
 /// AArch64 kernel). `mem_unit = 1` so every `*ram` field is already in bytes;

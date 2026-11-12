@@ -11,6 +11,15 @@ effects), `akuma-syscalls-glue/src/fs.rs` (the dup/fcntl/close_range syscall
 bodies, user copies, kernel-object release), `amd64/src/fd.rs` (the boot
 task's `KERNEL_TABLE`).
 
+**The descriptor syscalls are one implementation.** The AArch64 kernel calls glue
+directly; amd64's dispatcher calls `fd::call`, which is glue-amd64's
+`dispatch_call` (the x86 ABI translation Taoxichuan also runs) after
+`fd::kernel_task`, the by-number console of a task with no process. A rule about
+descriptors goes in glue (or glue-amd64, for an x86 ABI difference), never in
+`amd64/src/fd.rs`; that file's `sys_*` functions are `fd::call` by name for the
+self-tests ([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md),
+"fd: the policies are glue's").
+
 | item | what | who calls it |
 |---|---|---|
 | `Names<D>` | fd number → description, as a `BTreeMap` newtype that derefs to the map | everyone with a read-side lock (`/proc/<pid>/fd`, spawn stdio checks, `sys_close_range`'s scan) |
