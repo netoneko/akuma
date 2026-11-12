@@ -60,18 +60,18 @@ The published numbers this feeds live in ``docs/archive/LINE_COUNT_ANALYSIS.md``
 which is a *living* document — re-measure and rewrite it in place rather than
 appending a new snapshot.
 
-The report also splits the tree by PLATFORM. The repo is two kernels — the
-AArch64 bin (``src/``) and the amd64 machine half (``crates/akuma-kernel-amd64``) — over one shared crate
-pool. Which pool a crate belongs to is derived from the
-``#[cfg(target_arch = ...)]`` attributes the lexer already parsed, never from a
-hand-kept table: a crate naming exactly one arch is arch-only, anything else is
-shared. Each kernel's "links" footprint is its bin plus its arch-only crates
-plus the shared pool; the two footprints deliberately double-count the pool, so
+The report also splits the tree by PLATFORM. The repo is one kernel package,
+``akuma`` (bin root ``src/``), built for two targets over one crate pool; the
+amd64 machine half (``crates/akuma-kernel-amd64``) is an amd64-only crate like
+any other. Which pool a crate belongs to is read from ``cargo tree`` per target,
+falling back to the ``#[cfg(target_arch = ...)]`` attributes the lexer already
+parsed, never from a hand-kept table. Each target's "links" footprint is the
+bin plus its arch-only crates plus the shared pool; the two footprints deliberately double-count the pool, so
 the gap between them is the duplication the shared-crate extraction has not yet
 absorbed.
 
 Usage:
-    scripts/cloc_akuma.py                      # defaults to src/ crates/ crates/akuma-kernel-amd64/src/ taoxichuan/src/
+    scripts/cloc_akuma.py                      # defaults to src/ crates/ taoxichuan/src/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
     scripts/cloc_akuma.py --all-languages      # also C, asm, shell, TOML, Markdown, ...
@@ -1418,15 +1418,16 @@ def cargo_tree(pkg: str, triple: str, features: str = "", default: bool = True):
     return sorted(seen)
 
 
-#: manifest -> (cargo package, target triple) for the kernels `linked_crates` can ask cargo about.
+#: manifest -> cargo package, for the kernels `linked_crates` can ask cargo about. The root
+#: `akuma` package is both kernels (one package, two targets, since 2026-11-12), so the
+#: target triple is the caller's.
 KERNEL_PACKAGES = {
-    "Cargo.toml": ("akuma", "aarch64-unknown-none"),
-    os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"): ("akuma", "x86_64-unknown-none"),
-    os.path.join("taoxichuan", "Cargo.toml"): ("taoxichuan", "x86_64-unknown-none"),
+    "Cargo.toml": "akuma",
+    os.path.join("taoxichuan", "Cargo.toml"): "taoxichuan",
 }
 
 
-def linked_crates(root_manifest: str) -> set:
+def linked_crates(root_manifest: str, triple: str = "x86_64-unknown-none") -> set:
     """Workspace crate directories a kernel links, as repo-relative paths (the
     kernel's own dir excluded).
 
@@ -1438,7 +1439,7 @@ def linked_crates(root_manifest: str) -> set:
     """
     kp = KERNEL_PACKAGES.get(root_manifest)
     if kp:
-        tree = cargo_tree(*kp)
+        tree = cargo_tree(kp, triple)
         if tree:
             root = os.path.abspath(".")
             own = os.path.abspath(os.path.dirname(root_manifest))
@@ -1461,10 +1462,10 @@ def linked_crates(root_manifest: str) -> set:
 def platform_buckets(files: list) -> dict:
     """Group every component into a platform bucket, derived from the source.
 
-    The tree is two kernels over one shared crate pool: `src/` is the AArch64
-    bin (root `Cargo.toml`), `crates/akuma-kernel-amd64` is the amd64 machine half, `crates/` serve
-    whichever kernels link them. Which kernel links a crate is read from the
-    Cargo dependency graph (path dependencies, transitively):
+    The tree is one kernel package (`akuma`, root `Cargo.toml`, bin root `src/`)
+    built for two targets over one crate pool; `src/` is in both images, so it is
+    its own bucket and counts toward both footprints. Which target links a crate
+    is read from `cargo tree` for each triple:
 
       linked by both kernels — shared
       linked by only amd64   — amd64-only
@@ -1483,18 +1484,14 @@ def platform_buckets(files: list) -> dict:
     for fc in files:
         comp_arches.setdefault(component_of(fc.path), set()).update(fc.arches)
 
-    a64 = linked_crates("Cargo.toml")
-    x64 = linked_crates(os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"))
+    a64 = linked_crates("Cargo.toml", "aarch64-unknown-none")
+    x64 = linked_crates("Cargo.toml", "x86_64-unknown-none")
     have_graph = bool(a64 or x64)
 
     buckets: dict = {}
     for comp, arches in comp_arches.items():
         if comp == "src" or comp.startswith("src" + os.sep):
-            buckets.setdefault("aarch64 bin", []).append(comp)
-        # The machine half moved from `amd64/` to `crates/akuma-kernel-amd64` (2026-11-12);
-        # it stays in this bucket so reports compare across the move.
-        elif comp == os.path.join("crates", "akuma-kernel-amd64"):
-            buckets.setdefault("amd64 bin", []).append(comp)
+            buckets.setdefault("kernel bin", []).append(comp)
         elif comp == "taoxichuan" or comp.startswith("taoxichuan" + os.sep):
             buckets.setdefault("taoxichuan bin", []).append(comp)
         elif have_graph and comp in a64 and comp in x64:
@@ -1545,7 +1542,7 @@ def print_platform_report(files: list, W: int) -> None:
         f"{'unsafe':>8}{'enforced':>10}"
     )
     print(rule(W))
-    order = ("aarch64 bin", "amd64 bin", "taoxichuan bin", "aarch64-only crates",
+    order = ("kernel bin", "taoxichuan bin", "aarch64-only crates",
              "amd64-only crates", "shared crates")
     for name in order:
         if name not in by_bucket:
@@ -1559,8 +1556,8 @@ def print_platform_report(files: list, W: int) -> None:
     print(rule(W))
 
     for label, bin_key, only_key in (
-        ("aarch64 kernel links", "aarch64 bin", "aarch64-only crates"),
-        ("amd64 kernel links", "amd64 bin", "amd64-only crates"),
+        ("aarch64 kernel links", "kernel bin", "aarch64-only crates"),
+        ("amd64 kernel links", "kernel bin", "amd64-only crates"),
     ):
         parts = [by_bucket[k] for k in (bin_key, only_key, "shared crates") if k in by_bucket]
         if not parts:
@@ -1574,7 +1571,7 @@ def print_platform_report(files: list, W: int) -> None:
     # its footprint is its own source plus the closure of its path dependencies, which sit in
     # whichever bucket above they belong to, so it cannot be a sum of buckets.
     if "taoxichuan bin" in by_bucket:
-        linked = linked_crates(os.path.join("taoxichuan", "Cargo.toml"))
+        linked = linked_crates(os.path.join("taoxichuan", "Cargo.toml"), "x86_64-unknown-none")
         tx = Agg()
         tx.merge(by_bucket["taoxichuan bin"])
         n_crates = 0
@@ -1604,7 +1601,7 @@ def print_platform_report(files: list, W: int) -> None:
 #: --filter-platform` resolves target-specific dependencies against.
 EXTERNAL_KERNELS = {
     "aarch64": ("Cargo.toml", "aarch64-unknown-none"),
-    "amd64": (os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"), "x86_64-unknown-none"),
+    "amd64": ("Cargo.toml", "x86_64-unknown-none"),
     "taoxichuan": (os.path.join("taoxichuan", "Cargo.toml"), "x86_64-unknown-none"),
 }
 
@@ -1620,7 +1617,7 @@ def external_closure(manifest: str, triple: str):
     Returns None if cargo cannot answer.
     """
     kp = KERNEL_PACKAGES.get(manifest)
-    tree = cargo_tree(kp[0], triple) if kp else None
+    tree = cargo_tree(kp, triple) if kp else None
     if tree is None:
         return None
     try:
@@ -1710,8 +1707,7 @@ AUDIT_KERNELS = {
                          "x86_64-unknown-none", "no-tests", True),
     "taoxichuan-aarch64": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
                            "aarch64-unknown-none", "no-tests", True),
-    "akuma-amd64": (os.path.join("crates", "akuma-kernel-amd64", "Cargo.toml"), "akuma",
-                    "x86_64-unknown-none", "no-tests", True),
+    "akuma-amd64": ("Cargo.toml", "akuma", "x86_64-unknown-none", "no-tests", True),
     "akuma-aarch64": ("Cargo.toml", "akuma", "aarch64-unknown-none", "no-tests", True),
 }
 
@@ -1721,6 +1717,7 @@ AUDIT_KERNELS = {
 #: once for both. `--audit taoxichuan` means both tracks.
 AUDIT_TRACKS = {
     "taoxichuan": ("taoxichuan-amd64", "taoxichuan-aarch64"),
+    "akuma": ("akuma-amd64", "akuma-aarch64"),
 }
 
 
