@@ -159,16 +159,11 @@ pub struct UserCtx {
     /// keeps its own per-CPU block in the other half of that pair (`smp.rs`),
     /// so the program's value can never be written to `IA32_GS_BASE` directly.
     pub gs_base: u64,
-    /// This task's `thread::THREADS` slot, or [`crate::thread::NO_THREAD`] if
-    /// it is a process's main thread. Offset 152 — past everything the
-    /// assembly indexes, like `proc_slot` and for the same reason.
-    ///
-    /// This is what lets every `clone` child share **one** entry function, and
-    /// since 2026-09-06 `proc_slot` above does the same job for processes —
-    /// `usermode::proc_entry` replaced sixteen hand-written trampolines that
-    /// existed only because a process index had nowhere to live but the `fn`
-    /// pointer. Both indices are seeded before the task is published.
-    pub thread_slot: usize,
+    /// Unused; keeps the offsets below it where `syscall_entry` indexes them
+    /// (`exec_pending` at 168). It was `thread_slot`, a task's row in the
+    /// thread table that the process table replaced (2026-11-12): whether a
+    /// task is a thread is `pid != tgid` of its `Process`.
+    pub reserved_152: usize,
     /// Non-zero when this task's **first** ring-3 entry must resume with the
     /// parent's full register set (`enter_user_mode_forked`) rather than at a
     /// fresh `_start`. Offset 160 — not indexed by assembly.
@@ -291,7 +286,7 @@ impl UserCtx {
             fs_base: 0,
             saved_regs: [0; 12],
             gs_base: 0,
-            thread_slot: crate::thread::NO_THREAD,
+            reserved_152: 0,
             forked: 0,
             exec_pending: 0,
             user_rflags: 0,
@@ -2252,17 +2247,16 @@ pub fn enter_ring3(first: &UserContext) -> ! {
     // `crate::thread::run_thread` is the other teardown: zero
     // `clear_child_tid` and wake one futex waiter on it (which is
     // `pthread_join`), purge the futex table of this task, drop its identity
-    // row. The distinction is `UserCtx::thread_slot`, seeded by
-    // `thread::bind_clone_child` before the task was published — the same field
-    // `thread_entry` has always read, reached one function earlier.
-    let tslot = crate::thread::current_thread_slot();
-    if tslot != crate::thread::NO_THREAD {
-        crate::thread::run_thread(tslot, first)
+    // row. The distinction is the `Process` itself: a thread's has its own pid
+    // and the leader's `tgid`, and `clone_thread` registered it before the task
+    // was published.
+    if !crate::thread::current_is_main() {
+        crate::thread::run_thread(first)
     }
-    run_process(idx, first)
+    run_process(first)
 }
 
-/// Enter ring 3 for process slot `idx` at `first`, then mark the task finished.
+/// Enter ring 3 at `first` as a process's main thread, then mark the task finished.
 ///
 /// The scheduler has already installed this task's address space by the time
 /// this runs — `spawn_in_space_unpublished` recorded the root, and `yield_now`
@@ -2278,7 +2272,7 @@ pub fn enter_ring3(first: &UserContext) -> ! {
 /// rewrite them in between: this task has not executed a user instruction yet,
 /// so it cannot have `execve`d, and no other task writes another process's
 /// image).
-fn run_process(idx: usize, first: &UserContext) -> ! {
+fn run_process(first: &UserContext) -> ! {
     // A `fork` child's first entry re-enters ring 3 at the parent's post-`fork`
     // instruction with the parent's full register set. Read once, and spent by
     // that entry.
@@ -2314,8 +2308,8 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     if let Some(p) = current_process() {
         akuma_exec::process::hold_exited_thread_slot(p.pid, crate::sched::current_task());
     }
-    // Every pid in this thread group, captured **before** `thread::drain` can
-    // retire the threads' rows. Each thread has a pid of its own here, and a
+    // Every pid in this thread group, captured **before** `thread::drain` lets
+    // the threads unregister themselves. Each thread has a pid of its own here, and a
     // child records the *spawning thread's* pid as its parent, so a
     // multi-threaded process's children are mostly its workers' children (kot's
     // tokio workers running `sh -c`). `finish_process` reparents all of them
@@ -2327,7 +2321,9 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // running in that space would be walking freed page tables. This is the
     // only place that ordering can be enforced: the reaper is another process
     // and has no idea threads exist.
-    crate::thread::drain(idx);
+    if let Some(p) = current_process() {
+        crate::thread::drain(p.tgid);
+    }
     // Writable `MAP_SHARED` file mappings get `munmap`'s treatment before the
     // address space is dropped: written back, and released from the shared
     // writable page table. After the drain, so no sibling can fault a page
@@ -3202,7 +3198,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         Ok(r) => r,
         Err(r) => return r,
     };
-    akuma_syscalls_glue::execve::run(&Amd64Exec { slot, entered: core::cell::Cell::new((0, 0, 0)) }, req)
+    akuma_syscalls_glue::execve::run(&Amd64Exec { entered: core::cell::Cell::new((0, 0, 0)) }, req)
 }
 
 /// This kernel's half of `execve`; the rest is glue's `execve::run`, shared
@@ -3213,8 +3209,6 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
 /// `UserCtx::exec_pending` and returns 0, and `.Lexec_return` zeroes the
 /// register file and `sysret`s to the new entry.
 struct Amd64Exec {
-    /// The calling task's process slot, which a `#!` hop does not change.
-    slot: usize,
     /// `(entry, stack, CR3 root)` of the installed image, from `install` to `enter`.
     entered: core::cell::Cell<(u64, u64, u64)>,
 }
@@ -3251,13 +3245,14 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
     fn stop_siblings(&self) {
         // `drain` sets the group-exit flag, wakes every sibling so a parked
         // `FUTEX_WAIT` does not wait out the scheduler backstop, and spins
-        // (bounded) until none is live. Only from the main thread: `THREADS`
-        // holds non-main threads, so a non-leader caller would wait its full
-        // budget for itself. POSIX makes that caller the leader; this target has
-        // no leader transfer, and says so.
-        if crate::thread::current_is_main() {
-            crate::thread::drain(self.slot);
-        } else if crate::thread::live_count(self.slot) > 1 {
+        // (bounded) until none is live. Only from the main thread: the drain
+        // counts the group's non-leader threads, so a non-leader caller would
+        // wait its full budget for itself. POSIX makes that caller the leader;
+        // this target has no leader transfer, and says so.
+        let Some(p) = current_process() else { return };
+        if p.pid == p.tgid {
+            crate::thread::drain(p.tgid);
+        } else if crate::thread::live_count(p.tgid) > 1 {
             serial::puts("  [execve] from a non-leader thread with live siblings; \
                           they are not killed (no leader transfer on this target)\n");
         }
@@ -3478,14 +3473,12 @@ pub fn bind_child_task(
     // is the target's per-*process* exit record, and one written for a thread
     // would make the exit path publish an exit status — a `wait4` in the
     // parent would reap a process that is still running. What a thread needs
-    // instead is a `THREADS` row and a `UserCtx::thread_slot`; see
-    // `crate::thread::bind_clone_child` for the four questions that answers.
+    // is only its parent's `proc_slot`, which routes its fds the same way; its
+    // identity, its group and its `clear_child_tid` are its registered
+    // `Process` (`crate::thread`'s "the process table is the thread list").
     if kind == akuma_exec::process::ChildKind::Thread {
-        return crate::thread::bind_clone_child(
-            task_slot,
-            current_proc_slot(),
-            child.clear_child_tid.load(Ordering::Relaxed),
-        );
+        crate::sched::seed_proc_slot(task_slot, current_proc_slot());
+        return Ok(());
     }
 
     // No group state to clear here either: a `fork` child's `SharedSignalTable`
@@ -3515,24 +3508,7 @@ pub fn bind_child_task(
 
     // Under the BKL, and the task is unpublished.
     SPAWN.set(slot - SPAWN_SLOT_BASE, Spawn { pid: child.pid, exec_slot: task_slot });
-    // `seed_proc_slot` alone leaves `UserCtx::thread_slot` untouched. Every
-    // OTHER caller of this task-slot claim is a `fork`/`vfork`/`clone` child
-    // reached through `spawn_user_thread_initializing`'s two-phase claim,
-    // which never hands out a slot a `clone` thread is still occupying — the
-    // pool's own bookkeeping keeps those two kinds of slot apart in practice.
-    // `spawn_ext` is the first caller that claims a slot through the
-    // *one-phase* `spawn_user_thread_fn_for_process` primitive instead, which
-    // has no `bind_child_task`-shaped seed step of its own at all, so this is
-    // the only place anything for this target resets `thread_slot` for a
-    // process bind. Left stale, a recycled slot's old `clone` value would send
-    // `enter_ring3` down the `crate::thread::run_thread` branch for a plain
-    // process. Added alongside the `spawn.rs` lock-ordering fix
-    // (`docs/archive/AKUMA_AMD64_BOX_SPAWN_EXT.md`) that actually resolved the
-    // silent full-VM crash `spawn_ext` hit before both landed — this line's
-    // own effect was not isolated from that one, so treat it as a real
-    // correctness fix (a process is never a thread) rather than a proven
-    // independent cause.
-    crate::sched::seed_thread_slots(task_slot, slot, crate::thread::NO_THREAD);
+    crate::sched::seed_proc_slot(task_slot, slot);
     Ok(())
 }
 

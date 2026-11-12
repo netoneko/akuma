@@ -208,6 +208,18 @@ no handler can catch). `execve` ends the exit it began to stop its siblings
 recycled and the state outlives its process
 ([`../../../archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`](../../../archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md)).
 
+**A group's threads are the process table's rows with its `tgid`.** Every `CLONE_THREAD`
+thread is a registered `Process` (own pid, the leader's `tgid`), so "which threads are still
+running" is `akuma_exec::process::for_each_live_group_thread` / `live_group_threads` (members
+other than the leader whose `THREAD_PID_MAP` slot is live), and "is this task a thread" is
+`pid != tgid`. A leader's exit marks the group exiting **first** and counts after, and
+`clone_thread` refuses a new thread once the group is exiting (`GROUP_EXITING`, `EAGAIN`), so no
+thread can join after the leader's drain has counted to zero and its address space is freed. A
+thread's `clear_child_tid` is its `Process`'s (set by `CLONE_CHILD_CLEARTID`, moved by
+`set_tid_address`). Never keep a second thread list beside the table: amd64's slot-keyed one
+outlived its threads and made the next process drain threads it never had
+([`../../../../proposals/AKUMA_ONE_EXIT.md`](../../../../proposals/AKUMA_ONE_EXIT.md) step 3).
+
 Gates: `userspace/forktest/c_stress/killtree.c` (on both arches, through
 `ssh`) and the amd64 boot check `usermode::kill_test`
 (`userspace/amd64/killprobe`).

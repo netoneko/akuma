@@ -3555,6 +3555,11 @@ pub fn reread_clone_handoff(snap: &CloneSnapshot) -> Option<(u64, u64)> {
     Some(words.into())
 }
 
+/// [`clone_thread`]'s refusal when the caller's group is exiting: no new thread may join
+/// a group whose leader is draining it. Glue maps it to `EAGAIN`; the caller is about to
+/// leave anyway.
+pub const GROUP_EXITING: &str = "clone_thread: thread group is exiting";
+
 /// Clone a thread within the same process (CLONE_THREAD | CLONE_VM).
 /// The child shares the parent's address space and file descriptors.
 ///
@@ -3629,6 +3634,16 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
 
     let parent_tid = crate::threading::current_thread_id();
     let parent_ctx = crate::threading::get_saved_user_context(parent_tid).ok_or("No saved context")?;
+
+    // **No thread joins a group that is exiting.** Its leader is draining the group's threads
+    // (counted off this table, `table::for_each_live_group_thread`) before the address space
+    // is freed; a thread registered after the drain's last count would run in a freed space.
+    // The drain marks the group first and counts after, and this check sits under the same
+    // serialization as the register below, so every thread either is refused here or is
+    // counted. Linux refuses the same way (`copy_process` on a pending fatal signal).
+    if parent.signal_actions.group_exiting() {
+        return Err(GROUP_EXITING);
+    }
 
     let mut child_ctx = parent_ctx;
     child_ctx.set_child_return_zero();

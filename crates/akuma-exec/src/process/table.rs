@@ -375,6 +375,64 @@ pub fn group_cpu_time_us(tgid: Pid) -> u64 {
     total
 }
 
+/// Call `f(pid, tid)` for every thread of `tgid`'s group **other than its leader** that still
+/// holds a live thread slot, and return how many there were.
+///
+/// A group is the set of table rows sharing a `tgid`; a `CLONE_THREAD` thread is its own row
+/// with its own pid. Its slot is resolved through `THREAD_PID_MAP` (the authority, see
+/// [`thread_for_pid`]) and must be live: a row whose thread was hard-terminated, or that is
+/// between `thread_pid_map_remove` and `unregister_process` on its way out, runs no more user
+/// code in the group's address space and is not counted.
+///
+/// This is what a leader's exit waits on before its address space can be freed: the process
+/// table *is* the thread list, so a kernel needs no table of its own beside it
+/// (`proposals/AKUMA_ONE_EXIT.md` step 3).
+///
+/// Allocation-free (two stack buffers, about 4 KiB) and `f` runs with no lock held, so it may
+/// wake or interrupt the thread it is handed.
+pub fn for_each_live_group_thread<F: FnMut(Pid, usize)>(tgid: Pid, mut f: F) -> usize {
+    let mut pids = [0 as Pid; MAX_PROCESSES];
+    let mut n = 0usize;
+    PROCESS_TABLE.for_each_active(|_, p| {
+        if p.tgid == tgid && p.pid != tgid && n < MAX_PROCESSES {
+            pids[n] = p.pid;
+            n += 1;
+        }
+    });
+    if n == 0 {
+        return 0;
+    }
+    let pids = &mut pids[..n];
+    pids.sort_unstable();
+    // One pass over the map rather than a `thread_for_pid` scan per member: the caller drains
+    // in a loop, and a group can be a hundred threads.
+    let mut found = [(0 as Pid, 0usize); MAX_PROCESSES];
+    let mut m = 0usize;
+    with_irqs_disabled(|| {
+        for (&tid, &owner) in THREAD_PID_MAP.lock().iter() {
+            if m < MAX_PROCESSES && pids.binary_search(&owner).is_ok() {
+                found[m] = (owner, tid);
+                m += 1;
+            }
+        }
+    });
+    let mut live = 0usize;
+    for &(pid, tid) in &found[..m] {
+        if crate::threading::slot_is_live(tid) {
+            live += 1;
+            f(pid, tid);
+        }
+    }
+    live
+}
+
+/// How many threads of `tgid`'s group other than its leader are still live; see
+/// [`for_each_live_group_thread`].
+#[must_use]
+pub fn live_group_threads(tgid: Pid) -> usize {
+    for_each_live_group_thread(tgid, |_, _| {})
+}
+
 /// Iterate all active processes, calling `f` for each. Returns early if `f` returns Some.
 ///
 /// Runs entirely with IRQs disabled — the callback MUST NOT allocate.

@@ -2886,7 +2886,7 @@ pub fn thread_test(t: &mut Suite) {
     // finishes, so a non-zero count here means that drain is not working —
     // which is the use-after-free of a page table that `k::thread`'s
     // lifetime rule exists to prevent, seen before it can happen.
-    t.check_eq("thread: no thread outlived the process", k::thread::live_count(5) as u64, 0);
+    t.check_eq("thread: no thread outlived the process", k::thread::live_count(started.0) as u64, 0);
 
     finish_test_process(started.0, started.1);
     t.check_eq(
@@ -2912,7 +2912,7 @@ pub fn thread_test(t: &mut Suite) {
 ///   did not move. The old path's grace expiry hard-marked every sibling
 ///   from the killer's core, and a thread so marked never runs
 ///   `thread::teardown`;
-/// * **every `THREADS` row is back** (`live_count == 0`) — the rows the old
+/// * **every thread is gone** (`live_count == 0`) — the threads the old
 ///   path leaked, and that made the next process in the slot spin out
 ///   `DRAIN INCOMPLETE`;
 /// * **the status is a SIGKILL death** (`-9`), stamped by the leader's own
@@ -2946,11 +2946,11 @@ pub fn kill_test(t: &mut Suite) {
     // Let it reach the state: three workers registered, then a few hundred
     // more rounds so the parkers are parked and the spinner has been ticked.
     let mut spins = 0u64;
-    while k::thread::live_count(SLOT) < WORKERS && spins < 200_000 {
+    while k::thread::live_count(pid) < WORKERS && spins < 200_000 {
         spins += 1;
         k::sched::yield_now();
     }
-    t.check_eq("kill: the probe's threads came up", k::thread::live_count(SLOT) as u64, WORKERS as u64);
+    t.check_eq("kill: the probe's threads came up", k::thread::live_count(pid) as u64, WORKERS as u64);
     for _ in 0..500 {
         k::sched::yield_now();
     }
@@ -2972,7 +2972,7 @@ pub fn kill_test(t: &mut Suite) {
     t.check("kill: the group was gone within a second", took_us < 1_000_000);
     t.check_eq("kill: no thread was terminated by a peer",
         akuma_threading::cross_thread_terminations() as u64, cross_before as u64);
-    t.check_eq("kill: every thread row came back", k::thread::live_count(SLOT) as u64, 0);
+    t.check_eq("kill: every thread came down", k::thread::live_count(pid) as u64, 0);
     t.check_eq("kill: the status is a SIGKILL death", status, SIGKILL_STATUS);
     // A `kill(2)` at a dead pid: the row is a zombie until reaped, which is
     // still "exists" (0) — by pid and by its process group (Linux keeps a

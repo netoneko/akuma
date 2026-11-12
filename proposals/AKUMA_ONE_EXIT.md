@@ -21,7 +21,16 @@ amd64 and all-pass on AArch64. The 3 `DRAIN INCOMPLETE` lines after `lifeprobe`'
 (a stale `THREADS` row in the dead process's slot) appear on the step-1 kernel too; step 3
 removes the table they come from.
 
-Steps 3-4 not started.
+Step 3 done (2026-11-12): amd64's `THREADS` table is gone. A group's live threads are the
+process table's rows with its `tgid` and a live `THREAD_PID_MAP` slot
+(`akuma_exec::process::{for_each_live_group_thread, live_group_threads}`); "is this task a
+thread" is `pid != tgid`; a thread's exit clears its `Process`'s `clear_child_tid`.
+`clone_thread` refuses a thread once the group is exiting (`GROUP_EXITING`), and `drain` marks
+before it counts, so no thread joins after the count reaches zero. `UserCtx::thread_slot` is a
+reserved word (the assembly's offsets past it are fixed). Gates: amd64 suite 826/836/832,
+AArch64 312/320/318, both equal to step 2.
+
+Step 4 not started.
 
 ### What step 1 found
 

@@ -51,75 +51,27 @@
 //! use-after-free of a page table. [`live_count`] is what closes that: the main
 //! thread's exit path drains it to zero before it finishes, so by the time
 //! anything can reap, no task holds that `space_root`.
-
-use spinning_top::Spinlock;
+//!
+//! # The process table is the thread list
+//!
+//! Every thread is a registered `Process` (its own pid, `tgid` = the leader's),
+//! so "the group's threads" is a walk of the process table by `tgid`
+//! (`akuma_exec::process::for_each_live_group_thread`), and "is this task a
+//! thread" is `pid != tgid`. Until 2026-11-12 this file kept a second list, a
+//! 448-row `THREADS` table keyed by process slot, and every way the two
+//! disagreed was a bug: a row left standing by a thread that never ran
+//! [`teardown`] made the next process in that slot drain threads it never had
+//! (`DRAIN INCOMPLETE` after `lifeprobe`'s `SIGKILL`). The AArch64 kernel never
+//! had one (`proposals/AKUMA_ONE_EXIT.md` step 3).
 
 use crate::fd::errno;
 use crate::serial;
-
-/// Threads in flight, across all processes.
-///
-/// A fixed array, not a `Vec`: this is per-thread kernel state on a path that
-/// runs under memory pressure, and the ceiling wants to be a refusal
-/// (`EAGAIN`, which is what `pthread_create` already reports) rather than an
-/// allocation that can fail.
-///
-/// **Was 64 until 2026-10-08**, with the note that it was "well past what the
-/// scheduler's own `MAX_TASKS` budget makes useful". It was not: `MAX_TASKS`
-/// is 512, and one headless Chromium session is a browser with ~20 threads
-/// plus a dozen GPU/utility/renderer processes of 5–7 each. The 65th thread
-/// system-wide got `EAGAIN` from `clone`, the GPU process turned that into a
-/// `CHECK` (`[Fault] #BP`) five times over and the browser gave up ("GPU
-/// process isn't usable"). The `[sc!]` trace never showed it, because it
-/// leaves `EAGAIN` out on purpose; the `[clone] thread table full` serial
-/// line is the tell. The table is now sized to the task budget it draws
-/// from, less headroom for the main threads: an entry is three words, so
-/// this costs about 14 KiB of `.bss`. Every thread still costs a task slot
-/// and two 32 KiB kernel stacks, which is the ceiling that remains. Gate:
-/// `thrprobe.c` (8 processes × 12 threads alive together).
-pub const MAX_THREADS: usize = 448;
-
-/// "This task is not a thread." `UserCtx::thread_slot`'s resting value.
-pub const NO_THREAD: usize = usize::MAX;
-
-/// One live non-main thread.
-#[derive(Clone, Copy)]
-struct Thread {
-    /// Scheduler task slot. The identity a futex wake reaches.
-    task: usize,
-    /// The process slot whose address space this thread runs in — shared with
-    /// its process, which is what makes fd 0/1/2 route the same way.
-    proc_slot: usize,
-    /// `CLONE_CHILD_CLEARTID`'s address, or 0. On exit the kernel zeroes this
-    /// word and wakes one futex waiter on it — which is precisely how
-    /// `pthread_join` learns the thread is gone, and the reason a `join` that
-    /// never returns is the classic symptom of getting this wrong.
-    clear_child_tid: u64,
-}
-
-/// The thread table. It was `static mut` "under the BKL — the discipline
-/// `usermode::PROCS` had", an unchecked claim; a `Spinlock` makes it a fact. The
-/// guard is held only for a lookup or an edit, **never across a call into
-/// another subsystem**: the scans below copy a row out (`Thread` is `Copy`),
-/// drop the guard, and only then ask the process table or the scheduler about it.
-static THREADS: Spinlock<[Option<Thread>; MAX_THREADS]> = Spinlock::new([None; MAX_THREADS]);
-
-/// Row `i`, copied out, or `None` for a free row.
-fn thread_row(i: usize) -> Option<Thread> {
-    THREADS.lock()[i]
-}
 
 /// The calling thread's group: its `SharedSignalTable`, which `clone_thread` shares across the
 /// thread group and `fork`/`spawn` make fresh. The group's exit state lives there (Linux's
 /// `signal_struct`), so it is the group's by construction rather than a process slot's.
 fn group() -> Option<&'static akuma_exec::process::SharedSignalTable> {
     akuma_exec::process::current_process_shared().map(|p| &*p.signal_actions)
-}
-
-/// Has the calling thread's group been asked to exit as a whole?
-#[must_use]
-pub fn group_exiting() -> bool {
-    group().is_some_and(akuma_exec::process::SharedSignalTable::group_exiting)
 }
 
 /// Mark the calling thread's whole group for exit, so its siblings leave ring 3 at their next
@@ -183,22 +135,20 @@ pub fn exit_group_from_thread(tgid: u32, code: u64) {
     }
 }
 
-/// How many non-main threads of `proc_slot` are still alive.
+/// How many threads of `tgid`'s group other than its leader are still alive.
 #[must_use]
-pub fn live_count(proc_slot: usize) -> usize {
-    THREADS
-        .lock()
-        .iter()
-        .filter(|t| t.as_ref().is_some_and(|t| t.proc_slot == proc_slot))
-        .count()
+pub fn live_count(tgid: u32) -> usize {
+    akuma_exec::process::live_group_threads(tgid)
 }
 
 /// Is the running task a process's main thread (as opposed to a `clone` child)?
 ///
-/// The one question `exit` has to answer differently from `exit_group`.
+/// The one question `exit` has to answer differently from `exit_group`. A thread's
+/// `Process` has its own pid and the leader's `tgid`; a task running no process is
+/// nobody's thread.
 #[must_use]
 pub fn current_is_main() -> bool {
-    current_thread_slot() == NO_THREAD
+    akuma_exec::process::current_process_shared().is_none_or(|p| p.pid == p.tgid)
 }
 
 /// A non-main thread whose group has been told to exit should leave ring 3 at
@@ -213,15 +163,8 @@ pub fn current_is_main() -> bool {
 /// the backstop for anything else that goes wrong on the way out.
 #[must_use]
 pub fn should_leave_now() -> bool {
-    if current_is_main() {
-        return false;
-    }
-    group_exiting()
-}
-
-pub fn current_thread_slot() -> usize {
-    // Under the BKL; the running task's `UserCtx`.
-    crate::sched::read_current_uctx(|u| u.thread_slot).unwrap_or(NO_THREAD)
+    akuma_exec::process::current_process_shared()
+        .is_some_and(|p| p.pid != p.tgid && p.signal_actions.group_exiting())
 }
 
 /// `clone(flags, child_stack, parent_tid, child_tid, tls)` — x86_64 56, the
@@ -249,66 +192,13 @@ pub fn sys_clone_thread(
 ) -> u64 {
     // A task that is not running a registered process has no thread group to
     // join. `current_proc_slot` answering `usize::MAX` is how that shows up,
-    // and `bind_clone_child` would have nothing to key its row on.
+    // and the child would have no fd routing to share.
     if crate::usermode::current_proc_slot() >= crate::usermode::PROC_SLOTS {
         return errno::ENOSYS;
     }
 
     // asm-generic order: `(flags, stack, parent_tid, tls, child_tid)`.
     akuma_syscalls_glue::proc::clone_thread(flags, child_stack, parent_tid, tls, child_tid)
-}
-
-/// **The `ChildKind::Thread` half of `ExecRuntime::bind_child_task`** — give a
-/// child the shared `clone_thread` just spawned its `THREADS` row and its
-/// `UserCtx::thread_slot`, so this file's four thread questions can be asked of
-/// it.
-///
-/// Those four are the whole reason the row exists, and each is silent if the
-/// row is missing:
-///
-/// * [`current_tid`] — `gettid`, which musl caches in `pthread_self()->tid` and
-///   `tkill`s. Without a row a thread answers its *process's* pid, so a
-///   `tkill(self->tid, …)` addresses the main thread.
-/// * [`current_is_main`] — the one question `exit` answers differently from
-///   `exit_group`. Without a row every thread claims to be the main one and its
-///   `exit()` tears the whole process down.
-/// * [`live_count`] / [`drain`] — a process's exit waits for its threads. A
-///   thread with no row is invisible to that wait, and the reaper frees an
-///   address space a live thread is standing in.
-/// * [`teardown`] — `clear_child_tid` and its futex wake, i.e. `pthread_join`.
-///
-/// # `tid` is the kernel thread slot, which is a change on this target
-///
-/// See [`Thread::tid`]'s own note. Storing anything else here would make
-/// `gettid` disagree with what `clone` returned.
-///
-/// # `clear_child_tid` comes off the `Process`, not off the flags
-///
-/// `clone_thread` has already applied the `CLONE_CHILD_CLEARTID` rule —
-/// `InheritOverrides::clear_child_tid` is `child_tid_ptr` only when the flag is
-/// set, and 0 otherwise — so reading the field is reading that decision rather
-/// than making it a second time. The two used to be made independently, in two
-/// files, from the same flag word.
-pub fn bind_clone_child(
-    task: usize,
-    proc_slot: usize,
-    clear_child_tid: u64,
-) -> Result<(), &'static str> {
-    // Find and claim a free row under one guard, so two cores cannot take the same.
-    let claimed = {
-        let mut table = THREADS.lock();
-        table.iter().position(Option::is_none).inspect(|&slot| {
-            table[slot] = Some(Thread { task, proc_slot, clear_child_tid });
-        })
-    };
-    let Some(slot) = claimed else {
-        // The caller turns this string into `EAGAIN`, which is what Linux
-        // returns at the thread limit and what `pthread_create` reports.
-        serial::puts("  [clone] thread table full\n");
-        return Err("clone: thread table full");
-    };
-    crate::sched::seed_thread_slots(task, proc_slot, slot);
-    Ok(())
 }
 
 /// **A `clone` child's ring-3 lifetime**, from `Process::run`'s
@@ -320,11 +210,10 @@ pub fn bind_clone_child(
 /// retiring the process, all of which are wrong for one thread of several.
 ///
 /// It was `thread_entry`, an `extern "C" fn() -> !` that `sched` spawned
-/// directly and that read its own `rip`/`rsp` out of the `THREADS` row. Since
+/// directly and that read its own `rip`/`rsp` out of a thread-table row. Since
 /// the `clone` fold the child is spawned by `spawn_child_thread_and_publish`
 /// like every other child, enters at the shared `entry_point_trampoline`, and
-/// is handed its first context — so `first` replaces the row's two fields and
-/// the row no longer carries them. One authority for where a task enters ring
+/// is handed its first context. One authority for where a task enters ring
 /// 3, which is `ProcessImage::context`.
 ///
 /// **There is no `execve` loop here** — and since 2026-09-11 there is not one
@@ -336,14 +225,14 @@ pub fn bind_clone_child(
 /// It was never an omission here regardless: `execve` from a non-main thread
 /// replaces the whole process image, which on Linux kills every sibling first,
 /// and this target refuses it (`sys_execve` is reached only by a main thread).
-pub fn run_thread(slot: usize, first: &akuma_exec::process::UserContext) -> ! {
+pub fn run_thread(first: &akuma_exec::process::UserContext) -> ! {
     // `forked = true`: enter ring 3 through `enter_user_mode_forked`, which
     // restores the parent's register set from this task's own `saved_regs` and
     // sets `rax = 0`. A `clone` child sees 0 for exactly the reason a `vfork`
     // child does, so the path is the same one.
     let _status = crate::usermode::enter_user_from_thread(first.pc, first.sp);
 
-    teardown(slot);
+    teardown();
     crate::sched::finish();
 }
 
@@ -352,25 +241,32 @@ pub fn run_thread(slot: usize, first: &akuma_exec::process::UserContext) -> ! {
 /// The order is the contract. Zero the word *before* the wake, or a joiner that
 /// wakes and re-reads sees the old tid and parks again — a lost wakeup that
 /// only shows up when the joiner happens to be scheduled between the two.
-fn teardown(slot: usize) {
-    let Some(t) = THREADS.lock()[slot].take() else { return };
-    if t.clear_child_tid != 0 {
-        let _ = crate::uaccess::write_val::<u32>(t.clear_child_tid, 0);
+///
+/// The word is the `Process`'s `clear_child_tid`: `clone_thread` set it from
+/// `CLONE_CHILD_CLEARTID` and `set_tid_address` moves it, as on Linux. Written
+/// while this thread's `THREAD_PID_MAP` row still stands, so the leader's
+/// [`drain`] still counts it while it touches user memory.
+fn teardown() {
+    let task = crate::sched::current_task();
+    let ctid = akuma_exec::process::current_process_shared()
+        .map_or(0, |p| p.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed));
+    if ctid != 0 {
+        let _ = crate::uaccess::write_val::<u32>(ctid, 0);
         // Glue's kernel-internal wake: both namespaces, since a joiner may
         // have waited with or without `FUTEX_PRIVATE_FLAG` (musl's
         // `pthread_join` uses `priv = 0`).
-        akuma_syscalls_glue::futex_wake(crate::usermode::current_pid(), t.clear_child_tid as usize, 1);
+        akuma_syscalls_glue::futex_wake(crate::usermode::current_pid(), ctid as usize, 1);
     }
     // The slot this thread ran on becomes reusable the moment it is `Finished`.
     // Anything of its still on the futex table would then name whoever inherits
     // it, and absorb a wake meant for them.
-    akuma_syscalls_glue::futex_purge_tid(t.task);
+    akuma_syscalls_glue::futex_purge_tid(task);
     // Same argument for the identity map: a stale `tid -> pid` row would hand
     // the next occupant of this slot the dead thread's process.
     //
     // **And retire the `Process` behind it**, which is the half this target had
-    // no need of until the `clone` fold: a thread used to be a `THREADS` row and
-    // a task, with no `Process` of its own, so there was nothing here to
+    // no need of until the `clone` fold: a thread used to be a thread-table row
+    // and a task, with no `Process` of its own, so there was nothing here to
     // release. `clone_thread` gives every thread a real registered `Process`
     // (its own pid, `tgid` = the leader's), and on this target **nothing else
     // releases it**: a process is retired by `sys_waitpid`, and a thread is
@@ -394,24 +290,25 @@ fn teardown(slot: usize) {
     // removed was this thread's own pid, and a thread's `Process` has exactly
     // one thread by construction. `unregister_process` retires the slot; the
     // frames come back on the next `drain_retired_if_requested`.
-    if let Some(pid) = akuma_exec::process::thread_pid_map_remove(t.task) {
+    if let Some(pid) = akuma_exec::process::thread_pid_map_remove(task) {
         akuma_exec::process::unregister_process(pid);
     }
 }
 
-/// Ask every thread of `proc_slot` other than the caller to leave ring 3, and
-/// wait for them.
+/// Ask every thread of `tgid`'s group other than its leader (the caller) to
+/// leave ring 3, and wait for them.
 ///
 /// Called from the main thread's exit path. A thread parked in `FUTEX_WAIT`
-/// notices through [`group_exiting`], which its poll loop checks; one running
-/// in ring 3 notices at its next syscall. Signal delivery is at a syscall return
-/// too (`crate::signal`), so a thread in a genuinely unbounded ring-3 loop is
-/// still not reachable by either route — bounded by
-/// the same preemption that bounds any other runaway user program, and called
-/// out in `AKUMA_AMD64_RUST_STD.md` as a known gap rather than papered over.
-pub fn drain(proc_slot: usize) {
+/// notices through [`should_leave_now`], which its poll loop checks; one running
+/// in ring 3 notices at its next syscall, or at the timer tick
+/// (`signal::deliver_pending_on_tick`) if it makes none.
+///
+/// **Mark first, count after.** `clone_thread` refuses a new thread once the
+/// group is exiting, under the same BKL this runs under, so a thread is either
+/// refused or registered before the mark — and then counted below.
+pub fn drain(tgid: u32) {
     set_group_exiting();
-    wake_group(proc_slot);
+    wake_group(tgid);
     // Bounded, like every other drive loop in this kernel. An unbounded wait
     // here turns any bug in the leave path into a boot that hangs with no
     // output — the failure mode that costs the most to diagnose and says the
@@ -419,108 +316,52 @@ pub fn drain(proc_slot: usize) {
     // free out from under a live thread, which is worse in principle and far
     // better to debug, because it *tells you*.
     let mut spins = 0u32;
-    while live_count(proc_slot) > 0 && spins < DRAIN_SPINS {
+    while live_count(tgid) > 0 && spins < DRAIN_SPINS {
         spins += 1;
         crate::sched::yield_now();
     }
-    let left = live_count(proc_slot);
+    let left = live_count(tgid);
     if left > 0 {
         serial::puts("  [thread] DRAIN INCOMPLETE: ");
         serial::put_dec(left as u64);
-        serial::puts(" thread(s) still live in proc slot ");
-        serial::put_dec(proc_slot as u64);
+        serial::puts(" thread(s) still live in group ");
+        serial::put_dec(u64::from(tgid));
         serial::puts(" — the reaper may free a live address space\n");
     }
 }
 
-/// Make every thread of `proc_slot` runnable, so each can see the exit flag.
+/// Interrupt and wake every live thread of `tgid`'s group, so each sees the exit
+/// flag.
 ///
-/// The flag is only tested at syscall entry and inside the `futex` wait loop,
-/// and since 2026-09-07 that wait loop **parks** rather than spins. Without this
-/// an `exit_group` while a sibling holds an untimed `FUTEX_WAIT` would wait out
-/// the scheduler's one-second backstop before the sibling looked at anything —
-/// correct, because the backstop exists so a missing wake is slow rather than
-/// fatal, and far too slow to be the design. This is the wake path that stops it
-/// being the design.
+/// **Waking is not interrupting, and the difference is the whole of `DRAIN
+/// INCOMPLETE`.** `sched::wake` makes a parked thread runnable. A thread parked
+/// in the *futex* loop is then fine: that loop re-checks `should_leave_now` and
+/// leaves. A thread parked anywhere else — a pipe `read`, `poll`, the console —
+/// wakes, re-evaluates its **own** condition (still no data), and parks again.
+/// It never returns to syscall entry, which is the only other place
+/// `should_leave_now` is tested, so it never learns the group is exiting.
 ///
-/// Waking a thread that is not parked is a no-op with a recorded flag, so this
-/// cannot race the sibling into a park it will not come out of.
-fn wake_group(proc_slot: usize) {
-    // **Only rows whose task slot is still this group's.** A row is cleared by
-    // [`teardown`], which runs on the thread's own way out — so a thread that
-    // was hard-terminated from another core (the shared `kill_thread_group`
-    // path, which `kill(2)` on this target took until 2026-10-09) left its row
-    // standing, and the next process in this `proc_slot` inherited it: its
-    // exit saw 17, then 41, then 65 "live" threads, spun the whole
-    // [`DRAIN_SPINS`] budget, and posted a kill request plus a wake to a task
-    // slot that by then belonged to somebody else — a sticky `EINTR` on an
-    // innocent thread, since nothing here consumes `PENDING_KILL` but the
-    // slot scrub. Measured with `killtree` under Firecracker; recorded in
-    // `docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`.
-    //
-    // A row is ours if its task slot's `THREAD_PID_MAP` owner belongs to this
-    // thread group. A missing owner on a *live* slot is kept, not dropped:
-    // `clone_thread` publishes the map before the child can run, but the row
-    // and the map entry are two writes, and dropping a row for a thread about
-    // to start would let the reaper free the address space under it — the
-    // failure this module's lifetime rule exists to prevent. A dead or free
-    // slot with no owner is a leftover and goes.
-    let my_tgid = crate::usermode::current_process().map(|p| p.tgid);
-    let mut dropped = 0u32;
-    for i in 0..MAX_THREADS {
-        // Copied out: the process-table lookups below run with no guard held.
-        let Some(t) = thread_row(i) else { continue };
-        if t.proc_slot != proc_slot {
-            continue;
+/// `request_thread_kill` arms `PENDING_KILL`, which is what
+/// `should_interrupt_blocking_syscall` reads — the one hook the park loop
+/// consults (`akuma_threading::schedule_blocking`). So the sibling's wait
+/// returns `EINTR`, unwinds to syscall entry, and sees the flag. That is also
+/// what Linux does: `exit_group` is a group-wide kill, not a group-wide nudge.
+/// Found by `cargo`: `rustc` exited with two threads parked on its jobserver
+/// pipe and the build stopped dead (`docs/archive/RUST_TOOLCHAIN_AMD64.md`
+/// § session 4).
+///
+/// Only slots the process table resolves to this group are touched, so a kill
+/// request can never land on a slot that has since been reissued to somebody
+/// else — the hazard the old per-process-slot table had
+/// (`docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`).
+fn wake_group(tgid: u32) {
+    let me = crate::sched::current_task();
+    akuma_exec::process::for_each_live_group_thread(tgid, |_, task| {
+        if task != me {
+            akuma_threading::request_thread_kill(task);
+            crate::sched::wake(task);
         }
-        let owner_tgid = akuma_exec::process::pid_for_thread(t.task)
-            .and_then(akuma_exec::process::lookup_process_shared)
-            .map(|p| p.tgid);
-        let stale = match owner_tgid {
-            Some(tg) => my_tgid.is_some_and(|mine| mine != tg),
-            None => !akuma_threading::slot_is_live(t.task),
-        };
-        if stale {
-            THREADS.lock()[i] = None;
-            dropped += 1;
-        }
-    }
-    if dropped > 0 {
-        akuma_primitives::safe_print!(96,
-            "[thread] dropped {} stale thread row(s) from proc slot {}\n", dropped, proc_slot);
-    }
-    {
-        for t in (0..MAX_THREADS).filter_map(thread_row) {
-            if t.proc_slot == proc_slot {
-                // **Waking is not interrupting, and the difference is the
-                // whole of `DRAIN INCOMPLETE`.**
-                //
-                // `sched::wake` makes a parked thread runnable. A thread parked
-                // in the *futex* loop is then fine: that loop re-checks
-                // `should_leave_now` and leaves. A thread parked anywhere else
-                // — a pipe `read`, `poll`, the console — wakes, re-evaluates
-                // its **own** condition (still no data), and parks again. It
-                // never returns to syscall entry, which is the only other place
-                // `should_leave_now` is tested, so it never learns the group is
-                // exiting and `drain` spins out its 100 000 rounds and gives up.
-                //
-                // `request_thread_kill` arms `PENDING_KILL`, which is what
-                // `should_interrupt_blocking_syscall` reads — the one hook the
-                // park loop consults (`akuma_threading::schedule_blocking`). So
-                // the sibling's wait returns `EINTR`, unwinds to syscall entry,
-                // and sees the flag. That is also what Linux does: `exit_group`
-                // is a group-wide kill, not a group-wide nudge.
-                //
-                // Found by `cargo`: `rustc` exits with two threads parked on
-                // its jobserver pipe, drain gives up, the process is never
-                // reaped, and the parent waits forever — a build that stops
-                // dead at a random crate with nothing in cargo's own log
-                // (`docs/archive/RUST_TOOLCHAIN_AMD64.md` § session 4).
-                akuma_threading::request_thread_kill(t.task);
-                crate::sched::wake(t.task);
-            }
-        }
-    }
+    });
 }
 
 /// How many scheduler rounds [`drain`] gives the group before it gives up.

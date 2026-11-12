@@ -1789,33 +1789,10 @@ pub fn task_space_root(task_slot: usize) -> u64 {
     MACHINE.get(task_slot).map_or(0, |m| m.space_root.load(Ordering::Relaxed))
 }
 
-/// Seed a not-yet-running **clone child** with the two identities its entry
-/// path reads out of its own `UserCtx`: which process it belongs to, and which
-/// `thread::THREADS` row is its.
+/// Seed a not-yet-running task — a process's or a `clone` thread's — with the
+/// process slot it serves (a thread shares its parent's, which routes its fds).
 ///
-/// The `seed_thread_task` half that this is *not*: no `fs_base`, no `gs_base`,
-/// no register snapshot. The shared child-spawn path already wrote all three
-/// through `akuma_threading::update_thread_context`
-/// ([`write_user_context`]) — including the `CLONE_SETTLS` base, which reaches
-/// it as `UserContext::set_tls_base` -> `fs_base`. Writing them again here
-/// would be a second authority for the same fields, and the `fs_base` one is
-/// the field where the two primitives genuinely disagree (a `fork` child
-/// inherits the parent's; a thread must not), so it belongs with the context
-/// that states which primitive it is.
-pub fn seed_thread_slots(task_slot: usize, proc_slot: usize, thread_slot: usize) {
-    // Under the BKL; the slot is unpublished, so no core can be running it.
-    if let Some(m) = MACHINE.get(task_slot) {
-        m.uctx.with_mut(|u| {
-            u.proc_slot = proc_slot;
-            u.thread_slot = thread_slot;
-        });
-    }
-}
-
-/// Seed a not-yet-running **process** thread with the process slot it serves.
-///
-/// The counterpart of [`seed_thread_task`]'s `proc_slot`/`thread_slot` pair, and
-/// the reason `usermode` needs only one process entry function. Until 2026-09-06
+/// This is the reason `usermode` needs only one process entry function. Until 2026-09-06
 /// a process index had nowhere to live but the `fn` pointer itself, so
 /// `usermode::proc_entry_for` baked one into each of sixteen hand-written
 /// trampolines — and since only nine of them were ever handed out, the machine
