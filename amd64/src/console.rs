@@ -221,6 +221,7 @@ pub fn has_input() -> bool {
     CHANNEL.lock().as_ref().is_some_and(|ch| ch.has_stdin_data())
 }
 
+#[cfg(feature = "console")]
 /// How many bytes of one lap's keyboard input the pump moves at a time.
 ///
 /// A stack array, not a `Vec`: this runs on every lap of a daemon for the life
@@ -228,13 +229,16 @@ pub fn has_input() -> bool {
 /// interactive console alive is the kind the allocator rules exist to refuse.
 const PUMP_IN: usize = 256;
 
+#[cfg(feature = "console")]
 /// Of which the keyboard may fill this many; the rest is room for pointer
 /// reports ([`crate::touchpad::console_bridge`]), which can be longer than a key.
 const PUMP_KEYS: usize = 64;
 
+#[cfg(feature = "console")]
 /// The same, for the echo the line discipline writes back.
 const PUMP_OUT: usize = 256;
 
+#[cfg(feature = "console")]
 /// One lap of the bridge. Returns whether anything moved in either direction.
 ///
 /// Both directions, deliberately: the line discipline's echo is written to the
@@ -344,6 +348,7 @@ pub fn pump_once() -> bool {
     moved
 }
 
+#[cfg(feature = "console")]
 /// Release a reader parked in glue's `Stdin` arm.
 ///
 /// Verbatim the shape `akuma_exec::process::write_to_process_stdin` uses on the
@@ -361,6 +366,7 @@ fn wake_reader() {
     }
 }
 
+#[cfg(feature = "console")]
 /// The pump, as a daemon task.
 ///
 /// # It parks between idle laps, and yields when it cannot
@@ -401,14 +407,17 @@ extern "C" fn pump_daemon() -> ! {
     }
 }
 
+#[cfg(feature = "console")]
 /// How long an idle pump lap parks for: one tick, which is the resolution
 /// `block_until_deadline` has (`sched::block_until_deadline`). See
 /// [`pump_daemon`].
 const PUMP_IDLE_PARK_US: u64 = crate::lapic::US_PER_TICK_TARGET as u64; // one tick
 
+#[cfg(feature = "console")]
 /// Whether [`spawn_pump`] has already run.
 static PUMP_SPAWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
+#[cfg(feature = "console")]
 /// Start the pump. Idempotent — the second caller is a no-op rather than a
 /// second daemon racing the first for the same destructive `getb`.
 ///
@@ -431,5 +440,8 @@ pub fn spawn_pump() -> bool {
 /// very different answers.
 #[must_use]
 pub fn pump_running() -> bool {
-    PUMP_SPAWNED.load(core::sync::atomic::Ordering::Acquire)
+    #[cfg(feature = "console")]
+    return PUMP_SPAWNED.load(core::sync::atomic::Ordering::Acquire);
+    #[cfg(not(feature = "console"))]
+    false
 }

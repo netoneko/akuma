@@ -92,6 +92,7 @@ pub fn release(tgid: u32) {
 /// Called from the console pump when output is idle: if the owner no longer
 /// exists — it died on a path that did not reach [`release`] — take the screen
 /// back. One atomic load when nobody owns it, which is almost always.
+#[cfg(feature = "console")]
 pub fn poll_owner() {
     let tgid = owner();
     if tgid != 0 && akuma_exec::process::lookup_process_shared(tgid).is_none() {

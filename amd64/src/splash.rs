@@ -331,6 +331,7 @@ pub fn crash() {
 
 /// Hold `/etc/console.conf` until the splash ends. `true` if it was held (the
 /// caller must not apply it now), `false` if there is no splash and it should be.
+#[cfg(feature = "console")]
 pub fn defer_config(text: &str) -> bool {
     if !active() {
         return false;

@@ -602,6 +602,11 @@ trashcan (the Intel test box with a serial line; it already builds `headless`
 in practice since it has no hypervisor and no framebuffer use). Table and full
 feature list: `docs/reference/build-profiles.md` § amd64 images.
 
+`server` is `headless` without the interactive console (the machine half's `console`
+feature: no pump task, no keyboard, init's stdin EOF, `SPAWN_FLAG_CONSOLE` = `ENODEV`) —
+for a machine whose console is ssh. Anything that types into the serial console needs
+`headless` or the default.
+
 ## VM Access
 
 SSH on port 2222: `ssh -o StrictHostKeyChecking=no root@localhost -p 2222`

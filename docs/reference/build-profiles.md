@@ -253,7 +253,8 @@ left out takes its probe with it and the class reads as absent.
 |---|---|---|
 | **default** (bare metal) | `cargo build -p akuma-amd64 --target x86_64-unknown-none --release` | Every driver (`all-drivers`: `fbcon`, `hda`, `i8042`, `kvm`, `nvme`, `touchpad`, `wifi`, `xhci`) and the boot suite. The image for a machine that is used (HP box, ryzen). |
 | **headless** (bare-metal test box) | `... --no-default-features --features headless`; boot under TCG with `NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh` | The machine half's defaults, the boot suite, and only the storage and keyboard drivers (`storage-and-input`: `nvme`, `xhci`, `i8042`). No framebuffer console (the console is the serial port, GRUB's framebuffer is not touched), no splash, no `/dev/fb0`, no sound, no touchpad, no Wi-Fi (`/dev/wifi0`, the rtw89 card), no hypervisor (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`), and none of their crates linked. For a test box with a serial line (trashcan, an Intel CPU: the hypervisor is AMD SVM only). |
-| **no-tests** | `--features no-tests` (combines with `headless`) | Drops the boot suite (`akuma-kernel-tests-amd64` is not linked). |
+| **server** (reached over ssh) | `... --no-default-features --features server` | `headless` without the interactive console (the `console` feature) and without the keyboard drivers: storage only (`storage`: `nvme`, `xhci`). The serial line carries the kernel log and init's stdout/stderr, and nothing reads it: no console pump task, no USB keyboard enumeration, init's stdin is EOF, and 301's `SPAWN_FLAG_CONSOLE` (herd's `console = true`) is `ENODEV`. For a machine whose console is ssh. |
+| **no-tests** | `--features no-tests` (combines with `headless` or `server`) | Drops the boot suite (`akuma-kernel-tests-amd64` is not linked). |
 
 `headless` keeps what a test box needs: the storage and keyboard drivers by feature
 (`storage-and-input`: NVMe, xHCI, which is both the USB keyboard and USB storage, and the i8042),
@@ -271,8 +272,12 @@ and KVM became features):
 | default | 3,053,311 | 21,598,896 | 5,811,096 |
 | headless | 2,452,479 | 249,752 | 1,149,848 |
 | headless + no-tests | 2,255,855 | 154,576 | 1,118,360 |
+| headless + no-tests (2026-11-12) | 2,166,383 | 154,312 | 955,224 |
+| server + no-tests (2026-11-12) | 2,175,503 | 152,584 | 955,224 |
 
-The default image's `.rodata` is almost all `akuma-fbcon`'s baked fonts.
+The default image's `.rodata` is almost all `akuma-fbcon`'s baked fonts. `server` is not
+smaller than `headless` in `.text` (the pump is small, and inlining moved): what it removes is a
+running task and the keyboard probes, not bytes.
 
 ## Profiles were consolidated (2026-08-10)
 

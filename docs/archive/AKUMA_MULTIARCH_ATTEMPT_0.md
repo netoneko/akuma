@@ -2690,6 +2690,62 @@ the `Attach` itself exists for the console. A headless akuma, Taoxichuan or Shan
 not need it. Taoxichuan's builder already makes it opt-in (`Kernel::console()`); the plan is
 the same shape for the unified front.
 
+### The console is optional on amd64: the `server` image (2026-11-12)
+
+The machine half has a `console` feature for the interactive console, and `run_init` keeps it
+in one function, `console_before_init`. What it covers:
+
+- the pump task: keyboard and serial input into the console's line discipline, the echo drain,
+  and two jobs that live on the pump: the touchpad poll and reclaiming `/dev/fb0` from a dead owner;
+- the USB keyboard's enumeration;
+- the console's size from the framebuffer grid and `/etc/console.conf`;
+- 301's `SPAWN_FLAG_CONSOLE`, which is `ENODEV` without the feature.
+
+Without it, init is still attached to the console channel, so its stdout and stderr reach
+the serial log (the only place a failing `sshd` can say why), but that channel's stdin is
+closed: `read(0)` is EOF instead of a park that nothing ends.
+
+The bin's `default` and `headless` turn the feature on; the new `server` image is `headless`
+without it and without the i8042 (`akuma-drivers-amd64/storage` = NVMe + xHCI). The machine
+half's own `default` leaves it off, so a feature list cannot pick it up by accident.
+
+It saves a task and the keyboard probes, not bytes: `server + no-tests` is 9 KB **larger** in
+`.text` than `headless + no-tests` (2,175,503 vs 2,166,383; inlining moved) and 1.7 KB smaller in
+`.rodata`.
+
+AArch64 `akuma` has no console input to remove: its herd runs on a channel the main loop copies
+to the UART. Taoxichuan and Shanghai already make the console opt-in (`Kernel::console()`).
+The unified front should take that builder shape, `run_init`'s four stages (find, console,
+spawn, wait) being the part both bins share. `docs/reference/subsystems/boot.md` § Init has the
+three kernels side by side.
+
+Testing `server` found a bug in shared code: a **closed stdin never polled readable**, and
+closing it woke nobody, so busybox's line editor (which polls before it reads) parked for good on
+a stdin whose `read` returns 0. Fixed in glue's readiness probe and `ProcessChannel::close_stdin`,
+with a boot test that fails without the fix:
+[`CLOSED_STDIN_NEVER_POLLED_READABLE`](CLOSED_STDIN_NEVER_POLLED_READABLE.md).
+
+Gates (after `cargo clean`): amd64 `headless` 831/841/841 (SMP 1/2/4, the two new checks included),
+`server` 829/839/839 and 841 with the test, ring-3 OK; `server` with `init=/bin/sshd` served 10 ssh
+sessions and the exit-status script; `server` with `init=/bin/busybox initargs=sh` reached
+`-- init exited --` on EOF; `server` with `init=/bin/herd` started `sshd` and refused `console`
+(`ENODEV`); `headless` serial console unchanged (pid 1, `stty size` 24 80, `^C`); AArch64 HVF
+312/320/318; clippy on every target, `server` and the machine half alone included.
+
+Open, found on the way and not changed here:
+
+- **herd retries a refused service forever.** On `server` its `console = true` service fails with
+  `ENODEV` and is restarted every `restart_delay`: 69 times in a minute. herd should give up, or
+  back off, after repeated start failures.
+- **No job control on the amd64 serial console.** amd64 dispatches `setpgid`/`getpgid`/`getsid`
+  to `pty::*_gated`, which are real only inside a pty session and the old accepted no-ops
+  elsewhere. A busybox shell as init runs `sleep 30` "in" group 71 (its `TIOCSPGRP` sets the
+  terminal's foreground group), but the `setpgid` was a no-op, so `^C` reaches
+  `[ISIG] ... fg_pgid=71 members=0` and the `sleep` runs on. It was the same before `Attach`
+  (the old init had no controlling tty either). Under herd the console shell does not take a
+  group of its own, so `^C` does work there. The AArch64 kernel's `setpgid` is ungated; one of
+  the two answers has to win when dispatch converges.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

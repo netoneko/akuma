@@ -39,6 +39,16 @@ linux-extra-syscalls = [
 # OFF by default until its gates pass; `docs/archive/AMD64_RING0_PREEMPTION.md`.
 ring0-preempt = []
 
+# The interactive console: the pump that moves keyboard and serial input into the console's
+# line discipline, the USB keyboard's enumeration, the console's size from the framebuffer
+# grid and `/etc/console.conf`, and 301's `SPAWN_FLAG_CONSOLE` (herd's `console = true`).
+# Off, the serial line still carries the kernel log and init's stdout/stderr, but nothing reads
+# it: init's stdin is EOF and `SPAWN_FLAG_CONSOLE` is `ENODEV`. The pump also polls the touchpad
+# (`/dev/input/mouse0`) and takes the framebuffer back from a dead `/dev/fb0` owner, so the
+# `touchpad` and `fbcon` drivers want this on. Not in `default`: the bin's
+# `default` and `headless` add it, its `server` image does not.
+console = []
+
 # The compile-time syscall debug mode the AArch64 kernel has (root
 # `Cargo.toml`'s `syscall-debug-info`): glue's per-arm `[syscall]` lines and the
 # `[FORK-DBG]`/`[TRAMP]` fork/exec/thread-spawn lifecycle traces

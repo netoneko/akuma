@@ -11,7 +11,7 @@ workspace = true
 # does), forwarded so that `cargo build -p akuma-amd64 --features X` keeps working. A feature
 # added there needs its line here; one missing is a cargo error naming it, not a silent no-op.
 [features]
-default = ["akuma-kernel-amd64/default", "all-drivers"]
+default = ["akuma-kernel-amd64/default", "all-drivers", "console"]
 
 # Device drivers (`crates/akuma-drivers-amd64`), one feature per driver. A driver left out is
 # not compiled and its boot-time probe does nothing: the machine half sees the class as absent.
@@ -35,7 +35,14 @@ xhci = ["akuma-drivers-amd64/xhci"]
 # hypervisor (`/dev/kvm0`, `/dev/kvm`, `/dev/net/tun`: AMD SVM only, and a test box may be
 # Intel). The serial console, the GRUB-module ramdisk, virtio-blk and the NIC (RTL8169) are in
 # the machine half. `docs/reference/build-profiles.md`.
-headless = ["akuma-kernel-amd64/default", "akuma-drivers-amd64/storage-and-input"]
+headless = ["akuma-kernel-amd64/default", "akuma-drivers-amd64/storage-and-input", "console"]
+# `headless` without the interactive console (`console`, below) or the keyboard drivers: storage
+# only (NVMe, xHCI for a USB root). For a machine reached over ssh whose serial line is a log:
+# init's stdin is EOF, and herd's `console = true` services fail with `ENODEV`. Used as
+# `--no-default-features --features server`.
+server = ["akuma-kernel-amd64/default", "akuma-drivers-amd64/storage"]
+# The interactive console (`amd64/Cargo.toml` says what it covers). In `default` and `headless`.
+console = ["akuma-kernel-amd64/console"]
 ring0-preempt = ["akuma-kernel-amd64/ring0-preempt", "akuma-kernel-tests-amd64/ring0-preempt"]
 syscall-debug-info = ["akuma-kernel-amd64/syscall-debug-info"]
 pmm-forensics = ["akuma-kernel-amd64/pmm-forensics"]

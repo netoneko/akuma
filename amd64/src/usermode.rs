@@ -3730,6 +3730,12 @@ pub fn sys_spawn(
     // (`akuma_exec::process::Attach`). Its fresh spawn channel is what the
     // caller's `ChildStdout` and `wait` see, and reads EOF at exit: the right
     // shape for a supervisor, whose child's output is on the screen.
+    //
+    // Without the `console` feature there is no interactive console to give it:
+    // `ENODEV`, the answer for a console that does not exist.
+    if !cfg!(feature = "console") {
+        return errno::ENODEV;
+    }
     let (Some(channel), Some(terminal)) = (crate::console::channel(), crate::console::terminal_state()) else {
         return errno::ENODEV;
     };
@@ -3999,38 +4005,11 @@ pub fn spawn_row_of(pid: u32) -> Option<usize> {
 
 
 
-/// Load `path` and give it the console.
-///
-/// Not a self-test — it never returns while the shell is running, and it blocks
-/// on the UART waiting for a keystroke. It is the last thing the boot does, and
-/// only when the binary is on the disk, so a machine without it still reaches
-/// the "all self-tests passed" line and halts as before.
-///
-/// Selected by `init=` on the boot command line. `paws` is the shell; `httpd`
-/// is a server that never reads the console. Both are the same binaries the
-/// aarch64 devbox runs, compiled for `x86_64-unknown-none` against a ported
-/// `libakuma`.
-pub fn run_init(path: &str, args: &[&str]) {
-    // A missing init is reported and the boot halts as before. Resolved first: a
-    // usr-merged root has `/bin -> usr/bin` and `sh -> bash`.
-    if crate::fs::read_image_head(path).is_err() {
-        serial::puts("  [init] not on the disk: ");
-        serial::puts(path);
-        serial::puts("\n");
-        return;
-    }
-    // argv[0] is the path; `args` (from `initargs=`) follow. A multicall binary
-    // like busybox dispatches on `argv[1]` when `argv[0]`'s basename is
-    // `busybox`, so `initargs=uname,-a` runs its `uname` applet.
-    let mut argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(1 + args.len());
-    argv.push(path.as_bytes().to_vec());
-    for a in args {
-        argv.push(a.as_bytes().to_vec());
-    }
-
-    // Everything init's first instructions may rely on happens **before** the
-    // spawn, which publishes it: the shared spawn schedules the child at once.
-    //
+/// The interactive console's half of [`run_init`]: everything init's first
+/// `read(0)` and `TIOCGWINSZ` rely on, done before init exists. The `console`
+/// feature (`amd64/Cargo.toml`).
+#[cfg(feature = "console")]
+fn console_before_init(path: &str) {
     // The screen's real size into the console's terminal state (so `stty size`
     // and every program asking `TIOCGWINSZ` see the framebuffer grid, not a
     // default 24x80), and the one-line geometry summary at the end of the boot
@@ -4078,6 +4057,53 @@ pub fn run_init(path: &str, args: &[&str]) {
     if !crate::console::spawn_pump() {
         serial::puts("  [init] WARNING: no task slot for the console pump — the console will not deliver input\n");
     }
+}
+
+/// Without the `console` feature nothing reads the keyboard or the serial line:
+/// no pump, no keyboard enumeration, no console size. Init is still attached to
+/// the console channel, so its stdout and stderr reach the serial log, but its
+/// stdin is closed: a `read(0)` is EOF at once instead of a park nothing ends.
+/// The splash ends here whatever init is, since no console shell will end it.
+#[cfg(not(feature = "console"))]
+fn console_before_init(_path: &str) {
+    crate::splash::end_for_init();
+    if let Some(ch) = crate::console::channel() {
+        ch.close_stdin();
+    }
+}
+
+/// Load `path` and give it the console.
+///
+/// Not a self-test — it never returns while the shell is running, and it blocks
+/// on the UART waiting for a keystroke. It is the last thing the boot does, and
+/// only when the binary is on the disk, so a machine without it still reaches
+/// the "all self-tests passed" line and halts as before.
+///
+/// Selected by `init=` on the boot command line. `paws` is the shell; `httpd`
+/// is a server that never reads the console. Both are the same binaries the
+/// aarch64 devbox runs, compiled for `x86_64-unknown-none` against a ported
+/// `libakuma`.
+pub fn run_init(path: &str, args: &[&str]) {
+    // A missing init is reported and the boot halts as before. Resolved first: a
+    // usr-merged root has `/bin -> usr/bin` and `sh -> bash`.
+    if crate::fs::read_image_head(path).is_err() {
+        serial::puts("  [init] not on the disk: ");
+        serial::puts(path);
+        serial::puts("\n");
+        return;
+    }
+    // argv[0] is the path; `args` (from `initargs=`) follow. A multicall binary
+    // like busybox dispatches on `argv[1]` when `argv[0]`'s basename is
+    // `busybox`, so `initargs=uname,-a` runs its `uname` applet.
+    let mut argv: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::with_capacity(1 + args.len());
+    argv.push(path.as_bytes().to_vec());
+    for a in args {
+        argv.push(a.as_bytes().to_vec());
+    }
+
+    // Everything init's first instructions may rely on happens **before** the
+    // spawn, which publishes it: the shared spawn schedules the child at once.
+    console_before_init(path);
 
     // **Init is the shared spawn's**, as every other process is since 2026-11-12:
     // pid 1 (`sshd`'s `getpid` says so, and `reparent_children_to` names it),

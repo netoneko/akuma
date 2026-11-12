@@ -15,7 +15,9 @@ all = ["fbcon", "hda", "i8042", "kvm", "nvme", "touchpad", "wifi", "xhci"]
 # The bin's `no-tests`: drivers register no boot-suite checks.
 no-tests = []
 # The storage and keyboard drivers a test box keeps (the bin's `headless`).
-storage-and-input = ["i8042", "nvme", "xhci"]
+storage-and-input = ["storage", "i8042"]
+# The storage drivers alone (the bin's `server`, which has no interactive console).
+storage = ["nvme", "xhci"]
 # The framebuffer text console on GRUB's linear framebuffer, with the boot splash and
 # `/dev/fb0`'s registration. Off, the multiboot2 boot is headless: its console is the serial
 # port (the bare-metal reference machine has no UART, so a build for it wants this on).
