@@ -1,0 +1,532 @@
+//! 16550 UART on the legacy COM1 port block, via port I/O.
+//!
+//! This is the amd64 counterpart of `akuma-uart`, and it is a separate
+//! implementation rather than a `cfg` arm of that crate on purpose: the two
+//! share a register *layout* (the 16550 programming model) but nothing else.
+//! AArch64 reaches its UART through an MMIO window the MMU has to have mapped;
+//! x86 reaches this one through `in`/`out` on an I/O port, which needs no
+//! mapping and works before paging is on. Merging them would mean an
+//! abstraction over "how a byte reaches a register", which is the
+//! `trait Arch` shape `REDUCING_PLATFORM_DEPENDENCY.md` §7 argues against.
+//!
+//! No heap, no formatting machinery, no `core::fmt` — same rule as the kernel's
+//! `safe_print!`: the console is what survives when everything else is broken,
+//! so it may not depend on anything that can fail.
+
+/// Line status bit 5: transmit holding register empty.
+const LSR_THR_EMPTY: u8 = 1 << 5;
+/// Data Ready — a byte is waiting in the receive buffer.
+const LSR_DATA_READY: u8 = 1 << 0;
+
+use akuma_port::{COM1, UartReg};
+use akuma_dmesg::Ring;
+use core::sync::atomic::{AtomicBool, Ordering};
+use spinning_top::Spinlock;
+use spinning_top::guard::SpinlockGuard;
+
+/// One writer at a time, per call. With several cores printing, two `puts`
+/// interleaved byte by byte are unreadable; held per *call* rather than per
+/// line, so a line assembled from `puts`/`put_hex`/`put_dec` can still be
+/// interleaved with another core's — kernel code prints under the BKL and is
+/// serialised anyway, and this covers the bring-up window where it is not.
+///
+/// Best-effort on purpose: a core that cannot get the lock within the budget
+/// prints anyway. The console is what a crashed core reports through, and a
+/// lock held by a core that died mid-line must not silence the report.
+static LOCK: AtomicBool = AtomicBool::new(false);
+const LOCK_BUDGET: u32 = 1 << 22;
+
+/// A copy of the last [`KLOG_CAP`] console bytes, so `dmesg` works over ssh.
+///
+/// This target has no UART on the reference box and no `/proc/kmsg`, so once the
+/// framebuffer scrolls a diagnostic away there is no way to get it back — which
+/// on a headless box being driven entirely over ssh means "the kernel said why
+/// and nobody can read it". Every byte that goes to [`putb_raw`] is also written
+/// here, and `sys_syslog` (syscall 103) reads it back.
+///
+/// The wrap/skip arithmetic is [`akuma_dmesg::Ring`], shared with the AArch64
+/// kernel's `console::dmesg_*` and host-tested — it started here as a
+/// `static mut [u8; 64 * 1024]` with four raw-pointer helpers, and its single
+/// pure-function bug (a staging buffer that silently became the ceiling on
+/// `dmesg`) cost a reboot of the bare-metal box to find. What lives here is the
+/// `static` and the lock.
+///
+/// 64 KiB covers a whole boot's worth of output comfortably and costs nothing
+/// but `.bss`.
+const KLOG_CAP: usize = 64 * 1024;
+
+/// # Why its own lock, and why `try_lock` on the write path
+///
+/// [`putb_raw`] already runs under [`LOCK`], but that lock is *best-effort*: a
+/// core that cannot take it within [`LOCK_BUDGET`] prints anyway, so two cores
+/// can genuinely be inside `putb_raw` at once and the ring needs its own
+/// serialisation. The acquire there is a single non-blocking attempt, for the
+/// same reason the console lock is bounded — a panic or a fault landing while
+/// this core is mid-`putb_raw` must not spin forever on a lock this core
+/// itself holds. Losing a few bytes of *replay* beats losing the live output.
+///
+/// Readers ([`klog_snapshot_from`], [`klog_len`]) retry, bounded: a spurious
+/// `0` from a transient contention would break `sys_syslog`'s drain loop and
+/// truncate `dmesg` silently, which is precisely the failure this ring exists
+/// to stop.
+static KLOG: Spinlock<Ring<KLOG_CAP>> = Spinlock::new(Ring::new());
+
+/// Bounded acquire of [`KLOG`] for a reader. `None` means "give up rather than
+/// wedge"; callers report an empty/short answer, never a hang.
+fn klog_lock() -> Option<SpinlockGuard<'static, Ring<KLOG_CAP>>> {
+    let mut spins = 0u32;
+    loop {
+        if let Some(g) = KLOG.try_lock() {
+            return Some(g);
+        }
+        spins += 1;
+        if spins >= LOCK_BUDGET {
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Append one byte to [`KLOG`]. Never blocks; see [`KLOG`].
+fn klog_push(byte: u8) {
+    if let Some(mut ring) = KLOG.try_lock() {
+        ring.push(byte);
+    }
+}
+
+/// Copy console history into `out`, starting `skip` bytes past the oldest byte
+/// still retrievable. Returns how many bytes were written.
+///
+/// The `skip` is what lets a caller with a small staging buffer deliver the
+/// *whole* ring, a chunk at a time. Without it, `sys_syslog`'s 4 KiB staging
+/// buffer was also the hard ceiling on `dmesg`: `SIZE_BUFFER` advertised the
+/// full 64 KiB, `dmesg` allocated that and asked for it, and got the last 4 KiB
+/// back — fifteen sixteenths of the log unreachable, with nothing reporting a
+/// short read. On a machine whose console is a television with no scrollback,
+/// `dmesg` is the only way to read a boot, and it was silently truncating it to
+/// the last few seconds: an xHCI bring-up printed its whole trace and the NIC's
+/// stall dumps then pushed it out of reach.
+///
+/// `skip == 0` is the oldest retrievable byte, so successive calls walk forward
+/// through history.
+#[must_use]
+pub fn klog_snapshot_from(skip: usize, out: &mut [u8]) -> usize {
+    klog_lock().map_or(0, |r| r.snapshot_from(skip, out))
+}
+
+/// Write the last `max` bytes of the `dmesg` ring to the framebuffer console,
+/// bypassing the quiet policy: what a crash or a stuck quiet boot shows, so the
+/// television explains itself. Starts at a line boundary.
+pub fn replay_klog_tail_to_fb(max: usize) {
+    let mut skip = klog_len().saturating_sub(max);
+    let mut buf = [0u8; 256];
+    let mut at_line_start = skip == 0;
+    loop {
+        let n = klog_snapshot_from(skip, &mut buf);
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            if !at_line_start {
+                at_line_start = b == b'\n';
+                continue;
+            }
+            crate::drivers::mirror_byte(b);
+        }
+        skip += n;
+    }
+}
+
+/// Total bytes currently retrievable from [`klog_snapshot_from`]. For
+/// `SYSLOG_ACTION_SIZE_UNREAD` / `SIZE_BUFFER`.
+#[must_use]
+pub fn klog_len() -> usize {
+    klog_lock().map_or(0, |r| r.len())
+}
+
+/// Discard the buffered console history. For `SYSLOG_ACTION_CLEAR`.
+pub fn klog_clear() {
+    if let Some(mut ring) = klog_lock() {
+        ring.clear();
+    }
+}
+
+/// Append a string to the `dmesg` ring **only** — not to the framebuffer or the
+/// port. For a high-frequency diagnostic (the memory ticker) that belongs in
+/// `dmesg` but must not scroll the television on a box being watched.
+pub fn klog_only(s: &str) {
+    if let Some(mut ring) = klog_lock() {
+        ring.push_str_crlf(s);
+    }
+}
+
+/// [`put_dec`] into the ring only. Companion to [`klog_only`].
+pub fn klog_only_dec(mut val: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (val % 10) as u8;
+        val /= 10;
+        if val == 0 {
+            break;
+        }
+    }
+    if let Some(mut ring) = klog_lock() {
+        ring.push_bytes(&buf[i..]);
+    }
+}
+
+/// Did a 16550 answer the probe in [`init`]?
+///
+/// **An absent x86 I/O port reads `0xFF`.** On a machine with no UART — the
+/// bare-metal HP box, whose console is a framebuffer — polling `LSR` for
+/// data-ready therefore says "a byte is waiting", forever, and the byte is
+/// `0xFF`: a phantom keyboard typing an endless stream of one character. The
+/// first `sh` on that machine filled its screen with replacement glyphs from a
+/// stdin that never stopped (`docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`,
+/// "not a kernel bug at all"). Every read path checks this and reports "no
+/// data" when nothing is there; the write path still mirrors to the
+/// framebuffer and skips the port.
+static PRESENT: AtomicBool = AtomicBool::new(false);
+
+struct Guard;
+
+fn lock() -> Guard {
+    let mut spins = 0u32;
+    while LOCK
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        spins += 1;
+        if spins >= LOCK_BUDGET {
+            break;
+        }
+        core::hint::spin_loop();
+    }
+    Guard
+}
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        LOCK.store(false, Ordering::Release);
+    }
+}
+
+/// Configure COM1 for 115200 8N1 with FIFOs on.
+///
+/// Divisor 1 against the 115200 Hz base clock. QEMU does not care about the
+/// baud rate, but a real machine does and a wrong divisor is invisible under
+/// emulation — which is exactly the class of bug that only shows up on
+/// hardware, so it is set correctly here rather than left at the default.
+pub fn init() {
+    // Probe first: write two patterns to the scratch register and read them
+    // back. A real chip returns what it was given; an empty bus returns 0xFF
+    // for both — and a value of 0xFF from a real chip for the *first* pattern
+    // would be caught by the second. Only a chip that answers gets configured
+    // or read from.
+    // The scratch register is a plain storage byte with no side effect on a
+    // 16550, and an absent port ignores writes.
+    let present = {
+        COM1.write(UartReg::Scratch, 0x5A);
+        let a = COM1.read(UartReg::Scratch);
+        COM1.write(UartReg::Scratch, 0xA5);
+        let b = COM1.read(UartReg::Scratch);
+        a == 0x5A && b == 0xA5
+    };
+    PRESENT.store(present, Ordering::Release);
+    if !present {
+        return;
+    }
+    COM1.write(UartReg::IntEnable, 0x00); // no interrupts; this driver polls
+    COM1.write(UartReg::LineCtrl, 0x80); // DLAB on: the next two ports are the divisor
+    COM1.write(UartReg::Data, 0x01); // divisor low  = 1  -> 115200 baud
+    COM1.write(UartReg::IntEnable, 0x00); // divisor high = 0
+    COM1.write(UartReg::LineCtrl, 0x03); // DLAB off, 8 bits, no parity, 1 stop
+    COM1.write(UartReg::FifoCtrl, 0xC7); // FIFO on, cleared, 14-byte trigger
+    COM1.write(UartReg::ModemCtrl, 0x0B); // DTR + RTS + OUT2
+}
+
+/// Emit one byte, spinning until the transmit holding register drains.
+///
+/// Unbounded spin. On real hardware with no cable this blocks forever, which is
+/// the wrong trade for a production console and the right one for a bring-up
+/// console: a dropped byte during boot is a bug you cannot see, and a stall is
+/// a bug you can.
+pub fn putb(byte: u8) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    putb_raw(byte);
+}
+
+/// Set once a core has started printing a fatal-exception dump.
+///
+/// # Why the per-call [`LOCK`] above is not enough
+///
+/// That lock is **best-effort by design** — a core that cannot take it inside
+/// `LOCK_BUDGET` prints anyway, because a lock held by a core that died
+/// mid-line must never silence the next report. The cost is that a dump made of
+/// eighty `puts`/`put_hex` calls will have a peer barge in between two of them,
+/// and [`put_hex`] emits its sixteen digits under one acquire — so the peer's
+/// byte lands *inside* a number. That is not a theory: three captures of the
+/// 2026-09-12 ssh/apk wedge read `ffffyfff80296506` and `cs=0x0000]00000000008`,
+/// single characters substituted into otherwise-correct hex, and one of them had
+/// every printed register wrong in the same high bits. A dump you cannot trust
+/// digit by digit is worse than no dump, because it invites a diagnosis.
+///
+/// So a fatal dump does not share the port: the core that starts one silences
+/// every other writer for the rest of the boot. There is no release — the
+/// claimer is `!`. Its own output goes through the `fatal_*` entry points below,
+/// which skip this check; the second core to reach [`begin_fatal`] is told so
+/// and stops rather than printing a second dump into the first.
+static FATAL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Claim the port for a fatal dump. Returns `true` if some other core already
+/// has it — in which case the caller must not print at all.
+#[must_use]
+pub fn begin_fatal() -> bool {
+    // The dump is for the screen too: see `FB_QUIET` — and a boot splash gives way
+    // to it (best effort, never waiting on the console).
+    crate::splash::crash();
+    // A program drawing through `/dev/fb0` does not get to hide a crash.
+    crate::drivers::fb_force_unmute();
+    FB_QUIET.store(false, Ordering::Release);
+    FATAL_ACTIVE.swap(true, Ordering::AcqRel)
+}
+
+/// Is a fatal dump in progress? Every ordinary writer answers `true` by staying
+/// quiet.
+fn fatal_active() -> bool {
+    FATAL_ACTIVE.load(Ordering::Acquire)
+}
+
+/// [`puts`] for the core printing a fatal dump: bypasses [`fatal_active`].
+pub fn fatal_puts(s: &str) {
+    let _g = lock();
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            putb_raw(b'\r');
+        }
+        putb_raw(b);
+    }
+}
+
+/// [`put_hex`] for the core printing a fatal dump.
+pub fn fatal_hex(val: u64) {
+    let _g = lock();
+    put_hex_digits_raw(val);
+}
+
+/// [`put_dec`] for the core printing a fatal dump.
+pub fn fatal_dec(val: u64) {
+    let _g = lock();
+    put_dec_digits_raw(val);
+}
+
+/// Is the framebuffer being kept for the console shell?
+///
+/// Set once a console shell is running (`set_fb_quiet`): from then on the TV
+/// shows what that shell and the line discipline print, and **nothing the kernel
+/// or a service says about itself** — `[probe]`, `[BKL]`, `[PSTATS]`, `[herd]`.
+/// Those are diagnostics for `dmesg`, and a screen that scrolls them every few
+/// seconds under the prompt is a screen nobody can type on. A panic or a fatal
+/// exception clears it again (`begin_fatal`, `set_fb_quiet(false)`): a crash is
+/// the one thing that has to reach a screen with nobody watching `dmesg`.
+///
+/// Only the *framebuffer mirror* is gated. `klog_push` (what `dmesg` reads) and
+/// the UART are untouched.
+static FB_QUIET: AtomicBool = AtomicBool::new(false);
+
+/// Set by the `fbverbose` boot flag: never go quiet, for debugging on the
+/// metal where the TV is the only thing that shows a hang.
+static FB_VERBOSE: AtomicBool = AtomicBool::new(false);
+
+/// Keep the framebuffer for the console shell (`true`), or give it back to
+/// every writer (`false`). `true` is ignored under `fbverbose`.
+pub fn set_fb_quiet(quiet: bool) {
+    FB_QUIET.store(quiet && !FB_VERBOSE.load(Ordering::Relaxed), Ordering::Release);
+}
+
+/// Honour the `fbverbose` boot flag. Call before any console shell starts.
+pub fn set_fb_verbose(verbose: bool) {
+    FB_VERBOSE.store(verbose, Ordering::Relaxed);
+    if verbose {
+        FB_QUIET.store(false, Ordering::Release);
+    }
+}
+
+/// Does an ordinary writer's byte reach the framebuffer right now?
+fn fb_open() -> bool {
+    !FB_QUIET.load(Ordering::Acquire) || fatal_active()
+}
+
+/// [`putb`] for **console traffic** — the shell's output and the line
+/// discipline's echo — which reaches the framebuffer even while it is kept quiet
+/// for diagnostics. Same lock, same `dmesg` copy, same silence during a fatal
+/// dump as [`putb`]; the only difference is the mirror.
+pub fn putb_tty(byte: u8) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    putb_raw_m(byte, true);
+}
+
+/// [`putb`] without the lock, for callers that hold it across a whole string.
+fn putb_raw(byte: u8) {
+    putb_raw_m(byte, fb_open());
+}
+
+/// [`putb_raw`] with the mirror decided by the caller.
+fn putb_raw_m(byte: u8, mirror: bool) {
+    // Keep a copy for `dmesg` (see `KLOG`). First, so a byte survives even if
+    // the mirror or the port below hangs.
+    klog_push(byte);
+    // A quiet boot's splash shows the latest message (`splash::note_byte`).
+    crate::splash::note_byte(byte);
+
+    // Mirror to the framebuffer console, if one is up.
+    //
+    // FIRST, before the wait below. On the bare-metal target there is no UART at
+    // all: `inb` on an absent port reads 0xFF, so `LSR_THR_EMPTY` appears set and
+    // the loop happens to fall through -- but that is the I/O bus being
+    // forgiving, not a guarantee. Drawing before the wait means a machine whose
+    // absent port ever read 0 would still have said what it was about to hang
+    // on.
+    if mirror {
+        crate::drivers::mirror_byte(byte);
+    }
+
+    if !PRESENT.load(Ordering::Relaxed) {
+        return;
+    }
+    while COM1.read(UartReg::LineStatus) & LSR_THR_EMPTY == 0 {
+        core::hint::spin_loop();
+    }
+    COM1.write(UartReg::Data, byte);
+}
+
+/// Did [`init`] find a UART? `false` means every read reports no data.
+#[must_use]
+pub fn present() -> bool {
+    PRESENT.load(Ordering::Relaxed)
+}
+
+/// Emit a string, translating `\n` to CRLF.
+/// Take a byte from the receive buffer, or `None` if none is waiting.
+///
+/// Polled, like the transmit side: this target takes no device interrupts, so
+/// there is no IRQ to arrive and no buffer for one to fill. A caller that wants
+/// to block spins on this — which is honest here, because there is nothing else
+/// for the CPU to do while a shell waits for a key.
+///
+/// Non-blocking rather than blocking as the primitive, so a `read` with no data
+/// can return `EAGAIN` and a scheduler can be added later without changing the
+/// device layer.
+#[must_use]
+pub fn getb() -> Option<u8> {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return None; // no chip: no data, not an endless 0xFF
+    }
+    if COM1.read(UartReg::LineStatus) & LSR_DATA_READY == 0 {
+        return None;
+    }
+    Some(COM1.read(UartReg::Data))
+}
+
+/// Is a byte waiting on the receive side? Non-destructive — for `poll(2)` on a
+/// console fd, where consuming the byte would lose it before the following
+/// `read`.
+#[must_use]
+pub fn has_byte() -> bool {
+    if !PRESENT.load(Ordering::Relaxed) {
+        return false;
+    }
+    COM1.read(UartReg::LineStatus) & LSR_DATA_READY != 0
+}
+
+pub fn puts(s: &str) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            putb_raw(b'\r');
+        }
+        putb_raw(b);
+    }
+}
+
+/// Emit a `u64` as zero-padded 16-digit hex.
+///
+/// Fixed width rather than trimmed: leading zeros make addresses line up in a
+/// boot log, and a variable-width printer needs a branch this does not.
+pub fn put_hex(val: u64) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    put_hex_digits_raw(val);
+}
+
+/// The sixteen digits, lock already held. Shared by [`put_hex`] and
+/// [`fatal_hex`] so the two cannot format differently.
+fn put_hex_digits_raw(mut val: u64) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 16];
+    for slot in out.iter_mut().rev() {
+        *slot = DIGITS[(val & 0xF) as usize];
+        val >>= 4;
+    }
+    for &b in &out {
+        putb_raw(b);
+    }
+}
+
+/// Emit the low `nibbles` hex digits of `val`, zero-padded, no `0x`.
+///
+/// For fields that are not addresses — a PCI class byte, a 16-bit vendor id, a
+/// MAC octet — where the full 16-digit [`put_hex`] is noise.
+pub fn put_hexn(val: u64, nibbles: u32) {
+    if fatal_active() {
+        return;
+    }
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let n = nibbles.clamp(1, 16);
+    let _g = lock();
+    for shift in (0..n).rev() {
+        putb_raw(DIGITS[((val >> (shift * 4)) & 0xF) as usize]);
+    }
+}
+
+/// Emit a `u64` in decimal.
+pub fn put_dec(val: u64) {
+    if fatal_active() {
+        return;
+    }
+    let _g = lock();
+    put_dec_digits_raw(val);
+}
+
+/// The decimal digits, lock already held. Shared with [`fatal_dec`].
+fn put_dec_digits_raw(val: u64) {
+    if val == 0 {
+        putb_raw(b'0');
+        return;
+    }
+    // 20 digits is the width of u64::MAX; the buffer can never overflow.
+    let mut buf = [0u8; 20];
+    let mut n = val;
+    let mut i = buf.len();
+    while n > 0 {
+        i -= 1;
+        buf[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    for &b in &buf[i..] {
+        putb_raw(b);
+    }
+}

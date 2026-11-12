@@ -47,7 +47,7 @@ rows — see below. 18/18 host tests still pass; `tables_disagree_where_linux_do
 and `x86_only_legacy_spellings_are_not_in_the_table` cover the new rows without
 needing new test bodies.
 
-### `amd64/src/usermode.rs`
+### `crates/akuma-kernel-amd64/src/usermode.rs`
 
 Two legacy shims (`213`, `232`) before the neutral-table decode, four new
 `Syscall::` arms next to `Ppoll`/`Pselect6` (readiness family), and two new
@@ -76,7 +76,7 @@ routing through glue, unlike `Sendto`/`Recvfrom`'s existing AF_UNIX carve-out.
 `crate::sock::sys_socket` already allocates out of, so the two paths share
 data even though they're different code.
 
-### `amd64/src/exec_runtime.rs`
+### `crates/akuma-kernel-amd64/src/exec_runtime.rs`
 
 `eventfd_close`, `eventfd_clone_ref`, `epoll_destroy` were `not_wired!` (a
 panic) — real now, behind `#[cfg(feature = "sc-eventfd"/"sc-epoll")]`. These
@@ -95,7 +95,7 @@ The module header's stub count was also stale and got corrected: it said
 `resolve_file_id`/`read_at_by_inode` (no mount table on this target to answer
 from).
 
-### `amd64/Cargo.toml`
+### `crates/akuma-kernel-amd64/Cargo.toml`
 
 New `sc-epoll`/`sc-eventfd` features, forwarding to
 `akuma-syscalls-glue/sc-epoll`/`sc-eventfd`, added to `default`.
@@ -202,7 +202,7 @@ recognized industry-wide and Linux stopped reproducing it going forward. A
 `syscall_table!` row requires the two numbers to *differ*
 (`tables_disagree_where_linux_does` asserts it for every row), so `pidfd_open`
 would fail that test by construction. It's rule 3 in
-`akuma-syscalls-abi`'s module doc now, and `amd64/src/usermode.rs` gained a
+`akuma-syscalls-abi`'s module doc now, and `crates/akuma-kernel-amd64/src/usermode.rs` gained a
 third dispatch category alongside the x86-only-legacy list and the neutral
 table: a `match nr` for shared numbers, dispatched straight to glue with the
 one number both sides already agree on, no `Syscall` variant involved. Verified
@@ -216,7 +216,7 @@ Only `pidfd_open` was dispatched in this pass — `akuma-syscalls-glue::pidfd`
 had no `sys_pidfd_send_signal` at all, so 424 was left unreached. Given a
 fourth "keep going", it now does — see "Follow-up 3" below.
 
-`amd64/src/exec_runtime.rs`: `pidfd_close` goes from `not_wired!` to real
+`crates/akuma-kernel-amd64/src/exec_runtime.rs`: `pidfd_close` goes from `not_wired!` to real
 (`akuma_syscalls_glue::pidfd::pidfd_close`) behind `#[cfg(feature =
 "sc-pidfd")]`, same reasoning as the eventfd/epoll teardown hooks — once
 `pidfd_open` can be dispatched, `FileDescriptor::PidFd` is a real,
@@ -227,12 +227,12 @@ from four before this follow-up and nine before the epoll/eventfd pass.
 **No ABI-boundary bug this time** — `struct itimerspec` (two back-to-back
 `struct timespec`, 32 bytes) has no x86_64 packing wart the way `struct
 epoll_event` does; every 64-bit architecture lays it out the same way, and
-`amd64/src/usermode.rs` already forwards several other `Timespec`-shaped
+`crates/akuma-kernel-amd64/src/usermode.rs` already forwards several other `Timespec`-shaped
 syscalls (`ClockGettime`, `Nanosleep`, …) through the identical path
 unmodified. Confirmed rather than assumed: `timerfd_gettime` came back with
 the right `it_value` on the first live try.
 
-`amd64/Cargo.toml`: `sc-timerfd`/`sc-pidfd` added, both default-on.
+`crates/akuma-kernel-amd64/Cargo.toml`: `sc-timerfd`/`sc-pidfd` added, both default-on.
 
 ### Live verification
 
@@ -266,7 +266,7 @@ already correct on purpose.
 ## What else was missing: a full syscall-table audit
 
 Beyond the specific ask, every row in the (now 113-entry) `Syscall` table was
-diffed against every `Syscall::` reference in `amd64/src/usermode.rs`, to find
+diffed against every `Syscall::` reference in `crates/akuma-kernel-amd64/src/usermode.rs`, to find
 any table row with a glue implementation and no amd64 dispatch arm at all —
 the exact shape of gap `epoll_ctl` etc. were in before this session.
 
@@ -335,7 +335,7 @@ returned to userspace, not a `FileDescriptor`/fd-table entry, and neither is
 a SysV `msqid` (queues persist independent of any one process, matching
 real Linux — a crash doesn't destroy the queue). No new teardown hooks.
 
-`amd64/Cargo.toml`: `sc-aio`/`sc-sysv-ipc` added, both default-on.
+`crates/akuma-kernel-amd64/Cargo.toml`: `sc-aio`/`sc-sysv-ipc` added, both default-on.
 `akuma-vfs-glue/sc-sysv-ipc` (the `/proc/sysvipc/msg` listing) is
 deliberately **not** forwarded — that code lives inside `akuma-vfs-glue`'s
 `ProcFilesystem`, which does not build for `x86_64-unknown-none` at all, so
@@ -380,7 +380,7 @@ same simplification already made for plain `kill`. `flags` must be `0`
 `crates/akuma-syscalls-linux/src/nr.rs`: `PIDFD_SEND_SIGNAL = 424`, same
 number on both architectures (confirmed against musl's headers along with
 `pidfd_open`'s in Follow-up 1) — another shared-number dispatch in
-`amd64/src/usermode.rs`'s third match block, no `syscall_table!` row.
+`crates/akuma-kernel-amd64/src/usermode.rs`'s third match block, no `syscall_table!` row.
 
 ### Live verification
 
@@ -424,12 +424,12 @@ default for the *whole workspace*, amd64 package included.** Running
 x86_64 `UserAddressSpace` impl — `map_page_pte`, `pte_prot`,
 `for_each_leaf_in_range`, `rewrite_leaves_in_range`, `for_each_user_leaf`)
 compiles out, `UserAddressSpace` resolves to the aarch64 struct instead, and
-`amd64/src/uas.rs`/`uaccess.rs` — which call those x86_64-only methods by
+`crates/akuma-kernel-amd64/src/uas.rs`/`uaccess.rs` — which call those x86_64-only methods by
 name — fail with "no method named `X` found for struct `UserAddressSpace`".
 111 such errors, completely reproducible, looking exactly like a genuine
 pre-existing breakage on this branch.
 
-**It is not one.** `amd64/build.rs` and the crate's own doc comments say the
+**It is not one.** `crates/akuma-kernel-amd64/build.rs` and the crate's own doc comments say the
 correct invocation is `cargo build --release --target x86_64-unknown-none`
 from inside `amd64/` (there is deliberately no `[target.x86_64-unknown-none]`
 default in the workspace config, precisely so ad-hoc

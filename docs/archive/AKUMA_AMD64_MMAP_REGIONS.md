@@ -3,7 +3,7 @@
 **Date:** 2026-09-07
 **Scope:** items **B1** and **B2** of the unlock tree in
 `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` — wire the shared region table into
-`amd64/src/mm.rs`, then teach the `#PF` handler to service a not-present fault
+`crates/akuma-kernel-amd64/src/mm.rs`, then teach the `#PF` handler to service a not-present fault
 out of it.
 **Status:** done and verified on three rigs.
 **Proposal:** `proposals/NEXT_AGENT_AMD64_MMAP.md`.
@@ -12,7 +12,7 @@ out of it.
 
 ## What was wrong
 
-`amd64/src/mm.rs` was an eager bump allocator with no region table. Every one of
+`crates/akuma-kernel-amd64/src/mm.rs` was an eager bump allocator with no region table. Every one of
 its limits was a wall `rustc` hits, and they were not independent — each was a
 consequence of having nowhere to record what a process had mapped:
 

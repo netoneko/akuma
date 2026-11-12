@@ -1,0 +1,92 @@
+[package]
+name = "akuma-drivers-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 kernel's device drivers: the wiring between the host-tested driver crates and the machine half's per-class registration seam. One feature per driver."
+
+[lints]
+workspace = true
+
+# One feature per driver. A driver whose feature is off is not compiled, and `register` does
+# not install it, so the machine half's probe for that class does nothing. `all` is what the
+# bin's default (bare-metal) image enables; the root `Cargo.toml` names the smaller sets.
+[features]
+all = ["fbcon", "hda", "i8042", "kvm", "nvme", "touchpad", "wifi", "xhci"]
+# The bin's `no-tests`: drivers register no boot-suite checks.
+no-tests = []
+# The storage and keyboard drivers a test box keeps (the bin's `headless`).
+storage-and-input = ["storage", "i8042"]
+# The storage drivers alone (the bin's `server`, which has no interactive console).
+storage = ["nvme", "xhci"]
+# The framebuffer text console on GRUB's linear framebuffer, with the boot splash and
+# `/dev/fb0`'s registration. Off, the multiboot2 boot is headless: its console is the serial
+# port (the bare-metal reference machine has no UART, so a build for it wants this on).
+fbcon = [
+    "dep:akuma-fbcon", "dep:akuma-fbdev", "dep:akuma-multiboot2", "dep:akuma-pagetable",
+    "dep:akuma-boot-amd64", "dep:akuma-cpu", "dep:akuma-primitives", "dep:spinning_top",
+]
+# The laptop's I2C-HID touchpad (DesignWare I2C controller) behind `/dev/input/mouse0`.
+touchpad = [
+    "dep:akuma-dwi2c", "dep:akuma-hid", "dep:akuma-i2c-hid", "dep:akuma-touchpad",
+    "dep:akuma-primitives", "dep:akuma-ryzen-amd64", "dep:spinning_top",
+]
+# Wi-Fi: `/dev/wifi0` (with its `wifisim` backend) and the RTL8852CE (rtw89) card as a
+# WPA2 station that can be the network link. Off, there is no `/dev/wifi0` and the link is
+# the RTL8169 or loopback; it also takes the card's 4 MiB of receive buffers out of `.bss`
+# and its ~600 KiB of register sequences out of `.rodata`.
+wifi = [
+    "dep:akuma-wifi", "dep:akuma-rtw89", "dep:akuma-ieee80211", "dep:akuma-wpa", "dep:akuma-net",
+    "dep:akuma-pci", "dep:akuma-dma", "dep:akuma-primitives", "dep:spinning_top",
+]
+# The AMD SVM hypervisor: `/dev/kvm0`, the `/dev/kvm` ioctl surface and the `/dev/net/tun`
+# tap behind its gateway (`docs/reference/subsystems/kvm.md`). AMD only; off, none of the
+# three nodes opens, as on a CPU without SVM.
+kvm = ["dep:akuma-kvm-amd64"]
+# The xHCI USB host controller: a USB mass-storage root (`root=/dev/sda1`, `usb`) and the boot
+# keyboard behind it. A controller the firmware left running is stopped by the machine half on
+# every boot whether or not this is on.
+xhci = [
+    "dep:akuma-xhci", "dep:akuma-usb", "dep:akuma-usb-storage", "dep:akuma-dma", "dep:akuma-pci",
+    "dep:akuma-primitives", "dep:akuma-selftest", "dep:spinning_top",
+]
+# NVMe: the bare-metal root disk (`root=/dev/nvme0n1pN`) and the hypervisor's guest partition.
+nvme = ["dep:akuma-nvme", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:spinning_top"]
+# The i8042 keyboard controller (PS/2, or the firmware's USB legacy emulation of one).
+i8042 = ["dep:akuma-port", "dep:spinning_top"]
+# Intel HD Audio playback behind `/dev/dsp`.
+hda = ["dep:akuma-hda", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:akuma-virtio", "dep:spinning_top"]
+
+# Kernel-only. Specs are copied from `crates/akuma-kernel-amd64/Cargo.toml` exactly, default features included:
+# a dependency named here with more features than the kernel names would turn them on for the
+# whole kernel through feature unification.
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+akuma-kernel-amd64 = { path = "../akuma-kernel-amd64", default-features = false }
+akuma-kvm-amd64 = { path = "../akuma-kvm-amd64", optional = true }
+akuma-primitives = { path = "../akuma-primitives", optional = true }
+akuma-boot-amd64 = { path = "../akuma-boot-amd64", optional = true }
+akuma-cpu = { path = "../akuma-cpu", optional = true }
+akuma-dma = { path = "../akuma-dma", optional = true }
+akuma-dwi2c = { path = "../akuma-dwi2c", optional = true }
+akuma-fbcon = { path = "../akuma-fbcon", optional = true }
+akuma-fbdev = { path = "../akuma-fbdev", optional = true }
+akuma-hda = { path = "../akuma-hda", optional = true }
+akuma-hid = { path = "../akuma-hid", optional = true }
+akuma-ieee80211 = { path = "../akuma-ieee80211", optional = true }
+akuma-i2c-hid = { path = "../akuma-i2c-hid", optional = true }
+akuma-multiboot2 = { path = "../akuma-multiboot2", optional = true }
+akuma-nvme = { path = "../akuma-nvme", optional = true }
+akuma-port = { path = "../akuma-port", optional = true }
+akuma-selftest = { path = "../akuma-selftest", optional = true }
+akuma-usb = { path = "../akuma-usb", optional = true }
+akuma-usb-storage = { path = "../akuma-usb-storage", optional = true }
+akuma-xhci = { path = "../akuma-xhci", optional = true }
+akuma-net = { path = "../akuma-net", features = ["rtl8169"], optional = true }
+akuma-pagetable = { path = "../akuma-pagetable", optional = true }
+akuma-pci = { path = "../akuma-pci", optional = true }
+akuma-rtw89 = { path = "../akuma-rtw89", optional = true }
+akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64", optional = true }
+akuma-touchpad = { path = "../akuma-touchpad", optional = true }
+akuma-virtio = { path = "../akuma-virtio", optional = true }
+akuma-wifi = { path = "../akuma-wifi", optional = true }
+akuma-wpa = { path = "../akuma-wpa", optional = true }
+spinning_top = { version = "0.3", optional = true }

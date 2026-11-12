@@ -2,7 +2,7 @@
 name = "akuma-sched-amd64"
 version = "0.1.0"
 edition = "2024"
-description = "The machine half of the amd64 scheduler: the per-slot machine table (page-table root, trap stack, user context, FP state, pinning, affinity), and the switch / can_run / prepare_task_slot hooks akuma-threading asks for - generic over a Platform each kernel implements. Extracted from amd64/src/sched.rs so Taoxichuan and the metal kernel run the same code."
+description = "The machine half of the amd64 scheduler: the per-slot machine table (page-table root, trap stack, user context, FP state, pinning, affinity), and the switch / can_run / prepare_task_slot hooks akuma-threading asks for - generic over a Platform each kernel implements. Extracted from crates/akuma-kernel-amd64/src/sched.rs so Taoxichuan and the metal kernel run the same code."
 
 [lints]
 workspace = true

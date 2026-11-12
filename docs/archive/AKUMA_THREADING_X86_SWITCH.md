@@ -16,7 +16,7 @@ SGI-interrupt/fake-IRQ-frame mechanism those functions already had — see the
 gate-fix doc and the proposal for why that mechanism has no smaller version,
 only a materially different and simpler one.
 
-**Ported, not invented**: `amd64/src/sched.rs`'s `switch_context`
+**Ported, not invented**: `crates/akuma-kernel-amd64/src/sched.rs`'s `switch_context`
 (`push rbp/rbx/r12/r13/r14/r15; mov [rdi],rsp; mov rsp,[rsi]; pop …; ret`) is
 already proven — its own `smoke_test` runs real cooperative+preemptive
 round-robin scheduling in every `amd64/run.sh` boot. `akuma-threading` gets
@@ -53,7 +53,7 @@ answer `0` off `aarch64` (`akuma-primitives::preempt::current_tid`, the
 sibling fix to `akuma-mmu`'s own gate bug), so every thread would misread as
 "thread 0" if the switch used it. x86_64 has no free per-thread register for
 the same trick without also claiming `IA32_FS_BASE`, which
-`amd64/src/usermode.rs` already needs for real userspace TLS — out of scope
+`crates/akuma-kernel-amd64/src/usermode.rs` already needs for real userspace TLS — out of scope
 here, same as no-SMP.
 
 ## What compiles now vs. what still doesn't

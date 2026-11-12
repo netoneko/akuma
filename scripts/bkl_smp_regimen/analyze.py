@@ -49,7 +49,8 @@ def main(path):
               "(511 = profiler off)")
 
     windows = re.findall(
-        r"\[BKLPROF\] w(\d+) t=(\d+)s spins=(\d+) attributed=(\d+) windows_preserved=(\d+)",
+        # `windows_preserved=` is in logs from before 2026-11-11 only.
+        r"\[BKLPROF\] w(\d+) t=(\d+)s spins=(\d+) attributed=(\d+)(?: windows_preserved=(\d+))?",
         text)
     if not windows:
         print("\n-- attribution: none (build lacks the `bkl-profile` feature)")
@@ -64,7 +65,8 @@ def main(path):
     busiest = sorted(windows, key=lambda w: -int(w[2]))[:5]
     print("   busiest windows (spins):")
     for w, t, spins, attributed, preserved in busiest:
-        print(f"     w{w:>3} t={t}s spins={spins} attributed={attributed} preserved={preserved}")
+        extra = f" preserved={preserved}" if preserved else ""
+        print(f"     w{w:>3} t={t}s spins={spins} attributed={attributed}{extra}")
     print(f"   cumulative attributed spins by holder tag (total {total}):")
     for (label, tag), spins in per_tag.most_common(12):
         pct = 100.0 * spins / total if total else 0.0

@@ -409,10 +409,20 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
             }
         }
 
+        // Nothing to do: block until a connection arrives, and at most a second so a
+        // finished session is reaped (and its `max_sessions` slot freed) promptly. This
+        // was `sleep_ms(1)`: three syscalls a millisecond on an idle box, ~2300/s, and a
+        // timed sleeper that kept the kernel tick at 1 kHz on every core.
         if !did_work {
-            sleep_ms(1);
+            let mut fds = [PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 }];
+            let _ = poll(&mut fds, ACCEPT_POLL_MS);
         }
     }}
+
+/// The longest the fork-sessions accept loop waits in `poll` with no connection: how late a
+/// finished session can be reaped.
+#[cfg(feature = "fork-sessions")]
+const ACCEPT_POLL_MS: i32 = 1000;
 
 /// Yield exactly one poll cycle back to this session's `block_on`, then resume
 /// on the next poll.

@@ -60,18 +60,18 @@ The published numbers this feeds live in ``docs/archive/LINE_COUNT_ANALYSIS.md``
 which is a *living* document — re-measure and rewrite it in place rather than
 appending a new snapshot.
 
-The report also splits the tree by PLATFORM. The repo is two kernels — the
-AArch64 bin (``src/``) and the amd64 bin (``amd64/``) — over one shared crate
-pool. Which pool a crate belongs to is derived from the
-``#[cfg(target_arch = ...)]`` attributes the lexer already parsed, never from a
-hand-kept table: a crate naming exactly one arch is arch-only, anything else is
-shared. Each kernel's "links" footprint is its bin plus its arch-only crates
-plus the shared pool; the two footprints deliberately double-count the pool, so
+The report also splits the tree by PLATFORM. The repo is one kernel package,
+``akuma`` (bin root ``src/``), built for two targets over one crate pool; the
+amd64 machine half (``crates/akuma-kernel-amd64``) is an amd64-only crate like
+any other. Which pool a crate belongs to is read from ``cargo tree`` per target,
+falling back to the ``#[cfg(target_arch = ...)]`` attributes the lexer already
+parsed, never from a hand-kept table. Each target's "links" footprint is the
+bin plus its arch-only crates plus the shared pool; the two footprints deliberately double-count the pool, so
 the gap between them is the duplication the shared-crate extraction has not yet
 absorbed.
 
 Usage:
-    scripts/cloc_akuma.py                      # defaults to src/ crates/ amd64/src/ taoxichuan/src/
+    scripts/cloc_akuma.py                      # defaults to src/ crates/ taoxichuan/src/
     scripts/cloc_akuma.py src crates --by-file
     scripts/cloc_akuma.py --json
     scripts/cloc_akuma.py --all-languages      # also C, asm, shell, TOML, Markdown, ...
@@ -337,6 +337,9 @@ class FileCount:
     #: has none left (2026-09-01), and if one comes back it understates the
     #: crate rather than overstating it.
     forbids_unsafe: bool = False
+    #: The ban is `#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]`: it
+    #: binds production lines only, so test sites in the crate are not a leak.
+    forbid_production_only: bool = False
     #: Production CODE lines lying inside an `unsafe { .. }` block, plus the
     #: declaration line of an `unsafe fn`/`impl`/`trait`. This is the "how much
     #: of what ships is the compiler NOT checking" number; `unsafe_sites` counts
@@ -456,6 +459,11 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
     # edition-2024 `#[unsafe(..)]` attribute — neither of which opens an unsafe
     # *context*, so those count one line and nothing more.
     unsafe_pending = False
+    # The last `unsafe` token might yet turn out to be a function-pointer *type*
+    # (`unsafe fn(..)`, `unsafe extern "C" fn(..)` — a cast target or a field
+    # type, never a site): "unsafe" -> after it, "extern" -> after `extern`.
+    # A `fn` followed directly by `(` retracts the site the token recorded.
+    unsafe_fnptr_watch = ""
     unsafe_spans: list = []  # open blocks: dicts of start line / brace depth
     # Architectures named by `#[cfg(target_arch = "...")]` attributes (see
     # FileCount.arches).
@@ -702,6 +710,21 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                     and spans[-1]["depth"] == depth and spans[-1]["pdepth"] == pdepth
                     and last_ident != "pub"):
                 spans[-1]["kind"] = "item" if last_ident in ITEM_KEYWORDS else "expr"
+            if unsafe_fnptr_watch and last_ident != "unsafe":
+                if last_ident == "extern" and unsafe_fnptr_watch == "unsafe":
+                    unsafe_fnptr_watch = "extern"
+                else:
+                    if last_ident == "fn":
+                        k = j
+                        while k < n and text[k] in " \t\n":
+                            k += 1
+                        if k < n and text[k] == "(" and unsafe_lines:
+                            # A type, not a declaration: no name between `fn` and
+                            # its parameters. Undo what the `unsafe` token recorded.
+                            ln = unsafe_lines.pop()
+                            if ln not in unsafe_lines:
+                                unsafe_span.discard(ln)
+                    unsafe_fnptr_watch = ""
             if last_ident != "unsafe" and unsafe_pending:
                 # `unsafe fn` / `unsafe impl` / `unsafe trait` / `unsafe extern`.
                 # In edition 2024 an `unsafe fn` body is NOT itself an unsafe
@@ -726,6 +749,7 @@ def scan(text: str, spec: LangSpec, kernel_gate: bool = True):
                 unsafe_lines.append(line)
                 unsafe_span.add(line)
                 unsafe_pending = True
+                unsafe_fnptr_watch = "unsafe"
             i = j
             continue
 
@@ -806,7 +830,13 @@ ITEM_KEYWORDS = {
 
 #: A crate-level `#![forbid(unsafe_code)]`, at the start of a line so a mention
 #: inside a doc comment ("carries `#![forbid(unsafe_code)]`") does not match.
-FORBID_RE = re.compile(r"^\s*#!\[forbid\([^)]*\bunsafe_code\b", re.M)
+#: `#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]` counts too: this
+#: script already scores `no-tests`-gated code as test code, so a ban on the
+#: `no-tests` image is a ban on exactly the lines it calls production
+#: (`akuma-kernel-amd64`, whose boot-suite probes keep their `unsafe`).
+FORBID_RE = re.compile(
+    r'^\s*#!\[(cfg_attr\(\s*feature\s*=\s*"no-tests"\s*,\s*)?forbid\([^)]*\bunsafe_code\b', re.M
+)
 
 #: The arch named by a `#[cfg(target_arch = "...")]` attribute. Matched against
 #: the attribute's inner text, which the lexer has already cut out of comments
@@ -833,9 +863,9 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate,
     fc = FileCount(path=relpath, lang=spec.name)
     fc.arches = arches
     fc.whole_file_test = (filename_tests and is_test_path(relpath)) or inner_test
-    fc.forbids_unsafe = FORBID_RE.search(text) is not None and os.path.basename(
-        relpath
-    ) in ("lib.rs", "main.rs")
+    m = FORBID_RE.search(text)
+    fc.forbids_unsafe = m is not None and os.path.basename(relpath) in ("lib.rs", "main.rs")
+    fc.forbid_production_only = fc.forbids_unsafe and m.group(1) is not None
     for ln in unsafe_lines:
         if fc.whole_file_test or ln in test:
             fc.test_unsafe_sites += 1
@@ -1056,6 +1086,8 @@ class Agg:
     #: True once this component's crate root carried `#![forbid(unsafe_code)]`.
     #: See `FileCount.forbids_unsafe` for why only the root counts.
     forbids_unsafe: bool = False
+    #: See `FileCount.forbid_production_only`.
+    forbid_production_only: bool = False
 
     def add(self, fc: FileCount):
         self.files += 1
@@ -1065,6 +1097,7 @@ class Agg:
         self.unsafe_code += fc.unsafe_code
         self.test_unsafe_code += fc.test_unsafe_code
         self.forbids_unsafe = self.forbids_unsafe or fc.forbids_unsafe
+        self.forbid_production_only = self.forbid_production_only or fc.forbid_production_only
         for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code",
                   "copy_sites", "test_copy_sites", "mut_sites", "test_mut_sites"):
             setattr(self, f, getattr(self, f) + getattr(fc, f))
@@ -1079,6 +1112,7 @@ class Agg:
         self.unsafe_code += other.unsafe_code
         self.test_unsafe_code += other.test_unsafe_code
         self.forbids_unsafe = self.forbids_unsafe or other.forbids_unsafe
+        self.forbid_production_only = self.forbid_production_only or other.forbid_production_only
         for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code",
                   "copy_sites", "test_copy_sites", "mut_sites", "test_mut_sites"):
             setattr(self, f, getattr(self, f) + getattr(other, f))
@@ -1259,7 +1293,7 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
     all_code = sum(a.total_code for a in crates.values())
     all_unsafe = sum(a.unsafe_sites for a in crates.values())
     all_test_unsafe = sum(a.test_unsafe_sites for a in crates.values())
-    leaked = sum(a.unsafe_sites + a.test_unsafe_sites for a in safe)
+    leaked = sum(a.unsafe_sites + (0 if a.forbid_production_only else a.test_unsafe_sites) for a in safe)
     prod_code = sum(a.code for a in crates.values())
     prod_unsafe_code = sum(a.unsafe_code for a in crates.values())
     prod_safe_code = prod_code - prod_unsafe_code
@@ -1299,7 +1333,7 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
         print(f"{'unsafe sites by scope':<26}{'total':>11}{'production':>12}{'test':>8}")
         print(rule(W))
         # One row per root that was actually counted. `bins` used to be reported as
-        # a single "src/", which silently folded `amd64/src` into the AArch64
+        # a single "src/", which silently folded `crates/akuma-kernel-amd64/src` into the AArch64
         # kernel's number; the two kernels are different programs and the
         # port's `unsafe` is the one being driven down.
         def root_of(comp: str) -> str:
@@ -1384,15 +1418,16 @@ def cargo_tree(pkg: str, triple: str, features: str = "", default: bool = True):
     return sorted(seen)
 
 
-#: manifest -> (cargo package, target triple) for the kernels `linked_crates` can ask cargo about.
+#: manifest -> cargo package, for the kernels `linked_crates` can ask cargo about. The root
+#: `akuma` package is both kernels (one package, two targets, since 2026-11-12), so the
+#: target triple is the caller's.
 KERNEL_PACKAGES = {
-    "Cargo.toml": ("akuma", "aarch64-unknown-none"),
-    os.path.join("amd64", "Cargo.toml"): ("akuma-amd64", "x86_64-unknown-none"),
-    os.path.join("taoxichuan", "Cargo.toml"): ("taoxichuan", "x86_64-unknown-none"),
+    "Cargo.toml": "akuma",
+    os.path.join("taoxichuan", "Cargo.toml"): "taoxichuan",
 }
 
 
-def linked_crates(root_manifest: str) -> set:
+def linked_crates(root_manifest: str, triple: str = "x86_64-unknown-none") -> set:
     """Workspace crate directories a kernel links, as repo-relative paths (the
     kernel's own dir excluded).
 
@@ -1404,7 +1439,7 @@ def linked_crates(root_manifest: str) -> set:
     """
     kp = KERNEL_PACKAGES.get(root_manifest)
     if kp:
-        tree = cargo_tree(*kp)
+        tree = cargo_tree(kp, triple)
         if tree:
             root = os.path.abspath(".")
             own = os.path.abspath(os.path.dirname(root_manifest))
@@ -1427,10 +1462,10 @@ def linked_crates(root_manifest: str) -> set:
 def platform_buckets(files: list) -> dict:
     """Group every component into a platform bucket, derived from the source.
 
-    The tree is two kernels over one shared crate pool: `src/` is the AArch64
-    bin (root `Cargo.toml`), `amd64/` is the second bin, `crates/` serve
-    whichever kernels link them. Which kernel links a crate is read from the
-    Cargo dependency graph (path dependencies, transitively):
+    The tree is one kernel package (`akuma`, root `Cargo.toml`, bin root `src/`)
+    built for two targets over one crate pool; `src/` is in both images, so it is
+    its own bucket and counts toward both footprints. Which target links a crate
+    is read from `cargo tree` for each triple:
 
       linked by both kernels — shared
       linked by only amd64   — amd64-only
@@ -1449,16 +1484,14 @@ def platform_buckets(files: list) -> dict:
     for fc in files:
         comp_arches.setdefault(component_of(fc.path), set()).update(fc.arches)
 
-    a64 = linked_crates("Cargo.toml")
-    x64 = linked_crates(os.path.join("amd64", "Cargo.toml"))
+    a64 = linked_crates("Cargo.toml", "aarch64-unknown-none")
+    x64 = linked_crates("Cargo.toml", "x86_64-unknown-none")
     have_graph = bool(a64 or x64)
 
     buckets: dict = {}
     for comp, arches in comp_arches.items():
         if comp == "src" or comp.startswith("src" + os.sep):
-            buckets.setdefault("aarch64 bin", []).append(comp)
-        elif comp == "amd64" or comp.startswith("amd64" + os.sep):
-            buckets.setdefault("amd64 bin", []).append(comp)
+            buckets.setdefault("kernel bin", []).append(comp)
         elif comp == "taoxichuan" or comp.startswith("taoxichuan" + os.sep):
             buckets.setdefault("taoxichuan bin", []).append(comp)
         elif have_graph and comp in a64 and comp in x64:
@@ -1509,7 +1542,7 @@ def print_platform_report(files: list, W: int) -> None:
         f"{'unsafe':>8}{'enforced':>10}"
     )
     print(rule(W))
-    order = ("aarch64 bin", "amd64 bin", "taoxichuan bin", "aarch64-only crates",
+    order = ("kernel bin", "taoxichuan bin", "aarch64-only crates",
              "amd64-only crates", "shared crates")
     for name in order:
         if name not in by_bucket:
@@ -1523,8 +1556,8 @@ def print_platform_report(files: list, W: int) -> None:
     print(rule(W))
 
     for label, bin_key, only_key in (
-        ("aarch64 kernel links", "aarch64 bin", "aarch64-only crates"),
-        ("amd64 kernel links", "amd64 bin", "amd64-only crates"),
+        ("aarch64 kernel links", "kernel bin", "aarch64-only crates"),
+        ("amd64 kernel links", "kernel bin", "amd64-only crates"),
     ):
         parts = [by_bucket[k] for k in (bin_key, only_key, "shared crates") if k in by_bucket]
         if not parts:
@@ -1538,7 +1571,7 @@ def print_platform_report(files: list, W: int) -> None:
     # its footprint is its own source plus the closure of its path dependencies, which sit in
     # whichever bucket above they belong to, so it cannot be a sum of buckets.
     if "taoxichuan bin" in by_bucket:
-        linked = linked_crates(os.path.join("taoxichuan", "Cargo.toml"))
+        linked = linked_crates(os.path.join("taoxichuan", "Cargo.toml"), "x86_64-unknown-none")
         tx = Agg()
         tx.merge(by_bucket["taoxichuan bin"])
         n_crates = 0
@@ -1568,7 +1601,7 @@ def print_platform_report(files: list, W: int) -> None:
 #: --filter-platform` resolves target-specific dependencies against.
 EXTERNAL_KERNELS = {
     "aarch64": ("Cargo.toml", "aarch64-unknown-none"),
-    "amd64": (os.path.join("amd64", "Cargo.toml"), "x86_64-unknown-none"),
+    "amd64": ("Cargo.toml", "x86_64-unknown-none"),
     "taoxichuan": (os.path.join("taoxichuan", "Cargo.toml"), "x86_64-unknown-none"),
 }
 
@@ -1584,7 +1617,7 @@ def external_closure(manifest: str, triple: str):
     Returns None if cargo cannot answer.
     """
     kp = KERNEL_PACKAGES.get(manifest)
-    tree = cargo_tree(kp[0], triple) if kp else None
+    tree = cargo_tree(kp, triple) if kp else None
     if tree is None:
         return None
     try:
@@ -1674,8 +1707,7 @@ AUDIT_KERNELS = {
                          "x86_64-unknown-none", "no-tests", True),
     "taoxichuan-aarch64": (os.path.join("taoxichuan", "Cargo.toml"), "taoxichuan",
                            "aarch64-unknown-none", "no-tests", True),
-    "akuma-amd64": (os.path.join("amd64", "Cargo.toml"), "akuma-amd64",
-                    "x86_64-unknown-none", "no-tests", True),
+    "akuma-amd64": ("Cargo.toml", "akuma", "x86_64-unknown-none", "no-tests", True),
     "akuma-aarch64": ("Cargo.toml", "akuma", "aarch64-unknown-none", "no-tests", True),
 }
 
@@ -1685,6 +1717,7 @@ AUDIT_KERNELS = {
 #: once for both. `--audit taoxichuan` means both tracks.
 AUDIT_TRACKS = {
     "taoxichuan": ("taoxichuan-amd64", "taoxichuan-aarch64"),
+    "akuma": ("akuma-amd64", "akuma-aarch64"),
 }
 
 
@@ -2338,6 +2371,24 @@ UNSAFE_CASES = [
     ("unsafe impl is one line", "unsafe impl Send for X {}\n", 1, 1),
     ("unsafe trait is one line", "unsafe trait T {\n    fn a();\n}\n", 1, 1),
     (
+        "an unsafe fn-pointer type in a cast is not a site",
+        "fn f() {\n    let a = g as unsafe fn(&X) -> ! as usize;\n}\n",
+        0,
+        0,
+    ),
+    (
+        "nor is an unsafe extern fn-pointer type",
+        'struct S {\n    f: unsafe extern "C" fn(u64) -> u64,\n}\n',
+        0,
+        0,
+    ),
+    (
+        "but an unsafe extern fn declaration is",
+        'unsafe extern "C" fn f() {\n    a();\n}\n',
+        1,
+        1,
+    ),
+    (
         "unsafe extern block declares, it does not execute",
         'unsafe extern "C" {\n    fn a();\n}\n',
         1,
@@ -2444,7 +2495,7 @@ UNSAFE_CASES = [
         # A plain feature gate says nothing about tests; charging it to test
         # would hide real shipped `unsafe` behind any optional feature.
         "a non-test feature gate is production",
-        '#[cfg(feature = "smp-shared")]\nfn f() {\n    unsafe { a() };\n}\n',
+        '#[cfg(feature = "bkl-smp")]\nfn f() {\n    unsafe { a() };\n}\n',
         1,
         1,
     ),
@@ -2557,16 +2608,20 @@ def self_test() -> int:
         files, _ = walk(["crates"], True)
         by_crate: dict = {}
         for f in files:
-            agg = by_crate.setdefault(component_of(f.path), [False, 0])
+            agg = by_crate.setdefault(component_of(f.path), [False, 0, 0, False])
             agg[0] = agg[0] or f.forbids_unsafe
-            agg[1] += f.unsafe_sites + f.test_unsafe_sites
-        contradictions = [c for c, (forbids, sites) in by_crate.items() if forbids and sites]
+            agg[1] += f.unsafe_sites
+            agg[2] += f.test_unsafe_sites
+            agg[3] = agg[3] or f.forbid_production_only
+        # A `no-tests`-only ban binds production lines; its test sites are legal.
+        contradictions = [c for c, (forbids, prod, test, prod_only) in by_crate.items()
+                          if forbids and (prod or (test and not prod_only))]
         if contradictions:
             failures += 1
             print(f"  FAIL crate(s) claim #![forbid(unsafe_code)] yet report sites: "
                   f"{sorted(contradictions)}")
         else:
-            n = sum(1 for forbids, _ in by_crate.values() if forbids)
+            n = sum(1 for forbids, *_ in by_crate.values() if forbids)
             print(f"  ok   every forbidding crate reports zero unsafe sites ({n})")
 
     # A file the walker calls a test file must charge nothing to production, and
@@ -2731,15 +2786,14 @@ def emit_json(files: list, paths: list) -> None:
     )
 
 
-# `amd64/src`, not `amd64`: the bin's directory also holds `mkdisk.sh`, `Cargo.toml`,
-# a README and linker/boot scaffolding, which this counter would report as code.
-# The platform split keys on the `amd64/` prefix, so the narrower root changes nothing there.
-DEFAULT_PATHS = ["src", "crates", os.path.join("amd64", "src"), os.path.join("taoxichuan", "src")]
+# The amd64 machine half is `crates/akuma-kernel-amd64` (it was `amd64/` until 2026-11-12, when
+# this list named `amd64/src` to skip the scripts beside it), so `crates` covers it.
+DEFAULT_PATHS = ["src", "crates", os.path.join("taoxichuan", "src")]
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates amd64/src taoxichuan/src)")
+    ap.add_argument("paths", nargs="*", default=DEFAULT_PATHS, help="files/dirs (default: src crates taoxichuan/src)")
     ap.add_argument("--by-file", action="store_true", help="per-file table")
     ap.add_argument("--top", type=int, default=15, help="show N largest files (0 = off)")
     ap.add_argument("--json", action="store_true", help="machine-readable output")

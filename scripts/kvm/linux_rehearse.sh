@@ -3,8 +3,8 @@
 #
 #   scripts/kvm/linux_rehearse.sh LOG [SECONDS]
 #
-# Env: KERNEL   the amd64 kernel (default target/x86_64-unknown-none/release/akuma-amd64,
-#               built with: cargo build -p akuma-amd64 --target x86_64-unknown-none
+# Env: KERNEL   the amd64 kernel (default target/x86_64-unknown-none/release/akuma,
+#               built with: cargo build -p akuma --target x86_64-unknown-none
 #               --release --features no-tests)
 #      ROOT     the host's root ext2 image; it must contain /boot/vmlinux
 #               (the Firecracker CI vmlinux-6.1.128; `debugfs -w -R "write ..."`)
@@ -17,7 +17,7 @@
 set -eu
 LOG=${1:?usage: linux_rehearse.sh LOG [SECONDS]}
 MAX=${2:-150}
-KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma-amd64}
+KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma}
 ROOT=${ROOT:?set ROOT to the host root image}
 W=$(mktemp -d)
 trap 'rm -rf "$W"' EXIT

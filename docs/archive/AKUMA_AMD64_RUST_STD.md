@@ -2,7 +2,7 @@
 
 **Date:** 2026-09-06
 **Scope:** `userspace/amd64/ruststd`, `userspace/amd64/threadprobe`,
-`amd64/src/{thread,futex}.rs`, the `a6` syscall-argument change, and the
+`crates/akuma-kernel-amd64/src/{thread,futex}.rs`, the `a6` syscall-argument change, and the
 `clone`/`futex`/`gettid`/`exit` dispatch arms.
 **Status:** done. A `x86_64-unknown-linux-musl` Rust `std` binary runs all six
 of its stages on this kernel, spawns and joins a thread, and exits with the
@@ -125,7 +125,7 @@ this was a day and not a week.
 
 ## 4. What was built
 
-### 4a. `amd64/src/thread.rs` — `clone(CLONE_VM|CLONE_THREAD)`
+### 4a. `crates/akuma-kernel-amd64/src/thread.rs` — `clone(CLONE_VM|CLONE_THREAD)`
 
 A thread is a task, not a process, and the module is mostly *subtraction* from
 `fork`:
@@ -152,10 +152,10 @@ One entry function serves every thread, unlike `proc_entry_for`'s sixteen
 hand-written trampolines, because `UserCtx` gained a `thread_slot` field —
 there is somewhere to put the index now.
 
-### 4b. `amd64/src/futex.rs` — the effects half
+### 4b. `crates/akuma-kernel-amd64/src/futex.rs` — the effects half
 
 Not a new crate. `crates/akuma-syscalls-sync` is the crate, it is the one the
-AArch64 kernel uses, and the dep diff between `Cargo.toml` and `amd64/Cargo.toml`
+AArch64 kernel uses, and the dep diff between `Cargo.toml` and `crates/akuma-kernel-amd64/Cargo.toml`
 showed it was simply absent from the amd64 manifest. It owns the op decode, the
 `(tgid, uaddr)` key namespace, the waiter table, the deadline algebra and the
 `WAKE_OP` opcode — all host-tested.

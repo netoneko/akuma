@@ -1,12 +1,11 @@
 // Without `elf-loader` the loading half of this file compiles out; its imports stay.
 #![cfg_attr(not(feature = "elf-loader"), allow(unused_imports))]
 
-use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::format;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::Ordering;
 
 use akuma_tty as terminal;
 use spinning_top::Spinlock;
@@ -23,12 +22,9 @@ pub struct DeferredLazySegment {
 }
 use crate::mmu;
 use crate::runtime::{runtime, config, track_frame, FrameSource, PhysFrame};
-use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
+use crate::process::types::{MmapRegion, ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
 use crate::process::lifecycle::LifecycleGuard;
-use super::{
-    AtomicProcessState, LazyRegionMap, NEXT_PID, Process, ProcessState, ProcessSyscallStats, SharedFdTable,
-    SharedSignalTable, StdioBuffer, UserContext,
-};
+use super::{NEXT_PID, Process, SharedFdTable};
 
 #[cfg(feature = "elf-loader")]
 /// True if some OTHER process shares `tgid` — a live CLONE_THREAD sibling of `pid`.
@@ -61,18 +57,7 @@ fn kill_exec_siblings(pid: Pid, tgid: Pid) {
 /// 32 MB is enough for even the heaviest runtimes (Bun/JSC uses ~600KB–2MB).
 pub(crate) const LAZY_STACK_MAX: usize = 32 * 1024 * 1024;
 
-pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
-    const MIN_HEAP: usize = 16 * 1024 * 1024;
-    const RESERVE_PAGES: usize = 2048; // 8MB
-
-    let (_, _, free) = akuma_pmm::stats();
-    let phys_cap = free.saturating_sub(RESERVE_PAGES) * crate::mmu::PAGE_SIZE;
-    let va_cap = memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(brk);
-
-    core::cmp::max(core::cmp::min(phys_cap, va_cap), MIN_HEAP)
-}
-
-/// Set by a kernel whose page-fault handler does not serve [`LazyRegionMap`]
+/// Set by a kernel whose page-fault handler does not serve lazy regions
 /// (amd64): a path load then maps every segment up front instead of deferring.
 /// Without it the first instruction fetch of any binary over `HEAP_SLURP_MAX`
 /// is a not-present fault nothing resolves, and `box run` of a 1 MiB busybox
@@ -104,10 +89,10 @@ enum ImageSource<'a> {
 #[cfg(feature = "elf-loader")]
 impl ImageSource<'_> {
     /// Load the image and build its initial user stack.
-    fn load(
+    fn load<S: AsRef<[u8]>>(
         &self,
-        args: &[String],
-        env: &[String],
+        args: &[S],
+        env: &[S],
         interp_prefix: Option<&str>,
     ) -> Result<LoadedWithStack<akuma_mmu::UserAddressSpace>, ElfError> {
         let stack_size = config().user_stack_size;
@@ -125,20 +110,43 @@ impl ImageSource<'_> {
     }
 }
 
+/// A program loaded for `execve` and not yet installed on any process: the
+/// address space with its segments and initial stack. Dropping it frees them.
+#[cfg(feature = "elf-loader")]
+pub struct LoadedExec(LoadedWithStack<akuma_mmu::UserAddressSpace>);
+
+#[cfg(feature = "elf-loader")]
+fn load_exec<S: AsRef<[u8]>>(source: &ImageSource<'_>, args: &[S], env: &[S]) -> Result<LoadedExec, String> {
+    crate::process::lifecycle_trace("[FORK-DBG] replace_image: loading ELF\n");
+    source.load(args, env, None).map(LoadedExec).map_err(|e| format!("Failed to load ELF: {}", e))
+}
+
+/// Load an image already in the kernel heap, for [`Process::install_loaded`].
+#[cfg(feature = "elf-loader")]
+pub fn load_exec_bytes<S: AsRef<[u8]>>(elf_data: &[u8], args: &[S], env: &[S]) -> Result<LoadedExec, String> {
+    load_exec(&ImageSource::Bytes(elf_data), args, env)
+}
+
+/// Load an image off disk (demand-paged, or eagerly on a kernel that set
+/// [`set_eager_path_loads`]), for [`Process::install_loaded`].
+#[cfg(feature = "elf-loader")]
+pub fn load_exec_path<S: AsRef<[u8]>>(path: &str, file_size: usize, args: &[S], env: &[S]) -> Result<LoadedExec, String> {
+    load_exec(&ImageSource::Path { path, file_size }, args, env)
+}
+
 /// Register the loader's demand-paged segments as lazy regions.
 ///
 /// `segments` is empty for an eagerly-mapped image (`LoadedWithStack::
 /// deferred_segments` is a property of the mapping strategy, not of the caller),
 /// so this is a no-op on that path rather than a branch either caller has to make.
 #[cfg(not(feature = "elf-loader"))]
-const fn push_deferred_regions(_lazy: &mut LazyRegionMap, _segments: &[DeferredLazySegment]) {}
+const fn push_deferred_regions(_regions: &mut Vec<MmapRegion>, _segments: &[DeferredLazySegment]) {}
 
 #[cfg(feature = "elf-loader")]
-fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegment]) {
+fn push_deferred_regions(regions: &mut Vec<MmapRegion>, segments: &[DeferredLazySegment]) {
     for seg in segments {
         let source = match &seg.file_source {
             Some(fs) => LazySource::file(
-                fs.path.clone(),
                 fs.mount_id,
                 fs.inode,
                 fs.file_offset,
@@ -147,7 +155,29 @@ fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegme
             ),
             None => LazySource::Zero,
         };
-        lazy.push(seg.start_va, seg.size, seg.page_flags, source);
+        push_image_region(regions, seg.start_va, seg.size, seg.page_flags, &source);
+    }
+}
+
+/// Add one lazy region to an image's starting list. Every inode it names is
+/// pinned in the image's address space by [`pin_deferred_inodes`]; a region a
+/// later one replaces names the same file.
+fn push_image_region(regions: &mut Vec<MmapRegion>, start_va: usize, size: usize, flags: u64, source: &LazySource) {
+    let _ = super::insert_lazy_region(regions, super::lazy_mmap_region(start_va, size, flags, source));
+}
+
+/// Pin, in the image's own address space, the inode of every file-backed
+/// segment [`push_deferred_regions`] registers. Kept apart from that function so
+/// a caller holding the region lock never takes the address-space lock inside it.
+#[cfg(not(feature = "elf-loader"))]
+const fn pin_deferred_inodes(_aspace: &mut mmu::UserAddressSpace, _segments: &[DeferredLazySegment]) {}
+
+#[cfg(feature = "elf-loader")]
+fn pin_deferred_inodes(aspace: &mut mmu::UserAddressSpace, segments: &[DeferredLazySegment]) {
+    for seg in segments {
+        if let Some(fs) = &seg.file_source {
+            aspace.pin_mapped_inode(fs.inode);
+        }
     }
 }
 
@@ -178,8 +208,8 @@ pub struct ImageInstall<'a> {
     pub mmap_floor: usize,
     /// The new `argv`, for `/proc/<pid>/cmdline`.
     pub args: &'a [String],
-    /// Segments the loader chose not to map, to be demand-paged from
-    /// `lazy_regions`. Empty for a kernel that maps eagerly.
+    /// Segments the loader chose not to map, to be demand-paged from lazy
+    /// regions in `mmap_regions`. Empty for a kernel that maps eagerly.
     pub deferred_segments: &'a [DeferredLazySegment],
 }
 
@@ -202,7 +232,7 @@ impl Process {
     /// `&self`, not `&mut self` (`AKUMA_EXEC_AUDIT.md` §6.E group 2b): the
     /// mutated fields are now atomics (`entry_point`, `initial_brk`, `brk`,
     /// `process_info_phys`, `clear_child_tid`, `sigaltstack_*`), interior-locked
-    /// (`memory`, `mmap_regions`, `lazy_regions`, `address_space`,
+    /// (`memory`, `mmap_regions`, `address_space`,
     /// `signal_actions`), or behind [`Process::image`] (`args`, `context`). The
     /// `LifecycleGuard` + the caller's BKL are what keep a peer from observing
     /// the half-swapped state, exactly as before — this change only removes the
@@ -212,21 +242,33 @@ impl Process {
     /// until these two were merged, so whichever half of exec a binary's size
     /// selected was invisible to lifecycle tracing. They now cover both sources.
     fn replace_image_from(&self, source: ImageSource<'_>, args: &[String], env: &[String]) -> Result<(), String> {
-        crate::process::lifecycle_trace("[FORK-DBG] replace_image: loading ELF\n");
-        let interp_prefix: Option<&str> = None;
-        let loaded = source.load(args, env, interp_prefix)
-            .map_err(|e| format!("Failed to load ELF: {}", e))?;
-        crate::process::lifecycle_trace("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
+        let loaded = load_exec(&source, args, env)?;
+        self.kill_exec_siblings();
+        self.install_loaded(loaded, args)
+    }
 
+    #[cfg(feature = "elf-loader")]
+    /// POSIX: `execve` destroys every other thread of the caller's group. Called
+    /// once the new image has loaded (the point of no return) and before the
+    /// destructive swap; see [`kill_exec_siblings`].
+    pub fn kill_exec_siblings(&self) {
         kill_exec_siblings(self.pid, self.tgid);
+    }
 
-        // Serialize the DESTRUCTIVE window against preemption under shared-kernel SMP —
-        // from the AS deactivate/swap and `mmap_regions.clear()` onward the process is
-        // half-built and must not be observable mid-flight (runbook hypothesis 1, the
-        // SMP=4 heterogeneous SIGSEGVs). Acquired AFTER the ELF load above: the load
-        // allocates/copies for milliseconds and, for an `ImageSource::Path`, does block
-        // I/O — holding the preemption-disable guard across such waits wedges the box
-        // (see `process/lifecycle.rs` and the spawn.rs load-phase note).
+    #[cfg(feature = "elf-loader")]
+    /// Install a program [`load_exec_bytes`]/[`load_exec_path`] loaded.
+    ///
+    /// `args` is the `/proc/<pid>/cmdline` the install records; a caller that
+    /// sets it itself afterwards (`akuma-syscalls-glue`'s `execve::commit`)
+    /// passes `&[]`.
+    ///
+    /// The install serializes the destructive window against preemption
+    /// (`LifecycleGuard`), which is why the load is a separate step: it
+    /// allocates for milliseconds and, from a path, does block I/O, and holding
+    /// the guard across such waits wedges the box (`process/lifecycle.rs`).
+    pub fn install_loaded(&self, loaded: LoadedExec, args: &[String]) -> Result<(), String> {
+        let loaded = loaded.0;
+        crate::process::lifecycle_trace("[FORK-DBG] replace_image: ELF loaded, deactivating old AS\n");
         self.install_image(ImageInstall {
             address_space: loaded.address_space,
             entry_point: loaded.entry_point,
@@ -284,14 +326,14 @@ impl Process {
         // `replace` swaps the inner address space and refreshes the lock-free
         // scalar mirror (`ttbr0`/`shared`) in one step; the returned old address
         // space drops here, freeing its page-table frames.
-        drop(self.address_space.replace(inst.address_space));
+        let mut new_space = inst.address_space;
+        pin_deferred_inodes(&mut new_space, inst.deferred_segments);
+        drop(self.address_space.replace(new_space));
         crate::process::lifecycle_trace("[FORK-DBG] replace_image: AS swapped\n");
         self.entry_point.store(inst.entry_point, Ordering::Relaxed);
         self.brk.store(inst.brk, Ordering::Relaxed);
         self.initial_brk.store(inst.brk, Ordering::Relaxed);
         self.memory.reset(inst.brk, inst.stack_bottom, inst.stack_top, inst.mmap_floor);
-        self.mmap_regions.lock().clear();
-        self.lazy_regions.lock().clear();
         // `dynamic_page_tables` is always empty in this tree (nothing pushes to
         // it), so there is nothing to clear — and `&self` could not anyway.
         self.clear_child_tid.store(0, Ordering::Relaxed);
@@ -299,15 +341,17 @@ impl Process {
         // Written through the owned field rather than the pid-keyed
         // `push_lazy_region`: that would resolve `self.pid` back to this very
         // `Process` through a *shared* table lookup, re-entering the caller.
-        let heap_lazy_size = compute_heap_lazy_size(inst.brk, &self.memory);
         let lazy_stack_start = inst.stack_top.saturating_sub(LAZY_STACK_MAX);
         {
-            let mut lazy = self.lazy_regions.lock();
-            // Demand-paged segments first, then heap and stack — the order the
-            // on-demand path has always used.
-            push_deferred_regions(&mut lazy, inst.deferred_segments);
-            lazy.push(inst.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
-            lazy.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+            // Built aside and swapped in: the old list drops after the lock is
+            // released. Demand-paged segments first, then the stack (the `brk` heap is
+            // mapped by `set_brk` and is in no region) — the
+            // order the on-demand path has always used.
+            let mut regions = Vec::new();
+            push_deferred_regions(&mut regions, inst.deferred_segments);
+            push_image_region(&mut regions, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
+            let old = core::mem::replace(&mut *self.mmap_regions.lock(), regions);
+            drop(old);
         }
 
         if config().syscall_debug_info_enabled {
@@ -419,8 +463,9 @@ impl Process {
         // process table, and this `Process` does not exist yet — let alone is
         // registered — so every region would be silently dropped and the first
         // heap or deep-stack touch would SIGSEGV.
-        let mut lazy_regions = LazyRegionMap::new();
-        push_deferred_regions(&mut lazy_regions, &loaded.deferred_segments);
+        let mut mmap_regions = Vec::new();
+        push_deferred_regions(&mut mmap_regions, &loaded.deferred_segments);
+        pin_deferred_inodes(&mut loaded.address_space, &loaded.deferred_segments);
 
         let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or(ElfError::OutOfMemory)?;
         track_frame(process_info_frame, FrameSource::UserData);
@@ -440,68 +485,28 @@ impl Process {
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
             pid, loaded.brk, loaded.stack_bottom, loaded.stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit.load(Ordering::Relaxed));
 
-        let heap_lazy_size = compute_heap_lazy_size(loaded.brk, &memory);
-        lazy_regions.push(loaded.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
         let lazy_stack_start = loaded.stack_top.saturating_sub(LAZY_STACK_MAX);
-        lazy_regions.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        push_image_region(&mut mmap_regions, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
 
-        Ok(Self {
+        Ok(Self::fresh(crate::process::FreshProcess {
             pid,
-            pgid: pid,
-            tgid: pid, // group leader = self
-            state: AtomicProcessState::new(ProcessState::Ready),
-            address_space: crate::process::ProcAddressSpace::new(loaded.address_space),
-            image: Spinlock::new(crate::process::ProcessImage {
-                name: String::from(name),
-                exe: String::from(name),
-                args: Vec::new(),
-                context: UserContext::new(loaded.entry_point, loaded.sp),
-                text: akuma_primitives::TextPin::none(),
-            }),
             parent_pid: 0,
-            brk: core::sync::atomic::AtomicUsize::new(loaded.brk),
-            initial_brk: AtomicUsize::new(loaded.brk),
-            entry_point: AtomicUsize::new(loaded.entry_point),
+            name: String::from(name),
+            args: Vec::new(),
+            address_space: loaded.address_space,
+            entry: loaded.entry_point,
+            sp: loaded.sp,
+            brk: loaded.brk,
             memory,
-            process_info_phys: AtomicUsize::new(process_info_frame.addr),
-            cwd: String::from("/"),
-            root: String::from("/"),
-            stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
-            stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
-            exited: AtomicBool::new(false),
-            exit_code: AtomicI32::new(0),
-            dynamic_page_tables: Vec::new(),
-            mmap_regions: crate::process::AssistedSpinlock::new(Vec::new()),
-            lazy_regions: Spinlock::new(lazy_regions),
+            process_info_phys: process_info_frame.addr,
+            mmap_regions,
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
-            // Spawner PID - set when spawned by another process
-            spawner_pid: None,
-            ctty: core::sync::atomic::AtomicU32::new(0),
-            // Terminal State - default for new processes
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),
-
-            box_id: 0,
             // Root until something lowers it. `spawn` overwrites this with the
             // caller's credentials; only the very first process keeps it as is.
-            creds: Arc::new(crate::process::SharedCreds::new(crate::process::Creds::ROOT)),
-            namespace: akuma_isolation::global_namespace(),
+            creds: crate::process::Creds::ROOT,
             channel: None,
-            delegate_pid: None,
-            grabbed_by: None,
-            clear_child_tid: AtomicU64::new(0),
-            robust_list_head: 0,
-            robust_list_len: 0,
-            signal_actions: Arc::new(SharedSignalTable::new()),
-            signal_mask: 0,
-            fault_mutex: Spinlock::new(BTreeMap::new()),
-            sigaltstack_sp: AtomicU64::new(0),
-            sigaltstack_flags: AtomicI32::new(2), // SS_DISABLE
-            sigaltstack_size: AtomicU64::new(0),
-            start_time_us: (runtime().uptime_us)(),
-            current_syscall: core::sync::atomic::AtomicU64::new(!0),
-            last_syscall: core::sync::atomic::AtomicU64::new(0),
-            syscall_stats: ProcessSyscallStats::new(),
-        })
+        }))
     }
 }

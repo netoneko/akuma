@@ -1034,10 +1034,10 @@ pub mod park {
     /// semantics repair, not a style choice: AArch64 `wfi` wakes on a pending
     /// interrupt *even when `DAIF.I` masks it*; `hlt` with `IF=0` sleeps until
     /// an NMI and nothing else. Kernel code on this target runs with `IF`
-    /// clear (`amd64/src/sched.rs`: the idle loop is "the only place the
+    /// clear (`crates/akuma-kernel-amd64/src/sched.rs`: the idle loop is "the only place the
     /// scheduler re-enables it"), so a bare `hlt` there is a permanent sleep —
     /// measured as the `cowstale` probe never returning after
-    /// `blocking_relax_net` → `idle_halt` went live with `kernel_smp_shared`
+    /// `blocking_relax_net` → `idle_halt` went live with `kernel_bkl_smp`
     /// (2026-09-08). `sti` takes effect after the *following* instruction, so
     /// the three-instruction sequence is atomic with respect to the tick: an
     /// interrupt arriving between `sti` and `hlt` is taken, never slept past.
@@ -1197,7 +1197,7 @@ pub mod park {
 ///
 /// # The contract, and who enforces it
 ///
-/// The `%gs` base is `amd64/src/smp.rs`'s `PERCPU[idx]`, installed by that
+/// The `%gs` base is `crates/akuma-kernel-amd64/src/smp.rs`'s `PERCPU[idx]`, installed by that
 /// file's `install_percpu` **before any code that can reach these functions
 /// runs on that core** — the same precondition `this_cpu()` there documents.
 /// Before it, the base is 0 and a `gs:`-relative load faults; the one early
@@ -1687,7 +1687,7 @@ pub mod sysreg {
     ///
     /// Added 2026-09-01. The reader above already lived here, so a bare
     /// `asm!("msr fpcr, …")` in the boot suite was the *only* `asm!` in
-    /// `src/tests.rs` and the asymmetry — read admitted, write open-coded — was
+    /// `crates/akuma-kernel-tests-aarch64/src/tests.rs` and the asymmetry — read admitted, write open-coded — was
     /// the accident. Writes to FPCR belong here.
     #[inline(always)]
     pub fn set_fpcr(val: u64) {

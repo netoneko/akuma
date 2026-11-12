@@ -7,7 +7,7 @@ against bytes measured on the reference machine (HP 500-502nj) on 2026-09-05.
 ## Why
 
 The HP box has a USB keyboard (ROCCAT Vulcan AIMO) and no PS/2 controller, so
-`amd64/src/kbd.rs` finds nothing and there is no way to type at a bare-metal
+`crates/akuma-drivers-amd64/src/kbd.rs` finds nothing and there is no way to type at a bare-metal
 shell. A USB keyboard driver is mostly logic a host can check without hardware:
 
 | module | what it parses | for |

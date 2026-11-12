@@ -49,6 +49,12 @@ and "at EOF" into a single `POLLIN`, so without a distinct bit the
 *drained → EOF* transition yields `revents & !last_ready == 0` and the EOF edge
 is swallowed. See [`poll.md`](poll.md) for the edge bookkeeping.
 
+**The machine holds at most `MAX_PIPES` (2048) live pipes** (`akuma-syscalls-glue`'s
+`pipe::MAX_PIPES`); the next `pipe2` is `ENFILE`, the "system file table full" errno,
+on both kernels. `pipe::pipe_stats()` reports live, high-water, refused and the cap;
+amd64's `[PIPE]` health line reads it. Nothing else may keep its own pipe count
+([`../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md), "fd: the policies are glue's").
+
 ## Fd allocation & refcounting
 
 - Each `pipe2()` call always creates a **fresh** `KernelPipe` — there is no

@@ -431,10 +431,6 @@ impl Process {
         }
     }
 
-    /// Get a reference to the shared fd table (for direct access in sys_close_range, etc.)
-    pub fn fd_table(&self) -> &Arc<SharedFdTable> {
-        &self.fds
-    }
 }
 
 /// Regression coverage for `docs/archive/CONCURRENT_WRITE_POSITION_RACE.md` — the
@@ -669,7 +665,7 @@ mod alloc_fd_tests {
 /// method step 1) so the rewire can be checked against today's behaviour
 /// rather than against intentions. Each test states which syscall-level
 /// behaviour it is the table-level image of; the two `PINNED DIVERGENCE`
-/// tests carry the divergences `amd64/src/fd.rs`'s boot-suite self-tests pin
+/// tests carry the divergences `crates/akuma-kernel-amd64/src/fd.rs`'s boot-suite self-tests pin
 /// end-to-end (`fd: a dup's cursor is independent`; `fd: a dup keeps nonblock`
 /// since 2026-11-01) so the table layer cannot drift underneath them.
 ///
@@ -731,7 +727,7 @@ mod fdtable_characterization_tests {
         assert!(t.nonblock.lock().contains(&1));
     }
 
-    /// **PINNED DIVERGENCE** (`amd64/src/fd.rs` boot suite: "a dup's cursor is
+    /// **PINNED DIVERGENCE** (`crates/akuma-kernel-amd64/src/fd.rs` boot suite: "a dup's cursor is
     /// independent"): `dup` is a *by-value* copy of the `KernelFile`, so the
     /// two descriptors do not share the open file description — advancing one
     /// cursor leaves the other where the copy was taken. POSIX shares the

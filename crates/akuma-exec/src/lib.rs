@@ -135,6 +135,9 @@ pub use akuma_elf as elf_loader;
 pub use akuma_threading as threading;
 pub mod alarms;
 pub mod process;
+/// Writable `MAP_SHARED` file pages: one frame per file page for every mapper,
+/// on both kernels (`akuma-fpcache-rw`'s kernel half).
+pub mod shm;
 /// The box (container) registry — **moved to `akuma-isolation` on 2026-08-30**
 /// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.1), where it joins the mount and
 /// network namespaces it has always sat on top of and gains that crate's
@@ -226,8 +229,6 @@ pub(crate) fn register_threading(rt: &ExecRuntime, cfg: &ExecConfig) {
             enable_stack_canaries: cfg.enable_stack_canaries,
             stack_canary: cfg.stack_canary,
             canary_words: cfg.canary_words,
-            network_thread_ratio: cfg.network_thread_ratio,
-            prioritize_never_scheduled: cfg.prioritize_never_scheduled,
             deferred_thread_cleanup: cfg.deferred_thread_cleanup,
             thread_cleanup_cooldown_us: cfg.thread_cleanup_cooldown_us,
             syscall_debug_info_enabled: cfg.syscall_debug_info_enabled,
@@ -241,7 +242,7 @@ pub(crate) fn register_threading(rt: &ExecRuntime, cfg: &ExecConfig) {
 /// scheduler asks of it.
 ///
 /// Separate from [`init`], and `pub`, for one reason: **the amd64 kernel does
-/// not call `init`** (see `amd64/src/exec_runtime.rs`, "Why this is not
+/// not call `init`** (see `crates/akuma-kernel-amd64/src/exec_runtime.rs`, "Why this is not
 /// `akuma_exec::init`"), so it used to write this table out by hand. Five of its
 /// eight rows answered a constant — `|_| false`, `|_| None` — under comments
 /// saying "no process table on this target", and every one of those reasons had
@@ -249,7 +250,7 @@ pub(crate) fn register_threading(rt: &ExecRuntime, cfg: &ExecConfig) {
 /// `is_current_interrupted` is the one hook the x86 park loop reads, and
 /// `clear_draining`/`drain_in_flight` guard a reclaim sweep this target genuinely
 /// runs (`akuma_exec::process::reclaim::drain_retired`, seven call sites in
-/// `amd64/src`). See `docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md`.
+/// `crates/akuma-kernel-amd64/src`). See `docs/archive/AKUMA_AMD64_STALE_FALSE_HOOKS.md`.
 ///
 /// Three of the fields cannot be reached from outside this crate at all
 /// (`pub(crate)`), which is what made the hand-written copy the only option and

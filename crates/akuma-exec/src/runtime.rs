@@ -104,12 +104,13 @@ pub struct ExecRuntime {
     /// ambiguous across two mounted filesystems, which is what makes it unsafe
     /// as a page-cache key (F-1, `docs/archive/EXT2_WRITEBACK_DESIGN.md`).
     pub resolve_file_id: fn(&str) -> Result<(u32, u32), i32>,
-    /// Takes the path as well as the inode: the VFS is multi-root (`with_fs`
-    /// dispatches on the path prefix), so an inode alone does not name a file.
-    /// The prefault fill in `mmu/user_access.rs` calls this for every
-    /// inode-backed lazy file page — a stub registration here turns those pages
-    /// into silent zeros (`[FILL-SHORT/prefault]`, the self-host ICE).
-    pub read_at_by_inode: fn(&str, u32, usize, &mut [u8]) -> Result<usize, i32>,
+    /// Read a file named by `(mount id, inode)`, the pair a lazy file region
+    /// records. The mount id selects the filesystem (an inode alone does not
+    /// name a file), so no path is needed, and a file unlinked since it was
+    /// mapped still reads. The demand-fault and prefault fills call this for
+    /// every lazy file page; a stub registration turns those pages into silent
+    /// zeros (`[FILL-SHORT/prefault]`, the self-host ICE).
+    pub read_at_by_inode: fn(u32, u32, usize, &mut [u8]) -> Result<usize, i32>,
 
     /// Mark the file at `path` as being executed (`akuma_primitives::text_busy`, `ETXTBSY`), to be taken **before** its bytes are read and
     /// moved into the new process with `Process::set_text`. An inert pin for a path with no trackable identity.
@@ -305,7 +306,7 @@ pub struct ExecRuntime {
     ///   path has no `Process` to read a root from, and the first switch into
     ///   an unbound child would run ring-3 code against the kernel's tables.
     /// * its `SPAWN` row and the `UserCtx::proc_slot` naming it. That index is
-    ///   what `run_process` uses for `thread::drain` and `spawn_record_exit`,
+    ///   what `run_process` uses for `thread::drain`,
     ///   i.e. how the target tears a process down at all.
     ///
     /// **Fallible, and the row table is why**: `SPAWN` is a fixed array and a
@@ -386,9 +387,6 @@ pub struct ExecConfig {
     pub enable_stack_canaries: bool,
     pub stack_canary: u64,
     pub canary_words: usize,
-    pub network_thread_ratio: u32,
-    /// See `config::PRIORITIZE_NEVER_SCHEDULED`.
-    pub prioritize_never_scheduled: bool,
     pub deferred_thread_cleanup: bool,
     pub thread_cleanup_cooldown_us: u64,
     /// Cooldown before `process::reclaim_retired_processes` actually frees a
@@ -401,8 +399,10 @@ pub struct ExecConfig {
     pub proc_stdin_max_size: usize,
     pub proc_stdout_max_size: usize,
     pub cow_fork_enabled: bool,
-    /// Enable the vfork fast-path (shared-AS child for CLONE_VFORK). See
-    /// `config::VFORK_FASTPATH_ENABLED`.
+    /// Enable the vfork fast-path (shared-AS child for CLONE_VFORK). No single
+    /// global default (removed, config flag sweep 2026-11-11): each kernel sets
+    /// this field itself — `true` in `akuma-kernel-glue` (AArch64 root), `false`
+    /// in amd64's `exec_runtime.rs` and both tokio kernels.
     pub vfork_fastpath_enabled: bool,
 
     /// Let a `tkill`/`tgkill` (`pthread_kill`) signal interrupt a blocking
@@ -410,8 +410,10 @@ pub struct ExecConfig {
     pub pthread_kill_eintr_enabled: bool,
 
     /// Share physical frames between read-only file-backed mappings. Gates
-    /// [`crate::memmath::is_shareable_mapping`]. See
-    /// `config::SHARED_FILE_PAGES_ENABLED`.
+    /// [`crate::memmath::is_shareable_mapping`]. No single global default
+    /// (removed, config flag sweep 2026-11-11): each kernel sets this field
+    /// itself — `true` in `akuma-kernel-glue` (AArch64 root), `false` in
+    /// amd64's `exec_runtime.rs` and both tokio kernels.
     pub shared_file_pages_enabled: bool,
 }
 
@@ -506,8 +508,6 @@ impl ExecConfig {
             enable_stack_canaries: false,
             stack_canary: 0xDEAD_BEEF_CAFE_BABE,
             canary_words: 2,
-            network_thread_ratio: 4,
-            prioritize_never_scheduled: false,
             deferred_thread_cleanup: false,
             thread_cleanup_cooldown_us: 0,
             process_reclaim_cooldown_us: 0,

@@ -27,6 +27,7 @@ dependencies = [
  "akuma-boot",
  "akuma-config",
  "akuma-cpu",
+ "akuma-drivers-amd64",
  "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
@@ -37,8 +38,12 @@ dependencies = [
  "akuma-gic",
  "akuma-isolation",
  "akuma-kacho",
+ "akuma-kernel",
+ "akuma-kernel-amd64",
  "akuma-kernel-core",
  "akuma-kernel-glue",
+ "akuma-kernel-tests-aarch64",
+ "akuma-kernel-tests-amd64",
  "akuma-locks-rw",
  "akuma-net",
  "akuma-net-unix",
@@ -87,95 +92,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "akuma-amd64"
-version = "0.0.9"
-dependencies = [
- "akuma-affinity",
- "akuma-alloc",
- "akuma-bkl",
- "akuma-boot",
- "akuma-boot-amd64",
- "akuma-cmos-rtc",
- "akuma-config",
- "akuma-cow",
- "akuma-cpu",
- "akuma-dma",
- "akuma-dmesg",
- "akuma-dwi2c",
- "akuma-elf",
- "akuma-elf-exec",
- "akuma-exec",
- "akuma-exec-core",
- "akuma-ext2",
- "akuma-fbcon",
- "akuma-fbdev",
- "akuma-fdtable",
- "akuma-fpcache",
- "akuma-fpcache-rw",
- "akuma-fpu-amd64",
- "akuma-gdt",
- "akuma-hda",
- "akuma-hid",
- "akuma-i2c-hid",
- "akuma-idt-amd64",
- "akuma-ieee80211",
- "akuma-isolation",
- "akuma-kacho",
- "akuma-kvm-abi",
- "akuma-lapic-amd64",
- "akuma-locks-rw",
- "akuma-mmap",
- "akuma-mmu",
- "akuma-multiboot2",
- "akuma-net",
- "akuma-net-rtl8169",
- "akuma-nvme",
- "akuma-pagetable",
- "akuma-pci",
- "akuma-pipe",
- "akuma-pipes",
- "akuma-pmm",
- "akuma-port",
- "akuma-power",
- "akuma-primitives",
- "akuma-procfs",
- "akuma-pte-amd64",
- "akuma-rtw89",
- "akuma-ryzen-amd64",
- "akuma-sched-amd64",
- "akuma-selftest",
- "akuma-sntp",
- "akuma-svm-amd64",
- "akuma-syscalls",
- "akuma-syscalls-abi",
- "akuma-syscalls-glue",
- "akuma-syscalls-glue-amd64",
- "akuma-syscalls-linux",
- "akuma-syscalls-mem",
- "akuma-syscalls-net",
- "akuma-syscalls-poll",
- "akuma-syscalls-proc",
- "akuma-syscalls-sync",
- "akuma-syscalls-time",
- "akuma-threading",
- "akuma-touchpad",
- "akuma-trap-amd64",
- "akuma-tty",
- "akuma-usb",
- "akuma-usb-storage",
- "akuma-user-access",
- "akuma-user-space",
- "akuma-vfs",
- "akuma-vfs-glue",
- "akuma-virtio",
- "akuma-vm-spec",
- "akuma-wifi",
- "akuma-wpa",
- "akuma-xhci",
- "spinning_top",
-]
-
-[[package]]
 name = "akuma-bkl"
 version = "0.1.0"
 dependencies = [
@@ -207,12 +123,15 @@ version = "0.1.0"
 dependencies = [
  "akuma-alloc",
  "akuma-cpu",
+ "akuma-machine-facts",
+ "akuma-mem-policy",
+ "akuma-multiboot2",
  "akuma-pagetable",
  "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-pte-amd64",
- "akuma-ryzen-amd64",
+ "spinning_top",
 ]
 
 [[package]]
@@ -230,6 +149,7 @@ dependencies = [
 name = "akuma-config"
 version = "0.1.0"
 dependencies = [
+ "akuma-mem-policy",
  "akuma-primitives",
 ]
 
@@ -252,6 +172,42 @@ version = "0.1.0"
 [[package]]
 name = "akuma-dns"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-drivers-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-boot-amd64",
+ "akuma-cpu",
+ "akuma-dma",
+ "akuma-dwi2c",
+ "akuma-fbcon",
+ "akuma-fbdev",
+ "akuma-hda",
+ "akuma-hid",
+ "akuma-i2c-hid",
+ "akuma-ieee80211",
+ "akuma-kernel-amd64",
+ "akuma-kvm-amd64",
+ "akuma-multiboot2",
+ "akuma-net",
+ "akuma-nvme",
+ "akuma-pagetable",
+ "akuma-pci",
+ "akuma-port",
+ "akuma-primitives",
+ "akuma-rtw89",
+ "akuma-ryzen-amd64",
+ "akuma-selftest",
+ "akuma-touchpad",
+ "akuma-usb",
+ "akuma-usb-storage",
+ "akuma-virtio",
+ "akuma-wifi",
+ "akuma-wpa",
+ "akuma-xhci",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-dwi2c"
@@ -304,10 +260,12 @@ dependencies = [
  "akuma-fdt",
  "akuma-gic",
  "akuma-kernel-core",
+ "akuma-not-even-once",
  "akuma-phys",
  "akuma-primitives",
  "akuma-psci",
  "akuma-trap-aarch64",
+ "akuma-vectors-aarch64",
 ]
 
 [[package]]
@@ -349,6 +307,7 @@ dependencies = [
  "akuma-elf",
  "akuma-exec-core",
  "akuma-fdtable",
+ "akuma-fpcache-rw",
  "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",
@@ -416,6 +375,7 @@ version = "0.1.0"
 name = "akuma-firecracker"
 version = "0.1.0"
 dependencies = [
+ "akuma-machine-facts",
  "fdt",
 ]
 
@@ -493,6 +453,91 @@ name = "akuma-kacho"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-kernel"
+version = "0.1.0"
+dependencies = [
+ "akuma-kernel-amd64",
+ "akuma-kernel-glue",
+]
+
+[[package]]
+name = "akuma-kernel-amd64"
+version = "0.0.9"
+dependencies = [
+ "akuma-affinity",
+ "akuma-alloc",
+ "akuma-bkl",
+ "akuma-boot",
+ "akuma-boot-amd64",
+ "akuma-cmos-rtc",
+ "akuma-config",
+ "akuma-cow",
+ "akuma-cpu",
+ "akuma-dmesg",
+ "akuma-elf",
+ "akuma-elf-exec",
+ "akuma-exec",
+ "akuma-exec-core",
+ "akuma-ext2",
+ "akuma-fbdev",
+ "akuma-fdtable",
+ "akuma-fpcache",
+ "akuma-fpcache-rw",
+ "akuma-fpu-amd64",
+ "akuma-gdt",
+ "akuma-idt-amd64",
+ "akuma-isolation",
+ "akuma-kacho",
+ "akuma-kernel-core",
+ "akuma-lapic-amd64",
+ "akuma-locks-rw",
+ "akuma-machine-facts",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-multiboot2",
+ "akuma-net",
+ "akuma-net-rtl8169",
+ "akuma-pagetable",
+ "akuma-params",
+ "akuma-pci",
+ "akuma-percpu-gdt-amd64",
+ "akuma-phys",
+ "akuma-pipe",
+ "akuma-pipes",
+ "akuma-pmm",
+ "akuma-port",
+ "akuma-power",
+ "akuma-primitives",
+ "akuma-procfs",
+ "akuma-pte-amd64",
+ "akuma-ryzen-amd64",
+ "akuma-sched-amd64",
+ "akuma-selftest",
+ "akuma-sntp",
+ "akuma-syscalls",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
+ "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
+ "akuma-syscalls-net",
+ "akuma-syscalls-poll",
+ "akuma-syscalls-proc",
+ "akuma-syscalls-time",
+ "akuma-threading",
+ "akuma-trap-amd64",
+ "akuma-tty",
+ "akuma-user-access",
+ "akuma-user-space",
+ "akuma-user-tree",
+ "akuma-usermode-amd64",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-kernel-core"
 version = "0.1.0"
 dependencies = [
@@ -506,6 +551,7 @@ dependencies = [
  "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-machine-facts",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
@@ -529,17 +575,24 @@ dependencies = [
  "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
+ "akuma-exec-core",
  "akuma-ext2",
  "akuma-fdt",
  "akuma-gic",
  "akuma-kernel-core",
+ "akuma-machine-facts",
+ "akuma-mem-policy",
  "akuma-net",
+ "akuma-params",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-psci",
  "akuma-rump",
+ "akuma-switch",
  "akuma-syscalls-glue",
+ "akuma-threading",
  "akuma-timer",
+ "akuma-vectors-aarch64",
  "akuma-vfs-glue",
  "akuma-virtio",
  "log",
@@ -547,8 +600,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-kernel-tests-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-cpu",
+ "akuma-entry",
+ "akuma-exceptions",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-isolation",
+ "akuma-kernel-core",
+ "akuma-kernel-glue",
+ "akuma-net",
+ "akuma-net-yarn",
+ "akuma-phys",
+ "akuma-primitives",
+ "akuma-syscalls",
+ "akuma-syscalls-linux",
+ "akuma-tty",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "log",
+ "smoltcp",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-kernel-tests-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-boot-amd64",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-kernel-amd64",
+ "akuma-kernel-core",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-selftest",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-linux",
+ "akuma-threading",
+ "akuma-user-access",
+ "akuma-vfs-glue",
+]
+
+[[package]]
 name = "akuma-kvm-abi"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-kvm-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-affinity",
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-dmesg",
+ "akuma-exec",
+ "akuma-exec-core",
+ "akuma-kernel-amd64",
+ "akuma-kvm-abi",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-svm-amd64",
+ "akuma-svm-switch-amd64",
+ "akuma-syscalls-glue",
+ "akuma-threading",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "akuma-vm-spec",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-lapic-amd64"
@@ -575,6 +704,14 @@ dependencies = [
  "akuma-primitives",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-machine-facts"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-mem-policy"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-middleware"
@@ -825,6 +962,9 @@ dependencies = [
 [[package]]
 name = "akuma-ryzen-amd64"
 version = "0.1.0"
+dependencies = [
+ "akuma-machine-facts",
+]
 
 [[package]]
 name = "akuma-sched-amd64"
@@ -874,6 +1014,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-svm-switch-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-mmu-raw",
+ "akuma-phys",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-svm-amd64",
+ "akuma-vm-spec",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-switch"
 version = "0.1.0"
 dependencies = [
@@ -909,9 +1063,11 @@ dependencies = [
  "akuma-bkl",
  "akuma-boot",
  "akuma-config",
+ "akuma-cow",
  "akuma-cpu",
  "akuma-exec",
  "akuma-isolation",
+ "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
  "akuma-net-unix",
@@ -1079,6 +1235,7 @@ dependencies = [
  "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-mem-policy",
  "akuma-middleware",
  "akuma-mmu",
  "akuma-net",
@@ -1124,6 +1281,8 @@ dependencies = [
  "akuma-idt-amd64",
  "akuma-isolation",
  "akuma-lapic-amd64",
+ "akuma-machine-facts",
+ "akuma-mem-policy",
  "akuma-middleware",
  "akuma-mmap",
  "akuma-mmu",
@@ -1260,6 +1419,14 @@ version = "0.1.0"
 [[package]]
 name = "akuma-user-walk"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-usermode-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-gdt",
+]
 
 [[package]]
 name = "akuma-vectors-aarch64"

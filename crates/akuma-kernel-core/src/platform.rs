@@ -32,8 +32,6 @@
 //! Add a `machine` module with the same constants and a `feature` gate. Nothing
 //! outside this file should need a `#[cfg]` for it.
 
-#![allow(dead_code)]
-
 use akuma_exec::mmu::{self, DevRegion};
 use akuma_primitives::addr;
 
@@ -341,6 +339,15 @@ pub fn install_fdt_device_map(fdt: Option<&akuma_fdt::Fdt<'_>>) -> FdtMapOutcome
     addr::set_virtio_geometry(stride, slots.len().clamp(1, slot_cap.max(1)));
 
     FdtMapOutcome::Installed { gicr_pa, moved: gicr_pa != machine::GICR_PA }
+}
+
+/// The neutral view of the machine the FDT describes, or `None` without a readable FDT.
+///
+/// Pure and allocation-free; the boot path prints it beside the device-map outcome so both
+/// kernels report the same shape of line (`akuma_machine_facts::Facts`).
+#[must_use]
+pub fn fdt_facts(fdt: Option<&akuma_fdt::Fdt<'_>>) -> Option<akuma_machine_facts::Facts> {
+    akuma_firecracker::describe_fdt(fdt?).ok().map(|d| d.facts())
 }
 
 /// Bytes of VA a discovered virtio slot array needs, clamped to the reserved span.

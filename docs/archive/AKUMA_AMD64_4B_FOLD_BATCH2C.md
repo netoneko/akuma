@@ -11,7 +11,7 @@ ahead of the VFS in `openat`, `read`, `pread`, `lseek`, `fstat`, `newfstatat`,
 `/proc` and served whatever the local view declined. Two implementations of one
 namespace, differing about what exists.
 
-It is one now. `amd64/src/fd.rs` lost ~500 lines: `open_proc`,
+It is one now. `crates/akuma-kernel-amd64/src/fd.rs` lost ~500 lines: `open_proc`,
 `render_proc_file`, `render_pid_file`, `render_self_maps`, `render_self_statm`,
 `self_map_rows`, `render_meminfo`, `proc_metadata`, `proc_is_dir`,
 `normalise_proc`, `pid_files`, `proc_rest_of`, `install_synthetic_dir`,

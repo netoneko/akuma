@@ -5,7 +5,7 @@
 //!
 //! Every walker in the tree reached a table as `phys_to_virt(pa) as *mut u64`,
 //! then `.add(index).read_volatile()` / `.write_volatile(..)` — 14 sites in
-//! `amd64/src/paging.rs`, ~30 in the amd64 half of `akuma-mmu`, 80-odd in its
+//! `crates/akuma-kernel-amd64/src/paging.rs`, ~30 in the amd64 half of `akuma-mmu`, 80-odd in its
 //! AArch64 half — each with a `// SAFETY: table is a live table frame` comment
 //! vouching for the same fact. The fact is not about the line; it is about the
 //! *frame*, and it is true once.
@@ -59,7 +59,7 @@ pub const fn index(va: usize, level: u32) -> usize {
 /// Implemented by each kernel for its physmap. **Safe** to implement: the
 /// walkers treat the returned address as a claim to be checked against the
 /// contract above, and an implementation should `assert!` its own bound the way
-/// `amd64/src/phys.rs::phys_to_virt` does, so a frame outside the physmap fails
+/// `crates/akuma-kernel-amd64/src/phys.rs::phys_to_virt` does, so a frame outside the physmap fails
 /// loudly instead of returning a plausible pointer into nothing.
 pub trait PhysMap {
     /// Kernel-virtual address of the frame at `pa`.

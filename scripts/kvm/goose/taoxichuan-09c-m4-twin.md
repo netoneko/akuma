@@ -14,8 +14,8 @@ This session = plan slice 1 (twin runtime: register `ThreadRuntime`, `ThreadConf
 in the agent log "Stage 8, sessions T-Y" and plan § 3: re-derive the band arithmetic on paper before moving a stack.
 
 ## Read first (in order; `sed -n` the named parts)
-1. Plan §§ 1, 3, 5 (above). 2. `amd64/src/exec_runtime.rs` (the registration twin; 642 lines; read `runtime()` at ~189 and each hook's body only for the fields marked "real" in plan § 1).
-3. `amd64/src/sched.rs` ~800-850 (hook registration, `X86ArchHooks` at 834-846) and `Machine` (the per-slot side table). 4. `taoxichuan/src/child.rs` lines 60-110 (the statics) and the `fork_arm`/`exec_replace`/`child_exit` users of them.
+1. Plan §§ 1, 3, 5 (above). 2. `crates/akuma-kernel-amd64/src/exec_runtime.rs` (the registration twin; 642 lines; read `runtime()` at ~189 and each hook's body only for the fields marked "real" in plan § 1).
+3. `crates/akuma-kernel-amd64/src/sched.rs` ~800-850 (hook registration, `X86ArchHooks` at 834-846) and `Machine` (the per-slot side table). 4. `taoxichuan/src/child.rs` lines 60-110 (the statics) and the `fork_arm`/`exec_replace`/`child_exit` users of them.
 **Probes**: the M4 gate is `userspace/forkprobe` (slice 3); this session's gate is behavioural equivalence, so reuse `scripts/kvm/goose/run_pipes.sh` (P1-P5) and the F1 spot check. Do not write a new probe.
 
 ## Premises (re-run each check before your first edit; one line per row in RESULT-pc.md: HOLDS / WRONG (what you saw) / UNCHECKED)
@@ -23,7 +23,7 @@ in the agent log "Stage 8, sessions T-Y" and plan § 3: re-derive the band arith
 |---|---|---|---|
 | 1 | origin `c37cdb79` builds and passes: P1-P5, F1, ticks advance | `git log --oneline -3`; `kbuild -p taoxichuan -j 4 --features no-tests` | supervisor ran Mac clippy + amd64 `no-tests` check only after the clippy fix; the x86 boot predates it - UNCHECKED on this box |
 | 2 | `ThreadRuntime` has 6 fn fields, 4 of them IPI/IRQ-bound (pb's correction) | `sed -n 150,162p crates/akuma-threading/src/lib.rs` | pb: 4, not 2 |
-| 3 | `akuma-exec` registers via a `runtime()` returning `ExecRuntime` (amd64: `exec_runtime.rs:189`) | `grep -n "fn runtime\|pub fn init" amd64/src/exec_runtime.rs crates/akuma-exec/src/runtime.rs` | UNCHECKED |
+| 3 | `akuma-exec` registers via a `runtime()` returning `ExecRuntime` (amd64: `exec_runtime.rs:189`) | `grep -n "fn runtime\|pub fn init" crates/akuma-kernel-amd64/src/exec_runtime.rs crates/akuma-exec/src/runtime.rs` | UNCHECKED |
 | 4 | the crossing statics are exactly those in child.rs:72-94 and no other file reads them | `grep -n "RET_RSP\|SAVE_R\|SPAWN_OUT_SLOT\|PARENT_\|NESTED_" taoxichuan/src/*.rs \| cut -c1-100` | UNCHECKED - the list in plan § 3 is from pb |
 | 5 | one core, so a per-slot table indexed by `current_slot()` returning a fixed slot is behaviour-neutral | read how `fork_arm` picks its slot (child.rs ~720) | pa: forks reuse a dead slot, shell is slot 1 at depth 1 |
 | 6 | `akuma-slot-table` is what `akuma-exec`/`-threading` index by | `grep -n "slot" crates/akuma-slot-table/src/lib.rs \| head -20` | UNCHECKED (pb did not read it) |
@@ -37,7 +37,7 @@ One core. No procfs and no `/dev` (no `dd`). Fork exists only inside the spawned
 Ticks: PIT-calibrated LAPIC, vector 32, about 10 ms; a tick returns to the same instruction (no switch).
 
 ## Composition rule (mandatory)
-Look first (`grep -rn <name> crates/ amd64/src/`); pull by path dependency; extract from `amd64/src/` into a crate only if it lives only there (rule 3: new crates `forbid(unsafe_code)`, unsafe budget 0, `scripts/check_unsafe_budget.py --update` for unavoidable sites); write new only when it exists nowhere.
+Look first (`grep -rn <name> crates/ crates/akuma-kernel-amd64/src/`); pull by path dependency; extract from `crates/akuma-kernel-amd64/src/` into a crate only if it lives only there (rule 3: new crates `forbid(unsafe_code)`, unsafe budget 0, `scripts/check_unsafe_budget.py --update` for unavoidable sites); write new only when it exists nowhere.
 The twin's registration glue is taoxichuan's own (written new, say so); `amd64/` must keep building (`cargo check -p akuma-amd64 --target x86_64-unknown-none --features no-tests`). Report per hook: real / no-op / stub, and `wc -l taoxichuan/src/*.rs` start (6,275?) and end.
 Side task, cheap: `crates/akuma-lapic-amd64` has NO host tests (pb moved the code; clippy `-D warnings` on the host target is what the pre-commit hook runs). Add host tests for the pure parts only (register offsets, `APIC_BASE_MASK` masking, `NoApicBase`), nothing that needs `MmioWindow` hardware.
 

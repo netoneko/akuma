@@ -7,7 +7,7 @@
 //!
 //! **One resolver for every target.** Until 2026-10-18 this drove smoltcp's
 //! dedicated DNS socket (`smoltcp_net::dns_query`) while amd64 carried its own
-//! hand-rolled client (`amd64/src/dns.rs`), written when the former hung on
+//! hand-rolled client (`crates/akuma-kernel-amd64/src/dns.rs`), written when the former hung on
 //! amd64's first kernel-side caller. The two differed where it matters: smoltcp
 //! fails a query on the first `NXDOMAIN`, with one configured server, and a
 //! resolver that `NXDOMAIN`s a name another answers is a measured case (the HP

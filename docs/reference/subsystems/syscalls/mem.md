@@ -59,7 +59,7 @@ extraction stays A/B-able against what it replaced. Numbering matches
 | 3 | `MADV_FREE` returns `EINVAL` — deliberate: Redis reads it as "older kernel" and starts, where a fabricated 0 sends it into a self-check it cannot pass without `/proc/<pid>/smaps` | `diverge_madv_free_is_einval_not_success` |
 | 4 | every other advice returns success without acting, including ones Linux implements | `diverge_unknown_advice_reports_success` |
 | 5 | a shrinking `mremap` returns the old address and leaves the tail mapped; Linux unmaps it | `diverge_shrink_is_in_place_and_leaves_the_tail_mapped` |
-| 6 | `MAP_FIXED_NOREPLACE` is alignment-validated then treated as `MAP_FIXED`, without the "fail if occupied" check | — |
+| 6 | *(resolved 2026-11-12)* `MAP_FIXED_NOREPLACE` refuses an occupied range with `EEXIST` on both kernels | `mapnoreplace` probe |
 | 7 | `membarrier` recognises only `QUERY`/`PRIVATE_EXPEDITED`/`REGISTER_PRIVATE_EXPEDITED`; `GLOBAL` (1) and the `SYNC_CORE` family are `EINVAL` | `diverge_global_and_unknown_commands_are_einval` |
 
 `/proc/<pid>/` is not populated (no `smaps`, `maps`, `statm`), which `smapsdirty`
@@ -71,7 +71,7 @@ reports as DIVERGE rather than FAIL.
 # Host, milliseconds — the decisions and the region algebra
 cargo test -p akuma-syscalls-mem -p akuma-mmap --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 
-# Live guest — all ten c_stress memory probes
+# Live guest — the c_stress memory probes
 scripts/mem_suite.py --port 2322            # add --only <a,b> for a subset
 
 # Cost, A/B/A, ratio-to-getpid not ns
@@ -174,36 +174,46 @@ All always-on (no `sc-*` gate; see [`../syscalls.md`](../syscalls.md) "The
 
 ## Argument validation & error codes
 
-**`mmap`** (`sys_mmap`, `mem.rs:189`):
-- `len == 0` → `EINVAL`.
-- `PROT_WRITE | PROT_EXEC` is **granted**, on both kernels, as Linux grants
-  it (2026-10-08). `akuma_mmap::Prot::from_prot` maps it to the `RW` token,
-  which is "read, write and execute": before that date it dropped the
-  execute bit on AArch64, and the amd64 kernel refused the request outright
-  with `EINVAL` in both `mmap` and `mprotect`. V8 needs it on its 512 MB code
-  range, and every Chromium renderer died on the refusal. Gate `jitprobe.c`
-  (`docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 18). The ELF
-  loader's refusal of a writable+executable *segment* is a separate rule and
-  stands.
-- `MAP_FIXED`/`MAP_FIXED_NOREPLACE` with `addr != 0` and `addr & 0xFFF != 0` →
-  `EINVAL` (`mmap_fixed_addr_unaligned_einval`). This check runs **before**
-  `lookup_process` specifically so a kernel-test caller with no current
-  process still gets `EINVAL`, not `ESRCH` — a crash regression test
-  (`crash14: addr = 0xffffffffffffffea`) pins this ordering.
-- No current/owner process → `ESRCH`.
-- `MAP_FIXED`/`MAP_FIXED_NOREPLACE` overlapping the kernel identity-map range
-  (`mmap_fixed_overlaps_kernel_va`, scales with `kernel_va_end()`) → `EINVAL`.
-  Guards against Go's runtime committing heap arenas with `MAP_FIXED` onto the
-  kernel's RAM identity map (silent corruption otherwise).
-- Bump allocator (`proc.memory.alloc_mmap`) exhausted for a non-fixed request
-  → `ENOMEM`.
-- Eager frame batch alloc fails, and reclaim-and-retry also fails: a writable
-  `MAP_SHARED` file-backed mapping → `ENOMEM` (must stay eager to track pages
-  for writeback — no safe lazy fallback); everything else silently degrades
-  to a lazy region instead of failing (see `../memory.md` "Userspace memory
+**`mmap`** (`sys_mmap`, glue — both kernels since 2026-11-12; amd64 keeps only
+`/dev/fb0` and the `/dev/kvm` census in its dispatcher). Everything decidable
+from the arguments is refused **before** the process lookup, so a kernel-test
+caller with no current process gets Linux's errno, not `ESRCH` (a crash
+regression test, `crash14: addr = 0xffffffffffffffea`, pins the ordering):
+- `len == 0` → `EINVAL`; `len` past the user half → `ENOMEM`.
+- `PROT_WRITE | PROT_EXEC` is **granted**, as Linux grants it. V8 needs it on
+  its 512 MB code range (`jitprobe.c`,
+  `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 18). The ELF loader's
+  refusal of a writable+executable *segment* is a separate rule and stands.
+- `MAP_FIXED`/`MAP_FIXED_NOREPLACE`: unaligned `addr` → `EINVAL`; `addr` below
+  one page, or the range past `akuma_mmu::USER_VA_END` → `EINVAL`; the range
+  overlapping the kernel's RAM identity map (`ProcessMemory::kernel_hole()`:
+  AArch64 only, scales with RAM; empty on amd64, whose `ld.so` loads at 1 GiB)
+  → `EINVAL`.
+- A file mapping at an unaligned offset → `EINVAL`.
+- No owner process → `ESRCH`.
+- A file mapping whose fd is not a regular file (socket, pipe, directory, a
+  `/dev` node) → `EACCES`; `/dev/zero` maps as anonymous memory. A writable
+  `MAP_SHARED` mapping of an fd not opened for writing → `EACCES`, and of a
+  file the kernel's shared table cannot key (no inode) → `EACCES`.
+- `MAP_FIXED_NOREPLACE` over anything — a region, or a page no region records
+  (page walk capped at 256 MiB) → `EEXIST`. `MAP_FIXED_NOREPLACE` wins over
+  `MAP_FIXED` when both are set, as on Linux.
+- No gap in the placement window for a non-fixed request (`vm_alloc_mmap`) → `ENOMEM`.
+- Eager frame batch alloc fails, and reclaim-and-retry also fails: the mapping
+  silently degrades to a lazy region instead of failing (a writable `MAP_SHARED`
+  file mapping is always lazy and never gets here) (see `../memory.md` "Userspace memory
   model" — lazy anonymous mmap).
 
-**`mremap`** (`sys_mremap`, `mem.rs:400`):
+**A `MAP_SHARED|MAP_ANONYMOUS` mapping is never demand-paged.** Fork shares it
+by identity by walking the parent's present pages; a page not yet faulted is
+not one, and each side would fault a private frame. A writable `MAP_SHARED` file
+mapping is a lazy region carrying both a `file` and a `shared_write` record, and
+its pages are the shared writable table's (§ "Writable MAP_SHARED file-backed
+mappings" below).
+
+**`mremap`** (`sys_mremap`, glue `mem.rs`; **both kernels** since 2026-11-12):
+- `MREMAP_FIXED` → `EINVAL`. The placer chooses the address, and returning a different one than
+  the caller named is a confident wrong answer, so the flag is refused rather than ignored.
 - `new_size == 0` → `EINVAL`; `old_addr` misaligned → `EINVAL`.
 - `old_addr >= user_va_limit()` → `EFAULT`.
 - Shrink (`new_pages <= old_pages`) → returns `old_addr` unchanged, a no-op
@@ -213,26 +223,65 @@ All always-on (no `sc-*` gate; see [`../syscalls.md`](../syscalls.md) "The
   at all. This `ENOMEM`-vs-`EFAULT` split is deliberate and Linux-shaped —
   see Background: JSC's GC used to get `ENOMEM` for every unmapped probe
   address and couldn't distinguish "not my mapping" from "can't grow here".
-- `MREMAP_MAYMOVE`, new region alloc fails → `ENOMEM`.
+- `MREMAP_MAYMOVE`, no process → `ESRCH`; no room → `ENOMEM`.
+- **A move re-points pages; it never copies them.** The new region is demand-paged and carries the
+  old one's recorded protection (or its absence), `file`, `shared_write` and `shared_anon` records,
+  advanced to `old_addr`'s place. `UserAddressSpace::move_present` moves each present leaf with its
+  bits (a CoW page stays CoW, a device page keeps its cache type); a page never touched stays
+  absent and faults in from the same source. Then `unmap_range` retires the source. No frame is
+  allocated, and no copy loop exists that could stop early and look finished
+  ([`AKUMA_ONE_MREMAP_MADVISE.md`](../../../archive/AKUMA_ONE_MREMAP_MADVISE.md)).
 
-**`brk`** (`sys_brk`): no error path modeled. `new_brk == 0` is a size query
-(returns the current brk). If the owner process can't be looked up, returns
-`0` (not an errno) — brk's ABI has no failure return distinct from "brk
-didn't move", so there's nothing to signal.
+**`brk`** (`sys_brk` → `Process::set_brk`; **both kernels** since 2026-11-12). brk's ABI has no
+errno: a refusal answers the current break, and musl's `__expand_heap` then falls back to `mmap`.
+- `new_brk == 0` → the current break. No process → `0`. Below the initial break → refused.
+- **Growth** maps zeroed pages eagerly. It is refused when it asks for more pages than the PMM has
+  free, when a region overlaps it, or when any page in it is already mapped: amd64's interpreter
+  sits at `0x3000_0000`, 512 MiB above a PIE program, and is in no region. Nothing pre-maps the
+  heap and no region records it, on either kernel. Out of
+  memory part-way undoes this call's pages and refuses.
+- **Shrinking** unmaps the pages past the new break, so a regrowth reads zeros.
+- Heap pages are in no region. `MADV_DONTNEED` advises them anyway; fork copies them with the
+  page table. Probe: `brkgrow` in `scripts/mem_suite.py`
+  ([`AKUMA_ONE_BRK.md`](../../../archive/AKUMA_ONE_BRK.md)).
 
-**`mprotect`** (`sys_mprotect`, `mem.rs:602`):
+**`mprotect`** (`sys_mprotect`, glue `mem.rs`; **both kernels** since 2026-11-12 — amd64
+dispatches it to glue):
+- `addr` misaligned → `EINVAL` (checked before `len`, so `mprotect(odd, 0)` is `EINVAL`).
 - `len == 0` → `0` (no-op success, matches Linux).
-- `addr` misaligned → `EINVAL`.
-- Owner process lookup fails → **`EINVAL`**, not `ESRCH`. This is
-  inconsistent with `mmap`/`munmap`'s `ESRCH` on the same failure — a
-  syscall-boundary quirk worth knowing if a newly-ported binary's mprotect
-  path behaves differently than its mmap path under the same condition.
-- Unmapped pages in the requested range are silently skipped (not an error);
-  only mapped pages get `update_page_flags`.
+- `addr + len` past `akuma_mmu::USER_VA_END` → `EINVAL`. On amd64 this is what stops a walk
+  of the kernel's shared upper half.
+- Owner process lookup fails → `ESRCH`, as `mmap`/`munmap`.
+- The regions split on exactly the range; then `UserAddressSpace::reprotect_present`
+  rewrites every **present** page (absent pages are not an error; a lazy page picks up the
+  new protection from its region when it faults).
+- **A page whose frame is still copy-on-write shared stays without write**
+  (`akuma_cow::marks_cow`), so the next store copies it — unless its region is shared *by
+  identity* (`shared_anon`, `shared_write`), where it is granted the write. Never grant a
+  write to a shared private frame from `mprotect`: the store lands in every holder
+  ([`AKUMA_MPROTECT_CONVERGENCE.md`](../../../archive/AKUMA_MPROTECT_CONVERGENCE.md); probe
+  `cowprotect` in `scripts/mem_suite.py`).
 
-**`munmap`** (`sys_munmap`, `mem.rs:654`): owner lookup fails → `ESRCH`.
-`addr`/`len` are page-rounded; unmapping an address with nothing mapped there
-is **not** an error (matches Linux — silently succeeds).
+**`munmap`** (`sys_munmap`, both kernels): checked in Linux's order —
+unaligned `addr` → `EINVAL`; `addr + len` past `akuma_mmu::USER_VA_END` →
+`EINVAL`; owner lookup fails → `ESRCH`. `len` is page-rounded; unmapping an
+address with nothing mapped there is **not** an error (matches Linux — silently
+succeeds). The body, `unmap_range`, is one shape for every caller:
+
+1. write back the shared writable table pages in the range while still mapped,
+   unmap them and reap the entries whose frames that released
+   (`release_shared_write`);
+2. detach **every** region in the range, eager and lazy, and unpin each file
+   no region names afterwards (`akuma_exec::process::detach_regions_in_range`);
+3. sweep the whole range by live PTE (`UserAddressSpace::unmap_present`) and
+   free, outside the address-space lock, the frames the ledger says this space
+   held last.
+
+**Never free by the region's recorded frames**: the record goes stale on every
+CoW break and `MADV_DONTNEED`. **Never sweep only the regions' pages**: a range
+may hold pages no region claims. A kernel's own callers (`MAP_FIXED`, `mremap`,
+exit's shared-mapping release) use `akuma_syscalls_glue::mem::unmap_current`
+([`AKUMA_ONE_MUNMAP.md`](../../../archive/AKUMA_ONE_MUNMAP.md)).
 
 **`madvise`** (`sys_madvise`, `mem.rs:1001`): `MADV_FREE` returns `EINVAL`
 (deliberately — see below); everything else returns `0` unconditionally, and OOM
@@ -248,8 +297,19 @@ self-check it cannot pass without `/proc/<pid>/smaps`
 
 ### `MADV_DONTNEED` — breaks sharing, does not drop the mapping
 
-`madvise_dontneed_range` (`mem.rs:938`). Per page, the rule is
-`dontneed_page_action(mapped, cow_ref)`:
+`madvise_dontneed_range` (glue `mem.rs`; **both kernels** since 2026-11-12). What it touches:
+
+- **Only pages inside a recorded region, or the `brk` heap.** The ELF image is mapped by the loader
+  and is in no region; zeroing its text or data destroys the program with no way to re-read it.
+  Regions are walked a fixed batch at a time, so the walk allocates nothing.
+- **Never a device page.** A frame outside the PMM's RAM (`akuma_pmm::contains`, e.g. `/dev/fb0`)
+  reads as absent to both passes.
+- **A lazy file-backed page is dropped**, and the next touch re-reads the file.
+- **A page of the shared writable table** is written back and dropped by
+  `release_shared_write`, never zeroed (that would zero it for every mapper).
+- No process → `ESRCH` (`len == 0` is `0` first).
+
+Per anonymous page, the rule is `dontneed_page_action(mapped, cow_ref)`:
 
 | `cow_ref` | What it means | Action |
 |---|---|---|
@@ -262,7 +322,8 @@ self-check it cannot pass without `/proc/<pid>/smaps`
 see this frame". Breaking the share = `unmap_and_free_page(va)` — the usual
 `released_last_va` gate, so `pmm::free_page` routes through `cow_ref_dec` and
 declines to free the frame while the peer holds it — then a freshly zeroed
-private frame mapped at the same VA, `RW_NO_EXEC`.
+private frame mapped at the same VA with the **region's** recorded protection
+(`RW_NO_EXEC` when it records none), never the old PTE's bits.
 
 **Until 2026-08-14 every page in that bottom row was `memset` in place**, which
 after a `fork` wrote through the frame the peer was still reading: the peer's
@@ -307,44 +368,78 @@ so would require teaching the eager path to register a region first.
 calibrated against real Linux arm64) and the boot test
 `madvise_dontneed_spares_shared_frame`.
 
-**`msync`** (`sys_msync`, `mem.rs:94`): always returns `0`, even for a range
-with no writable `MAP_SHARED` file mapping (matches Linux: a no-op on a
-clean/private range is a success, not an error).
+**`msync`** (`sys_msync`, glue `mem.rs`; both kernels): `addr` 0 or unaligned →
+`EINVAL`; `len == 0` → `0`; no process → `ESRCH`. Otherwise it writes back the
+shared writable pages present in the range and returns `0`, also for a range with
+no such mapping (as Linux: a no-op on a clean/private range is a success).
 
 **`membarrier`** (`membarrier_cmd`, `mem.rs:582`): `CMD_QUERY` returns a
 capability bitmask (`0x18` = `PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED`).
 `CMD_REGISTER_PRIVATE_EXPEDITED` is a no-op success. `CMD_PRIVATE_EXPEDITED`
 issues a real `dsb ish` + `isb`. Any other cmd → `EINVAL`.
 
+## `MAP_FIXED` replaces exactly as `munmap` removes
+
+Whatever a `MAP_FIXED` mapping lands on is removed by glue's `unmap_range`, the function that
+is `munmap`'s body. That covers eager regions (clipped, frames freed from the live PTE, shared
+file pages written back), lazy regions and stray pages. Then a `PROT_NONE` reservation takes the
+range until the new mapping is installed, so the placer cannot hand it to a `CLONE_VM` sibling
+in between.
+
+**Never clear a range by `unmap_page` alone.** It clears the PTE and nothing else. The frame
+stays in the ledger until exit, and the old `MmapRegion` stays in the list under the new one,
+which breaks the no-overlap invariant every region lookup relies on. Any path that replaces a
+mapping goes through `unmap_range`. Gates:
+
+- `userspace/forktest/c_stress/mapfixed.c`, the `mem_suite.py` probe, measures free memory
+  over 2000 replace cycles;
+- `test_map_fixed_replaces_eager_mapping` (boot suite) checks the record count and the PMM.
+
+[`archive/AKUMA_MAP_FIXED_EAGER_LEAK.md`](../../../archive/AKUMA_MAP_FIXED_EAGER_LEAK.md)
+
 ## Writable MAP_SHARED file-backed mappings (writeback)
 
-This mechanism lives entirely in `mem.rs` — it is not covered in
-`../memory.md`. Akuma has no unified page cache, so a file-backed mapping and
-its backing file don't share storage automatically. When `flags & MAP_SHARED`
-and `prot & PROT_WRITE` and the mapping is file-backed, `sys_mmap` forces the
-**eager** (fully-resident) path and records `(tgid, base_va) →
-SharedFileMapping { path, file_offset, len }` in `SHARED_FILE_MAPPINGS`
-(`mem.rs:40`). Three syscall-visible flush points read that table back to the
-file: `msync`, `munmap` (before the frames are freed), and process exit
-(`flush_and_clear_shared_file_mappings`, called from the exit syscalls in
-`proc.rs`). If the eager frame batch can't be satisfied even after
-reclaiming, such a mapping fails with `ENOMEM` rather than silently
-downgrading to `MAP_PRIVATE` semantics (a downgrade some earlier `go build`
-traces logged — see Background).
+One table for both kernels, `akuma_exec::shm` over `akuma-fpcache-rw`: every process that maps
+page `p` of a file `MAP_SHARED|PROT_WRITE` maps **one frame**, writable and never CoW-marked,
+keyed `(mount, inode, p)`. The region carries `shared_write` (mount, inode, offset, path) beside
+its `file` record; fork shares its present pages by identity and copies the record.
 
-## Placement: the region list is kept in address order
+- **Fault.** Both kernels' fault paths call `shm::fault_page` (a hit maps the peer's frame; a miss
+  reads the file's current page and publishes it) for a `shared_write` region, and
+  `shm::map_existing` first for a read-only page of any other file mapping, so a reader sees a
+  writer's frame. A private writable mapping never takes the writer's frame.
+- **Write-back** (`flush_shared_write`): `msync`, `munmap`/`MAP_FIXED`/`mremap`'s source,
+  `MADV_DONTNEED`, exit and `execve` write each present page below the file's current size — by
+  path while the path still names the inode, by inode otherwise. Then those callers unmap and
+  reap only the entries whose frames the unmap released (`shm::reap_released`).
+- **`write(2)`** and truncation are copied into the mapped frames (`MappedFileHooks`, registered by
+  `akuma_vfs_glue::init_shared_write`); an inode's entries go when ext2 frees it.
 
-The two kernels place a mapping differently and only one of them scans.
-**AArch64** places from a per-process bump cursor plus a free list
-(`ProcessMemory::next_mmap` / `free_regions`) and never looks at the region
-list for a gap. **amd64** has no cursor: `find_free_va` (`amd64/src/mm.rs`) is a
-first-fit scan over `mmap_regions`, which needs the list in address order.
+Design, invariants and what is not promised:
+[`../amd64-shared-write-mmap.md`](../amd64-shared-write-mmap.md);
+[`AKUMA_ONE_SHARED_WRITABLE_TABLE.md`](../../../archive/AKUMA_ONE_SHARED_WRITABLE_TABLE.md).
+
+## Placement: one placer, over the region list
+
+Both kernels place with `akuma_mmap::place::find_free_va_from`: first fit over
+`mmap_regions` from the per-process cursor (`ProcessMemory::next_mmap`), wrapping
+once to the window's base, never into the window's hole (AArch64's kernel RAM
+identity map, `[KERNEL_VA_START, kernel_va_end())`). A freed range is free again
+as soon as its regions are gone; **there is no free list**. AArch64's window is
+`ProcessMemory`'s `[mmap_base, mmap_limit)`; amd64's is still `[MMAP_BASE, MMAP_TOP)`
+until its `mmap` moves to glue.
+
+**Place and record in one hold.** `Process::vm_alloc_mmap` places under the region
+lock and inserts a `PROT_NONE` demand-paged reservation before releasing it; the
+mapping replaces it (`vm_install_region`, or a lazy push) or gives it back
+(`vm_release_reservation`). Placing without recording lets two threads of one
+process get the same range
+([`AKUMA_ONE_VA_PLACER.md`](../../../archive/AKUMA_ONE_VA_PLACER.md)).
 
 Since 2026-09-17 that order is an **invariant maintained by every writer, on
 both kernels**, and it is what lets every walk over the list be a binary search.
 `akuma_mmap::insert_region_sorted` owns it and documents it; the writers are
-amd64's `mmap`/`mremap`, AArch64's `mmap`/`mremap` (`akuma-syscalls-glue`) and
-`akuma_exec::process::record_mmap_region`. Everything else in `akuma-mmap`
+amd64's `mmap`/`mremap` and AArch64's `mmap`/`mremap` (`akuma-syscalls-glue`). Everything else in `akuma-mmap`
 already preserved order: `inherit_mmap_regions_for_cow_child` maps over its
 input, `mprotect_eager_regions_in_range` drains in order and emits each region's
 pieces ascending, `detach_eager_regions_in_range` leaves survivors in the slot
@@ -413,7 +508,7 @@ placement cursor:
 | first-fit from `MMAP_BASE` | 4.02 ns/region | 16 720 ns |
 | with the cursor | **1.65 ns/region** | **7 600 ns** |
 | Linux | flat | ~930 ns |
-| AArch64 (bump cursor + free list) | flat | ~1 400 ns |
+| AArch64 (bump cursor + free list, before 2026-11-12) | flat | ~1 400 ns |
 
 **Compare the shape across kernels, never the nanoseconds** — those arms ran
 under different hypervisors, and flat-vs-linear is the finding. The residual

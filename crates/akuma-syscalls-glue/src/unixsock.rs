@@ -1336,8 +1336,7 @@ fn pipe_read_bytes(rx: u32, buf: &mut [u8], nonblock: bool) -> u64 {
 /// but never accepted.
 ///
 /// `kernel_tests`-gated because `test_unix_table_returns_to_baseline` is its
-/// only caller, and `extreme-size` builds with `no-tests` against a 4.0 MB
-/// floor — an ungated accessor there is dead code the linker still has to carry.
+/// only caller — in a `no-tests` build an ungated accessor is dead code.
 #[cfg(kernel_tests)]
 #[must_use]
 pub fn table_stats() -> (usize, usize) {

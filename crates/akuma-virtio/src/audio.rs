@@ -6,10 +6,10 @@
 //! build an `MmioTransport`, and drive the crate.
 //!
 //! Memory model: DMA stays bounded. `pcm_xfer` shares the caller's PCM buffer in
-//! place (no megabyte-sized device buffer), and we pick small period/buffer sizes
-//! so the driver fits the 4 MB `extreme` budget if the `sound` feature is opted
-//! back in there. The userspace player (`wavplay`) streams the file through a
-//! small fixed buffer, so end-to-end RAM is independent of song length.
+//! place (no megabyte-sized device buffer), and we pick small period/buffer
+//! sizes so the driver stays small. The userspace player (`wavplay`) streams the
+//! file through a small fixed buffer, so end-to-end RAM is independent of song
+//! length.
 //!
 //! I/O model: polling (the crate's `pcm_xfer` is blocking), matching block/rng.
 //! The whole module is gated behind the `sound` Cargo feature; when off, the

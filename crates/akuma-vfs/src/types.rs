@@ -132,10 +132,6 @@ impl FsStats {
         self.free_blocks * self.block_size as u64
     }
 
-    #[must_use]
-    pub const fn used_bytes(&self) -> u64 {
-        self.total_bytes() - self.free_bytes()
-    }
 }
 
 /// Information about a mounted filesystem

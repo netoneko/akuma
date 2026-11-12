@@ -32,7 +32,7 @@ pub mod user;
 /// boot stack reserved above it.
 ///
 /// These were declared inline in `kernel_main` (and, separately and identically,
-/// in `src/process_tests.rs`) until this crate existed. Reading a linker symbol's
+/// in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`) until this crate existed. Reading a linker symbol's
 /// *address* is a safe operation — `&raw const` needs no `unsafe` block — so the
 /// only reason those call sites were unsafe at all was the `unsafe extern` block
 /// required to name the symbols. Naming them once here makes every consumer safe

@@ -5,8 +5,8 @@ on the ryzen metal it runs on. It runs a real Linux guest (Firecracker CI
 `vmlinux-6.1.128`) with a console, timer interrupts and a virtio-blk ext2 root, and
 the **Akuma amd64 kernel itself** as a guest (local APIC, virtio from the command
 line, busybox init).
-Source: **`amd64/src/kvm.rs`** (phases 0-5, the consistency ladder),
-**`amd64/src/kvm/linux.rs`** (the Linux phase), and the pure models in
+Source: **`crates/akuma-kvm-amd64/src/lib.rs`** (phases 0-5, the consistency ladder),
+**`crates/akuma-kvm-amd64/src/linux.rs`** (the Linux phase), and the pure models in
 **`crates/akuma-svm-amd64`**.
 
 > **Stability: C (active risk).** Phases 0-9 have passed on the metal (2026-10-22:
@@ -23,8 +23,35 @@ from the AMD APM Vol 2/3, the virtio and ACPI specifications, Xen's public
 ## Division of labour
 
 `akuma-svm-amd64` is `#![forbid(unsafe_code)]`, `no_std`, no dependencies, and owns
-*vocabulary and decisions*. `amd64/src/kvm*.rs` owns every `unsafe` (the MSR
-writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
+*vocabulary and decisions*. `akuma-svm-switch-amd64` executes the instructions (the
+`EFER.SVME`/`VM_HSAVE_PA` writes, `VMRUN`, `VMSAVE`/`VMLOAD`) behind owned types;
+`akuma-kvm-amd64` is the wiring and every effect, and is `forbid(unsafe_code)`.
+
+### What a guest can reach
+
+A guest is entered only through `akuma_svm_switch_amd64::Guest::run`, which is safe because the
+switch crate owns everything that bounds the guest
+([`AKUMA_SAFE_GUEST_ENTRY.md`](../../archive/AKUMA_SAFE_GUEST_ENTRY.md)):
+
+- **RAM** is a `GuestRam`, made only from the page allocator or the `kvmmem=` reserve
+  (`reserve::{init, carve}`, one reserve per boot), and given back on drop.
+- **The nested page table** is an `Npt` that owns its table frames and every `GuestRam` and page
+  it maps. Leaves are written only into adopted memory (`map_ram`, `adopt_page`), and it is
+  append-only. Guests share it through an `Arc`, so it cannot be dropped under a running guest.
+- **The ASID** is an `Asid`, unique among live values.
+- **On every entry** `run` rewrites, from those values, the VMCB fields that bound the guest:
+  - nested paging on, `N_CR3`, and no SEV, SEV-ES or PML bits;
+  - the all-intercept I/O and MSR maps;
+  - the `IOIO_PROT`, `MSR_PROT`, `SHUTDOWN`, `VMRUN`, `VMLOAD`, `VMSAVE`, `STGI`, `CLGI`,
+    `SKINIT` and `XSETBV` intercepts;
+  - AVIC and virtual `VMLOAD`/`VMSAVE` off, `V_INTR_MASKING` on;
+  - its ASID, and a flush of that ASID on its first entry on each core;
+  - VMCB clean bits zero.
+- **The host** is `VMSAVE`d with GIF already clear on every entry.
+
+What the wiring writes into those fields is overwritten, so a guest that needs a port, an MSR or a
+memory range is emulated through its exits, never granted directly. **Never map a page into a guest
+that the `Npt` does not own, and never add a second way into `VMRUN`.**
 
 | module | what it is |
 |---|---|
@@ -44,7 +71,7 @@ writes, `VMRUN`, `VMSAVE`/`VMLOAD`) and every effect.
 The VM's *description* is a separate leaf crate, **`akuma-vm-spec`** (`forbid(unsafe_code)`, no
 dependencies): the `Spec` (kernel, command line, RAM, vCPUs, disk, port forwards, backend) with its
 parser, its `key=value` wire text, the first-fit extent `arena` over the reserved guest RAM, and the
-`kvmcores=` list parser. The kernel (`amd64/src/kvm/ctl.rs`) and herd both depend on it, so they cannot
+`kvmcores=` list parser. The kernel (`crates/akuma-kvm-amd64/src/ctl.rs`) and herd both depend on it, so they cannot
 disagree on a key or a limit.
 
 ## Invariants
@@ -322,7 +349,7 @@ otherwise. Verified: Alpine's `firecracker --no-api --no-seccomp --config-file v
 ([`../../runbooks/run-firecracker-on-akuma.md`](../../runbooks/run-firecracker-on-akuma.md)). How the protocol was learned and
 what is unconfirmed: [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AKUMA_FIRECRACKER_KVM.md). Code: the pure crate
 `crates/akuma-kvm-abi` (request decode, vCPU argument layouts, the memslot table, the run page; `forbid(unsafe)`),
-`amd64/src/kvm/api.rs` + `api/{vcpu,platform}.rs`, `mm::{remap_user_to_phys, mmap_frames}`.
+`crates/akuma-kvm-amd64/src/api.rs` + `api/{vcpu,platform}.rs`, `mm::{remap_user_to_phys, mmap_frames}`.
 
 - **Handles.** `FileDescriptor::DevKvm(id)`: 0 is `/dev/kvm0`, `n > 0` names a slot of the handle table (system / VM / vCPU),
   so `dup` needs no reference counts. A handle, and the VM, live until their owner process is gone (reaped by the next
@@ -360,6 +387,10 @@ what is unconfirmed: [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AK
 
 * **Firecracker on `/dev/kvm`: the to-do list that ends the KVM work** is in [`../../archive/AKUMA_FIRECRACKER_KVM.md`](../../archive/AKUMA_FIRECRACKER_KVM.md) § *Before the KVM work is finished*: CPU **affinity** (placing vCPU threads and `sched_setaffinity`), the I/O APIC, `GET/SET_LAPIC`, more than one vCPU, seccomp, a kernel-stack guard, a real `HLT` block, an irqfd waker, NetBSD, and lifting the one-VM exclusivity.
 
+* **`akuma-kvm-amd64` has no host tests.** The crate is kernel-only (`cfg(target_os = "none")`), so
+  `cargo test` never sees it; only `akuma-svm-amd64`'s vocabulary and device models are host-tested.
+  Future work in [`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md)
+  § *Host tests for `akuma-kvm-amd64`*.
 * **Large guest->host transfers wedge the guest** (96 MiB+ through the relay), on the old kernel too; the host's
   `/bin/ssh` client spins while the relay's host socket stays full. Evidence and next experiments:
   [`KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md`](../../archive/KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE.md).

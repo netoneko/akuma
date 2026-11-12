@@ -1,7 +1,7 @@
 # Intel HD Audio (amd64)
 
 Source: `crates/akuma-hda` (pure, host-tested, `forbid(unsafe_code)`),
-`amd64/src/hda.rs` (registers, DMA memory, the `/dev/dsp` backend),
+`crates/akuma-kernel-amd64/src/hda.rs` (registers, DMA memory, the `/dev/dsp` backend),
 `crates/akuma-virtio/src/audio.rs` (`hda_backend`: the one dispatch point).
 Bring-up history and the failed first attempt: the runbook
 [`../../../archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md`](../../../archive/AKUMA_AMD64_HDA_AUDIO_BRIEF.md).
@@ -124,7 +124,7 @@ read that `[HDA] pci` line first.**
 cargo test -p akuma-hda --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 
 # QEMU, objective: the WAV backend records what the driver played
-qemu-system-x86_64 -M q35 -cpu max -m 1024 -kernel target/x86_64-unknown-none/release/akuma-amd64 \
+qemu-system-x86_64 -M q35 -cpu max -m 1024 -kernel target/x86_64-unknown-none/release/akuma \
   -append "pci hdatest skiptests" -audiodev wav,id=a0,path=hda.wav \
   -device intel-hda -device hda-output,audiodev=a0 -serial file:hda.log -display none -no-reboot
 # hda.log: "[HDA] ready (/dev/dsp)", then the recorded tone matches the generated

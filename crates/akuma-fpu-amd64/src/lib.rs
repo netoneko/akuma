@@ -1,7 +1,7 @@
 //! The amd64 FPU save area, as bytes and rules.
 //!
 //! Two kernels save x87/SSE(/AVX) state around a context switch: the full amd64 kernel
-//! (`amd64/src/sched.rs`, `xsave64` when the CPU has AVX, else `fxsave64`) and taoxichuan
+//! (`crates/akuma-kernel-amd64/src/sched.rs`, `xsave64` when the CPU has AVX, else `fxsave64`) and taoxichuan
 //! (`crates/akuma-tokio-kernel-amd64/src/exec_twin.rs`, `fxsave64` only). They each had their own copy of the
 //! same facts - the area size, the offsets, the power-on image - and one of those facts
 //! (`MXCSR = 0x1F80`, not zero) is the difference between a program that runs and a

@@ -20,8 +20,6 @@
 extern crate alloc;
 
 use alloc::boxed::Box;
-#[cfg(all(target_os = "none", sgi_sched))]
-use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -41,35 +39,32 @@ use akuma_stack::StackRegion;
 /// be PICKED by a scheduler only when its gate is clear. Two distinct races
 /// require this, and thread STATE alone catches neither:
 ///
-/// 1. **Switch-out tail.** `commit_switch` marks the outgoing thread READY and
-///    POOL is released when `sgi_scheduler_handler_with_sp` returns — but the
-///    switching core keeps EXECUTING ON THE OUTGOING THREAD'S KERNEL STACK
-///    until the vector asm's `mov sp, x0` (Rust epilogues, BKL reconcile and
-///    tag bookkeeping all run on it after POOL is gone). A peer picking the
-///    thread in that window resumes it onto a stack still in use.
+/// 1. **Switch-out tail.** The outgoing thread is READY again before the
+///    switching core has left its kernel stack: the core keeps EXECUTING ON
+///    THE OUTGOING THREAD'S STACK until the switch has moved SP. A peer picking
+///    the thread in that window resumes it onto a stack still in use.
 /// 2. **Wake-before-switch-out.** `schedule_blocking` stores WAITING (often
 ///    with an already-expired deadline) while the thread is STILL RUNNING,
 ///    before its yield-SGI fires. A peer's wake-pass / `mark_thread_ready`
-///    flips it READY and a peer scheduler resumes it from its STALE `ctx.sp`
+///    flips it READY and a peer scheduler resumes it from its STALE saved SP
 ///    (the previous switch-out's frame) while it is still running elsewhere —
 ///    a double-run on one stack. Observed as EL1 `ret` into kernel data /
 ///    `ELR=0x8` with SP in another thread's stack, and as §5.1's ERET to EL0
 ///    with a kernel register file.
 ///
-/// Protocol: `commit_switch` sets the gate for the INCOMING thread (and
-/// defensively re-asserts the outgoing thread's, which stays set from its own
-/// switch-in); the outgoing tid is recorded per-core and its gate is cleared by
-/// `rust_switch_finished`, called from the vector asm immediately AFTER
-/// `mov sp, x0`. Bringup sites (boot thread, per-core idle claim) set the gate
-/// for the thread they start life running. Pickers and the slot recycler skip
-/// gated threads.
+/// Protocol: the picker's 0→1 CAS on the INCOMING thread's gate is its claim
+/// (`akuma_threading::pick_next`); the outgoing thread's gate stays set from its
+/// own switch-in. The switch records the outgoing tid in [`PER_CORE_OFFCPU`] and
+/// [`rust_switch_finished`] clears its gate once this core is off that stack.
+/// Bringup sites (boot thread, per-core idle claim) set the gate for the thread
+/// they start life running. Pickers and the slot recycler skip gated threads.
 pub static ON_CPU: [AtomicU8; MAX_THREADS] = {
     const INIT: AtomicU8 = AtomicU8::new(0);
     [INIT; MAX_THREADS]
 };
 
 /// Per-core: the tid whose [`ON_CPU`] gate this core must clear once the
-/// vector asm has switched SP (`usize::MAX` = none pending). Sized by
+/// switch has moved SP (`usize::MAX` = none pending). Sized by
 /// `types::MAX_CORES`, the SMP bringup cap.
 pub static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
     const INIT: AtomicUsize = AtomicUsize::new(usize::MAX);
@@ -77,11 +72,10 @@ pub static PER_CORE_OFFCPU: [AtomicUsize; MAX_CORES] = {
 };
 
 
-/// Clear the outgoing thread's off-CPU gate; the vector asm and the trampolines below call it.
+/// Clear the outgoing thread's off-CPU gate; the switch and the trampolines below call it.
 ///
-/// Called immediately after `mov sp, x0`: this core is
-/// now off the outgoing thread's kernel stack, so peers may pick that thread up (or recycle its slot). Clears
-/// the off-CPU gate `commit_switch` latched. Runs with IRQs masked on the incoming thread's stack; takes no locks.
+/// Called once SP has moved: this core is now off the outgoing thread's kernel stack, so peers may pick that
+/// thread up (or recycle its slot). Runs with IRQs masked on the incoming thread's stack; takes no locks.
 #[unsafe(no_mangle)]
 pub extern "C" fn rust_switch_finished() {
     let core = akuma_bkl::bkl::current_core_id() as usize;
@@ -112,7 +106,10 @@ pub fn set_exception_stack(stack_top: u64) {
 pub fn set_exception_stack(_stack_top: u64) {}
 
 /// Set the current thread id in `TPIDRRO_EL0` (read-only from EL0). Every per-slot static is indexed with it.
-#[cfg(all(target_os = "none", sgi_sched))]
+///
+/// Both AArch64 scheduler paths: the SGI switch calls it, and so does the root kernel's hooked
+/// machine half (`akuma-kernel-glue`'s `hooked`), whose `set_current_slot` hook it is.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[inline]
 pub fn set_thread_register(tid: usize) {
     // SAFETY: a single `msr` with no memory operands; the caller is the scheduler naming the thread it runs.
@@ -124,7 +121,9 @@ pub fn set_thread_register(tid: usize) {
 /// The kernel runs in the TTBR0 low half, so a TTBR0 that does not map kernel text is a machine-wedging fault
 /// loop at the next fetch: the caller must pass a root it has just validated (the scheduler installs a
 /// thread's own saved root). Refuses (returns `false`) the one value that can never be a root.
-#[cfg(all(target_os = "none", sgi_sched))]
+///
+/// Both AArch64 scheduler paths, for the reason [`set_thread_register`] is.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 #[must_use]
 pub fn install_ttbr0_flush(new_ttbr0: u64) -> bool {
     if new_ttbr0 & 0x0000_FFFF_FFFF_F000 == 0 {
@@ -293,79 +292,7 @@ pub fn word_cell(idx: usize, field: CtxField) -> &'static AtomicU64 {
 
 // ── the switch ──────────────────────────────────────────────────────────────────────────────────────────
 
-#[cfg(all(target_os = "none", sgi_sched))]
-global_asm!(
-    r#"
-.section .text
-.global thread_start
-.global thread_start_closure
 
-// Thread entry trampoline for extern "C" functions
-// x19 holds the actual thread entry function
-thread_start:
-    // Enable IRQs for this thread
-    msr daifclr, #2
-    
-    // Call the thread entry function (in x19)
-    blr x19
-    
-    // Thread returned - mark as terminated and yield
-    // (This shouldn't happen for -> ! functions, but just in case)
-    b thread_exit_asm
-
-// Thread entry trampoline for Rust closures
-// x19 holds pointer to the closure trampoline function
-// x20 holds the raw pointer to the boxed closure data
-// x21 holds IRQ enable flag: 0 = enable IRQs now, non-zero = keep disabled
-thread_start_closure:
-    // CRITICAL: Verify x19 (trampoline) is valid before calling
-    // If x19 == 0, we'd jump to address 0 and crash with EC=0x0
-    cbnz x19, 2f
-    // x19 is 0! Halt with marker
-    mov x0, #0xBAD
-    movk x0, #0x0019, lsl #16   // 0x00190BAD = "bad x19"
-3:  wfi
-    b 3b
-2:
-    // Check if we should enable IRQs (x21 == 0 means enable)
-    // For process threads: x21 != 0, keep IRQs disabled until activate()
-    // For system/test threads: x21 == 0, enable IRQs now
-    cbnz x21, 1f           // Skip IRQ enable if x21 != 0
-    msr daifclr, #2        // Enable IRQs
-1:
-    // Call the trampoline with closure pointer as argument
-    // x19 = trampoline function pointer
-    // x20 = closure data pointer (passed as x0)
-    mov x0, x20
-    blr x19
-    
-    // Thread returned - should not happen for -> ! closures
-    b thread_exit_asm
-
-thread_exit_asm:
-    wfi
-    b thread_exit_asm
-"#
-);
-
-#[cfg(all(target_os = "none", sgi_sched))]
-unsafe extern "C" {
-    fn thread_start() -> !;
-    fn thread_start_closure() -> !;
-}
-
-#[cfg(not(all(target_os = "none", sgi_sched)))]
-extern "C" fn thread_start() -> ! { panic!("not on bare metal aarch64") }
-#[cfg(not(all(target_os = "none", sgi_sched)))]
-extern "C" fn thread_start_closure() -> ! { panic!("not on bare metal aarch64") }
-
-/// Address of the SGI path's `extern "C"` thread entry trampoline.
-#[must_use]
-pub fn thread_start_addr() -> u64 { thread_start as *const () as u64 }
-
-/// Address of the SGI path's closure entry trampoline (`x19` = fn, `x20` = data, `x21` = IRQ-mask flag).
-#[must_use]
-pub fn thread_start_closure_addr() -> u64 { thread_start_closure as *const () as u64 }
 
 #[cfg(target_arch = "x86_64")]
 core::arch::global_asm!(
@@ -383,7 +310,7 @@ akuma_threading_x86_switch_context:
      * is how this port shipped originally: `IF` has to belong to the task, not
      * to whoever last ran on this core. A syscall (interrupts off) that yields
      * to a kernel task (interrupts on) must come back with them off, and it did
-     * not until `amd64/src/sched.rs` Stage U — the resumer's state leaked into
+     * not until `crates/akuma-kernel-amd64/src/sched.rs` Stage U — the resumer's state leaked into
      * the resumed, presenting as an unrelated intermittent hang. Restored here
      * 2026-09-06 before anything adopts this switch
      * (`docs/archive/AKUMA_PIPES_EXTRACTION.md` § "two of them disagree"). */
@@ -408,7 +335,7 @@ akuma_threading_x86_switch_context:
 .global akuma_threading_x86_thread_entry_trampoline
 akuma_threading_x86_thread_entry_trampoline:
     /* Reached via the `ret` above the first time a freshly spawned thread is
-     * switched in — see `x86_build_closure_context`, which pre-loads r12 =
+     * switched in — see `build_closure_context`, which pre-loads r12 =
      * closure_ptr and rbx = the boxed-closure trampoline fn pointer at
      * exactly the stack slots this switch's `pop`s read them from. `jmp`,
      * not `call`: the trampoline is `fn(*mut ()) -> !` and never returns, so
@@ -421,7 +348,7 @@ akuma_threading_x86_thread_entry_trampoline:
      * target: a fresh task never returns to x86_switch_context's tail, so
      * its `rust_switch_finished()` never runs for us. Without the call here
      * the OUTGOING thread's ON_CPU gate stays latched forever, and pickers
-     * and `x86_runnable_exists` skip gated threads — the preempted thread
+     * and `runnable_exists` skip gated threads — the preempted thread
      * can never be scheduled again. Seen on Taoxichuan stage 12: the first
      * `sleep_until` park yielded (per its own contract) to the freshly
      * seeded idle thread, the gate on the parker latched, idle saw nothing
@@ -440,7 +367,10 @@ unsafe extern "C" {
     fn akuma_threading_x86_thread_entry_trampoline() -> !;
 }
 
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+// Bare metal only, like the SGI path's asm above: a host build (`cargo test` with the default
+// features, which carry `hooked-sched`) assembles for Mach-O/ELF-host, where `.section .text` is not
+// valid, and never switches: `switch_contexts` has a host arm, and the trampoline a host stub.
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 core::arch::global_asm!(
     r#"
     .section .text
@@ -484,7 +414,7 @@ akuma_threading_hooked_switch_context:
 akuma_threading_hooked_thread_entry_trampoline:
     /* First switch-in of a fresh thread: the `ret` above lands here with
      * x19 = closure_ptr and x20 = the boxed-closure trampoline, seeded by
-     * `x86_build_closure_context`. As on x86, this is the task's first scheduler
+     * `build_closure_context`. As on x86, this is the task's first scheduler
      * entry, so it clears the outgoing thread's ON_CPU gate itself. `br`, not
      * `blr`: the trampoline never returns. */
     bl rust_switch_finished
@@ -493,13 +423,19 @@ akuma_threading_hooked_thread_entry_trampoline:
 "#
 );
 
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 unsafe extern "C" {
     fn akuma_threading_hooked_switch_context(old: *mut Context, new: *const Context);
     fn akuma_threading_hooked_thread_entry_trampoline() -> !;
 }
 
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+/// Host stand-in for the entry trampoline; its address is all a host build takes.
+#[cfg(all(not(target_os = "none"), target_arch = "aarch64"))]
+extern "C" fn akuma_threading_hooked_thread_entry_trampoline() -> ! {
+    unreachable!("akuma-switch: host builds have no context switch");
+}
+
+#[cfg(target_arch = "aarch64")]
 const _: () = {
     assert!(core::mem::offset_of!(Context, x19) == 8);
     assert!(core::mem::offset_of!(Context, x29) == 88);
@@ -519,7 +455,6 @@ const _: () = {
 ///
 /// # Panics
 /// If `old == new`, an index is out of range, or either slot is borrowed.
-#[cfg(hooked_sched)]
 pub fn switch_contexts(old: usize, new: usize) {
     assert!(old != new, "switch_contexts: old == new ({old})");
     assert!(
@@ -533,27 +468,32 @@ pub fn switch_contexts(old: usize, new: usize) {
     unsafe {
         akuma_threading_x86_switch_context(&raw mut (*o).rsp, &raw const (*n).rsp);
     }
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_os = "none", target_arch = "aarch64"))]
     // SAFETY: see the doc.
     unsafe {
         akuma_threading_hooked_switch_context(o, n);
     }
+    // Host builds (`cargo test` with the default features) have no switch asm and never switch.
+    #[cfg(all(not(target_os = "none"), target_arch = "aarch64"))]
+    {
+        let _ = (o, n);
+        unreachable!("akuma-switch: host builds have no context switch");
+    }
 }
 
 /// The address a fresh hooked thread's first switch returns into.
-#[cfg(all(hooked_sched, target_arch = "x86_64"))]
+#[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn entry_trampoline_addr() -> u64 { akuma_threading_x86_thread_entry_trampoline as *const () as u64 }
 
 /// The address a fresh hooked thread's first switch returns into.
-#[cfg(all(hooked_sched, target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[must_use]
 pub fn entry_trampoline_addr() -> u64 { akuma_threading_hooked_thread_entry_trampoline as *const () as u64 }
 
 // ── fresh-stack writers ─────────────────────────────────────────────────────────────────────────────────
 
 /// How much of a stack's top the writers below may touch: a frame plus the register file, nothing deeper.
-#[allow(dead_code)]
 const SEED_WINDOW: usize = 4096;
 
 /// A stack's region, vouched by its owner.
@@ -606,7 +546,7 @@ pub fn build_closure_context(stack_top: usize, trampoline: u64, closure_ptr: u64
 
 /// A fresh thread's [`Context`] on the aarch64 hooked path: a zeroed d8-d15 block, `DAIF` = 0, returning into
 /// the entry trampoline with `closure_ptr` in x19 and `trampoline` in x20.
-#[cfg(all(target_arch = "aarch64", hooked_sched))]
+#[cfg(target_arch = "aarch64")]
 #[must_use]
 pub fn build_closure_context(stack_top: usize, trampoline: u64, closure_ptr: u64) -> Context {
     let entry_sp = (stack_top & !0xf) - 64;

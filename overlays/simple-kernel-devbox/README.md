@@ -8,7 +8,7 @@ link). It is the rootfs half of
 and boot it** on QEMU or Firecracker. Build the kernel, build this image, boot,
 ssh in.
 
-The sibling of `overlays/devbox` (rump) and `overlays/devbox-smoltcp` — a strict
+The sibling of `overlays/devbox` (rump and smoltcp) — a strict
 subset of the smoltcp devbox with three differences:
 
 | | devbox-smoltcp | **simple-kernel-devbox** |
@@ -85,7 +85,7 @@ Knobs (`run.sh`): `SIMPLE_KERNEL_DISK`, `MEMORY` (4096), `SMP` (2),
 Same image, Firecracker loader. Build the FC-shaped kernel and pass the disk:
 
 ```bash
-FC_FEATURES=devbox-smoltcp,no-tests overlays/devbox-firecracker/build.sh   # -> akuma-fc.bin
+FC_FEATURES=no-tests overlays/devbox-firecracker/build.sh   # -> akuma-fc.bin
 FC_DISK=$PWD/simple-kernel-devbox.img overlays/devbox-firecracker/run.sh   # mac: via Lima (default)
 FC_DISK=$PWD/simple-kernel-devbox.img overlays/devbox-firecracker/run.sh --local   # KVM metal
 ```
@@ -111,5 +111,5 @@ Apple Silicon (`overlays/devbox-firecracker/host-setup.sh` first). SSH lands on 
 
 - Guide for AI agents: `bootstrap/public/kernel-bootstrap-with-local-ai/index.md`
 - Full devbox (rump): `overlays/devbox/` + `docs/runbooks/build-devbox.md`
-- smoltcp devbox: `overlays/devbox-smoltcp/`, `scripts/build_devbox_smoltcp.sh`
+- smoltcp devbox: `overlays/devbox/run-smoltcp.sh`, `scripts/build_devbox_smoltcp.sh`
 - Firecracker: `overlays/devbox-firecracker/`

@@ -5,7 +5,7 @@
 # docs/runbooks/amd64-bare-metal-loop.md § "Install the kernel from inside Akuma"
 #
 # Usage: install_kernel_amd64.sh [elf-path] [dest]
-#   elf-path defaults to /root/ktarget/x86_64-unknown-none/release/akuma-amd64
+#   elf-path defaults to /root/ktarget/x86_64-unknown-none/release/akuma
 #   dest     defaults to /boot/akuma-amd64
 #
 # This is the amd64 counterpart of scripts/dropoff_kernel.sh, and it is smaller
@@ -30,7 +30,7 @@ if [ "$(uname -s)" != "Akuma" ]; then
     exit 1
 fi
 
-ELF="${1:-/root/ktarget/x86_64-unknown-none/release/akuma-amd64}"
+ELF="${1:-/root/ktarget/x86_64-unknown-none/release/akuma}"
 DEST="${2:-/boot/akuma-amd64}"
 
 [ -f "$ELF" ] || { echo "install_kernel_amd64.sh: no ELF at $ELF — build it first" >&2; exit 1; }

@@ -27,7 +27,7 @@ are real masks now. Two documented divergences:
 
 `paging.rs`'s private `pushfq`/`cli` pair and `exec_runtime.rs`'s private
 `cli`/`sti` hooks migrated onto the crate; their "silent no-op" warnings are
-retired. `amd64/Cargo.toml` gains a direct `akuma-cpu` dependency.
+retired. `crates/akuma-kernel-amd64/Cargo.toml` gains a direct `akuma-cpu` dependency.
 
 ### 2. x86 per-core identity
 
@@ -41,7 +41,7 @@ sharing one counter.
 
 Fix: `akuma_cpu::percpu` (`core_id()` = `gs:[24]`, `current_task()` =
 `gs:[32]`) reading amd64's `PerCpu.index` / `PerCpu.current_task`. The
-cross-crate contract is enforced by `amd64/src/smp.rs`'s `OFFSETS_PINNED`
+cross-crate contract is enforced by `crates/akuma-kernel-amd64/src/smp.rs`'s `OFFSETS_PINNED`
 (extended with `index==24`, `current_task==32`); the writer side's assert is
 the only enforcement `akuma-cpu` gets, and the module header says so. Both
 fields were already maintained per core (`install_percpu`, the context
@@ -54,7 +54,7 @@ core as an argument for exactly this reason (5a's finding).
 ### 3. BKL unification: `akuma_bkl` is *the* amd64 BKL
 
 Flipping the feature would have activated `akuma_bkl`'s `KernelLock` alongside
-`amd64/src/smp.rs`'s private ticket lock — two locks answering one question
+`crates/akuma-kernel-amd64/src/smp.rs`'s private ticket lock — two locks answering one question
 (`idle_halt`, `blocking_relax`, `akuma_elf::interp` taking the crate's; every
 ring-3 boundary taking the private one). The private lock is deleted;
 `bkl_enter`/`bkl_leave`/`bkl_abandon`/`bkl_drop_window`/`bkl_run_unlocked`
@@ -145,7 +145,7 @@ That is a **use-after-free read through a stale peer-core TLB entry**:
 once; a fork demotes bss, a parent write-fault CoW-copies a page, and the old
 frame is freed when the child drops its ref. A reader on another core still
 holds the pre-demote `RO` translation — x86 has **no TLB shootdown**
-(`amd64/src/smp.rs`'s own header: "complete here because an address space is
+(`crates/akuma-kernel-amd64/src/smp.rs`'s own header: "complete here because an address space is
 only ever active on the core running its one task"), and that invariant is
 exactly what `pthread_create` breaks. When PMM hands the freed frame out
 `alloc_page_zeroed`, the stale translation reads zeros. The fork self-tests

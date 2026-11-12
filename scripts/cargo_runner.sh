@@ -80,8 +80,8 @@ GDB_PORT="${GDB_PORT:-$((1234 + INSTANCE))}"
 # in 0.1s" cargo line that looks like a normal cache hit.
 #
 # That breaks exactly the workflow this repo relies on most: a same-source A/B that
-# alternates feature sets (e.g. `--features …,no-bkl-vfs` vs without, or any BKL
-# carve-out validation). Observed 2026-07-31: a `devbox-smoltcp` boot whose ELF had the
+# alternates feature sets (e.g. `--features …,bkl-profile` vs without, or any
+# measurement build). Observed 2026-07-31: a `devbox-smoltcp` boot whose ELF had the
 # in-kernel SSH server compiled OUT still printed "[Main] Spawning built-in SSH server
 # thread" and served the in-kernel banner, because the .bin was from a plain
 # `smp-shared` build minutes earlier.
@@ -228,7 +228,7 @@ elif [ "$use_hvf" = "1" ]; then
   echo "[cargo_runner] accelerator: HVF (-accel hvf -cpu host). HVF=0 to force TCG." >&2
 
   # HVF + a boot-test build + under 2 GB = `Assertion failed: (isv)` and QEMU
-  # exits 134 before the suite finishes. `src/tests.rs`'s user-copy trampoline
+  # exits 134 before the suite finishes. `crates/akuma-kernel-tests-aarch64/src/tests.rs`'s user-copy trampoline
   # test deliberately runs a copy off the end of mapped kernel memory; below
   # 2048 that cliff lands where HVF cannot resolve the access as plain RAM, so
   # it reports ISV=0 and QEMU asserts instead of the guest taking the fault.
@@ -236,7 +236,7 @@ elif [ "$use_hvf" = "1" ]; then
   #
   # Measured 2026-08-28 on an unmodified tree, SMP=4: 256M (this script's own
   # default), 512M and 1024M all assert; 2048M passes 316/0 and boots to SSH.
-  # Warn rather than fail, because a `no-tests` build (devbox, extreme-size)
+  # Warn rather than fail, because a `no-tests` build (the devboxes)
   # compiles none of that and is genuinely fine at 256M — and this script
   # cannot tell the two apart from the ELF alone.
   #
@@ -252,7 +252,7 @@ elif [ "$use_hvf" = "1" ]; then
     echo "[cargo_runner]   'Assertion failed: (isv) ... hvf.c' and qemu exit 134 —" >&2
     echo "[cargo_runner]   that is this configuration, NOT a kernel bug." >&2
     echo "[cargo_runner]   Use MEMORY=2048M, or HVF=0 for TCG. A no-tests build" >&2
-    echo "[cargo_runner]   (devbox / extreme-size) is unaffected; ignore this." >&2
+    echo "[cargo_runner]   (the devboxes) is unaffected; ignore this." >&2
     echo "[cargo_runner]   docs/archive/QEMU_HVF_ISV_BUG.md 'Root cause 5'." >&2
   fi
 else
@@ -320,6 +320,16 @@ case "$KERNEL_DROPOFF" in
     ;;
 esac
 
+# INIT / INITARGS: the kernel's `init=` / `initargs=` (comma-separated), passed as the DTB's
+# `/chosen/bootargs`; APPEND adds any other words. Unset, the kernel starts `herd daemon`.
+# The same names `amd64/run.sh` takes. `docs/reference/subsystems/boot.md` § Init.
+BOOTARGS="${APPEND:-}"
+[ -n "${INIT:-}" ] && BOOTARGS="$BOOTARGS init=$INIT"
+[ -n "${INITARGS:-}" ] && BOOTARGS="$BOOTARGS initargs=$INITARGS"
+BOOTARGS="${BOOTARGS# }"
+APPEND_ARGS=()
+[ -n "$BOOTARGS" ] && APPEND_ARGS=(-append "$BOOTARGS")
+
 QEMU_ARGS=(
   -semihosting
   -machine virt,gic-version=3
@@ -340,6 +350,7 @@ QEMU_ARGS=(
   "${DROPOFF_ARGS[@]}"
   "${ACTION_ARGS[@]}"
   -kernel "$BIN"
+  "${APPEND_ARGS[@]}"
   "${GDB_ARGS[@]}"
 )
 

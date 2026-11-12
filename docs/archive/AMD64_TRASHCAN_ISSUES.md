@@ -129,7 +129,7 @@ in `akuma-syscalls-glue` — with `sc=0` (x86_64 `read`):
 pid 81: 453 -> 483). A lost wakeup leaves a thread parked and never picked;
 these are being scheduled, re-testing their condition, finding the pipe
 empty and parking again. So the wake path is working and the ~500 lines of
-sticky-`WOKEN_STATES` reasoning in `amd64/src/sched.rs` § "There is no
+sticky-`WOKEN_STATES` reasoning in `crates/akuma-kernel-amd64/src/sched.rs` § "There is no
 `prepare_block`" are not implicated. **The data is simply not in the pipe.**
 
 That moves the question from "who failed to wake whom" to "where did the
@@ -186,7 +186,7 @@ perfectly — the tell that the two use different resolvers.
 **"Fixed where?" again.** The AArch64 resolver has always short-circuited
 `localhost` and a dotted quad — twice, in fact, once inside
 `akuma_net::dns::resolve_host` and once inside `resolve_host_blocking`.
-`amd64/src/dns.rs::resolve_a` is a *separate* A-record client (written because
+`crates/akuma-kernel-amd64/src/dns.rs::resolve_a` is a *separate* A-record client (written because
 `smoltcp_net::dns_query` hung on this target, §3.30 of
 `AKUMA_FIRECRACKER_AMD64.md`) and it had neither. So `resolve_host("192.168.1.203")`
 went out and asked a resolver for an A record **named** `192.168.1.203`, got
@@ -213,7 +213,7 @@ on the same ssh session worked normally.
 That split is the whole diagnosis. `read(2)` on fd 0 goes through
 `akuma-syscalls-glue`'s `Stdin` arm, which reads the process's
 `ProcessChannel` — the thing `sshd` actually feeds. `poll_input_event` had a
-**local copy** in `amd64/src/fd.rs` that, for anything that was not a pipe,
+**local copy** in `crates/akuma-kernel-amd64/src/fd.rs` that, for anything that was not a pipe,
 looped on `crate::input::getb()` — the **serial port**. An ssh session's
 keystrokes are never there. `meow`'s TUI blocked on its terminal-size probe
 before painting a single frame; `paws` blocked on its first keystroke.
@@ -223,7 +223,7 @@ the timeout **is** a TUI's frame tick (`meow` polls with 50 ms and repaints when
 it expires) and it is what lets the terminal-size probe give up after 500 ms and
 fall back to 100x25 instead of waiting for a cursor report nobody will send.
 
-**The fix:** `amd64/src/usermode.rs` arm 313 hands the call to
+**The fix:** `crates/akuma-kernel-amd64/src/usermode.rs` arm 313 hands the call to
 `akuma-syscalls-glue`'s `sys_poll_input_event` whenever the process has a
 channel — the shared implementation AArch64 has always used, which reads the
 channel, honours the timeout, registers an input waker and re-resolves the
@@ -249,7 +249,7 @@ wrong, and the screenshot is the whole bug report: `meow`'s footer printed
 `[Provider: mlx] [Model: …] [MEOW] awaiting user input...` instead of one row
 repainted in place.
 
-`amd64/src/usermode.rs`'s Akuma-private match implemented 300, 301, 302, 303,
+`crates/akuma-kernel-amd64/src/usermode.rs`'s Akuma-private match implemented 300, 301, 302, 303,
 313, 315-319, 322, 324-326 — and **nothing between 307 and 314**. Everything
 else in that range fell through to `_ => errno::ENOSYS`:
 
@@ -591,7 +591,7 @@ that writing `dmesg` to the screen appears to disturb networking. It does not
 need an experiment to explain, only a read:
 
 1. **Every amd64 syscall takes the BKL at entry, unconditionally.**
-   `amd64/src/usermode.rs` calls `crate::smp::bkl_enter()` at both dispatch
+   `crates/akuma-kernel-amd64/src/usermode.rs` calls `crate::smp::bkl_enter()` at both dispatch
    sites, and that is `akuma_bkl::bkl::enter_kernel()` with no condition on it.
    **This target has no per-syscall opt-out bitmap** — AArch64 has one
    (`akuma_bkl::policy`, the seven `no-bkl-*` phase toggles plus the bitmap);
@@ -601,13 +601,13 @@ need an experiment to explain, only a read:
    machine is the framebuffer (`akuma-fbcon`), there is no UART, and drawing a
    scrolling screenful is slow work — all of it inside the lock.
 3. **The network path needs that same lock, and is already known to lose on it.**
-   `amd64/src/net.rs:560` records: "Measured 2026-09-17: at `SMP=4` this daemon's
+   `crates/akuma-kernel-amd64/src/net.rs:560` records: "Measured 2026-09-17: at `SMP=4` this daemon's
    near-continuous BKL ownership starved every other core's syscall entry into a
    `[BKL] stuck`". The drain itself was carved out for exactly this reason
    (`dropped_window_open`/`close` around it), but the daemon still needs the lock
    around that window.
 4. And an arriving packet here waits for the next `netpoll` lap because **there is
-   no NIC interrupt on this target** (`amd64/src/net.rs:433`), so delaying the lap
+   no NIC interrupt on this target** (`crates/akuma-kernel-amd64/src/net.rs:433`), so delaying the lap
    delays delivery directly rather than merely slowing a copy.
 
 So "printing to the screen hurts the network" is the expected behaviour of this
@@ -748,7 +748,7 @@ busybox: /sbin/acpid: Function not implemented
 
 That is `ENOSYS`. Plain `busybox --install` makes **hard links**, so it calls
 `link(2)` — x86_64 **86**, one of the legacy spellings with no asm-generic twin
-(the class `amd64/src/usermode.rs` keeps a shim list for: `open`, `stat`,
+(the class `crates/akuma-kernel-amd64/src/usermode.rs` keeps a shim list for: `open`, `stat`,
 `unlink` 87, `symlink` 88, `readlink` 89 …). 86 has no arm, so it falls through
 to `_ => errno::ENOSYS`. Confirmed directly: `busybox ln /bin/hello /tmp/x`
 gives `Function not implemented`, while `ln -s` creates a real symlink.
@@ -1065,7 +1065,7 @@ why every observation looked like a pipe problem and none of them was:
 
 **Why it was here and not on AArch64.** `Process::close_cloexec_fds` is shared
 code and had exactly one caller: `akuma-syscalls-glue`'s `sys_execve`, the
-AArch64 path. `amd64/src/usermode.rs`'s `sys_execve` had no sweep at all. This
+AArch64 path. `crates/akuma-kernel-amd64/src/usermode.rs`'s `sys_execve` had no sweep at all. This
 is the runbook's "when the archive says fixed, ask **fixed where?**" in its
 purest form — nothing was regressed, the call site simply never existed here.
 
@@ -1076,10 +1076,10 @@ never before — a failed `execve` must leave the fd table untouched):
   and `Process::close_cloexec_fds_releasing()` built on it. `close_cloexec_fds`
   alone only removes the *names*; the references still have to be dropped, and a
   second inline copy of that list is how the two kernels drifted apart.
-* `amd64/src/usermode.rs::sys_execve`: calls it.
+* `crates/akuma-kernel-amd64/src/usermode.rs::sys_execve`: calls it.
 
 Also landed on the way, because the bug was invisible without it:
-`amd64/src/pipe.rs::report` now calls `glue::pipe_dump()`. The per-pipe
+`crates/akuma-kernel-amd64/src/pipe.rs::report` now calls `glue::pipe_dump()`. The per-pipe
 breakdown existed but its only callers were in `akuma-kernel-glue` — AArch64
 again — so the one diagnostic that separates a lost wakeup from an unwritten
 pipe was unreachable on this target.

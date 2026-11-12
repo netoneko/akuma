@@ -342,7 +342,7 @@ before it is in force.
   test: demand paging 4 faults serviced, frames 126380 -> 126378   [OK]
 ```
 
-`amd64/src/idt.rs`. Before it, *every* fault was fatal and invisible: with no IDT
+`crates/akuma-kernel-amd64/src/idt.rs`. Before it, *every* fault was fatal and invisible: with no IDT
 loaded a page fault escalates to a double fault and then a triple fault, and the
 VMM resets the guest with nothing on the serial line. Every bug in the earlier
 stages had that same symptom — silence — which is why those modules bounds-check
@@ -404,7 +404,7 @@ group. `amd64/run-firecracker.sh` stages a `run.sh` that uses it and tees to
   test: timer interrupts 5 ticks in 10691123 spins   [OK]   # Firecracker, Zen 4
 ```
 
-`amd64/src/lapic.rs`. Everything before this ran with `IF` clear from `boot.s`
+`crates/akuma-kernel-amd64/src/lapic.rs`. Everything before this ran with `IF` clear from `boot.s`
 onward: the kernel could fault, but nothing could *interrupt* it. A timer tick is
 the prerequisite for preemption and therefore for a scheduler.
 
@@ -452,7 +452,7 @@ has to tick fast enough for a bounded spin loop to observe. That loop is bounded
 precisely so a timer that never fires reports a failure instead of hanging the
 boot.
 
-Port I/O moved out of `serial.rs` into `amd64/src/port.rs` when this became its
+Port I/O moved out of `serial.rs` into `crates/akuma-kernel-amd64/src/port.rs` when this became its
 second consumer.
 
 ## 3.10 Stage E: context switching and a scheduler
@@ -462,7 +462,7 @@ second consumer.
   test: tick-driven resched observed   [OK]
 ```
 
-`amd64/src/sched.rs`. Three tasks on separate stacks, round-robin, paced by the
+`crates/akuma-kernel-amd64/src/sched.rs`. Three tasks on separate stacks, round-robin, paced by the
 LAPIC tick.
 
 **It is a real context switch and it is not preemption.** A task that never calls
@@ -529,7 +529,7 @@ a type with no public fields.
   test: ring 3 entered, 2 syscalls, arg=0x0000000000001234 status=0x0000000000002468   [OK]
 ```
 
-`amd64/src/gdt.rs` (GDT + TSS) and `amd64/src/usermode.rs` (`syscall`/`sysret`).
+`crates/akuma-kernel-amd64/src/gdt.rs` (GDT + TSS) and `crates/akuma-kernel-amd64/src/usermode.rs` (`syscall`/`sysret`).
 The kernel drops to ring 3, userspace makes a syscall, the kernel doubles the
 argument, userspace gets the result back and passes it out as an exit status:
 `0x2468 = 0x1234 * 2` proves the value made the whole round trip rather than the
@@ -1025,7 +1025,7 @@ map low addresses for itself. A stricter split would refuse.
 
 ## 3.18 Stage L: an ELF loader, and the first real kernel bug
 
-The kernel no longer runs programs it wrote itself. `amd64/src/loader.rs` parses
+The kernel no longer runs programs it wrote itself. `crates/akuma-kernel-amd64/src/loader.rs` parses
 an ELF64 image, places its `PT_LOAD` segments into a process address space, lays
 out a System V initial stack, and jumps to `e_entry`.
 
@@ -1074,7 +1074,7 @@ against its own assumptions.
 
 ### 3.18.2 Where the image comes from
 
-`userspace/amd64/hello/hello.rs`, compiled by `amd64/build.rs` with the same
+`userspace/amd64/hello/hello.rs`, compiled by `crates/akuma-kernel-amd64/build.rs` with the same
 `rustc` that is building the kernel, `--target x86_64-unknown-none`, and
 embedded with `include_bytes!`.
 
@@ -1216,7 +1216,7 @@ rather than to the console.
 
 ## 3.19 Stage M: a block device, and the machine description behind it
 
-The kernel reads a disk. `amd64/src/blk.rs` maps a virtio-MMIO transport,
+The kernel reads a disk. `crates/akuma-kernel-amd64/src/blk.rs` maps a virtio-MMIO transport,
 `akuma-virtio` drives it, and the self-test reads two known sectors 1 MiB apart
 and checks every byte of both.
 
@@ -1329,7 +1329,7 @@ an explicit non-AArch64 arm that says zero and says why.
 ### 3.19.5 `akuma-ryzen-amd64`: the machine description, host-tested
 
 Three modules written for this stage — the PVH handoff parser, the command-line
-parser and the ACPI scanner — moved out of `amd64/src/` into a crate, on the
+parser and the ACPI scanner — moved out of `crates/akuma-kernel-amd64/src/` into a crate, on the
 `akuma-firecracker` model: `no_std`, allocation-free, **no dependencies**, and
 `#![forbid(unsafe_code)]`.
 
@@ -1392,7 +1392,7 @@ interrupt is its own stage. The IRQ number is parsed and kept
 
 ### 3.19.8 A doc error the arithmetic exposed
 
-`amd64/src/phys.rs`, `lapic.rs` and §3.17.1 all said the LAPIC at `0xFEE0_0000`
+`crates/akuma-kernel-amd64/src/phys.rs`, `lapic.rs` and §3.17.1 all said the LAPIC at `0xFEE0_0000`
 was "inside the first GiB" and therefore already had a cached alias in the
 physmap. `0xFEE0_0000` is **3.98 GiB** and `PHYSMAP_LIMIT` is 1 GiB. The alias
 never existed; `phys_to_virt` would have asserted on it.
@@ -1440,7 +1440,7 @@ pub trait BlockDevice: Send + Sync {
 ```
 
 which is exactly the shape `akuma_virtio::block` exposes, so the shim in
-`amd64/src/fs.rs` is a struct and two forwarding calls. That brevity is the
+`crates/akuma-kernel-amd64/src/fs.rs` is a struct and two forwarding calls. That brevity is the
 finding rather than an accident: the seam was drawn in the right place years
 before this target existed, and neither crate had to learn anything about the
 other.
@@ -1493,7 +1493,7 @@ other check and fail that one.
 stays as the fallback for a machine with no disk — `DISK=none`, and every stage
 before Stage M — so the loader is still exercised on a machine with no storage.
 
-The two come from **different build steps**: `amd64/build.rs` compiles the
+The two come from **different build steps**: `crates/akuma-kernel-amd64/build.rs` compiles the
 program into `OUT_DIR`, and `amd64/mkdisk.sh` copies that same file into the
 image. They are supposed to be byte-identical, and the test asserts it. Without
 that assertion a stale image would silently run the *previous* build's program
@@ -1867,7 +1867,7 @@ claim was only ever true for addresses *below* the physmap base.
 Only `akuma-net-nic`, with its BSS-resident arenas, hit it.
 
 **Fix:** `virt_to_phys` on amd64 now checks the kernel image window first
-(`KERNEL_IMAGE_OFFSET`, mirroring `amd64/src/phys.rs::KERNEL_VMA`) and subtracts
+(`KERNEL_IMAGE_OFFSET`, mirroring `crates/akuma-kernel-amd64/src/phys.rs::KERNEL_VMA`) and subtracts
 whichever base the pointer is in — the same two-alias `__pa()` a real
 higher-half kernel carries. AArch64 is untouched: both offsets are zero there
 and the function still folds to the identity.
@@ -1949,7 +1949,7 @@ to the console.
 The pipe buffer is a new leaf crate, **`akuma-pipe`** — a bounded `VecDeque<u8>`
 with a closable write end and the empty-vs-EOF rule, `#![forbid(unsafe_code)]`,
 host-tested. `akuma_syscalls_glue::pipe` is the real one and has the same shape
-plus a waker map, but does not build here (behind `akuma-exec`); `amd64/src/pipe.rs`
+plus a waker map, but does not build here (behind `akuma-exec`); `crates/akuma-kernel-amd64/src/pipe.rs`
 is the `static` array + spinlock around the leaf. See
 `docs/archive/AMD64_CRATE_REUSE_AUDIT.md`.
 
@@ -1976,7 +1976,7 @@ is the `static` array + spinlock around the leaf. See
 
 ### 3.24.5 Deferred: the allocation audit
 
-**`amd64/src/` has not been through the "analyze every path for allocations"
+**`crates/akuma-kernel-amd64/src/` has not been through the "analyze every path for allocations"
 pass the kernel convention requires** (`CLAUDE.md` § "Kernel conventions"). Stage
 O/P/R were written for reach first. The known offenders, to be settled when this
 code is extracted into crates:
@@ -2310,7 +2310,7 @@ farm (**hard links**, not symlinks — the ext2 path walk does not follow
 symlinks), `/etc/passwd`, `/etc/profile`, static `/dev` nodes — so the shell has
 a PATH and an environment.
 
-**Two debts not to grow:** `amd64/src/` has never had the allocation audit
+**Two debts not to grow:** `crates/akuma-kernel-amd64/src/` has never had the allocation audit
 (§3.24.5 — fixed buffers, not `Vec`, on every new syscall path — `sys_execve`
 and `sys_fork` add more `Vec`-per-argv / per-syscall work on the spawn path);
 and `loader::MAX_PROC_FRAMES` is a `[usize; 512]`-per-`Process` fixed array a
@@ -2413,7 +2413,7 @@ through this module instead with no other change. It supplies:
 - `#[global_allocator]`/`#[panic_handler]`/`#[alloc_error_handler]` — also
   normally `libakuma`'s job. The allocator is one eager 16 MiB anonymous
   `mmap` (this target's `mmap` is fully eager — real frames at `mmap()` time,
-  not on first fault, capped at 64 MiB/call in `amd64/src/mm.rs`), bump-
+  not on first fault, capped at 64 MiB/call in `crates/akuma-kernel-amd64/src/mm.rs`), bump-
   allocated, `dealloc` a deliberate no-op: for a single `tcc -o file src.c`
   invocation that runs once and exits, "never reclaim" and "reclaim only
   within this process's lifetime" are the same thing.
@@ -2424,7 +2424,7 @@ through this module instead with no other change. It supplies:
   answer them yet, §3.27.1).
 - **`Stat`, at the x86_64 offsets** — not `libakuma::Stat`, whose layout is
   `asm-generic`/aarch64's. `st_nlink` is 4 bytes at offset 16 there; 8 bytes at
-  offset 16 here. Mirrors `amd64/src/fd.rs`'s `encode_stat` field-for-field,
+  offset 16 here. Mirrors `crates/akuma-kernel-amd64/src/fd.rs`'s `encode_stat` field-for-field,
   with a `const _: () = assert!(size_of::<Stat>() == 144)`.
 
 **Two link-time gaps only a real link run surfaced**, both C symbols
@@ -2553,7 +2553,7 @@ feature (static-PIE loading, §3.29.1) and turned up three more real bugs
 
 ### 3.29.1 Static-PIE (`ET_DYN`) loading
 
-`amd64/src/loader.rs` refused anything but `ET_EXEC` outright — "`ET_DYN`
+`crates/akuma-kernel-amd64/src/loader.rs` refused anything but `ET_EXEC` outright — "`ET_DYN`
 needs relocation and an interpreter; neither exists here." Half of that
 sentence was never true: `apk.static` is `ET_DYN` **with no `PT_INTERP`** —
 static-PIE, not dynamically linked — and its relocations are `DT_RELR` (a
@@ -2723,7 +2723,7 @@ is unchanged. All 12 of the extracted tests still pass, unmodified.
 
 ### 3.30.2 The kernel-side effects: `clock.rs`, and what it deliberately is not
 
-`amd64/src/clock.rs` supplies `akuma_sntp::boot::BootstrapEffects` from
+`crates/akuma-kernel-amd64/src/clock.rs` supplies `akuma_sntp::boot::BootstrapEffects` from
 `akuma_net::socket::{socket_send_udp, socket_recv_udp}` (a raw UDP socket
 allocated and freed around one fetch, not routed through the fd table at
 all) and the uptime source `net.rs` already had —
@@ -2805,7 +2805,7 @@ Sidestepped two ways rather than fixed at the lock (finding *which* lock,
 and whether the real fix is BKL-shaped IRQ discipline or a smaller local
 change, is future work, not attempted here):
 
-- **`amd64/src/dns.rs`** (new): a minimal, hand-rolled single-question
+- **`crates/akuma-kernel-amd64/src/dns.rs`** (new): a minimal, hand-rolled single-question
   A-record DNS client over raw UDP — the exact same
   `socket_send_udp`/`socket_recv_udp` primitives `clock.rs`'s own SNTP fetch
   already uses and already trusts — replacing the call into smoltcp's
@@ -3051,7 +3051,7 @@ Rebuilding the (now-bigger) disk and re-running found a second, independent
 bug: a *second* `apk add` in the same boot — a fresh SSH session, a fresh
 `apk` process — failed almost immediately with `ERROR: System state may be
 inconsistent: failed to write database: No file descriptors available`,
-before doing any real work. `amd64/src/fd.rs`'s descriptor table
+before doing any real work. `crates/akuma-kernel-amd64/src/fd.rs`'s descriptor table
 (`MAX_OPEN = 16`) is one flat array shared by **every** task on this target,
 by design (see the module header) — but nothing ever swept a task's entries
 out of it when the task exited. Real Linux closes every fd a process still
@@ -3172,7 +3172,7 @@ what follows is the state as of Stage L rather than the original text.
 - **No TSS and no IST.** A double fault runs on the faulting stack, which is
   fine while nothing can overflow it and wrong the moment a guard page exists.
   When one appears, vector 8 needs an IST entry *before* it.
-- **Page tables exist but are not shared with `akuma-mmap`.** `amd64/src/paging.rs`
+- **Page tables exist but are not shared with `akuma-mmap`.** `crates/akuma-kernel-amd64/src/paging.rs`
   can map, unmap, translate and now report a page's permissions, with a local `Prot`
   struct deliberately shaped the way proposal item 1 wants. It is local because
   `MmapRegion.flags` is still a raw AArch64 `u64` and the two encodings share no
@@ -3190,26 +3190,26 @@ what follows is the state as of Stage L rather than the original text.
 
 | Path | |
 |---|---|
-| `amd64/src/boot.s` | PVH note, 32-bit trampoline, long-mode entry |
-| `amd64/src/serial.rs` | polled 16550 on port 0x3F8 |
-| `amd64/src/main.rs` | `kmain`, panic handler, x86_64-only guard, the self-test order |
-| `amd64/src/hvm.rs` | `hvm_start_info` and its memory map |
-| `amd64/src/mem.rs` | heap then PMM, and why that order |
-| `amd64/src/phys.rs` | the physmap / device / kernel windows |
-| `amd64/src/paging.rs` | 4-level tables, `Prot`/`MemAttr`, `AddressSpace` |
-| `amd64/src/gdt.rs`, `amd64/src/idt.rs` | descriptor tables, exceptions, demand paging |
-| `amd64/src/lapic.rs`, `amd64/src/port.rs` | timer, I/O ports |
-| `amd64/src/sched.rs` | context switch, round-robin, preemption |
-| `amd64/src/usermode.rs` | ring 3, `syscall`/`sysret`, `Process`, `syscall_dispatch`, `sys_spawn`/`waitpid`, `arch_prctl`/`uname`, the ring-3 tests |
-| `amd64/src/loader.rs` | the ELF loader, `build_stack` (real argv), `MAX_PROC_FRAMES` (Stage L) |
-| `amd64/src/fd.rs` | the global fd table, file syscall bodies, `fcntl`, pipe-backed fds, `/proc/<pid>/fd/0` |
-| `amd64/src/pipe.rs` | the `static` pipe pool + spinlock over `akuma-pipe` (Stage R) |
-| `amd64/src/net.rs`, `amd64/src/sock.rs` | `NetRuntime` hooks, netpoll daemon, AF_INET socket syscalls (Stage P/Q) |
+| `crates/akuma-kernel-amd64/src/boot.s` | PVH note, 32-bit trampoline, long-mode entry |
+| `crates/akuma-kernel-amd64/src/serial.rs` | polled 16550 on port 0x3F8 |
+| `crates/akuma-kernel-amd64/src/main.rs` | `kmain`, panic handler, x86_64-only guard, the self-test order |
+| `crates/akuma-kernel-amd64/src/hvm.rs` | `hvm_start_info` and its memory map |
+| `crates/akuma-kernel-amd64/src/mem.rs` | heap then PMM, and why that order |
+| `crates/akuma-kernel-amd64/src/phys.rs` | the physmap / device / kernel windows |
+| `crates/akuma-kernel-amd64/src/paging.rs` | 4-level tables, `Prot`/`MemAttr`, `AddressSpace` |
+| `crates/akuma-kernel-amd64/src/gdt.rs`, `crates/akuma-kernel-amd64/src/idt.rs` | descriptor tables, exceptions, demand paging |
+| `crates/akuma-kernel-amd64/src/lapic.rs`, `crates/akuma-kernel-amd64/src/port.rs` | timer, I/O ports |
+| `crates/akuma-kernel-amd64/src/sched.rs` | context switch, round-robin, preemption |
+| `crates/akuma-kernel-amd64/src/usermode.rs` | ring 3, `syscall`/`sysret`, `Process`, `syscall_dispatch`, `sys_spawn`/`waitpid`, `arch_prctl`/`uname`, the ring-3 tests |
+| `crates/akuma-kernel-amd64/src/loader.rs` | the ELF loader, `build_stack` (real argv), `MAX_PROC_FRAMES` (Stage L) |
+| `crates/akuma-kernel-amd64/src/fd.rs` | the global fd table, file syscall bodies, `fcntl`, pipe-backed fds, `/proc/<pid>/fd/0` |
+| `crates/akuma-kernel-amd64/src/pipe.rs` | the `static` pipe pool + spinlock over `akuma-pipe` (Stage R) |
+| `crates/akuma-kernel-amd64/src/net.rs`, `crates/akuma-kernel-amd64/src/sock.rs` | `NetRuntime` hooks, netpoll daemon, AF_INET socket syscalls (Stage P/Q) |
 | `crates/akuma-pipe/` | the pure byte-FIFO half of a pipe, `#![forbid(unsafe_code)]`, host-tested |
 | `userspace/amd64/user.ld` | guest link script: `ET_EXEC` at 0x40_0000, page-aligned segments |
 | `userspace/amd64/hello/hello.rs` | the loader's probe; reports through its exit status |
-| `amd64/linker.ld` | load at 2 MiB, explicit `PHDRS` incl. `PT_NOTE` |
-| `amd64/build.rs` | the kernel link script, and building the guest programs |
+| `crates/akuma-kernel-amd64/linker.ld` | load at 2 MiB, explicit `PHDRS` incl. `PT_NOTE` |
+| `crates/akuma-kernel-amd64/build.rs` | the kernel link script, and building the guest programs |
 | `amd64/mkdisk.sh` | the ext2 image: `paws`/`httpd`/`sshd` (`x86_64-unknown-none`), busybox, keys |
 | `amd64/run.sh`, `amd64/run-firecracker.sh`, `amd64/net-setup.sh` | QEMU / Firecracker / tap+DHCP+NAT |
 | `overlays/devbox-amd64/` | the amd64 target's "devbox" home (thin wrapper today) |
@@ -3278,7 +3278,7 @@ row in the dispatch table.
 **Background:** the one kernel defect this port has found so far has its own
 document: `docs/archive/AMD64_SYSCALL_ABI_REGISTER_CLOBBER.md`.
 `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0 carries the corrected
-claim and the reproduction commands; `amd64/README.md` is the current-state doc for
+claim and the reproduction commands; `crates/akuma-kernel-amd64/README.md` is the current-state doc for
 this target. The aarch64 Firecracker port — a different machine with a different
 device model — is `docs/archive/AKUMA_FIRECRACKER_KVM.md` and
 `docs/archive/FIRECRACKER_PORT.md`. The instruction-chokepoint work this gate belongs to

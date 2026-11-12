@@ -183,7 +183,7 @@ Rerun the local stress with `scripts/utils/amd64_fsintegrity_check.py [--smp 4] 
   `crates/akuma-ext2/src/tests.rs`.
 - **New:** `userspace/forktest/c_stress/fsintegrity.c`,
   `scripts/utils/amd64_fsintegrity_check.py`.
-- **Not changed, and why:** `amd64/src/shmpages.rs`, `akuma-fpcache-rw` — no defect found that
+- **Not changed, and why:** `crates/akuma-kernel-amd64/src/shmpages.rs`, `akuma-fpcache-rw` — no defect found that
   reaches a directory. The `detach_inode`-ignores-mount note is a coherence nit; fixing it
   needs the inode-freed hook to carry the mount id.
 

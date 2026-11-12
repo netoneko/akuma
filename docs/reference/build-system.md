@@ -8,7 +8,8 @@ comparison (sizes, networking, purpose), see
 [`build-profiles.md`](build-profiles.md).
 
 > **Stability: A (stable).** The profile/feature pairing model has been
-> settled since the size/extreme/devbox split. The recurring lesson:
+> settled since the size/extreme/devbox split (the `extreme` feature is gone
+> since 2026-11-11; its profile remains as codegen). The recurring lesson:
 > **profile = codegen, feature = behaviour** — a profile sets opt-level/LTO,
 > and the `scripts/build_*.sh` wrapper pairs it with `--no-default-features`
 > plus a specific feature set. Edit one without the other and a build
@@ -22,32 +23,29 @@ and `release-debug` (a DWARF-debug variant of `release`, not tied to any
 wrapper script). The `size` profile and the one-kernel-per-core "multikernel"
 (`smp` feature, `release-smp`/`release-smp-shared` profiles) were both removed
 2026-08-10 — see `docs/archive/TRIM_FAT_MULTIKERNEL.md` and
-`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`. Real (shared-kernel) SMP,
-`smp-shared`, is now in `default` — it is not a separate profile or an opt-in
-CLI feature anymore.
+`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`. Real (shared-kernel) SMP is
+unconditional — not a profile and, since 2026-11-11, not a feature either (the
+shared crates' `bkl-smp` switch is on for both Akuma kernels; see
+`docs/reference/subsystems/smp-shared.md`).
 
 | Target | Profile | Codegen | Wrapper script | Feature set |
 |---|---|---|---|---|
-| `release` | `release` | `panic=abort` | (plain `cargo run --release`) | full `default` (includes `smp-shared`) |
-| `extreme-size` | `extreme-size` | inherits `release` + `opt-level=z`, LTO, `codegen-units=1`, `strip`, `panic=immediate-abort` | `scripts/build_extreme_size.sh` (+ `extreme` feature) | `--no-default-features`; `no-tests,smoltcp,extreme,userspace-sshd` |
-| `devbox` (rump-only, deferred) | `release` | inherits release | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | `--no-default-features`; `devbox,sound,no-tests,rump-tests`, all `sc-*` |
-| `devbox-smoltcp` (default devbox) | `release` | inherits release | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | `default` + `devbox-smoltcp,no-tests` (**no** `--no-default-features`) |
+| `release` | `release` | `panic=abort` | (plain `cargo run --release`) | full `default` |
+| `extreme-size` | `extreme-size` | inherits `release` + `opt-level=z`, LTO, `codegen-units=1`, `strip` | (none — `cargo build --profile extreme-size`) | any; codegen only, the same kernel as `release` for that set |
+| `devbox` (rump-only, deferred) | `release` | inherits release | `scripts/build_devbox.sh` / `overlays/devbox/run.sh` | `--no-default-features`; `rump-default,sc-reboot,sound,no-tests,linux-extra-syscalls` |
+| `devbox-smoltcp` (default devbox) | `release` | inherits release | `scripts/build_devbox_smoltcp.sh` / `overlays/devbox/run-smoltcp.sh` | `default` + `no-tests` (**no** `--no-default-features`) |
 
-`devbox-smoltcp` is the default "develop inside Akuma" image; it layers its
-feature on top of plain `release` rather than defining its own profile, so a
+`devbox-smoltcp` is the default "develop inside Akuma" image; it layers `no-tests`
+on top of plain `release` rather than defining its own profile, so a
 target is not always 1:1 with a profile.
 
-The `devbox` feature is the meta-feature `["rump-default", "userspace-sshd"]`
-— rump becomes the default stack for box 0. `devbox-smoltcp` is
-`["userspace-sshd", "smp-shared"]` — it keeps smoltcp and adds real SMP.
-`userspace-sshd` no longer drops a "built-in SSH" on either target: the
-in-kernel SSH server (and the shell/editor behind it) was deleted outright on
-2026-08-10 (`docs/archive/BUILTIN_SSH_REMOVAL.md`), so every profile's SSH is
-now the userspace `/bin/sshd`; the feature only toggles whether herd or
-`AUTO_START_SSHD` starts it. `extreme` is **not** a syscall gate: it's the
-discriminator `build.rs` reads (via `CARGO_FEATURE_EXTREME`) to emit
-`cfg(kernel_profile_extreme)` for tighter `IMAGE_SIZE`/stack knobs (forwarded
-to `akuma-exec`/`akuma-ext2`).
+`rump-default` makes rump the default stack for box 0. `devbox-smoltcp` names the
+image, not a feature (the empty feature was removed 2026-11-11). Every image's SSH is the
+userspace `/bin/sshd`, started by herd: the in-kernel SSH server (and the
+shell/editor behind it) was deleted on 2026-08-10
+(`docs/archive/BUILTIN_SSH_REMOVAL.md`). No cfg reads the Cargo profile: the
+`extreme` feature and its `kernel_profile_extreme` cfg (tighter stacks, heap
+seed, socket table) were removed 2026-11-11, so a profile changes codegen only.
 
 When adding a `sc-*` syscall family, **every** `--no-default-features`
 wrapper must re-add it or that build silently drops it — see
@@ -64,9 +62,8 @@ target/aarch64-unknown-none/<profile>/akuma.bin    # flat Image (rust-objcopy)
 
 `scripts/cargo_runner.sh` is the Cargo runner (set in `.cargo/config.toml`);
 it `rust-objcopy`s the ELF to a flat binary and enforces a per-profile size
-guard before booting QEMU (`scripts/cargo_runner.sh:100-108`): **1 MB**
-(`extreme-size`), **4 MB** (everything else, including `release`). Oversize
-aborts the boot.
+guard before booting QEMU (`scripts/mkbin.sh`): **4 MB** on every profile.
+Oversize aborts the boot.
 
 ## Disk image lifecycle
 
@@ -126,4 +123,4 @@ out flaky rustc crashes under the devbox. See
   investigation (superseded — see `archive/NIGHTLY_CARGO_HVF_SIGILL.md` for
   the actual root cause + fix, 2026-08-06; nightly and apk-stable rust now
   both work and ship side by side on the devbox, see `runbooks/build-devbox.md`).
-- `archive/AKUMA_SELF_HOSTING.md` — the `fs-cache` feature + self-host design.
+- `archive/AKUMA_SELF_HOSTING.md` — the ext2 block cache (once the `fs-cache` feature) + self-host design.

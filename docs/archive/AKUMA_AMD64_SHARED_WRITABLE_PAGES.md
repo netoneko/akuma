@@ -54,7 +54,7 @@ tests) holds the decisions:
 - `Generations` (the fill race).
 - `marks_cow` (the CoW-marking rule plus its identity-sharing exception).
 
-The kernel half is **`amd64/src/shmpages.rs`**: one IRQ-masked spinlock, the PMM refcount and
+The kernel half is **`crates/akuma-kernel-amd64/src/shmpages.rs`**: one IRQ-masked spinlock, the PMM refcount and
 the physmap copies. Lock order is address space → table → `COW_REFCOUNTS`/PMM.
 
 | path | what it does now |
@@ -183,9 +183,9 @@ the one line reverted and **PASSES** with it.
 
 ## Files
 
-- **New:** `crates/akuma-fpcache-rw/`, `amd64/src/shmpages.rs`,
+- **New:** `crates/akuma-fpcache-rw/`, `crates/akuma-kernel-amd64/src/shmpages.rs`,
   `userspace/forktest/c_stress/shmwrite.c`, `scripts/utils/amd64_shmwrite_check.py`.
-- **Changed:** `amd64/src/{mm,usermode,fs,idt,main}.rs`, `amd64/Cargo.toml`, `Cargo.toml`,
+- **Changed:** `crates/akuma-kernel-amd64/src/{mm,usermode,fs,idt,main}.rs`, `crates/akuma-kernel-amd64/Cargo.toml`, `Cargo.toml`,
   `crates/akuma-vfs-glue/src/lib.rs` (the hooks), `crates/akuma-mmap/src/region.rs` (docs only),
   `scripts/benchmarks/sqlite_wal_stress.py` (`mixed`/`spawn` modes, error timing, close on error).
 

@@ -424,7 +424,7 @@ def deploy(repo=".", branch=None, timeout=600,
     # build *succeeds* against the old code, and the numbers you then read look
     # like your change did nothing.
     #
-    # Measured 2026-09-07: `amd64/src/boot.rs` was new, the patch carried the
+    # Measured 2026-09-07: `crates/akuma-kernel-amd64/src/boot.rs` was new, the patch carried the
     # edits to `main.rs`/`multiboot2.rs` that referenced it and not the file
     # itself, and the box shipped a kernel byte-identical to the previous one.
     # The md5 in `stage_akuma.sh`'s output was the only evidence.
@@ -505,11 +505,11 @@ def box_head(timeout=60):
 # Where the box keeps the things this module drives.
 BOX_REPO = "/root/akuma"
 BOX_CARGO = "export PATH=/root/.cargo/bin:$PATH"
-BOX_KERNEL = f"{BOX_REPO}/target/x86_64-unknown-none/release/akuma-amd64"
+BOX_KERNEL = f"{BOX_REPO}/target/x86_64-unknown-none/release/akuma"
 BOX_DISK = f"{BOX_REPO}/target/x86_64-unknown-none/release/amd64-root.img"
 
 
-def build(pkg="akuma-amd64", target="x86_64-unknown-none", timeout=900):
+def build(pkg="akuma", target="x86_64-unknown-none", timeout=900):
     """Build `pkg` on the Ubuntu side. Returns ``(rc, tail_of_output)``.
 
     `BOX_CARGO` is not optional: a non-interactive ssh does not read the

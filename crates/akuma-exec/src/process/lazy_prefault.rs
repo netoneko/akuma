@@ -46,7 +46,7 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
             };
             let page_frame = crate::PhysFrame::new(page_addr);
             if let crate::process::LazySource::File {
-                ref path, inode, file_offset, filesz, segment_va, ..
+                inode, mount_id, file_offset, filesz, segment_va, ..
             } = source
             {
                 let pg_data_start = core::cmp::max(va, segment_va);
@@ -66,13 +66,7 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
                         page_frame.addr,
                         dst_off,
                         read_len,
-                        |page_buf| {
-                            if inode == 0 {
-                                (rt.read_at)(path, file_off, page_buf)
-                            } else {
-                                (rt.read_at_by_inode)(path, inode, file_off, page_buf)
-                            }
-                        },
+                        |page_buf| (rt.read_at_by_inode)(mount_id, inode, file_off, page_buf),
                     )
                     .unwrap_or(Err(0));
                     // The range is already clamped to `filesz`, so anything less

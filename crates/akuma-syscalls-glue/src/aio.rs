@@ -62,9 +62,9 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
         None => return ENOMEM,
     };
 
-    let frame = match akuma_exec::pmm::alloc_page_zeroed() {
-        Some(f) => f,
-        None => return ENOMEM,
+    let Some(frame) = akuma_exec::pmm::alloc_page_zeroed() else {
+        proc.vm_release_reservation(ring_va, PAGE_SIZE);
+        return ENOMEM;
     };
 
     // Under `as_lock`, which the previous raw `map_user_page` call here did NOT
@@ -81,6 +81,13 @@ pub(super) fn sys_io_setup(nr_events: u64, ctx_idp: u64) -> u64 {
             akuma_exec::mmu::user_flags::RW_NO_EXEC,
         );
     });
+    // The ring is a mapping like any other: recorded, so `munmap`, fork and
+    // the placer see it (and the reservation it replaces goes).
+    proc.vm_install_region(akuma_exec::process::MmapRegion::owned_with_prot(
+        ring_va,
+        alloc::vec![frame],
+        akuma_exec::mmu::Prot::RW_NO_EXEC,
+    ));
 
     // ── Write the ring header ────────────────────────────────────────────────
     // Through `ring_va`, not the frame's kernel alias: the page was just mapped

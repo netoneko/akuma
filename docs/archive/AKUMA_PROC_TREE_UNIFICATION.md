@@ -9,10 +9,10 @@
 The request said `/proc` "exists twice in spirit: one for AArch64 and one for
 amd64". **It doesn't.** Since 5b slice 3, amd64 registers every process with
 `akuma-exec` and mounts `akuma_vfs_glue::proc::ProcFilesystem` at `/proc`
-(`amd64/src/fs.rs::init_vfs`). Its own synthetic `/proc` in `fd.rs` was deleted
+(`crates/akuma-kernel-amd64/src/fs.rs::init_vfs`). Its own synthetic `/proc` in `fd.rs` was deleted
 in 4b batch 2c. Two comments said otherwise, and both are now corrected:
 `crates/akuma-vfs-glue/Cargo.toml` ("still not mounted there") and the
-`amd64/src/fs.rs` module doc ("What deliberately did not come with it is
+`crates/akuma-kernel-amd64/src/fs.rs` module doc ("What deliberately did not come with it is
 `/proc`").
 
 | Entry point | AArch64 | amd64 | Shared? |

@@ -57,16 +57,16 @@ builtin-paws = ["akuma", "dep:paws"]
 # one session, not the server) and real multi-core use, at the cost of a process
 # per session against the kernel's global `MAX_PROCESSES = 64`.
 #
-# ON by default since 2026-08-10. Pairs with the kernel's `many-sessions`
-# feature (also default) — without the deeper listener backlog that provides,
-# the stack RSTs past 8 simultaneous arrivals and `max_sessions` (24) is
-# unreachable.
+# ON by default since 2026-08-10. The kernel's listener backlog is 8 (the
+# `many-sessions` feature that raised it to 32 was removed 2026-11-11), so a
+# burst past 8 simultaneous arrivals is RST and `max_sessions` (24) is not
+# reachable by a burst; lower it if that matters for your image.
 #
 # To build WITHOUT it — the memory-constrained case, e.g. `extreme-size`, where
 # a process per session is the wrong trade:
 #     SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only
 # which drops to the cooperative single-process executor. See
-# `docs/runbooks/build-extreme-size.md` and
+# `docs/archive/EXTREME_SIZE_BUILD.md` and
 # `userspace/sshd/docs/PROCESS_PER_SESSION.md`.
 fork-sessions = []
 

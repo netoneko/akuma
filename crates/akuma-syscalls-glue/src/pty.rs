@@ -149,7 +149,7 @@ pub fn pty_close(n: u32, master: bool) {
 
 /// Deliver `signo` to every process (thread-group leader) in group `pgid`.
 ///
-/// Unlike `kill_process_group` — the console's `^C`, which deliberately spares
+/// Unlike `kill_foreground_group` — the console's `^C`, which deliberately spares
 /// the group leader — this is `killpg(2)`: the leader is a member. Group 0 and
 /// group 1 are refused outright: 0 is "no foreground group", and 1 is `init`'s
 /// and with it every console process, which a terminal emulator's `^C` must
@@ -158,7 +158,7 @@ fn signal_pgrp(pgid: u32, signo: u32) {
     if pgid <= 1 {
         return;
     }
-    // Fixed array, as in `kill_process_group`: the callback runs with IRQs
+    // Fixed array, as in `kill_group`: the callback runs with IRQs
     // masked and must not allocate.
     let mut targets = [0u32; akuma_exec::process::MAX_PROCESSES];
     let mut count = 0;
@@ -694,44 +694,19 @@ fn set_ctty(n: u32, steal: bool) -> SysResult {
     Ok(0)
 }
 
-// ---- process groups and sessions --------------------------------------------------
+// ---- sessions ----------------------------------------------------------------------
 //
-// The amd64 kernel answered `getpgid`/`getsid`/`getpgrp` with 1 and made
-// `setpgid`/`setsid` no-ops, deliberately: its console's `TerminalState` keeps
-// `foreground_pgid` at the spawned child, and a shell that read a real group
-// and `TIOCSPGRP`'d it would move the console's `^C` target
-// (`amd64/src/usermode.rs`, the `Getpgid` arm). A pty session is a terminal
-// with its own foreground group, and a shell on it does job control —
-// busybox `ash` loops `killpg(0, SIGTTIN)` until `tcgetpgrp() == getpgrp()`.
-// So the answers are real **for a process whose session a pty controls**, and
-// unchanged for everything else.
-
-/// `setsid()`: a new session and process group, no controlling terminal.
-/// Real on both kernels; returns the new session id (the caller's pid).
-pub fn sys_setsid() -> u64 {
-    akuma_exec::process::with_current_process(|p| {
-        p.pgid = p.pid;
-        p.ctty.store(0, Ordering::Relaxed);
-        u64::from(p.pid)
-    })
-    .unwrap_or(ESRCH)
-}
+// `setsid`, `setpgid` and `getpgid` are `super::proc`'s, on both kernels. The one
+// session question answered here is `getsid`, because the only session model is a
+// pty's: its leader is whoever took it with `TIOCSCTTY`.
 
 fn target_pid(pid: u32) -> Option<u32> {
     if pid == 0 { akuma_exec::process::read_current_pid() } else { Some(pid) }
 }
 
-/// amd64's `getpgid(pid)` / `getpgrp()`: the real group inside a pty session,
-/// 1 elsewhere.
-pub fn sys_getpgid_gated(pid: u32) -> u64 {
-    let Some(p) = target_pid(pid).and_then(akuma_exec::process::lookup_process_shared) else {
-        return ESRCH;
-    };
-    if ctty_slot(p.ctty.load(Ordering::Relaxed)).is_some() { u64::from(p.pgid) } else { 1 }
-}
-
-/// amd64's `getsid(pid)`: the controlling pty's session leader, 1 elsewhere.
-pub fn sys_getsid_gated(pid: u32) -> u64 {
+/// `getsid(pid)`: the controlling pty's session leader, and 1 (init's session)
+/// for a process no pty controls.
+pub(super) fn sys_getsid(pid: u32) -> u64 {
     let Some(p) = target_pid(pid).and_then(akuma_exec::process::lookup_process_shared) else {
         return ESRCH;
     };
@@ -739,10 +714,4 @@ pub fn sys_getsid_gated(pid: u32) -> u64 {
         Some(n) => with_pair(n, |pair| u64::from(pair.session)).unwrap_or(1),
         None => 1,
     }
-}
-
-/// amd64's `setpgid(pid, pgid)`: real for a caller in a pty session, the old
-/// accepted no-op elsewhere.
-pub fn sys_setpgid_gated(pid: u32, pgid: u32) -> u64 {
-    if current_ctty().is_some() { super::proc::sys_setpgid(pid, pgid) } else { 0 }
 }

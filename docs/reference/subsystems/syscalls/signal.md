@@ -8,9 +8,9 @@ build/unwind lives in `crates/akuma-exceptions/src/lib.rs` (`try_deliver_signal`
 `rt_sigsuspend`/`rt_sigtimedwait` see [`../scheduler.md`](../scheduler.md)
 "Blocking & wait/wake".
 
-> **Stability: C (active risk).** Last touched 2026-10-09 (amd64 `kill`/`tkill`
-> moved off glue's SIGKILL hard-kill path — see "amd64: `kill`, `tkill` and
-> `tgkill` are the target's own"); before that 2026-08-20 (`fork` gave the
+> **Stability: C (active risk).** Last touched 2026-11-11 (`kill`/`tkill`/`tgkill`
+> are one copy in glue for every kernel and SIGKILL is a pend — see "`kill`, `tkill` and
+> `tgkill`: one copy, and SIGKILL is a pend"); before that 2026-08-20 (`fork` gave the
 > child an empty disposition table instead of the parent's — see "Disposition
 > inheritance across fork and exec"); before that 2026-08-04 (fatal `SIG_DFL`
 > signals arriving via the pending queue were dropped, `tkill` was being
@@ -108,7 +108,7 @@ All three kernels serve both from glue. **Whoever delivers signals at the
 syscall return owns the slot from there:** a handler frame records the saved
 mask as `uc_sigmask`, and a return that enters no handler must put the saved
 mask back itself. The x86 kernels take the slot once per return
-(`amd64/src/signal.rs::deliver_pending`, Taoxichuan's
+(`crates/akuma-kernel-amd64/src/signal.rs::deliver_pending`, Taoxichuan's
 `child::deliver_at_return`) and do both; AArch64 takes it only while building a
 frame, so a woken-then-discarded signal leaves the temporary mask installed
 (open, [`archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md`](../../../archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md)).
@@ -135,17 +135,19 @@ bottom out in.
   nothing, take anything pending"; passing `!0` means "take only
   SIGKILL/SIGSTOP" — inverted from what it looks like at a glance, and the
   cause of a whole cluster of test-only bugs (`archive/SIGNAL_HELL.md` §2).
-- **`sys_tkill`** resolves the *target* thread's process and reads its mask and
-  the process-wide handler table. **A tid it cannot attribute (no process, or
-  one already gone) is dropped**, never treated as `Default`. `Ignore` → no-op;
-  `UserFn` → `pend_signal_for_thread` (delivered at the target's next syscall
-  return); `Default` with a fatal-by-default signal (and `SIGKILL` always) ends
-  **the target's group, never the caller's**: `sys_exit_group` when the target
-  is in the caller's own group, else pend + `interrupt_thread` so the target dies
-  at its own return. Blocked → pended until unmasked.
+- **`sys_tkill`** (glue, every kernel) resolves the *target* thread's process
+  and reads its mask and the process-wide handler table. **A tid it cannot
+  attribute (no process, or one already gone) is dropped**, never treated as
+  `Default`. `SIGKILL` → pend + `interrupt_thread`. Blocked → pend, no
+  interrupt. `Ignore` → drop; `UserFn` → `pend_signal_for_thread` (delivered at
+  the target's next return to user mode); `Default` with a fatal-by-default
+  signal → pend + `interrupt_thread`, other defaults → drop. **No fatal default
+  acts inside `tkill`**, the caller's own group included: the target dies at its
+  own return, through that kernel's delivery (AArch64
+  `apply_default_signal_action`, amd64 `deliver_pending`).
   **The decision is `akuma_syscalls_signal::tkill_action`** (host-tested, with an
   exhaustive sweep and a mask fuzz); `sys_tkill` only looks up the target and
-  performs the returned `Drop`/`Pend`/`PendInterrupt`/`ExitOwnGroup`. Change the
+  performs the returned `Drop`/`Pend`/`PendInterrupt`. Change the
   rule there, never inline. A kernel thread (no process) is a dropped target, so
   boot tests cannot reach the pend branch through `spawn_fn`; that branch is
   covered on the host (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`, correction).
@@ -153,45 +155,81 @@ bottom out in.
   `1..=64` except ignore-by-default (17, 23, 28) and stop/continue (18-22, no
   job control). The two `tkill` rules above are what make that safe under the
   `SIGUSR1` storm of a `rustc` build (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
-- **The interrupt bit answers only calls that are not signal state.** While a
-  thread's interrupt bit is set, glue's dispatch prologue answers `EINTR`
-  without running the call, **except** `rt_sigprocmask`, `rt_sigaction`,
-  `rt_sigpending`, `rt_sigreturn` and `sigaltstack`, which run and leave the bit
-  alone. Those calls are how a program makes a pending signal deliverable, and
-  Linux never fails them with `EINTR` (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
+- **The interrupt bit answers only calls that can block.** While a thread's
+  interrupt bit is set, glue's dispatch prologue answers `EINTR` without running
+  the call, **except** `rt_sigprocmask`, `rt_sigaction`, `rt_sigpending`,
+  `rt_sigreturn`, `sigaltstack` and the signal senders `kill`, `tkill`,
+  `tgkill`, Akuma's 302 and `pidfd_send_signal`, which run and leave the bit
+  alone. The first five are how a program makes a pending signal deliverable;
+  the senders never block, and Linux never fails any of them with `EINTR`. A
+  `kill` answered `EINTR` here was silently not sent
+  (`archive/SIGNAL_FATAL_DEFAULT_LINUX.md`,
+  `archive/AKUMA_MULTIARCH_ATTEMPT_0.md` "Slice 3: signals").
 - **`sys_tgkill`** adds one check over `tkill`: if the target tid resolves to
   a live process whose `tgid` doesn't match the caller's argument, `ESRCH`
   (prevents mis-delivery to a tid recycled into a different process); falls
   through to `tkill`'s own handling otherwise.
 - `send_sigpipe()` (pipe writes) is just `sys_tkill(current_tid, 13)`.
 
-### amd64: `kill`, `tkill` and `tgkill` are the target's own, and SIGKILL is a pend
+### `kill`, `tkill` and `tgkill`: one copy, and SIGKILL is a pend
 
-On amd64 (`amd64/src/signal.rs`, since 2026-10-09) **no signal hard-terminates
-a thread from another core.** `sys_kill` decodes the `pid_t` (`> 0`, `0` own
+Every kernel runs glue's `signal::{sys_kill, sys_tkill, sys_tgkill}` (x86_64
+62/200/234 reach them through `to_glue`; AArch64 129/130/131 and Akuma's 302
+directly; Taoxichuan's arms call them by name). **No `kill(2)` hard-terminates a
+thread from another core.** `sys_kill` decodes the `pid_t` (`> 0`, `0` own
 group, `-1` everyone but init and the caller, `< -1` a group — the decode is
 `akuma_exec::process::kill_target`, host-tested) and calls
 `pend_signal_to_group` for every signal, 9 included: pend on each thread of the
 group, raise the interrupt bit so a parked thread's wait returns `EINTR`, and
-let `signal::deliver_pending` (syscall return) or `deliver_pending_on_tick`
-(ring-3 compute loop) take `Next::Fatal` on the dying thread itself — a
-thread unwinds through `run_thread` → `teardown`, the leader through
-`run_process`, whose epilogue drains the rest. `tkill`/`tgkill` with SIGKILL
-pend it the same way (they used to `exit_current_from_signal(9)` on the
-*caller*), and a fatal default signal to a parked thread also sets the
-interrupt bit, since a park loop re-parks for anything but a `UserFn` handler.
+let the dying thread take the default action at its own return to user mode —
+AArch64's syscall return or hooked IRQ return, amd64's `deliver_pending` /
+`deliver_pending_on_tick`. `pidfd_send_signal` pends the same way.
 
-Why: glue's `sys_kill` hands SIGKILL to `deliver_signal`, whose SIGKILL arm is
-`kill_thread_group` + `kill_process_with_signal` — the AArch64 teardown that
-`mark_thread_terminated`s every sibling from the killer's core after a 2 s
-grace. amd64 has no consumer for the deferred kill it posts, so the grace
-always expired, the hard mark landed on RUNNING threads, and every thread so
-marked skipped `thread::teardown` and leaked its `THREADS` row; after enough
-`kill -9`s the 448-row table was full and the box sat in a `[BKL] stuck`
-storm. Measured and recorded in
-[`../../../archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`](../../../archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md);
-gates: `userspace/forktest/c_stress/killtree.c` and the boot check
-`usermode::kill_test` (`userspace/amd64/killprobe`).
+`deliver_signal`'s SIGKILL arm (`kill_thread_group` + `kill_process_with_signal`,
+marking every sibling `TERMINATED` from the caller's core after a 2 s grace) is
+reached only by `kill_foreground_group` (console Ctrl-C) now. amd64 cannot
+survive it at all: it has no consumer for the deferred kill that path posts
+([`../../../archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`](../../../archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md)).
+
+**One teardown per thread group.** A group-wide pend makes every thread take
+the fatal default at once, and each one calls `sys_exit_group`. The first
+claims the group's exit (`SharedSignalTable::claim_group_exit`, Linux's
+`SIGNAL_GROUP_EXIT`) and runs `kill_thread_group`; every later one marks its own
+slot `TERMINATED` and parks, as a posted deferred kill does at the EL0 boundary.
+Two teardowns in one group grace-wait on each other for the whole 2 s.
+
+**A group's exit state is the group's, on both kernels.** The flag and the status live on the
+group's `SharedSignalTable` (shared by `clone_thread`, fresh for `fork` and spawn, Linux's
+`signal_struct`): `begin_group_exit`/`group_exiting` (siblings leave at their next syscall or
+tick), `claim_group_exit` (exactly one teardown), and `GroupExit::{Code, Signal}` for a group
+whose end a sibling decided (a sibling's `exit_group`, or its default-action signal death, which
+no handler can catch). `execve` ends the exit it began to stop its siblings
+(`end_group_exit_for_exec`). Never index group state by a process or task slot: slots are
+recycled and the state outlives its process
+([`../../../archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`](../../../archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md)).
+
+**A group's threads are the process table's rows with its `tgid`.** Every `CLONE_THREAD`
+thread is a registered `Process` (own pid, the leader's `tgid`), so "which threads are still
+running" is `akuma_exec::process::for_each_live_group_thread` / `live_group_threads` (members
+other than the leader whose `THREAD_PID_MAP` slot is live), and "is this task a thread" is
+`pid != tgid`. A leader's exit marks the group exiting **first** and counts after, and
+`clone_thread` refuses a new thread once the group is exiting (`GROUP_EXITING`, `EAGAIN`), so no
+thread can join after the leader's drain has counted to zero and its address space is freed. A
+thread's `clear_child_tid` is its `Process`'s (set by `CLONE_CHILD_CLEARTID`, moved by
+`set_tid_address`). Never keep a second thread list beside the table: amd64's slot-keyed one
+outlived its threads and made the next process drain threads it never had
+([`../../../../proposals/AKUMA_ONE_EXIT.md`](../../../../proposals/AKUMA_ONE_EXIT.md) step 3).
+
+**Every blocking wait must leave on a deferred kill request**, not only on a pending signal:
+a group exit asks a sibling to leave with `request_thread_kill` (`PENDING_KILL`), which pends
+nothing. The common park loops read it through `should_interrupt_blocking_syscall`; a loop of
+its own (`suspend_until_signal`, behind `pause`/`rt_sigsuspend`) must test `has_pending_kill`
+itself, or a thread parked there outlives its group's drain
+([`../../../archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md`](../../../archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md)).
+
+Gates: `userspace/forktest/c_stress/killtree.c` (on both arches, through
+`ssh`) and the amd64 boot check `usermode::kill_test`
+(`userspace/amd64/killprobe`).
 
 **`tid` here is a kernel thread slot, never a PID.** `pend_signal_for_thread`
 and `thread_signal_mask_of` index the per-thread arrays directly with whatever

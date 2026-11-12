@@ -1,7 +1,7 @@
 //! A local APIC in xAPIC (MMIO) mode: the register page, the timer, and the
 //! interrupt request/in-service state a hypervisor needs to hand a guest its tick.
 //!
-//! The guest that wants one is Akuma itself (`amd64/src/lapic.rs`): it maps the
+//! The guest that wants one is Akuma itself (`crates/akuma-kernel-amd64/src/lapic.rs`): it maps the
 //! page at `0xFEE0_0000`, software-enables it, and drives a calibrated periodic or
 //! one-shot timer on LVT vector 32. Everything else about the chip — thermal and
 //! performance LVTs, the error register, logical destination — is present as

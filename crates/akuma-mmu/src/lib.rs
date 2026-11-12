@@ -203,7 +203,7 @@ use akuma_mmap::PhysFrame;
 // Both architectures' `UserAddressSpace` carries one — the AArch64 struct since
 // `akuma-user-space` was split out, the x86_64 one since B3 widened it
 // (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`).
-use akuma_user_space::FrameLedger;
+use akuma_user_space::{FrameLedger, MappingPins};
 use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 
 /// MMU initialization state
@@ -746,7 +746,7 @@ pub fn sync_icache_range(kva: usize, len: usize) {
 /// `oncpu_gate_scheduler_race`, `cowstale_stale_write_fault_fixed`) turned on
 /// exactly that question. `ThisCore` is for a translation provably private to
 /// the calling core (e.g. a scratch mapping nothing else could have cached);
-/// picking it for anything else under `kernel_smp_shared` reintroduces the
+/// picking it for anything else under `kernel_bkl_smp` reintroduces the
 /// stale-peer-translation bug those investigations closed.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TlbTarget {
@@ -916,7 +916,7 @@ fn shootdown_wait_remote() {
 // variants broadcast the invalidation across the inner-shareable domain (all cores on
 // QEMU `virt`). Other builds keep the cheaper core-local form. The context-switch flush
 // (threading) stays local — it only needs to clear the switching core's own TLB.
-#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_bkl_smp))]
 pub fn flush_tlb_all(target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     match target {
@@ -926,7 +926,7 @@ pub fn flush_tlb_all(target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_bkl_smp)))]
 pub fn flush_tlb_all(_target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vmalle1();
@@ -967,7 +967,7 @@ pub fn get_boot_ttbr0() -> u64 {
 pub fn get_boot_ttbr0() -> u64 { 0 }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
-#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_bkl_smp))]
 pub fn flush_tlb_asid(asid: u16, target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     match target {
@@ -977,7 +977,7 @@ pub fn flush_tlb_asid(asid: u16, target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_bkl_smp)))]
 pub fn flush_tlb_asid(asid: u16, _target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::aside1(asid);
@@ -1000,7 +1000,7 @@ pub fn flush_tlb_asid(_asid: u16, target: TlbTarget) -> TlbFlush {
 pub fn flush_tlb_asid(_asid: u16, _target: TlbTarget) -> TlbFlush { TlbFlush::done() }
 
 // Inner-shareable under shared SMP (see `flush_tlb_all`).
-#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_smp_shared))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", kernel_bkl_smp))]
 pub fn flush_tlb_page(va: usize, target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     match target {
@@ -1010,7 +1010,7 @@ pub fn flush_tlb_page(va: usize, target: TlbTarget) -> TlbFlush {
     TlbFlush::pending()
 }
 
-#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_smp_shared)))]
+#[cfg(all(target_os = "none", target_arch = "aarch64", not(kernel_bkl_smp)))]
 pub fn flush_tlb_page(va: usize, _target: TlbTarget) -> TlbFlush {
     akuma_cpu::barrier::dsb_ishst();
     akuma_cpu::tlb::vaae1((va >> 12) as u64);
@@ -1159,11 +1159,11 @@ static PREV_L0: [AtomicU64; TTBR_TRACK_CORES] = [ATOMIC_U64_ZERO; TTBR_TRACK_COR
 ///
 /// It used to read `akuma_bkl::bkl::current_core_id()` itself, which is
 /// `akuma_primitives::cpu::current_core_id` — an `mrs mpidr_el1` under
-/// `kernel_smp_shared`, and a **literal `0`** otherwise. That shim's doc reasons
+/// `kernel_bkl_smp`, and a **literal `0`** otherwise. That shim's doc reasons
 /// about two cases (single-core, and the AArch64 multikernel where every caller
 /// wants `0`) and there is now a third it did not anticipate: **amd64 is real
-/// SMP without `kernel_smp_shared`**, running four cores off its own ticket BKL
-/// in `amd64/src/smp.rs`. There every core would have published into slot 0,
+/// SMP without `kernel_bkl_smp`**, running four cores off its own ticket BKL
+/// in `crates/akuma-kernel-amd64/src/smp.rs`. There every core would have published into slot 0,
 /// and the last writer would erase the record of a table a *peer* core is still
 /// running on — which is the precise thing this registry exists to prevent, so
 /// the gate would have been worse than absent.
@@ -1486,6 +1486,19 @@ pub fn pending_ttbr_free_stats() -> (usize, usize, usize) {
     })
 }
 
+/// The L0 addresses of up to `out.len()` parked address spaces, for a diagnostic that asks
+/// the gates which core or thread still names each one. Returns how many it wrote.
+pub fn pending_ttbr_free_l0s(out: &mut [u64]) -> usize {
+    with_irqs_disabled(|| {
+        let pending = PENDING_TTBR_FREES.lock();
+        let n = pending.len().min(out.len());
+        for (slot, e) in out.iter_mut().zip(pending.iter()) {
+            *slot = e.l0_frame.addr as u64;
+        }
+        n
+    })
+}
+
 /// Free the frames of a dead address space, or park them if some core's
 /// TTBR0 is still resident on `l0_addr`. The sole exit for page-table frames
 /// from both `UserAddressSpace::drop` branches (owner-immediate and
@@ -1629,6 +1642,10 @@ struct SharedL0Entry {
     deferred_user_frames: Option<BTreeMap<usize, u32>>,
     deferred_pt_frames: Option<Vec<PhysFrame>>,
     deferred_l0: Option<PhysFrame>,
+    /// The owner's ASID, parked with its frames when the owner dropped while
+    /// views were alive. Thread views ([`UserAddressSpace::new_thread_view`])
+    /// run under it, so it is freed by the last view, never before.
+    deferred_asid: Option<u16>,
 }
 
 /// Temporary: an entry removed from `SHARED_L0_TABLE` while it still carries a
@@ -1752,6 +1769,13 @@ pub struct UserAddressSpace {
     /// in this struct is the AArch64 page-table walker.
     ledger: FrameLedger,
     asid: u16,
+    /// Whether this address space allocated `asid` and frees it on drop. `false`
+    /// for a thread view, which borrows its owner's ([`Self::new_thread_view`]).
+    asid_owned: bool,
+    /// The inodes this address space's file mappings keep alive
+    /// ([`Self::pin_mapped_inode`]). Empty in a borrowed view: the mappings, and
+    /// the pins, belong to the owner.
+    mapping_pins: MappingPins,
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -1778,6 +1802,8 @@ impl UserAddressSpace {
             l0_frame,
             ledger: FrameLedger::new(false),
             asid,
+            asid_owned: true,
+            mapping_pins: MappingPins::new(),
         };
         addr_space.add_kernel_mappings().ok()?;
         instr::as_new();
@@ -1808,6 +1834,7 @@ impl UserAddressSpace {
                     deferred_user_frames: None,
                     deferred_pt_frames: None,
                     deferred_l0: None,
+                    deferred_asid: None,
                 });
         });
         instr::as_new_shared();
@@ -1815,7 +1842,48 @@ impl UserAddressSpace {
             l0_frame: PhysFrame { addr: parent_l0_phys },
             ledger: FrameLedger::new(true),
             asid,
+            asid_owned: true,
+            mapping_pins: MappingPins::new(),
         })
+    }
+
+    /// A thread's view of its group's address space (`clone(CLONE_VM |
+    /// CLONE_THREAD)`): the owner's L0 **and the owner's ASID**, as on Linux,
+    /// where the ASID belongs to the mm and every thread shares it.
+    ///
+    /// [`Self::new_shared`] allocates a fresh ASID for the view. A thread never
+    /// ran under it (`clone_thread` hands the child the parent's `ttbr0`
+    /// verbatim), yet held it until its row was reclaimed, so a burst of
+    /// thread create/join exhausted the 256 ASIDs within a few hundred rounds and
+    /// every `fork`/`spawn` failed until reclaim caught up
+    /// (`userspace/forktest/c_stress/thrchurn.c`). A view made here costs no
+    /// ASID. The owner's ASID outlives the owner while any view is alive: an
+    /// owner that drops first parks it in `SHARED_L0_TABLE` with its frames,
+    /// and the last view frees it.
+    ///
+    /// `owner_asid` is the ASID in the owner's `ttbr0` (bits 63:48).
+    #[must_use]
+    pub fn new_thread_view(parent_l0_phys: usize, owner_asid: u16) -> Self {
+        with_irqs_disabled(|| {
+            let mut table = SHARED_L0_TABLE.lock();
+            table.entry(parent_l0_phys)
+                .and_modify(|e| e.ref_count += 1)
+                .or_insert(SharedL0Entry {
+                    ref_count: 1,
+                    deferred_user_frames: None,
+                    deferred_pt_frames: None,
+                    deferred_l0: None,
+                    deferred_asid: None,
+                });
+        });
+        instr::as_new_shared();
+        Self {
+            l0_frame: PhysFrame { addr: parent_l0_phys },
+            ledger: FrameLedger::new(true),
+            asid: owner_asid,
+            asid_owned: false,
+            mapping_pins: MappingPins::new(),
+        }
     }
 
     fn add_kernel_mappings(&self) -> Result<(), &'static str> {
@@ -1960,30 +2028,6 @@ impl UserAddressSpace {
         for i in 0..pages {
             self.map_page(va_start + i * PAGE_SIZE, pa_start + i * PAGE_SIZE, user_flags)?;
         }
-        Ok(())
-    }
-
-    /// Map a 2 MiB block `va -> pa` as **EL1-only RW, no-execute** (a kernel/partition RAM
-    /// block in a user table). A secondary's EL0 process needs its kernel code/data and its
-    /// partition reachable when a syscall traps to EL1 *under this table* (Akuma is TTBR0-
-    /// only, no switch on trap). `va`/`pa` must be 2 MiB-aligned. EL0 has no access (AP
-    /// defaults to EL1); `PXN|UXN` block execution. Intermediate L1/L2 frames are tracked
-    /// for Drop; the block target is kernel RAM (not a user frame) so it is not tracked.
-    pub fn map_kernel_block_2mb(&mut self, va: usize, pa: usize) -> Result<(), &'static str> {
-        const TWO_MB: usize = 1 << 21;
-        if va & (TWO_MB - 1) != 0 || pa & (TWO_MB - 1) != 0 {
-            return Err("2MB block must be 2MB-aligned");
-        }
-        let l0_idx = (va >> 39) & 0x1FF;
-        let l1_idx = (va >> 30) & 0x1FF;
-        let l2_idx = (va >> 21) & 0x1FF;
-        let l1_frame = self.get_or_create_table(table_phys(self.l0_frame.addr), l0_idx)?;
-        let l2_frame = self.get_or_create_table(table_phys(l1_frame.addr), l1_idx)?;
-        let l2 = table_phys(l2_frame.addr);
-        // L2 BLOCK descriptor (TABLE bit clear): EL1 RW, inner-shareable, normal WB, no exec.
-        let entry = (pa as u64) | flags::VALID | flags::AF | flags::SH_INNER
-            | attr_index(MAIR_NORMAL_WB) | flags::PXN | flags::UXN;
-        l2.set(l2_idx, entry);
         Ok(())
     }
 
@@ -2428,6 +2472,104 @@ impl UserAddressSpace {
         }
     }
 
+    /// `mprotect`'s page-table half: re-permission every **present** page in
+    /// `[start, end)` as `prot`, then flush the range once on every core.
+    /// Returns how many pages were rewritten.
+    ///
+    /// `keep_cow(va, pa)` answers whether the frame is still copy-on-write
+    /// shared; such a page is mapped [`without_write`](akuma_mmap::Prot::without_write)
+    /// so the first store faults and breaks the sharing (the caller asks the
+    /// PMM, which this crate deliberately does not). A page EL0 cannot touch is
+    /// left alone when `prot` is `NONE`, since there is nothing to take away.
+    /// The x86 twin has the same contract.
+    pub fn reprotect_present(
+        &mut self,
+        start: usize,
+        end: usize,
+        prot: akuma_mmap::Prot,
+        mut keep_cow: impl FnMut(usize, usize) -> bool,
+    ) -> usize {
+        let mut changed = 0usize;
+        let mut va = start & !(PAGE_SIZE - 1);
+        while va < end {
+            if let Some(entry) = self.read_l3_page_entry(va)
+                && (entry & flags::USER != 0 || !prot.is_none())
+            {
+                let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+                let p = if keep_cow(va, pa) { prot.without_write() } else { prot };
+                self.update_page_flags_inner(va, user_flags::to_pte(p), false);
+                changed += 1;
+            }
+            let Some(next) = va.checked_add(PAGE_SIZE) else { break };
+            va = next;
+        }
+        if changed > 0 {
+            let first = start & !(PAGE_SIZE - 1);
+            let _ = flush_tlb_range(first, (va - first) / PAGE_SIZE, TlbTarget::AllCores);
+        }
+        changed
+    }
+
+    /// `mremap`'s page half: move every present user page of `[start, end)` to
+    /// the same offset from `new_base`, keeping its entry bits (protection, CoW
+    /// state). The frame is the same one at one VA before and after, so the
+    /// ledger's count is untouched. The pages are collected first (the `Vec` is
+    /// sized by residency) and the source cleared before any destination is
+    /// installed, so a frame is never mapped twice. `false` if a page table
+    /// could not be allocated partway: the pages moved so far stay moved, and
+    /// the rest of the destination demand-pages. The x86 twin has the same
+    /// contract.
+    pub fn move_present(&mut self, start: usize, end: usize, new_base: usize) -> bool {
+        let first = start & !(PAGE_SIZE - 1);
+        let mut moves: Vec<(usize, u64)> = Vec::new();
+        let mut va = first;
+        while va < end {
+            if let Some(entry) = self.read_l3_page_entry(va)
+                && entry & flags::USER != 0
+                && let Some(slot) = self.l3_slot(va)
+            {
+                slot.set(0);
+                moves.push((va, entry));
+            }
+            let Some(next) = va.checked_add(PAGE_SIZE) else { break };
+            va = next;
+        }
+        let _ = flush_tlb_range_all_asid(first, (va - first) / PAGE_SIZE, TlbTarget::AllCores);
+        let mut ok = true;
+        for &(va, entry) in &moves {
+            let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+            let (tables, installed) = map_user_page_inner(new_base + (va - start), pa, entry & !0x0000_FFFF_FFFF_F000, false);
+            for tf in tables {
+                self.track_page_table_frame(tf);
+            }
+            if !installed {
+                ok = false;
+                break;
+            }
+        }
+        ok
+    }
+
+    /// `munmap`'s page half: clear every present page in `[start, end)` and
+    /// push each frame this address space held the **last** VA onto `out`
+    /// (the ledger decides, as [`unmap_and_free_page_no_flush`](Self::unmap_and_free_page_no_flush)),
+    /// then flush the range once on every core. Freeing is the caller's, after
+    /// releasing the address-space lock; the PMM's share count decides whether
+    /// another address space still holds the frame. The x86 twin has the same
+    /// contract.
+    pub fn unmap_present(&mut self, start: usize, end: usize, out: &mut Vec<PhysFrame>) {
+        let first = start & !(PAGE_SIZE - 1);
+        let mut va = first;
+        while va < end {
+            if let Some(frame) = self.unmap_and_free_page_no_flush(va) {
+                out.push(frame);
+            }
+            let Some(next) = va.checked_add(PAGE_SIZE) else { break };
+            va = next;
+        }
+        let _ = flush_tlb_range_all_asid(first, (va - first) / PAGE_SIZE, TlbTarget::AllCores);
+    }
+
     /// Raw L3 page descriptor for `va` (4KiB-aligned), if mapped at the final level.
     /// Used by kernel tests and diagnostics (e.g. verify `UXN` after `update_page_flags`).
     pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
@@ -2516,9 +2658,62 @@ fn publish_and_install_ttbr0(ttbr0: u64) {
     publish_l0_end(token);
 }
 
+/// The inode pins, the same on both targets: each struct carries a
+/// `mapping_pins: MappingPins` (`akuma-user-space`, host-tested), and these are
+/// the only way to reach it.
+impl UserAddressSpace {
+    /// Keep `inode`'s data alive while a mapping in this address space names it.
+    ///
+    /// A demand-paged file mapping reads its pages long after `mmap` returned,
+    /// usually after the descriptor was closed (`ld.so` closes it at once).
+    /// Without a pin the filesystem may free the inode on `unlink` and reissue
+    /// its number, and the mapping then faults in zeros or another file's bytes
+    /// with nothing logged (root cause #2 of the self-host `rustc` ICE,
+    /// `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
+    ///
+    /// Idempotent per inode, and `inode == 0` pins nothing. Call it on the
+    /// **owner's** address space (the thread-group leader's), never a thread's
+    /// view: a view drops with its thread and would take the pin with it.
+    pub fn pin_mapped_inode(&mut self, inode: u32) {
+        self.mapping_pins.pin(inode);
+    }
+
+    /// Release `inode`'s pin. The caller has just removed a mapping of it and
+    /// checked that no surviving mapping in this address space names it.
+    pub fn unpin_mapped_inode(&mut self, inode: u32) {
+        self.mapping_pins.unpin(inode);
+    }
+
+    /// Drop every pin whose inode `still_mapped` no longer answers `true` for:
+    /// the release half for a caller that can only answer over its whole
+    /// surviving region list. Without a release, `munmap` freed the pages and
+    /// kept the claim on the file, and a long-lived process accumulated one
+    /// permanent pin per inode it had ever mapped, until the pin table
+    /// saturated and ext2 stopped freeing unlinked files.
+    pub fn retain_mapped_inode_pins(&mut self, still_mapped: impl Fn(u32) -> bool) {
+        self.mapping_pins.retain(still_mapped);
+    }
+
+    /// Take the same pins `other` holds: a `fork` child inherits its parent's
+    /// file mappings, so it must inherit their claim on the files.
+    pub fn inherit_mapped_inode_pins(&mut self, other: &Self) {
+        self.mapping_pins.inherit(&other.mapping_pins);
+    }
+
+    /// Whether this address space pins `inode` (diagnostics and tests).
+    #[must_use]
+    pub fn pins_mapped_inode(&self, inode: u32) -> bool {
+        self.mapping_pins.contains(inode)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 impl Drop for UserAddressSpace {
     fn drop(&mut self) {
+        // Whether the end of this drop returns `self.asid`; see each branch.
+        let mut free_own_asid = self.asid_owned;
+        // An owner's ASID handed over by the last view (`new_thread_view`).
+        let mut parked_asid: Option<u16> = None;
         #[allow(clippy::let_unit_value)]
         let _ledger = instr::as_drop_enter(
             self.ledger.is_shared(),
@@ -2547,17 +2742,23 @@ impl Drop for UserAddressSpace {
                 let pt_frames = self.ledger.take_page_table_frames();
                 let l0 = self.l0_frame;
                 let n_uf = user_frames.len();
+                let owner_asid = self.asid;
                 let stored = with_irqs_disabled(|| {
                     let mut table = SHARED_L0_TABLE.lock();
                     if let Some(entry) = table.get_mut(&l0_addr) {
                         entry.deferred_user_frames = Some(user_frames);
                         entry.deferred_pt_frames = Some(pt_frames);
                         entry.deferred_l0 = Some(l0);
+                        // Thread views run under this ASID: it goes when they do.
+                        entry.deferred_asid = Some(owner_asid);
                         true
                     } else {
                         false
                     }
                 });
+                // Parked: the last view frees it. Not parked (the views all went
+                // between the check and the store): it is ours to free below.
+                free_own_asid = !stored;
                 // Temporary: no entry to park in, so the map died inside the
                 // closure above. Stop counting its entries as live.
                 if !stored { instr::uf_silent(n_uf); }
@@ -2583,6 +2784,7 @@ impl Drop for UserAddressSpace {
                         let uf = entry.deferred_user_frames.take();
                         let pf = entry.deferred_pt_frames.take();
                         let l0 = entry.deferred_l0.take();
+                        parked_asid = entry.deferred_asid.take();
                         table.remove(&l0_addr);
                         return (uf, pf, l0);
                     }
@@ -2603,7 +2805,7 @@ impl Drop for UserAddressSpace {
                 // Same TTBR liveness gate as the owner-drop branch: the killer-side
                 // hard-terminate in `kill_thread_group` can leave a straggler's core
                 // parked on this very L0 while the last software view drops here.
-                free_or_defer_as_frames(l0.addr, self.asid, l0, uf, pf, "last-view");
+                free_or_defer_as_frames(l0.addr, parked_asid.unwrap_or(self.asid), l0, uf, pf, "last-view");
             }
         }
         // Whatever the branch above did not take (a shared view's own map) dies
@@ -2627,8 +2829,13 @@ impl Drop for UserAddressSpace {
         // Flushing first closes it: by the time the ASID is allocatable again, no
         // translation for it remains. `tlbi aside1is` is inner-shareable, so peers are
         // covered too.
-        let _ = flush_tlb_asid(self.asid, TlbTarget::AllCores);
-        with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(self.asid));
+        //
+        // A thread view returns no ASID of its own (it borrowed its owner's), and
+        // the last view returns the owner's if the owner parked it.
+        for asid in [free_own_asid.then_some(self.asid), parked_asid].into_iter().flatten() {
+            let _ = flush_tlb_asid(asid, TlbTarget::AllCores);
+            with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(asid));
+        }
         instr::as_drop_exit(_ledger);
     }
 }
@@ -2637,7 +2844,7 @@ impl Drop for UserAddressSpace {
 // x86_64 UserAddressSpace — Phase 4 of proposals/AKUMA_MMU_ARCH_PORTABILITY.md
 // ============================================================================
 //
-// A minimal x86_64 body, ported directly from `amd64/src/paging.rs` (which
+// A minimal x86_64 body, ported directly from `crates/akuma-kernel-amd64/src/paging.rs` (which
 // already built this exact vocabulary and encoding — see that file's own
 // header) rather than redesigned. Deliberately NOT the aarch64 struct's peer
 // in features: no ASID/PCID, no lazy regions, no multi-core epoch tracking, and
@@ -2647,7 +2854,7 @@ impl Drop for UserAddressSpace {
 // error here, which is the honest boundary of what this port proves.
 //
 // **It is the amd64 kernel's only user-space walker since step 5a.** That
-// sentence used to read "no runtime caller"; `amd64/src/paging.rs` lost its
+// sentence used to read "no runtime caller"; `crates/akuma-kernel-amd64/src/paging.rs` lost its
 // `AddressSpace` and `mm.rs`/`idt.rs`/`loader.rs`/`usermode.rs`/`fd.rs` all map
 // through this (`docs/archive/AKUMA_AMD64_STEP5A_ONE_WALKER.md`). Three things
 // arrived with those callers and are x86-only for stated reasons: the PTE-level
@@ -2659,7 +2866,7 @@ impl Drop for UserAddressSpace {
 /// The amd64 page-permission vocabulary and encoder — `akuma-pte-amd64`'s,
 /// re-exported so every `akuma_mmu::{PteProt, MemAttr, encode_pte}` call site is
 /// unchanged. They lived here until 2026-10-18; the bits are pure data and the
-/// kernel's own walker (`amd64/src/paging.rs`) needs them without this crate's
+/// kernel's own walker (`crates/akuma-kernel-amd64/src/paging.rs`) needs them without this crate's
 /// `UserAddressSpace`.
 #[cfg(any(target_arch = "x86_64", test))]
 pub use akuma_pte_amd64::{MemAttr, PteProt, encode_pte};
@@ -2669,7 +2876,7 @@ pub use akuma_pte_amd64::{MemAttr, PteProt, encode_pte};
 ///
 /// A struct rather than a `(usize, u64, PteProt)` tuple for one reason: `pa`
 /// and the raw entry are both integers of the same width, and the two range
-/// walks this replaces in `amd64/src/paging.rs` passed them adjacently. A
+/// walks this replaces in `crates/akuma-kernel-amd64/src/paging.rs` passed them adjacently. A
 /// transposition there compiles and produces a mapping of the flag word.
 #[cfg(any(target_arch = "x86_64", test))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -2699,7 +2906,7 @@ pub struct Leaf {
 /// three. **Policy stays with the caller**: whether a writable region may
 /// become a writable *PTE* depends on the frame's CoW share count, which is a
 /// PMM question this crate deliberately does not ask
-/// (`amd64/src/mm.rs::pte_prot_for`).
+/// (`crates/akuma-kernel-amd64/src/mm.rs::pte_prot_for`).
 #[cfg(any(target_arch = "x86_64", test))]
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum LeafAction {
@@ -2789,7 +2996,7 @@ use akuma_pagetable::amd64 as x86_walk;
 /// to find it later.
 ///
 /// Until C1 step 6 the only thing standing in the way of that was
-/// `amd64/src/loader.rs` refusing a `PT_LOAD` outside the lower half, one
+/// `crates/akuma-kernel-amd64/src/loader.rs` refusing a `PT_LOAD` outside the lower half, one
 /// `if` in one caller, against `p_vaddr` read from a file ring 3 chose. Its
 /// replacement `akuma-elf` has no such check — and neither did any other
 /// caller, so the guard belonged to the walk all along rather than to the one
@@ -2915,6 +3122,17 @@ fn x86_leaf_slot_in(root: u64, va: usize) -> Option<akuma_pagetable::Slot<'stati
 /// the kernel's shared upper half, which no user walk may touch.
 #[cfg(any(target_arch = "x86_64", test))]
 pub const USER_HALF_END: usize = 1 << 47;
+
+/// One past the last virtual address a syscall may name in a user range — the
+/// bound `mprotect`/`munmap` check before walking. x86_64: the low half
+/// ([`USER_HALF_END`]); above it is the kernel's shared upper half, which a
+/// walk of a user root would otherwise re-permission. AArch64: `TTBR0`'s
+/// 48-bit range (`T0SZ = 16`).
+#[cfg(target_arch = "x86_64")]
+pub const USER_VA_END: usize = USER_HALF_END;
+/// See the x86_64 twin.
+#[cfg(not(target_arch = "x86_64"))]
+pub const USER_VA_END: usize = 1 << 48;
 
 /// Bytes one page-table entry at `level` spans: 512 GiB, 1 GiB, 2 MiB, 4 KiB.
 ///
@@ -3070,10 +3288,9 @@ pub struct UserAddressSpace {
     /// having to know they exist. `akuma_mmap::MmapRegion` cannot hold them at
     /// all: that crate's `[dependencies]` table is empty and load-bearing.
     ///
-    /// The AArch64 struct has no such field because its lazy file regions carry
-    /// their own pin inside `LazySource::File`; this target demand-pages from
-    /// `mmap_regions`, which has nowhere to put one.
-    mapping_pins: alloc::vec::Vec<akuma_primitives::InodePin>,
+    /// The AArch64 struct carries the same set (`akuma_user_space::MappingPins`);
+    /// the methods are shared ([`Self::pin_mapped_inode`]).
+    mapping_pins: MappingPins,
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3105,66 +3322,7 @@ impl UserAddressSpace {
         // down table, and a frame the PMM has re-issued *as an L0* is a live
         // table, not a stale reference.
         unnote_freed_l0(root as u64 & L0_BASE_MASK);
-        Some(Self { root, ledger: FrameLedger::new(false), mapping_pins: alloc::vec::Vec::new() })
-    }
-
-    /// Keep `inode`'s data alive for as long as this address space exists.
-    ///
-    /// Idempotent per inode: a program that maps one shared object three times
-    /// (`ld.so` maps the same file once per segment) takes one pin, not three.
-    /// The count is a global table of bounded size, and an entry held per
-    /// *mapping* rather than per *file* is how it saturates — a saturated pin
-    /// table answers "pinned" for everything and stalls the filesystem's
-    /// deferred frees, which is a failure this tree has already had once
-    /// (`docs/archive/EXT2_UNLINK_INODE_BLOCK_LEAK.md`).
-    ///
-    /// `inode == 0` means "no inode identity", and pins nothing.
-    pub fn pin_mapped_inode(&mut self, inode: u32) {
-        if inode == 0 || self.mapping_pins.iter().any(|p| p.inode() == inode) {
-            return;
-        }
-        self.mapping_pins.push(akuma_primitives::InodePin::new(inode));
-    }
-
-    /// Drop every pin whose inode `still_mapped` no longer answers `true` for.
-    ///
-    /// **The release half of [`pin_mapped_inode`](Self::pin_mapped_inode), and
-    /// for a year there was none.** The pins live in this struct because it
-    /// "dies exactly when the mappings do — on `exec` and on exit"; that is true
-    /// of the *address space* and false of an individual mapping, so a
-    /// `munmap` released the pages and kept the claim on the file. A long-lived
-    /// process that maps and unmaps files — every `ld.so`, every build tool —
-    /// accumulated one permanent pin per distinct inode it had ever mapped.
-    ///
-    /// The visible failure is a space leak, not a memory one, and it needs the
-    /// pin table to saturate before it shows: past its 1024 slots `is_pinned`
-    /// answers `true` for *every* inode, so ext2 defers every `unlink`'s block
-    /// free onto a 256-slot list that then never drains, because the pins that
-    /// would release it are held by a process that is still running.
-    /// `ext2probe`'s `reclaim[pinned]` phase measured **0 %** of deleted bytes
-    /// returned on this target against 85 % on AArch64 — which does not have the
-    /// bug, because its pin rides inside `LazySource::File` in the lazy region
-    /// and dies with the region.
-    ///
-    /// Taking the predicate rather than an inode is what makes this correct
-    /// rather than approximately correct: a pin is per *inode* and per address
-    /// space, one mapping may be unmapped while three others still name the same
-    /// file (`ld.so` maps one shared object once per segment), and only the
-    /// caller's surviving region list can answer whether the last one has gone.
-    pub fn retain_mapped_inode_pins(&mut self, still_mapped: impl Fn(u32) -> bool) {
-        self.mapping_pins.retain(|p| still_mapped(p.inode()));
-    }
-
-    /// Take the same pins `other` holds — a `fork` child inherits its parent's
-    /// file mappings, so it must inherit their claim on the files.
-    ///
-    /// Without this the child's mappings are pinned only by the parent's, and a
-    /// parent that execs or exits while the child still faults leaves the child
-    /// reading an inode nothing keeps alive.
-    pub fn inherit_mapped_inode_pins(&mut self, other: &Self) {
-        for pin in &other.mapping_pins {
-            self.pin_mapped_inode(pin.inode());
-        }
+        Some(Self { root, ledger: FrameLedger::new(false), mapping_pins: MappingPins::new() })
     }
 
     /// A borrowed view of an existing address space (`CLONE_VM` / `vfork`):
@@ -3191,8 +3349,20 @@ impl UserAddressSpace {
             ledger: FrameLedger::new(true),
             // A borrowed view pins nothing: the mappings — and the pins that
             // keep their files alive — belong to the owner, which outlives it.
-            mapping_pins: alloc::vec::Vec::new(),
+            mapping_pins: MappingPins::new(),
         })
+    }
+
+    /// A thread's view: [`Self::new_shared`], since this target has no ASID to
+    /// share (the AArch64 form gives the view its owner's). `_owner_asid` is the
+    /// high half of the owner's [`Self::ttbr0`], always 0 here.
+    #[must_use]
+    pub fn new_thread_view(parent_l0_phys: usize, _owner_asid: u16) -> Self {
+        Self {
+            root: parent_l0_phys,
+            ledger: FrameLedger::new(true),
+            mapping_pins: MappingPins::new(),
+        }
     }
 
     // ── scalar identity ────────────────────────────────────────────────────
@@ -3470,7 +3640,7 @@ impl UserAddressSpace {
     /// architectures genuinely cannot share a body. AArch64 has no CoW bit: a
     /// demoted page is indistinguishable from an `mprotect(PROT_READ)` one, and
     /// `akuma-cow` is handed `refs > 0` in place of a marker. x86 has bit 9
-    /// free, `amd64/src/paging.rs` uses it, and `akuma_cow`'s pinned divergence
+    /// free, `crates/akuma-kernel-amd64/src/paging.rs` uses it, and `akuma_cow`'s pinned divergence
     /// note names this target as the one that passes a real PTE bit. Demoting
     /// without setting it would make every CoW fault here look like a genuine
     /// protection violation.
@@ -3771,6 +3941,73 @@ impl UserAddressSpace {
         f: impl FnMut(&FrameLedger, Leaf) -> LeafAction,
     ) -> usize {
         x86_walk_leaves(self.root as u64, &self.ledger, start, end, f)
+    }
+
+    /// `mremap`'s page half, the AArch64 twin's contract: each present user
+    /// leaf moves to the same offset from `new_base` with its protection, CoW
+    /// marker and cache type (a moved `/dev/fb0` page stays write-combining).
+    /// The source is cleared by the walk's own `Unmap` and the destination
+    /// installed after it, because the walk holds `&mut self`.
+    pub fn move_present(&mut self, start: usize, end: usize, new_base: usize) -> bool {
+        let mut moves: Vec<(usize, usize, PteProt, bool, MemAttr)> = Vec::new();
+        self.rewrite_leaves_in_range(start, end, |_ledger, leaf| {
+            if !leaf.prot.user {
+                return LeafAction::Keep;
+            }
+            moves.push((leaf.va, leaf.pa, leaf.prot, leaf.cow, leaf.attr));
+            LeafAction::Unmap
+        });
+        for &(va, pa, prot, cow, attr) in &moves {
+            let to = new_base + (va - start);
+            let moved = if attr == MemAttr::WriteBack {
+                self.map_page_pte(to, pa, prot, cow)
+            } else {
+                self.map_device_page(to, pa, prot, attr)
+            };
+            if !moved {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// `munmap`'s page half, the AArch64 twin's contract in one descent:
+    /// absent subtrees cost one read, so a sparse gigabyte is cheap. A leaf the
+    /// ledger does not track (a device window) is cleared and not handed back.
+    pub fn unmap_present(&mut self, start: usize, end: usize, out: &mut Vec<PhysFrame>) {
+        self.rewrite_leaves_in_range(start, end, |ledger, leaf| {
+            let frame = PhysFrame::new(leaf.pa);
+            if ledger.remove_user_frame(frame) {
+                out.push(frame);
+            }
+            LeafAction::Unmap
+        });
+    }
+
+    /// `mprotect`'s page-table half — the AArch64 twin's contract, in one
+    /// descent: every present leaf in `[start, end)` becomes `prot`, or
+    /// `prot` without write and CoW-marked where `keep_cow(va, pa)` says the
+    /// frame is still shared. A leaf ring 3 cannot touch is re-permissioned
+    /// when *granting* (a `PROT_NONE` page is `KERNEL_RO` here, and skipping
+    /// it stranded Chromium's decommitted pages, 2026-10-09) and left alone
+    /// for `NONE`. The walk invalidates and shoots down what it edits.
+    pub fn reprotect_present(
+        &mut self,
+        start: usize,
+        end: usize,
+        prot: akuma_mmap::Prot,
+        mut keep_cow: impl FnMut(usize, usize) -> bool,
+    ) -> usize {
+        let mut changed = 0usize;
+        self.rewrite_leaves_in_range(start, end, |_ledger, leaf| {
+            if !leaf.prot.user && prot.is_none() {
+                return LeafAction::Keep;
+            }
+            changed += 1;
+            let cow = keep_cow(leaf.va, leaf.pa);
+            LeafAction::Reprotect(PteProt::from_region(if cow { prot.without_write() } else { prot }), cow)
+        });
+        changed
     }
 
 
@@ -4164,8 +4401,9 @@ pub fn map_user_page_no_flush(va: usize, pa: usize, user_flags_val: u64) -> (Tab
 /// Widening to all-ASID rather than "pass the right ASID" is deliberate: a
 /// single L0 table can be live under **several** ASIDs at once, because
 /// `UserAddressSpace::new_shared` allocates a fresh ASID while reusing the
-/// parent's `l0_frame` (CLONE_VM threads and vfork-fastpath children), and
-/// `activate()` installs that view's own ASID. One PTE edit therefore has to
+/// parent's `l0_frame` (vfork-fastpath children; CLONE_VM threads share the
+/// owner's ASID through `new_thread_view`), and `activate()` installs that
+/// view's own ASID. One PTE edit therefore has to
 /// invalidate every ASID aliasing those tables, which is what `vaae1is`
 /// ("VA, All-ASID, EL1") does. Same instruction as `flush_tlb_page`.
 #[inline]
@@ -4226,7 +4464,7 @@ pub fn flush_tlb_range_all_asid(start_va: usize, pages: usize, target: TlbTarget
     // invalidate peers running the same address space in EL0 (see
     // `flush_tlb_all`). Other builds, and a `ThisCore` target, keep the
     // cheaper core-local form.
-    let broadcast = cfg!(kernel_smp_shared) && target == TlbTarget::AllCores;
+    let broadcast = cfg!(kernel_bkl_smp) && target == TlbTarget::AllCores;
     for _ in 0..pages {
         if broadcast {
             akuma_cpu::tlb::vaae1is((va >> 12) as u64);
@@ -4516,26 +4754,6 @@ fn resolve_user_leaf(l0: &akuma_pagetable::Table, va: usize) -> Option<UserLeaf>
     Some(UserLeaf { entry: l3_entry, pa_mask: TABLE_PA, offset_mask: 0xFFF })
 }
 
-/// Translate a user VA to its physical address using the given L0 page table.
-/// Returns None if the page is not mapped.
-/// [`translate_user_va`] for the **current** address space: resolves the L0 from
-/// `TTBR0_EL1` itself, so a caller with no `&Process` can ask "what physical frame
-/// is behind this user VA right now?".
-///
-/// Added for the frame-lifecycle diagnostic in
-/// `docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`: comparing the answer before and
-/// after a `copy_to_user` says whether the frame under the destination was
-/// swapped out from under the copy.
-#[must_use]
-pub fn translate_current_user_va(va: usize) -> Option<usize> {
-    let ttbr0 = get_current_ttbr0();
-    if ttbr0 == 0 {
-        return None;
-    }
-    let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
-    resolve_user_leaf(table_phys(l0_addr), va).map(|leaf| leaf.phys(va))
-}
-
 pub fn translate_user_va(l0_ptr: *const u64, va: usize) -> Option<usize> {
     resolve_user_leaf(table(l0_ptr as usize), va).map(|leaf| leaf.phys(va))
 }
@@ -4707,10 +4925,10 @@ fn demote_range(l0: &akuma_pagetable::Table, va_start: usize, pages: usize) -> u
             demoted += 1;
         }
     });
-    // Ensure all PTE writes are visible before returning. Under kernel_smp_shared,
+    // Ensure all PTE writes are visible before returning. Under kernel_bkl_smp,
     // the caller will issue flush_tlb_all() which includes DSB, but this DSB here
     // guarantees ordering even if the call pattern changes.
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     akuma_cpu::barrier::dsb_ish();
     demoted
 }
@@ -4785,7 +5003,7 @@ mod icache_tests {
     // On the host target the cache-maintenance asm is compiled out, so this only
     // guards that `sync_icache_range` is callable and that the `len == 0` and
     // sub-cache-line cases don't panic / over-run. The real coherency proof is the
-    // on-target boot self-test `test_icache_sync_rewrites_code` (src/process_tests.rs),
+    // on-target boot self-test `test_icache_sync_rewrites_code` (crates/akuma-kernel-tests-aarch64/src/process_tests.rs),
     // which writes + rewrites executable code and runs it (docs/AKUMA_SELF_HOSTING.md §7j).
     #[test]
     fn sync_icache_range_handles_edge_lengths() {
@@ -4799,16 +5017,16 @@ mod icache_tests {
 
 /// The x86 permission encoding, pinned against the walker that already ships.
 ///
-/// `amd64/src/paging.rs` has its own `PteProt`/`encode` pair driving the amd64
+/// `crates/akuma-kernel-amd64/src/paging.rs` has its own `PteProt`/`encode` pair driving the amd64
 /// kernel's page tables, and its boot self-test asserts each of these six
 /// values. This crate's copy is the one the *shared* crates reach through
 /// `UserAddressSpace`, so the two must agree exactly or a page mapped through
-/// `akuma-exec` and a page mapped through `amd64/src/mm.rs` get different
+/// `akuma-exec` and a page mapped through `crates/akuma-kernel-amd64/src/mm.rs` get different
 /// permissions from the same region.
 ///
 /// Spelled as hex literals for the same reason `prot_roundtrips_to_todays_bits`
 /// is: a test written against `x86_encode`'s own constants would pass even if
-/// they drifted. These were read off `amd64/src/paging.rs`'s
+/// they drifted. These were read off `crates/akuma-kernel-amd64/src/paging.rs`'s
 /// `region_prot_roundtrip_check`.
 ///
 /// Compiled on any host via the `cfg(test)` half of the gate on the encoding —

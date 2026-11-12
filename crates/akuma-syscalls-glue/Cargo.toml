@@ -7,9 +7,11 @@ description = "The Linux syscall dispatcher and its per-family implementations"
 [dependencies]
 akuma-bkl = { path = "../akuma-bkl" }
 akuma-config = { path = "../akuma-config" }
+akuma-cow = { path = "../akuma-cow" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec" }
 akuma-isolation = { path = "../akuma-isolation", default-features = false }
+akuma-mmap = { path = "../akuma-mmap" }
 akuma-mmu = { path = "../akuma-mmu" }
 akuma-net = { path = "../akuma-net", default-features = false }
 # eventfd's state machine (stage 8 session Q seam-cut): the counter/flag
@@ -55,19 +57,14 @@ log = { version = "0.4", default-features = false }
 # unreachable and `-D dead-code` fires on code no build ships without.
 #
 # **The bin must therefore use `default-features = false`** — same as it does for
-# `akuma-net` — or an `extreme-size` build would silently gain smoltcp.
+# `akuma-net` — or a `--no-default-features` build would silently gain smoltcp.
 default = ["smoltcp", "exec", "akuma-native"]
 
 # Every one is forwarded from the bin, which owns the real definitions.
 sc-reboot = ["dep:akuma-boot"]
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
-smp-shared = []
-no-bkl-network = []
-no-bkl-vfs = []
-no-bkl-mm = []
-no-bkl-drivers = []
+bkl-smp = []
 no-tests = []
-extreme = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 sc-aio = []
 sc-containers = ["akuma-isolation/containers"]

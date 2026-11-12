@@ -99,13 +99,13 @@ Every arm `dispatch_inner` keeps after the steps above:
 | 26 | `msync` | `msync_arm` (lib.rs) | writes a writable `MAP_SHARED` file mapping back to its file |
 | 28 | `madvise` | `madvise_arm` (lib.rs) | `akuma-syscalls-mem` decode; `MADV_DONTNEED` zeroes the mmap-slab pages (a frame a fork peer maps is replaced, not zeroed); `MADV_FREE` is `EINVAL` |
 | 25 | `mremap` | dispatch (lib.rs) | shrink frees the tail; grow in place at the slab top, else move and copy; `MREMAP_FIXED` refused |
-| 24 | `sched_yield` | dispatch (lib.rs) | `akuma_threading::x86_yield` when another thread is runnable |
+| 24 | `sched_yield` | dispatch (lib.rs) | `akuma_threading::try_yield` when another thread is runnable |
 | 130, 127 | `rt_sigsuspend`, `rt_sigpending` | glue, called directly | glue's arms, as on the other kernels |
 | 34 | `pause` | `akuma_syscalls_glue::sys_pause` | |
 | 15 | `rt_sigreturn` | `child::sigreturn_arm` | restores the frame `push_handler` saved |
 | 56, 57, 58 | `clone`, `fork`, `vfork` | `child::fork_arm` | `akuma-syscalls-proc::clone::decode`: `CLONE_THREAD` → `clone_thread`, everything else → `fork_process` ([`processes.md`](processes.md)) |
 | 59 | `execve` | `child::exec_real_task` | the boot thread has no process to replace: `ENOSYS` |
-| 62, 200, 234 | `kill`, `tkill`, `tgkill` | `akuma_syscalls_glue_amd64::kill` | the x86 kernels' shared bodies: pend, and interrupt the target only when the default action kills |
+| 62, 200, 234 | `kill`, `tkill`, `tgkill` | `akuma_syscalls_glue::signal::{sys_kill,sys_tkill,sys_tgkill}` | every kernel's shared bodies: pend, and interrupt the target only when the default action kills |
 
 ## Facts the shared layers rely on
 

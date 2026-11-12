@@ -11,7 +11,7 @@ one-file wrapper — the image itself is assembled by `amd64/mkdisk.sh`, which
 
 | path | what |
 |---|---|
-| `/bin/hello`, `/bin/fdprobe` | the loader/syscall probes, compiled by `amd64/build.rs` |
+| `/bin/hello`, `/bin/fdprobe` | the loader/syscall probes, compiled by `crates/akuma-kernel-amd64/build.rs` |
 | `/bin/paws` | the shell, built from `userspace/` for `x86_64-unknown-none` |
 | `/bin/httpd` | the HTTP server (`INIT=/bin/httpd`) |
 | `/bin/sshd` | userspace SSH, cooperative single-process build (no `fork-sessions`) |
@@ -28,7 +28,7 @@ INIT=/bin/httpd        overlays/devbox-amd64/run.sh # curl http://localhost:8080
 INIT=/bin/busybox INITARGS=uname,-a overlays/devbox-amd64/run.sh   # busybox applet
 SSHD_SHELL=/bin/sh     overlays/devbox-amd64/run.sh # sshd starts busybox
 STRACE=1               overlays/devbox-amd64/run.sh # trace every syscall the init program makes
-SMP=4                  overlays/devbox-amd64/run.sh # four cores (amd64/README.md § "SMP")
+SMP=4                  overlays/devbox-amd64/run.sh # four cores (crates/akuma-kernel-amd64/README.md § "SMP")
 ```
 
 ssh in with the key `amd64/mkdisk.sh` generated:
@@ -50,4 +50,4 @@ after `FC_HOST=… amd64/net-setup.sh`.
   stage, and its rootfs assembly (a real `/etc`, `/dev`, PATH layout) is what
   this overlay is for.
 
-Background: `docs/archive/AKUMA_FIRECRACKER_AMD64.md`, `amd64/README.md`.
+Background: `docs/archive/AKUMA_FIRECRACKER_AMD64.md`, `crates/akuma-kernel-amd64/README.md`.

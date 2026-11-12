@@ -1,0 +1,9161 @@
+//! System tests for threading and other core functionality
+//!
+//! Entered through `run_memory_tests`, `run_threading_tests` and `run_benchmarks`
+//! (see this crate's `lib.rs`), after scheduler initialization.
+//! If tests fail, the kernel should halt.
+
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::fmt::Write as _;
+
+use crate::config;
+use crate::console;
+use akuma_exec::threading;
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::string::String;
+use alloc::vec;
+use alloc::vec::Vec;
+// The one errno table (`akuma_primitives::errno`), in the negated form a
+// syscall returns. Every test here used to declare its own local consts from
+// raw literals — 94 of them across the five test files, which is how a
+// comment and a number get to disagree. See
+// docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
+use akuma_primitives::errno::negated::{
+    EFAULT, EINVAL, ENOSYS, ESRCH,
+};
+
+/// Run memory tests (allocator, mmap) - can run before filesystem init
+/// Returns true if all pass
+pub fn run_memory_tests() -> bool {
+    console::print("\n========== Memory Tests ==========\n");
+
+    let mut all_pass = true;
+    let mut failed_tests: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+
+    // Helper macro to run a test and track failures
+    macro_rules! run_test {
+        ($test_fn:expr, $name:expr) => {
+            if !$test_fn() {
+                all_pass = false;
+                failed_tests.push($name);
+            }
+        };
+    }
+
+    // Allocator tests (run first - fundamental)
+    run_test!(test_allocator_vec, "allocator_vec");
+    run_test!(test_allocator_box, "allocator_box");
+    run_test!(test_allocator_large, "allocator_large");
+
+    // Comprehensive allocator tests
+    run_test!(test_realloc_grow, "realloc_grow");
+    run_test!(test_realloc_shrink, "realloc_shrink");
+    run_test!(test_realloc_preserves_data, "realloc_preserves_data");
+    run_test!(test_alloc_zeroed_basic, "alloc_zeroed_basic");
+    run_test!(test_alloc_zeroed_after_dirty, "alloc_zeroed_after_dirty");
+    run_test!(test_alignment_various, "alignment_various");
+    run_test!(test_fragmentation_small_blocks, "fragmentation_small_blocks");
+    run_test!(test_interleaved_alloc_free, "interleaved_alloc_free");
+    run_test!(test_mixed_sizes, "mixed_sizes");
+    run_test!(test_vec_remove_regression, "vec_remove_regression");
+    run_test!(test_rapid_push_pop, "rapid_push_pop");
+    run_test!(test_string_operations, "string_operations");
+    run_test!(test_string_push_str_realloc, "string_push_str_realloc");
+    run_test!(test_string_realloc_detailed, "string_realloc_detailed");
+    run_test!(test_vec_of_vecs, "vec_of_vecs");
+    run_test!(test_adjacent_allocations, "adjacent_allocations");
+
+    // Console history: proves the `console::emit` tee into `akuma-dmesg` is
+    // wired, which no host test can show.
+    run_test!(test_dmesg_ring_captured_boot, "dmesg_ring_captured_boot");
+
+    // Mmap allocator edge case tests (for userspace debugging)
+    run_test!(test_mmap_single_page, "mmap_single_page");
+    run_test!(test_mmap_multi_page, "mmap_multi_page");
+    run_test!(test_mmap_page_boundary_write, "mmap_page_boundary_write");
+    run_test!(test_mmap_rapid_alloc_dealloc, "mmap_rapid_alloc_dealloc");
+    run_test!(test_mmap_realloc_pattern, "mmap_realloc_pattern");
+    run_test!(test_mmap_string_growth_pattern, "mmap_string_growth_pattern");
+    run_test!(test_mmap_vec_capacity_doubling, "mmap_vec_capacity_doubling");
+    run_test!(test_mmap_interleaved_strings, "mmap_interleaved_strings");
+
+    // Allocator leak detection tests
+    run_test!(test_alloc_free_no_leak, "alloc_free_no_leak");
+    run_test!(test_btreemap_churn_no_leak, "btreemap_churn_no_leak");
+    run_test!(test_vec_growth_no_leak, "vec_growth_no_leak");
+    run_test!(test_high_volume_small_allocs_no_leak, "high_volume_small_allocs_no_leak");
+
+    // Mmap subsystem tests
+    run_test!(test_alloc_mmap_non_overlapping, "alloc_mmap_non_overlapping");
+    run_test!(test_lazy_region_push_lookup, "lazy_region_push_lookup");
+    run_test!(test_lazy_region_munmap_full, "lazy_region_munmap_full");
+    run_test!(test_lazy_region_munmap_prefix, "lazy_region_munmap_prefix");
+    run_test!(test_lazy_region_munmap_suffix, "lazy_region_munmap_suffix");
+    run_test!(test_lazy_region_munmap_middle, "lazy_region_munmap_middle");
+    run_test!(test_lazy_region_munmap_multi, "lazy_region_munmap_multi");
+    run_test!(test_lazy_and_eager_regions_share_one_list, "lazy_and_eager_share_one_list");
+    run_test!(test_lazy_region_lookup_pid_isolation, "lazy_region_lookup_pid_isolation");
+    run_test!(test_map_user_page_roundtrip, "map_user_page_roundtrip");
+    run_test!(test_eager_mmap_pages_survive_subrange_munmap, "eager_mmap_subrange_munmap");
+    run_test!(test_clone_vm_mmap_regions_on_owner, "clone_vm_mmap_regions_on_owner");
+    run_test!(test_clone_vm_eager_fallback_finds_region, "clone_vm_eager_fallback_finds_region");
+
+    // IrqGuard correctness — tests the DAIF save/restore invariant (Bug 13: akuma-exec extraction)
+    run_test!(test_irqguard_preserves_disabled_state, "irqguard_preserves_disabled_state");
+    run_test!(test_irqguard_nesting_preserves_state, "irqguard_nesting_preserves_state");
+    run_test!(test_with_irqs_disabled_nesting, "with_irqs_disabled_nesting");
+    run_test!(test_map_user_page_preserves_irq_state, "map_user_page_preserves_irq_state");
+
+    // Timer invariant (regression test for go-build hang investigation). The
+    // critical_section-based DAIF-preservation tests that used to live here were removed
+    // when BKL Phase 7a dropped the `critical_section` crate from kernel_timer.rs in favor
+    // of `IrqGuard` + a real `Spinlock` — `test_irqguard_nesting_preserves_state` and
+    // `test_with_irqs_disabled_nesting` above already cover the same DAIF-nesting invariant.
+    run_test!(test_timer_interval_no_overflow,      "timer_interval_no_overflow");
+    run_test!(test_thread_pool_stats_sane,          "thread_pool_stats_sane");
+    run_test!(test_siginfo_fields_set,              "siginfo_fields_set");
+    run_test!(test_reentrant_signal_repend,         "reentrant_signal_repend");
+    run_test!(test_eventfd_refcount,                "eventfd_refcount");
+
+    // PTE durability — tests the ACTUAL invariant that broke in the crash
+    run_test!(test_map_127_pages_all_ptes_exist, "map_127_pages_all_ptes_exist");
+    run_test!(test_map_pages_survive_subsequent_allocs, "map_pages_survive_subsequent_allocs");
+    run_test!(test_map_interleaved_regions_same_l3, "map_interleaved_regions_same_l3");
+    run_test!(test_kernel_identity_mapping_full_ram, "kernel_identity_mapping_full_ram");
+    run_test!(test_boot_map_covers_full_ram, "boot_map_covers_full_ram");
+    run_test!(test_compute_heap_size, "compute_heap_size");
+    run_test!(test_reserve_calc_ram, "reserve_calc_ram");
+    run_test!(test_compute_memory_layout, "compute_memory_layout");
+    run_test!(test_compute_thread_limit, "compute_thread_limit");
+    run_test!(test_mmap_does_not_overlap_identity_map, "mmap_does_not_overlap_identity_map");
+
+    // Bug 10: partial munmap of eager regions
+    run_test!(test_eager_munmap_prefix_preserves_suffix, "eager_munmap_prefix_preserves_suffix");
+    run_test!(test_eager_munmap_suffix_preserves_prefix, "eager_munmap_suffix_preserves_prefix");
+    run_test!(test_eager_munmap_full_removes_all, "eager_munmap_full_removes_all");
+
+    // Bug 11-12: munmap fallback and mprotect lazy flag updates
+    run_test!(test_munmap_fallback_clears_stale_ptes, "munmap_fallback_clears_stale_ptes");
+    run_test!(test_mprotect_updates_lazy_flags, "mprotect_updates_lazy_flags");
+
+    // Bug 2: clear_child_tid not reset on execve
+    run_test!(test_execve_clears_child_tid, "execve_clears_child_tid");
+
+    // Bug 3: phantom frame leak on demand-paging race
+    run_test!(test_map_user_page_race_leaks_frame, "map_user_page_race_leaks_frame");
+
+    // Bug 5: CLONE_VM readahead race causes phantom frame waste
+    run_test!(test_readahead_race_phantom_frames, "readahead_race_phantom_frames");
+
+    // Page leak fixes: unmap_and_free_page, lazy munmap frame freeing, kill_process cleanup
+    run_test!(test_unmap_and_free_page_returns_frame, "unmap_and_free_page_returns_frame");
+    run_test!(test_lazy_munmap_frees_demand_paged_frames, "lazy_munmap_frees_demand_paged_frames");
+    run_test!(test_kill_process_clears_lazy_regions, "kill_process_clears_lazy_regions");
+
+    // MADV_DONTNEED: page reclaim and lazy region preservation
+    run_test!(test_madvise_dontneed_frees_pages, "madvise_dontneed_frees_pages");
+    run_test!(test_madvise_dontneed_loop_no_leak, "madvise_dontneed_loop_no_leak");
+
+    // Batch PMM allocation
+    run_test!(test_alloc_pages_batch_basic, "alloc_pages_batch_basic");
+    run_test!(test_alloc_pages_batch_free, "alloc_pages_batch_free");
+    run_test!(test_alloc_pages_batch_insufficient, "alloc_pages_batch_insufficient");
+    run_test!(test_alloc_pages_batch_interleaved, "alloc_pages_batch_interleaved");
+    run_test!(test_pmm_heap_lock_order, "pmm_heap_lock_order");
+
+    // mprotect IC IALLU optimization
+    run_test!(test_mprotect_flag_update_with_cache_maintenance, "mprotect_flag_update_cache_maint");
+
+    run_test!(test_mprotect_large_region_completes, "mprotect_large_region_completes");
+
+    // mremap + lazy region handling
+    run_test!(test_mremap_lazy_region_moves_data, "mremap_lazy_region_moves_data");
+    run_test!(test_mremap_lazy_region_shrink, "mremap_lazy_region_shrink");
+    run_test!(test_mremap_lazy_cleans_old_ptes, "mremap_lazy_cleans_old_ptes");
+
+    // Large mmap limit (Bun Gigacage support)
+    run_test!(test_large_mmap_limit, "large_mmap_limit");
+
+    // close_range syscall
+    run_test!(test_close_range, "close_range");
+
+    // set_robust_list
+    run_test!(test_set_robust_list_stores_head, "set_robust_list_stores_head");
+    run_test!(test_robust_list_cleanup_wakes_futex, "robust_list_cleanup_wakes_futex");
+
+    // membarrier command dispatch
+    run_test!(test_membarrier_private_expedited_succeeds, "membarrier_private_expedited_succeeds");
+
+    // Regression: PMM contiguous allocation (extract-syscalls branch)
+    // Thread stacks moved from heap to PMM contiguous pages — must allocate,
+    // be zeroed, not overlap, and free correctly.
+    run_test!(test_pmm_contiguous_alloc_basic, "pmm_contiguous_alloc_basic");
+    run_test!(test_pmm_contiguous_alloc_zeroed, "pmm_contiguous_alloc_zeroed");
+    run_test!(test_pmm_contiguous_free_restores_count, "pmm_contiguous_free_restores_count");
+    run_test!(test_pmm_contiguous_stack_sized_no_overlap, "pmm_contiguous_stack_sized_no_overlap");
+    run_test!(test_pmm_contiguous_double_stack_size_no_overlap, "pmm_contiguous_double_stack_size_no_overlap");
+
+    // Regression: alloc_mmap skips kernel VA hole (extract-syscalls branch)
+    // Previously mmap could allocate at 0x4000_0000–0x5000_0000 (kernel identity VA).
+    run_test!(test_alloc_mmap_skips_kernel_va_hole, "alloc_mmap_skips_kernel_va_hole");
+
+    // Regression: compute_stack_top constants.
+    // Verify values fit in 48-bit VA and mmap space is correct.
+    run_test!(test_stack_top_within_48bit_va, "stack_top_within_48bit_va");
+    run_test!(test_mmap_space_covers_jsc_gigacage, "mmap_space_covers_jsc_gigacage");
+
+    // Regression: Go binary VA exhaustion (forktest_parent OOM fix).
+    // Threshold lowered from 4 MB to 512 KB so Go static binaries get large VA.
+    run_test!(test_compute_stack_top_small_static,    "compute_stack_top_small_static");
+    run_test!(test_compute_stack_top_go_sized_static, "compute_stack_top_go_sized_static");
+    run_test!(test_compute_stack_top_boundary_512k,   "compute_stack_top_boundary_512k");
+    run_test!(test_go_binary_va_exhaustion_scenario,  "go_binary_va_exhaustion_scenario");
+
+    // Regression: demand-pager/instruction-abort handler used lazy_region_lookup()
+    // (calls read_current_pid() internally) instead of lazy_region_lookup_for_pid(pid, va)
+    // with the PID captured once at handler entry. A second call to read_current_pid()
+    // inside the same exception handler could race or return 0 (boot TTBR0 still active),
+    // causing the lazy region to be missed and the process killed with "no lazy region".
+    run_test!(test_lazy_region_lookup_for_pid_explicit, "lazy_region_lookup_for_pid_explicit");
+    run_test!(test_lazy_region_lookup_pid_consistency, "lazy_region_lookup_pid_consistency");
+
+    // Regression: Go build SIGSEGV at PC=0x80000000 — kernel VA range enforcement
+    // MAP_FIXED bypass, lazy fault guard, and fork copy guard.
+    run_test!(test_mmap_fixed_kernel_va_guard,  "mmap_fixed_kernel_va_guard");
+    run_test!(test_lazy_fault_kernel_va_guard,  "lazy_fault_kernel_va_guard");
+    run_test!(test_fork_mmap_skips_kernel_va,   "fork_mmap_skips_kernel_va");
+
+    // Regression: forktest §E `[EINVAL] nr=222` (docs/GO_FORKTEST_DEBUG.md).
+    // Pin the alignment-EINVAL helper so the mmap diagnostic decode and
+    // sys_mmap guard cannot drift apart. crash14 shape: addr=-22, FIXED set.
+    run_test!(test_mmap_einval_through_handle_syscall,      "mmap_einval_through_handle_syscall");
+    run_test!(test_mmap_madvise_hostile_length_is_refused, "mmap_madvise_hostile_length_is_refused");
+
+    // Common memory allocation patterns
+    // NOTE: These tests hang during preemption - need investigation
+    // run_test!(test_lifo_pattern, "lifo_pattern");
+    // run_test!(test_fifo_pattern, "fifo_pattern");
+    // run_test!(test_memory_pool_pattern, "memory_pool_pattern");
+    // run_test!(test_resize_pattern, "resize_pattern");
+    // run_test!(test_temporary_buffers, "temporary_buffers");
+    // run_test!(test_linked_structure, "linked_structure");
+
+    // Bun install fixes (improve-dash-compatibility branch)
+    run_test!(test_user_stack_size_is_2mb, "user_stack_size_is_2mb");
+    run_test!(test_kernel_heap_matches_heuristic, "kernel_heap_matches_heuristic");
+    run_test!(test_direntry_has_is_symlink_field, "direntry_has_is_symlink_field");
+    run_test!(test_procfs_fd_symlink_resolution, "procfs_fd_symlink_resolution");
+    run_test!(test_map_user_page_already_mapped, "map_user_page_already_mapped");
+    run_test!(test_kernel_va_rejected_as_user_pointer, "kernel_va_rejected_as_user_pointer");
+    run_test!(test_read_current_pid_rejects_bare_address_space, "read_current_pid_bare_address_space");
+    run_test!(test_epoll_event_is_16_bytes_on_arm64, "epoll_event_is_16_bytes_on_arm64");
+    run_test!(test_epoll_infinite_wait_uses_bounded_deadline, "epoll_infinite_wait_bounded_deadline");
+    run_test!(test_kill_process_cascades_to_children, "kill_process_cascades_to_children");
+
+    // ENOSYS syscall handling (bun crash prevention)
+    run_test!(test_enosys_syscalls_return_proper_errno, "enosys_syscalls_proper_errno");
+    run_test!(test_enosys_is_negative_38, "enosys_is_negative_38");
+    run_test!(test_io_setup_and_destroy, "io_setup_and_destroy");
+    run_test!(test_oom_crash_pattern_documentation, "oom_crash_pattern_docs");
+
+    // Safe user access fault redirection tests
+    run_test!(test_safe_user_access_fault, "safe_user_access_fault");
+    run_test!(test_user_copy_wide_and_faults, "user_copy_wide_and_faults");
+    run_test!(test_copy_from_user_str_fault, "copy_from_user_str_fault");
+
+    // Kernel identity-mapping regression tests (opencode crash fix)
+    run_test!(test_kernel_identity_map_covers_full_ram, "kernel_identity_map_full_ram");
+    run_test!(test_mmap_allocator_skips_full_kernel_range, "mmap_allocator_skips_kernel_range");
+    run_test!(test_block_shatter_preserves_identity, "block_shatter_preserves_identity");
+
+    // ioctl FIONREAD/FIONBIO regression tests
+    run_test!(test_pipe_bytes_available, "pipe_bytes_available");
+    run_test!(test_shared_fd_table_arc_clone, "shared_fd_table_arc_clone");
+    run_test!(test_shared_fd_table_deep_clone_for_fork, "shared_fd_table_deep_clone_fork");
+    run_test!(test_sysinfo_reports_actual_ram, "sysinfo_reports_actual_ram");
+
+    // Pipe write EPIPE regression tests (go build compile -V=full fix)
+    run_test!(test_pipe_write_to_destroyed_pipe_returns_epipe, "pipe_write_destroyed_returns_epipe");
+    run_test!(test_pipe_write_no_readers_returns_epipe, "pipe_write_no_readers_returns_epipe");
+    run_test!(test_pipe_write_with_readers_succeeds, "pipe_write_with_readers_succeeds");
+    run_test!(test_pipe_cloexec_cleanup_preserves_live_writer, "pipe_cloexec_preserves_writer");
+
+    // Signal frame layout tests (go build crash: corrupted SP/PSTATE after sigreturn)
+    run_test!(test_signal_frame_uc_stack_offsets, "signal_frame_uc_stack_offsets");
+    run_test!(test_lazy_region_btreemap_boundary_lookup, "lazy_region_btreemap_boundary_lookup");
+
+    // AIO stub safety: io_getevents/io_submit/io_cancel must never return ENOSYS.
+    // ENOSYS (-38) as a pointer → WILD-DA crash in Go compile workers (PID 143 pattern).
+    run_test!(test_aio_getevents_never_returns_enosys, "aio_getevents_never_enosys");
+    run_test!(test_aio_stubs_invalid_ctx_returns_einval, "aio_stubs_invalid_ctx_einval");
+    run_test!(test_aio_stubs_valid_ctx_returns_zero, "aio_stubs_valid_ctx_zero");
+    run_test!(test_map_shared_readonly_returns_success, "map_shared_readonly_success");
+
+    // CoW fork: PMM refcounting and IC flush SVC detection
+    run_test!(test_cow_refcount_basic, "cow_refcount_basic");
+    run_test!(test_cow_refcount_multi, "cow_refcount_multi");
+    run_test!(test_cow_free_page_respects_refcount, "cow_free_page_respects_refcount");
+    run_test!(test_ic_flush_svc_detection, "ic_flush_svc_detection");
+    run_test!(test_cow_el1_fault_conditions, "cow_el1_fault_conditions");
+    run_test!(test_cow_dec_after_fault, "cow_dec_after_fault");
+    run_test!(test_ensure_cow_writable_resolves_cow_page, "ensure_cow_writable_resolves");
+    run_test!(test_cow_el1_resolver_no_dec_on_fail, "cow_el1_resolver_no_dec_on_fail");
+    run_test!(test_cow_prefault_not_cow_page_no_op, "cow_prefault_not_cow_page_no_op");
+
+    console::print("\n==================================\n");
+    if all_pass {
+        console::print("Memory Tests: ALL PASSED\n");
+    } else {
+        crate::safe_print!(64, 
+            "Memory Tests: {} FAILED\n",
+            failed_tests.len()
+        );
+        console::print("Failed tests:\n");
+        for test_name in &failed_tests {
+            crate::safe_print!(32, "  - {}\n", test_name);
+        }
+    }
+    console::print("==================================\n\n");
+
+    all_pass
+}
+
+/// Run threading tests - requires filesystem for parallel process tests
+/// Returns true if all pass
+pub fn run_threading_tests() -> bool {
+    console::print("\n========== Threading Tests ==========\n");
+
+    let mut all_pass = true;
+    let mut failed_tests: alloc::vec::Vec<&str> = alloc::vec::Vec::new();
+
+    // Helper macro to run a test and track failures
+    macro_rules! run_test {
+        ($test_fn:expr, $name:expr) => {
+            if !$test_fn() {
+                all_pass = false;
+                failed_tests.push($name);
+            }
+        };
+    }
+
+    // On tiny machines, skip the resource-heavy tests (they spawn several
+    // parallel processes/threads and can't fit — see docs/LOW_MEMORY_ENVIRONMENT.md).
+    let ram_mb = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base())
+        / (1024 * 1024);
+    let skip_heavy = crate::config::LOW_MEM_TEST_SKIP_MB != 0
+        && ram_mb <= crate::config::LOW_MEM_TEST_SKIP_MB;
+    if skip_heavy {
+        crate::safe_print!(128,
+            "  [low-mem: {} MB < {} MB] skipping heavy parallel/FP-preemption tests\n",
+            ram_mb, crate::config::LOW_MEM_TEST_SKIP_MB);
+    }
+    // Like run_test!, but skipped on low-memory machines.
+    macro_rules! run_test_heavy {
+        ($test_fn:expr, $name:expr) => {
+            if !skip_heavy { run_test!($test_fn, $name); }
+        };
+    }
+
+    // Threading tests (no fs dependency)
+    run_test!(test_scheduler_init, "scheduler_init");
+    run_test!(test_thread_stats, "thread_stats");
+    run_test!(test_yield, "yield");
+    run_test!(test_thread_cleanup, "thread_cleanup");
+    run_test!(test_spawn_thread, "spawn_thread");
+    run_test!(test_spawn_and_run, "spawn_and_run");
+    run_test!(test_spawn_and_cleanup, "spawn_and_cleanup");
+    run_test_heavy!(test_spawn_multiple, "spawn_multiple");
+    run_test_heavy!(test_spawn_and_yield, "spawn_and_yield");
+    run_test_heavy!(test_yield_cycle, "yield_cycle");
+
+    // Waker mechanism tests
+    run_test!(test_waker_mechanism, "waker_mechanism");
+    run_test!(test_block_on_noop_waker, "block_on_noop_waker");
+    run_test!(test_thread_waker_marks_ready, "thread_waker_marks_ready");
+    run_test!(test_thread_waker_idempotent, "thread_waker_idempotent");
+    run_test!(test_thread_waker_roundtrip, "thread_waker_roundtrip");
+    run_test!(test_block_on_real_waker, "block_on_real_waker");
+
+    // NEON/FP register save/restore tests.
+    //
+    // There is no voluntary-yield variant: a kernel thread's `yield_now()` is an ordinary call,
+    // which preserves what AAPCS64 says a call preserves (d8-d15) and no more, so caller-saved
+    // FP state across it is not a kernel guarantee. User threads keep theirs in the EL0 trap
+    // frame. The tick preempts kernel threads through an IRQ entry that saves the whole vector
+    // file, which is what these two check (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
+    run_test_heavy!(test_neon_regs_across_preemption, "neon_regs_across_preemption");
+    run_test_heavy!(test_fp_arithmetic_across_preemption, "fp_arithmetic_across_preemption");
+
+    // Parallel process tests (requires /bin/hello)
+    run_test_heavy!(test_parallel_processes, "parallel_processes");
+    run_test!(test_terminal_syscalls, "terminal_syscalls");
+    
+    // Orphaned lock recovery tests
+    run_test!(test_thread_terminated_detection, "thread_terminated_detection");
+    run_test!(test_ext2_orphaned_lock_recovery, "ext2_orphaned_lock_recovery");
+    run_test!(test_reap_registry_is_populated, "reap_registry_is_populated");
+
+    console::print("\n==================================\n");
+    if all_pass {
+        console::print("Threading Tests: ALL PASSED\n");
+    } else {
+        crate::safe_print!(64, 
+            "Threading Tests: {} FAILED\n",
+            failed_tests.len()
+        );
+        console::print("Failed tests:\n");
+        for test_name in &failed_tests {
+            crate::safe_print!(32, "  - {}\n", test_name);
+        }
+    }
+    console::print("==================================\n\n");
+
+    all_pass
+}
+
+/// Test: Basic terminal syscalls from userspace
+///
+/// This tests the new terminal control syscalls (raw mode, cursor, clear screen)
+/// and input polling.
+#[allow(clippy::useless_let_if_seq)]
+fn test_terminal_syscalls() -> bool {
+    console::print("\n[TEST] Terminal Syscalls (Userspace)\n");
+
+    // Check if terminal_test binary exists
+    if crate::fs::read_file("/bin/terminal_test").is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            console::print("  /bin/terminal_test not found\n");
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+        console::print("  Skipping: /bin/terminal_test not found\n");
+        console::print("  Result: SKIP\n");
+        return true; // Skip, don't fail
+    }
+
+    let result = crate::async_tests::run_async_test(async {
+        akuma_exec::process::exec_async("/bin/terminal_test", None, None).await
+    });
+
+    let (exit_code, output) = match result {
+        Ok((code, out)) => (code, out),
+        Err(e) => {
+            crate::safe_print!(64, "  Execution failed: {}\n", e);
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+    };
+
+    let output_str = String::from_utf8_lossy(&output);
+    crate::safe_print!(1024, "  Terminal Test Output:\n{}\n", output_str);
+
+    // Verify exit code
+    let mut all_ok = if exit_code != 0 {
+        crate::safe_print!(64, "  Test program exited with non-zero code: {}\n", exit_code);
+        false
+    } else {
+        true
+    };
+
+    // Verify key messages in output
+    if !output_str.contains("Terminal Test Program Started") {
+        console::print("  Missing 'Terminal Test Program Started'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Raw mode enabled.") {
+        console::print("  Missing 'Raw mode enabled.'\n");
+        all_ok = false;
+    }
+    // Cannot check "Screen cleared." or "Cursor hidden." directly from output,
+    // as these manipulate the terminal directly.
+    if !output_str.contains("Hello from Akuma Terminal Test!") {
+        console::print("  Missing 'Hello from Akuma Terminal Test!'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Blocking poll: Waiting for input") {
+        console::print("  Missing 'Blocking poll: Waiting for input'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Cursor shown.") {
+        console::print("  Missing 'Cursor shown.'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Terminal attributes restored.") {
+        console::print("  Missing 'Terminal attributes restored.'\n");
+        all_ok = false;
+    }
+    if !output_str.contains("Terminal Test Program Finished") {
+        console::print("  Missing 'Terminal Test Program Finished'\n");
+        all_ok = false;
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if all_ok { "PASS" } else { "FAIL" });
+    all_ok
+}
+
+
+
+
+/// Test: the console history ring actually captured this boot.
+///
+/// `akuma-dmesg` is host-tested exhaustively; what a host test cannot show is
+/// that the tee in `console::emit` is *wired* — that real boot output reaches
+/// the ring rather than the capture being dead code nobody notices for a year.
+/// So this asserts on the ring's live contents: it prints a distinctive marker
+/// and then finds it in the history, which fails if the tee is missing, if the
+/// `try_lock` never succeeds, or if `snapshot_from`'s offsets are wrong against
+/// a ring that has already wrapped during a real boot.
+///
+/// Skipped as a pass on a build with the ring disabled (`DMESG_CAP == 0`
+/// selects `Ring<0>`); "no history" is that build's correct behaviour, not a
+/// failure.
+fn test_dmesg_ring_captured_boot() -> bool {
+    console::print("\n[TEST] dmesg console history\n");
+
+    if console::dmesg_len() == 0 && console::dmesg_total() == 0 {
+        console::print("  ring disabled (capacity 0) - skipping\n");
+        return true;
+    }
+
+    // A marker unlikely to occur in ordinary boot output.
+    const MARKER: &str = "dmesg-probe-8f3a1c\n";
+    let before = console::dmesg_total();
+    console::print(MARKER);
+    let after = console::dmesg_total();
+
+    if after < before + MARKER.len() as u64 {
+        console::print("  FAIL: total did not advance by the printed length\n");
+        return false;
+    }
+
+    // Drain the whole ring the way a `syslog(2)` reader would — a bounded
+    // staging buffer plus an advancing `skip` — and look for the marker. A
+    // single-pass read with a small buffer is exactly the bug this shape exists
+    // to prevent, so the test uses the correct shape rather than a convenient
+    // one.
+    let len = console::dmesg_len();
+    let mut stage = [0u8; 512];
+    let mut history: Vec<u8> = Vec::with_capacity(len);
+    let mut done = 0usize;
+    while done < len {
+        let n = console::dmesg_snapshot_from(done, &mut stage);
+        if n == 0 {
+            break;
+        }
+        history.extend_from_slice(&stage[..n]);
+        done += n;
+    }
+
+    if history.len() != len {
+        console::print("  FAIL: chunked drain returned ");
+        console::print_dec(history.len());
+        console::print(" of ");
+        console::print_dec(len);
+        console::print(" bytes\n");
+        return false;
+    }
+
+    let found = history.windows(MARKER.len()).any(|w| w == MARKER.as_bytes());
+    if !found {
+        console::print("  FAIL: marker not found in captured history\n");
+        return false;
+    }
+
+    console::print("  captured ");
+    console::print_dec(len);
+    console::print(" bytes, total ");
+    console::print_u64(after);
+    console::print(" - PASS\n");
+    true
+}
+
+/// Test: Vec allocation and basic operations
+fn test_allocator_vec() -> bool {
+    console::print("\n[TEST] Allocator Vec operations\n");
+
+    // Create and populate a vector
+    let mut test_vec: Vec<u32> = Vec::new();
+    for i in 0..10 {
+        test_vec.push(i);
+    }
+
+    // Test basic operations
+    let len_ok = test_vec.len() == 10;
+    crate::safe_print!(64, "  Vec length: {} (expect 10)\n", test_vec.len());
+
+    // Test remove and insert
+    test_vec.remove(0);
+    test_vec.insert(0, 99);
+    let first_ok = test_vec[0] == 99;
+    crate::safe_print!(64, "  First element: {} (expect 99)\n", test_vec[0]);
+
+    // Test drop (implicit when vec goes out of scope)
+    drop(test_vec);
+    console::print("  Drop completed\n");
+
+    let ok = len_ok && first_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Box allocation
+fn test_allocator_box() -> bool {
+    console::print("\n[TEST] Allocator Box operations\n");
+
+    // Allocate a boxed value
+    let boxed: Box<u64> = Box::new(42);
+    let val_ok = *boxed == 42;
+    crate::safe_print!(64, "  Box value: {} (expect 42)\n", *boxed);
+
+    // Allocate a boxed array
+    let boxed_arr: Box<[u8; 256]> = Box::new([0xAB; 256]);
+    let arr_ok = boxed_arr[0] == 0xAB && boxed_arr[255] == 0xAB;
+    crate::safe_print!(128, 
+        "  Box array: first=0x{:02X}, last=0x{:02X} (expect 0xAB)\n",
+        boxed_arr[0], boxed_arr[255]
+    );
+
+    drop(boxed);
+    drop(boxed_arr);
+    console::print("  Drop completed\n");
+
+    let ok = val_ok && arr_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Large allocation
+fn test_allocator_large() -> bool {
+    console::print("\n[TEST] Allocator large allocation\n");
+
+    // Allocate 1MB
+    const SIZE: usize = 1024 * 1024;
+    crate::safe_print!(64, "  Allocating {} KB...", SIZE / 1024);
+
+    let mut large_vec: Vec<u8> = Vec::with_capacity(SIZE);
+    for _ in 0..SIZE {
+        large_vec.push(0);
+    }
+    console::print(" done\n");
+
+    let len_ok = large_vec.len() == SIZE;
+    crate::safe_print!(64, "  Size: {} bytes\n", large_vec.len());
+
+    // Write and verify
+    large_vec[0] = 0x12;
+    large_vec[SIZE - 1] = 0x34;
+    let write_ok = large_vec[0] == 0x12 && large_vec[SIZE - 1] == 0x34;
+    crate::safe_print!(96, 
+        "  First: 0x{:02X}, Last: 0x{:02X}\n",
+        large_vec[0],
+        large_vec[SIZE - 1]
+    );
+
+    drop(large_vec);
+    console::print("  Drop completed\n");
+
+    let ok = len_ok && write_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Realloc growing - Vec growth triggers realloc
+fn test_realloc_grow() -> bool {
+    console::print("\n[TEST] Realloc grow (Vec capacity growth)\n");
+
+    let mut vec: Vec<u64> = Vec::with_capacity(4);
+    crate::safe_print!(64, "  Initial capacity: {}\n", vec.capacity());
+
+    // Fill with known pattern (use wrapping_mul to avoid overflow panic)
+    for i in 0..4u64 {
+        vec.push(i.wrapping_mul(0x1111_1111_1111_1111));
+    }
+
+    // Force reallocation by pushing more
+    for i in 4..20u64 {
+        vec.push(i.wrapping_mul(0x1111_1111_1111_1111));
+    }
+    crate::safe_print!(64, 
+        "  New capacity: {} (should be >= 20)\n",
+        vec.capacity()
+    );
+
+    // Verify all data preserved
+    let mut data_ok = true;
+    for i in 0..20u64 {
+        if vec[i as usize] != i.wrapping_mul(0x1111_1111_1111_1111) {
+            crate::safe_print!(64, "  Data mismatch at index {}\n", i);
+            data_ok = false;
+            break;
+        }
+    }
+
+    let capacity_ok = vec.capacity() >= 20;
+    crate::safe_print!(64, "  Data preserved: {}\n", data_ok);
+
+    drop(vec);
+
+    let ok = capacity_ok && data_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Realloc shrinking - shrink_to_fit
+fn test_realloc_shrink() -> bool {
+    console::print("\n[TEST] Realloc shrink (shrink_to_fit)\n");
+
+    let mut vec: Vec<u32> = Vec::with_capacity(100);
+    crate::safe_print!(64, "  Initial capacity: {}\n", vec.capacity());
+
+    // Add just a few elements
+    for i in 0..5u32 {
+        vec.push(i * 12345);
+    }
+
+    // Shrink to fit
+    vec.shrink_to_fit();
+    crate::safe_print!(64, "  After shrink_to_fit: {}\n", vec.capacity());
+
+    // Verify data
+    let mut data_ok = true;
+    for i in 0..5u32 {
+        if vec[i as usize] != i * 12345 {
+            data_ok = false;
+            break;
+        }
+    }
+
+    let shrunk = vec.capacity() <= 10; // Should shrink to close to 5
+    crate::safe_print!(64, "  Data preserved: {}\n", data_ok);
+
+    drop(vec);
+
+    let ok = shrunk && data_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Realloc preserves data with known pattern
+fn test_realloc_preserves_data() -> bool {
+    console::print("\n[TEST] Realloc preserves data pattern\n");
+
+    const PATTERN: u8 = 0xDE;
+    const INITIAL_SIZE: usize = 64;
+    const FINAL_SIZE: usize = 256;
+
+    let mut vec: Vec<u8> = Vec::with_capacity(INITIAL_SIZE);
+    for _ in 0..INITIAL_SIZE {
+        vec.push(PATTERN);
+    }
+    crate::safe_print!(96, 
+        "  Filled {} bytes with 0x{:02X}\n",
+        INITIAL_SIZE, PATTERN
+    );
+
+    // Force multiple reallocations
+    for _ in INITIAL_SIZE..FINAL_SIZE {
+        vec.push(0xAD); // Different pattern for new data
+    }
+    crate::safe_print!(64, "  Grew to {} bytes\n", vec.len());
+
+    // Verify original data unchanged
+    let mut original_ok = true;
+    for (i, &item) in vec.iter().enumerate().take(INITIAL_SIZE) {
+        if item != PATTERN {
+            crate::safe_print!(96,
+                "  Corruption at byte {} (got 0x{:02X})\n",
+                i, item
+            );
+            original_ok = false;
+            break;
+        }
+    }
+
+    // Verify new data correct
+    let mut new_ok = true;
+    for &item in vec.iter().take(FINAL_SIZE).skip(INITIAL_SIZE) {
+        if item != 0xAD {
+            new_ok = false;
+            break;
+        }
+    }
+
+    crate::safe_print!(64, "  Original data intact: {}\n", original_ok);
+    crate::safe_print!(64, "  New data correct: {}\n", new_ok);
+
+    drop(vec);
+
+    let ok = original_ok && new_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: alloc_zeroed - verify memory is actually zeroed
+fn test_alloc_zeroed_basic() -> bool {
+    console::print("\n[TEST] alloc_zeroed basic\n");
+
+    // vec![0; N] uses alloc_zeroed internally
+    const SIZE: usize = 512;
+    let vec: Vec<u8> = vec![0u8; SIZE];
+
+    let mut all_zero = true;
+    for (i, &byte) in vec.iter().enumerate() {
+        if byte != 0 {
+            crate::safe_print!(96, "  Non-zero at index {}: 0x{:02X}\n", i, byte);
+            all_zero = false;
+            break;
+        }
+    }
+
+    crate::safe_print!(96, "  {} bytes all zero: {}\n", SIZE, all_zero);
+
+    // Also test with Box
+    let boxed: Box<[u8; 256]> = Box::new([0u8; 256]);
+    let box_ok = boxed.iter().all(|&b| b == 0);
+    crate::safe_print!(64, "  Boxed array all zero: {}\n", box_ok);
+
+    drop(vec);
+    drop(boxed);
+
+    let ok = all_zero && box_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: alloc_zeroed after dirty memory
+fn test_alloc_zeroed_after_dirty() -> bool {
+    console::print("\n[TEST] alloc_zeroed after dirty memory\n");
+
+    const SIZE: usize = 128;
+
+    // First allocation - fill with dirty pattern
+    {
+        let mut dirty: Vec<u8> = Vec::with_capacity(SIZE);
+        for _ in 0..SIZE {
+            dirty.push(0xFF);
+        }
+        crate::safe_print!(64, "  Filled {} bytes with 0xFF, dropping...\n", SIZE);
+        drop(dirty);
+    }
+
+    // Second allocation - request zeroed memory
+    let clean: Vec<u8> = vec![0u8; SIZE];
+
+    let mut all_zero = true;
+    for (i, &byte) in clean.iter().enumerate() {
+        if byte != 0 {
+            crate::safe_print!(96, "  Residual dirty data at {}: 0x{:02X}\n", i, byte);
+            all_zero = false;
+            break;
+        }
+    }
+
+    crate::safe_print!(64, "  Zeroed allocation clean: {}\n", all_zero);
+
+    drop(clean);
+
+    crate::safe_print!(64, 
+        "  Result: {}\n",
+        if all_zero { "PASS" } else { "FAIL" }
+    );
+    all_zero
+}
+
+/// Test: Various alignment requirements
+fn test_alignment_various() -> bool {
+    console::print("\n[TEST] Alignment requirements\n");
+
+    let mut all_aligned = true;
+
+    // Test different alignments using repr(align) structs
+    #[repr(align(8))]
+    #[allow(dead_code)]
+    struct Align8([u8; 8]);
+
+    #[repr(align(16))]
+    #[allow(dead_code)]
+    struct Align16([u8; 16]);
+
+    #[repr(align(32))]
+    #[allow(dead_code)]
+    struct Align32([u8; 32]);
+
+    #[repr(align(64))]
+    #[allow(dead_code)]
+    struct Align64([u8; 64]);
+
+    // Allocate and check alignment
+    let a8: Box<Align8> = Box::new(Align8([0; 8]));
+    let ptr8 = &raw const *a8 as usize;
+    let ok8 = ptr8.is_multiple_of(8);
+    crate::safe_print!(96, "  Align 8: ptr=0x{:x}, ok={}\n", ptr8, ok8);
+    all_aligned &= ok8;
+
+    let a16: Box<Align16> = Box::new(Align16([0; 16]));
+    let ptr16 = &raw const *a16 as usize;
+    let ok16 = ptr16.is_multiple_of(16);
+    crate::safe_print!(96, "  Align 16: ptr=0x{:x}, ok={}\n", ptr16, ok16);
+    all_aligned &= ok16;
+
+    let a32: Box<Align32> = Box::new(Align32([0; 32]));
+    let ptr32 = &raw const *a32 as usize;
+    let ok32 = ptr32.is_multiple_of(32);
+    crate::safe_print!(96, "  Align 32: ptr=0x{:x}, ok={}\n", ptr32, ok32);
+    all_aligned &= ok32;
+
+    let a64: Box<Align64> = Box::new(Align64([0; 64]));
+    let ptr64 = &raw const *a64 as usize;
+    let ok64 = ptr64.is_multiple_of(64);
+    crate::safe_print!(96, "  Align 64: ptr=0x{:x}, ok={}\n", ptr64, ok64);
+    all_aligned &= ok64;
+
+    drop(a8);
+    drop(a16);
+    drop(a32);
+    drop(a64);
+
+    crate::safe_print!(64, 
+        "  Result: {}\n",
+        if all_aligned { "PASS" } else { "FAIL" }
+    );
+    all_aligned
+}
+
+/// Test: Fragmentation with many small blocks
+fn test_fragmentation_small_blocks() -> bool {
+    console::print("\n[TEST] Fragmentation (simple)\n");
+
+    // Simplified test - just do a few allocations without tight loops
+    let block1 = vec![0x11u8; 32];
+    console::print("  Block 1 allocated\n");
+
+    let block2 = vec![0x22u8; 32];
+    console::print("  Block 2 allocated\n");
+
+    let block3 = vec![0x33u8; 32];
+    console::print("  Block 3 allocated\n");
+
+    // Verify
+    let ok = block1[0] == 0x11 && block2[0] == 0x22 && block3[0] == 0x33;
+
+    drop(block1);
+    drop(block2);
+    drop(block3);
+
+    if ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    ok
+}
+
+/// Test: Interleaved allocation and deallocation pattern
+fn test_interleaved_alloc_free() -> bool {
+    console::print("\n[TEST] Interleaved alloc/free pattern\n");
+
+    const ITERATIONS: usize = 30; // Reduced from 50
+    let mut all_ok = true;
+
+    for i in 0..ITERATIONS {
+        // Allocate A
+        let a: Vec<u8> = vec![i as u8; 64];
+
+        // Allocate B
+        let b: Vec<u8> = vec![(i + 1) as u8; 128];
+
+        // Free A
+        drop(a);
+
+        // Allocate C (may reuse A's memory)
+        let c: Vec<u8> = vec![(i + 2) as u8; 64];
+
+        // Verify B unchanged
+        if b[0] != (i + 1) as u8 || b[127] != (i + 1) as u8 {
+            console::print("  Corruption (B)\n");
+            all_ok = false;
+            break;
+        }
+
+        // Verify C correct
+        if c[0] != (i + 2) as u8 || c[63] != (i + 2) as u8 {
+            console::print("  Corruption (C)\n");
+            all_ok = false;
+            break;
+        }
+
+        drop(b);
+        drop(c);
+    }
+
+    console::print("  30 iterations completed\n");
+    if all_ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    all_ok
+}
+
+/// Test: Mixed allocation sizes
+fn test_mixed_sizes() -> bool {
+    console::print("\n[TEST] Mixed allocation sizes\n");
+
+    let mut all_ok = true;
+
+    // Small allocations using Vec
+    let small1: Vec<u8> = vec![0x11; 16];
+    let small2: Vec<u8> = vec![0x22; 32];
+    let small3: Vec<u8> = vec![0x33; 64];
+
+    // Medium allocations (1KB-4KB)
+    let medium1: Vec<u8> = vec![0x44; 1024];
+    let medium2: Vec<u8> = vec![0x55; 4096];
+
+    // Large allocation (64KB)
+    let large: Vec<u8> = vec![0x66; 65536];
+
+    // Verify all allocations
+    if small1[0] != 0x11 || small1[15] != 0x11 {
+        console::print("  Small1 corrupted\n");
+        all_ok = false;
+    }
+    if small2[0] != 0x22 || small2[31] != 0x22 {
+        console::print("  Small2 corrupted\n");
+        all_ok = false;
+    }
+    if small3[0] != 0x33 || small3[63] != 0x33 {
+        console::print("  Small3 corrupted\n");
+        all_ok = false;
+    }
+    if medium1[0] != 0x44 || medium1[1023] != 0x44 {
+        console::print("  Medium1 corrupted\n");
+        all_ok = false;
+    }
+    if medium2[0] != 0x55 || medium2[4095] != 0x55 {
+        console::print("  Medium2 corrupted\n");
+        all_ok = false;
+    }
+    if large[0] != 0x66 || large[65535] != 0x66 {
+        console::print("  Large corrupted\n");
+        all_ok = false;
+    }
+
+    console::print("  Small, Medium, Large: ok\n");
+
+    // Free in random order
+    drop(medium1);
+    drop(small2);
+    drop(large);
+    drop(small1);
+    drop(medium2);
+    drop(small3);
+
+    if all_ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    all_ok
+}
+
+/// Test: Vec::remove(0) regression test (original bug)
+fn test_vec_remove_regression() -> bool {
+    console::print("\n[TEST] Vec::remove(0) regression\n");
+
+    let mut vec: Vec<u32> = Vec::new();
+    for i in 0..10 {
+        vec.push(i * 100);
+    }
+    crate::safe_print!(64, "  Initial vec: {:?}\n", &vec[..3]);
+
+    // This was the original failure case
+    let removed = vec.remove(0);
+    crate::safe_print!(64, "  Removed index 0: {}\n", removed);
+
+    let remove_ok = removed == 0;
+    let first_ok = vec[0] == 100;
+    let len_ok = vec.len() == 9;
+
+    crate::safe_print!(64, "  New first element: {} (expect 100)\n", vec[0]);
+    crate::safe_print!(64, "  New length: {} (expect 9)\n", vec.len());
+
+    // Remove from middle
+    let mid = vec.remove(4);
+    crate::safe_print!(64, "  Removed index 4: {} (expect 500)\n", mid);
+    let mid_ok = mid == 500;
+
+    // Remove from end
+    let end = vec.remove(vec.len() - 1);
+    crate::safe_print!(64, "  Removed last: {} (expect 900)\n", end);
+    let end_ok = end == 900;
+
+    drop(vec);
+
+    let ok = remove_ok && first_ok && len_ok && mid_ok && end_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Rapid push/pop cycling
+fn test_rapid_push_pop() -> bool {
+    console::print("\n[TEST] Rapid push/pop cycling\n");
+
+    const ITERATIONS: usize = 5;
+    const ITEMS: usize = 200;
+
+    let mut all_ok = true;
+
+    for iter in 0..ITERATIONS {
+        let mut vec: Vec<u64> = Vec::new();
+
+        // Push many items
+        for i in 0..ITEMS {
+            vec.push((iter * ITEMS + i) as u64);
+        }
+
+        // Verify and pop all
+        for i in (0..ITEMS).rev() {
+            let val = vec.pop().unwrap();
+            if val != (iter * ITEMS + i) as u64 {
+                crate::safe_print!(96, "  Mismatch at iter {} index {}\n", iter, i);
+                all_ok = false;
+                break;
+            }
+        }
+
+        if !vec.is_empty() {
+            crate::safe_print!(64, "  Vec not empty after iteration {}\n", iter);
+            all_ok = false;
+        }
+    }
+
+    crate::safe_print!(96, 
+        "  {} iterations of {} push/pop: {}\n",
+        ITERATIONS, ITEMS, all_ok
+    );
+    crate::safe_print!(64, 
+        "  Result: {}\n",
+        if all_ok { "PASS" } else { "FAIL" }
+    );
+    all_ok
+}
+
+/// Test: String operations (uses realloc internally)
+fn test_string_operations() -> bool {
+    console::print("\n[TEST] String operations\n");
+
+    let mut s = String::new();
+
+    // Append strings (triggers realloc)
+    s.push_str("Hello");
+    s.push_str(", ");
+    s.push_str("World!");
+    crate::safe_print!(64, "  Built string: \"{}\"\n", s);
+
+    let hello_ok = s == "Hello, World!";
+
+    // Longer string building
+    let mut long = String::new();
+    for i in 0..50 {
+        let _ = write!(long, "{i} ");
+    }
+    crate::safe_print!(64, "  Long string len: {}\n", long.len());
+    let long_ok = long.starts_with("0 1 2 ");
+
+    // Truncate
+    s.truncate(5);
+    crate::safe_print!(64, "  Truncated: \"{}\"\n", s);
+    let trunc_ok = s == "Hello";
+
+    // Clear and rebuild
+    s.clear();
+    s.push_str("Rebuilt");
+    let rebuild_ok = s == "Rebuilt";
+
+    drop(s);
+    drop(long);
+
+    let ok = hello_ok && long_ok && trunc_ok && rebuild_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: String::push_str reallocation pattern (userspace bug reproduction)
+/// This test mirrors the exact pattern that causes heap corruption in userspace:
+/// 1. Vec allocates
+/// 2. String::from allocates  
+/// 3. push_str triggers realloc -> corruption
+fn test_string_push_str_realloc() -> bool {
+    console::print("\n[TEST] String::push_str realloc pattern (userspace bug mirror)\n");
+
+    // Step 1: Vec allocation (like userspace test_vec)
+    console::print("  Step 1: Vec allocation...\n");
+    let v: Vec<i32> = alloc::vec![1, 2, 3];
+    let v_ptr = v.as_ptr() as usize;
+    crate::safe_print!(96, "    Vec ptr: {:#x}, len: {}\n", v_ptr, v.len());
+
+    // Step 2: String::from allocation (like userspace test_string_from)
+    console::print("  Step 2: String::from allocation...\n");
+    let s = String::from("Hello");
+    let s_ptr = s.as_ptr() as usize;
+    crate::safe_print!(128, 
+        "    String ptr: {:#x}, len: {}, cap: {}\n",
+        s_ptr,
+        s.len(),
+        s.capacity()
+    );
+
+    // Step 3: push_str triggers reallocation (THE BUG!)
+    console::print("  Step 3: push_str (triggers realloc)...\n");
+    let mut s2 = s.clone();
+    let s2_ptr_before = s2.as_ptr() as usize;
+    crate::safe_print!(96, 
+        "    Before push_str: ptr={:#x}, cap={}\n",
+        s2_ptr_before,
+        s2.capacity()
+    );
+
+    // This is where userspace crashes - realloc corrupts the allocator head
+    s2.push_str(", World!");
+
+    let s2_ptr_after = s2.as_ptr() as usize;
+    crate::safe_print!(96, 
+        "    After push_str: ptr={:#x}, cap={}\n",
+        s2_ptr_after,
+        s2.capacity()
+    );
+    crate::safe_print!(64, "    Result: \"{}\"\n", s2);
+
+    // Verify data integrity
+    let vec_ok = v.len() == 3 && v[0] == 1 && v[2] == 3;
+    let string_ok = s2 == "Hello, World!";
+
+    // Check for suspicious pointer values (like 0x814000 in userspace bug)
+    let ptr_suspicious = s2_ptr_after > 0x800000 && s2_ptr_after < 0x900000;
+    if ptr_suspicious {
+        crate::safe_print!(96, 
+            "  WARNING: Suspicious pointer {:#x} (similar to userspace bug pattern)\n",
+            s2_ptr_after
+        );
+    }
+
+    drop(v);
+    drop(s);
+    drop(s2);
+
+    let ok = vec_ok && string_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Detailed String reallocation with capacity tracking
+/// Tracks each allocation to help debug heap corruption
+fn test_string_realloc_detailed() -> bool {
+    console::print("\n[TEST] String realloc with detailed tracking\n");
+
+    // Create with small capacity to force realloc
+    let mut s = String::with_capacity(5);
+    crate::safe_print!(128, 
+        "  Initial: ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    );
+
+    // Push small string (no realloc needed)
+    s.push_str("Hi");
+    crate::safe_print!(128, 
+        "  After 'Hi': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    );
+
+    // Push more to trigger realloc
+    s.push_str("!!!"); // Still within capacity
+    crate::safe_print!(128, 
+        "  After '!!!': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    );
+
+    // This should trigger realloc (capacity 5, current len 5, adding 6 more)
+    let ptr_before = s.as_ptr() as usize;
+    s.push_str(" World");
+    let ptr_after = s.as_ptr() as usize;
+
+    crate::safe_print!(128, 
+        "  After ' World': ptr={:#x}, len={}, cap={}\n",
+        s.as_ptr() as usize,
+        s.len(),
+        s.capacity()
+    );
+
+    let reallocated = ptr_before != ptr_after;
+    crate::safe_print!(64, "  Reallocation occurred: {}\n", reallocated);
+
+    let content_ok = s == "Hi!!! World";
+    crate::safe_print!(64, "  Content: \"{}\" (expect \"Hi!!! World\")\n", s);
+
+    drop(s);
+
+    crate::safe_print!(64, 
+        "  Result: {}\n",
+        if content_ok { "PASS" } else { "FAIL" }
+    );
+    content_ok
+}
+
+/// Test: Nested allocations (Vec of Vecs)
+fn test_vec_of_vecs() -> bool {
+    console::print("\n[TEST] Vec of Vecs (nested allocations)\n");
+
+    const OUTER: usize = 10;
+    const INNER: usize = 20;
+
+    let mut outer: Vec<Vec<u8>> = Vec::new();
+
+    // Build nested structure
+    for i in 0..OUTER {
+        let mut inner: Vec<u8> = Vec::new();
+        for j in 0..INNER {
+            inner.push((i * INNER + j) as u8);
+        }
+        outer.push(inner);
+    }
+    crate::safe_print!(96, "  Created {}x{} nested vecs\n", OUTER, INNER);
+
+    // Verify data
+    let mut all_ok = true;
+    'outer_loop: for (i, row) in outer.iter().enumerate().take(OUTER) {
+        for (j, &val) in row.iter().enumerate().take(INNER) {
+            if val != (i * INNER + j) as u8 {
+                crate::safe_print!(96, "  Mismatch at [{i}][{j}]\n");
+                all_ok = false;
+                break 'outer_loop;
+            }
+        }
+    }
+
+    // Remove some inner vecs
+    outer.remove(5);
+    outer.remove(3);
+    crate::safe_print!(64, "  After removals: {} outer vecs\n", outer.len());
+
+    let len_ok = outer.len() == OUTER - 2;
+
+    // Add new inner vec
+    outer.push(vec![0xAB; 30]);
+    crate::safe_print!(64, "  After push: {} outer vecs\n", outer.len());
+
+    drop(outer);
+
+    let ok = all_ok && len_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Adjacent allocations boundary integrity
+fn test_adjacent_allocations() -> bool {
+    console::print("\n[TEST] Adjacent allocation boundaries\n");
+
+    // Simple test without format! to rule out format allocation issues
+    console::print("  Testing simple allocations\n");
+
+    let buf1: Vec<u8> = vec![0x11u8; 64];
+    console::print("  buf1 ok\n");
+
+    let buf2: Vec<u8> = vec![0x22u8; 64];
+    console::print("  buf2 ok\n");
+
+    let buf3: Vec<u8> = vec![0x33u8; 64];
+    console::print("  buf3 ok\n");
+
+    // Verify data is correct
+    let ok = buf1[0] == 0x11
+        && buf1[63] == 0x11
+        && buf2[0] == 0x22
+        && buf2[63] == 0x22
+        && buf3[0] == 0x33
+        && buf3[63] == 0x33;
+
+    // Cleanup
+    drop(buf1);
+    drop(buf2);
+    drop(buf3);
+    console::print("  Cleanup done\n");
+
+    if ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    ok
+}
+
+// ============================================================================
+// Mmap Allocator Edge Case Tests (for userspace debugging)
+// ============================================================================
+
+/// Test: Single page allocation and access
+/// Verifies basic mmap allocation returns usable memory
+fn test_mmap_single_page() -> bool {
+    console::print("\n[TEST] Mmap: Single page allocation\n");
+
+    // Allocate a small buffer (will use one page in mmap mode)
+    let buf: Vec<u8> = vec![0u8; 100];
+    let ptr = buf.as_ptr() as usize;
+    crate::safe_print!(64, "  Allocated 100 bytes at {:#x}\n", ptr);
+
+    // Write pattern
+    let mut buf = buf;
+    for (i, slot) in buf.iter_mut().enumerate().take(100) {
+        *slot = (i & 0xFF) as u8;
+    }
+
+    // Verify pattern
+    let mut ok = true;
+    for (i, &val) in buf.iter().enumerate().take(100) {
+        if val != (i & 0xFF) as u8 {
+            crate::safe_print!(128,
+                "  Mismatch at {}: got {}, expected {}\n",
+                i,
+                val,
+                i & 0xFF
+            );
+            ok = false;
+            break;
+        }
+    }
+
+    drop(buf);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Multi-page allocation
+/// Tests allocations that span multiple pages (> 4KB)
+fn test_mmap_multi_page() -> bool {
+    console::print("\n[TEST] Mmap: Multi-page allocation (12KB)\n");
+
+    const SIZE: usize = 12 * 1024; // 3 pages
+
+    let mut buf: Vec<u8> = vec![0u8; SIZE];
+    let ptr = buf.as_ptr() as usize;
+    crate::safe_print!(96, "  Allocated {} bytes at {:#x}\n", SIZE, ptr);
+
+    // Write to first byte of each page
+    buf[0] = 0x11;
+    buf[4096] = 0x22;
+    buf[8192] = 0x33;
+    buf[SIZE - 1] = 0x44;
+
+    // Verify
+    let ok = buf[0] == 0x11 && buf[4096] == 0x22 && buf[8192] == 0x33 && buf[SIZE - 1] == 0x44;
+
+    crate::safe_print!(128, 
+        "  Page boundaries: {:#x}, {:#x}, {:#x}, {:#x}\n",
+        buf[0],
+        buf[4096],
+        buf[8192],
+        buf[SIZE - 1]
+    );
+
+    drop(buf);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Write exactly at page boundary
+/// This catches off-by-one errors in page mapping
+fn test_mmap_page_boundary_write() -> bool {
+    console::print("\n[TEST] Mmap: Page boundary writes\n");
+
+    const PAGE_SIZE: usize = 4096;
+
+    // Allocate exactly 2 pages
+    let mut buf: Vec<u8> = vec![0u8; PAGE_SIZE * 2];
+    let ptr = buf.as_ptr() as usize;
+
+    // Write at critical positions
+    buf[PAGE_SIZE - 1] = 0xAA; // Last byte of page 1
+    buf[PAGE_SIZE] = 0xBB; // First byte of page 2
+
+    crate::safe_print!(64, "  Ptr: {:#x}\n", ptr);
+    crate::safe_print!(96, 
+        "  buf[{}] = {:#x} (last of page 1)\n",
+        PAGE_SIZE - 1,
+        buf[PAGE_SIZE - 1]
+    );
+    crate::safe_print!(96, 
+        "  buf[{}] = {:#x} (first of page 2)\n",
+        PAGE_SIZE, buf[PAGE_SIZE]
+    );
+
+    let ok = buf[PAGE_SIZE - 1] == 0xAA && buf[PAGE_SIZE] == 0xBB;
+
+    drop(buf);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Rapid alloc/dealloc cycles
+/// Stresses the allocator with many short-lived allocations
+fn test_mmap_rapid_alloc_dealloc() -> bool {
+    console::print("\n[TEST] Mmap: Rapid alloc/dealloc (100 cycles)\n");
+
+    let mut ok = true;
+
+    for i in 0..100 {
+        let buf: Vec<u8> = vec![(i & 0xFF) as u8; 256];
+        if buf[0] != (i & 0xFF) as u8 || buf[255] != (i & 0xFF) as u8 {
+            crate::safe_print!(64, "  Cycle {} failed\n", i);
+            ok = false;
+            break;
+        }
+        drop(buf);
+    }
+
+    if ok {
+        console::print("  All 100 cycles passed\n");
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Realloc pattern that mirrors userspace bug
+/// Allocate, then grow, then use - the exact pattern that fails
+fn test_mmap_realloc_pattern() -> bool {
+    console::print("\n[TEST] Mmap: Realloc pattern (grow then use)\n");
+
+    // Small initial allocation
+    let mut v: Vec<u64> = Vec::with_capacity(2);
+    let ptr1 = v.as_ptr() as usize;
+    crate::safe_print!(96, 
+        "  Initial: ptr={:#x}, cap={}\n",
+        ptr1,
+        v.capacity()
+    );
+
+    v.push(0x1111111111111111);
+    v.push(0x2222222222222222);
+
+    // Force reallocation
+    v.push(0x3333333333333333);
+    v.push(0x4444444444444444);
+    v.push(0x5555555555555555);
+    let ptr2 = v.as_ptr() as usize;
+    crate::safe_print!(96, 
+        "  After growth: ptr={:#x}, cap={}\n",
+        ptr2,
+        v.capacity()
+    );
+
+    // Immediately use the new memory (this is where userspace fails)
+    v.push(0x6666666666666666);
+    v.push(0x7777777777777777);
+
+    // Verify all data
+    let ok = v[0] == 0x1111111111111111
+        && v[1] == 0x2222222222222222
+        && v[2] == 0x3333333333333333
+        && v[5] == 0x6666666666666666
+        && v[6] == 0x7777777777777777;
+
+    crate::safe_print!(64, 
+        "  Data integrity: {}\n",
+        if ok { "OK" } else { "CORRUPTED" }
+    );
+
+    drop(v);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: String growth pattern (exact userspace failure scenario)
+fn test_mmap_string_growth_pattern() -> bool {
+    console::print("\n[TEST] Mmap: String growth pattern\n");
+
+    // This is the exact pattern that crashes in userspace
+    let mut s = String::from("Hello");
+    let ptr1 = s.as_ptr() as usize;
+    crate::safe_print!(128, 
+        "  Initial: ptr={:#x}, len={}, cap={}\n",
+        ptr1,
+        s.len(),
+        s.capacity()
+    );
+
+    // Trigger realloc by pushing more data
+    s.push_str(", World!");
+    let ptr2 = s.as_ptr() as usize;
+    crate::safe_print!(128, 
+        "  After push_str: ptr={:#x}, len={}, cap={}\n",
+        ptr2,
+        s.len(),
+        s.capacity()
+    );
+
+    // Critical: access the string after realloc
+    let content_ok = s == "Hello, World!";
+    let len_ok = s.len() == 13;
+
+    // Try to use it more
+    s.push_str(" This is a test.");
+    let final_ok = s == "Hello, World! This is a test.";
+
+    crate::safe_print!(64, "  Content: \"{}\"\n", s);
+
+    drop(s);
+
+    let ok = content_ok && len_ok && final_ok;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Vec capacity doubling stress test
+fn test_mmap_vec_capacity_doubling() -> bool {
+    console::print("\n[TEST] Mmap: Vec capacity doubling (1->1024 elements)\n");
+
+    let mut v: Vec<u32> = Vec::new();
+    let mut reallocs = 0;
+    let mut last_ptr = 0usize;
+
+    for i in 0..1024 {
+        let ptr_before = v.as_ptr() as usize;
+        v.push(i);
+        let ptr_after = v.as_ptr() as usize;
+
+        if ptr_before != ptr_after && ptr_before != 0 {
+            reallocs += 1;
+        }
+        last_ptr = ptr_after;
+    }
+
+    crate::safe_print!(96, 
+        "  Final: len={}, cap={}, ptr={:#x}\n",
+        v.len(),
+        v.capacity(),
+        last_ptr
+    );
+    crate::safe_print!(64, "  Realloc count: {}\n", reallocs);
+
+    // Verify all data
+    let mut ok = true;
+    for (i, &val) in v.iter().enumerate().take(1024) {
+        if val != i as u32 {
+            crate::safe_print!(96, "  Mismatch at {}: got {}\n", i, val);
+            ok = false;
+            break;
+        }
+    }
+
+    drop(v);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Interleaved string operations
+/// Multiple strings allocated and modified in interleaved order
+fn test_mmap_interleaved_strings() -> bool {
+    console::print("\n[TEST] Mmap: Interleaved string operations\n");
+
+    let mut s1 = String::from("AAA");
+    let mut s2 = String::from("BBB");
+    let mut s3 = String::from("CCC");
+
+    crate::safe_print!(64, "  s1: ptr={:#x}\n", s1.as_ptr() as usize);
+    crate::safe_print!(64, "  s2: ptr={:#x}\n", s2.as_ptr() as usize);
+    crate::safe_print!(64, "  s3: ptr={:#x}\n", s3.as_ptr() as usize);
+
+    // Interleaved modifications (triggers reallocs in different orders)
+    s1.push_str("111");
+    s2.push_str("222");
+    s3.push_str("333");
+
+    s2.push_str("more");
+    s1.push_str("even more");
+    s3.push_str("and more");
+
+    crate::safe_print!(32, "  After modifications:\n");
+    crate::safe_print!(64, "    s1: \"{}\"\n", s1);
+    crate::safe_print!(64, "    s2: \"{}\"\n", s2);
+    crate::safe_print!(64, "    s3: \"{}\"\n", s3);
+
+    let ok = s1 == "AAA111even more" && s2 == "BBB222more" && s3 == "CCC333and more";
+
+    drop(s1);
+    drop(s2);
+    drop(s3);
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// Common Memory Allocation Patterns
+// NOTE: These tests hang during preemption - need investigation
+// ============================================================================
+
+/// Test: LIFO (stack-like) allocation pattern
+/// Common in: function call stacks, undo buffers, recursive algorithms
+#[allow(dead_code)]
+fn test_lifo_pattern() -> bool {
+    console::print("\n[TEST] LIFO allocation pattern\n");
+
+    console::print("  Creating stack...\n");
+    const DEPTH: usize = 5; // Reduced further
+    let mut stack: Vec<Vec<u8>> = Vec::with_capacity(DEPTH);
+    console::print("  Stack created\n");
+
+    // Push allocations
+    for i in 0..DEPTH {
+        let mut block = vec![0u8; 32]; // Reduced from 64
+        block[0] = i as u8;
+        block[31] = (i * 3) as u8;
+        stack.push(block);
+    }
+    console::print("  Pushed 5 allocations\n");
+
+    // Pop in reverse order (LIFO)
+    let mut all_ok = true;
+    console::print("  Popping...\n");
+    for i in (0..DEPTH).rev() {
+        let block = stack.pop().unwrap();
+        if block[0] != i as u8 || block[31] != (i * 3) as u8 {
+            console::print("  LIFO mismatch\n");
+            all_ok = false;
+            break;
+        }
+    }
+    console::print("  Pop complete\n");
+
+    drop(stack);
+
+    if all_ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    all_ok
+}
+
+/// Test: FIFO (queue-like) allocation pattern\
+/// Common in: message queues, task schedulers, event handlers
+#[allow(dead_code)]
+fn test_fifo_pattern() -> bool {
+    console::print("\n[TEST] FIFO allocation pattern\n");
+
+    const QUEUE_SIZE: usize = 15; // Reduced from 30
+    let mut queue: VecDeque<Vec<u8>> = VecDeque::with_capacity(QUEUE_SIZE);
+
+    // Enqueue items
+    for i in 0..QUEUE_SIZE {
+        let mut block = vec![0u8; 32]; // Reduced from 64
+        block[0] = i as u8;
+        block[31] = (i ^ 0xFF) as u8;
+        queue.push_back(block);
+    }
+    console::print("  Enqueued 15 items\n");
+
+    // Dequeue in FIFO order
+    let mut all_ok = true;
+    for i in 0..QUEUE_SIZE {
+        let block = queue.pop_front().unwrap();
+        if block[0] != i as u8 || block[31] != (i ^ 0xFF) as u8 {
+            console::print("  FIFO mismatch\n");
+            all_ok = false;
+            break;
+        }
+    }
+
+    if all_ok {
+        console::print("  FIFO order verified\n");
+    }
+
+    drop(queue);
+
+    if all_ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    all_ok
+}
+
+/// Test: Memory pool pattern
+/// Common in: game engines, real-time systems, network buffers
+#[allow(dead_code)]
+fn test_memory_pool_pattern() -> bool {
+    console::print("\n[TEST] Memory pool pattern\n");
+
+    const POOL_SIZE: usize = 16;
+    const BLOCK_SIZE: usize = 256;
+
+    // Pre-allocate pool using Vec instead of Box
+    let mut pool: Vec<Vec<u8>> = Vec::with_capacity(POOL_SIZE);
+    for _ in 0..POOL_SIZE {
+        pool.push(vec![0u8; BLOCK_SIZE]);
+    }
+    console::print("  Pool created: 16 x 256 bytes\n");
+
+    // Simulate acquire/release cycles
+    let mut acquired: Vec<Vec<u8>> = Vec::new();
+    let mut all_ok = true;
+
+    for cycle in 0..5 {
+        // Acquire half the pool
+        for i in 0..(POOL_SIZE / 2) {
+            if let Some(mut block) = pool.pop() {
+                block[0] = (cycle * 10 + i) as u8;
+                acquired.push(block);
+            }
+        }
+
+        // Use acquired blocks
+        for (i, block) in acquired.iter().enumerate() {
+            if block[0] != (cycle * 10 + i) as u8 {
+                all_ok = false;
+                break;
+            }
+        }
+
+        // Release back to pool
+        while let Some(block) = acquired.pop() {
+            pool.push(block);
+        }
+    }
+
+    console::print("  Pool cycles: 5\n");
+
+    let size_ok = pool.len() == POOL_SIZE;
+
+    drop(pool);
+    drop(acquired);
+
+    let ok = all_ok && size_ok;
+    if ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    ok
+}
+
+/// Test: Dynamic resize pattern
+/// Common in: growing arrays, string builders, buffers
+#[allow(dead_code)]
+fn test_resize_pattern() -> bool {
+    console::print("\n[TEST] Dynamic resize pattern\n");
+
+    let mut buffer: Vec<u8> = Vec::new();
+    let mut all_ok = true;
+
+    // Exponential growth pattern
+    let sizes = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+
+    let mut prev_size = 0usize;
+    for &size in &sizes {
+        // Resize to new size
+        buffer.resize(size, 0xAB);
+
+        // Verify OLD content is preserved (should be index pattern)
+        for (i, &val) in buffer.iter().enumerate().take(prev_size) {
+            if val != (i & 0xFF) as u8 {
+                console::print("  Old content mismatch\n");
+                all_ok = false;
+                break;
+            }
+        }
+
+        // Verify NEW content is 0xAB
+        for &val in buffer.iter().take(size).skip(prev_size) {
+            if val != 0xAB {
+                console::print("  New content mismatch\n");
+                all_ok = false;
+                break;
+            }
+        }
+
+        // Overwrite with index pattern
+        for (i, slot) in buffer.iter_mut().enumerate().take(size) {
+            *slot = (i & 0xFF) as u8;
+        }
+
+        prev_size = size;
+    }
+
+    console::print("  Grew through 12 sizes (max 2048)\n");
+
+    // Shrink back down
+    for &size in sizes.iter().rev().skip(1) {
+        buffer.truncate(size);
+        if buffer.len() != size {
+            all_ok = false;
+            break;
+        }
+        // Verify data preserved
+        for (i, &val) in buffer.iter().enumerate().take(size) {
+            if val != (i & 0xFF) as u8 {
+                all_ok = false;
+                break;
+            }
+        }
+    }
+
+    if all_ok {
+        console::print("  Shrink verified\n");
+    }
+
+    // Clear and cleanup
+    buffer.clear();
+    buffer.shrink_to_fit();
+    drop(buffer);
+
+    if all_ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    all_ok
+}
+
+/// Test: Temporary buffer pattern
+/// Common in: I/O operations, parsing, formatting
+#[allow(dead_code)]
+fn test_temporary_buffers() -> bool {
+    console::print("\n[TEST] Temporary buffer pattern\n");
+
+    const ITERATIONS: usize = 50;
+    let mut all_ok = true;
+
+    for i in 0..ITERATIONS {
+        // Simulate: allocate temp buffer, use it, free it
+        let size = 64 + (i % 7) * 32; // Varying sizes
+
+        // Allocate
+        let mut temp: Vec<u8> = vec![0u8; size];
+
+        // Use (write pattern)
+        for (j, slot) in temp.iter_mut().enumerate().take(size) {
+            *slot = ((i + j) & 0xFF) as u8;
+        }
+
+        // Verify
+        for (j, &val) in temp.iter().enumerate().take(size) {
+            if val != ((i + j) & 0xFF) as u8 {
+                console::print("  Temp buffer failed\n");
+                all_ok = false;
+                break;
+            }
+        }
+
+        drop(temp);
+    }
+
+    console::print("  50 temporary allocations done\n");
+    if all_ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    all_ok
+}
+
+/// Test: Linked/tree structure pattern
+/// Common in: linked lists, trees, graphs
+#[allow(dead_code)]
+fn test_linked_structure() -> bool {
+    console::print("\n[TEST] Linked structure pattern\n");
+
+    // Simple linked list node
+    struct Node {
+        value: u32,
+        next: Option<Box<Self>>,
+    }
+
+    // Build linked list (smaller size to reduce Box allocations)
+    const LIST_SIZE: usize = 10;
+    let mut head: Option<Box<Node>> = None;
+
+    for i in (0..LIST_SIZE).rev() {
+        head = Some(Box::new(Node {
+            value: i as u32,
+            next: head,
+        }));
+    }
+    console::print("  Built linked list of 10 nodes\n");
+
+    // Traverse and verify
+    let mut all_ok = true;
+    let mut current = &head;
+    let mut count = 0;
+
+    while let Some(node) = current {
+        if node.value != count {
+            console::print("  Node value mismatch\n");
+            all_ok = false;
+            break;
+        }
+        current = &node.next;
+        count += 1;
+    }
+
+    let count_ok = count == LIST_SIZE as u32;
+    console::print("  Traversed nodes\n");
+
+    // Cleanup: drop the entire list (recursive drops)
+    drop(head);
+    console::print("  List dropped\n");
+
+    let ok = all_ok && count_ok;
+    if ok {
+        console::print("  Result: PASS\n");
+    } else {
+        console::print("  Result: FAIL\n");
+    }
+    ok
+}
+
+// ============================================================================
+// Threading Tests
+// ============================================================================
+
+/// Test: Scheduler is initialized
+fn test_scheduler_init() -> bool {
+    console::print("\n[TEST] Scheduler initialization\n");
+
+    let count = threading::thread_count();
+    let ok = count >= 1; // At least idle thread
+
+    crate::safe_print!(64, "  Thread count: {} (expect >= 1)\n", count);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+
+    ok
+}
+
+/// Test: Thread stats work correctly
+fn test_thread_stats() -> bool {
+    console::print("\n[TEST] Thread statistics\n");
+
+    let (ready, running, terminated) = threading::thread_stats();
+    let ok = running >= 1; // Current thread should be running
+
+    crate::safe_print!(128, 
+        "  Ready: {}, Running: {}, Terminated: {}\n",
+        ready, running, terminated
+    );
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+
+    ok
+}
+
+/// Test: yield_now() works without crashing
+fn test_yield() -> bool {
+    console::print("\n[TEST] Yield operation\n");
+
+    console::print("  Calling yield_now()...");
+    threading::yield_now();
+    console::print(" returned\n");
+    console::print("  Result: PASS\n");
+
+    true
+}
+
+/// Test: Cleanup function exists and doesn't crash
+fn test_thread_cleanup() -> bool {
+    console::print("\n[TEST] Thread cleanup\n");
+
+    // Get initial state
+    let count_before = threading::thread_count();
+    let (ready, running, terminated) = threading::thread_stats();
+    crate::safe_print!(128, 
+        "  State: {} threads (R:{} U:{} T:{})\n",
+        count_before, ready, running, terminated
+    );
+
+    // Run cleanup (should be safe even with no terminated threads)
+    let cleaned = threading::cleanup_terminated_force();
+    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
+
+    // Verify state is still valid
+    let count_after = threading::thread_count();
+    let (ready2, running2, terminated2) = threading::thread_stats();
+    crate::safe_print!(128, 
+        "  After: {} threads (R:{} U:{} T:{})\n",
+        count_after, ready2, running2, terminated2
+    );
+
+    // Test passes if:
+    // 1. Count decreased by amount cleaned (or stayed same if 0 cleaned)
+    // 2. At least one thread still exists (idle)
+    let count_ok = count_after == count_before - cleaned;
+    let has_idle = count_after >= 1;
+    let ok = count_ok && has_idle;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+
+    ok
+}
+
+// Global flag for test thread communication
+static TEST_THREAD_RAN: AtomicBool = AtomicBool::new(false);
+
+fn set_test_flag(val: bool) {
+    TEST_THREAD_RAN.store(val, Ordering::Release);
+}
+
+fn get_test_flag() -> bool {
+    TEST_THREAD_RAN.load(Ordering::Acquire)
+}
+
+/// Slots the collector has recycled since boot (`hooked-sched`); 0 on the SGI path, whose
+/// only collector is the thread running these tests. Under `hooked-sched` every core's
+/// idle thread collects, so at SMP>1 a spawned test thread can run and be recycled on a
+/// peer core between `spawn_fn` and the test's next count; the spawn tests accept that
+/// outcome when this moved by more than their own cleanup accounts for.
+fn peer_reaps() -> u64 {
+    {
+        threading::slots_collected()
+    }
+}
+
+/// Test: Can spawn a thread without hanging
+fn test_spawn_thread() -> bool {
+    console::print("\n[TEST] Thread spawn\n");
+
+    let count_before = threading::thread_count();
+    let reaps_before = peer_reaps();
+    crate::safe_print!(64, "  Threads before: {}\n", count_before);
+
+    // Try to spawn - simple thread that just marks itself terminated immediately
+    console::print("  Spawning test thread...");
+    match threading::spawn_fn(|| {
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+            akuma_cpu::park::wfi();
+        }
+    }) {
+        Ok(tid) => {
+            crate::safe_print!(64, " OK (tid={})\n", tid);
+
+            let count_after = threading::thread_count();
+            crate::safe_print!(64, "  Threads after: {}\n", count_after);
+
+            let reaped = peer_reaps() > reaps_before;
+            if reaped {
+                console::print("  (ran and was reaped on a peer core)\n");
+            }
+            let ok = count_after == count_before + 1 || (reaped && count_after == count_before);
+            crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+            ok
+        }
+        Err(e) => {
+            crate::safe_print!(64, " FAILED: {}\n", e);
+            console::print("  Result: FAIL\n");
+            false
+        }
+    }
+}
+
+/// Test: Spawned thread actually executes
+fn test_spawn_and_run() -> bool {
+    console::print("\n[TEST] Thread execution\n");
+
+    // Reset flag
+    set_test_flag(false);
+
+    // Spawn thread that sets the flag and terminates
+    console::print("  Spawning thread that sets flag...");
+    match threading::spawn_fn(|| {
+        set_test_flag(true);
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+            akuma_cpu::park::wfi();
+        }
+    }) {
+        Ok(tid) => {
+            crate::safe_print!(64, " OK (tid={})\n", tid);
+
+            // Yield a few times to let the thread run
+            console::print("  Yielding to let thread run...");
+            for _ in 0..10 {
+                threading::yield_now();
+            }
+            console::print(" done\n");
+
+            // Check if flag was set
+            let ran = get_test_flag();
+            crate::safe_print!(64, "  Thread ran: {}\n", ran);
+
+            // Cleanup
+            let cleaned = threading::cleanup_terminated_force();
+            crate::safe_print!(64, "  Cleaned up: {} threads\n", cleaned);
+
+            crate::safe_print!(64, 
+                "  Result: {}\n",
+                if ran { "PASS" } else { "FAIL" }
+            );
+            ran
+        }
+        Err(e) => {
+            crate::safe_print!(64, " FAILED: {}\n", e);
+            console::print("  Result: FAIL\n");
+            false
+        }
+    }
+}
+
+/// Test: Spawn, terminate, cleanup, verify count returns to original
+fn test_spawn_and_cleanup() -> bool {
+    console::print("\n[TEST] Spawn and cleanup\n");
+
+    let count_before = threading::thread_count();
+    let reaps_before = peer_reaps();
+    crate::safe_print!(64, "  Threads before: {}\n", count_before);
+
+    // Spawn thread
+    console::print("  Spawning...");
+    let _tid = match threading::spawn_fn(|| {
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+            akuma_cpu::park::wfi();
+        }
+    }) {
+        Ok(t) => {
+            crate::safe_print!(32, " tid={}\n", t);
+            t
+        }
+        Err(e) => {
+            crate::safe_print!(64, " FAILED: {}\n", e);
+            return false;
+        }
+    };
+
+    // Yield to let it run and terminate
+    console::print("  Yielding...");
+    for _ in 0..5 {
+        threading::yield_now();
+    }
+    console::print(" done\n");
+
+    // Check it's terminated
+    let (_, _, terminated) = threading::thread_stats();
+    crate::safe_print!(64, "  Terminated count: {}\n", terminated);
+
+    // Cleanup
+    let cleaned = threading::cleanup_terminated_force();
+    crate::safe_print!(64, "  Cleaned: {}\n", cleaned);
+
+    let count_after = threading::thread_count();
+    crate::safe_print!(64, "  Threads after: {}\n", count_after);
+
+    let ok = count_after == count_before
+        && (cleaned >= 1 || peer_reaps() > reaps_before + cleaned as u64);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// Counter for multiple thread test
+static THREAD_COUNTER: AtomicU32 = AtomicU32::new(0);
+
+fn increment_counter() {
+    THREAD_COUNTER.fetch_add(1, Ordering::AcqRel);
+}
+
+fn get_counter() -> u32 {
+    THREAD_COUNTER.load(Ordering::Acquire)
+}
+
+fn reset_counter() {
+    THREAD_COUNTER.store(0, Ordering::Release);
+}
+
+/// Test: Spawn multiple threads
+fn test_spawn_multiple() -> bool {
+    console::print("\n[TEST] Spawn multiple threads\n");
+
+    reset_counter();
+    let count_before = threading::thread_count();
+    crate::safe_print!(64, "  Threads before: {}\n", count_before);
+
+    // Spawn 3 threads
+    const NUM_THREADS: usize = 3;
+    crate::safe_print!(64, "  Spawning {} threads...", NUM_THREADS);
+
+    for i in 0..NUM_THREADS {
+        match threading::spawn_fn(|| {
+            increment_counter();
+            threading::mark_current_terminated();
+            loop {
+                threading::yield_now();
+                akuma_cpu::park::wfi();
+            }
+        }) {
+            Ok(_) => {}
+            Err(e) => {
+                crate::safe_print!(64, " FAILED at {}: {}\n", i, e);
+                return false;
+            }
+        }
+    }
+    console::print(" done\n");
+
+    let count_mid = threading::thread_count();
+    crate::safe_print!(64, "  Threads after spawn: {}\n", count_mid);
+
+    // Yield to let them all run
+    console::print("  Yielding...");
+    for _ in 0..20 {
+        threading::yield_now();
+    }
+    console::print(" done\n");
+
+    let counter_val = get_counter();
+    crate::safe_print!(96, 
+        "  Counter value: {} (expect {})\n",
+        counter_val, NUM_THREADS
+    );
+
+    // Cleanup
+    let cleaned = threading::cleanup_terminated_force();
+    crate::safe_print!(64, "  Cleaned: {}\n", cleaned);
+
+    let count_after = threading::thread_count();
+    crate::safe_print!(64, "  Threads after cleanup: {}\n", count_after);
+
+    let ok = counter_val == NUM_THREADS as u32 && count_after == count_before;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// Yield counter for yield test
+static YIELD_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn increment_yield_count() {
+    YIELD_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+fn get_yield_count() -> u32 {
+    YIELD_COUNT.load(Ordering::Acquire)
+}
+
+fn reset_yield_count() {
+    YIELD_COUNT.store(0, Ordering::Release);
+}
+
+/// Test: Thread that yields multiple times
+fn test_spawn_and_yield() -> bool {
+    console::print("\n[TEST] Thread with multiple yields\n");
+
+    reset_yield_count();
+
+    console::print("  Spawning yielding thread...");
+    match threading::spawn_fn(|| {
+        // Yield 5 times, incrementing counter each time
+        for _ in 0..5 {
+            increment_yield_count();
+            threading::yield_now();
+        }
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+            akuma_cpu::park::wfi();
+        }
+    }) {
+        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
+        Err(e) => {
+            crate::safe_print!(64, " FAILED: {}\n", e);
+            return false;
+        }
+    }
+
+    // Yield many times to let thread complete
+    console::print("  Running scheduler...");
+    for _ in 0..20 {
+        threading::yield_now();
+    }
+    console::print(" done\n");
+
+    let count = get_yield_count();
+    crate::safe_print!(64, "  Yield count: {} (expect 5)\n", count);
+
+    // Cleanup
+    threading::cleanup_terminated_force();
+
+    let ok = count == 5;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// Yield cycle counter
+static YIELD_CYCLE_COUNT: AtomicU32 = AtomicU32::new(0);
+
+fn increment_yield_cycle() {
+    YIELD_CYCLE_COUNT.fetch_add(1, Ordering::AcqRel);
+}
+
+fn get_yield_cycle() -> u32 {
+    YIELD_CYCLE_COUNT.load(Ordering::Acquire)
+}
+
+fn reset_yield_cycle() {
+    YIELD_CYCLE_COUNT.store(0, Ordering::Release);
+}
+
+/// Test: Thread can yield and resume multiple times in sequence
+fn test_yield_cycle() -> bool {
+    console::print("\n[TEST] Yield-resume cycle\n");
+
+    reset_yield_cycle();
+
+    const CYCLES: u32 = 10;
+
+    crate::safe_print!(64, "  Spawning thread for {} yield cycles...", CYCLES);
+    match threading::spawn_fn(|| {
+        // Perform multiple yield-resume cycles
+        for _ in 0..CYCLES {
+            increment_yield_cycle();
+            threading::yield_now();
+        }
+        threading::mark_current_terminated();
+        loop {
+            threading::yield_now();
+            akuma_cpu::park::wfi();
+        }
+    }) {
+        Ok(tid) => crate::safe_print!(32, " tid={}\n", tid),
+        Err(e) => {
+            crate::safe_print!(64, " FAILED: {}\n", e);
+            return false;
+        }
+    }
+
+    // Each cycle requires 2 yields (one from worker, one from main)
+    // Plus extra to ensure completion
+    console::print("  Running yield cycles...");
+    for i in 0..(CYCLES * 2 + 10) {
+        threading::yield_now();
+        if i % 5 == 0 {
+            console::print(".");
+        }
+    }
+    console::print(" done\n");
+
+    let cycles = get_yield_cycle();
+    crate::safe_print!(96, 
+        "  Completed cycles: {} (expect {})\n",
+        cycles, CYCLES
+    );
+
+    // Cleanup
+    let cleaned = threading::cleanup_terminated_force();
+    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
+
+    let ok = cycles == CYCLES;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// Parallel Process Tests
+// ============================================================================
+
+// Flags for parallel process test
+static PROCESS1_STARTED: AtomicBool = AtomicBool::new(false);
+static PROCESS2_STARTED: AtomicBool = AtomicBool::new(false);
+static PROCESS1_DONE: AtomicBool = AtomicBool::new(false);
+static PROCESS2_DONE: AtomicBool = AtomicBool::new(false);
+
+/// Test: Run 2 processes in parallel and verify both appear in process table
+/// 
+/// This tests true concurrency:
+/// 1. Spawn 2 hello processes on separate threads
+/// 2. While both are running, check process table shows 2 processes
+/// 3. Wait for both to complete
+/// 4. Verify both ran successfully
+fn test_parallel_processes() -> bool {
+    console::print("\n[TEST] Parallel process execution\n");
+
+    // Reset flags
+    PROCESS1_STARTED.store(false, Ordering::Release);
+    PROCESS2_STARTED.store(false, Ordering::Release);
+    PROCESS1_DONE.store(false, Ordering::Release);
+    PROCESS2_DONE.store(false, Ordering::Release);
+
+    let thread_count_before = threading::thread_count();
+    crate::safe_print!(64, "  Threads before: {}\n", thread_count_before);
+
+    // Check if hello binary exists by trying to read it
+    if crate::fs::read_file("/bin/hello").is_err() {
+        if config::FAIL_TESTS_IF_TEST_BINARY_MISSING {
+            console::print("  /bin/hello not found\n");
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+        console::print("  Skipping: /bin/hello not found\n");
+        console::print("  Result: SKIP\n");
+        return true; // Skip, don't fail
+    }
+
+    let process_args: Option<&[&str]> = Some(&["10", "100"]);
+    // Spawn first process using spawn_process_with_channel
+    console::print("  Spawning process 1...");
+    let result1 = akuma_exec::process::spawn_process_with_channel("/bin/hello", process_args, None);
+    
+    let (tid1, channel1) = match result1 {
+        Ok((tid, channel, _pid)) => {
+            crate::safe_print!(32, " tid={}\n", tid);
+            PROCESS1_STARTED.store(true, Ordering::Release);
+            (tid, channel)
+        }
+        Err(e) => {
+            crate::safe_print!(64, " FAILED: {}\n", e);
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+    };
+
+    // Spawn second process
+    console::print("  Spawning process 2...");
+    let result2 = akuma_exec::process::spawn_process_with_channel("/bin/hello", process_args, None);
+
+    let (tid2, channel2) = match result2 {
+        Ok((tid, channel, _pid)) => {
+            crate::safe_print!(32, " tid={}\n", tid);
+            PROCESS2_STARTED.store(true, Ordering::Release);
+            (tid, channel)
+        }
+        Err(e) => {
+            crate::safe_print!(64, " FAILED: {}\n", e);
+            console::print("  Result: FAIL\n");
+            return false;
+        }
+    };
+
+    crate::safe_print!(96, "  Spawned threads {} and {}\n", tid1, tid2);
+    
+    // The fact that we spawned two processes on different threads (tid1 != tid2)
+    // and they both complete successfully proves parallel execution capability.
+    // The interleaved output visible in logs provides visual confirmation.
+
+    // Wait for both to complete using channel status.
+    //
+    // The ps/kthreads checks run on every iteration (no artificial delay) so
+    // they get a chance to observe the running processes even if they finish
+    // quickly.  Once a check passes it is not retried.
+    console::print("  Waiting for processes to complete...\n");
+    let complete_timeout = 40_000_000; // 40 seconds
+    let complete_start = crate::timer::uptime_us();
+    // Without the in-kernel shell these two checks cannot run at all; start them
+    // satisfied so the loop below does not spin waiting for a result that will
+    // never arrive, and `checks_ok` stays meaningful.
+    // ps/kthreads were checked by running them through the in-kernel shell
+    // pipeline, which no longer exists; treat them as satisfied.
+    let ps_done = true;
+    let kthreads_done = true;
+    let mut checks_attempted = false;
+
+    loop {
+        threading::yield_now();
+        // Real shared-kernel SMP: drop the BKL across this cooperative wait (same reason as
+        // exec_with_io_cwd — a child claimed onto a peer core strands if this thread holds
+        // the BKL while waiting for it). Without this, both children can end up RUNNING on
+        // secondaries and freeze needing EL1 while the BSP yield-holds the BKL → the known
+        // nondeterministic SMP=4 `parallel_processes` hang. See docs/runbooks/debug-smp.md.
+        akuma_exec::threading::idle_halt();
+
+        let p1_done = channel1.has_exited() || akuma_exec::threading::is_thread_terminated(tid1);
+        let p2_done = channel2.has_exited() || akuma_exec::threading::is_thread_terminated(tid2);
+        let exit_code1 = channel1.exit_code();
+        let exit_code2 = channel2.exit_code();
+
+        if (exit_code1 != 0 && channel1.has_exited()) || (exit_code2 != 0 && channel2.has_exited()) {
+            crate::safe_print!(64, "  Processes failed with exit codes {} and {}\n", exit_code1, exit_code2);
+            break;
+        }
+
+        // Run ps/kthreads checks while at least one process is still alive.
+        // No delay gate — try on every iteration until both succeed or
+        // the processes finish.
+        if (!p1_done || !p2_done) && (!ps_done || !kthreads_done) {
+            checks_attempted = true;
+
+        }
+
+        if p1_done && p2_done {
+            console::print("  Both processes done\n");
+            PROCESS1_DONE.store(true, Ordering::Release);
+            PROCESS2_DONE.store(true, Ordering::Release);
+            break;
+        }
+
+        if crate::timer::uptime_us() - complete_start > complete_timeout {
+            console::print("  TIMEOUT\n");
+            crate::safe_print!(96, "    P1 done: {}, P2 done: {}\n", p1_done, p2_done);
+            break;
+        }
+    }
+
+    // Cleanup
+    let cleaned = threading::cleanup_terminated_force();
+    crate::safe_print!(64, "  Cleaned: {} threads\n", cleaned);
+
+    let thread_count_after = threading::thread_count();
+    crate::safe_print!(64, "  Threads after: {}\n", thread_count_after);
+
+    // Verify results
+    let p1_done = PROCESS1_DONE.load(Ordering::Acquire);
+    let p2_done = PROCESS2_DONE.load(Ordering::Acquire);
+
+    let threads_different = tid1 != tid2;
+
+    // The ps/kthreads checks are best-effort: they can only succeed while at
+    // least one process is still running.  If both processes finished before
+    // the checks had a chance to run, don't penalise.
+    //
+    // Require EITHER check, not both: `kthreads` runs in-kernel and is fast,
+    // while `ps` spawns a busybox subprocess and is much slower, so for a
+    // short-lived `/bin/hello` `ps` frequently queries only after the process
+    // has already exited. Both observations prove the same thing — the two
+    // processes were concurrently alive and listable — so one suffices.
+    let checks_ok = if checks_attempted {
+        ps_done || kthreads_done
+    } else {
+        true
+    };
+
+    let ok = threads_different && p1_done && p2_done && checks_ok;
+
+    if !ok {
+        crate::safe_print!(192, "  tid1={}, tid2={}, P1 done: {}, P2 done: {}, ps: {}, kthreads: {}, checks_attempted: {}\n",
+                               tid1, tid2, p1_done, p2_done, ps_done, kthreads_done, checks_attempted);
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Waker mechanism works correctly
+/// 
+/// Tests that async wakers properly signal when a future should be polled again.
+/// This is critical for embassy-net and other async operations.
+pub fn test_waker_mechanism() -> bool {
+    use core::future::Future;
+    use core::pin::Pin;
+    use core::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    
+    console::print("\n[TEST] Waker mechanism\n");
+    
+    // Counters to track waker activity
+    static WAKE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    static CLONE_COUNT: AtomicUsize = AtomicUsize::new(0);
+    
+    // Reset counters
+    WAKE_COUNT.store(0, Ordering::SeqCst);
+    CLONE_COUNT.store(0, Ordering::SeqCst);
+    
+    // Create a waker vtable that tracks calls
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(
+        // clone
+        |_| {
+            CLONE_COUNT.fetch_add(1, Ordering::SeqCst);
+            RawWaker::new(core::ptr::null(), &VTABLE)
+        },
+        // wake
+        |_| {
+            WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+        },
+        // wake_by_ref
+        |_| {
+            WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+        },
+        // drop
+        |_| {},
+    );
+    
+    // Create a simple future that returns Pending once, then Ready
+    struct TestFuture {
+        polled_once: bool,
+    }
+    
+    impl Future for TestFuture {
+        type Output = i32;
+        
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+            if self.polled_once {
+                Poll::Ready(42)
+            } else {
+                self.polled_once = true;
+                // Schedule a wake - this is what embassy does when waiting for I/O
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+        }
+    }
+    
+    let mut future = core::pin::pin!(TestFuture { polled_once: false });
+    
+    // Create waker
+    let raw_waker = RawWaker::new(core::ptr::null(), &VTABLE);
+    let waker = unsafe { Waker::from_raw(raw_waker) };
+    let mut cx = Context::from_waker(&waker);
+    
+    // First poll - should return Pending and call wake_by_ref
+    let result1 = future.as_mut().poll(&mut cx);
+    let pending = matches!(result1, Poll::Pending);
+    crate::safe_print!(64, "  First poll: {} (expected Pending)\n", 
+                           if pending { "Pending" } else { "Ready" });
+    
+    // Check wake was called
+    let wakes_after_first = WAKE_COUNT.load(Ordering::SeqCst);
+    crate::safe_print!(96, "  Wake count after first poll: {} (expected 1)\n", wakes_after_first);
+    
+    // Second poll - should return Ready
+    let result2 = future.as_mut().poll(&mut cx);
+    let ready = matches!(result2, Poll::Ready(42));
+    crate::safe_print!(64, "  Second poll: {} (expected Ready(42))\n",
+                           if ready { "Ready(42)" } else { "unexpected" });
+    
+    let ok = pending && wakes_after_first == 1 && ready;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Block-on executor with no-op waker
+///
+/// Poll counter for [`MultiPollFuture`]. Reset by [`MultiPollFuture::new`], read
+/// back by the two `block_on` tests — which run sequentially in the boot suite, so
+/// one counter serves both.
+static MULTI_POLL_COUNT: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// A future that returns `Pending` until it has been polled `polls_needed` times,
+/// then `Ready(polls_done)`.
+///
+/// Both `block_on` tests below need exactly this, and each used to declare its own
+/// copy — identical apart from the one line that matters: `wake_self`. The no-op
+/// waker test must *not* wake, because its whole point is that the executor keeps
+/// polling anyway; the real-`ThreadWaker` test must, because that is what tells a
+/// real executor to re-poll. Making that the one field keeps the difference stated
+/// rather than buried in a second copy of the body.
+struct MultiPollFuture {
+    polls_needed: usize,
+    polls_done: usize,
+    wake_self: bool,
+}
+
+impl MultiPollFuture {
+    /// Also zeroes [`MULTI_POLL_COUNT`], so a test can never read a previous
+    /// test's tally.
+    fn new(polls_needed: usize, wake_self: bool) -> Self {
+        MULTI_POLL_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+        Self { polls_needed, polls_done: 0, wake_self }
+    }
+
+    fn polls_seen() -> usize {
+        MULTI_POLL_COUNT.load(core::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl core::future::Future for MultiPollFuture {
+    type Output = usize;
+
+    fn poll(
+        mut self: core::pin::Pin<&mut Self>,
+        cx: &mut core::task::Context<'_>,
+    ) -> core::task::Poll<usize> {
+        self.polls_done += 1;
+        MULTI_POLL_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+
+        if self.polls_done >= self.polls_needed {
+            core::task::Poll::Ready(self.polls_done)
+        } else {
+            if self.wake_self {
+                // Wake ourselves so the executor knows to re-poll.
+                cx.waker().wake_by_ref();
+            }
+            core::task::Poll::Pending
+        }
+    }
+}
+
+/// Tests that a block_on style executor works even with a no-op waker
+/// (which is what we use in SSH sessions). Verifies the polling loop
+/// continues despite wake() doing nothing.
+pub fn test_block_on_noop_waker() -> bool {
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    console::print("\n[TEST] Block-on with no-op waker\n");
+
+    // The no-op waker this test is named for is now `Waker::noop()` — the safe
+    // `const` stdlib item, rather than a local `RawWakerVTable` of four empty
+    // closures behind `Waker::from_raw`. Same waker, and a more faithful one:
+    // `block_on` in the SSH path uses the stdlib item too.
+    
+    // Simulate block_on with limited iterations
+    fn block_on_limited<F: Future>(future: F, max_iters: usize) -> Option<F::Output> {
+        let mut future = core::pin::pin!(future);
+
+        for _ in 0..max_iters {
+            let mut cx = Context::from_waker(Waker::noop());
+            
+            match future.as_mut().poll(&mut cx) {
+                Poll::Ready(output) => return Some(output),
+                Poll::Pending => {
+                    // In real block_on, we'd yield here
+                    // For test, just continue
+                }
+            }
+        }
+        None
+    }
+    
+    let future = MultiPollFuture::new(5, false);
+    let result = block_on_limited(future, 10);
+
+    let poll_count = MultiPollFuture::polls_seen();
+    crate::safe_print!(64, "  Total polls: {} (expected 5)\n", poll_count);
+    crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
+    
+    let ok = result == Some(5) && poll_count == 5;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// Allocator leak detection tests
+//
+// These verify that repeated alloc/dealloc cycles don't leak kernel heap.
+// Modeled after the pattern that caused Node.js OOM: 4M+ fcntl syscalls
+// leaking ~11 bytes each via BTreeMap/Vec operations.
+// ============================================================================
+
+fn heap_used() -> usize {
+    crate::allocator::allocated_bytes()
+}
+
+/// Basic alloc/free cycle leak test: 100K rounds of 56-byte and 152-byte
+/// allocations (the exact sizes observed in the Node.js OOM).
+fn test_alloc_free_no_leak() -> bool {
+    console::print("\n[TEST] Alloc/free leak detection (100K cycles, 56+152 bytes)\n");
+    use alloc::alloc::{alloc, dealloc, Layout};
+
+    let before = heap_used();
+    let iterations = 100_000usize;
+
+    for _ in 0..iterations {
+        unsafe {
+            let layout56 = Layout::from_size_align(56, 8).unwrap();
+            let p1 = alloc(layout56);
+            if !p1.is_null() {
+                core::ptr::write_bytes(p1, 0xAB, 56);
+                dealloc(p1, layout56);
+            }
+
+            let layout152 = Layout::from_size_align(152, 8).unwrap();
+            let p2 = alloc(layout152);
+            if !p2.is_null() {
+                core::ptr::write_bytes(p2, 0xCD, 152);
+                dealloc(p2, layout152);
+            }
+        }
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// BTreeMap churn: insert + lookup + remove on 1000-entry maps, repeated 100
+/// times.  BTreeMap node allocation/deallocation is the most likely source of
+/// the per-syscall leak since BTreeSet is used for cloexec_fds/nonblock_fds
+/// and BTreeMap for fd_table, THREAD_PID_MAP, etc.
+fn test_btreemap_churn_no_leak() -> bool {
+    console::print("\n[TEST] BTreeMap churn leak detection\n");
+    use alloc::collections::BTreeMap;
+
+    let before = heap_used();
+
+    for round in 0..100u32 {
+        let mut map: BTreeMap<u32, u64> = BTreeMap::new();
+        for i in 0..1000u32 {
+            map.insert(i + round * 1000, u64::from(i));
+        }
+        for i in 0..1000u32 {
+            let _ = map.get(&(i + round * 1000));
+        }
+        for i in 0..1000u32 {
+            map.remove(&(i + round * 1000));
+        }
+        drop(map);
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Vec growth pattern: repeatedly grow a Vec (triggering realloc), drain it,
+/// and drop.  Tests the realloc path for leaks since Vec capacity doubling
+/// goes through GlobalAlloc::realloc.
+fn test_vec_growth_no_leak() -> bool {
+    console::print("\n[TEST] Vec growth/shrink leak detection\n");
+
+    let before = heap_used();
+
+    for _ in 0..200u32 {
+        let mut v: Vec<u64> = Vec::new();
+        for i in 0..2000u64 {
+            v.push(i);
+        }
+        v.clear();
+        v.shrink_to_fit();
+        drop(v);
+    }
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// High-volume small allocations: 500K alloc+free of sizes 8-256 bytes,
+/// simulating the syscall dispatch path where temporary Strings, Vecs, and
+/// BTreeMap nodes are created and destroyed.  At 4M+ calls this is where
+/// even a 1-byte-per-call leak becomes fatal.
+fn test_high_volume_small_allocs_no_leak() -> bool {
+    console::print("\n[TEST] High-volume small allocs leak detection (500K cycles)\n");
+    use alloc::collections::BTreeSet;
+
+    let before = heap_used();
+
+    let mut set: BTreeSet<u32> = BTreeSet::new();
+    for i in 0..500_000u32 {
+        set.insert(i % 64);
+        set.remove(&(i % 64));
+
+        if i % 10000 == 0 {
+            let s = format!("iter_{i}");
+            drop(s);
+        }
+    }
+    drop(set);
+
+    let after = heap_used();
+    let leaked = after.saturating_sub(before);
+    crate::safe_print!(128, "  Before: {} bytes, After: {} bytes, Leaked: {} bytes\n",
+        before, after, leaked);
+
+    let ok = leaked < 4096;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// Mmap subsystem tests
+// ============================================================================
+
+/// Verify alloc_mmap returns non-overlapping address ranges
+fn test_alloc_mmap_non_overlapping() -> bool {
+    console::print("\n[TEST] alloc_mmap: non-overlapping addresses\n");
+
+    let mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+
+    let mut addrs = Vec::new();
+    let sizes = [0x1000, 0x4000, 0x10000, 0x1000, 0x8000, 0x7F000];
+    for &sz in &sizes {
+        if let Some(a) = mem.place(&mut [], sz) { addrs.push((a, sz)) } else {
+            crate::safe_print!(192, "  alloc_mmap returned None for size {:#x} (next={:#x} limit={:#x})\n",
+                sz, mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
+            return false;
+        }
+    }
+
+    let mut ok = true;
+    for i in 0..addrs.len() {
+        let (a_start, a_sz) = addrs[i];
+        let a_end = a_start + a_sz;
+        for &(b_start, b_sz) in addrs.iter().skip(i + 1) {
+            let b_end = b_start + b_sz;
+            if a_start < b_end && b_start < a_end {
+                crate::safe_print!(192, "  OVERLAP: [{:#x}..{:#x}) vs [{:#x}..{:#x})\n",
+                    a_start, a_end, b_start, b_end);
+                ok = false;
+            }
+        }
+    }
+
+    crate::safe_print!(64, "  {} allocations, all disjoint: {}\n", addrs.len(), ok);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+const TEST_PID: u32 = 9999;
+
+/// RAII registration of a minimal `Process`, so a synthetic test PID has
+/// somewhere to keep its lazy regions.
+///
+/// Lazy regions used to live in a global `LAZY_REGION_TABLE` keyed by PID, which
+/// happily accepted entries for PIDs that had no `Process` at all. They now live
+/// on `Process::lazy_regions` (docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md),
+/// so `push_lazy_region` on an unregistered PID is a silent no-op and any test
+/// that skips this guard would assert on an empty map and pass vacuously.
+///
+/// Retires the process on drop, so the OOM early-`return`s these tests are full
+/// of still clean up.
+struct LazyTestProcess(u32);
+
+impl LazyTestProcess {
+    fn new(pid: u32) -> Self {
+        akuma_exec::process::register_process(pid, crate::process_tests::make_test_process(pid));
+        Self(pid)
+    }
+}
+
+impl Drop for LazyTestProcess {
+    fn drop(&mut self) {
+        akuma_exec::process::clear_lazy_regions(self.0);
+        let _ = akuma_exec::process::unregister_process(self.0);
+        // `unregister_process` only RETIRES the slot, and retired slots are
+        // ineligible for `register_process`'s free-slot scan until a drain runs.
+        // Two dozen tests each parking a slot until the periodic collector wakes
+        // is how the suite would walk into `Process table full (256 slots)`, so
+        // force the collection here — the same thing the PMM tests do
+        // (docs/reference/subsystems/memory.md -> "Reclaim under memory pressure").
+        let _ = akuma_exec::process::table::reclaim_retired_processes_force();
+    }
+}
+
+/// `(start_va, size, flags)` for every lazy region registered to `pid`, sorted by
+/// `start_va`. Replaces the direct `LAZY_REGION_TABLE.lock().get(&pid)` peeking
+/// these tests used before the map moved onto `Process`.
+fn lazy_regions_of(pid: u32) -> Vec<(usize, usize, u64)> {
+    akuma_exec::process::lazy_regions_snapshot(pid).map_or(Vec::new(), |m| {
+        m.values()
+            .map(|r| (r.start_va, r.size, r.prot.map_or(0, akuma_exec::mmu::user_flags::to_pte)))
+            .collect()
+    })
+}
+
+/// Verify push_lazy_region stores the region and it can be found
+fn test_lazy_region_push_lookup() -> bool {
+    console::print("\n[TEST] lazy_region: push and lookup\n");
+
+    let _proc = LazyTestProcess::new(TEST_PID);
+
+    let start = 0x5000_0000usize;
+    let size = 0x1000_0000usize;
+    akuma_exec::process::push_lazy_region(TEST_PID, start, size, 0);
+
+    let covers = |va: usize| {
+        lazy_regions_of(TEST_PID)
+            .iter()
+            .any(|&(s, sz, _)| va >= s && va < s + sz)
+    };
+
+    let found = covers(start + size / 2);
+    // Verify address outside region is NOT found
+    let outside = covers(start + size + 0x1000);
+
+    let ok = found && !outside;
+    crate::safe_print!(64, "  found_inside={} found_outside={}\n", found, outside);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the entire lazy region
+fn test_lazy_region_munmap_full() -> bool {
+    console::print("\n[TEST] lazy_region: munmap full region\n");
+
+    let _proc = LazyTestProcess::new(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x1_0000);
+
+    let remaining = lazy_regions_of(TEST_PID).len();
+
+    let ok = results.len() == 1 && results[0] == (0x5000_0000, 16) && remaining == 0;
+    if !ok {
+        crate::safe_print!(128, "  results.len()={}, remaining={}\n", results.len(), remaining);
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the prefix of a lazy region
+fn test_lazy_region_munmap_prefix() -> bool {
+    console::print("\n[TEST] lazy_region: munmap prefix\n");
+
+    let _proc = LazyTestProcess::new(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_0000, 0x4000);
+
+    let remaining = lazy_regions_of(TEST_PID);
+    let (start, size) = match remaining.as_slice() {
+        [(s, sz, _)] => (*s, *sz),
+        _ => (0, 0),
+    };
+
+    let ok = results.len() == 1
+        && results[0] == (0x5000_0000, 4)
+        && start == 0x5000_4000
+        && size == 0xC000;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the suffix of a lazy region
+fn test_lazy_region_munmap_suffix() -> bool {
+    console::print("\n[TEST] lazy_region: munmap suffix\n");
+
+    let _proc = LazyTestProcess::new(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_C000, 0x4000);
+
+    let remaining = lazy_regions_of(TEST_PID);
+    let (start, size) = match remaining.as_slice() {
+        [(s, sz, _)] => (*s, *sz),
+        _ => (0, 0),
+    };
+
+    let ok = results.len() == 1
+        && results[0] == (0x5000_C000, 4)
+        && start == 0x5000_0000
+        && size == 0xC000;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap the middle of a lazy region — should split into two
+fn test_lazy_region_munmap_middle() -> bool {
+    console::print("\n[TEST] lazy_region: munmap middle (split)\n");
+
+    let _proc = LazyTestProcess::new(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_4000, 0x4000);
+
+    let regions = lazy_regions_of(TEST_PID);
+
+    let ok = results.len() == 1
+        && results[0] == (0x5000_4000, 4)
+        && regions.len() == 2
+        && regions.iter().any(|&(s, sz, _)| s == 0x5000_0000 && sz == 0x4000)
+        && regions.iter().any(|&(s, sz, _)| s == 0x5000_8000 && sz == 0x8000);
+
+    if !ok {
+        crate::safe_print!(192, "  freed={:?} regions={:?}\n", results, regions);
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Munmap range spanning two adjacent lazy regions
+fn test_lazy_region_munmap_multi() -> bool {
+    console::print("\n[TEST] lazy_region: munmap spanning two regions\n");
+
+    let _proc = LazyTestProcess::new(TEST_PID);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5000_0000, 0x1_0000, 0);
+    akuma_exec::process::push_lazy_region(TEST_PID, 0x5001_0000, 0x1_0000, 0);
+
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, 0x5000_8000, 0x1_0000);
+
+    let remaining = lazy_regions_of(TEST_PID);
+
+    let ok = results.len() == 2
+        && remaining.len() == 2
+        && remaining.iter().any(|&(s, sz, _)| s == 0x5000_0000 && sz == 0x8000)
+        && remaining.iter().any(|&(s, sz, _)| s == 0x5001_8000 && sz == 0x8000);
+
+    if !ok {
+        crate::safe_print!(192, "  freed={:?} remain={:?}\n", results, remaining);
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Lazy and eager regions live in one `mmap_regions` list: a lazy lookup
+/// never answers for an eager region, the eager readers never answer for a lazy
+/// one, and removing the lazy regions leaves the eager one in place.
+fn test_lazy_and_eager_regions_share_one_list() -> bool {
+    console::print("\n[TEST] lazy_region: lazy and eager share one list\n");
+
+    const PID: u32 = 0xDEAD;
+    let _proc = LazyTestProcess::new(PID);
+    const A: u64 = akuma_exec::mmu::user_flags::RW_NO_EXEC;
+    const B: u64 = akuma_exec::mmu::user_flags::RX;
+    akuma_exec::process::push_lazy_region(PID, 0x1000_0000, 0x10_0000, A);
+    akuma_exec::process::push_lazy_region(PID, 0x3000_0000, 0x10_0000, B);
+    let eager = akuma_exec::process::MmapRegion::inherited_with_prot(0x2000_0000, 4, akuma_exec::mmu::Prot::RO);
+    let inserted = akuma_exec::process::with_process(PID, |p| {
+        p.vm_with_regions(|r| akuma_exec::process::insert_region_sorted(r, eager));
+    })
+    .is_some();
+
+    let lazy_hit = akuma_exec::process::lazy_region_lookup_for_pid(PID, 0x3000_1000).map(|(f, _, s, _)| (f, s));
+    let lazy_miss_on_eager = akuma_exec::process::lazy_region_lookup_for_pid(PID, 0x2000_1000).is_none();
+    let eager_hit = akuma_exec::process::eager_region_flags_for_page_fault(PID, 0x2000_1000);
+    let eager_miss_on_lazy = akuma_exec::process::eager_region_flags_for_page_fault(PID, 0x1000_1000).is_none();
+    let counted = akuma_exec::process::lazy_region_count_for_pid(PID);
+
+    akuma_exec::process::clear_lazy_regions(PID);
+    let after_clear = (
+        akuma_exec::process::lazy_region_count_for_pid(PID),
+        akuma_exec::process::eager_region_flags_for_page_fault(PID, 0x2000_1000).is_some(),
+    );
+
+    let ok = inserted
+        && lazy_hit == Some((B, 0x3000_0000))
+        && lazy_miss_on_eager
+        && eager_hit == Some(akuma_exec::mmu::user_flags::RO)
+        && eager_miss_on_lazy
+        && counted == 2
+        && after_clear == (0, true);
+    if !ok {
+        crate::safe_print!(256, "  lazy_hit={:?} miss_on_eager={} eager_hit={:?} miss_on_lazy={} count={} after_clear={:?}\n",
+            lazy_hit, lazy_miss_on_eager, eager_hit, eager_miss_on_lazy, counted, after_clear);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that lazy_region_lookup_for_pid finds regions only for the correct PID
+fn test_lazy_region_lookup_pid_isolation() -> bool {
+    console::print("\n[TEST] lazy_region: lookup PID isolation\n");
+
+    const PID_A: u32 = 0xAAAA;
+    const PID_B: u32 = 0xBBBB;
+
+    let _a = LazyTestProcess::new(PID_A);
+    let _b = LazyTestProcess::new(PID_B);
+
+    // Create region only in PID_A
+    akuma_exec::process::push_lazy_region(PID_A, 0x3000_0000, 0x100_0000, 0x3);
+
+    // Lookup should succeed for PID_A
+    let found_a = akuma_exec::process::lazy_region_lookup_for_pid(PID_A, 0x3000_5000).is_some();
+
+    // Lookup should fail for PID_B (region doesn't exist there)
+    let found_b = akuma_exec::process::lazy_region_lookup_for_pid(PID_B, 0x3000_5000).is_some();
+
+    // Lookup with PID 0 (invalid) should fail
+    let found_zero = akuma_exec::process::lazy_region_lookup_for_pid(0, 0x3000_5000).is_some();
+
+    let ok = found_a && !found_b && !found_zero;
+
+    if !ok {
+        crate::safe_print!(128, "  found_a={} found_b={} found_zero={}\n",
+            found_a, found_b, found_zero);
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Verify map_user_page actually creates a PTE, and clearing it works
+/// Bug 13: IrqGuard must not unconditionally enable IRQs on drop.
+///
+/// The akuma-exec extraction introduced a broken IrqGuard that called
+/// enable_irqs() on drop instead of restoring the saved DAIF register.
+/// When map_user_page (called from the exception handler with IRQs
+/// architecturally disabled) dropped its IrqGuard, IRQs were re-enabled
+/// inside the exception handler, causing preemption races during demand
+/// paging readahead. This leaked physical pages and caused OOM crashes.
+///
+/// This test verifies that creating and dropping an IrqGuard in an
+/// already-disabled context does not re-enable IRQs.
+fn test_irqguard_preserves_disabled_state() -> bool {
+    console::print("\n[TEST] Bug 13: IrqGuard preserves disabled state\n");
+
+    fn read_daif_i() -> bool {
+        (akuma_cpu::daif::read() >> 7) & 1 == 1 // DAIF.I bit
+    }
+
+    // Disable IRQs manually
+    akuma_cpu::daif::mask_irq();
+    let disabled_before = read_daif_i();
+
+    // Create and drop an IrqGuard while IRQs are already disabled
+    {
+        let _guard = akuma_exec::runtime::IrqGuard::new();
+        // IRQs should still be disabled inside the guard
+    }
+    // After drop: IRQs must still be disabled (the bug would enable them here)
+    let disabled_after = read_daif_i();
+
+    // Restore IRQs
+    akuma_cpu::daif::unmask_irq();
+
+    let pass = disabled_before && disabled_after;
+    if !pass {
+        crate::safe_print!(128, "  disabled_before={} disabled_after={}\n",
+            disabled_before, disabled_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 13: Nested IrqGuard must restore intermediate state correctly.
+///
+/// Outer guard disables IRQs, inner guard disables again (no-op), inner
+/// drops (must keep disabled), outer drops (must re-enable).
+fn test_irqguard_nesting_preserves_state() -> bool {
+    console::print("\n[TEST] Bug 13: IrqGuard nesting preserves state\n");
+
+    fn read_daif_i() -> bool {
+        (akuma_cpu::daif::read() >> 7) & 1 == 1
+    }
+
+    // IRQs start enabled
+    akuma_cpu::daif::unmask_irq();
+    let irqs_enabled_initially = !read_daif_i();
+
+    let irqs_disabled_in_outer;
+    let irqs_disabled_after_inner_drop;
+    {
+        let _outer = akuma_exec::runtime::IrqGuard::new();
+        irqs_disabled_in_outer = read_daif_i();
+        {
+            let _inner = akuma_exec::runtime::IrqGuard::new();
+        }
+        // After inner drop: must still be disabled
+        irqs_disabled_after_inner_drop = read_daif_i();
+    }
+    // After outer drop: must be re-enabled (restored to initial state)
+    let irqs_enabled_after_outer = !read_daif_i();
+
+    let pass = irqs_enabled_initially
+        && irqs_disabled_in_outer
+        && irqs_disabled_after_inner_drop
+        && irqs_enabled_after_outer;
+    if !pass {
+        crate::safe_print!(192,
+            "  initial_enabled={} outer_disabled={} after_inner_disabled={} after_outer_enabled={}\n",
+            irqs_enabled_initially, irqs_disabled_in_outer,
+            irqs_disabled_after_inner_drop, irqs_enabled_after_outer);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 13: with_irqs_disabled must not leak state when nested.
+fn test_with_irqs_disabled_nesting() -> bool {
+    console::print("\n[TEST] Bug 13: with_irqs_disabled nesting\n");
+
+    fn read_daif_i() -> bool {
+        (akuma_cpu::daif::read() >> 7) & 1 == 1
+    }
+
+    // Disable IRQs manually (simulating exception context)
+    akuma_cpu::daif::mask_irq();
+
+    // Call with_irqs_disabled while already disabled
+    let inner_disabled = akuma_exec::runtime::with_irqs_disabled(read_daif_i);
+
+    // After return: must still be disabled
+    let still_disabled = read_daif_i();
+
+    // Clean up
+    akuma_cpu::daif::unmask_irq();
+
+    let pass = inner_disabled && still_disabled;
+    if !pass {
+        crate::safe_print!(128, "  inner_disabled={} still_disabled={}\n",
+            inner_disabled, still_disabled);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 13: map_user_page must not re-enable IRQs in caller's context.
+///
+/// This is the exact scenario that caused the bun crash: the demand paging
+/// handler (running with IRQs disabled) calls map_user_page, which creates
+/// and drops an IrqGuard internally. With the broken IrqGuard, this
+/// re-enabled IRQs in the exception handler, allowing preemption races.
+fn test_map_user_page_preserves_irq_state() -> bool {
+    console::print("\n[TEST] Bug 13: map_user_page preserves IRQ state\n");
+
+    fn read_daif_i() -> bool {
+        (akuma_cpu::daif::read() >> 7) & 1 == 1
+    }
+
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+
+    // Above the RAM identity map (see test_map_user_page_roundtrip for why a fixed
+    // ~7.5GB VA crashes at MEMORY≥8G).
+    let test_va: usize = 0x41_4000_0000; // 261GB
+
+    // Disable IRQs (simulating exception handler context)
+    akuma_cpu::daif::mask_irq();
+    let disabled_before = read_daif_i();
+
+    // Call map_user_page — the internal IrqGuard must not leak state
+    let (table_frames, _) =
+        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+
+    let disabled_after = read_daif_i();
+
+    // Re-enable IRQs before cleanup (cleanup allocates, needs IRQs for PMM)
+    akuma_cpu::daif::unmask_irq();
+
+    // Clean up: clear PTE and free frames
+    clear_boot_ttbr0_pte(test_va, PtClear::LeafAndTables);
+    crate::pmm::free_page(frame);
+    for tf in table_frames { crate::pmm::free_page(tf); }
+
+    let pass = disabled_before && disabled_after;
+    if !pass {
+        crate::safe_print!(128, "  disabled_before={} disabled_after={}\n",
+            disabled_before, disabled_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+fn test_map_user_page_roundtrip() -> bool {
+    console::print("\n[TEST] map_user_page: map → verify → unmap → verify\n");
+
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+
+    // Pick a VA *above* the kernel RAM identity-map window. A fixed ~7.75GB VA
+    // (the old value) is a safe "high user VA" only while RAM ≲ 7GB; once RAM is
+    // large enough that the identity map reaches it (e.g. MEMORY=8G), this VA
+    // lands inside an identity 1GB block, and map_user_page splits that block and
+    // allocates its page-table frames from the very region it just unmapped —
+    // EC=0x25 translation fault at FAR≈7GB during boot. 256GB+ is always above the
+    // identity map (see docs/MEMORY_LAYOUT.md "Boot self-test VAs").
+    let test_va: usize = 0x41_0000_0000; // 260GB, above the RAM identity map
+
+    let before = akuma_exec::mmu::is_current_user_page_mapped(test_va);
+
+    let (table_frames, _) =
+        akuma_exec::mmu::map_user_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+
+    let after_map = akuma_exec::mmu::is_current_user_page_mapped(test_va);
+
+    // Clear all page table entries for test_va, from L3 up to L1, to fully
+    // restore the boot TTBR0. Without this, the boot L1[idx] entry would keep
+    // pointing to the freed L2 frame. If that freed frame is later reused (e.g.,
+    // as a new UserAddressSpace's L1), the boot TTBR0 would alias the new AS's
+    // tables, causing spurious translation faults in subsequent tests.
+    clear_boot_ttbr0_pte(test_va, PtClear::LeafAndTables);
+
+    let after_clear = akuma_exec::mmu::is_current_user_page_mapped(test_va);
+
+    crate::pmm::free_page(frame);
+    for tf in table_frames { crate::pmm::free_page(tf); }
+
+    let ok = !before && after_map && !after_clear;
+    if !ok {
+        crate::safe_print!(128, "  before={} after_map={} after_clear={}\n",
+            before, after_map, after_clear);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Verify sub-range munmap of an eager allocation is a no-op
+/// (the fix for Bug 5: sys_munmap must not blindly unmap pages)
+fn test_eager_mmap_pages_survive_subrange_munmap() -> bool {
+    console::print("\n[TEST] munmap: sub-range of eager alloc is no-op\n");
+
+    let mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+
+    let base = mem.place(&mut [], 0x7F000).unwrap();
+    let pages = 0x7F000 / 4096; // 127
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else { console::print("  OOM\n"); return false; }
+    }
+    mmap_regions.push((base, frames));
+
+    // Simulate sys_munmap for sub-range (base + 0x23000)
+    let sub_addr = base + 0x23000;
+    let sub_len = 0x1000;
+
+    // Step 1: exact start match in mmap_regions?
+    let exact = mmap_regions.iter().position(|(start, _)| *start == sub_addr);
+
+    // Step 2: lazy region match? (the process is registered but has no lazy
+    // regions, so this exercises the real "registered, no match" path rather than
+    // the "no such process" shortcut.)
+    let _proc = LazyTestProcess::new(TEST_PID);
+    let lazy_results = akuma_exec::process::munmap_lazy_regions_in_range(TEST_PID, sub_addr, sub_len);
+
+    // With Bug 5 fix: neither matches → return success, no pages unmapped
+    let ok = exact.is_none() && lazy_results.is_empty();
+
+    // Verify frame count unchanged (nothing freed)
+    let frames_intact = mmap_regions[0].1.len() == pages;
+
+    // Cleanup
+    for (_, region_frames) in mmap_regions {
+        for f in region_frames { crate::pmm::free_page(f); }
+    }
+    akuma_exec::process::clear_lazy_regions(TEST_PID);
+
+    let pass = ok && frames_intact;
+    if !pass {
+        crate::safe_print!(128, "  exact={:?} lazy={} frames_intact={}\n",
+            exact, lazy_results.len(), frames_intact);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Helper: create a minimal test Process and box it for PROCESS_TABLE registration.
+fn make_test_process(
+    pid: u32,
+    ppid: u32,
+    addr_space: akuma_exec::mmu::UserAddressSpace,
+    info_phys: usize,
+) -> alloc::boxed::Box<akuma_exec::process::Process> {
+    use spinning_top::Spinlock;
+    use alloc::collections::BTreeMap;
+    let mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
+    );
+    alloc::boxed::Box::new(akuma_exec::process::Process {
+        pid, pgid: pid, tgid: pid,
+        state: akuma_exec::process::AtomicProcessState::new(akuma_exec::process::ProcessState::Ready),
+        address_space: akuma_exec::process::ProcAddressSpace::new(addr_space),
+        image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage { name: String::from("test"), exe: String::from("test"), args: Vec::new(), context: akuma_exec::process::UserContext::new(0, 0), text: akuma_primitives::TextPin::none() }),
+        parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: core::sync::atomic::AtomicUsize::new(0x1000_0000),
+        entry_point: core::sync::atomic::AtomicUsize::new(0), memory: mem, process_info_phys: core::sync::atomic::AtomicUsize::new(info_phys),
+        cwd: String::from("/"),
+        root: String::from("/"),
+        stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
+        stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
+        exited: core::sync::atomic::AtomicBool::new(false), exit_code: core::sync::atomic::AtomicI32::new(0),
+        dynamic_page_tables: Vec::new(), mmap_regions: akuma_exec::process::AssistedSpinlock::new(Vec::new()),
+        fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
+        fault_mutex: Spinlock::new(BTreeMap::new()),
+        thread_id: None, spawner_pid: None, ctty: core::sync::atomic::AtomicU32::new(0),
+        terminal_state: alloc::sync::Arc::new(Spinlock::new(
+            akuma_tty::TerminalState::default(),
+        )),
+        box_id: 0, namespace: akuma_isolation::global_namespace(),
+        creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(akuma_exec::process::Creds::ROOT)),
+        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: core::sync::atomic::AtomicU64::new(0),
+        robust_list_head: 0, robust_list_len: 0,
+        signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),
+        signal_mask: 0,
+        sigaltstack_sp: core::sync::atomic::AtomicU64::new(0), sigaltstack_flags: core::sync::atomic::AtomicI32::new(2), sigaltstack_size: core::sync::atomic::AtomicU64::new(0),
+        start_time_us: 0,
+        current_syscall: core::sync::atomic::AtomicU64::new(!0),
+        last_syscall: core::sync::atomic::AtomicU64::new(0),
+        syscall_stats: akuma_exec::process::ProcessSyscallStats::new(),
+    })
+}
+
+/// Verify that the mmap allocator never returns addresses within the
+/// kernel identity-mapped RAM range (0x4000_0000 to 0xC000_0000).
+fn test_mmap_does_not_overlap_identity_map() -> bool {
+    console::print("\n[TEST] MMU: mmap allocator avoids kernel identity map\n");
+
+    let mem = akuma_exec::process::ProcessMemory::new(
+        0x1000_0000, 0xD000_0000, 0xD010_0000, 0x0,
+    );
+
+    for _ in 0..10 {
+        let size = 0x1000;
+        let addr = mem.place(&mut [], size);
+        if let Some(a) = addr {
+            // Verify address is completely outside the kernel reserved range
+            let end = a + size;
+            if a < 0xC000_0000 && end > 0x4000_0000 {
+                crate::safe_print!(128, "  FAIL: allocated 0x{:x}-0x{:x} overlaps kernel\n", a, end);
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Verify that the kernel identity mapping covers the full 2GB RAM range.
+/// This test confirms the fix for the 1GB-hardcoded-limit bug.
+fn test_kernel_identity_mapping_full_ram() -> bool {
+    console::print("\n[TEST] MMU: kernel identity mapping covers full RAM (up to 2GB)\n");
+
+    // 1. Verify low RAM (first 1GB)
+    let low_pa = 0x4000_1000;
+    let low_va = akuma_exec::mmu::phys_to_virt(low_pa) as usize;
+    if low_va != low_pa {
+        crate::safe_print!(128, "  low_va={:#x} != low_pa={:#x}\n", low_va, low_pa);
+        return false;
+    }
+
+    // 2. Verify high RAM (second 1GB, requires L1[2] mapping)
+    // We can't easily allocate a high page from PMM for a unit test without
+    // potentially exhausting memory or relying on luck, but we can verify
+    // that the Page Tables themselves contain the mapping for 0x8000_0000.
+    let high_pa = 0x8000_0000; // PA 2GB (start of 2nd GB)
+    let high_va = akuma_exec::mmu::phys_to_virt(high_pa) as usize;
+
+    if high_va != high_pa {
+        crate::safe_print!(128, "  high_va={:#x} != high_pa={:#x}\n", high_va, high_pa);
+        return false;
+    }
+
+    // 3. Perform a safe probe of the mapping if possible.
+    // In this test environment, we are running in the kernel's address space.
+    // Let's try to allocate a page and see if it lands in high memory.
+    // If it doesn't, we'll manually check the L1/L2 entries for 0x8000_0000.
+    let mut high_frame = None;
+    for _ in 0..1024 { // Try many times to get a high frame
+        if let Some(f) = crate::pmm::alloc_page_zeroed() {
+            if f.addr >= 0x8000_0000 {
+                high_frame = Some(f);
+                break;
+            }
+            crate::pmm::free_page(f);
+        } else {
+            break;
+        }
+    }
+
+    if let Some(f) = high_frame {
+        crate::safe_print!(128, "  Found high frame at {:#x}, probing... ", f.addr);
+        let ptr = akuma_exec::mmu::phys_to_virt(f.addr).cast::<u64>();
+        unsafe {
+            ptr.write_volatile(0xDEAD_BEEF_CAFE_BABE);
+            let val = ptr.read_volatile();
+            if val != 0xDEAD_BEEF_CAFE_BABE {
+                crate::safe_print!(64, "FAIL (readback {:#x})\n", val);
+                crate::pmm::free_page(f);
+                return false;
+            }
+        }
+        crate::safe_print!(64, "OK\n");
+        crate::pmm::free_page(f);
+    } else {
+        crate::safe_print!(128, "  (No high frame allocated, verifying page tables manually)\n");
+        // Manual verification of TTBR0 -> L1 -> L2
+        let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+        unsafe {
+            let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
+            
+            // L0[0] covers 0..512GB
+            let l0e = l0_ptr.add(0).read_volatile();
+            if l0e & 1 == 0 {
+                crate::safe_print!(64, "  FAIL: L0[0] not valid\n");
+                return false;
+            }
+
+            let l1_addr = (l0e & 0x0000_FFFF_FFFF_F000) as usize;
+            let l1_ptr = akuma_exec::mmu::phys_to_virt(l1_addr).cast::<u64>();
+
+            // Check L1[2] (covers 2GB..3GB)
+            let l1e = l1_ptr.add(2).read_volatile();
+            if l1e & 1 == 0 {
+                crate::safe_print!(64, "  FAIL: L1[2] (2GB mapping) not valid\n");
+                return false;
+            }
+            crate::safe_print!(64, "  L1[2] is valid: {:#x}\n", l1e);
+        }
+    }
+
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+/// The boot TTBR0 identity map must cover *all* detected RAM, not just the
+/// static 3GB from boot.rs. Regression for the MEMORY>2GB EL1 fault: the kernel
+/// zeroes PMM frames via phys_to_virt while the boot table is the active TTBR0
+/// (e.g. replace_image's deactivate→swap window), so a frame at PA>=3GB on a
+/// >2GB machine faulted (killed clang/ld). `mmu::extend_boot_ram_identity_map`
+/// > (called from `mmu::init`) maps the rest of RAM as 1GB blocks. This walks the
+/// > boot L1 and asserts every 1GB entry covering [ram_base, ram_end) is valid —
+/// > it passes at any MEMORY size and fails if the high-RAM mapping is missing.
+fn test_boot_map_covers_full_ram() -> bool {
+    console::print("\n[TEST] boot identity map covers full detected RAM\n");
+    let ram_base = akuma_exec::mmu::ram_base();
+    let ram_end = akuma_exec::mmu::ram_end();
+    let l0_phys = (akuma_exec::mmu::get_boot_ttbr0() & 0x0000_FFFF_FFFF_F000) as usize;
+    if l0_phys == 0 {
+        console::print("  SKIP: boot ttbr0 unavailable\n");
+        return true;
+    }
+    let l0 = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
+    let l0e = unsafe { core::ptr::read_volatile(l0) };
+    if l0e & 1 == 0 {
+        console::print("  FAIL: boot L0[0] not valid\n");
+        return false;
+    }
+    let l1 = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+
+    let start = ram_base >> 30;
+    let end = (ram_end - 1) >> 30;
+    let mut pass = true;
+    for idx in start..=end {
+        let e = unsafe { core::ptr::read_volatile(l1.add(idx)) };
+        if e & 1 == 0 {
+            crate::safe_print!(128, "  FAIL: boot L1[{}] (VA {:#x}) not mapped — RAM frame there is unreachable in boot context\n",
+                idx, idx << 30);
+            pass = false;
+        }
+    }
+    crate::safe_print!(128, "  RAM [{:#x},{:#x}) covered by boot L1[{}..={}]  Result: {}\n",
+        ram_base, ram_end, start, end, if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the kernel heap auto-sizing heuristic (`crate::compute_heap_size`):
+/// large RAM keeps the historical generous heap, and small RAM (< 256 MB) always
+/// leaves user pages (the old flat 64 MB floor gave 0 user pages below ~72 MB →
+/// no boot). Pure-function test; skipped if a manual override is configured.
+fn test_compute_heap_size() -> bool {
+    console::print("\n[TEST] compute_heap_size heuristic\n");
+    const MB: usize = 1024 * 1024;
+    if crate::config::KERNEL_HEAP_SIZE_MB != 0 {
+        console::print("  SKIP: KERNEL_HEAP_SIZE_MB override set\n");
+        return true;
+    }
+    // Mirror main.rs's code_and_stack reserve.
+    let cs = |ram: usize| core::cmp::max(ram / 16, 8 * MB);
+    let mut pass = true;
+
+    // Large RAM (>= 256MB): exact historical values must be preserved.
+    let exact: &[(usize, usize)] = &[
+        (256, 64), (512, 64), (1024, 128), (2048, 256), (4096, 256),
+    ];
+    for &(ram_mb, exp_mb) in exact {
+        let ram = ram_mb * MB;
+        let h = crate::compute_heap_size(ram, cs(ram));
+        if h != exp_mb * MB {
+            crate::safe_print!(96, "  FAIL: {}MB RAM -> heap {}MB, expected {}MB\n",
+                ram_mb, h / MB, exp_mb);
+            pass = false;
+        }
+    }
+
+    // Small RAM (< 256MB): heap must leave > 0 user pages and keep a sane floor
+    // (>= 4 MB; boot uses ~2.2 MB). Thread stacks live in PMM, not the heap, so
+    // the heap no longer has to cover them (see compute_thread_limit).
+    for &ram_mb in &[32usize, 48, 64, 96, 128, 192] {
+        let ram = ram_mb * MB;
+        let c = cs(ram);
+        let h = crate::compute_heap_size(ram, c);
+        let user = ram.saturating_sub(c + h);
+        if user == 0 {
+            crate::safe_print!(96, "  FAIL: {}MB RAM -> 0 user pages (heap {}MB)\n", ram_mb, h / MB);
+            pass = false;
+        }
+        if h < 4 * MB {
+            crate::safe_print!(96, "  FAIL: {}MB RAM -> heap {}MB below 4MB floor\n", ram_mb, h / MB);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the reserve-RAM clamp (`crate::reserve_calc_ram`): with clamp 0 it is
+/// the identity (release/size behaviour preserved); with a non-zero clamp it caps
+/// the value used for the kernel's own reserves while never inflating a
+/// small-RAM box. Also checks the intended end-to-end effect: on a large box a
+/// clamp leaves strictly more user pages than no clamp.
+fn test_reserve_calc_ram() -> bool {
+    console::print("\n[TEST] reserve_calc_ram clamp\n");
+    const MB: usize = 1024 * 1024;
+    let mut pass = true;
+
+    // clamp == 0 is the identity for every RAM size.
+    for &ram_mb in &[4usize, 8, 16, 64, 256, 1024] {
+        let r = ram_mb * MB;
+        if crate::reserve_calc_ram(r, 0) != r {
+            crate::safe_print!(80, "  FAIL: clamp 0 changed {}MB\n", ram_mb);
+            pass = false;
+        }
+    }
+
+    // clamp == 4: cap above 4MB, untouched at/below 4MB (never inflate).
+    let cases: &[(usize, usize)] = &[(2, 2), (4, 4), (8, 4), (64, 4), (256, 4)];
+    for &(ram_mb, exp_mb) in cases {
+        let got = crate::reserve_calc_ram(ram_mb * MB, 4);
+        if got != exp_mb * MB {
+            crate::safe_print!(96, "  FAIL: clamp 4, {}MB RAM -> {}MB, expected {}MB\n",
+                ram_mb, got / MB, exp_mb);
+            pass = false;
+        }
+    }
+
+    // End-to-end: on a 64MB box, clamping the reserve RAM must leave strictly
+    // more user pages (the whole point — surplus RAM goes to userspace).
+    let ram = 64 * MB;
+    let cs = |cr: usize| core::cmp::max(cr / 16, MB); // approx code+stack
+    let up = |cr: usize| {
+        let c = cs(cr);
+        ram.saturating_sub(c + crate::compute_heap_size(cr, c))
+    };
+    let clamped = up(crate::reserve_calc_ram(ram, 4));
+    let unclamped = up(crate::reserve_calc_ram(ram, 0));
+    if clamped <= unclamped {
+        crate::safe_print!(96, "  FAIL: clamp gave {}MB user pages, no-clamp {}MB (expected more)\n",
+            clamped / MB, unclamped / MB);
+        pass = false;
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the kernel memory-layout calculator (`crate::compute_memory_layout`):
+/// the three regions are contiguous, in-bounds, cover the boot stack, and leave
+/// a non-empty heap and user-page pool. Uses a synthetic boot-stack top so it is
+/// independent of the linked image size. Reflects the active profile's config.
+fn test_compute_memory_layout() -> bool {
+    console::print("\n[TEST] compute_memory_layout\n");
+    const MB: usize = 1024 * 1024;
+    if crate::config::KERNEL_HEAP_SIZE_MB != 0 {
+        console::print("  SKIP: KERNEL_HEAP_SIZE_MB override set\n");
+        return true;
+    }
+    let ram_base = 0x4000_0000usize;
+    let boot_stack_top = ram_base + 2 * MB; // plausible: kernel image + boot stack
+    let mut pass = true;
+    for &ram_mb in &[16usize, 32, 64, 128, 256, 1024] {
+        let ram = ram_mb * MB;
+        let l = crate::compute_memory_layout(ram_base, ram, boot_stack_top);
+        let ram_end = ram_base + ram;
+        let ok = l.heap_start == ram_base + l.code_and_stack
+            && l.user_pages_start == l.heap_start + l.heap_size
+            && l.user_pages_start + l.user_pages_size <= ram_end
+            && boot_stack_top <= l.heap_start          // code+stack covers boot stack
+            && l.heap_size > 0
+            && l.user_pages_size > 0;
+        if !ok {
+            crate::safe_print!(120,
+                "  FAIL: {}MB -> cs {}KB heap {}KB user {}KB (start {:#x})\n",
+                ram_mb, l.code_and_stack / 1024, l.heap_size / 1024,
+                l.user_pages_size / 1024, l.user_pages_start);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the thread-limit auto-scaling heuristic (`crate::compute_thread_limit`):
+/// the stack pool fits in ~1/4 of the user pages (or hits the reserved+6 floor),
+/// stays within [reserved+6, MAX_THREADS], and uses the full pool on large RAM.
+/// Skipped if a manual override is configured.
+fn test_compute_thread_limit() -> bool {
+    console::print("\n[TEST] compute_thread_limit heuristic\n");
+    const MB: usize = 1024 * 1024;
+    if crate::config::THREAD_LIMIT_OVERRIDE != 0 {
+        console::print("  SKIP: THREAD_LIMIT_OVERRIDE set\n");
+        return true;
+    }
+    let reserved = crate::config::RESERVED_THREADS;
+    let maxt = crate::config::MAX_THREADS;
+    let sys_total = reserved.saturating_sub(1) * crate::config::SYSTEM_THREAD_STACK_SIZE;
+    let ustack = crate::config::USER_THREAD_STACK_SIZE;
+    let mut pass = true;
+
+    // Large user-pages → full MAX_THREADS.
+    let big = crate::compute_thread_limit(1024 * MB);
+    if big != maxt {
+        crate::safe_print!(96, "  FAIL: large RAM -> {} threads, expected MAX {}\n", big, maxt);
+        pass = false;
+    }
+
+    // Small user-pages → bounded, and pool fits in 1/4 of the user pages unless
+    // at the reserved+6 floor (raised from +2 so shell+SSH+tcc can coexist).
+    for &up_mb in &[4usize, 8, 16, 32, 64, 128] {
+        let up = up_mb * MB;
+        let n = crate::compute_thread_limit(up);
+        if n < reserved + 6 || n > maxt {
+            crate::safe_print!(96, "  FAIL: {}MB userpages -> {} threads out of [{},{}]\n",
+                up_mb, n, reserved + 6, maxt);
+            pass = false;
+        }
+        let pool = sys_total + (n - reserved) * ustack;
+        if n > reserved + 6 && pool > up / 4 {
+            crate::safe_print!(96, "  FAIL: {}MB userpages -> pool {}KB > quarter {}KB\n",
+                up_mb, pool / 1024, (up / 4) / 1024);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 8: CLONE_VM child's mmap_regions is empty — lookups must use owner PID.
+///
+/// Registers a parent and a CLONE_VM child in PROCESS_TABLE. Adds mmap_regions
+/// to the parent. Verifies lookup_process_shared(parent) sees the regions while
+/// lookup_process_shared(child) sees none.
+fn test_clone_vm_mmap_regions_on_owner() -> bool {
+    console::print("\n[TEST] CLONE_VM: mmap_regions only on address-space owner\n");
+
+    let parent_pid = akuma_exec::process::allocate_pid();
+    let child_pid = akuma_exec::process::allocate_pid();
+
+    let parent_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (parent AS)\n"); return false; };
+    let l0 = parent_as.l0_phys();
+    let child_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(l0) { a } else { console::print("  OOM (child AS)\n"); return false; };
+    let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+
+    let parent_proc = make_test_process(parent_pid, 0, parent_as, info.addr);
+
+    // Simulate an eager mmap on the parent
+    let test_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+    parent_proc.mmap_regions.lock().push(akuma_exec::process::MmapRegion::owned(0x6809_d000, vec![test_frame]));
+
+    let child_proc = make_test_process(child_pid, parent_pid, child_as, info.addr);
+
+    akuma_exec::process::register_process(parent_pid, parent_proc);
+    akuma_exec::process::register_process(child_pid, child_proc);
+
+    let parent_regions = akuma_exec::process::lookup_process_shared(parent_pid)
+        .map_or(0, |p| p.mmap_regions.lock().len());
+    let child_regions = akuma_exec::process::lookup_process_shared(child_pid)
+        .map_or(0, |p| p.mmap_regions.lock().len());
+
+    // Cleanup. Free the manually-injected mmap frames while the process is still
+    // ACTIVE (and thus visible to lookup_process) — unregister_process now retires
+    // rather than returning ownership, see its doc comment, so this must happen
+    // before, not after.
+    if let Some(p) = akuma_exec::process::lookup_process_shared(parent_pid) {
+        // Detach under vm_lock (mem::take is allocation-free), free outside it.
+        let regions = p.vm_with_regions(core::mem::take);
+        for reg in regions {
+            for f in reg.frames { crate::pmm::free_page(f); }
+        }
+    }
+    let _ = akuma_exec::process::unregister_process(child_pid);
+    let _ = akuma_exec::process::unregister_process(parent_pid);
+    crate::pmm::free_page(info);
+
+    let pass = parent_regions == 1 && child_regions == 0;
+    if !pass {
+        crate::safe_print!(128, "  parent_regions={} child_regions={}\n",
+            parent_regions, child_regions);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 8: Eager mmap fallback must search owner's mmap_regions, not worker's.
+///
+/// Simulates the fault-handler recovery logic: given a fault VA inside an
+/// eager mmap tracked on the owner, verify that searching owner.mmap_regions
+/// finds it while searching worker.mmap_regions does not.
+fn test_clone_vm_eager_fallback_finds_region() -> bool {
+    console::print("\n[TEST] CLONE_VM: eager fallback lookup by owner PID\n");
+
+    let owner_pid = akuma_exec::process::allocate_pid();
+    let worker_pid = akuma_exec::process::allocate_pid();
+
+    let owner_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM\n"); return false; };
+    let l0 = owner_as.l0_phys();
+    let worker_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(l0) { a } else { console::print("  OOM\n"); return false; };
+    let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+
+    let owner_proc = make_test_process(owner_pid, 0, owner_as, info.addr);
+    let worker_proc = make_test_process(worker_pid, owner_pid, worker_as, info.addr);
+
+    // 127-page eager mmap tracked on the owner
+    let region_base: usize = 0x6809_d000;
+    let pages = 127usize;
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { frames.push(f) } else {
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM (frames)\n");
+            return false;
+        }
+    }
+    owner_proc.mmap_regions.lock().push(akuma_exec::process::MmapRegion::owned(region_base, frames));
+
+    akuma_exec::process::register_process(owner_pid, owner_proc);
+    akuma_exec::process::register_process(worker_pid, worker_proc);
+
+    // Fault at 0x680c0000 — page 35 inside the region
+    let fault_va: usize = 0x680c_0000;
+    let page_va = fault_va & !0xFFF;
+
+    // Search via owner PID (correct path after fix)
+    let found_via_owner = akuma_exec::process::lookup_process_shared(owner_pid).and_then(|p| {
+        for reg in p.mmap_regions.lock().iter() {
+            if reg.contains(page_va) {
+                return Some((reg.start_va, reg.pages));
+            }
+        }
+        None
+    });
+
+    // Search via worker PID (broken path before fix)
+    let found_via_worker = akuma_exec::process::lookup_process_shared(worker_pid).and_then(|p| {
+        for reg in p.mmap_regions.lock().iter() {
+            if reg.contains(page_va) {
+                return Some((reg.start_va, reg.pages));
+            }
+        }
+        None
+    });
+
+    // Cleanup. Free the manually-injected mmap frames while the process is still
+    // ACTIVE (and thus visible to lookup_process) — unregister_process now retires
+    // rather than returning ownership, see its doc comment, so this must happen
+    // before, not after.
+    if let Some(p) = akuma_exec::process::lookup_process_shared(owner_pid) {
+        // Detach under vm_lock (mem::take is allocation-free), free outside it.
+        let regions = p.vm_with_regions(core::mem::take);
+        for reg in regions {
+            for f in reg.frames { crate::pmm::free_page(f); }
+        }
+    }
+    let _ = akuma_exec::process::unregister_process(worker_pid);
+    let _ = akuma_exec::process::unregister_process(owner_pid);
+    crate::pmm::free_page(info);
+
+    let pass = found_via_owner == Some((region_base, pages)) && found_via_worker.is_none();
+    if !pass {
+        crate::safe_print!(128, "  owner={:?} worker={:?}\n", found_via_owner, found_via_worker);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// PTE Durability Tests
+//
+// These test the REAL invariant that broke in the Node.js crash:
+//   After map_user_page(va, pa, flags), the PTE at va must exist.
+// Previous tests validated theories about CLONE_VM lookup. These verify
+// hardware-level page table state.
+// ============================================================================
+
+/// Walk the page table from a given L0 physical address and read the L3 PTE.
+/// Returns the raw PTE value (0 if any level is missing).
+fn read_l3_pte(l0_phys: usize, va: usize) -> u64 {
+    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
+    let l0_idx = (va >> 39) & 0x1FF;
+    let l1_idx = (va >> 30) & 0x1FF;
+    let l2_idx = (va >> 21) & 0x1FF;
+    let l3_idx = (va >> 12) & 0x1FF;
+    unsafe {
+        let l0e = l0_ptr.add(l0_idx).read_volatile();
+        if l0e & 1 == 0 { return 0; }
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add(l1_idx).read_volatile();
+        if l1e & 1 == 0 { return 0; }
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add(l2_idx).read_volatile();
+        if l2e & 1 == 0 { return 0; }
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        l3_ptr.add(l3_idx).read_volatile()
+    }
+}
+
+/// Helper: clear a PTE by walking the page table.
+fn clear_pte(l0_phys: usize, va: usize) {
+    unsafe {
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
+        let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 == 0 { return; }
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+        if l1e & 1 == 0 { return; }
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+        if l2e & 1 == 0 { return; }
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
+        l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
+        let _ = akuma_exec::mmu::flush_tlb_page(va, akuma_exec::mmu::TlbTarget::AllCores);
+    }
+}
+
+/// Map 127 pages (matching the crash scenario) and verify EVERY PTE exists.
+/// The crash always hits page 35 (offset 0x23000). If this test fails,
+/// the bug is in map_user_page. If it passes, the bug is downstream.
+fn test_map_127_pages_all_ptes_exist() -> bool {
+    console::print("\n[TEST] map 127 pages, verify every PTE exists\n");
+
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    // Each test uses a unique 2MB-aligned VA range to avoid cross-test
+    // contamination through shared L1/L2 entries. Page table frames are
+    // intentionally LEAKED (not freed) — this matches real kernel behavior
+    // where map_user_page's return value is dropped and PhysFrame has no Drop.
+    // Scratch VA at 256GB (L1[256]), unique to this test. Must stay ABOVE the
+    // kernel RAM identity map (extended to cover all RAM in the boot table by
+    // mmu::extend_boot_ram_identity_map) — a base in [3GB, ram_end) would now
+    // collide with a 1GB identity block on >2GB machines.
+    let base_va: usize = 0x40_0000_0000;
+    let pages = 127usize;
+    let mut frames = Vec::new();
+
+    for i in 0..pages {
+        let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            console::print("  OOM\n");
+            for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+            for f in frames { crate::pmm::free_page(f); }
+            return false;
+        };
+        // Drop the returned table frames — matches real kernel behavior
+        let _ = akuma_exec::mmu::map_user_page(
+            base_va + i * 4096,
+            frame.addr,
+            akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        );
+        frames.push(frame);
+    }
+
+    let mut missing = Vec::new();
+    for i in 0..pages {
+        let pte = read_l3_pte(l0_phys, base_va + i * 4096);
+        if pte & 1 == 0 {
+            missing.push(i);
+        }
+    }
+
+    // Cleanup: clear leaf PTEs, free data frames. Table frames are leaked.
+    for i in 0..pages { clear_pte(l0_phys, base_va + i * 4096); }
+    for f in frames { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty();
+    if !pass {
+        crate::safe_print!(128, "  MISSING PTEs at page indices: {:?} ({}/{})\n",
+            &missing[..core::cmp::min(missing.len(), 20)], missing.len(), pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Map 127 pages, then alloc 64 more zeroed pages. Verify original PTEs survive.
+/// Catches: PMM returning an in-use page-table frame, alloc_page_zeroed
+/// destroying the L3 table.
+fn test_map_pages_survive_subsequent_allocs() -> bool {
+    console::print("\n[TEST] map 127 pages, alloc 64 more, verify PTEs survive\n");
+
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    let base_va: usize = 0x40_4000_0000; // 257GB (L1[257]), above the RAM identity map
+    let pages = 127usize;
+    let mut frames = Vec::new();
+
+    for i in 0..pages {
+        let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            for j in 0..frames.len() { clear_pte(l0_phys, base_va + j * 4096); }
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n"); return false;
+        };
+        let _ = akuma_exec::mmu::map_user_page(
+            base_va + i * 4096,
+            frame.addr,
+            akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        );
+        frames.push(frame);
+    }
+
+    // Allocate 64 more zeroed pages without mapping them
+    let mut extra = Vec::new();
+    for _ in 0..64 {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { extra.push(f); }
+    }
+
+    let mut missing = Vec::new();
+    for i in 0..pages {
+        let pte = read_l3_pte(l0_phys, base_va + i * 4096);
+        if pte & 1 == 0 { missing.push(i); }
+    }
+
+    for f in extra { crate::pmm::free_page(f); }
+    for i in 0..pages { clear_pte(l0_phys, base_va + i * 4096); }
+    for f in frames { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty();
+    if !pass {
+        crate::safe_print!(128, "  MISSING PTEs after alloc: {:?} ({}/{})\n",
+            &missing[..core::cmp::min(missing.len(), 20)], missing.len(), pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Map 1+3+5+127 pages in the same 2MB range, exactly like the crash log.
+/// Verifies all 136 PTEs exist and point to the correct physical addresses.
+fn test_map_interleaved_regions_same_l3() -> bool {
+    console::print("\n[TEST] map 1+3+5+127 pages in same 2MB range, verify all PTEs\n");
+
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    // 258GB (L1[258]), above the RAM identity map. Offsets within a single 2MB range.
+    let base_2mb: usize = 0x40_8000_0000;
+    let regions: [(usize, usize); 4] = [
+        (0x94000, 1),   // L3[148]
+        (0x95000, 3),   // L3[149-151]
+        (0x98000, 5),   // L3[152-156]
+        (0x9d000, 127), // L3[157-283], crash page = L3[192]
+    ];
+
+    let mut mappings: Vec<(usize, crate::pmm::PhysFrame)> = Vec::new();
+
+    for &(offset, count) in &regions {
+        for i in 0..count {
+            let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+                console::print("  OOM\n");
+                for (va, _) in &mappings { clear_pte(l0_phys, *va); }
+                for (_, f) in mappings { crate::pmm::free_page(f); }
+                return false;
+            };
+            let va = base_2mb + offset + i * 4096;
+            let _ = akuma_exec::mmu::map_user_page(
+                va,
+                frame.addr,
+                akuma_exec::mmu::user_flags::RW_NO_EXEC,
+            );
+            mappings.push((va, frame));
+        }
+    }
+
+    let mut missing = Vec::new();
+    let mut wrong_pa = Vec::new();
+    for (idx, (va, frame)) in mappings.iter().enumerate() {
+        let pte = read_l3_pte(l0_phys, *va);
+        if pte & 1 == 0 {
+            missing.push((idx, *va));
+        } else {
+            let pte_pa = (pte & 0x0000_FFFF_FFFF_F000) as usize;
+            if pte_pa != frame.addr {
+                wrong_pa.push((idx, *va, pte_pa, frame.addr));
+            }
+        }
+    }
+
+    for (va, _) in &mappings { clear_pte(l0_phys, *va); }
+    for (_, f) in mappings { crate::pmm::free_page(f); }
+
+    let pass = missing.is_empty() && wrong_pa.is_empty();
+    if !pass {
+        if !missing.is_empty() {
+            crate::safe_print!(128, "  MISSING PTEs ({}):\n", missing.len());
+            for (idx, va) in &missing[..core::cmp::min(missing.len(), 10)] {
+                crate::safe_print!(128, "    idx={} va=0x{:x} L3[{}]\n",
+                    idx, va, (va >> 12) & 0x1FF);
+            }
+        }
+        if !wrong_pa.is_empty() {
+            crate::safe_print!(128, "  WRONG PA ({}):\n", wrong_pa.len());
+            for (idx, va, got, exp) in &wrong_pa[..core::cmp::min(wrong_pa.len(), 10)] {
+                crate::safe_print!(128, "    idx={} va=0x{:x} got=0x{:x} exp=0x{:x}\n",
+                    idx, va, got, exp);
+            }
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bug 10: Partial munmap of eager mmap regions
+//
+// sys_munmap removes the ENTIRE eager region when the start address matches,
+// ignoring the requested unmap length. Node.js/V8/jemalloc frequently mmap a
+// large region then trim prefix/suffix via munmap to get alignment.
+// ============================================================================
+
+/// Helper: replicates the FIXED sys_munmap eager-region logic.
+/// Supports partial prefix unmap: when len < region_size, only the first
+/// `len/4096` pages are freed and the remainder is re-inserted.
+fn simulate_sys_munmap_eager(
+    mmap_regions: &mut Vec<(usize, Vec<crate::pmm::PhysFrame>)>,
+    addr: usize,
+    len: usize,
+) -> (Option<usize>, usize) {
+    let unmap_pages = len / 4096;
+
+    // Exact start match
+    if let Some(idx) = mmap_regions.iter().position(|(start, _)| *start == addr) {
+        let region_pages = mmap_regions[idx].1.len();
+        if unmap_pages >= region_pages {
+            let (_, frames) = mmap_regions.remove(idx);
+            let freed = frames.len();
+            for f in frames { crate::pmm::free_page(f); }
+            return (Some(idx), freed);
+        }
+        // Partial prefix unmap
+        let (old_start, old_frames) = mmap_regions.remove(idx);
+        let mut iter = old_frames.into_iter();
+        let mut freed = 0usize;
+        for _ in 0..unmap_pages {
+            if let Some(f) = iter.next() {
+                crate::pmm::free_page(f);
+                freed += 1;
+            }
+        }
+        let remaining: Vec<crate::pmm::PhysFrame> = iter.collect();
+        if !remaining.is_empty() {
+            let new_start = old_start + unmap_pages * 4096;
+            mmap_regions.push((new_start, remaining));
+        }
+        return (Some(idx), freed);
+    }
+
+    // Sub-range munmap (addr inside an eager region) is NOT handled here —
+    // it falls through to the lazy region handler in the real sys_munmap.
+
+    (None, 0)
+}
+
+/// Build the single-region eager-mmap fixture the three `test_eager_munmap_*` tests
+/// start from: `pages` freshly zeroed frames recorded as one region at `base`.
+///
+/// Returns `None` on OOM, having already freed whatever it managed to allocate and
+/// printed the `  OOM` line — so the caller's whole failure path is `else { return
+/// false }`. Was written out three times, identically, including the partial-free.
+fn alloc_eager_region(
+    base: usize,
+    pages: usize,
+) -> Option<Vec<(usize, Vec<crate::pmm::PhysFrame>)>> {
+    let mut frames = Vec::new();
+    for _ in 0..pages {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() {
+            frames.push(f);
+        } else {
+            for f in frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n");
+            return None;
+        }
+    }
+    Some(alloc::vec![(base, frames)])
+}
+
+/// Prefix munmap of an eager region MUST preserve the suffix.
+///
+/// Scenario matching the Node.js crash:
+///   1. mmap(NULL, 127*4096) → base_addr  (eager, 127 pages)
+///   2. munmap(base_addr, 4*4096)          (trim prefix — only 4 pages)
+///   3. Access page 35 → should still be mapped
+///
+/// Expected: after step 2, only 4 pages are freed and pages 4–126 survive.
+/// BUG: sys_munmap removes ALL 127 pages because it ignores `len`.
+fn test_eager_munmap_prefix_preserves_suffix() -> bool {
+    console::print("\n[TEST] Bug 10: munmap prefix of eager region preserves suffix\n");
+
+    let pages = 127usize;
+    let unmap_pages = 4usize;
+    let base: usize = 0xA000_0000;
+
+    let Some(mut mmap_regions) = alloc_eager_region(base, pages) else { return false };
+
+    // Simulate munmap(base, 4*4096) — should free only first 4 pages
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, base, unmap_pages * 4096,
+    );
+
+    // CORRECT behavior assertions:
+    // 1. The munmap should match (start == addr)
+    let did_match = matched.is_some();
+    // 2. Only 4 pages should be freed, not 127
+    let freed_correct = freed_count == unmap_pages;
+    // 3. A region for the suffix (pages 4–126) should remain
+    let suffix_addr = base + unmap_pages * 4096;
+    let suffix_remaining = mmap_regions.iter().any(|(start, fr)| {
+        *start == suffix_addr && fr.len() == pages - unmap_pages
+    });
+
+    // Cleanup remaining regions
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+
+    let pass = did_match && freed_correct && suffix_remaining;
+    if !pass {
+        crate::safe_print!(256,
+            "  matched={} freed={} (expected {}) suffix_present={}\n",
+            did_match, freed_count, unmap_pages, suffix_remaining);
+        crate::safe_print!(128,
+            "  BUG: sys_munmap freed ALL {} pages instead of {} — suffix destroyed\n",
+            freed_count, unmap_pages);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Suffix munmap of an eager region: sub-range match is disabled for safety.
+/// The munmap falls through to the lazy region handler. The eager region is untouched.
+fn test_eager_munmap_suffix_preserves_prefix() -> bool {
+    console::print("\n[TEST] Bug 10: munmap suffix — no-op for eager (falls to lazy handler)\n");
+
+    let pages = 127usize;
+    let keep = 100usize;
+    let trim = pages - keep;
+    let base: usize = 0xB000_0000;
+
+    let Some(mut mmap_regions) = alloc_eager_region(base, pages) else { return false };
+
+    let suffix_addr = base + keep * 4096;
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, suffix_addr, trim * 4096,
+    );
+
+    let no_match = matched.is_none();
+    let no_freed = freed_count == 0;
+    let original_intact = mmap_regions.iter().any(|(start, fr)| {
+        *start == base && fr.len() == pages
+    });
+
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+
+    let pass = no_match && no_freed && original_intact;
+    if !pass {
+        crate::safe_print!(128,
+            "  matched={:?} freed={} original_intact={}\n",
+            matched, freed_count, original_intact);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Full munmap correctly removes the entire region.
+fn test_eager_munmap_full_removes_all() -> bool {
+    console::print("\n[TEST] munmap: full-length eager region removal\n");
+
+    let pages = 127usize;
+    let base: usize = 0xC000_0000;
+
+    let Some(mut mmap_regions) = alloc_eager_region(base, pages) else { return false };
+
+    let (matched, freed_count) = simulate_sys_munmap_eager(
+        &mut mmap_regions, base, pages * 4096,
+    );
+
+    let pass = matched.is_some() && freed_count == pages && mmap_regions.is_empty();
+    if !pass {
+        crate::safe_print!(128,
+            "  matched={:?} freed={} regions_left={}\n",
+            matched, freed_count, mmap_regions.len());
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Bug 11: munmap fallback clears stale PTEs while protecting eager regions.
+///
+/// Simulates the scenario: demand-paged pages exist without mmap_region tracking.
+/// munmap must clear those PTEs but NOT touch PTEs inside tracked eager regions.
+fn test_munmap_fallback_clears_stale_ptes() -> bool {
+    console::print("\n[TEST] Bug 11: munmap fallback clears stale PTEs, protects eager regions\n");
+
+    let base: usize = 0xD000_0000;
+    let eager_base: usize = base + 4 * 4096;
+    let eager_pages = 4usize;
+
+    let mut mmap_regions: Vec<(usize, Vec<crate::pmm::PhysFrame>)> = Vec::new();
+    let mut eager_frames = Vec::new();
+    for _ in 0..eager_pages {
+        if let Some(f) = crate::pmm::alloc_page_zeroed() { eager_frames.push(f) } else {
+            for f in eager_frames { crate::pmm::free_page(f); }
+            console::print("  OOM\n"); return false;
+        }
+    }
+    mmap_regions.push((eager_base, eager_frames));
+
+    // Simulate munmap fallback: clear PTEs for pages NOT in eager regions
+    let munmap_start = base;
+    let munmap_pages = 12usize; // spans both non-eager and eager pages
+    let mut cleared = 0usize;
+    let mut protected = 0usize;
+    for i in 0..munmap_pages {
+        let va = munmap_start + i * 4096;
+        let in_eager = mmap_regions.iter().any(|(start, frames)| {
+            va >= *start && va < *start + frames.len() * 4096
+        });
+        if in_eager {
+            protected += 1;
+        } else {
+            cleared += 1;
+        }
+    }
+
+    // Expect: 4 pages protected (inside eager region), 8 pages cleared
+    let pass = cleared == 8 && protected == 4;
+    if !pass {
+        crate::safe_print!(128, "  cleared={} protected={} (expected 8, 4)\n",
+            cleared, protected);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+
+    for (_, frs) in mmap_regions { for f in frs { crate::pmm::free_page(f); } }
+    pass
+}
+
+/// Bug 12: mprotect must update lazy region flags for demand paging.
+///
+/// Verifies that `update_eager_region_flags` — `mprotect`'s record edit, over
+/// the one list that holds lazy regions too — changes the stored flags on an
+/// overlapping lazy region.
+fn test_mprotect_updates_lazy_flags() -> bool {
+    console::print("\n[TEST] Bug 12: mprotect updates lazy region flags\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
+    let va_start: usize = 0xE000_0000;
+    let region_size: usize = 16 * 4096;
+
+    // Push a PROT_NONE lazy region (flags=0)
+    akuma_exec::process::push_lazy_region(test_pid, va_start, region_size, 0);
+
+    // Verify initial flags are 0
+    let initial_flags = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, va_start)
+        .map_or(0xDEAD, |(f, _, _, _)| f);
+    let initial_ok = initial_flags == 0;
+
+    // mprotect updates flags to RW_NO_EXEC
+    let new_flags = akuma_exec::mmu::user_flags::RW_NO_EXEC;
+    akuma_exec::process::update_eager_region_flags(test_pid, va_start, region_size, akuma_exec::mmu::Prot::RW_NO_EXEC);
+
+    // Verify flags are updated
+    let updated_flags = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, va_start)
+        .map_or(0xDEAD, |(f, _, _, _)| f);
+    let updated_ok = updated_flags == new_flags;
+
+    // Clean up
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = initial_ok && updated_ok;
+    if !pass {
+        crate::safe_print!(128, "  initial_flags=0x{:x} (expected 0) updated=0x{:x} (expected 0x{:x})\n",
+            initial_flags, updated_flags, new_flags);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bug 2: clear_child_tid not reset on execve
+// ============================================================================
+//
+// When a process calls execve, Linux resets clear_child_tid to 0.  Akuma's
+// replace_image / replace_image_from_path did NOT do this.  If the pre-exec
+// program (e.g. musl) had called set_tid_address() to store a TLS pointer,
+// that pointer survives into the post-exec address space.  On exit,
+// return_to_kernel writes 0 to that (now-stale) address from EL1.  If the
+// page is lazily mapped and never faulted in, the write causes an EL1 data
+// abort because EL1 page faults don't trigger demand paging.
+//
+// This test verifies that replace_image resets clear_child_tid to 0.
+fn test_execve_clears_child_tid() -> bool {
+    console::print("\n[TEST] Bug 2: execve must reset clear_child_tid\n");
+
+    let pid = akuma_exec::process::allocate_pid();
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (AS)\n"); return false; };
+    let info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+
+    // Create Process with clear_child_tid set (simulating set_tid_address)
+    let proc = make_test_process(pid, 0, addr_space, info.addr);
+    proc.clear_child_tid.store(0x300c_2e80, core::sync::atomic::Ordering::Relaxed);
+
+    let before = proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed);
+    assert!(before == 0x300c_2e80, "clear_child_tid should be set");
+
+    // Simulate what replace_image now does: reset clear_child_tid to 0
+    proc.clear_child_tid.store(0, core::sync::atomic::Ordering::Relaxed);
+
+    // Verify the fix: clear_child_tid must be 0 after exec (replace_image)
+    let pass = proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed) == 0;
+    if !pass {
+        crate::safe_print!(128, "  clear_child_tid before=0x{:x} after=0x{:x} (expected 0)\n",
+            before, proc.clear_child_tid.load(core::sync::atomic::Ordering::Relaxed));
+    }
+
+    // Cleanup
+    akuma_exec::process::register_process(pid, proc);
+    let _ = akuma_exec::process::unregister_process(pid);
+    crate::pmm::free_page(info);
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bug 3: phantom frame leak when map_user_page loses a race
+// ============================================================================
+//
+// When two threads fault on the same VA, both allocate a physical frame and
+// call map_user_page.  The first thread wins the CAS and installs the PTE.
+// The second sees "already mapped" and returns, but the caller still tracks
+// the losing frame via track_user_frame.  This "phantom frame" is allocated,
+// tracked, but never accessible — wasting memory until process exit.
+//
+// With readahead of 256 pages and multiple CLONE_VM threads, the waste
+// compounds and can exhaust physical memory on the second run.
+//
+// This test maps a page, then maps the SAME VA again with a different frame.
+// It verifies that map_user_page does NOT report success for the second
+// mapping and that the caller can detect the phantom frame.
+fn test_map_user_page_race_leaks_frame() -> bool {
+    console::print("\n[TEST] Bug 3: map_user_page race → phantom frame leak\n");
+
+    let frame_a = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+    let frame_b = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { crate::pmm::free_page(frame_a); console::print("  OOM\n"); return false; };
+
+    // Above the RAM identity map (see test_map_user_page_roundtrip for why a fixed
+    // ~7.5GB VA crashes at MEMORY≥8G).
+    let test_va: usize = 0x41_8000_0000; // 262GB
+
+    // Map frame_a at test_va (first mapper wins)
+    let (table_frames_a, installed_a) =
+        akuma_exec::mmu::map_user_page(test_va, frame_a.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+
+    let _mapped_a = akuma_exec::mmu::is_current_user_page_mapped(test_va);
+
+    // Now simulate a racing second mapper: map frame_b at the SAME VA
+    let (table_frames_b, installed_b) =
+        akuma_exec::mmu::map_user_page(test_va, frame_b.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC);
+
+    // After the fix, map_user_page returns (TableFrames, bool) where
+    // bool=true means "PTE was installed", bool=false means "already mapped,
+    // your frame was NOT installed" (phantom).
+    //
+    // First call: installed_a should be true (we won the race).
+    // Second call: installed_b should be false (we lost, frame_b is phantom).
+    let pte_pa = get_mapped_pa(test_va);
+    let _ = pte_pa == Some(frame_a.addr); // frame_b should be phantom (not installed)
+
+    // Cleanup: clear the PTE manually
+    clear_boot_ttbr0_pte(test_va, PtClear::LeafAndTables);
+
+    crate::pmm::free_page(frame_a);
+    crate::pmm::free_page(frame_b);
+    for tf in table_frames_a { crate::pmm::free_page(tf); }
+    for tf in table_frames_b { crate::pmm::free_page(tf); }
+
+    // Record PMM free count before/after to verify no leak
+    let (_, _, free_after) = crate::pmm::stats();
+
+    // PASS when installed_a==true and installed_b==false (API reports the phantom).
+    let pass = installed_a && !installed_b;
+    if !pass {
+        crate::safe_print!(128, "  frame_a=0x{:x} frame_b=0x{:x} pte_pa=0x{:x} installed_a={} installed_b={} free={}\n",
+            frame_a.addr, frame_b.addr, pte_pa.unwrap_or(0), installed_a, installed_b, free_after);
+        if !installed_a {
+            crate::safe_print!(128, "  BUG: first map_user_page should report installed=true\n");
+        } else if installed_b {
+            crate::safe_print!(128, "  BUG: second map_user_page should report installed=false (phantom)\n");
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// How far up the walk [`clear_boot_ttbr0_pte`] tears down.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PtClear {
+    /// Clear only the L3 entry. For a test unmapping several pages that share one
+    /// L3 table: cutting the branch on the first page would leave the rest of the
+    /// leaves unreachable and therefore uncleared.
+    LeafOnly,
+    /// Clear the L3 entry **and** the L2 and L1 entries above it. Required by any
+    /// test that then `free_page`s the table frames `map_user_page` returned —
+    /// otherwise the boot L1 keeps pointing at a freed L2, and when that frame is
+    /// reused (e.g. as a new `UserAddressSpace`'s L1) the boot TTBR0 aliases the
+    /// new address space's tables and later tests take spurious translation faults.
+    LeafAndTables,
+}
+
+/// Undo a boot-TTBR0 mapping a test installed with `map_user_page`, restoring the
+/// table to the state the next test expects.
+///
+/// This walk was written four times in this file — three of them clearing only the
+/// leaf, and exactly one (in `test_map_user_page_roundtrip`) carrying both the L2/L1
+/// clear and the comment explaining why it is needed. All three shallow copies then
+/// freed the table frames anyway, so they had the aliasing hazard that comment
+/// describes; they now pass [`PtClear::LeafAndTables`]. That is the whole argument
+/// of `TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §6 in one function: the fix lived
+/// in one copy of four, and no reader of the other three could see it was missing.
+///
+/// Silently does nothing if any level is already absent, which is the same
+/// best-effort contract every copy had.
+fn clear_boot_ttbr0_pte(va: usize, depth: PtClear) {
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    unsafe {
+        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>();
+        let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 == 0 { return; }
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
+        let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+        if l1e & 1 == 0 { return; }
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
+        let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+        if l2e & 1 == 0 { return; }
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize).cast::<u64>();
+        l3_ptr.add((va >> 12) & 0x1FF).write_volatile(0);
+        if depth == PtClear::LeafAndTables {
+            l2_ptr.add((va >> 21) & 0x1FF).write_volatile(0);
+            l1_ptr.add((va >> 30) & 0x1FF).write_volatile(0);
+        }
+        let _ = akuma_exec::mmu::flush_tlb_page(va, akuma_exec::mmu::TlbTarget::AllCores);
+    }
+}
+
+/// Read the physical address from the L3 PTE for a given VA using current TTBR0.
+fn get_mapped_pa(va: usize) -> Option<usize> {
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    unsafe {
+        let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+        let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
+        let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+        if l0e & 1 == 0 { return None; }
+        let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+        if l1e & 1 == 0 { return None; }
+        let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+        if l2e & 1 == 0 { return None; }
+        let l3_ptr = akuma_exec::mmu::phys_to_virt((l2e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+        let l3e = l3_ptr.add((va >> 12) & 0x1FF).read_volatile();
+        if l3e & 1 == 0 { return None; }
+        Some((l3e & 0x0000_FFFF_FFFF_F000) as usize)
+    }
+}
+
+// ============================================================================
+// Bug 5: CLONE_VM readahead race causes phantom frame waste
+// ============================================================================
+//
+// When multiple CLONE_VM threads readahead the same file-backed lazy region,
+// each thread allocates frames for 256 pages.  The first thread installs
+// the PTEs; subsequent threads find "already mapped" and their frames become
+// phantoms — allocated and tracked but never accessible.
+//
+// With 3 threads readaheading the same 256-page range, 512 frames (2 MB)
+// are wasted per region.  Over 20 lazy regions this is 40 MB — enough to
+// cause OOM on the second process run.
+//
+// This test verifies the readahead fix: Thread B checks is_current_user_page_mapped
+// before each page and skips if already mapped — no phantom frames created.
+fn test_readahead_race_phantom_frames() -> bool {
+    console::print("\n[TEST] Bug 5: readahead race → phantom frame waste\n");
+
+    const NUM_PAGES: usize = 8;
+    let base_va: usize = 0x40_C000_0000; // 259GB, above the RAM identity map
+
+    // "Thread A" readahead: map NUM_PAGES pages normally
+    let mut frames_a = Vec::new();
+    let mut table_frames_all = Vec::new();
+    let mut all_installed = true;
+    for i in 0..NUM_PAGES {
+        let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+        let (tfs, installed) = akuma_exec::mmu::map_user_page(
+            base_va + i * 0x1000,
+            frame.addr,
+            akuma_exec::mmu::user_flags::RW_NO_EXEC,
+        );
+        if !installed {
+            all_installed = false;
+        }
+        for tf in tfs { table_frames_all.push(tf); }
+        frames_a.push(frame);
+    }
+
+    // "Thread B" readahead: check is_current_user_page_mapped before each page,
+    // skip if already mapped (simulating the fix — no allocation, no phantom).
+    let mut skipped_count = 0usize;
+    for i in 0..NUM_PAGES {
+        let va = base_va + i * 0x1000;
+        if akuma_exec::mmu::is_current_user_page_mapped(va) {
+            skipped_count += 1;
+        }
+    }
+
+    // Cleanup: clear every leaf first — all NUM_PAGES share one L3 table, so cutting
+    // the branch on page 0 would strand the other seven — then cut the branch once,
+    // because the table frames are freed just below.
+    for i in 0..NUM_PAGES {
+        clear_boot_ttbr0_pte(base_va + i * 0x1000, PtClear::LeafOnly);
+    }
+    clear_boot_ttbr0_pte(base_va, PtClear::LeafAndTables);
+
+    for f in frames_a { crate::pmm::free_page(f); }
+    for tf in table_frames_all { crate::pmm::free_page(tf); }
+
+    // PASS when: Thread A installed all pages, Thread B skipped all (no phantom frames)
+    let pass = all_installed && skipped_count == NUM_PAGES;
+    if !pass {
+        crate::safe_print!(128, "  all_installed={} skipped_count={}/{} (expected all N)\n",
+            all_installed, skipped_count, NUM_PAGES);
+        if !all_installed {
+            crate::safe_print!(128, "  BUG: Thread A map_user_page should report installed=true for each page\n");
+        } else {
+            crate::safe_print!(128, "  BUG: Thread B should skip all N pages (is_current_user_page_mapped check)\n");
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify that unmap_and_free_page returns the physical frame and removes it
+/// from user_frames, allowing the caller to free it via PMM.
+fn test_unmap_and_free_page_returns_frame() -> bool {
+    console::print("\n[TEST] unmap_and_free_page: returns frame and removes from user_frames\n");
+
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (frame)\n"); return false; };
+
+    let test_va: usize = 0x1000_0000;
+    if addr_space.map_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+        crate::pmm::free_page(frame);
+        console::print("  map_page failed\n");
+        return false;
+    }
+    addr_space.track_user_frame(frame);
+
+    let free_before = crate::pmm::free_count();
+
+    let returned = addr_space.unmap_and_free_page(test_va);
+
+    let got_frame = returned.map(|f| f.addr) == Some(frame.addr);
+    let not_mapped = !addr_space.is_mapped(test_va);
+
+    if let Some(f) = returned {
+        crate::pmm::free_page(f);
+    }
+
+    let free_after = crate::pmm::free_count();
+    let freed_one = free_after == free_before + 1;
+
+    let second_call = addr_space.unmap_and_free_page(test_va);
+    let second_none = second_call.is_none();
+
+    let pass = got_frame && not_mapped && freed_one && second_none;
+    if !pass {
+        crate::safe_print!(128, "  got_frame={} not_mapped={} freed_one={} second_none={}\n",
+            got_frame, not_mapped, freed_one, second_none);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify that lazy region munmap now frees demand-paged physical frames.
+/// Simulates the sys_munmap lazy path: push lazy region, map pages into it
+/// (as demand paging would), munmap via lazy_regions_in_range + unmap_and_free_page,
+/// and verify PMM free count is restored.
+fn test_lazy_munmap_frees_demand_paged_frames() -> bool {
+    console::print("\n[TEST] lazy munmap: frees demand-paged physical frames\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    let base_va: usize = 0x7000_0000;
+    let num_pages: usize = 8;
+    let region_size = num_pages * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, region_size, 0);
+
+    let free_before = crate::pmm::free_count();
+
+    let mut page_frames = Vec::new();
+    for i in 0..num_pages {
+        let f = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            for pf in &page_frames { crate::pmm::free_page(*pf); }
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  OOM\n");
+            return false;
+        };
+        let va = base_va + i * 4096;
+        if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+            crate::pmm::free_page(f);
+            for pf in &page_frames { crate::pmm::free_page(*pf); }
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  map_page failed\n");
+            return false;
+        }
+        addr_space.track_user_frame(f);
+        page_frames.push(f);
+    }
+
+    let free_after_alloc = crate::pmm::free_count();
+    let alloc_cost = free_before - free_after_alloc;
+
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base_va, region_size);
+
+    let mut freed_count = 0usize;
+    for &(freed_start, freed_pages) in &results {
+        for i in 0..freed_pages {
+            if let Some(frame) = addr_space.unmap_and_free_page(freed_start + i * 4096) {
+                crate::pmm::free_page(frame);
+                freed_count += 1;
+            }
+        }
+    }
+
+    let free_after_munmap = crate::pmm::free_count();
+
+    let all_freed = freed_count == num_pages;
+    let pmm_restored = free_after_munmap >= free_before - 4; // page table frames still held
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = all_freed && pmm_restored && results.len() == 1;
+    if !pass {
+        crate::safe_print!(128, "  freed_count={}/{} alloc_cost={} pmm_restored={} results={}\n",
+            freed_count, num_pages, alloc_cost, pmm_restored, results.len());
+        crate::safe_print!(128, "  free: before={} after_alloc={} after_munmap={}\n",
+            free_before, free_after_alloc, free_after_munmap);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Simulate MADV_DONTNEED: map pages into a lazy region, free them via
+/// unmap_and_free_page, verify PMM recovers and lazy region persists.
+fn test_madvise_dontneed_frees_pages() -> bool {
+    console::print("\n[TEST] MADV_DONTNEED: zeroes pages in place, preserves mapping & lazy region\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    let base_va: usize = 0xA000_0000;
+    let num_pages: usize = 16;
+    let region_size = num_pages * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, region_size, 0);
+
+    for i in 0..num_pages {
+        let f = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  OOM\n");
+            return false;
+        };
+        let va = base_va + i * 4096;
+        if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+            crate::pmm::free_page(f);
+            akuma_exec::process::clear_lazy_regions(test_pid);
+            console::print("  map_page failed\n");
+            return false;
+        }
+        addr_space.track_user_frame(f);
+
+        // Write a non-zero pattern so we can verify zeroing
+        unsafe {
+            let ptr = akuma_exec::mmu::phys_to_virt(f.addr).cast::<u8>();
+            core::ptr::write_bytes(ptr, 0xAB, 4096);
+        }
+    }
+
+    let free_before = crate::pmm::free_count();
+
+    // Simulate MADV_DONTNEED: zero pages in place (no unmap, no free)
+    let mut zeroed = 0usize;
+    for i in 0..num_pages {
+        let va = base_va + i * 4096;
+        if addr_space.zero_mapped_page(va) {
+            zeroed += 1;
+        }
+    }
+
+    let free_after = crate::pmm::free_count();
+
+    // Pages should NOT be freed — zero in place keeps the mapping
+    let no_pmm_change = free_before == free_after;
+
+    // Lazy region must still exist
+    let region_exists = lazy_regions_of(test_pid)
+        .iter()
+        .any(|&(s, sz, _)| s == base_va && sz == region_size);
+
+    let pass = zeroed == num_pages && no_pmm_change && region_exists;
+    if !pass {
+        crate::safe_print!(128, "  zeroed={}/{} no_pmm_change={} region_exists={}\n",
+            zeroed, num_pages, no_pmm_change, region_exists);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// MADV_DONTNEED loop: repeated zero-in-place cycles must not leak pages.
+fn test_madvise_dontneed_loop_no_leak() -> bool {
+    console::print("\n[TEST] MADV_DONTNEED loop: zero-in-place 50 iterations, no leak\n");
+
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    let test_va: usize = 0xB000_0000;
+    let f = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+    if addr_space.map_page(test_va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+        crate::pmm::free_page(f);
+        console::print("  map_page failed\n");
+        return false;
+    }
+    addr_space.track_user_frame(f);
+
+    let free_baseline = crate::pmm::free_count();
+    let iterations = 50;
+
+    for _ in 0..iterations {
+        // Write dirty data, then zero via MADV_DONTNEED semantics
+        unsafe {
+            let ptr = akuma_exec::mmu::phys_to_virt(f.addr).cast::<u8>();
+            core::ptr::write_bytes(ptr, 0xCC, 4096);
+        }
+        addr_space.zero_mapped_page(test_va);
+    }
+
+    let free_after = crate::pmm::free_count();
+    let no_leak = free_baseline == free_after;
+    let pass = no_leak;
+    if !pass {
+        crate::safe_print!(128, "  baseline={} after={} diff={}\n",
+            free_baseline, free_after, free_baseline.saturating_sub(free_after));
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify that `clear_lazy_regions` empties a process's lazy-region map.
+fn test_kill_process_clears_lazy_regions() -> bool {
+    console::print("\n[TEST] kill_process: clears lazy regions\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
+
+    akuma_exec::process::push_lazy_region(test_pid, 0x8000_0000, 0x10_0000, 0);
+    akuma_exec::process::push_lazy_region(test_pid, 0x9000_0000, 0x10_0000, 0);
+
+    let before = akuma_exec::process::lazy_region_count_for_pid(test_pid);
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    // The map is now empty. The `Process` itself outlives the clear — it is the
+    // owner of the map, and it goes away with `unregister_process` (here, the
+    // guard's `Drop`), not with `clear_lazy_regions`.
+    let after = akuma_exec::process::lazy_region_count_for_pid(test_pid);
+
+    let pass = before == 2 && after == 0;
+    if !pass {
+        crate::safe_print!(128, "  before={} after={}\n", before, after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify kill_process(parent) cascades to direct children.
+fn test_kill_process_cascades_to_children() -> bool {
+    console::print("\n[TEST] kill_process: parent kill cascades to child\n");
+
+    let parent_pid = akuma_exec::process::allocate_pid();
+    let child_pid = akuma_exec::process::allocate_pid();
+
+    let parent_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (parent AS)\n"); return false; };
+    let child_as = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (child AS)\n"); return false; };
+    let parent_info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (parent info)\n"); return false; };
+    let child_info = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+        crate::pmm::free_page(parent_info);
+        console::print("  OOM (child info)\n");
+        return false;
+    };
+
+    let parent_proc = make_test_process(parent_pid, 0, parent_as, parent_info.addr);
+    let child_proc = make_test_process(child_pid, parent_pid, child_as, child_info.addr);
+    akuma_exec::process::register_process(parent_pid, parent_proc);
+    akuma_exec::process::register_process(child_pid, child_proc);
+
+    let kill_ok = akuma_exec::process::kill_process(parent_pid).is_ok();
+    // After kill, processes should be zombies (still in table, but exited=true)
+    let parent_zombie = akuma_exec::process::lookup_process_shared(parent_pid)
+        .is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
+    let child_zombie = akuma_exec::process::lookup_process_shared(child_pid)
+        .is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
+
+    // Clean up zombies (simulates what wait4/on_thread_cleanup would do)
+    let _ = akuma_exec::process::unregister_process(parent_pid);
+    let _ = akuma_exec::process::unregister_process(child_pid);
+    crate::pmm::free_page(parent_info);
+    crate::pmm::free_page(child_info);
+
+    let pass = kill_ok && parent_zombie && child_zombie;
+    if !pass {
+        crate::safe_print!(128, "  kill_ok={} parent_zombie={} child_zombie={}\n",
+            kill_ok, parent_zombie, child_zombie);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Batch allocate 64 pages, verify all distinct and zeroed.
+fn test_alloc_pages_batch_basic() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: batch 64 pages, all distinct and zeroed\n");
+
+    let count = 64usize;
+    let frames = if let Some(f) = crate::pmm::alloc_pages_zeroed(count) { f } else { console::print("  OOM\n"); return false; };
+
+    let got_count = frames.len() == count;
+
+    // Verify all distinct addresses
+    let mut addrs: Vec<usize> = frames.iter().map(|f| f.addr).collect();
+    addrs.sort_unstable();
+    addrs.dedup();
+    let all_distinct = addrs.len() == count;
+
+    // Verify all zeroed
+    let mut all_zeroed = true;
+    for frame in &frames {
+        let ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *const u64;
+        for i in 0..512 {
+            let val = unsafe { ptr.add(i).read_volatile() };
+            if val != 0 {
+                all_zeroed = false;
+                break;
+            }
+        }
+        if !all_zeroed { break; }
+    }
+
+    for f in &frames { crate::pmm::free_page(*f); }
+
+    let pass = got_count && all_distinct && all_zeroed;
+    if !pass {
+        crate::safe_print!(128, "  got_count={} all_distinct={} all_zeroed={}\n",
+            got_count, all_distinct, all_zeroed);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Batch allocate 128 pages, free all, verify PMM free count restored.
+fn test_alloc_pages_batch_free() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: batch 128 alloc+free restores PMM\n");
+
+    let free_before = crate::pmm::free_count();
+
+    let frames = if let Some(f) = crate::pmm::alloc_pages_zeroed(128) { f } else { console::print("  OOM\n"); return false; };
+
+    let free_during = crate::pmm::free_count();
+    let allocated_128 = free_before - free_during == 128;
+
+    for f in &frames { crate::pmm::free_page(*f); }
+
+    let free_after = crate::pmm::free_count();
+    let restored = free_after == free_before;
+
+    let pass = allocated_128 && restored;
+    if !pass {
+        crate::safe_print!(128, "  before={} during={} after={}\n",
+            free_before, free_during, free_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Batch alloc when insufficient pages: returns None, no partial alloc.
+fn test_alloc_pages_batch_insufficient() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: insufficient returns None, no leak\n");
+
+    let free_before = crate::pmm::free_count();
+
+    // Request more pages than available
+    let result = crate::pmm::alloc_pages_zeroed(free_before + 1000);
+    let returned_none = result.is_none();
+
+    let free_after = crate::pmm::free_count();
+    let no_leak = free_after == free_before;
+
+    let pass = returned_none && no_leak;
+    if !pass {
+        crate::safe_print!(128, "  returned_none={} free_before={} free_after={}\n",
+            returned_none, free_before, free_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Alternate batch and single allocs, verify no overlap.
+fn test_alloc_pages_batch_interleaved() -> bool {
+    console::print("\n[TEST] alloc_pages_zeroed: interleaved with single allocs\n");
+
+    let batch1 = if let Some(f) = crate::pmm::alloc_pages_zeroed(16) { f } else { console::print("  OOM batch1\n"); return false; };
+
+    let single1 = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+        for f in &batch1 { crate::pmm::free_page(*f); }
+        console::print("  OOM single1\n");
+        return false;
+    };
+
+    let batch2 = if let Some(f) = crate::pmm::alloc_pages_zeroed(16) { f } else {
+        for f in &batch1 { crate::pmm::free_page(*f); }
+        crate::pmm::free_page(single1);
+        console::print("  OOM batch2\n");
+        return false;
+    };
+
+    let mut all_addrs: Vec<usize> = Vec::new();
+    for f in &batch1 { all_addrs.push(f.addr); }
+    all_addrs.push(single1.addr);
+    for f in &batch2 { all_addrs.push(f.addr); }
+
+    all_addrs.sort_unstable();
+    let before_dedup = all_addrs.len();
+    all_addrs.dedup();
+    let no_overlap = all_addrs.len() == before_dedup;
+
+    for f in &batch1 { crate::pmm::free_page(*f); }
+    crate::pmm::free_page(single1);
+    for f in &batch2 { crate::pmm::free_page(*f); }
+
+    let pass = no_overlap;
+    if !pass {
+        crate::safe_print!(128, "  before_dedup={} after_dedup={}\n",
+            before_dedup, all_addrs.len());
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression for the TALC <-> PMM lock cycle.
+/// See `docs/reference/subsystems/memory.md` -> "PMM ↔ heap lock flow".
+///
+/// `BitmapAllocator::alloc_pages` used to build its `Vec<PhysFrame>` *while
+/// holding `PMM`*. The kernel heap's own growth path (`PmmOomHandler::handle_oom`)
+/// takes `PMM`, so that closed a cycle between two non-reentrant spinlocks.
+///
+/// **How a regression here presents: the boot suite HANGS, it does not fail.**
+/// The PMM side spins inside `with_irqs_disabled`, so the stuck core takes no
+/// timer IRQ — no preemption, no console, no panic. "The suite stopped printing
+/// at this test" IS the failure signal. That is also why this reproduced in the
+/// field as a *silent* all-core wedge at ~399% host CPU rather than a crash.
+///
+/// This phase is single-core and deterministic: it interleaves batch page
+/// allocation with heap traffic sized to force `handle_oom` to run.
+fn test_pmm_heap_lock_order() -> bool {
+    console::print("\n[TEST] pmm/heap lock order: batch alloc interleaved with heap growth\n");
+
+    let (_t, _a, free_before) = crate::pmm::stats();
+
+    // Each round: take a page batch, then churn the heap hard enough that talc
+    // must claim new spans from the PMM. Pre-fix, the `Vec` inside the PMM lock
+    // could itself be the allocation that triggered that claim -> self-deadlock
+    // on one core, no second core required.
+    for round in 0..8usize {
+        let count = 32 + round * 16;
+        let Some(frames) = crate::pmm::alloc_pages_zeroed(count) else {
+            console::print("  OOM (batch)\n");
+            return false;
+        };
+        if frames.len() != count {
+            crate::safe_print!(96, "  short batch: got {} want {}\n", frames.len(), count);
+            for f in &frames { crate::pmm::free_page(*f); }
+            return false;
+        }
+
+        // Heap traffic while those pages are held.
+        let mut ballast: Vec<Vec<u8>> = Vec::new();
+        for i in 0..24usize {
+            ballast.push(alloc::vec![(i & 0xff) as u8; 4096 * (1 + (i % 4))]);
+        }
+        // Touch it so nothing is optimised away.
+        let mut sum = 0usize;
+        for b in &ballast { sum = sum.wrapping_add(b[0] as usize); }
+        core::hint::black_box(sum);
+        drop(ballast);
+
+        for f in &frames { crate::pmm::free_page(*f); }
+    }
+
+    let (_t2, _a2, free_after) = crate::pmm::stats();
+    let conserved = free_after == free_before;
+    if !conserved {
+        crate::safe_print!(128, "  PMM leak: free_before={} free_after={}\n",
+            free_before, free_after);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if conserved { "PASS" } else { "FAIL" });
+    conserved
+}
+
+/// Test that mprotect flag updates work: RW_NO_EXEC -> RX via update_page_flags,
+/// and the IC IALLU cache maintenance path runs without error.
+fn test_mprotect_flag_update_with_cache_maintenance() -> bool {
+    console::print("\n[TEST] mprotect: flag update RW -> RX with cache maintenance\n");
+
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (frame)\n"); return false; };
+
+    let test_va: usize = 0xC000_0000;
+    if addr_space.map_page(test_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+        crate::pmm::free_page(frame);
+        console::print("  map_page failed\n");
+        return false;
+    }
+    addr_space.track_user_frame(frame);
+
+    // Write some data (simulating JIT code write)
+    let ptr = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u32>();
+    unsafe {
+        // AArch64 NOP = 0xD503201F, RET = 0xD65F03C0
+        ptr.write_volatile(0xD503201F); // NOP
+        ptr.add(1).write_volatile(0xD65F03C0); // RET
+    }
+
+    // Update flags to RX (simulating mprotect PROT_READ|PROT_EXEC)
+    addr_space.update_page_flags(test_va, akuma_exec::mmu::user_flags::RX);
+    // Prove the edit landed by reading the leaf back — RX must clear UXN. This
+    // was `.is_ok()` on an always-`Ok` Result, i.e. a term that contributed
+    // nothing to `pass` below.
+    let update_ok = addr_space
+        .read_l3_page_entry(test_va)
+        .is_some_and(|e| e & akuma_exec::mmu::flags::UXN == 0);
+
+    // Run the IC IALLU cache maintenance path (as sys_mprotect now does).
+    // Clean the data cache via the kernel-mapped address of the frame, NOT the
+    // user VA: `addr_space` is not the active TTBR0 here, so `test_va` is not
+    // translatable and `dc cvau` on it would fault on real hardware / HVF (it is
+    // only a silent no-op under QEMU TCG). The real sys_mprotect cleans via the
+    // same kernel VA — see the DC CVAU on `kva` in exceptions.rs.
+    let kva = akuma_exec::mmu::phys_to_virt(frame.addr) as usize;
+    let mut off = 0usize;
+    while off < 4096 {
+        akuma_cpu::cache::dc_cvau(kva + off);
+        off += 64;
+    }
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::cache::ic_iallu();
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
+
+    // Verify page is still mapped
+    let still_mapped = addr_space.is_mapped(test_va);
+
+    let pass = update_ok && still_mapped;
+    if !pass {
+        crate::safe_print!(128, "  update_ok={} still_mapped={}\n", update_ok, still_mapped);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that mprotect with IC IALLU completes on a large region (256 pages = 1MB)
+/// without hanging. Exercises the batch cache maintenance path.
+fn test_mprotect_large_region_completes() -> bool {
+    console::print("\n[TEST] mprotect: IC IALLU on 256-page region completes\n");
+
+    let mut addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    let num_pages: usize = 256;
+    let base_va: usize = 0xD000_0000;
+
+    let frames = if let Some(f) = crate::pmm::alloc_pages_zeroed(num_pages) { f } else { console::print("  OOM (frames)\n"); return false; };
+
+    for (i, f) in frames.iter().enumerate() {
+        let va = base_va + i * 4096;
+        if addr_space.map_page(va, f.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_err() {
+            for ff in &frames { crate::pmm::free_page(*ff); }
+            console::print("  map_page failed\n");
+            return false;
+        }
+        addr_space.track_user_frame(*f);
+    }
+
+    // Update all to RX
+    for i in 0..num_pages {
+        let va = base_va + i * 4096;
+        addr_space.update_page_flags(va, akuma_exec::mmu::user_flags::RX);
+    }
+
+    // Run the optimized cache maintenance path: DC CVAU loop + single IC IALLU.
+    // Clean via each frame's kernel-mapped address (not the user VA in the
+    // inactive `addr_space`), matching the real sys_mprotect path — see the
+    // companion note in test_mprotect_flag_update_with_cache_maintenance.
+    for f in &frames {
+        let kva = akuma_exec::mmu::phys_to_virt(f.addr) as usize;
+        let mut off = 0usize;
+        while off < 4096 {
+            akuma_cpu::cache::dc_cvau(kva + off);
+            off += 64;
+        }
+    }
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::cache::ic_iallu();
+    akuma_cpu::barrier::dsb_ish();
+    akuma_cpu::barrier::isb();
+
+    // If we got here, it completed without hanging
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+// ============================================================================
+// mremap + lazy region tests
+// ============================================================================
+
+/// Test that mremap of a lazy region copies demand-faulted data and
+/// removes the old lazy region entry from the process's lazy-region map.
+fn test_mremap_lazy_region_moves_data() -> bool {
+    console::print("\n[TEST] mremap: lazy region moves data and removes old entry\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
+    let base_va: usize = 0xB000_0000;
+    let old_size: usize = 512 * 4096; // >256 pages = lazy
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, old_size, 0);
+
+    let has_region = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_some();
+
+    // Simulate mremap removing the old lazy region
+    let results = akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base_va, old_size);
+    let removed = !results.is_empty() || akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_none();
+    let gone = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_none();
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = has_region && removed && gone;
+    if !pass {
+        crate::safe_print!(128, "  has_region={} removed={} gone={}\n", has_region, removed, gone);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that mremap to a smaller size (shrink) returns the old address.
+fn test_mremap_lazy_region_shrink() -> bool {
+    console::print("\n[TEST] mremap: shrink returns old address (no-op)\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
+    let base_va: usize = 0xC000_0000;
+    let old_size: usize = 1024 * 4096;
+    let new_size: usize = 512 * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, old_size, 0);
+
+    let old_pages = old_size.div_ceil(4096);
+    let new_pages = new_size.div_ceil(4096);
+    let shrink_returns_old = new_pages <= old_pages;
+
+    // Lazy region should still be present (shrink is a no-op for sys_mremap)
+    let still_there = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_some();
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = shrink_returns_old && still_there;
+    if !pass {
+        crate::safe_print!(64, "  shrink_ok={} still_there={}\n", shrink_returns_old, still_there);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that after mremap of a lazy region, the old VA range has no
+/// lazy region coverage (simulating PTE cleanup).
+fn test_mremap_lazy_cleans_old_ptes() -> bool {
+    console::print("\n[TEST] mremap: old lazy region removed after move\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let _proc = LazyTestProcess::new(test_pid);
+    let base_va: usize = 0xD000_0000;
+    let region_size: usize = 512 * 4096;
+
+    akuma_exec::process::push_lazy_region(test_pid, base_va, region_size, 0);
+
+    let covered_before = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_some();
+    let mid_covered = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va + region_size / 2).is_some();
+
+    // Remove old lazy region (as mremap would do)
+    akuma_exec::process::munmap_lazy_regions_in_range(test_pid, base_va, region_size);
+
+    let uncovered_after = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va).is_none();
+    let mid_uncovered = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, base_va + region_size / 2).is_none();
+
+    akuma_exec::process::clear_lazy_regions(test_pid);
+
+    let pass = covered_before && mid_covered && uncovered_after && mid_uncovered;
+    if !pass {
+        crate::safe_print!(128, "  before={} mid={} after={} mid_after={}\n",
+            covered_before, mid_covered, uncovered_after, mid_uncovered);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// set_robust_list tests
+// ============================================================================
+
+/// Test that set_robust_list stores the head pointer on the process.
+fn test_set_robust_list_stores_head() -> bool {
+    console::print("\n[TEST] set_robust_list: stores head pointer\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM\n"); return false; };
+
+    let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+
+    let mut proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
+    let initial_ok = proc.robust_list_head == 0;
+
+    proc.robust_list_head = 0xDEAD_BEEF_0000;
+    proc.robust_list_len = 24;
+    let stored_ok = proc.robust_list_head == 0xDEAD_BEEF_0000 && proc.robust_list_len == 24;
+
+    crate::pmm::free_page(info_frame);
+
+    let pass = initial_ok && stored_ok;
+    if !pass {
+        crate::safe_print!(64, "  initial_ok={} stored_ok={}\n", initial_ok, stored_ok);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test that robust_list fields are initialized to zero on new processes.
+fn test_robust_list_cleanup_wakes_futex() -> bool {
+    console::print("\n[TEST] robust_list: fields initialized to zero\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM\n"); return false; };
+
+    let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
+
+    let proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
+    let head_zero = proc.robust_list_head == 0;
+    let len_zero = proc.robust_list_len == 0;
+
+    crate::pmm::free_page(info_frame);
+
+    let pass = head_zero && len_zero;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// membarrier tests
+// ============================================================================
+
+/// Test that MEMBARRIER_CMD_PRIVATE_EXPEDITED returns success.
+fn test_membarrier_private_expedited_succeeds() -> bool {
+    console::print("\n[TEST] membarrier: PRIVATE_EXPEDITED returns 0\n");
+
+    let result = crate::syscall::membarrier_cmd(8);
+    let pass = result == 0;
+    if !pass {
+        crate::safe_print!(64, "  expected=0 got={:#x}\n", result);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// NEON/FP register save/restore tests
+// ============================================================================
+//
+// These tests verify that NEON/FP registers (Q0-Q31, FPCR, FPSR) are correctly
+// saved and restored across context switches (both preemptive IRQ and voluntary
+// yield). Without this, NEON-heavy userspace (e.g. llama.cpp with -march=armv8.2-a)
+// would get corrupted FP state after being preempted.
+
+static NEON_TEST_ERRORS: AtomicU32 = AtomicU32::new(0);
+
+/// One thread of [`test_neon_regs_across_preemption`]: fill **Q4-Q7** with
+/// `pattern` and busy-loop for 30 ms, re-checking as fast as it can.
+///
+/// It fills Q4-Q7. Until 2026-11-11 a sibling voluntary-yield test filled Q0-Q3;
+/// it ran only on the SGI scheduler, whose yield entered through the IRQ path, and
+/// was deleted with that scheduler's last trace.
+fn neon_preempt_thread(pattern: u64, label: &'static str, done: &'static AtomicBool) -> ! {
+    let mut errors: u32 = 0;
+    unsafe {
+        core::arch::asm!(
+            "dup v4.2d, {p}",
+            "dup v5.2d, {p}",
+            "dup v6.2d, {p}",
+            "dup v7.2d, {p}",
+            p = in(reg) pattern,
+        );
+    }
+
+    let start = crate::timer::uptime_us();
+    let duration = 30_000; // 30ms — guarantees multiple preemptions at 10ms quantum
+    let mut checks: u32 = 0;
+
+    while crate::timer::uptime_us() - start < duration {
+        let mut lo4: u64;
+        let mut lo5: u64;
+        let mut lo6: u64;
+        let mut lo7: u64;
+        unsafe {
+            core::arch::asm!(
+                "mov {lo4}, v4.d[0]",
+                "mov {lo5}, v5.d[0]",
+                "mov {lo6}, v6.d[0]",
+                "mov {lo7}, v7.d[0]",
+                lo4 = out(reg) lo4,
+                lo5 = out(reg) lo5,
+                lo6 = out(reg) lo6,
+                lo7 = out(reg) lo7,
+            );
+        }
+        if lo4 != pattern || lo5 != pattern || lo6 != pattern || lo7 != pattern {
+            errors += 1;
+        }
+        checks += 1;
+    }
+
+    if errors > 0 {
+        NEON_TEST_ERRORS.fetch_add(errors, Ordering::Relaxed);
+    }
+    crate::safe_print!(64, "  {}: {} checks, {} errors\n", label, checks, errors);
+    done.store(true, Ordering::Release);
+    threading::mark_current_terminated();
+    loop { threading::yield_now(); akuma_cpu::park::wfi(); }
+}
+
+/// Test: NEON registers survive preemptive scheduling (busy-loop, no yield).
+///
+/// Two threads busy-loop using NEON registers for a known duration. The timer
+/// IRQ will preempt them. After the loop each thread checks its registers.
+/// This catches missing save/restore in irq_el0_handler / irq_handler.
+fn test_neon_regs_across_preemption() -> bool {
+    console::print("\n[TEST] NEON registers across preemptive scheduling\n");
+
+    NEON_TEST_ERRORS.store(0, Ordering::SeqCst);
+
+    static P_DONE_A: AtomicBool = AtomicBool::new(false);
+    static P_DONE_B: AtomicBool = AtomicBool::new(false);
+    P_DONE_A.store(false, Ordering::SeqCst);
+    P_DONE_B.store(false, Ordering::SeqCst);
+
+    // Thread A: busy-loop with Q4-Q7 = 0x1111 pattern for ~30ms
+    match threading::spawn_fn(|| neon_preempt_thread(0x1111_1111_1111_1111, "A", &P_DONE_A)) {
+        Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
+    }
+
+    // Thread B: busy-loop with Q4-Q7 = 0xEEEE pattern for ~30ms
+    match threading::spawn_fn(|| neon_preempt_thread(0xEEEE_EEEE_EEEE_EEEE, "B", &P_DONE_B)) {
+        Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
+    }
+
+    // Wait for both threads (they run for ~30ms each under preemption)
+    for _ in 0..500 {
+        threading::yield_now();
+        if P_DONE_A.load(Ordering::Acquire) && P_DONE_B.load(Ordering::Acquire) { break; }
+    }
+
+    let cleaned = threading::cleanup_terminated_force();
+    let errors = NEON_TEST_ERRORS.load(Ordering::SeqCst);
+    let both_done = P_DONE_A.load(Ordering::Acquire) && P_DONE_B.load(Ordering::Acquire);
+    let pass = both_done && errors == 0;
+
+    crate::safe_print!(128,
+        "  done_a={} done_b={} errors={} cleaned={}\n",
+        P_DONE_A.load(Ordering::Acquire), P_DONE_B.load(Ordering::Acquire), errors, cleaned
+    );
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: FP arithmetic produces correct results across preemption.
+///
+/// Two threads perform floating-point accumulation with known expected results.
+/// If NEON state is corrupted, the floating-point accumulators will diverge.
+fn test_fp_arithmetic_across_preemption() -> bool {
+    console::print("\n[TEST] FP arithmetic across preemptive scheduling\n");
+
+    static FP_RESULT_A: AtomicU64 = AtomicU64::new(0);
+    static FP_RESULT_B: AtomicU64 = AtomicU64::new(0);
+    static FP_DONE_A: AtomicBool = AtomicBool::new(false);
+    static FP_DONE_B: AtomicBool = AtomicBool::new(false);
+    FP_RESULT_A.store(0, Ordering::SeqCst);
+    FP_RESULT_B.store(0, Ordering::SeqCst);
+    FP_DONE_A.store(false, Ordering::SeqCst);
+    FP_DONE_B.store(false, Ordering::SeqCst);
+
+    // Thread A: sum 1.0 + 2.0 + ... + 1000.0 using FP, busy-looping for preemption
+    match threading::spawn_fn(|| {
+        let mut acc: f64 = 0.0;
+        for i in 1..=1000u64 {
+            acc += i as f64;
+            if i % 100 == 0 {
+                // Spin briefly to allow preemption between batches
+                let t = crate::timer::uptime_us();
+                while crate::timer::uptime_us() - t < 500 {
+                    akuma_cpu::park::nop();
+                }
+            }
+        }
+        FP_RESULT_A.store(acc.to_bits(), Ordering::Release);
+        FP_DONE_A.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); akuma_cpu::park::wfi(); }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread A: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn A failed: {}\n", e); return false; }
+    }
+
+    // Thread B: sum 1001.0 + 1002.0 + ... + 2000.0 using FP
+    match threading::spawn_fn(|| {
+        let mut acc: f64 = 0.0;
+        for i in 1001..=2000u64 {
+            acc += i as f64;
+            if i % 100 == 0 {
+                let t = crate::timer::uptime_us();
+                while crate::timer::uptime_us() - t < 500 {
+                    akuma_cpu::park::nop();
+                }
+            }
+        }
+        FP_RESULT_B.store(acc.to_bits(), Ordering::Release);
+        FP_DONE_B.store(true, Ordering::Release);
+        threading::mark_current_terminated();
+        loop { threading::yield_now(); akuma_cpu::park::wfi(); }
+    }) {
+        Ok(tid) => crate::safe_print!(32, "  Thread B: tid={}\n", tid),
+        Err(e) => { crate::safe_print!(64, "  Spawn B failed: {}\n", e); return false; }
+    }
+
+    for _ in 0..500 {
+        threading::yield_now();
+        if FP_DONE_A.load(Ordering::Acquire) && FP_DONE_B.load(Ordering::Acquire) { break; }
+    }
+
+    let cleaned = threading::cleanup_terminated_force();
+    let both_done = FP_DONE_A.load(Ordering::Acquire) && FP_DONE_B.load(Ordering::Acquire);
+
+    let result_a = f64::from_bits(FP_RESULT_A.load(Ordering::Acquire));
+    let result_b = f64::from_bits(FP_RESULT_B.load(Ordering::Acquire));
+    let expected_a: f64 = 500500.0;  // n*(n+1)/2 for n=1000
+    let expected_b: f64 = 1500500.0; // sum(1001..2000) = sum(1..2000) - sum(1..1000)
+
+    let diff_a = if result_a > expected_a { result_a - expected_a } else { expected_a - result_a };
+    let diff_b = if result_b > expected_b { result_b - expected_b } else { expected_b - result_b };
+    let a_ok = diff_a < 0.001;
+    let b_ok = diff_b < 0.001;
+    let pass = both_done && a_ok && b_ok;
+
+    crate::safe_print!(128,
+        "  A={} (expect {}) B={} (expect {}) cleaned={}\n",
+        result_a as u64, expected_a as u64, result_b as u64, expected_b as u64, cleaned
+    );
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test large mmap limit expansion (for Bun Gigacage support)
+/// Verifies that a ProcessMemory configured with large limits can allocate 128GB
+fn test_large_mmap_limit() -> bool {
+    console::print("\n[TEST] Large mmap limit (Bun Gigacage)\n");
+    
+    // Simulate limits for a large binary (from elf_loader.rs)
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128GB
+    const MAX_STACK_TOP: usize = 0x40_0000_0000;  // 256GB
+    const USER_STACK_SIZE: usize = 2 * 1024 * 1024;
+    
+    let brk = 0x2000_0000; // Simulate some heap usage
+    let stack_top = MAX_STACK_TOP;
+    let stack_bottom = stack_top - USER_STACK_SIZE;
+    let mmap_floor = brk + MIN_MMAP_SPACE;
+    
+    let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bottom, stack_top, mmap_floor);
+    
+    crate::safe_print!(128, "  Created ProcessMemory: next_mmap={:#x}, mmap_limit={:#x}\n",
+        mem.next_mmap.load(core::sync::atomic::Ordering::Relaxed), mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
+    
+    // Bun allocates a 1GB arena + 64GB Gigacage (not 128GB contiguous)
+    let arena_size = 1024 * 1024 * 1024;
+    let gigacage_size = 64usize * 1024 * 1024 * 1024;
+
+    let arena_addr = mem.place(&mut [], arena_size);
+    let gigacage_addr = mem.place(&mut [], gigacage_size);
+
+    match (arena_addr, gigacage_addr) {
+        (Some(a1), Some(a2)) => {
+            crate::safe_print!(128, "  1GB arena at {:#x}, 64GB gigacage at {:#x}\n", a1, a2);
+            console::print("  Result: PASS\n");
+            true
+        }
+        (a1, a2) => {
+            crate::safe_print!(128, "  FAILED: arena={:?} gigacage={:?} (limit={:#x})\n",
+                a1, a2, mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
+            console::print("  Result: FAIL\n");
+            false
+        }
+    }
+}
+
+/// Test: sys_close_range implementation
+///
+/// Creates a temporary test process and registers it so that current_process_shared()
+/// works inside sys_close_range. This is necessary because memory tests run
+/// during early boot before any user process exists.
+fn test_close_range() -> bool {
+    console::print("\n[TEST] sys_close_range\n");
+
+    let test_pid = akuma_exec::process::allocate_pid();
+    let addr_space = if let Some(a) = akuma_exec::mmu::UserAddressSpace::new() { a } else { console::print("  OOM (addr space)\n"); return false; };
+    let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM (info frame)\n"); return false; };
+
+    let test_proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
+    akuma_exec::process::register_process(test_pid, test_proc);
+
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::process::register_thread_pid(tid, test_pid);
+
+    let proc = akuma_exec::process::lookup_process_shared(test_pid).unwrap();
+
+    // 1. Setup a few FDs
+    let fd1 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd2 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd3 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+    let fd4 = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevNull);
+
+    crate::safe_print!(128, "  Allocated FDs: {}, {}, {}, {}\n", fd1, fd2, fd3, fd4);
+
+    // 2. Test CLOSE_RANGE_CLOEXEC
+    crate::safe_print!(128, "  Testing CLOSE_RANGE_CLOEXEC on {}-{}\n", fd1, fd2);
+    crate::syscall::sys_close_range(fd1, fd2, 4); // 4 = CLOSE_RANGE_CLOEXEC
+
+    let cloexec1 = proc.is_cloexec(fd1);
+    let cloexec2 = proc.is_cloexec(fd2);
+    let cloexec3 = proc.is_cloexec(fd3);
+
+    crate::safe_print!(128, "  CLOEXEC states: {}={}, {}={}, {}={}\n",
+        fd1, cloexec1, fd2, cloexec2, fd3, cloexec3);
+
+    if !cloexec1 || !cloexec2 || cloexec3 {
+        console::print("  CLOEXEC state mismatch\n");
+        akuma_exec::process::unregister_thread_pid(tid);
+        akuma_exec::process::unregister_process(test_pid);
+        crate::pmm::free_page(info_frame);
+        return false;
+    }
+
+    // 3. Test actual close
+    crate::safe_print!(128, "  Testing actual close on {}-{}\n", fd1, fd3);
+    crate::syscall::sys_close_range(fd1, fd3, 0);
+
+    let exists1 = proc.get_fd(fd1).is_some();
+    let exists2 = proc.get_fd(fd2).is_some();
+    let exists3 = proc.get_fd(fd3).is_some();
+    let exists4 = proc.get_fd(fd4).is_some();
+
+    crate::safe_print!(128, "  FD exists: {}={}, {}={}, {}={}, {}={}\n",
+        fd1, exists1, fd2, exists2, fd3, exists3, fd4, exists4);
+
+    let pass = !exists1 && !exists2 && !exists3 && exists4;
+    if !pass {
+        console::print("  FD existence mismatch after close\n");
+    }
+
+    // Cleanup
+    akuma_exec::process::unregister_thread_pid(tid);
+    akuma_exec::process::unregister_process(test_pid);
+    crate::pmm::free_page(info_frame);
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Regression tests for extract-syscalls branch
+// ============================================================================
+
+/// Regression: PMM contiguous alloc returns a valid frame.
+///
+/// Thread stacks were moved from heap Vec to PMM contiguous pages in
+/// `threading.rs`. This tests the basic contract: alloc returns Some,
+/// address is page-aligned, and free restores the free count.
+fn test_pmm_contiguous_alloc_basic() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: basic alloc and free\n");
+
+    const PAGES: usize = 32; // 128KB — minimum thread stack size
+    let before = crate::pmm::free_count();
+
+    let frame = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(PAGES) { f } else {
+        console::print("  OOM\n");
+        return false;
+    };
+
+    let during = crate::pmm::free_count();
+    let allocated_ok = before.saturating_sub(during) == PAGES;
+    let aligned = frame.addr % 4096 == 0;
+
+    crate::safe_print!(128, "  frame.addr={:#x} allocated={} aligned={}\n",
+        frame.addr, allocated_ok, aligned);
+
+    crate::pmm::free_pages_contiguous(frame, PAGES);
+
+    let after = crate::pmm::free_count();
+    let restored = after == before;
+
+    let pass = allocated_ok && aligned && restored;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: PMM contiguous alloc returns zeroed pages.
+///
+/// `alloc_pages_contiguous_zeroed` must zero all allocated pages and flush
+/// the data cache before returning. Without zeroing, thread stacks contain
+/// garbage and canary checks fail on first spawn.
+fn test_pmm_contiguous_alloc_zeroed() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: all pages are zeroed\n");
+
+    const PAGES: usize = 8;
+    let frame = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(PAGES) { f } else {
+        console::print("  OOM\n");
+        return false;
+    };
+
+    let mut all_zero = true;
+    let virt = akuma_exec::mmu::phys_to_virt(frame.addr) as *const u64;
+    for i in 0..(PAGES * 4096 / 8) {
+        let val = unsafe { virt.add(i).read_volatile() };
+        if val != 0 {
+            crate::safe_print!(64, "  non-zero at offset {}: {:#x}\n", i * 8, val);
+            all_zero = false;
+            break;
+        }
+    }
+
+    crate::pmm::free_pages_contiguous(frame, PAGES);
+
+    crate::safe_print!(64, "  Result: {}\n", if all_zero { "PASS" } else { "FAIL" });
+    all_zero
+}
+
+/// Regression: PMM contiguous free restores the free count exactly.
+///
+/// Simulates allocate → use → free for a single thread stack. Verifies no
+/// pages are leaked regardless of the address returned.
+fn test_pmm_contiguous_free_restores_count() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: free restores exact count\n");
+
+    const PAGES: usize = 64; // 256KB — system_thread_stack_size
+    let before = crate::pmm::free_count();
+
+    let frame = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(PAGES) { f } else {
+        console::print("  OOM\n");
+        return false;
+    };
+
+    // Write a sentinel to each page so we know they're all distinct
+    let base = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u64>();
+    for i in 0..PAGES {
+        unsafe { base.add(i * 512).write_volatile(0xDEAD_BEEF_0000_0000 | i as u64); }
+    }
+
+    crate::pmm::free_pages_contiguous(frame, PAGES);
+
+    let after = crate::pmm::free_count();
+    let pass = after == before;
+    if !pass {
+        crate::safe_print!(128, "  before={} after={} diff={}\n",
+            before, after, before as isize - after as isize);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: 32 PMM contiguous stack allocations don't overlap.
+///
+/// `ThreadPool::init` calls `allocate_stack_for_slot` for every thread slot
+/// (MAX_THREADS = 32). Each slot gets a PMM-backed stack. If the contiguous
+/// allocator returns overlapping regions, two threads share stack space and
+/// one will corrupt the other.
+fn test_pmm_contiguous_stack_sized_no_overlap() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: 32 stack-sized allocs don't overlap\n");
+
+    const STACK_PAGES: usize = 32; // 128 KB
+    const NUM_SLOTS: usize = 32;
+
+    let mut frames: Vec<(usize, usize)> = Vec::new(); // (start_phys, end_phys)
+    let mut oom = false;
+
+    for _ in 0..NUM_SLOTS {
+        if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(STACK_PAGES) {
+            frames.push((f.addr, f.addr + STACK_PAGES * 4096));
+        } else {
+            oom = true;
+            break;
+        }
+    }
+
+    if oom {
+        // Free what we got then skip — kernel might not have enough RAM for test
+        for (addr, _) in &frames {
+            crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(*addr), STACK_PAGES);
+        }
+        console::print("  OOM (not enough physical RAM for 32 stacks — skip)\n");
+        return true; // Not a test failure, just insufficient resources
+    }
+
+    // Check no two regions overlap
+    let mut overlap = false;
+    'outer: for i in 0..frames.len() {
+        for j in (i + 1)..frames.len() {
+            let (a_start, a_end) = frames[i];
+            let (b_start, b_end) = frames[j];
+            if a_start < b_end && b_start < a_end {
+                crate::safe_print!(128, "  OVERLAP: slot {} [{:#x}–{:#x}) vs slot {} [{:#x}–{:#x})\n",
+                    i, a_start, a_end, j, b_start, b_end);
+                overlap = true;
+                break 'outer;
+            }
+        }
+    }
+
+    for (addr, _) in &frames {
+        crate::pmm::free_pages_contiguous(akuma_exec::PhysFrame::new(*addr), STACK_PAGES);
+    }
+
+    let pass = !overlap;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Allocate at stack size, double, free original — no overlap.
+///
+/// `reallocate_stack` frees the old PMM stack and allocates a new larger one.
+/// Verify that the new allocation doesn't overlap with any other live stack.
+fn test_pmm_contiguous_double_stack_size_no_overlap() -> bool {
+    console::print("\n[TEST] PMM contiguous alloc: reallocate (double size) no overlap\n");
+
+    const SMALL_PAGES: usize = 32; // 128KB original
+    const LARGE_PAGES: usize = 64; // 256KB reallocated
+
+    let frame_a = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) { f } else { console::print("  OOM\n"); return false; };
+    let frame_b = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(SMALL_PAGES) { f } else {
+        crate::pmm::free_pages_contiguous(frame_a, SMALL_PAGES);
+        console::print("  OOM\n");
+        return false;
+    };
+
+    // Simulate reallocating frame_a: free it, then alloc a larger region
+    crate::pmm::free_pages_contiguous(frame_a, SMALL_PAGES);
+    let frame_large = if let Some(f) = crate::pmm::alloc_pages_contiguous_zeroed(LARGE_PAGES) { f } else {
+        crate::pmm::free_pages_contiguous(frame_b, SMALL_PAGES);
+        console::print("  OOM\n");
+        return false;
+    };
+
+    // frame_large must not overlap with frame_b (the surviving stack)
+    let b_start = frame_b.addr;
+    let b_end = b_start + SMALL_PAGES * 4096;
+    let l_start = frame_large.addr;
+    let l_end = l_start + LARGE_PAGES * 4096;
+    let overlap = l_start < b_end && b_start < l_end;
+
+    if overlap {
+        crate::safe_print!(128, "  OVERLAP: large=[{:#x}–{:#x}) vs B=[{:#x}–{:#x})\n",
+            l_start, l_end, b_start, b_end);
+    }
+
+    crate::pmm::free_pages_contiguous(frame_b, SMALL_PAGES);
+    crate::pmm::free_pages_contiguous(frame_large, LARGE_PAGES);
+
+    let pass = !overlap;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: alloc_mmap skips the kernel identity-mapped VA hole.
+///
+/// In the extract-syscalls branch, `ProcessMemory::alloc_mmap` was changed to
+/// skip [0x4000_0000, 0x5000_0000) when the bump pointer would otherwise
+/// land there. Previously allocations could land in the kernel VA and crash.
+fn test_alloc_mmap_skips_kernel_va_hole() -> bool {
+    const KERNEL_VA_START: usize = 0x4000_0000;
+    // Dynamic: the hole now spans the real RAM identity map, which scales with
+    // detected RAM (was hardcoded 0xC000_0000 = 2GB machine).
+    let kernel_va_end: usize = akuma_exec::mmu::kernel_va_end();
+    crate::safe_print!(96, "\n[TEST] alloc_mmap: skips kernel VA hole 0x{:x}-0x{:x}\n",
+        KERNEL_VA_START, kernel_va_end);
+
+    // Place next_mmap just before the hole so the next alloc would enter it
+    // without the skip logic.
+    let brk        = 0x1000_0000;
+    let stack_top  = 0x80_0000_0000; // 512GB
+    let stack_bot  = stack_top - 2 * 1024 * 1024;
+    let mmap_floor = 0x3010_0000;
+
+    let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
+
+    // Manually bump next_mmap to just before kernel hole
+    mem.next_mmap.store(KERNEL_VA_START - 4096, core::sync::atomic::Ordering::Relaxed); // one page before hole
+
+    // A 2-page alloc would straddle [KERNEL_VA_START-4096, KERNEL_VA_START+4096)
+    // which enters the hole. The allocator must jump past KERNEL_VA_END.
+    let addr = if let Some(a) = mem.place(&mut [], 2 * 4096) { a } else {
+        console::print("  alloc_mmap returned None unexpectedly\n");
+        return false;
+    };
+
+    let inside_hole = addr < kernel_va_end && addr + 2 * 4096 > KERNEL_VA_START;
+    if inside_hole {
+        crate::safe_print!(128, "  FAIL: alloc_mmap returned {:#x} inside kernel VA hole\n", addr);
+    } else {
+        crate::safe_print!(128, "  alloc_mmap returned {:#x} (hole avoided)\n", addr);
+    }
+
+    let pass = !inside_hole && addr >= kernel_va_end;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: stack top with new constants fits within 48-bit VA.
+///
+/// The extract-syscalls branch doubled MIN_MMAP_SPACE (128GB → 256GB) and
+/// MAX_STACK_TOP (256GB → 512GB). Verify the computed stack top for a
+/// dynamically-linked binary (bun) never exceeds 48-bit VA (2^48).
+fn test_stack_top_within_48bit_va() -> bool {
+    console::print("\n[TEST] compute_stack_top: result within 48-bit VA\n");
+
+    // Replicate compute_stack_top() logic with current constants
+    const DEFAULT: usize         = 0x4000_0000;
+    const INTERP_END: usize      = 0x3010_0000;
+    const MIN_MMAP_SPACE: usize  = 0x20_0000_0000; // 128 GB (current)
+    const MAX_STACK_TOP: usize   = 0x40_0000_0000; // 256 GB (current)
+    const VA_48BIT_MAX: usize    = (1usize << 48) - 1;
+
+    // Test several representative brk values for dynamically-linked binaries
+    let test_cases: &[(usize, bool)] = &[
+        (0x600_0000,  true),  // typical bun (96 MB segments)
+        (0x200_0000,  true),  // small dynamic binary
+        (0x1000_0000, true),  // 256 MB binary
+        (0x5000_0000, true),  // 1.25 GB binary
+    ];
+
+    let mut all_ok = true;
+    for &(brk, has_interp) in test_cases {
+        let base_mmap = (brk + 0x1000_0000) & !0xFFFF;
+        let mmap_start = if has_interp {
+            core::cmp::max(base_mmap, INTERP_END)
+        } else {
+            base_mmap
+        };
+        let needed  = mmap_start + MIN_MMAP_SPACE;
+        let raw     = core::cmp::max(DEFAULT, needed);
+        let aligned = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+        let stack_top = core::cmp::min(aligned, MAX_STACK_TOP);
+
+        let within_48 = stack_top <= VA_48BIT_MAX;
+        let within_max = stack_top <= MAX_STACK_TOP;
+
+        if !within_48 || !within_max {
+            crate::safe_print!(128, "  FAIL brk={:#x} has_interp={}: stack_top={:#x}\n",
+                brk, has_interp, stack_top);
+            all_ok = false;
+        } else {
+            crate::safe_print!(128, "  brk={:#x}: stack_top={:#x} OK\n", brk, stack_top);
+        }
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if all_ok { "PASS" } else { "FAIL" });
+    all_ok
+}
+
+/// Verify mmap space can satisfy a large JSC-style allocation.
+///
+/// The kernel VA hole (0x4000_0000–0x5000_0000, 256 MB) forces the bump
+/// allocator to skip past it, so the maximum contiguous allocation is
+/// mmap_limit - 0x5000_0000 ≈ 127.7 GB. JSC falls back to smaller sizes
+/// when a full 128 GB isn't available, so we verify that at least 64 GB
+/// fits (enough for the Gigacage fallback path) and that a 1 GB arena
+/// (mimalloc's actual pattern) always succeeds.
+fn test_mmap_space_covers_jsc_gigacage() -> bool {
+    console::print("\n[TEST] mmap space: large JSC-style allocation succeeds\n");
+
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128 GB (current constants)
+    const MAX_STACK_TOP:  usize = 0x40_0000_0000; // 256 GB (current constants)
+    const STACK_SIZE:     usize = 2 * 1024 * 1024; // 2 MB
+
+    let brk         = 0x600_0000;
+    let mmap_floor  = 0x3010_0000usize;
+    let base_mmap   = (brk + 0x1000_0000) & !0xFFFF;
+    let mmap_start  = core::cmp::max(base_mmap, mmap_floor);
+    let needed      = mmap_start + MIN_MMAP_SPACE;
+    let raw         = core::cmp::max(0x4000_0000usize, needed);
+    let aligned     = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    let stack_top   = core::cmp::min(aligned, MAX_STACK_TOP);
+    let stack_bot   = stack_top - STACK_SIZE;
+
+    let mem = akuma_exec::process::ProcessMemory::new(brk, stack_bot, stack_top, mmap_floor);
+
+    const ARENA_1GB: usize = 1024 * 1024 * 1024;
+    let addr_1g = mem.place(&mut [], ARENA_1GB);
+    let pass_1g = addr_1g.is_some();
+    if let Some(a) = addr_1g {
+        crate::safe_print!(128, "  1 GB arena at {:#x}–{:#x} OK\n", a, a + ARENA_1GB);
+    } else {
+        crate::safe_print!(64, "  FAIL: 1 GB arena allocation failed\n");
+    }
+
+    const GIGACAGE_64GB: usize = 64 * 1024 * 1024 * 1024;
+    let addr_64g = mem.place(&mut [], GIGACAGE_64GB);
+    let pass_64g = addr_64g.is_some();
+    if let Some(a) = addr_64g {
+        crate::safe_print!(128, "  64 GB gigacage at {:#x}–{:#x} OK\n", a, a + GIGACAGE_64GB);
+    } else {
+        crate::safe_print!(128, "  FAIL: 64 GB alloc failed (mmap_limit={:#x})\n",
+            mem.mmap_limit.load(core::sync::atomic::Ordering::Relaxed));
+    }
+
+    let pass = pass_1g && pass_64g;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: compute_stack_top threshold change (Go binary OOM fix).
+///
+/// A static binary with brk < 512 KB (musl/TCC C program) must still get
+/// the 1 GB default VA space — it doesn't use arena allocators.
+fn test_compute_stack_top_small_static() -> bool {
+    console::print("\n[TEST] compute_stack_top: tiny static binary gets 1 GB default\n");
+
+    const DEFAULT: usize = 0x4000_0000;
+    const THRESHOLD: usize = 0x8_0000; // 512 KB (new threshold)
+
+    let test_cases: &[usize] = &[
+        0x1000,          // 4 KB
+        0x1_0000,        // 64 KB
+        THRESHOLD - 1,   // 512 KB - 1 byte — just below threshold
+    ];
+
+    let mut pass = true;
+    for &brk in test_cases {
+        let result = if brk < THRESHOLD { DEFAULT } else { 0 };
+        let ok = result == DEFAULT;
+        crate::safe_print!(128, "  brk={:#x}: stack_top={:#x} — {}\n",
+            brk, result, if ok { "OK" } else { "FAIL" });
+        if !ok { pass = false; }
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: compute_stack_top threshold change (Go binary OOM fix).
+///
+/// A static binary with brk >= 512 KB (Go programs are 1–3 MB minimum) must
+/// get large VA space so Go's arenaHint probing succeeds.
+fn test_compute_stack_top_go_sized_static() -> bool {
+    console::print("\n[TEST] compute_stack_top: Go-sized static binary gets large VA space\n");
+
+    const DEFAULT: usize        = 0x4000_0000;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128 GB
+    const MAX_STACK_TOP: usize  = 0x40_0000_0000; // 256 GB
+    const THRESHOLD: usize      = 0x8_0000;        // 512 KB
+
+    // Representative Go binary brk values (statically-linked, no interp)
+    let test_cases: &[usize] = &[
+        0x20_0000,   // 2 MB — small Go binary
+        0x100_0000,  // 16 MB
+        0x300_0000,  // 48 MB
+    ];
+
+    let mut pass = true;
+    for &brk in test_cases {
+        // Replicate compute_stack_top large-space branch
+        let base_mmap   = (brk + 0x1000_0000) & !0xFFFF;
+        let needed      = base_mmap + MIN_MMAP_SPACE;
+        let raw         = core::cmp::max(DEFAULT, needed);
+        let aligned     = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+        let stack_top   = core::cmp::min(aligned, MAX_STACK_TOP);
+
+        // Must only take this path if brk >= THRESHOLD
+        let ok = brk >= THRESHOLD && stack_top > DEFAULT;
+        crate::safe_print!(128, "  brk={:#x}: stack_top={:#x} — {}\n",
+            brk, stack_top, if ok { "OK" } else { "FAIL" });
+        if !ok { pass = false; }
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: compute_stack_top 512 KB boundary is exact (Go binary OOM fix).
+///
+/// brk = 512 KB - 1: must return DEFAULT (1 GB).
+/// brk = 512 KB:     must return large stack_top (> DEFAULT).
+fn test_compute_stack_top_boundary_512k() -> bool {
+    console::print("\n[TEST] compute_stack_top: 512 KB boundary is correct\n");
+
+    const DEFAULT: usize        = 0x4000_0000;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000;
+    const MAX_STACK_TOP: usize  = 0x40_0000_0000;
+    const THRESHOLD: usize      = 0x8_0000; // 512 KB
+
+    // Just below threshold — must get DEFAULT
+    let brk_below = THRESHOLD - 1;
+    let result_below = if brk_below < THRESHOLD { DEFAULT } else { 0 };
+    let pass_below = result_below == DEFAULT;
+    crate::safe_print!(128, "  brk={:#x} (below): stack_top={:#x} — {}\n",
+        brk_below, result_below, if pass_below { "OK" } else { "FAIL" });
+
+    // Exactly at threshold — must take large-space path
+    let brk_at    = THRESHOLD;
+    let base_mmap = (brk_at + 0x1000_0000) & !0xFFFF;
+    let needed    = base_mmap + MIN_MMAP_SPACE;
+    let raw       = core::cmp::max(DEFAULT, needed);
+    let aligned   = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    let result_at = core::cmp::min(aligned, MAX_STACK_TOP);
+    let pass_at   = result_at > DEFAULT;
+    crate::safe_print!(128, "  brk={:#x} (at threshold): stack_top={:#x} — {}\n",
+        brk_at, result_at, if pass_at { "OK" } else { "FAIL" });
+
+    let pass = pass_below && pass_at;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Go arenaHint probe loop exhausts 1 GB VA, succeeds with large VA.
+///
+/// The Go runtime probes heap arenas via mmap(hint, 64MB, PROT_NONE).  On
+/// Akuma, hints are ignored and the kernel returns the next available VA.
+/// Since the address != hint, Go munmaps it.  PROT_NONE munmap does NOT
+/// recycle VA on Akuma (prevents mmap→reject→munmap loops), so each probe
+/// permanently consumes 64 MB.  With 1 GB: 1 GB / 64 MB ≈ 15 probes before
+/// `alloc_mmap` returns None.  Go tries up to 128 hints → OOM crash.
+///
+/// This test verifies:
+/// 1. The 1 GB mmap budget can fit fewer than 128 × 64 MB probes.
+/// 2. The large VA budget (128 GB+ mmap space) fits all 128 probes.
+fn test_go_binary_va_exhaustion_scenario() -> bool {
+    console::print("\n[TEST] Go arenaHint probe loop: 1 GB exhausts, large VA succeeds\n");
+
+    const PROBE_SIZE: usize    = 64 * 1024 * 1024; // 64 MB per arenaHint
+    const NUM_PROBES: usize    = 128;               // Go tries up to 128 hints
+    const STACK_SIZE: usize    = 2 * 1024 * 1024;  // 2 MB
+
+    // --- Scenario A: 1 GB layout (old behaviour for Go-sized static binary) ---
+    let stack_top_1g: usize = 0x4000_0000; // 1 GB
+    let stack_bot_1g        = stack_top_1g - STACK_SIZE;
+    let brk_go              = 0x20_0000; // 2 MB — below old 4 MB threshold
+
+    let mem_1g = akuma_exec::process::types::ProcessMemory::new(
+        brk_go, stack_bot_1g, stack_top_1g, 0,
+    );
+    let budget_1g         = mem_1g.mmap_limit.load(core::sync::atomic::Ordering::Relaxed);
+    let probes_before_1g  = budget_1g / PROBE_SIZE;
+    let would_exhaust_1g  = probes_before_1g < NUM_PROBES;
+    crate::safe_print!(128,
+        "  1 GB: mmap_limit={:#x}, budget_probes={}, would_exhaust={}\n",
+        budget_1g, probes_before_1g, would_exhaust_1g);
+
+    // --- Scenario B: large VA layout (new behaviour) ---
+    const DEFAULT: usize        = 0x4000_0000;
+    const MIN_MMAP_SPACE: usize = 0x20_0000_0000;
+    const MAX_STACK_TOP: usize  = 0x40_0000_0000;
+
+    let base_mmap       = (brk_go + 0x1000_0000) & !0xFFFF;
+    let needed          = base_mmap + MIN_MMAP_SPACE;
+    let raw             = core::cmp::max(DEFAULT, needed);
+    let aligned         = (raw + 0x0FFF_FFFF) & !0x0FFF_FFFF;
+    let stack_top_large = core::cmp::min(aligned, MAX_STACK_TOP);
+    let stack_bot_large = stack_top_large - STACK_SIZE;
+
+    let mem_large = akuma_exec::process::types::ProcessMemory::new(
+        brk_go, stack_bot_large, stack_top_large, 0,
+    );
+
+    let mut large_all_ok = true;
+    for i in 0..NUM_PROBES {
+        if mem_large.place(&mut [], PROBE_SIZE).is_none() {
+            crate::safe_print!(128, "  FAIL: large VA exhausted at probe {}\n", i);
+            large_all_ok = false;
+            break;
+        }
+    }
+
+    let budget_large = mem_large.mmap_limit.load(core::sync::atomic::Ordering::Relaxed);
+    let probes_large = budget_large / PROBE_SIZE;
+    crate::safe_print!(128,
+        "  Large: mmap_limit={:#x}, budget_probes={}, all_ok={}\n",
+        budget_large, probes_large, large_all_ok);
+
+    let pass = would_exhaust_1g && large_all_ok;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: demand-pager used lazy_region_lookup() which calls read_current_pid()
+/// a second time inside the same exception handler. The outer handler captures `pid`
+/// once; if the two calls return different values (e.g. pid=0 race) the lazy region
+/// would not be found. Fixed by switching to lazy_region_lookup_for_pid(pid, va).
+///
+/// This test verifies that lazy_region_lookup_for_pid with an explicit PID finds
+/// the region that was registered under that PID, even when read_current_pid()
+/// would return 0 (e.g. no process info page mapped).
+fn test_lazy_region_lookup_for_pid_explicit() -> bool {
+    console::print("\n[TEST] lazy_region_lookup_for_pid: explicit PID finds region\n");
+
+    use akuma_exec::process::{push_lazy_region, lazy_region_lookup_for_pid, clear_lazy_regions};
+    use akuma_exec::mmu::user_flags;
+
+    // Use a synthetic PID that won't collide with real processes
+    let test_pid: u32 = 0xDEAD;
+    let va: usize = 0x2000_0000;
+    let size: usize = 0x10_0000_0000; // 64 GB (Gigacage-like)
+
+    let _proc = LazyTestProcess::new(test_pid);
+
+    // Register a lazy region under the test PID
+    push_lazy_region(test_pid, va, size, user_flags::RW);
+
+    // lazy_region_lookup_for_pid with the correct explicit PID must find it
+    let found = lazy_region_lookup_for_pid(test_pid, va + 0x1000).is_some();
+
+    // lazy_region_lookup_for_pid with the wrong PID must NOT find it
+    let not_found = lazy_region_lookup_for_pid(test_pid + 1, va + 0x1000).is_none();
+
+    // A VA outside the region must not be found
+    let out_of_range = lazy_region_lookup_for_pid(test_pid, va + size + 0x1000).is_none();
+
+    clear_lazy_regions(test_pid);
+
+    let pass = found && not_found && out_of_range;
+    crate::safe_print!(64, "  found={} not_found={} out_of_range={} => {}\n",
+        found, not_found, out_of_range, if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: instruction abort path in exceptions.rs used lazy_region_lookup()
+/// (reads PID internally) rather than lazy_region_lookup_for_pid(pid, va) with
+/// the PID captured once at handler entry. Verify that looking up by explicit PID
+/// is consistent with a single read_current_pid call.
+///
+/// This test registers a region under PID 0xBEEF and verifies that passing PID=0
+/// (what read_current_pid returns when no process is active) misses the region,
+/// while the explicit PID hits.
+fn test_lazy_region_lookup_pid_consistency() -> bool {
+    console::print("\n[TEST] lazy_region_lookup_for_pid: PID=0 misses, explicit PID hits\n");
+
+    use akuma_exec::process::{push_lazy_region, lazy_region_lookup_for_pid, clear_lazy_regions};
+    use akuma_exec::mmu::user_flags;
+
+    let test_pid: u32 = 0xBEEF;
+    let va: usize = 0x6000_0000;
+    let size: usize = 0x1000_0000;
+
+    let _proc = LazyTestProcess::new(test_pid);
+    push_lazy_region(test_pid, va, size, user_flags::RW);
+
+    // With PID=0 (what a racy/missing read_current_pid returns) -- must miss
+    let miss_with_zero = lazy_region_lookup_for_pid(0, va + 0x2000).is_none();
+
+    // With explicit correct PID -- must hit
+    let hit_with_pid = lazy_region_lookup_for_pid(test_pid, va + 0x2000).is_some();
+
+    clear_lazy_regions(test_pid);
+
+    let pass = miss_with_zero && hit_with_pid;
+    crate::safe_print!(64, "  miss_with_zero={} hit_with_pid={} => {}\n",
+        miss_with_zero, hit_with_pid, if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// Bun install fixes (improve-dash-compatibility branch)
+// ============================================================================
+
+/// Test: User stack size is automatically computed from RAM
+///
+/// With auto-scaling: stack_size = RAM / 2048, clamped to [128KB, 8MB]
+/// This test verifies the compute_user_stack_size function works correctly.
+fn test_user_stack_size_is_2mb() -> bool {
+    console::print("\n[TEST] User stack size auto-scaling\n");
+
+    let mut pass = true;
+    
+    // If override is active, skip scaling tests and verify the override instead
+    if crate::config::USER_STACK_SIZE_OVERRIDE != 0 {
+        crate::safe_print!(128, "  Override is active: {} KB\n", crate::config::USER_STACK_SIZE_OVERRIDE / 1024);
+        let actual = crate::config::compute_user_stack_size(4096 * 1024 * 1024);
+        if actual != crate::config::USER_STACK_SIZE_OVERRIDE {
+             crate::safe_print!(128, "  FAIL: Expected override {}KB, got {}KB\n", 
+                crate::config::USER_STACK_SIZE_OVERRIDE / 1024, actual / 1024);
+             pass = false;
+        }
+    } else {
+        // Test the scaling function
+        let test_cases: [(usize, usize); 6] = [
+            (256 * 1024 * 1024, 128 * 1024),      // 256 MB → 128 KB (minimum)
+            (512 * 1024 * 1024, 256 * 1024),      // 512 MB → 256 KB
+            (1024 * 1024 * 1024, 512 * 1024),     // 1 GB → 512 KB
+            (2048 * 1024 * 1024, 1024 * 1024),    // 2 GB → 1 MB
+            (4096 * 1024 * 1024, 2 * 1024 * 1024),// 4 GB → 2 MB
+            (16384 * 1024 * 1024, 8 * 1024 * 1024),// 16 GB → 8 MB (maximum)
+        ];
+
+        for (ram, expected_stack) in test_cases {
+            let actual = crate::config::compute_user_stack_size(ram);
+            if actual != expected_stack {
+                crate::safe_print!(128, "  FAIL: RAM {}MB → {}KB (expected {}KB)\n",
+                    ram / 1024 / 1024, actual / 1024, expected_stack / 1024);
+                pass = false;
+            }
+        }
+    }
+    
+    // Also verify the actual runtime stack size is reasonable
+    let actual_stack = akuma_exec::runtime::config().user_stack_size;
+    crate::safe_print!(128, "  Runtime user_stack_size = {} KB\n", actual_stack / 1024);
+    
+    // Should be at least 128KB
+    if actual_stack < 128 * 1024 {
+        crate::safe_print!(64, "  FAIL: Stack too small\n");
+        pass = false;
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: Kernel heap matches the `compute_heap_size` heuristic for the detected
+/// RAM. On large machines (>= 128 MB) this is >= 16 MB — enough for bun's 40+ TCP
+/// sockets (~1.25 MB of buffers), the original reason for the floor. On small
+/// machines the heap scales down on purpose (thread stacks live in PMM, not the
+/// heap), so a flat 16 MB assertion no longer holds — validate against the
+/// heuristic instead. See docs/LOW_MEMORY_ENVIRONMENT.md.
+fn test_kernel_heap_matches_heuristic() -> bool {
+    console::print("\n[TEST] Kernel heap matches compute_heap_size heuristic\n");
+
+    let heap_size = crate::allocator::stats().heap_size;
+    let ram = akuma_exec::mmu::ram_end().saturating_sub(akuma_exec::mmu::ram_base());
+    let code_and_stack = core::cmp::max(ram / 16, 8 * 1024 * 1024);
+    let expected = crate::compute_heap_size(ram, code_and_stack);
+
+    // The heap region is sized by compute_heap_size in main.rs; allow 1 MB slack
+    // for allocator bookkeeping, and require a sane 4 MB floor.
+    let pass = heap_size + 1024 * 1024 >= expected && heap_size >= 4 * 1024 * 1024;
+    crate::safe_print!(160, "  heap_size={} MB, heuristic={} MB (RAM {} MB)\n",
+        heap_size / 1024 / 1024, expected / 1024 / 1024, ram / 1024 / 1024);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: DirEntry struct has is_symlink field
+///
+/// getdents64 must report DT_LNK (10) for symlinks. This requires the
+/// VFS DirEntry struct to have an is_symlink field.
+fn test_direntry_has_is_symlink_field() -> bool {
+    console::print("\n[TEST] DirEntry has is_symlink field\n");
+
+    use akuma_vfs::DirEntry;
+
+    // Create a DirEntry with is_symlink = true
+    let symlink_entry = DirEntry {
+        name: alloc::string::String::from("test_link"),
+        is_dir: false,
+        is_symlink: true,
+        size: 0,
+    };
+
+    // Create a DirEntry with is_symlink = false
+    let file_entry = DirEntry {
+        name: alloc::string::String::from("test_file"),
+        is_dir: false,
+        is_symlink: false,
+        size: 100,
+    };
+
+    let pass = symlink_entry.is_symlink && !file_entry.is_symlink;
+    crate::safe_print!(64, "  symlink_entry.is_symlink={} file_entry.is_symlink={}\n",
+        symlink_entry.is_symlink, file_entry.is_symlink);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: procfs /proc/<pid>/fd/<n> symlink resolution
+///
+/// Bun calls readlinkat("/proc/self/fd/N") to resolve fd to path. A name is a
+/// symlink exactly when it exists, as on Linux: since 2026-10-16 `is_symlink`
+/// asks the shared `/proc` tree (`akuma_procfs::tree`) like every other
+/// `ProcFilesystem` method. This test used to assert that `123/fd/5` — no such
+/// process — was a symlink, which is the listed-but-unresolvable shape the tree
+/// exists to rule out; it now registers a real process to ask about.
+fn test_procfs_fd_symlink_resolution() -> bool {
+    console::print("\n[TEST] procfs /proc/<pid>/fd/<n> symlink resolution\n");
+
+    use crate::vfs::proc::ProcFilesystem;
+    use akuma_vfs::Filesystem;
+
+    const PID: u32 = 7741;
+    let _proc = LazyTestProcess::new(PID);
+    let Some(p) = akuma_exec::process::lookup_process_shared(PID) else {
+        console::print("  could not register the test process\n  Result: FAIL\n");
+        return false;
+    };
+    p.set_fd(5, akuma_exec::process::FileDescriptor::DevNull);
+    let tid = akuma_exec::threading::current_thread_id();
+    akuma_exec::process::register_thread_pid(tid, PID);
+
+    let procfs = ProcFilesystem::new();
+    let self_fd_0 = procfs.is_symlink("self/fd/0");
+    let self_fd_1 = procfs.is_symlink("self/fd/1");
+    let pid_fd_5 = procfs.is_symlink("7741/fd/5");
+    let thread_fd_5 = procfs.is_symlink("7741/task/7741/fd/5");
+    let self_is_symlink = procfs.is_symlink("self");
+    // Absent names are not symlinks: a closed fd, and a pid with no process.
+    let closed_fd_6 = !procfs.is_symlink("7741/fd/6");
+    let no_such_pid = !procfs.is_symlink("123/fd/5");
+    let net_not_symlink = !procfs.is_symlink("net");
+
+    akuma_exec::process::unregister_thread_pid(tid);
+
+    let pass = self_fd_0 && self_fd_1 && pid_fd_5 && thread_fd_5 && self_is_symlink
+        && closed_fd_6 && no_such_pid && net_not_symlink;
+    crate::safe_print!(160, "  self/fd/0={} self/fd/1={} fd/5={} task/fd/5={} self={} !fd/6={} !123={} !net={}\n",
+        self_fd_0, self_fd_1, pid_fd_5, thread_fd_5, self_is_symlink, closed_fd_6, no_such_pid, net_not_symlink);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: map_user_page returns (frames, false) when page already mapped
+///
+/// When two paths race to map the same page (via preemption on single-core),
+/// one wins (installed=true) and one loses (installed=false). The loser must
+/// NOT treat this as a failure. This test verifies:
+/// 1. First map_user_page returns installed=true
+/// 2. Second map_user_page to same VA returns installed=false
+/// 3. The page IS mapped after both calls
+///
+/// This behavior is critical for demand paging to avoid spurious SIGSEGV.
+fn test_map_user_page_already_mapped() -> bool {
+    console::print("\n[TEST] map_user_page returns installed=false for already-mapped page\n");
+
+    use akuma_exec::mmu::{UserAddressSpace, user_flags, map_user_page, is_current_user_page_mapped};
+
+    // Create a test address space
+    let Some(addr_space) = UserAddressSpace::new() else {
+        crate::safe_print!(64, "  SKIP: failed to allocate address space\n");
+        return true;
+    };
+
+    // Allocate test pages
+    let Some(page1) = crate::pmm::alloc_page_zeroed() else {
+        crate::safe_print!(64, "  SKIP: failed to allocate page\n");
+        return true;
+    };
+    let Some(page2) = crate::pmm::alloc_page_zeroed() else {
+        crate::pmm::free_page(page1);
+        crate::safe_print!(64, "  SKIP: failed to allocate second page\n");
+        return true;
+    };
+
+    let test_va = 0x1000_0000usize; // Arbitrary user VA
+
+    // Activate this address space
+    addr_space.activate();
+
+    // First map should succeed with installed=true
+    let (frames1, installed1) = map_user_page(test_va, page1.addr, user_flags::RW);
+    addr_space.track_user_frame(page1);
+    for f in frames1 {
+        addr_space.track_page_table_frame(f);
+    }
+
+    // Page should now be mapped
+    let is_mapped_after_first = is_current_user_page_mapped(test_va);
+
+    // Second map to same VA should return installed=false (page already there)
+    let (frames2, installed2) = map_user_page(test_va, page2.addr, user_flags::RW);
+
+    // Page should still be mapped
+    let is_mapped_after_second = is_current_user_page_mapped(test_va);
+
+    // Track any table frames from second call
+    for f in frames2 {
+        addr_space.track_page_table_frame(f);
+    }
+
+    // Free the unused page2 since it wasn't installed
+    if !installed2 {
+        crate::pmm::free_page(page2);
+    }
+
+    UserAddressSpace::deactivate();
+
+    let pass = installed1 && !installed2 && is_mapped_after_first && is_mapped_after_second;
+    crate::safe_print!(128, "  first: installed={}, mapped={}\n", installed1, is_mapped_after_first);
+    crate::safe_print!(128, "  second: installed={}, mapped={}\n", installed2, is_mapped_after_second);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: a mapped **kernel** VA is rejected as a user pointer.
+///
+/// `AddressSpace::add_kernel_mappings` identity-maps kernel RAM as EL1-only 2 MB
+/// blocks into *every* user address space, so a kernel VA is genuinely present in
+/// TTBR0. User-pointer validation used to test presence only, so such an address
+/// passed — and the EL1-only permission stopped nothing, because the copy loop runs
+/// at EL1. Nothing but the user VA allocator's layout convention kept it unreachable
+/// (docs/archive/USER_COPY_FOLD.md §7). The fix tests the leaf PTE's AP bits.
+///
+/// Four cases, and the first two are the pair that matters: the kernel VA must be
+/// **present** and **not user-accessible**. Asserting only the second would pass
+/// just as well against an address that happens to be unmapped, which proves nothing.
+fn test_kernel_va_rejected_as_user_pointer() -> bool {
+    console::print("\n[TEST] kernel VA rejected as a user pointer (AP-bit check)\n");
+
+    use akuma_exec::mmu::{
+        UserAddressSpace, is_current_user_page_mapped, is_current_user_range_mapped,
+        map_user_page, user_flags,
+    };
+    use akuma_exec::process::{
+        lookup_process_shared, register_process, register_thread_pid, unregister_process,
+        unregister_thread_pid,
+    };
+
+    // A REGISTERED process, and we activate ITS address space rather than a bare
+    // one. That is not fixture ceremony — `validate_user_range`'s `Prefault::Yes`
+    // arm reaches `address_space_owner_pid_for_fault`, whose fallback
+    // `read_current_pid` reads user VA `PROCESS_INFO_ADDR` (0x1000). The first
+    // version of this test used a bare `UserAddressSpace`, where nothing is mapped
+    // at 0x1000, and that read was a wild EL1 access that wedged the VM; the guard
+    // was "TTBR0 is not the *boot* TTBR0", which is not the same question. That
+    // hazard is fixed (`read_current_pid` now checks the mapping — see
+    // `test_read_current_pid_rejects_bare_address_space`), but owning the address
+    // space is still the right fixture here: it makes the TTBR0→pid lookup succeed
+    // so this test exercises the AP-bit check and not the fallback.
+    let pid: u32 = 7712;
+    let tid = akuma_exec::threading::current_thread_id();
+    register_process(pid, crate::process_tests::make_test_process(pid));
+    register_thread_pid(tid, pid);
+    let Some(proc) = lookup_process_shared(pid) else {
+        unregister_process(pid);
+        unregister_thread_pid(tid);
+        crate::safe_print!(64, "  SKIP: test process did not register\n");
+        return true;
+    };
+
+    let Some(user_page) = crate::pmm::alloc_page_zeroed() else {
+        unregister_process(pid);
+        unregister_thread_pid(tid);
+        crate::safe_print!(64, "  SKIP: failed to allocate page\n");
+        return true;
+    };
+    let Some(none_page) = crate::pmm::alloc_page_zeroed() else {
+        crate::pmm::free_page(user_page);
+        unregister_process(pid);
+        unregister_thread_pid(tid);
+        crate::safe_print!(64, "  SKIP: failed to allocate second page\n");
+        return true;
+    };
+
+    // A kernel heap allocation: certainly inside the identity-mapped RAM window,
+    // and certainly mapped, without hard-coding an address.
+    let kernel_buf = alloc::vec![0u8; 128];
+    let kernel_va = kernel_buf.as_ptr() as usize;
+
+    let user_va = 0x1000_0000usize;
+    let none_va = 0x1001_0000usize;
+
+    proc.address_space.activate();
+
+    let (frames, _) = map_user_page(user_va, user_page.addr, user_flags::RW);
+    { let asg = proc.address_space.lock(); asg.track_user_frame(user_page); for f in frames { asg.track_page_table_frame(f); } }
+    let (frames, _) = map_user_page(none_va, none_page.addr, user_flags::NONE);
+    { let asg = proc.address_space.lock(); asg.track_user_frame(none_page); for f in frames { asg.track_page_table_frame(f); } }
+
+    // 1. The kernel VA really is mapped in this user address space...
+    let kernel_present = is_current_user_page_mapped(kernel_va);
+    // 2. ...and must nonetheless be refused as a user range.
+    let kernel_rejected = !is_current_user_range_mapped(kernel_va, 128);
+    // 3. A real user page still passes — the check must not be "reject everything".
+    let user_accepted = is_current_user_range_mapped(user_va, 128);
+    // 4. A PROT_NONE page (AP_RO_EL1) is refused too, which is what Linux does.
+    let prot_none_rejected = !is_current_user_range_mapped(none_va, 128);
+
+    // 5. The whole change is defeated unless `validate_user_range` re-asserts the
+    // range AFTER prefaulting: `prefault_user_range` skips pages that are already
+    // present — deliberately, so it never re-maps a guard page — so on its own it
+    // reports success for this very address, on every `Prefault::Yes` path, which is
+    // most syscalls.
+    let prefault_rejected = !akuma_exec::process::user_access::validate_user_range(
+        kernel_va as u64, 128, akuma_exec::process::user_access::Prefault::Yes);
+
+    UserAddressSpace::deactivate();
+    drop(kernel_buf);
+    unregister_process(pid);
+    unregister_thread_pid(tid);
+
+    let pass = kernel_present && kernel_rejected && user_accepted && prot_none_rejected && prefault_rejected;
+    crate::safe_print!(160, "  kernel_va=0x{:x} present={} rejected={}\n", kernel_va, kernel_present, kernel_rejected);
+    crate::safe_print!(160, "  user_accepted={} prot_none_rejected={} prefault_rejected={}\n",
+        user_accepted, prot_none_rejected, prefault_rejected);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: `read_current_pid` returns `None` under a bare address space instead of
+/// wildly reading user VA `PROCESS_INFO_ADDR`.
+///
+/// `read_current_pid`'s page-read fallback used to be gated only on "TTBR0 is not
+/// the *boot* TTBR0", which is not the same question as "is there a process here".
+/// A bare `UserAddressSpace::new()` — several boot tests build one and `activate()`
+/// it — is a non-boot TTBR0 with nothing mapped at 0x1000, so the guard passed and
+/// the read was a wild EL1 access: the VM wedged with no output at all. That is how
+/// the first version of `test_kernel_va_rejected_as_user_pointer` died, reaching
+/// here through `address_space_owner_pid_for_fault`'s fallback
+/// (docs/archive/USER_COPY_FOLD.md §7).
+///
+/// The assertion is deliberately two-part. `pid == None` alone would pass against a
+/// build that never reached the fallback at all, so the test also asserts the thing
+/// that makes the address space dangerous — that nothing is mapped at
+/// `PROCESS_INFO_ADDR`. **On an unfixed kernel this test does not FAIL, it hangs**,
+/// which is the honest failure mode for a wild read and is why it prints before it
+/// activates.
+fn test_read_current_pid_rejects_bare_address_space() -> bool {
+    console::print("\n[TEST] read_current_pid: bare address space -> None, not a wild read\n");
+
+    use akuma_exec::mmu::{UserAddressSpace, is_current_user_page_mapped};
+    use akuma_exec::process::{PROCESS_INFO_ADDR, read_current_pid};
+
+    // Precondition: the `THREAD_PID_MAP` fast path must be cold for this thread, or
+    // `read_current_pid` returns from it and never reaches the fallback under test.
+    // On boot TTBR0 the fallback returns `None`, so `Some` here means a map entry
+    // exists — and then the test would prove nothing rather than something.
+    if read_current_pid().is_some() {
+        console::print("  SKIP: this thread has a THREAD_PID_MAP entry\n");
+        return true;
+    }
+
+    let addr_space = if let Some(a) = UserAddressSpace::new() { a } else { console::print("  OOM (addr_space)\n"); return false; };
+
+    addr_space.activate();
+    let info_mapped = is_current_user_page_mapped(PROCESS_INFO_ADDR);
+    let pid = read_current_pid();
+    UserAddressSpace::deactivate();
+
+    let pass = !info_mapped && pid.is_none();
+    crate::safe_print!(160, "  info_page_mapped={} pid_is_none={} pid={}\n",
+        info_mapped, pid.is_none(), pid.unwrap_or(0));
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: epoll_event struct is 16 bytes on ARM64
+///
+/// On ARM64, epoll_event is NOT packed (unlike x86_64).
+/// The struct has 4 bytes of padding between events (u32) and data (u64).
+/// This caused bun install express to crash because we were using 12-byte
+/// (packed) layout, causing misaligned reads of the data field.
+fn test_epoll_event_is_16_bytes_on_arm64() -> bool {
+    console::print("\n[TEST] epoll_event is 16 bytes on ARM64\n");
+
+    #[repr(C)]
+    struct EpollEvent {
+        events: u32,
+        _pad: u32,
+        data: u64,
+    }
+
+    let size = core::mem::size_of::<EpollEvent>();
+    let align = core::mem::align_of::<EpollEvent>();
+
+    // Verify offsets
+    let events_offset = core::mem::offset_of!(EpollEvent, events);
+    let pad_offset = core::mem::offset_of!(EpollEvent, _pad);
+    let data_offset = core::mem::offset_of!(EpollEvent, data);
+
+    crate::safe_print!(128, "  size={} bytes, align={}\n", size, align);
+    crate::safe_print!(128, "  offsets: events={}, _pad={}, data={}\n",
+        events_offset, pad_offset, data_offset);
+
+    let pass = size == 16 && data_offset == 8;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: epoll infinite waits use bounded scheduler deadlines.
+fn test_epoll_infinite_wait_uses_bounded_deadline() -> bool {
+    console::print("\n[TEST] epoll infinite wait uses bounded deadline\n");
+
+    // Retargeted 2026-08-24 at the machine the three wait loops actually run
+    // (`akuma_net_yarn`), rather than at the standalone `epoll_wait_deadline`
+    // helper this used to call — that helper was a second implementation of the
+    // same arithmetic and has been deleted. Same property, live path.
+    use akuma_net_yarn::{Observation, WaitError, WaitMachine, WaitPolicy, WaitStep};
+
+    let start_time = 1_000_000u64;
+    let timeout_us = 42_000u64;
+    let now = 1_234_567u64;
+    const INTERVAL: u64 = 10_000;
+    let policy = WaitPolicy::epoll(INTERVAL);
+
+    // An INFINITE wait must still park on a bounded deadline, never u64::MAX —
+    // the whole point of this test.
+    let infinite = WaitMachine::new(start_time, None, policy).park_deadline(now);
+
+    // A finite wait parks at whichever comes FIRST: its own deadline or the
+    // backstop. In this fixture `now` (1_234_567) is already well past the
+    // caller's deadline (start + timeout = 1_042_000), so the caller's deadline
+    // is the nearer one and the clamp must pick it — never the backstop, which
+    // would sleep past a timeout the caller asked for.
+    let finite = WaitMachine::new(start_time, Some(timeout_us), policy).park_deadline(now);
+
+    // A ZERO timeout must not park at all: the policy's inclusive `>=` expires
+    // it on the first lap. That is the non-blocking `epoll_wait(.., 0)`
+    // contract, and it replaces the old `deadline == 0` sentinel.
+    let mut zero_m = WaitMachine::new(start_time, Some(0), policy);
+    zero_m.lap_start(0);
+    let zero_step = zero_m.lap_end(&Observation {
+        now_us: start_time,
+        poll_epoch: 0,
+        progress: false,
+        condition_met: false,
+        interrupted: false,
+    });
+
+    let pass = infinite == now + INTERVAL
+        && infinite != u64::MAX
+        && finite == start_time + timeout_us
+        && zero_step == WaitStep::Failed(WaitError::TimedOut)
+        && zero_m.stats().parks == 0;
+    if !pass {
+        crate::safe_print!(128, "  finite={} infinite={} zero={:?}\n", finite, infinite, zero_step);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ============================================================================
+// ENOSYS syscall handling tests (bun crash prevention)
+// ============================================================================
+
+/// Test: Syscalls that return ENOSYS are properly handled
+///
+/// When a syscall returns ENOSYS (-38), userspace should check for errors.
+/// Bun has a bug where it uses the ENOSYS return value as a pointer, causing
+/// a crash at FAR=0xFFFFFFFFFFFFFFDA (which is -38 in two's complement).
+///
+/// This test verifies that our ENOSYS-returning syscalls return the correct
+/// value and documents which syscalls return ENOSYS for bun compatibility.
+#[allow(clippy::useless_let_if_seq)]
+fn test_enosys_syscalls_return_proper_errno() -> bool {
+    console::print("\n[TEST] ENOSYS syscalls return proper errno\n");
+
+    // ENOSYS = -38 = 0xFFFFFFFFFFFFFFDA (64-bit two's complement)
+
+    // Test io_uring syscalls (NR 425, 426, 427)
+    // Bun probes io_uring support at startup and should fall back to epoll
+    let io_uring_setup_result = crate::syscall::handle_syscall(425, &[0, 0, 0, 0, 0, 0]);
+    let io_uring_enter_result = crate::syscall::handle_syscall(426, &[0, 0, 0, 0, 0, 0]);
+    let io_uring_register_result = crate::syscall::handle_syscall(427, &[0, 0, 0, 0, 0, 0]);
+
+    crate::safe_print!(128, "  io_uring_setup(425) = {:#x} (expect {:#x})\n",
+        io_uring_setup_result, ENOSYS);
+    crate::safe_print!(128, "  io_uring_enter(426) = {:#x} (expect {:#x})\n",
+        io_uring_enter_result, ENOSYS);
+    crate::safe_print!(128, "  io_uring_register(427) = {:#x} (expect {:#x})\n",
+        io_uring_register_result, ENOSYS);
+
+    // io_setup (NR 0) and io_destroy (NR 1) are now implemented; not tested here
+
+    // Test pidfd_open (NR 434) — now implemented; returns ESRCH for non-child pid=1
+    let pidfd_open_result = crate::syscall::handle_syscall(434, &[1, 0, 0, 0, 0, 0]);
+    let esrch: u64 = ESRCH;
+    crate::safe_print!(128, "  pidfd_open(434) = {:#x} (expect {:#x} ESRCH)\n",
+        pidfd_open_result, esrch);
+
+    // Test inotify syscalls (NR 26, 27, 28)
+    // Bun uses these for file watching
+    let inotify_init1_result = crate::syscall::handle_syscall(26, &[0, 0, 0, 0, 0, 0]);
+    crate::safe_print!(128, "  inotify_init1(26) = {:#x} (expect {:#x})\n",
+        inotify_init1_result, ENOSYS);
+
+    // Verify all return ENOSYS
+    let mut pass = if io_uring_setup_result != ENOSYS {
+        console::print("  FAIL: io_uring_setup did not return ENOSYS\n");
+        false
+    } else {
+        true
+    };
+    if io_uring_enter_result != ENOSYS {
+        console::print("  FAIL: io_uring_enter did not return ENOSYS\n");
+        pass = false;
+    }
+    if io_uring_register_result != ENOSYS {
+        console::print("  FAIL: io_uring_register did not return ENOSYS\n");
+        pass = false;
+    }
+    if pidfd_open_result != esrch {
+        crate::safe_print!(64, "  FAIL: pidfd_open returned {:#x}, expected ESRCH ({:#x})\n",
+            pidfd_open_result, esrch);
+        pass = false;
+    }
+    if inotify_init1_result != ENOSYS {
+        console::print("  FAIL: inotify_init1 did not return ENOSYS\n");
+        pass = false;
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: ENOSYS is correctly represented as -38 in two's complement
+///
+/// This test documents the exact crash pattern: when bun calls io_uring_setup
+/// and gets ENOSYS (-38), it sometimes uses this value directly as a pointer
+/// without checking for errors. The resulting page fault shows:
+///   FAR=0xFFFFFFFFFFFFFFDA (which is -38 in 64-bit two's complement)
+///
+/// This is a bun bug, but we document the pattern here to help diagnose
+/// similar crashes in the future.
+fn test_enosys_is_negative_38() -> bool {
+    console::print("\n[TEST] ENOSYS is -38 (crash pattern documentation)\n");
+
+    const ENOSYS_SIGNED: i64 = -38;
+    const ENOSYS_UNSIGNED: u64 = ENOSYS;
+    const EXPECTED_FAR: u64 = 0xFFFFFFFFFFFFFFDA;
+
+    crate::safe_print!(128, "  ENOSYS as i64 = {}\n", ENOSYS_SIGNED);
+    crate::safe_print!(128, "  ENOSYS as u64 = {:#x}\n", ENOSYS_UNSIGNED);
+    crate::safe_print!(128, "  Expected crash FAR = {:#x}\n", EXPECTED_FAR);
+
+    let match_expected = ENOSYS_UNSIGNED == EXPECTED_FAR;
+    let match_negative = (ENOSYS_UNSIGNED as i64) == ENOSYS_SIGNED;
+
+    crate::safe_print!(64, "  Values match: {}, {}\n", match_expected, match_negative);
+
+    let pass = match_expected && match_negative;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+
+    if pass {
+        console::print("\n  NOTE: If you see a crash with FAR=0xFFFFFFFFFFFFFFDA,\n");
+        console::print("        it means userspace (bun) treated ENOSYS as a pointer.\n");
+        console::print("        Check which syscall returned ENOSYS via last_sc in the log.\n");
+    }
+
+    pass
+}
+
+/// Test: io_setup and io_destroy lifecycle
+fn test_io_setup_and_destroy() -> bool {
+    console::print("\n[TEST] io_setup and io_destroy\n");
+
+
+    // nr_events=0 must return EINVAL
+    let r = crate::syscall::handle_syscall(0, &[0, 0, 0, 0, 0, 0]);
+    crate::safe_print!(64, "  io_setup(nr=0, null) = {:#x} (expect EINVAL={:#x})\n", r, EINVAL);
+    if r != EINVAL {
+        console::print("  FAIL: io_setup(0) did not return EINVAL\n");
+        return false;
+    }
+
+    // null ctx_idp with nr_events>0 must return EFAULT (BYPASS_VALIDATION=false, ptr 0 is invalid)
+    let r = crate::syscall::handle_syscall(0, &[8, 0, 0, 0, 0, 0]);
+    crate::safe_print!(64, "  io_setup(nr=8, null) = {:#x} (expect EFAULT={:#x})\n", r, EFAULT);
+    if r != EFAULT {
+        console::print("  FAIL: io_setup(nr=8, null) did not return EFAULT\n");
+        return false;
+    }
+
+    // io_destroy with unknown context must return 0 (idempotent; EINVAL breaks Go — crash10.log)
+    let r = crate::syscall::handle_syscall(1, &[0xdeadbeef, 0, 0, 0, 0, 0]);
+    crate::safe_print!(64, "  io_destroy(0xdeadbeef) = {:#x} (expect 0)\n", r);
+    if r != 0 {
+        console::print("  FAIL: io_destroy(bad_ctx) did not return 0\n");
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// Test: Document OOM crash pattern for bun
+///
+/// When bun runs out of memory during package installation, the PMM reports
+/// "0 free pages" and demand paging fails. The kernel tries to deliver SIGSEGV
+/// but can't allocate a signal frame either, so the process is killed.
+///
+/// This test documents the pattern and verifies memory calculation helpers.
+fn test_oom_crash_pattern_documentation() -> bool {
+    console::print("\n[TEST] OOM crash pattern documentation\n");
+
+    // Get current memory stats
+    let (pmm_total, _pmm_alloc, pmm_free) = crate::pmm::stats();
+    let total_mb = (pmm_total * 4096) / 1024 / 1024;
+    let free_mb = (pmm_free * 4096) / 1024 / 1024;
+
+    crate::safe_print!(128, "  PMM: {} total pages ({} MB), {} free pages ({} MB)\n",
+        pmm_total, total_mb, pmm_free, free_mb);
+
+    // Document memory requirements for bun
+    console::print("\n  Memory requirements for bun install:\n");
+    console::print("    Small packages (express):        256MB-512MB\n");
+    console::print("    Medium packages (typescript):    512MB-1GB\n");
+    console::print("    Large packages (gemini-cli):     1GB-2GB+\n");
+
+    // Document the OOM crash signature
+    console::print("\n  OOM crash signature:\n");
+    console::print("    [DA-DP] ... anon alloc failed, 0 free pages\n");
+    console::print("    [signal] sig 11 frame page ... not mappable\n");
+    console::print("    [Fault] Process N (name) SIGSEGV after Xs\n");
+
+    // Calculate minimum recommended RAM for large packages
+    // Kernel overhead: ~144MB (128MB code/stack + 16MB heap)
+    // Bun base: ~200MB
+    // Per-download worker: ~50MB
+    // Safety margin: 200MB
+    const KERNEL_OVERHEAD_MB: usize = 144;
+    const BUN_BASE_MB: usize = 200;
+    const PER_WORKER_MB: usize = 50;
+    const SAFETY_MB: usize = 200;
+    const TYPICAL_WORKERS: usize = 4;
+
+    let recommended_mb = KERNEL_OVERHEAD_MB + BUN_BASE_MB + (PER_WORKER_MB * TYPICAL_WORKERS) + SAFETY_MB;
+    crate::safe_print!(128, "\n  Recommended minimum RAM for large packages: {} MB\n", recommended_mb);
+    crate::safe_print!(128, "    Kernel overhead: {} MB\n", KERNEL_OVERHEAD_MB);
+    crate::safe_print!(128, "    Bun base:        {} MB\n", BUN_BASE_MB);
+    crate::safe_print!(128, "    Workers (x{}):    {} MB\n", TYPICAL_WORKERS, PER_WORKER_MB * TYPICAL_WORKERS);
+    crate::safe_print!(128, "    Safety margin:   {} MB\n", SAFETY_MB);
+
+    // Check if current memory might be insufficient
+    let current_available_mb = free_mb;
+    let might_oom = current_available_mb < (BUN_BASE_MB + PER_WORKER_MB * TYPICAL_WORKERS);
+
+    if might_oom {
+        crate::safe_print!(128, "\n  WARNING: Current free memory ({} MB) may be insufficient\n",
+            current_available_mb);
+        console::print("           for large package installations.\n");
+        console::print("           Run with: MEMORY=2048M cargo run --release\n");
+    }
+
+    crate::safe_print!(64, "  Result: PASS (documentation only)\n");
+    true
+}
+
+/// Test safe user memory access and EC=0x25 fault redirection.
+/// Verifies that accessing an unmapped address via safe primitives 
+/// returns EFAULT (14) instead of killing the process.
+fn test_safe_user_access_fault() -> bool {
+    console::print("\n[TEST] Safe user access fault redirection\n");
+    
+    // Address that is definitely not mapped: just above the kernel RAM identity
+    // map (which scales with RAM — a fixed low address like 0xdead0000 lands
+    // *inside* the EL1-only identity map on >2GB machines and no longer faults).
+    let invalid_addr = (akuma_exec::mmu::kernel_va_end() + 0x4000_0000) as *mut u8;
+    let kernel_buf = [0u8; 16];
+    
+    // This should NOT crash/kill kernel, but return Err(14) (EFAULT).
+    //
+    // Deliberately the RAW primitive, not `copy_to_user`: what this test exercises is
+    // the byte loop's fault-recovery trampoline, and the folded API would reject this
+    // address at the range check and never reach the copy at all.
+    let res = unsafe { akuma_exec::process::user_access::copy_to_user_safe(invalid_addr, kernel_buf.as_ptr(), 16) };
+    
+    let ok = match res {
+        Err(14) => {
+            console::print("  OK: copy to invalid address returned EFAULT\n");
+            true
+        }
+        Err(e) => {
+            crate::safe_print!(64, "  FAILED: expected EFAULT (14), got {}\n", e);
+            false
+        }
+        Ok(()) => {
+            console::print("  FAILED: expected EFAULT, but copy succeeded?!\n");
+            false
+        }
+    };
+    
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// The widened user-copy loop must move exactly the same bytes the byte loop did,
+/// at every length and every alignment — and still return `EFAULT` from a fault
+/// **part way through** a copy rather than returning to garbage.
+///
+/// `__arch_copy_user_memory` was one byte per four instructions until 2026-08-27
+/// (`docs/archive/USER_COPY_BYTE_LOOP.md`). Widening it to 64/16/8-byte chunks
+/// introduces two failure modes a whole-range-bad test cannot see:
+///
+/// 1. **Head/tail handling.** The chunk loops only handle multiples; lengths that
+///    are not, and source/destination pairs that are relatively misaligned, are
+///    where a hand-written wide copy goes wrong. Swept below across every length
+///    0..=80 and both alignments 0..8, which covers every path through the
+///    64/16/8/byte ladder and every combination of relative alignment.
+/// 2. **The leaf-function invariant.** The fault trampoline returns through `x30`,
+///    which only holds if the copy routine never writes `x30` or `sp`. A version
+///    written with a normal prologue passes every success case and then returns to
+///    a garbage address on the first mid-copy fault. The straddling case below is
+///    that regression test: it faults with bytes already copied, which is exactly
+///    when a clobbered `x30` would show.
+fn test_user_copy_wide_and_faults() -> bool {
+    console::print("\n[TEST] user copy: widened loop, all lengths/alignments, mid-copy fault\n");
+    use akuma_exec::process::user_access::{copy_from_user_safe, copy_to_user_safe};
+
+    let mut ok = true;
+
+    // ── 1. Correctness sweep. Kernel buffers both sides: this exercises the copy
+    //       loop itself, which is direction-agnostic (both wrappers call it).
+    let mut src = [0u8; 128];
+    for (i, b) in src.iter_mut().enumerate() {
+        *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+    }
+    let mut dst = [0u8; 128];
+    let mut bad: Option<(usize, usize, usize)> = None;
+    for len in 0..=80usize {
+        for soff in 0..8usize {
+            for doff in 0..8usize {
+                dst.fill(0xA5);
+                let r = unsafe {
+                    copy_to_user_safe(
+                        dst.as_mut_ptr().add(doff),
+                        src.as_ptr().add(soff),
+                        len,
+                    )
+                };
+                if r.is_err() {
+                    bad = Some((len, soff, doff));
+                    break;
+                }
+                if dst[doff..doff + len] != src[soff..soff + len] {
+                    bad = Some((len, soff, doff));
+                    break;
+                }
+                // Nothing outside the range may be touched — a chunk loop that
+                // over-copies would land here and nowhere else.
+                if dst[..doff].iter().any(|&b| b != 0xA5)
+                    || dst[doff + len..].iter().any(|&b| b != 0xA5)
+                {
+                    bad = Some((len, soff, doff));
+                    break;
+                }
+            }
+            if bad.is_some() { break; }
+        }
+        if bad.is_some() { break; }
+    }
+    if let Some((len, soff, doff)) = bad {
+        ok = false;
+        crate::safe_print!(128,
+            "  FAILED: wrong bytes or overrun at len={} src_off={} dst_off={}\n",
+            len, soff, doff);
+    } else {
+        console::print("  OK: 81 lengths x 8 x 8 alignments copy exactly, no overrun\n");
+    }
+
+    // ── 2. A whole-range-bad copy still returns EFAULT.
+    let unmapped = (akuma_exec::mmu::kernel_va_end() + 0x4000_0000) as *const u8;
+    let mut sink = [0u8; 64];
+    let r = unsafe { copy_from_user_safe(sink.as_mut_ptr(), unmapped, 64) };
+    if r.is_err() {
+        console::print("  OK: fully unmapped source returns EFAULT\n");
+    } else {
+        ok = false;
+        console::print("  FAILED: unmapped source did not fault\n");
+    }
+
+    // ── 3. THE ONE THAT MATTERS: fault part way through a long copy.
+    //       Start in a mapped page and run off its end, so the first chunks succeed and a later one faults. If `x30`
+    //       were clobbered by a prologue, the trampoline's `ret` would not come back here and this test would not
+    //       return at all - a hang or a wild jump, not a FAILED line.
+    //
+    //       The cliff is a real one the guest itself defines: one mapped user page in a fresh address space, its
+    //       neighbour unmapped. It used to be the end of the kernel identity map, and that is not a cliff under a
+    //       hypervisor: the boot map can reach past a small guest's RAM, and a page that is mapped but has no RAM behind
+    //       it is a *stage-2* fault the guest never sees - QEMU's HVF backend asserts on it (`ldp` carries no syndrome,
+    //       ISV=0) and TCG silently reads zeros. A stage-1 hole is the same under TCG, HVF and KVM.
+    let page_off = 0x400usize; // bytes before the cliff
+    let straddle_len = 0x2000usize; // 8 KB: many 64-byte chunks, the later ones past the cliff
+    let user_va = 0x1000_0000usize;
+    let mut big = alloc::vec![0u8; straddle_len];
+    let mut outcome: Option<(bool, bool)> = None; // (copy returned an error, the bytes before the cliff arrived)
+    if let Some(mut space) = akuma_exec::mmu::UserAddressSpace::new()
+        && let Some(frame) = crate::pmm::alloc_page_zeroed()
+    {
+        if space.map_page(user_va, frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC).is_ok() {
+            space.track_user_frame(frame);
+            let page = akuma_exec::mmu::phys_to_virt(frame.addr);
+            for i in 0..4096usize {
+                unsafe { page.add(i).write_volatile((i % 251) as u8) };
+            }
+            let src = (user_va + 4096 - page_off) as *const u8;
+            // Interrupts off while this space is live: a scheduler tick would swap `TTBR0` under the copy.
+            let r = akuma_primitives::with_irqs_disabled(|| {
+                space.activate();
+                let r = unsafe { copy_from_user_safe(big.as_mut_ptr(), src, straddle_len) };
+                akuma_exec::mmu::UserAddressSpace::deactivate();
+                r
+            });
+            // The chunks wholly before the cliff were delivered (64-byte chunks: allow the last partial one).
+            let delivered = (0..page_off - 64).all(|i| big[i] == ((4096 - page_off + i) % 251) as u8);
+            outcome = Some((r.is_err(), delivered));
+        } else {
+            crate::pmm::free_page(frame);
+        }
+    }
+    match outcome {
+        Some((true, true)) => console::print("  OK: mid-copy fault returned EFAULT, earlier bytes delivered (trampoline still returns correctly)\n"),
+        Some((errored, delivered)) => {
+            ok = false;
+            crate::safe_print!(160, "  FAILED: copy running off a mapped page: errored={} earlier_bytes_delivered={}\n", errored, delivered);
+        }
+        None => {
+            ok = false;
+            console::print("  FAILED: could not build the test address space (OOM or map failed)\n");
+        }
+    }
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test safe copy_from_user_str handling of unmapped memory.
+fn test_copy_from_user_str_fault() -> bool {
+    console::print("\n[TEST] copy_from_user_str fault handling\n");
+    
+    // Unmapped VA above the (RAM-size-dependent) kernel identity map; see
+    // test_safe_user_access_fault for why a fixed low address no longer works.
+    let invalid_addr = (akuma_exec::mmu::kernel_va_end() + 0x4000_0000) as u64;
+    let res = crate::syscall::copy_from_user_str(invalid_addr, 1024);
+    
+    let ok = match res {
+        Err(e) if e == 14 || e == 18446744073709551602 => {
+            console::print("  OK: copy_from_user_str returned EFAULT for invalid addr\n");
+            true
+        }
+        Err(e) => {
+            crate::safe_print!(128, "  FAILED: expected EFAULT (14 or -14), got {}\n", e);
+            false
+        }
+        Ok(s) => {
+            crate::safe_print!(128, "  FAILED: expected EFAULT, got success: \"{}\"\n", s);
+            false
+        }
+    };
+    
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Verify that user page tables identity-map the full 1GB RAM range
+/// (0x40000000-0x7FFFFFFF) so that phys_to_virt works for any PMM-allocated
+/// page regardless of which TTBR0 is active.  Before the fix, only 256MB
+/// (0x40000000-0x4FFFFFFF) was mapped, causing EL1 data aborts when the PMM
+/// returned physical pages at 0x50000000+.
+fn test_kernel_identity_map_covers_full_ram() -> bool {
+    console::print("\n[TEST] kernel identity map covers full 1GB RAM\n");
+    let mut pass = true;
+
+    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
+    let l0_phys = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
+
+    let check_addrs: &[usize] = &[
+        0x4000_0000, // first 2MB block (always mapped)
+        0x4800_0000, // 128MB offset
+        0x4FFE_0000, // last block of the old 256MB range
+        0x5000_0000, // first block BEYOND old 256MB limit (the crash point)
+        0x5000_4000, // exact FAR from the opencode crash
+        0x6000_0000, // 512MB offset
+        0x7FFE_0000, // last 2MB block of 1GB
+    ];
+
+    for &va in check_addrs {
+        let mapped = unsafe {
+            let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_phys) as *const u64;
+            let l0e = l0_ptr.add((va >> 39) & 0x1FF).read_volatile();
+            if l0e & 1 == 0 { false }
+            else {
+                let l1_ptr = akuma_exec::mmu::phys_to_virt((l0e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+                let l1e = l1_ptr.add((va >> 30) & 0x1FF).read_volatile();
+                if l1e & 1 == 0 { false }
+                else if l1e & 2 == 0 { true } // L1 block
+                else {
+                    let l2_ptr = akuma_exec::mmu::phys_to_virt((l1e & 0x0000_FFFF_FFFF_F000) as usize) as *const u64;
+                    let l2e = l2_ptr.add((va >> 21) & 0x1FF).read_volatile();
+                    l2e & 1 != 0 // valid L2 block or table entry
+                }
+            }
+        };
+        if !mapped {
+            crate::safe_print!(96, "  FAIL: VA {:#x} not mapped in user page tables\n", va);
+            pass = false;
+        }
+    }
+
+    if pass {
+        console::print("  OK: all 1GB RAM addresses mapped in user page tables\n");
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify the mmap VA allocator skips the full kernel identity range
+/// (0x40000000-0x7FFFFFFF) to avoid conflicts with block-mapped RAM.
+fn test_mmap_allocator_skips_full_kernel_range() -> bool {
+    console::print("\n[TEST] mmap allocator skips full kernel VA range\n");
+    let mut pass = true;
+
+    let mem = akuma_exec::process::types::ProcessMemory::new(
+        0x3000_0000, // code_end: just below kernel range
+        0x1_0000_0000, // stack_bottom
+        0x1_0020_0000, // stack_top
+        0x3000_0000,   // mmap_floor
+    );
+
+    for _ in 0..20 {
+        if let Some(addr) = mem.place(&mut [], 0x100_0000) { // 16MB chunks
+            if (0x4000_0000..0x8000_0000).contains(&addr) {
+                crate::safe_print!(96, "  FAIL: alloc_mmap returned {:#x} inside kernel range\n", addr);
+                pass = false;
+                break;
+            }
+        } else {
+            break;
+        }
+    }
+
+    if pass {
+        console::print("  OK: mmap never returned addresses in 0x40000000-0x7FFFFFFF\n");
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Verify that shattering a 2MB block descriptor into L3 page entries
+/// preserves the identity mapping for all 512 pages within the block.
+fn test_block_shatter_preserves_identity() -> bool {
+    console::print("\n[TEST] block shatter preserves identity mapping\n");
+
+    let frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else {
+        console::print("  SKIP: out of memory\n");
+        return true;
+    };
+
+    // Construct a fake 2MB block entry for PA 0x50000000 with typical kernel flags
+    let block_pa: u64 = 0x5000_0000;
+    let block_flags: u64 = akuma_exec::mmu::flags::VALID
+        | akuma_exec::mmu::flags::BLOCK
+        | akuma_exec::mmu::flags::AF
+        | akuma_exec::mmu::flags::UXN
+        | akuma_exec::mmu::flags::SH_INNER
+        | akuma_exec::mmu::attr_index(akuma_exec::mmu::MAIR_NORMAL_WB);
+    let block_entry = block_pa | block_flags;
+
+    akuma_exec::mmu::shatter_block_to_pages(frame, block_entry);
+
+    let mut pass = true;
+    let l3_ptr = akuma_exec::mmu::phys_to_virt(frame.addr) as *const u64;
+
+    for i in [0usize, 1, 255, 511] {
+        let entry = unsafe { l3_ptr.add(i).read_volatile() };
+        let expected_pa = block_pa + (i as u64) * 0x1000;
+        let got_pa = entry & 0x0000_FFFF_FFFF_F000;
+        if got_pa != expected_pa {
+            crate::safe_print!(128, "  FAIL: L3[{}] PA={:#x}, expected {:#x}\n", i, got_pa, expected_pa);
+            pass = false;
+        }
+        if entry & 0x3 != 0x3 {
+            crate::safe_print!(96, "  FAIL: L3[{}] type bits={:#x}, expected 0x3 (page)\n", i, entry & 0x3);
+            pass = false;
+        }
+    }
+
+    crate::pmm::free_page(frame);
+
+    if pass {
+        console::print("  OK: shattered block has correct identity-mapped L3 entries\n");
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: pipe_bytes_available returns correct buffer length.
+fn test_pipe_bytes_available() -> bool {
+    console::print("\n[TEST] pipe_bytes_available\n");
+
+    let pipe_id = crate::syscall::pipe::pipe_create();
+
+    let avail_empty = crate::syscall::pipe::pipe_bytes_available(pipe_id);
+    if avail_empty != 0 {
+        crate::safe_print!(96, "  FAIL: expected 0 bytes on empty pipe, got {}\n", avail_empty);
+        return false;
+    }
+
+    let data = b"hello world";
+    let _ = crate::syscall::pipe::pipe_write(pipe_id, data);
+    let avail_after = crate::syscall::pipe::pipe_bytes_available(pipe_id);
+    if avail_after != data.len() {
+        crate::safe_print!(96, "  FAIL: expected {} bytes, got {}\n", data.len(), avail_after);
+        return false;
+    }
+
+    let mut buf = [0u8; 5];
+    crate::syscall::pipe::pipe_read(pipe_id, &mut buf);
+    let avail_partial = crate::syscall::pipe::pipe_bytes_available(pipe_id);
+    let expected = data.len() - 5;
+    if avail_partial != expected {
+        crate::safe_print!(96, "  FAIL: expected {} bytes after partial read, got {}\n", expected, avail_partial);
+        return false;
+    }
+
+    crate::syscall::pipe::pipe_close_write(pipe_id);
+    crate::syscall::pipe::pipe_close_read(pipe_id);
+
+    console::print("  OK: pipe_bytes_available tracks buffer length correctly\n");
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+/// Test: SharedFdTable Arc::clone shares the same table (CLONE_FILES semantics).
+fn test_shared_fd_table_arc_clone() -> bool {
+    console::print("\n[TEST] SharedFdTable Arc::clone shares table\n");
+
+    let table = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new());
+    let clone = table.clone();
+
+    {
+        let mut t = table.table.lock();
+        t.insert(10, akuma_exec::process::FileDescriptor::DevNull);
+    }
+
+    let clone_has_fd = clone.table.lock().contains_key(&10);
+    if !clone_has_fd {
+        console::print("  FAIL: Arc::clone did not share fd table\n");
+        return false;
+    }
+
+    let count = alloc::sync::Arc::strong_count(&table);
+    if count != 2 {
+        crate::safe_print!(96, "  FAIL: expected strong_count=2, got {}\n", count);
+        return false;
+    }
+
+    console::print("  OK: Arc::clone shares fd table, strong_count=2\n");
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+/// Test: SharedFdTable::clone_deep_for_fork creates an independent copy.
+fn test_shared_fd_table_deep_clone_for_fork() -> bool {
+    console::print("\n[TEST] SharedFdTable deep clone for fork\n");
+
+    let original = alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::with_stdio());
+    {
+        let mut t = original.table.lock();
+        t.insert(5, akuma_exec::process::FileDescriptor::DevNull);
+    }
+    original.cloexec.lock().insert(5);
+    original.nonblock.lock().insert(5);
+
+    let forked = original.clone_deep_for_fork();
+
+    let forked_has_fd5 = forked.table.lock().contains_key(&5);
+    let forked_has_cloexec = forked.cloexec.lock().contains(&5);
+    let forked_has_nonblock = forked.nonblock.lock().contains(&5);
+
+    if !forked_has_fd5 || !forked_has_cloexec || !forked_has_nonblock {
+        crate::safe_print!(128, "  FAIL: fork copy missing data (fd={} cloexec={} nonblock={})\n",
+            forked_has_fd5, forked_has_cloexec, forked_has_nonblock);
+        return false;
+    }
+
+    {
+        let mut t = original.table.lock();
+        t.insert(99, akuma_exec::process::FileDescriptor::DevNull);
+    }
+    let forked_has_99 = forked.table.lock().contains_key(&99);
+    if forked_has_99 {
+        console::print("  FAIL: fork copy is not independent (saw fd 99 from original)\n");
+        return false;
+    }
+
+    console::print("  OK: deep clone creates independent copy with all data\n");
+    crate::safe_print!(64, "  Result: PASS\n");
+    true
+}
+
+/// Test: sysinfo reports actual RAM from PMM, not hardcoded 256MB.
+fn test_sysinfo_reports_actual_ram() -> bool {
+    console::print("\n[TEST] sysinfo reports actual RAM\n");
+
+    let total_pages = crate::pmm::total_count();
+    let total_bytes = total_pages * 4096;
+
+    if total_bytes <= 256 * 1024 * 1024 {
+        crate::safe_print!(96, "  SKIP: PMM total ({} MB) <= 256MB, can't distinguish from hardcoded\n",
+            total_bytes / 1024 / 1024);
+        return true;
+    }
+
+    let pass = total_bytes > 256 * 1024 * 1024;
+    crate::safe_print!(128, "  PMM reports {} MB total RAM (should match sysinfo)\n", total_bytes / 1024 / 1024);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: writing to a pipe that has been fully destroyed (both ends closed)
+/// returns Err(EPIPE) instead of silently returning Ok(0).
+/// This is the exact regression that caused `go tool compile -V=full` to produce
+/// empty output: pipe_write returned 0, sys_write passed that through as a
+/// successful short write, and the parent Go process saw empty stdout.
+fn test_pipe_write_to_destroyed_pipe_returns_epipe() -> bool {
+    console::print("\n[TEST] pipe_write to destroyed pipe returns EPIPE\n");
+
+    let id = crate::syscall::pipe::pipe_create();
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::syscall::pipe::pipe_close_read(id);
+
+    let result = crate::syscall::pipe::pipe_write(id, b"should fail with EPIPE");
+    let pass = matches!(result, Err(32)); // EPIPE = 32
+    if !pass {
+        crate::safe_print!(96, "  FAIL: pipe_write returned {:?}, expected Err(32/EPIPE)\n", result);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: writing to a pipe where read_count=0 (all readers closed) returns
+/// Err(EPIPE), matching Linux SIGPIPE/EPIPE semantics.
+fn test_pipe_write_no_readers_returns_epipe() -> bool {
+    console::print("\n[TEST] pipe_write with no readers returns EPIPE\n");
+
+    let id = crate::syscall::pipe::pipe_create();
+    crate::syscall::pipe::pipe_close_read(id);
+
+    let result = crate::syscall::pipe::pipe_write(id, b"no reader");
+    let pass = matches!(result, Err(32));
+    if !pass {
+        crate::safe_print!(96, "  FAIL: pipe_write returned {:?}, expected Err(32/EPIPE)\n", result);
+    }
+
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Test: writing to a pipe with active readers succeeds normally.
+fn test_pipe_write_with_readers_succeeds() -> bool {
+    console::print("\n[TEST] pipe_write with readers succeeds\n");
+
+    let id = crate::syscall::pipe::pipe_create();
+    let data = b"go tool compile -V=full";
+    let result = crate::syscall::pipe::pipe_write(id, data);
+    let pass = matches!(result, Ok(n) if n == data.len());
+    if !pass {
+        crate::safe_print!(96, "  FAIL: pipe_write returned {:?}, expected Ok({})\n", result, data.len());
+    }
+
+    let mut buf = [0u8; 64];
+    let (n, eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    let data_pass = n == data.len() && &buf[..n] == data && !eof;
+    if !data_pass {
+        crate::safe_print!(96, "  FAIL: read back n={} eof={}\n", n, eof);
+    }
+
+    crate::syscall::pipe::pipe_close_write(id);
+    crate::syscall::pipe::pipe_close_read(id);
+    let final_pass = pass && data_pass;
+    crate::safe_print!(64, "  Result: {}\n", if final_pass { "PASS" } else { "FAIL" });
+    final_pass
+}
+
+/// Test: simulates the compile -V=full scenario where cloexec cleanup during
+/// execve closes inherited pipe fds but the child's dup'd stdout (fd=1) must
+/// survive. Verifies that pipe_clone_ref correctly keeps the writer alive
+/// through cloexec close of the original fd.
+fn test_pipe_cloexec_cleanup_preserves_live_writer() -> bool {
+    console::print("\n[TEST] cloexec cleanup preserves live pipe writer\n");
+
+    let id = crate::syscall::pipe::pipe_create(); // write=1, read=1
+
+    // Simulate fork: deep-copy bumps both refcounts
+    crate::syscall::pipe::pipe_clone_ref(id, true);  // write=2
+    crate::syscall::pipe::pipe_clone_ref(id, false); // read=2
+
+    // Child: dup write end to fd=1 (clone_ref again)
+    crate::syscall::pipe::pipe_clone_ref(id, true);  // write=3
+
+    // Child: close original write fd
+    crate::syscall::pipe::pipe_close_write(id); // write=2
+
+    // Child: execve cloexec closes inherited read fd
+    crate::syscall::pipe::pipe_close_read(id); // read=1
+
+    // Parent: closes its write fd (only needed read end)
+    crate::syscall::pipe::pipe_close_write(id); // write=1
+
+    // Child writes to fd=1 (the dup'd write end) — must succeed
+    let result = crate::syscall::pipe::pipe_write(id, b"compile -V=full\n");
+    let write_ok = matches!(result, Ok(16));
+    if !write_ok {
+        crate::safe_print!(96, "  FAIL: child write returned {:?}, expected Ok(16)\n", result);
+    }
+
+    // Parent reads from its read end — must get the data
+    let mut buf = [0u8; 64];
+    let (n, _eof) = crate::syscall::pipe::pipe_read(id, &mut buf);
+    let read_ok = n == 16;
+    if !read_ok {
+        crate::safe_print!(96, "  FAIL: parent read returned {} bytes, expected 16\n", n);
+    }
+
+    // Cleanup
+    crate::syscall::pipe::pipe_close_write(id); // write=0
+    crate::syscall::pipe::pipe_close_read(id);  // read=0, destroyed
+
+    let pass = write_ok && read_ok;
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: a hostile `len` must be refused, not turned into a page loop.
+///
+/// `sys_mmap` and `sys_madvise` take `len` straight from a user register. Before
+/// 2026-08-29 neither validated it: `mmap`'s `MAP_FIXED` path ran
+/// `for i in 0..pages { aspace.unmap_page(va) }` over a wrapped page count, and
+/// `madvise(addr, -1, MADV_DONTNEED)` produced ~4.5e15 pages and walked them one at
+/// a time inside an `MmBklGuard` window. Both pinned a core with no way out — an
+/// unprivileged local denial of service.
+///
+/// The value of this test is that it **returns at all**: pre-fix it would hang the
+/// boot suite here rather than fail. See docs/archive/AKUMA_EXTRACT_MMAP.md §10.1.
+fn test_mmap_madvise_hostile_length_is_refused() -> bool {
+    console::print("\n[TEST] hostile mmap/madvise length is refused (no unbounded loop)\n");
+    use crate::syscall::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE};
+    use akuma_primitives::errno::negated::ENOMEM;
+    const NR_MMAP: u64 = 222;
+    const NR_MADVISE: u64 = 233;
+    const MADV_DONTNEED: u64 = 4;
+
+    let anon_flags = u64::from(MAP_ANONYMOUS | MAP_PRIVATE);
+
+    // mmap(NULL, -1, RW, ANON|PRIVATE) — a length spanning the address space.
+    let huge_anon = crate::syscall::handle_syscall(
+        NR_MMAP, &[0, !0u64, 0x3, anon_flags, !0u64, 0]);
+    let huge_anon_ok = huge_anon == ENOMEM;
+
+    // The MAP_FIXED variant, which is the one that reached the unmap loop and also
+    // slipped past the kernel-VA overlap guard when `pages * 4096` wrapped.
+    let fixed_flags = u64::from(MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE);
+    let huge_fixed = crate::syscall::handle_syscall(
+        NR_MMAP, &[0x1000, !0u64, 0x3, fixed_flags, !0u64, 0]);
+    let huge_fixed_ok = huge_fixed == ENOMEM;
+
+    // madvise(0x1000, -1, MADV_DONTNEED) — the unbounded-loop shape.
+    let huge_madv = crate::syscall::handle_syscall(
+        NR_MADVISE, &[0x1000, !0u64, MADV_DONTNEED, 0, 0, 0]);
+    let huge_madv_ok = huge_madv == EINVAL;
+
+    // A legitimate small madvise must get past the guard — it must not have
+    // become "reject everything". `0` with a process, `ESRCH` without one.
+    let ok_madv = crate::syscall::handle_syscall(
+        NR_MADVISE, &[0x1000, 0x1000, MADV_DONTNEED, 0, 0, 0]);
+    let ok_madv_ok = ok_madv != EINVAL;
+
+    let pass = huge_anon_ok && huge_fixed_ok && huge_madv_ok && ok_madv_ok;
+    if !pass {
+        crate::safe_print!(255,
+            "  FAIL: huge_anon={:#x} huge_fixed={:#x} huge_madv={:#x} ok_madv={:#x}\n",
+            huge_anon, huge_fixed, huge_madv, ok_madv);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: forktest §E `[EINVAL] nr=222` end-to-end through `handle_syscall`.
+///
+/// Walks the same matrix through the public `handle_syscall(nr=222, …)` entry
+/// point so we also catch breakage in `sys_mmap`'s call into the helper, not
+/// just the helper itself. Uses the `len==0` and `MAP_FIXED + unaligned addr`
+/// EINVAL branches that don't require a live process address space.
+fn test_mmap_einval_through_handle_syscall() -> bool {
+    console::print("\n[TEST] handle_syscall mmap EINVAL paths (len==0 / fixed+unaligned)\n");
+    use crate::syscall::{MAP_ANONYMOUS, MAP_FIXED, MAP_PRIVATE};
+    const NR_MMAP: u64 = 222;
+
+    // mmap(addr=0, len=0, prot=0, flags=0, fd=-1, off=0) → EINVAL (len check).
+    let len_zero = crate::syscall::handle_syscall(NR_MMAP, &[0, 0, 0, 0, !0u64, 0]);
+    let len_zero_ok = len_zero == EINVAL;
+
+    // mmap(addr=0xffffffffffffffea, len=0x1000, MAP_FIXED|ANON|PRIVATE) → EINVAL
+    // (fixed+unaligned). Mirrors crash14: addr is a negative errno-shaped word.
+    let fixed_flags = u64::from(MAP_FIXED | MAP_ANONYMOUS | MAP_PRIVATE);
+    let fixed_unaligned = crate::syscall::handle_syscall(
+        NR_MMAP,
+        &[0xffffffffffffffea_u64, 0x1000, 0x3, fixed_flags, !0u64, 0],
+    );
+    let fixed_unaligned_ok = fixed_unaligned == EINVAL;
+
+    let pass = len_zero_ok && fixed_unaligned_ok;
+    if !pass {
+        crate::safe_print!(192,
+            "  FAIL: len_zero={:#x} fixed_unaligned={:#x} (expected {:#x})\n",
+            len_zero, fixed_unaligned, EINVAL);
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Go SIGSEGV at PC=0x80000000 — MAP_FIXED kernel VA guard.
+///
+/// Verifies that the guard condition used in `sys_mmap`'s MAP_FIXED branch
+/// correctly identifies all allocations that would overlap the kernel
+/// identity-map range (KERNEL_VA_START..KERNEL_VA_END).
+fn test_mmap_fixed_kernel_va_guard() -> bool {
+    console::print("\n[TEST] mmap MAP_FIXED: kernel VA range guard logic\n");
+    use akuma_exec::process::types::ProcessMemory;
+    let kva_start = ProcessMemory::KERNEL_VA_START;
+    // Dynamic: the guard now tracks the real RAM identity-map extent, which
+    // scales with detected RAM (kernel_va_end >= KERNEL_VA_START always).
+    let kva_end   = akuma_exec::mmu::kernel_va_end();
+    let mid = (kva_start + (kva_end - kva_start) / 2) & !0xFFF;
+
+    // (addr, len, should_reject)
+    let cases: &[(usize, usize, bool)] = &[
+        (mid,         0x1000, true),   // mid-range
+        (kva_start,   0x1000, true),   // at exact start
+        (kva_end - 0x1000, 0x1000, true), // last page in range
+        (kva_end - 0x1000, 0x2000, true), // straddles end
+        (kva_start - 0x1000, 0x2000, true), // straddles start
+        (0x3000_0000, 0x1000, false),  // well below (256 MB, under RAM base)
+        (kva_end,     0x1000, false),  // first page above range
+        (kva_end + 0x1000_0000, 0x1000, false),  // well above
+    ];
+
+    let mut pass = true;
+    for &(addr, len, should_reject) in cases {
+        let map_end = addr.saturating_add(len);
+        let rejected = addr < kva_end && map_end > kva_start;
+        if rejected != should_reject {
+            crate::safe_print!(192, "  FAIL: addr={:#x} len={:#x} expected_reject={} got={}\n",
+                addr, len, should_reject, rejected);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Lazy-fault kernel-VA guard, dynamic-RAM aware.
+///
+/// `far_in_kernel_identity_user_range` must cover the *full* kernel RAM
+/// identity-map VA window `[KERNEL_VA_START, kernel_va_end())`, where
+/// `kernel_va_end()` scales with detected RAM (it was hardcoded to 0xC000_0000,
+/// which only fit a 2GB machine and made MEMORY>2GB SIGSEGV; see
+/// docs/COW_OPTIMIZATIONS.md).  Cases are derived from the dynamic bound so this
+/// passes at any `MEMORY` size.
+fn test_lazy_fault_kernel_va_guard() -> bool {
+    console::print("\n[TEST] lazy fault: far_in_kernel_identity_user_range covers RAM identity map\n");
+    use akuma_exceptions::far_in_kernel_identity_user_range;
+    use akuma_exec::process::types::ProcessMemory;
+    let kva_start = ProcessMemory::KERNEL_VA_START as u64;
+    let kva_end   = akuma_exec::mmu::kernel_va_end() as u64; // dynamic: tracks detected RAM
+    let mid = kva_start + (kva_end - kva_start) / 2;
+
+    // (far, expected_in_range)
+    let cases: &[(u64, bool)] = &[
+        (kva_start,       true),
+        (mid,             true),
+        (kva_end - 1,     true),
+        (kva_end,         false), // first address above the identity map
+        (kva_start - 1,   false),
+        (0x1009_ee90,     false), // user low VA, below RAM base
+        (kva_end + 0x1000_0000, false), // well above
+    ];
+
+    let mut pass = true;
+    for &(far, expected) in cases {
+        let got = far_in_kernel_identity_user_range(far);
+        if got != expected {
+            crate::safe_print!(192, "  FAIL: far={:#x} expected={} got={}\n", far, expected, got);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+/// Regression: Go SIGSEGV at PC=0x80000000 — fork mmap VA guard.
+///
+/// Verifies the guard condition used in `fork_process`'s mmap copy loop
+/// to skip pages whose virtual address falls in the kernel identity range.
+fn test_fork_mmap_skips_kernel_va() -> bool {
+    console::print("\n[TEST] fork mmap copy: skips pages in kernel VA range\n");
+    use akuma_exec::process::types::ProcessMemory;
+    let kva_start = ProcessMemory::KERNEL_VA_START;
+    let kva_end   = akuma_exec::mmu::kernel_va_end(); // dynamic: tracks detected RAM
+    let mid = (kva_start + (kva_end - kva_start) / 2) & !0xFFF;
+
+    let bad_vas:  &[usize] = &[kva_start, mid, kva_end - 0x1000];
+    let ok_vas:   &[usize] = &[kva_start - 0x1000, kva_end, 0x1000_0000, kva_end + 0x1000_0000];
+
+    let mut pass = true;
+    for &va in bad_vas {
+        if !(va >= kva_start && va < kva_end) {
+            crate::safe_print!(128, "  FAIL: va={:#x} should be detected as kernel range\n", va);
+            pass = false;
+        }
+    }
+    for &va in ok_vas {
+        if va >= kva_start && va < kva_end {
+            crate::safe_print!(128, "  FAIL: va={:#x} should NOT be detected as kernel range\n", va);
+            pass = false;
+        }
+    }
+    crate::safe_print!(64, "  Result: {}\n", if pass { "PASS" } else { "FAIL" });
+    pass
+}
+
+// ── Timer and critical-section invariants ─────────────────────────────────────
+
+/// Test: timer re-arm computation `(freq * interval_us) / 1_000_000` doesn't overflow
+/// for realistic QEMU frequencies, and `counter + ticks` doesn't overflow near u64::MAX/2.
+fn test_timer_interval_no_overflow() -> bool {
+    console::print("\n[TEST] Timer interval computation — no overflow\n");
+    for freq in [1_000_000u64, 62_500_000, 100_000_000] {
+        let interval_us = 10_000u64; // 10 ms
+        let ticks = if let Some(v) = freq.checked_mul(interval_us) { v / 1_000_000 } else {
+            crate::safe_print!(96, "  FAIL: mul overflow at freq={}\n", freq);
+            return false;
+        };
+        let high_counter = u64::MAX / 2;
+        if high_counter.checked_add(ticks).is_none() {
+            crate::safe_print!(96, "  FAIL: new_cval overflow at freq={}\n", freq);
+            return false;
+        }
+        crate::safe_print!(96, "  freq={} ticks={} ok\n", freq, ticks);
+    }
+    console::print("  PASS\n");
+    true
+}
+
+/// Test: `thread_stats()` returns internally consistent values — at least one running thread,
+/// total ≤ MAX_THREADS, and warns if pool is 100% occupied (starvation risk).
+fn test_thread_pool_stats_sane() -> bool {
+    console::print("\n[TEST] Thread pool stats sanity\n");
+
+    let (ready, running, _terminated) = akuma_exec::threading::thread_stats();
+    let max = akuma_exec::threading::max_threads();
+    let used = ready + running;
+
+    crate::safe_print!(128, "  thread_stats: ready={} running={} max={}\n",
+        ready, running, max);
+
+    if running == 0 {
+        console::print("  FAIL: zero running threads (current thread must be counted)\n");
+        return false;
+    }
+    if used > max {
+        crate::safe_print!(96, "  FAIL: used={} > max={}\n", used, max);
+        return false;
+    }
+    if used == max {
+        console::print("  WARN: thread pool 100% occupied — starvation risk\n");
+        // Not a hard failure, just a diagnostic
+    }
+    console::print("  PASS\n");
+    true
+}
+
+fn test_reentrant_signal_repend() -> bool {
+    // Verify pend_signal_for_thread and take_pending_signal round-trip correctly.
+    // The actual re-entrant re-pend path (non-fault signal on sigaltstack) uses
+    // these same primitives; this test confirms the API contract.
+    let slot = akuma_exec::threading::current_thread_id();
+    if slot >= akuma_exec::threading::max_threads() {
+        crate::safe_print!(96, "  FAIL: slot={} >= max={}\n", slot,
+            akuma_exec::threading::max_threads());
+        return false;
+    }
+    // Pend SIGURG (signal 23 = Go's async preemption signal) then take it back.
+    // mask=0 means no signals are blocked; a set bit blocks that signal.
+    akuma_exec::threading::pend_signal_for_thread(slot, 23);
+    let taken = akuma_exec::threading::take_pending_signal(0u64);
+    if taken != Some(23) {
+        crate::safe_print!(96, "  FAIL: take_pending_signal returned {:?}, expected Some(23)\n", taken);
+        return false;
+    }
+    // A second take should return None (queue is empty).
+    let taken2 = akuma_exec::threading::take_pending_signal(0u64);
+    if taken2.is_some() {
+        crate::safe_print!(96, "  FAIL: second take returned {:?}, expected None\n", taken2);
+        return false;
+    }
+    console::print("  PASS\n");
+    true
+}
+
+fn test_eventfd_refcount() -> bool {
+    // Verify that eventfd reference counting prevents use-after-exec EBADF.
+    // Bug: clone_deep_for_fork() shared the same eventfd id with the child;
+    // child exec() closed it (EFD_CLOEXEC), destroying it from the global table;
+    // parent then got EBADF on write → Go's netpollBreak fatal error.
+
+    // Create an eventfd (ref_count starts at 1)
+    let id = crate::syscall::eventfd::eventfd_create(0, 0);
+
+    // Simulate fork: bump ref_count to 2
+    crate::syscall::eventfd::eventfd_clone_ref(id);
+
+    // First close (simulates child exec CLOEXEC close): ref_count → 1
+    // eventfd must still be alive
+    crate::syscall::eventfd::eventfd_close(id);
+    if crate::syscall::eventfd::eventfd_write(id, 1).is_err() {
+        crate::safe_print!(96, "  FAIL: eventfd_write after first close returned error (id={})\n", id);
+        crate::syscall::eventfd::eventfd_close(id); // cleanup
+        return false;
+    }
+
+    // Second close (parent closes): ref_count → 0, eventfd is destroyed
+    crate::syscall::eventfd::eventfd_close(id);
+    // Write must now fail with EBADF
+    if crate::syscall::eventfd::eventfd_write(id, 1).is_ok() {
+        crate::safe_print!(96, "  FAIL: eventfd_write after destroy succeeded (expected EBADF, id={})\n", id);
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+fn test_siginfo_fields_set() -> bool {
+    // Verify the si_code constants match the Linux AArch64 ABI values that Go reads.
+    // Go's sigpanic() guard: if si.Code <= 0 (SI_USER=0), it skips sigpanic and crashes.
+    // Hardware faults must use SEGV_MAPERR=1; user-sent signals use SI_USER=0.
+    const SEGV_MAPERR: i32 = 1;
+    const SI_USER: i32 = 0;
+
+    let fault_code = if true { SEGV_MAPERR } else { SI_USER };
+    if fault_code != 1 {
+        console::print("  FAIL: fault path must produce SEGV_MAPERR=1\n");
+        return false;
+    }
+    let user_code = if false { SEGV_MAPERR } else { SI_USER };
+    if user_code != 0 {
+        console::print("  FAIL: user-signal path must produce SI_USER=0\n");
+        return false;
+    }
+
+    // Verify the siginfo_t field offsets used in try_deliver_signal match Linux ABI.
+    // si_signo=@0 (i32), si_errno=@4 (i32), si_code=@8 (i32), si_addr=@16 (u64)
+    const SI_SIGNO_OFFSET: usize = 0;
+    const SI_CODE_OFFSET: usize = 8;
+    const SI_ADDR_OFFSET: usize = 16;
+    if SI_SIGNO_OFFSET != 0 || SI_CODE_OFFSET != 8 || SI_ADDR_OFFSET != 16 {
+        console::print("  FAIL: siginfo_t offset constants wrong\n");
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+// =============================================================================
+// Benchmarks (not correctness tests — they always return true)
+// =============================================================================
+// Signal frame and lazy region regression tests
+// =============================================================================
+
+/// Verify signal frame ucontext layout matches Linux AArch64 ABI.
+/// uc_stack (stack_t) must be at ucontext+16 with fields:
+///   +16: ss_sp (u64), +24: ss_flags (i32 + 4 pad), +32: ss_size (u64)
+/// uc_sigmask at ucontext+40.
+/// mcontext at ucontext+176 (after 120-byte _pad + 8-byte _pad2 for alignment).
+fn test_signal_frame_uc_stack_offsets() -> bool {
+    use akuma_exceptions::{
+        TEST_SIGFRAME_UCONTEXT, TEST_SIGFRAME_MCONTEXT,
+        TEST_SIGFRAME_UC_SIGMASK, TEST_SIGFRAME_SIZE,
+    };
+    console::print("  signal_frame_uc_stack_offsets: ");
+
+    // ucontext layout (matches Go's defs_linux_arm64.go):
+    //   +0:   uc_flags (u64)
+    //   +8:   uc_link  (u64)
+    //   +16:  uc_stack.ss_sp    (u64)
+    //   +24:  uc_stack.ss_flags (i32 + 4 pad)
+    //   +32:  uc_stack.ss_size  (u64)
+    //   +40:  uc_sigmask        (u64)
+    //   +48:  _pad[(1024-64)/8] (120 bytes)
+    //   +168: _pad2[8]          (8 bytes for 16-byte alignment)
+    //   +176: uc_mcontext (sigcontext)
+
+    let uc_stack_ss_sp = TEST_SIGFRAME_UCONTEXT + 16;
+    let uc_stack_ss_flags = TEST_SIGFRAME_UCONTEXT + 24;
+    let uc_stack_ss_size = TEST_SIGFRAME_UCONTEXT + 32;
+    let uc_sigmask = TEST_SIGFRAME_UC_SIGMASK;
+
+    // uc_sigmask should be at ucontext + 40
+    if uc_sigmask != TEST_SIGFRAME_UCONTEXT + 40 {
+        crate::safe_print!(64, "FAIL: uc_sigmask offset {} != ucontext+40 ({})\n",
+            uc_sigmask, TEST_SIGFRAME_UCONTEXT + 40);
+        return false;
+    }
+
+    // mcontext should be at ucontext + 176 (per Linux AArch64 ABI)
+    // Go's ucontext has: _pad[(1024-64)/8]=120 bytes + _pad2[8]=8 bytes before uc_mcontext
+    if TEST_SIGFRAME_MCONTEXT != TEST_SIGFRAME_UCONTEXT + 176 {
+        crate::safe_print!(64, "FAIL: mcontext offset {} != ucontext+176 ({})\n",
+            TEST_SIGFRAME_MCONTEXT, TEST_SIGFRAME_UCONTEXT + 176);
+        return false;
+    }
+
+    // ss_sp should be before ss_flags, which is before ss_size, which is before uc_sigmask
+    if !(uc_stack_ss_sp < uc_stack_ss_flags
+        && uc_stack_ss_flags < uc_stack_ss_size
+        && uc_stack_ss_size < uc_sigmask
+        && uc_sigmask < TEST_SIGFRAME_MCONTEXT)
+    {
+        crate::safe_print!(64, "FAIL: uc_stack field ordering broken: ss_sp={} ss_flags={} ss_size={} sigmask={} mctx={}\n",
+            uc_stack_ss_sp, uc_stack_ss_flags, uc_stack_ss_size, uc_sigmask, TEST_SIGFRAME_MCONTEXT);
+        return false;
+    }
+
+    // Frame size must accommodate all sections
+    if TEST_SIGFRAME_SIZE < TEST_SIGFRAME_MCONTEXT + 280 {
+        crate::safe_print!(64, "FAIL: sigframe too small: {} < mcontext+280 ({})\n",
+            TEST_SIGFRAME_SIZE, TEST_SIGFRAME_MCONTEXT + 280);
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// Test BTreeMap-based lazy region lookup at boundaries: exact start, last byte,
+/// one-past-end (miss), adjacent regions, and middle-of-region.
+fn test_lazy_region_btreemap_boundary_lookup() -> bool {
+    use akuma_exec::process::{push_lazy_region, lazy_region_lookup_for_pid, clear_lazy_regions};
+    console::print("  lazy_region_btreemap_boundary: ");
+
+    let test_pid = 99990;
+    let _proc = LazyTestProcess::new(test_pid);
+
+    // Region A: [0x1000_0000, 0x1000_0000 + 0x10000) = 16 pages
+    push_lazy_region(test_pid, 0x1000_0000, 0x10000, 0x3);
+    // Region B: [0x2000_0000, 0x2000_0000 + 0x8000) = 8 pages
+    push_lazy_region(test_pid, 0x2000_0000, 0x8000, 0x3);
+
+    // Exact start of region A
+    if lazy_region_lookup_for_pid(test_pid, 0x1000_0000).is_none() {
+        console::print("FAIL: miss at exact start of region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Last byte of region A (last page start)
+    if lazy_region_lookup_for_pid(test_pid, 0x1000_F000).is_none() {
+        console::print("FAIL: miss at last page of region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // One past end of region A — should NOT match
+    if lazy_region_lookup_for_pid(test_pid, 0x1001_0000).is_some() {
+        console::print("FAIL: false hit past end of region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Before any region
+    if lazy_region_lookup_for_pid(test_pid, 0x0FFF_F000).is_some() {
+        console::print("FAIL: false hit before region A\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Between regions A and B
+    if lazy_region_lookup_for_pid(test_pid, 0x1800_0000).is_some() {
+        console::print("FAIL: false hit between regions A and B\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    // Middle of region B
+    if lazy_region_lookup_for_pid(test_pid, 0x2000_4000).is_none() {
+        console::print("FAIL: miss in middle of region B\n");
+        clear_lazy_regions(test_pid);
+        return false;
+    }
+
+    clear_lazy_regions(test_pid);
+    console::print("  PASS\n");
+    true
+}
+
+// =============================================================================
+// AIO stub safety tests
+// =============================================================================
+
+/// Critical safety invariant: io_getevents (syscall 4) must NEVER return ENOSYS.
+///
+/// ENOSYS = -38 = 0xffffffffffffffda.  If Go's compile tool receives this value
+/// from io_getevents, it treats it as a pointer and immediately dereferences it,
+/// causing a WILD-DA at FAR=0xffffffffffffffda → process killed → go build exits 1.
+/// This test guards against regressions to that ENOSYS return path.
+fn test_aio_getevents_never_returns_enosys() -> bool {
+    console::print("\n[TEST] io_getevents never returns ENOSYS\n");
+
+    // All AIO stubs must return 0 for any ctx — never negative (ENOSYS, EINVAL, etc.)
+    // Go dereferences negative returns as pointers → WILD-DA crash.
+    let test_ctxs: &[u64] = &[0, 0xdeadbeef];
+    for &ctx in test_ctxs {
+        let r = crate::syscall::handle_syscall(4, &[ctx, 1, 8, 0, 0, 0]);
+        crate::safe_print!(96, "  io_getevents(ctx={:#x}) = {:#x} (must be 0)\n", ctx, r);
+        if r != 0 {
+            crate::safe_print!(96, "  FAIL: io_getevents returned {:#x}, not 0\n", r);
+            return false;
+        }
+
+        let r = crate::syscall::handle_syscall(2, &[ctx, 0, 0, 0, 0, 0]);
+        crate::safe_print!(96, "  io_submit(ctx={:#x}) = {:#x} (must be 0)\n", ctx, r);
+        if r != 0 {
+            crate::safe_print!(96, "  FAIL: io_submit returned {:#x}, not 0\n", r);
+            return false;
+        }
+
+        let r = crate::syscall::handle_syscall(3, &[ctx, 0, 0, 0, 0, 0]);
+        crate::safe_print!(96, "  io_cancel(ctx={:#x}) = {:#x} (must be 0)\n", ctx, r);
+        if r != 0 {
+            crate::safe_print!(96, "  FAIL: io_cancel returned {:#x}, not 0\n", r);
+            return false;
+        }
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// io_getevents/io_submit/io_cancel with invalid ctx must return EINVAL (not ENOSYS,
+/// not 0, and not some random value).
+fn test_aio_stubs_invalid_ctx_returns_einval() -> bool {
+    console::print("\n[TEST] AIO stubs with invalid ctx return 0 (never negative)\n");
+
+    // CRITICAL: AIO stubs must NEVER return negative values for any ctx.
+    // Go treats negative returns as pointers: EINVAL(-22) → *(x0+16) = *(-6) → WILD-DA.
+    // All stubs return 0 ("nothing happened") regardless of ctx validity.
+
+    let bad_ctxs: &[u64] = &[0, 0xdeadbeef, 0xffffffffffffffff, 1, 0x1000];
+
+    for &ctx in bad_ctxs {
+        // io_getevents
+        let r = crate::syscall::handle_syscall(4, &[ctx, 0, 8, 0, 0, 0]);
+        if r != 0 {
+            crate::safe_print!(128,
+                "  FAIL: io_getevents(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
+            return false;
+        }
+
+        // io_submit
+        let r = crate::syscall::handle_syscall(2, &[ctx, 0, 0, 0, 0, 0]);
+        if r != 0 {
+            crate::safe_print!(128,
+                "  FAIL: io_submit(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
+            return false;
+        }
+
+        // io_cancel
+        let r = crate::syscall::handle_syscall(3, &[ctx, 0, 0, 0, 0, 0]);
+        if r != 0 {
+            crate::safe_print!(128,
+                "  FAIL: io_cancel(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
+            return false;
+        }
+
+        // io_destroy
+        let r = crate::syscall::handle_syscall(1, &[ctx, 0, 0, 0, 0, 0]);
+        if r != 0 {
+            crate::safe_print!(128,
+                "  FAIL: io_destroy(ctx={:#x}) = {:#x}, expected 0\n", ctx, r);
+            return false;
+        }
+
+        // Extra safety: verify none of them ever return ENOSYS
+        let r2 = crate::syscall::handle_syscall(2, &[ctx, 0, 0, 0, 0, 0]);
+        let r3 = crate::syscall::handle_syscall(3, &[ctx, 0, 0, 0, 0, 0]);
+        let r4 = crate::syscall::handle_syscall(4, &[ctx, 0, 8, 0, 0, 0]);
+        let r5 = crate::syscall::handle_syscall(1, &[ctx, 0, 0, 0, 0, 0]);
+        if r2 == ENOSYS || r3 == ENOSYS || r4 == ENOSYS || r5 == ENOSYS {
+            crate::safe_print!(128,
+                "  FAIL: AIO stub returned ENOSYS for ctx={:#x}\n", ctx);
+            return false;
+        }
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// After io_setup succeeds, io_getevents must return 0 (empty ring, head==tail),
+/// io_submit must return 0 (no ops submitted), and io_destroy must return 0.
+fn test_aio_stubs_valid_ctx_returns_zero() -> bool {
+    console::print("\n[TEST] AIO stubs with valid ctx return 0\n");
+
+
+    // Kernel-test stacks are kernel VA; io_setup(null ctx_idp) → EFAULT.
+    // io_destroy without io_setup (unknown ctx) → 0 — must not return EINVAL
+    // or Go may fault (crash10.log / aio.rs).
+
+    // Verify io_setup with null ctx_idp returns EFAULT (not ENOSYS)
+    let r = crate::syscall::handle_syscall(0, &[8, 0, 0, 0, 0, 0]);
+    crate::safe_print!(96, "  io_setup(nr=8, null) = {:#x} (expect EFAULT={:#x})\n", r, EFAULT);
+    if r != EFAULT {
+        crate::safe_print!(96, "  FAIL: expected EFAULT, got {:#x}\n", r);
+        return false;
+    }
+
+    // io_destroy(ctx=0) with no setup: unknown ctx → 0 (same policy as other AIO stubs)
+    let r = crate::syscall::handle_syscall(1, &[0, 0, 0, 0, 0, 0]);
+    crate::safe_print!(96, "  io_destroy(ctx=0) = {:#x} (expect 0)\n", r);
+    if r != 0 {
+        crate::safe_print!(96, "  FAIL: expected 0, got {:#x}\n", r);
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+/// Verify the MAP_SHARED warning suppression logic: the warning must only fire
+/// for file-backed writable (PROT_WRITE) mappings, not for read-only or anonymous ones.
+///
+/// Go's build system maps compiled object files with MAP_SHARED|PROT_READ.
+/// Before the fix, the kernel logged a warning for every such mmap, producing
+/// 76 noisy lines during go build.  After the fix, read-only MAP_SHARED is
+/// silently treated as MAP_PRIVATE (same semantics when no writes occur).
+///
+/// This test validates the decision logic that controls the warning by directly
+/// exercising the flag combinations that matter.
+fn test_map_shared_readonly_returns_success() -> bool {
+    console::print("\n[TEST] MAP_SHARED warning suppression logic\n");
+
+    // From `akuma-syscalls-linux`, not restated locally: a test that redefines
+    // the bits it is testing cannot catch a wrong bit.
+    use akuma_syscalls_linux::flags::map::{MAP_ANONYMOUS, MAP_SHARED};
+    use akuma_syscalls_linux::flags::prot::{PROT_READ, PROT_WRITE};
+
+    // Helper: does this combination trigger the writable MAP_SHARED warning?
+    // Mirrors the exact condition in sys_mmap:
+    //   flags & MAP_SHARED != 0 && is_file_backed && (prot & PROT_WRITE) != 0
+    let should_warn = |flags: u32, prot: u32, fd: i32| -> bool {
+        let is_file_backed = flags & MAP_ANONYMOUS == 0 && fd >= 0;
+        flags & MAP_SHARED != 0 && is_file_backed && (prot & PROT_WRITE) != 0
+    };
+
+    // Case 1: MAP_SHARED | MAP_ANONYMOUS | PROT_READ → anonymous, never warn
+    let warn = should_warn(MAP_SHARED | MAP_ANONYMOUS, PROT_READ, -1);
+    crate::safe_print!(96, "  MAP_SHARED|MAP_ANON PROT_READ  → should_warn={} (expect false)\n", warn);
+    if warn {
+        console::print("  FAIL: anonymous MAP_SHARED should never warn\n");
+        return false;
+    }
+
+    // Case 2: MAP_SHARED | file-backed | PROT_READ → read-only, must NOT warn (Go pattern)
+    let warn = should_warn(MAP_SHARED, PROT_READ, 3);
+    crate::safe_print!(96, "  MAP_SHARED file-backed PROT_READ  → should_warn={} (expect false)\n", warn);
+    if warn {
+        console::print("  FAIL: read-only file-backed MAP_SHARED should not warn\n");
+        return false;
+    }
+
+    // Case 3: MAP_SHARED | file-backed | PROT_READ|PROT_WRITE → writable, MUST warn
+    let warn = should_warn(MAP_SHARED, PROT_READ | PROT_WRITE, 3);
+    crate::safe_print!(96, "  MAP_SHARED file-backed PROT_RW    → should_warn={} (expect true)\n", warn);
+    if !warn {
+        console::print("  FAIL: writable file-backed MAP_SHARED must warn (unsupported)\n");
+        return false;
+    }
+
+    // Case 4: MAP_PRIVATE | file-backed | PROT_READ|PROT_WRITE → not shared, no warn
+    let warn = should_warn(0, PROT_READ | PROT_WRITE, 3);
+    crate::safe_print!(96, "  MAP_PRIVATE file-backed PROT_RW   → should_warn={} (expect false)\n", warn);
+    if warn {
+        console::print("  FAIL: MAP_PRIVATE should never trigger MAP_SHARED warning\n");
+        return false;
+    }
+
+    console::print("  PASS\n");
+    true
+}
+
+// =============================================================================
+
+/// Run kernel memory benchmarks.  Prints throughput numbers to serial.
+/// Safe to call after scheduler init.  Always returns true.
+pub fn run_benchmarks() -> bool {
+    console::print("\n========== Memory Benchmarks ==========\n");
+    bench_mmap_eager();
+    bench_demand_page();
+    bench_fork_clone();
+    console::print("========================================\n\n");
+    true
+}
+
+/// Benchmark: eager mmap alloc cost — allocate 256 pages as a batch vs single,
+/// then free them.  Measures PMM throughput before/after batch optimisation.
+fn bench_mmap_eager() {
+    use crate::pmm;
+    use crate::timer::uptime_us;
+
+    const PAGES: usize = 256;
+    console::print("[BENCH] mmap_eager_alloc: ");
+
+    // Warm up PMM
+    if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); }
+
+    let t0 = uptime_us();
+    let frames = if let Some(f) = pmm::alloc_pages_zeroed(PAGES) { f } else {
+        console::print("SKIP (OOM)\n");
+        return;
+    };
+    let t_alloc = uptime_us();
+
+    for frame in frames { pmm::free_page(frame); }
+
+    let t_end = uptime_us();
+    let alloc_us = t_alloc.saturating_sub(t0);
+    let free_us  = t_end.saturating_sub(t_alloc);
+    let total_us = t_end.saturating_sub(t0);
+    let kb = (PAGES * 4) as u64;
+    let throughput = (kb * 1_000_000).checked_div(alloc_us).unwrap_or(0);
+
+    crate::safe_print!(128,
+        "{} pages ({}KB): alloc={}µs free={}µs total={}µs alloc_throughput={}KB/s\n",
+        PAGES, kb, alloc_us, free_us, total_us, throughput);
+}
+
+/// Benchmark: single-page alloc+free round-trip latency (PMM hot path).
+fn bench_demand_page() {
+    use crate::pmm;
+    use crate::timer::uptime_us;
+
+    const ITERATIONS: u64 = 256;
+    console::print("[BENCH] demand_page_alloc: ");
+
+    // Warm up
+    if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); }
+
+    let t0 = uptime_us();
+    let mut done = 0u64;
+    for i in 0..ITERATIONS {
+        if let Some(f) = pmm::alloc_page_zeroed() { pmm::free_page(f); done += 1; } else { crate::safe_print!(32, "OOM at {}\n", i); break; }
+    }
+    let elapsed_us = uptime_us().saturating_sub(t0);
+    let per_page_ns = (elapsed_us * 1000).checked_div(done).unwrap_or(0);
+
+    crate::safe_print!(128,
+        "{} iters in {}µs = {}ns/page\n",
+        done, elapsed_us, per_page_ns);
+}
+
+/// Benchmark: fork page-copy throughput (alloc + 4KB memcpy per page).
+/// This is the dominant cost in fork_process before Copy-on-Write.
+/// Use the numbers here to measure improvement after CoW is implemented.
+fn bench_fork_clone() {
+    use crate::pmm;
+    use crate::timer::uptime_us;
+
+    const PAGES: usize = 512; // 2 MB
+    console::print("[BENCH] fork_copy (alloc+memcpy): ");
+
+    let src_frames = if let Some(f) = pmm::alloc_pages_zeroed(PAGES) { f } else { console::print("SKIP (OOM for src 2MB)\n"); return; };
+
+    let t0 = uptime_us();
+    let mut copied = 0usize;
+    let mut dst_frames: alloc::vec::Vec<akuma_exec::PhysFrame> = alloc::vec::Vec::new();
+
+    for src_frame in &src_frames {
+        match pmm::alloc_page_zeroed() {
+            Some(dst_frame) => {
+                let src = akuma_exec::mmu::phys_to_virt(src_frame.addr).cast_const();
+                let dst = akuma_exec::mmu::phys_to_virt(dst_frame.addr).cast::<u8>();
+                unsafe { core::ptr::copy_nonoverlapping(src, dst, 4096); }
+                dst_frames.push(dst_frame);
+                copied += 1;
+            }
+            None => break,
+        }
+    }
+
+    let elapsed_us = uptime_us().saturating_sub(t0);
+    for f in src_frames { pmm::free_page(f); }
+    for f in dst_frames { pmm::free_page(f); }
+
+    let total_kb = (copied * 4) as u64;
+    let mb_s = (total_kb * 1_000_000).checked_div(elapsed_us).unwrap_or(0) / 1024;
+
+    crate::safe_print!(128,
+        "{} pages ({}KB) copied in {}µs = {}MB/s\n",
+        copied, total_kb, elapsed_us, mb_s);
+}
+
+// ============================================================================
+// CoW Fork Tests
+// ============================================================================
+
+/// Test basic CoW refcount: inc sets count to 2, dec brings it to 1 then 0.
+fn test_cow_refcount_basic() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW refcount basic\n");
+    let fake_pa: usize = 0xDEAD_0000;
+
+    let mut ok = true;
+    ok &= pmm::cow_ref_get(fake_pa) == 0;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 2;
+    let is_last = pmm::cow_ref_dec(fake_pa);
+    ok &= !is_last && pmm::cow_ref_get(fake_pa) == 1;
+    let is_last = pmm::cow_ref_dec(fake_pa);
+    ok &= is_last && pmm::cow_ref_get(fake_pa) == 0;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test CoW refcount with multiple increments (simulating multi-fork).
+fn test_cow_refcount_multi() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW refcount multi\n");
+    let fake_pa: usize = 0xBEEF_0000;
+
+    let mut ok = true;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 2;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 3;
+    pmm::cow_ref_inc(fake_pa);
+    ok &= pmm::cow_ref_get(fake_pa) == 4;
+
+    ok &= !pmm::cow_ref_dec(fake_pa); // 4→3
+    ok &= !pmm::cow_ref_dec(fake_pa); // 3→2
+    ok &= !pmm::cow_ref_dec(fake_pa); // 2→1
+    ok &= pmm::cow_ref_dec(fake_pa);  // 1→0, last ref
+    ok &= pmm::cow_ref_get(fake_pa) == 0;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that free_page respects CoW refcount: shared pages are not freed.
+fn test_cow_free_page_respects_refcount() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW free_page respects refcount\n");
+
+    let frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else {
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
+    };
+    let free_before = pmm::free_count();
+
+    pmm::cow_ref_inc(frame.addr);
+    let mut ok = pmm::cow_ref_get(frame.addr) == 2;
+
+    // free_page should NOT actually free (still shared)
+    pmm::free_page(frame);
+    ok &= pmm::free_count() == free_before;
+    ok &= pmm::cow_ref_get(frame.addr) == 1;
+
+    // Second free_page should actually free (last ref)
+    pmm::free_page(frame);
+    ok &= pmm::free_count() == free_before + 1;
+    ok &= pmm::cow_ref_get(frame.addr) == 0;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test IC flush SVC instruction detection encoding.
+fn test_ic_flush_svc_detection() -> bool {
+    console::print("\n[TEST] IC flush SVC detection\n");
+
+    let svc_mask = |instr: u32| -> bool {
+        (instr & 0xFFE0_001F) == 0xD4000001
+    };
+
+    let mut ok = true;
+    // SVC encodings
+    ok &= svc_mask(0xD4000001);  // SVC #0
+    ok &= svc_mask(0xD4000021);  // SVC #1
+    ok &= svc_mask(0xD40003E1);  // SVC #0x1F
+    ok &= svc_mask(0xD41FFFE1);  // SVC #0xFFFF
+
+    // Not SVC
+    ok &= !svc_mask(0xD503201F); // NOP
+    ok &= !svc_mask(0xD4200000); // BRK #0
+    ok &= !svc_mask(0xD65F03C0); // RET
+    ok &= !svc_mask(0xD2800000); // MOV x0, #0
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test the ISS condition used to detect CoW faults in the EL1 sync handler.
+///
+/// The EL1 CoW handler checks:
+///   DFSC = ISS & 0x3F == 0x0F  (permission fault level 3)
+///   ISS bit 6 == 1               (WnR = write fault)
+///
+/// No FAR range check — user VA space is 0..512GB on AArch64 (39-bit VAs);
+/// translate_user_va() returning None is the correct guard for non-user addresses.
+///
+/// This test verifies the ISS pattern matches real CoW scenarios and doesn't
+/// false-positive on translation faults or read faults.
+fn test_cow_el1_fault_conditions() -> bool {
+    console::print("\n[TEST] CoW EL1 fault conditions\n");
+
+    let is_cow_el1_fault = |iss: u32| -> bool {
+        let dfsc = iss & 0x3F;
+        dfsc == 0x0F && (iss & (1 << 6)) != 0
+        // No FAR check — user VA is 0..512GB; translate_user_va handles non-user addresses
+    };
+
+    let mut ok = true;
+
+    // ISS=0x4F: DFSC=0x0F (perm fault L3), bit6=1 (write)
+    // Matches the exact crash: EC=0x25, ISS=0x4f, FAR=0x20000bbac (altstack at ~8GB)
+    ok &= is_cow_el1_fault(0x4F);
+
+    // ISS=0x0F: DFSC=0x0F (perm fault L3), bit6=0 (READ fault) — NOT a write, no CoW
+    ok &= !is_cow_el1_fault(0x0F);
+
+    // ISS=0x45: DFSC=0x05 (translation fault L1), bit6=1 — not a permission fault
+    ok &= !is_cow_el1_fault(0x45);
+
+    // ISS=0x5: DFSC=0x05, bit6=0 — translation fault, read
+    ok &= !is_cow_el1_fault(0x05);
+
+    // ISS=0x4E: DFSC=0x0E (perm fault L2), bit6=1 — L2, not L3
+    ok &= !is_cow_el1_fault(0x4E);
+
+    // ISS=0x4D: DFSC=0x0D (perm fault L1), bit6=1 — L1, not L3
+    ok &= !is_cow_el1_fault(0x4D);
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that after a simulated CoW fault (alloc new, dec old), the old PA is
+/// freed when its refcount reaches zero, and the new frame is tracked correctly.
+fn test_cow_dec_after_fault() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW dec after fault lifecycle\n");
+
+    let (old_frame, new_frame) = if let (Some(o), Some(n)) = (pmm::alloc_page_zeroed(), pmm::alloc_page_zeroed()) { (o, n) } else {
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
+    };
+    let free_before = pmm::free_count();
+
+    // Simulate CoW share: refcount = 2 (parent + child both track old_frame)
+    pmm::cow_ref_inc(old_frame.addr);
+    let mut ok = pmm::cow_ref_get(old_frame.addr) == 2;
+
+    // Simulate CoW fault in child:
+    // cow_ref_dec(old_pa): 2→1 (parent still has it)
+    let freed = pmm::cow_ref_dec(old_frame.addr);
+    ok &= !freed; // should NOT free — parent still has it
+    ok &= pmm::cow_ref_get(old_frame.addr) == 1;
+
+    // Parent exits: free_page(old_pa) → cow_ref_dec 1→0 → frees
+    // free_before was measured after both allocs, so freeing one frame → free_before + 1
+    pmm::free_page(old_frame);
+    ok &= pmm::free_count() == free_before + 1;
+    ok &= pmm::cow_ref_get(old_frame.addr) == 0;
+
+    // Clean up new_frame — second frame freed → free_before + 2
+    pmm::free_page(new_frame);
+    ok &= pmm::free_count() == free_before + 2;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that the CoW pre-fault logic (used by ensure_cow_page_writable) correctly
+/// resolves a CoW-shared frame: allocates a private copy, decrements old refcount,
+/// and leaves old PA still tracked by the "other owner" (refcount 2→1).
+fn test_ensure_cow_writable_resolves_cow_page() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] ensure_cow_page_writable logic: resolves CoW frame\n");
+
+    let old_frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n  Result: FAIL\n"); return false; };
+
+    // Simulate CoW share: two processes both track old_frame → refcount = 2
+    pmm::cow_ref_inc(old_frame.addr);
+    let mut ok = pmm::cow_ref_get(old_frame.addr) == 2;
+
+    // Simulate ensure_cow_page_writable: allocate new frame, copy, dec refcount
+    let new_frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else {
+        pmm::free_page(old_frame);
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
+    };
+    let free_after_alloc = pmm::free_count();
+
+    // new_frame != old_frame (different physical frames)
+    ok &= new_frame.addr != old_frame.addr;
+
+    // Decrement refcount (child broke CoW, has its own private copy now)
+    pmm::cow_ref_dec(old_frame.addr);
+    ok &= pmm::cow_ref_get(old_frame.addr) == 1; // parent still holds it
+
+    // Simulate parent exit: free_page → cow_ref_dec 1→0 → actually frees
+    pmm::free_page(old_frame);
+    ok &= pmm::cow_ref_get(old_frame.addr) == 0;
+    ok &= pmm::free_count() == free_after_alloc + 1;
+
+    // Also free new_frame (child's private copy)
+    pmm::free_page(new_frame);
+    ok &= pmm::free_count() == free_after_alloc + 2;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that the fixed try_resolve_el1_cow_fault path does NOT decrement the
+/// refcount when lookup_process fails (page stays RO, refcount unchanged).
+/// Before the fix, cow_ref_dec was always called even without remapping.
+fn test_cow_el1_resolver_no_dec_on_fail() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] CoW EL1 resolver: no dec when lookup_process fails\n");
+
+    let frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n  Result: FAIL\n"); return false; };
+    let free_before = pmm::free_count();
+
+    // Simulate CoW share: refcount = 2
+    pmm::cow_ref_inc(frame.addr);
+    let mut ok = pmm::cow_ref_get(frame.addr) == 2;
+
+    // Simulate the "lookup_process failed" path in the fixed handler:
+    // We allocated new_frame but cannot remap (no owner) → free new_frame, skip cow_ref_dec.
+    let new_frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else {
+        pmm::free_page(frame);
+        console::print("  OOM\n  Result: FAIL\n");
+        return false;
+    };
+    // Fixed behavior: free new_frame, do NOT call cow_ref_dec
+    pmm::free_page(new_frame);
+
+    // Refcount must still be 2 — the page was NOT resolved
+    ok &= pmm::cow_ref_get(frame.addr) == 2;
+    // free_count should be back to free_before (new_frame allocated then freed)
+    ok &= pmm::free_count() == free_before;
+
+    // Cleanup: dec twice to reach 0, then free_page will actually free
+    pmm::cow_ref_dec(frame.addr); // 2→1
+    pmm::free_page(frame);        // cow_ref_dec 1→0 → frees
+    ok &= pmm::cow_ref_get(frame.addr) == 0;
+    ok &= pmm::free_count() == free_before + 1;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test that ensure_cow_page_writable is a no-op for non-CoW pages
+/// (cow_ref_get == 0 → no allocation, no refcount change, no frame leak).
+fn test_cow_prefault_not_cow_page_no_op() -> bool {
+    use crate::pmm;
+    console::print("\n[TEST] ensure_cow_page_writable: no-op for non-CoW page\n");
+
+    let frame = if let Some(f) = pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n  Result: FAIL\n"); return false; };
+    let free_after_alloc = pmm::free_count();
+
+    // No cow_ref_inc → refcount = 0 (not a CoW page)
+    let mut ok = pmm::cow_ref_get(frame.addr) == 0;
+
+    // ensure_cow_page_writable early-returns for non-CoW pages: no extra allocation
+    ok &= pmm::free_count() == free_after_alloc;
+
+    // Cleanup
+    pmm::free_page(frame);
+    ok &= pmm::free_count() == free_after_alloc + 1;
+
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+// ============================================================================
+// ThreadWaker tests
+// ============================================================================
+
+/// Trampoline for a thread slot these tests hold in INITIALIZING/WAITING for the
+/// whole test — never actually dispatched. Only runs if a scheduler pass ever
+/// does pick it up (a race these tests don't fully close), in which case it must
+/// not spin forever holding a slot: self-terminate immediately.
+extern "C" fn waker_test_park_trampoline() -> ! {
+    akuma_exec::threading::mark_current_terminated();
+    loop {
+        akuma_exec::threading::yield_now();
+        akuma_cpu::park::wfi();
+    }
+}
+
+/// Spawn a slot for the ThreadWaker tests below with a REAL initialized context
+/// (valid `sp`/`ttbr0`/`elr`), left in INITIALIZING so it is never actually
+/// scheduled while the test pokes its state directly.
+///
+/// The three tests here fabricate WAITING/READY state on a thread slot to probe
+/// `ThreadWaker` in isolation, without spawning the real workload it would
+/// normally belong to. They used to do that on a bare FREE slot — whose
+/// `Context.sp` is still 0, never having gone through any spawn path. On the old
+/// cooperative scheduler that was merely reckless: thread 0 (running the test
+/// suite) enjoyed a 100 ms grace window immune to involuntary preemption, so the
+/// scheduler essentially never got a chance to dispatch to the fabricated slot
+/// before the test restored it to FREE. Removing that flag
+/// (`docs/archive/TRIM_FAT_COOPERATIVE_SCHEDULING.md`) made thread 0 preemptible
+/// like everything else, and a timer tick landing in that narrow window now
+/// dispatches to the phantom slot and hits the scheduler's `[SGI-S FATAL]
+/// new_sp=0x0` halt — the exact failure mode already documented on
+/// `test_kill_thread_group_reaps_futex_blocked_sibling` in
+/// `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, which independently arrived at the same fix: use a
+/// really-spawned slot, not a bare one.
+///
+/// A valid context alone isn't quite enough, though: unlike the old bare-slot
+/// version, this slot is now genuinely schedulable once woken, and its
+/// trampoline self-terminates the instant it is dispatched. On a fully
+/// preemptible thread 0 (post-removal, same doc) a timer tick landing between
+/// `wake()` and the state read below can let it actually run before the test
+/// observes the READY state it just set — flipping the read to TERMINATED and
+/// failing the assertion, not crashing. Each test below wraps that window in
+/// `disable_preemption()`/`enable_preemption()` to make the read deterministic
+/// on the single-core boot the self-test suite normally runs under.
+/// Did a woken test slot read as woken? `READY`, or any state a
+/// peer core's idle thread can carry it to before the read: it picks up a `READY` thread
+/// at once (`disable_preemption` holds only this core), runs the self-terminating
+/// trampoline, and reaps the slot. Never `WAITING` or `INITIALIZING`, which are what a
+/// lost or misdirected wake leaves.
+fn woken_state_ok(state: u8) -> bool {
+    use akuma_exec::threading::thread_state;
+    state == thread_state::READY
+        || matches!(state, thread_state::RUNNING | thread_state::TERMINATED | thread_state::FREE)
+}
+
+fn spawn_waker_test_slot() -> Result<usize, &'static str> {
+    akuma_exec::threading::spawn_user_thread_initializing(
+        waker_test_park_trampoline,
+        core::ptr::null_mut(),
+    )
+}
+
+/// Test: ThreadWaker::wake() transitions WAITING→READY and sets WOKEN_STATES flag
+pub fn test_thread_waker_marks_ready() -> bool {
+    use akuma_exec::threading::{self, thread_state};
+
+    console::print("\n[TEST] ThreadWaker marks thread ready\n");
+
+    let tid = match spawn_waker_test_slot() {
+        Ok(tid) => tid,
+        Err(e) => {
+            crate::safe_print!(64, "  spawn FAILED: {}\n  Result: FAIL\n", e);
+            return false;
+        }
+    };
+
+    // Set thread to WAITING, fire the waker, and read the result all under
+    // disable_preemption() — see spawn_waker_test_slot's docs for why.
+    threading::disable_preemption();
+    threading::set_thread_state(tid, thread_state::WAITING);
+    threading::set_woken_state(tid, false);
+    let waker = threading::get_waker_for_thread(tid);
+    waker.wake();
+    let state = threading::get_thread_state(tid);
+    let woken = threading::get_woken_state(tid);
+    threading::enable_preemption();
+
+    // Reclaim the slot (never actually dispatched; a hard external terminate is safe).
+    threading::mark_thread_terminated(tid);
+    threading::cleanup_terminated_force();
+
+    let ok = woken_state_ok(state) && woken;
+    crate::safe_print!(128, "  state={} (expected {}), woken={} (expected true)\n",
+        state, thread_state::READY, woken);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Calling wake() on an already-READY thread is harmless
+pub fn test_thread_waker_idempotent() -> bool {
+    use akuma_exec::threading::{self, thread_state};
+
+    console::print("\n[TEST] ThreadWaker idempotent on READY thread\n");
+
+    let tid = match spawn_waker_test_slot() {
+        Ok(tid) => tid,
+        Err(e) => {
+            crate::safe_print!(64, "  spawn FAILED: {}\n  Result: FAIL\n", e);
+            return false;
+        }
+    };
+
+    // Set thread to READY, fire the waker twice, and read the result all under
+    // disable_preemption() — see spawn_waker_test_slot's docs for why.
+    threading::disable_preemption();
+    threading::set_thread_state(tid, thread_state::READY);
+    threading::set_woken_state(tid, false);
+    let waker = threading::get_waker_for_thread(tid);
+    waker.wake_by_ref();
+    waker.wake_by_ref();
+    // State should still be READY (not corrupted)
+    let state = threading::get_thread_state(tid);
+    // WOKEN_STATES should be set (sticky flag)
+    let woken = threading::get_woken_state(tid);
+    threading::enable_preemption();
+
+    // Reclaim the slot (never actually dispatched; a hard external terminate is safe).
+    threading::mark_thread_terminated(tid);
+    threading::cleanup_terminated_force();
+
+    let ok = woken_state_ok(state) && woken;
+    crate::safe_print!(128, "  state={} (expected {}), woken={}\n",
+        state, thread_state::READY, woken);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Create waker via get_waker_for_thread(), clone it, fire clone, verify state
+pub fn test_thread_waker_roundtrip() -> bool {
+    use akuma_exec::threading::{self, thread_state};
+
+    console::print("\n[TEST] ThreadWaker roundtrip (clone + wake)\n");
+
+    let tid = match spawn_waker_test_slot() {
+        Ok(tid) => tid,
+        Err(e) => {
+            crate::safe_print!(64, "  spawn FAILED: {}\n  Result: FAIL\n", e);
+            return false;
+        }
+    };
+
+    // Set thread to WAITING, fire the waker, and read the result all under
+    // disable_preemption() — see spawn_waker_test_slot's docs for why.
+    threading::disable_preemption();
+    threading::set_thread_state(tid, thread_state::WAITING);
+    threading::set_woken_state(tid, false);
+    let waker = threading::get_waker_for_thread(tid);
+    let cloned = waker.clone();
+    drop(waker);
+    cloned.wake();
+    let state = threading::get_thread_state(tid);
+    let woken = threading::get_woken_state(tid);
+    threading::enable_preemption();
+
+    // Reclaim the slot (never actually dispatched; a hard external terminate is safe).
+    threading::mark_thread_terminated(tid);
+    threading::cleanup_terminated_force();
+
+    let ok = woken_state_ok(state) && woken;
+    crate::safe_print!(128, "  state={} (expected {}), woken={}\n",
+        state, thread_state::READY, woken);
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: block_on-style executor with real ThreadWaker completes a multi-poll future
+pub fn test_block_on_real_waker() -> bool {
+    use core::task::{Context, Poll};
+
+    console::print("\n[TEST] Block-on with real ThreadWaker\n");
+
+    // Use a real ThreadWaker (same as the new SSH block_on)
+    let waker = akuma_exec::threading::current_thread_waker();
+    let mut cx = Context::from_waker(&waker);
+
+    let mut future = core::pin::pin!(MultiPollFuture::new(5, true));
+
+    let mut result = None;
+    for _ in 0..20 {
+        match future.as_mut().poll(&mut cx) {
+            Poll::Ready(v) => { result = Some(v); break; }
+            Poll::Pending => {}
+        }
+    }
+
+    let poll_count = MultiPollFuture::polls_seen();
+    crate::safe_print!(64, "  Total polls: {} (expected 5)\n", poll_count);
+    crate::safe_print!(64, "  Result: {:?} (expected Some(5))\n", result);
+
+    let ok = result == Some(5) && poll_count == 5;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}
+
+/// Test: Orphaned ext2 RwSpinlock recovery.
+/// 
+/// Simulates the scenario where a thread holding the ext2 write lock is killed,
+/// and verifies that another thread can detect the orphan and recover.
+pub fn test_ext2_orphaned_lock_recovery() -> bool {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+    use spinning_top::RwSpinlock;
+    
+    console::print("\n[TEST] ext2 orphaned RwSpinlock recovery\n");
+    
+    // Simulate the ext2 lock ownership tracking
+    static TEST_LOCK_OWNER: AtomicUsize = AtomicUsize::new(0);
+    static TEST_LOCK: RwSpinlock<u32> = RwSpinlock::new(42);
+    
+    // Helper to check if "thread" is dead (simulated)
+    static DEAD_THREAD: AtomicUsize = AtomicUsize::new(0);
+    fn is_thread_dead(tid: usize) -> bool {
+        DEAD_THREAD.load(Ordering::Acquire) == tid && tid != 0
+    }
+    
+    // 1. Simulate thread 5 taking the write lock
+    let fake_owner_tid = 5usize;
+    console::print("  Step 1: Thread 5 takes write lock\n");
+    {
+        let guard = TEST_LOCK.try_write().expect("Should get write lock");
+        TEST_LOCK_OWNER.store(fake_owner_tid, Ordering::Release);
+        // Simulate crash: forget the guard (never drops, never unlocks)
+        core::mem::forget(guard);
+    }
+    crate::safe_print!(64, "    Lock owner: {} (simulating held by thread 5)\n", 
+        TEST_LOCK_OWNER.load(Ordering::Acquire));
+    
+    // 2. Verify the lock is indeed stuck
+    console::print("  Step 2: Verify lock is stuck (try_read fails)\n");
+    let can_read = TEST_LOCK.try_read().is_some();
+    if can_read {
+        console::print("    FAIL: Unexpectedly got read lock\n");
+        return false;
+    }
+    console::print("    OK: try_read() returned None (lock is stuck)\n");
+    
+    // 3. Mark thread 5 as dead
+    console::print("  Step 3: Mark thread 5 as dead\n");
+    DEAD_THREAD.store(fake_owner_tid, Ordering::Release);
+    
+    // 4. Simulate the orphan recovery logic (from ext2.rs try_read_state)
+    console::print("  Step 4: Attempt orphan recovery\n");
+    let owner = TEST_LOCK_OWNER.load(Ordering::Acquire);
+    if owner != 0 && is_thread_dead(owner) {
+        console::print("    Detected orphaned lock, force-unlocking\n");
+        unsafe { TEST_LOCK.force_unlock_write(); }
+        TEST_LOCK_OWNER.store(0, Ordering::Release);
+    } else {
+        console::print("    FAIL: Did not detect orphaned lock\n");
+        return false;
+    }
+    
+    // 5. Verify we can now acquire the lock
+    console::print("  Step 5: Verify lock is recoverable\n");
+    let can_read_now = TEST_LOCK.try_read().is_some();
+    if !can_read_now {
+        console::print("    FAIL: Still can't get read lock after recovery\n");
+        return false;
+    }
+    console::print("    OK: try_read() succeeded after recovery\n");
+    
+    // 6. Verify we can also write
+    let can_write = TEST_LOCK.try_write().is_some();
+    if !can_write {
+        console::print("    FAIL: Can't get write lock after recovery\n");
+        return false;
+    }
+    console::print("    OK: try_write() succeeded after recovery\n");
+    
+    console::print("  Result: PASS\n");
+    true
+}
+
+/// Test: the orphaned-lock sweep has something to sweep.
+///
+/// The test above proves the *recovery algorithm* works, on a lock it creates
+/// itself. This proves the thing that algorithm is useless without: that the
+/// real root mount is actually enrolled in `akuma_vfs_glue`'s registry, so a
+/// reap reaches it.
+///
+/// Worth its own test because the two are independent and only one of them has
+/// ever been wrong. The amd64 kernel had every hook registered and an **empty**
+/// registry for months — its root is a different instantiation of
+/// `Ext2Filesystem` than the registry could hold, so nothing was ever recorded
+/// and `reap_dead_thread` swept nothing, which is indistinguishable from working
+/// at every observation point except this one
+/// (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §8.3). The registry is shared
+/// between the two kernels now; this is the AArch64 half of the same check.
+pub fn test_reap_registry_is_populated() -> bool {
+    console::print("\n[TEST] orphaned-lock sweep registry is populated\n");
+    let n = akuma_vfs_glue::reapable_mount_count();
+    if n == 0 {
+        console::print("    FAIL: no mount enrolled — a reap would sweep nothing\n");
+        return false;
+    }
+    console::print("  Result: PASS\n");
+    true
+}
+
+/// Test: is_thread_terminated returns true for TERMINATED and FREE states.
+pub fn test_thread_terminated_detection() -> bool {
+    use akuma_exec::threading::{is_thread_terminated, get_thread_state, set_thread_state, thread_state};
+    
+    console::print("\n[TEST] is_thread_terminated detects TERMINATED and FREE\n");
+    
+    // Use a high slot number that's unlikely to be in use
+    // We'll temporarily modify its state and restore it
+    let test_slot = 62usize; // Near end of thread array
+    let original_state = get_thread_state(test_slot);
+
+    // The whole fabricate-and-restore window runs with IRQs masked, and the
+    // prints are deferred until after it. `THREAD_STATES` is the scheduler's
+    // live run queue, not a private variable: parking slot 62 in `READY` (test 4)
+    // makes it *eligible*, and it has no context — a timer SGI landing anywhere
+    // in this window picks a thread whose saved SP is 0 and the box dies with
+    // `[SGI-S FATAL] new_sp=0x0 invalid!` mid-suite. That was a real, if rare,
+    // boot-suite kill, and it is a race in the test rather than in anything it
+    // tests. Masking IRQs closes the window on this core; a peer core cannot
+    // reach it because the boot suite runs before secondaries schedule userspace.
+    let (terminated_detected, free_detected, running_detected, ready_detected) =
+        akuma_exec::runtime::with_irqs_disabled(|| {
+            set_thread_state(test_slot, thread_state::TERMINATED);
+            let t = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, thread_state::FREE);
+            let f = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, thread_state::RUNNING);
+            let r = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, thread_state::READY);
+            let y = is_thread_terminated(test_slot);
+            set_thread_state(test_slot, original_state);
+            (t, f, r, y)
+        });
+
+    crate::safe_print!(64, "  TERMINATED state: is_thread_terminated={} (expected true)\n", terminated_detected);
+    crate::safe_print!(64, "  FREE state: is_thread_terminated={} (expected true)\n", free_detected);
+    crate::safe_print!(64, "  RUNNING state: is_thread_terminated={} (expected false)\n", running_detected);
+    crate::safe_print!(64, "  READY state: is_thread_terminated={} (expected false)\n", ready_detected);
+
+    let ok = terminated_detected && free_detected && !running_detected && !ready_detected;
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
+}

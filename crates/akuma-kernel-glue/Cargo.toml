@@ -22,6 +22,10 @@ akuma-ext2 = { path = "../akuma-ext2" }
 akuma-fdt = { path = "../akuma-fdt" }
 akuma-gic = { path = "../akuma-gic" }
 akuma-kernel-core = { path = "../akuma-kernel-core" }
+akuma-machine-facts = { path = "../akuma-machine-facts" }
+akuma-mem-policy = { path = "../akuma-mem-policy" }
+# The boot command line (`/chosen/bootargs`), kept once; `init=`/`initargs=` read through `akuma_params::init`.
+akuma-params = { path = "../akuma-params" }
 akuma-net = { path = "../akuma-net", default-features = false }
 akuma-pmm = { path = "../akuma-pmm" }
 akuma-primitives = { path = "../akuma-primitives" }
@@ -33,6 +37,13 @@ akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = fals
 akuma-timer = { path = "../akuma-timer" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 akuma-virtio = { path = "../akuma-virtio" }
+akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
+akuma-switch = { path = "../akuma-switch" }
+akuma-exec-core = { path = "../akuma-exec-core" }
+# The AArch64 root kernel's two choices in the shared scheduler, which amd64 makes the other way:
+# a thread yielding with the BKL dropped takes it for the switch (its dropped-BKL windows), and a
+# dead slot is recycled only by the collector, whose cleanup callback is this kernel's teardown.
+akuma-threading = { path = "../akuma-threading", features = ["yield-takes-bkl", "collector-recycles"] }
 log = { version = "0.4", default-features = false }
 spinning_top = "0.3"
 
@@ -45,31 +56,18 @@ pmm-instr = ["akuma-pmm/pmm-instr", "akuma-kernel-core/pmm-instr", "akuma-ext2/p
 # Mirrors the root package's own toggles of the same name — see
 # `akuma-kernel-core/Cargo.toml` for why each needs its own copy here rather
 # than relying on root's build.rs (build scripts are per-package).
-extreme = ["akuma-entry/extreme"]
 no-tests = ["akuma-kernel-core/no-tests", "akuma-entry/no-tests"]
-smp-shared = [
-    "akuma-exec/smp-shared",
-    "akuma-vfs-glue/smp-shared",
-    "akuma-exceptions/smp-shared",
-    "akuma-gic/smp-shared",
-    "akuma-net/smp-shared",
-    "akuma-primitives/smp-shared",
-    "akuma-syscalls-glue/smp-shared",
-    "akuma-kernel-core/smp-shared",
-    "akuma-entry/smp-shared",
-    "no-bkl-network",
-    "no-bkl-vfs",
-    "no-bkl-process",
-    "no-bkl-mm",
-    "no-bkl-drivers",
-    "no-bkl-irq",
+bkl-smp = [
+    "akuma-exec/bkl-smp",
+    "akuma-vfs-glue/bkl-smp",
+    "akuma-gic/bkl-smp",
+    "akuma-net/bkl-smp",
+    "akuma-primitives/bkl-smp",
+    "akuma-syscalls-glue/bkl-smp",
+    "akuma-kernel-core/bkl-smp",
+    "akuma-entry/bkl-smp",
+    "akuma-ext2/bkl-smp",
 ]
-no-bkl-network = ["akuma-exec/no-bkl-network", "akuma-net/no-bkl-network", "akuma-primitives/no-bkl-network", "akuma-syscalls-glue/no-bkl-network"]
-no-bkl-vfs = ["akuma-exec/no-bkl-vfs", "akuma-net/no-bkl-vfs", "akuma-primitives/no-bkl-vfs", "akuma-syscalls-glue/no-bkl-vfs"]
-no-bkl-process = ["akuma-exec/no-bkl-process"]
-no-bkl-mm = ["akuma-syscalls-glue/no-bkl-mm"]
-no-bkl-drivers = ["akuma-syscalls-glue/no-bkl-drivers"]
-no-bkl-irq = ["akuma-exceptions/no-bkl-irq"]
 net-profile = ["akuma-net/net-profile", "akuma-kernel-core/net-profile"]
 bkl-profile = ["akuma-kernel-core/bkl-profile"]
 smoltcp = ["akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-core/smoltcp"]
@@ -77,7 +75,6 @@ sound = ["akuma-virtio/sound"]
 platform-firecracker = ["akuma-config/platform-firecracker", "akuma-entry/platform-firecracker", "akuma-kernel-core/platform-firecracker", "akuma-virtio/platform-firecracker"]
 rump = ["akuma-net/rump", "dep:akuma-rump", "akuma-syscalls-glue/rump"]
 rump-default = ["rump"]
-rump-tests = []
 sc-eventfd = ["akuma-syscalls-glue/sc-eventfd"]
 sc-pidfd = ["akuma-syscalls-glue/sc-pidfd"]
 sc-epoll = ["akuma-syscalls-glue/sc-epoll"]

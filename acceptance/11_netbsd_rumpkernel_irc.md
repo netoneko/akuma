@@ -194,11 +194,11 @@ pre-namespace by the kernel (see docs/BOX_SUBDIR_FS_LIMITATIONS.md).
 ### Run it fresh
 
 ```sh
-cargo build --release
+cargo build --release --features rump   # rump is off by default since 2026-11-11
 userspace/build.sh                 # builds userspace/sshd, herd, busybox staging, etc.
 scripts/create_disk.sh             # (re)create the ext2 disk
 scripts/populate_disk.sh           # copies bootstrap/ (incl. srv/rumpbox + the 2 herd confs) onto it
-RUMP_NIC=1 MEMORY=1024M cargo run --release
+RUMP_NIC=1 MEMORY=1024M cargo run --release --features rump
 ```
 
 Boot prints the proxy self-test `[Test] rump_listen_accept PASSED`; herd starts

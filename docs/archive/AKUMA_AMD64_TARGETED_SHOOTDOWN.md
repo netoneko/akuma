@@ -63,7 +63,7 @@ root is the sender's `CR3`, stores that set in `TARGET[me]` and the generation i
 * `TARGETED` (`AtomicBool`) restores the old behaviour; there is no runtime
   switch yet, so the A/B is two kernel binaries.
 
-Files: `amd64/src/shootdown.rs`, `crates/akuma-mmu/src/lib.rs`.
+Files: `crates/akuma-kernel-amd64/src/shootdown.rs`, `crates/akuma-mmu/src/lib.rs`.
 
 ## 4. Results
 

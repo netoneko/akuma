@@ -439,7 +439,7 @@ async fn run_exec_session(
                 session.term_height as u16,
             );
         }
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested && !res.terminal).await;
     }
 
     // Same emergency fallback as the interactive path, with paws's own `-c`
@@ -457,7 +457,7 @@ async fn run_exec_session(
             );
         }
         println(&format!("[SSH] Spawned emergency shell: {}", used_path));
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested && !res.terminal).await;
     }
 
     // Neither could be spawned — exec itself is what is broken. Last resort:
@@ -516,7 +516,7 @@ async fn run_shell_session(
         // fresh TerminalState from the pty spawn, so its fd (ChildStdout) is
         // the handle the kernel resolves to that state.
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, true).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, !res.terminal).await;
     }
 
     // The configured shell couldn't be spawned at all — try the built-in
@@ -525,7 +525,7 @@ async fn run_shell_session(
     if let Some((res, used_path)) = try_emergency_shell(&shell_path, None, &env_refs, true) {
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
         println(&format!("[SSH] Spawned emergency shell: {}", used_path));
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, true).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, !res.terminal).await;
     }
 
     // Neither could be spawned — exec itself is what is broken. Last resort:
@@ -769,10 +769,11 @@ async fn send_paws_output(
     Ok(())
 }
 
-/// `\n` → `\r\n` for a client PTY, byte-identical passthrough otherwise. A PTY
-/// needs it because the shell's stdout is a pipe, not a terminal, so no line
-/// discipline cooks it for us (mirrors the in-kernel sshd's cooked-mode
-/// output). An exec channel's stdout is a raw byte stream, not terminal
+/// `\n` → `\r\n` for a client PTY whose child sits on a pipe,
+/// byte-identical passthrough otherwise. A pipe has no line discipline to cook
+/// it for us (mirrors the in-kernel sshd's cooked-mode output); a child on a
+/// real `/dev/pts/N` (`SpawnResult::terminal`) is already cooked by its
+/// pty's `ONLCR`, and cooking again sends `\r\r\n`. An exec channel's stdout is a raw byte stream, not terminal
 /// text — translating it corrupts any binary or digest-checked output. See
 /// `EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md` root cause B.
 fn cook_output(data: &[u8], pty: bool) -> Vec<u8> {
@@ -803,20 +804,102 @@ fn cook_output(data: &[u8], pty: bool) -> Vec<u8> {
 /// ours will interrupt.
 fn teardown_child(pid: u32, stdout_fd: u32, stdin_fd: i32) {
     kill_signal(pid, SIGKILL);
+    // The shell's own group too (`kill(-pgid)`, served by the amd64 kernel):
+    // a `sleep` or `tail -f` it started would otherwise outlive the session.
+    // ESRCH when the child is not a group leader, EPERM on kernels without
+    // group kill — both fine, the direct kill above already went out.
+    let _ = kill_signal(session_policy::group_signal_target(pid), SIGKILL);
+    // sshd does not setsid its children, so the shell is rarely a group leader and
+    // the group kill above finds nothing: take the shell's descendants down by
+    // walking /proc (best effort: a box without /proc mounted simply has none to find).
+    kill_descendants(pid);
+    // Closing a pty master also hangs the terminal up (SIGHUP + SIGCONT to the
+    // session and foreground group), which is what OpenSSH relies on.
     close(stdout_fd as i32);
     if stdin_fd >= 0 {
         close(stdin_fd);
     }
+    reap_child(pid);
 }
 
+/// SIGKILL every transitive child of `root`, found through `/proc/<pid>/stat`'s ppid.
+fn kill_descendants(root: u32) {
+    let Some(dir) = read_dir("/proc") else { return };
+    let mut procs: Vec<(u32, u32)> = Vec::new();
+    for e in dir {
+        let Ok(pid) = e.name.parse::<u32>() else { continue };
+        let fd = open(&format!("/proc/{}/stat", pid), open_flags::O_RDONLY);
+        if fd < 0 {
+            continue;
+        }
+        let mut buf = [0u8; 256];
+        let n = read_fd(fd, &mut buf);
+        close(fd);
+        if n > 0
+            && let Some(ppid) = session_policy::parse_ppid(&buf[..n as usize])
+        {
+            procs.push((pid, ppid));
+        }
+    }
+    let mut kids = [0u32; 128];
+    let n = session_policy::descendants(root, &procs, &mut kids);
+    if n > 0 {
+        eprintln(&format!("[SSHD] killing {} descendant(s) of pid {}", n, root));
+    }
+    for &k in &kids[..n] {
+        kill_signal(k, SIGKILL);
+    }
+}
+
+/// Wait (bounded) for a SIGKILLed child and reap it, as OpenSSH's SIGCHLD
+/// handler does, so a torn-down session never leaves a zombie behind.
+/// `SIGKILL` delivery is asynchronous, so a single `waitpid` right after the
+/// kill usually sees "still running"; poll briefly. Blocking `sleep_ms` is fine
+/// here: each session is its own forked process, not a shared executor.
+fn reap_child(pid: u32) {
+    const REAP_POLLS: u32 = 500;
+    for _ in 0..REAP_POLLS {
+        if waitpid_status(pid).is_some() {
+            return;
+        }
+        sleep_ms(2);
+    }
+    eprintln(&format!("[SSHD] child pid {} did not exit after SIGKILL; not reaped", pid));
+}
+
+/// Runs the bridge; if it ends in an error (a send to a client that is gone —
+/// every `?` inside means that) the child has not been reaped, so kill and reap
+/// it here rather than orphaning it when the session process exits.
 async fn bridge_process(
     stream: &mut SshStream,
     session: &mut SshSession,
     pid: u32,
     stdout_fd: u32,
     child_stdin: Option<u32>,
-    pty: bool,
+    cook: bool,
 ) -> Result<(), NetError> {
+    match bridge_process_inner(stream, session, pid, stdout_fd, child_stdin, cook).await {
+        Ok(report) => report,
+        Err(e) => {
+            eprintln(&format!(
+                "[SSHD] Session pid {}: bridge ended with {:?} ({}) - killing and reaping the child",
+                pid, e.kind(), e.message
+            ));
+            // stdin fd (if the bridge opened it) is closed by process exit.
+            teardown_child(pid, stdout_fd, -1);
+            Err(e)
+        }
+    }
+}
+
+async fn bridge_process_inner(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    pid: u32,
+    stdout_fd: u32,
+    child_stdin: Option<u32>,
+    cook: bool,
+) -> Result<Result<(), NetError>, NetError> {
     let mut buf = [0u8; 1024];
 
     // The child's stdin, two ways. A `linux-abi` spawn hands us the write end
@@ -902,7 +985,7 @@ async fn bridge_process(
             loop {
                 let n = read_fd(stdout_fd as i32, &mut buf);
                 if n > 0 {
-                    let out = cook_output(&buf[..n as usize], pty);
+                    let out = cook_output(&buf[..n as usize], cook);
                     send_channel_data(stream, session, &out).await?;
                 } else {
                     break;
@@ -926,7 +1009,7 @@ async fn bridge_process(
                     if session.watch.probe_outstanding { "un" } else { "" },
                 ));
                 teardown_child(pid, stdout_fd, stdin_fd);
-                return Ok(());
+                return Ok(Ok(()));
             }
         }
 
@@ -935,7 +1018,7 @@ async fn bridge_process(
         // 2. Output from process to SSH (non-blocking). See cook_output().
         let n = read_fd(stdout_fd as i32, &mut buf);
         if n > 0 {
-            let out = cook_output(&buf[..n as usize], pty);
+            let out = cook_output(&buf[..n as usize], cook);
             send_channel_data(stream, session, &out).await?;
             did_io = true;
         }
@@ -948,7 +1031,16 @@ async fn bridge_process(
             // stdout in the same tick, so it can't await a would-block read
             // (see `SshStream::try_read`).
             match stream.try_read(&mut ssh_buf) {
-                Ok(0) => client_done = true, // peer closed its write side (TCP)
+                // TCP EOF. Not "done sending": an SSH client says that with
+                // CHANNEL_EOF (handled below) and OpenSSH treats a bare TCP EOF as
+                // the peer being gone and ends the session - so do we. Waiting on
+                // it left a dead client's shell running until the idle watch's
+                // probe grace ran out (up to 2 minutes at the defaults).
+                Ok(0) => {
+                    eprintln(&format!("[SSHD] Session pid {}: client closed the connection - tearing down", pid));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(Ok(()));
+                }
                 Ok(n) => {
                     did_io = true;
                     // Any inbound byte — even one belonging to a packet the
@@ -971,7 +1063,7 @@ async fn bridge_process(
                         pid, e
                     ));
                     teardown_child(pid, stdout_fd, stdin_fd);
-                    return Ok(());
+                    return Ok(Ok(()));
                 }
             }
 
@@ -1038,6 +1130,41 @@ async fn bridge_process(
                     }
                 }
             }
+        } else {
+            // The client has finished SENDING (CHANNEL_EOF, or a TCP FIN) but the
+            // socket still has to be watched. Without this, a client that died
+            // after its FIN was never noticed (its RST, provoked by our probe,
+            // sat unread) and a live one's keepalive replies never counted as
+            // life, so the idle watch could only fire after the full probe
+            // grace (up to 2 minutes at the defaults) - or kill a healthy
+            // `ssh host longcmd </dev/null` that was answering every probe.
+            let mut drain = [0u8; 512];
+            match stream.try_read(&mut drain) {
+                // TCP EOF after the client's CHANNEL_EOF: it hung up for good.
+                Ok(0) => {
+                    eprintln(&format!("[SSHD] Session pid {}: client closed the connection - tearing down", pid));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(Ok(()));
+                }
+                Ok(n) => {
+                    did_io = true;
+                    session.watch.note_activity(now_ms());
+                    session.input_buffer.extend_from_slice(&drain[..n]);
+                    // Keep the cipher's sequence numbers in step; the content
+                    // (probe replies, window adjusts) needs no action.
+                    while process_encrypted_packet(session).is_some() {}
+                }
+                Err(e) if e.kind() == NetErrorKind::WouldBlock
+                    || e.kind() == NetErrorKind::Interrupted => {}
+                Err(e) => {
+                    eprintln(&format!(
+                        "[SSHD] Session pid {}: socket failed after client EOF ({:?}) — tearing down",
+                        pid, e
+                    ));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(Ok(()));
+                }
+            }
         }
 
         // 4. Push queued input at the child's stdin. Non-blocking, so this can
@@ -1095,7 +1222,8 @@ async fn bridge_process(
 
     // Only now that the fds are released (so a write error can't leak them via
     // `?`) tell the client how the command ended.
-    send_exit_report(stream, session, status).await
+    // Child already reaped: a failure here must not trigger teardown.
+    Ok(send_exit_report(stream, session, status).await)
 }
 
 /// RFC 4254 §6.10: report how the command ended, then tear the channel down

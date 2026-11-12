@@ -89,7 +89,7 @@ pointers_in_nomem_asm_block = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)', 'cfg(kernel_smp)', 'cfg(ext2_fs_cache)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_smp)'] }
 
 [profile.release]
 panic = "abort"

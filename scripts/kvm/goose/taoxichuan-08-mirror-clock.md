@@ -23,13 +23,13 @@ behaviour; build with `userspace/build.sh --abiprobe-only`. For the clock gate b
 ## Composition rule (mandatory)
 `taoxichuan/` is a **composition root**, not a kernel written from scratch. It is 4,581 newly written lines (`main.rs` 3,033) next to 101 existing crates and a full amd64 kernel.
 Before you write any arm, subsystem or helper of more than about 20 lines:
-1. **Look first**: `grep -rn "<name>" crates/ amd64/src/` for the concept; `ls crates/`; the survey table in the plan § 0 already names the crates for this session (`akuma-timer`, `akuma-sntp`,
+1. **Look first**: `grep -rn "<name>" crates/ crates/akuma-kernel-amd64/src/` for the concept; `ls crates/`; the survey table in the plan § 0 already names the crates for this session (`akuma-timer`, `akuma-sntp`,
    `akuma-syscalls-time`, `akuma-cmos-rtc`).
 2. **It exists in a crate**: add a path dependency and call it. Do not copy it.
-3. **It exists only in `amd64/src/`**: extract it into a crate first (`akuma-<thing>`, `#![forbid(unsafe_code)]` where it can; `scripts/check_unsafe_budget.py` gates new `unsafe`), make `amd64/`
+3. **It exists only in `crates/akuma-kernel-amd64/src/`**: extract it into a crate first (`akuma-<thing>`, `#![forbid(unsafe_code)]` where it can; `scripts/check_unsafe_budget.py` gates new `unsafe`), make `amd64/`
    depend on it too, then depend on it from `taoxichuan/`.
 3b. **It exists but is welded to `Process`/`akuma-exec`**: that is a seam to cut (pure leaf crate, as `akuma-sntp` was cut from `akuma-syscalls-time`) or a cargo feature. Say which and what it costs.
-    Before M1: diff `amd64/Cargo.toml`'s `akuma-*` dependencies against `taoxichuan/Cargo.toml`'s (18) and say which unused one covers the clock.
+    Before M1: diff `crates/akuma-kernel-amd64/Cargo.toml`'s `akuma-*` dependencies against `taoxichuan/Cargo.toml`'s (18) and say which unused one covers the clock.
 4. **It exists nowhere**: write it, in a crate with host tests where the logic is pure, and say why in the RESULT file.
 The plan expects M1 to be about 30 newly written lines (cmdline anchor + offset store + the two time arms). If a crate already holds the offset store or the cmdline-token parse and can be
 called from `taoxichuan/` without `akuma-exec`, depend on it instead and say so. In the RESULT file report per change *pulled / extracted / cut / written new (why)*, `wc -l taoxichuan/src/*.rs`

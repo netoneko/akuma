@@ -37,7 +37,7 @@ akuma-primitives = { path = "../akuma-primitives" }
 # mounted" on amd64 and that the amd64 kernel "renders `/proc` from its own
 # process tables". Both stopped being true at 5b slice 3, when amd64 began
 # registering every process with `akuma-exec` and mounting this filesystem
-# (`amd64/src/fs.rs::init_vfs`); its own synthetic `/proc` in `fd.rs` was
+# (`crates/akuma-kernel-amd64/src/fs.rs::init_vfs`); its own synthetic `/proc` in `fd.rs` was
 # deleted in 4b batch 2c. **One `/proc` implementation serves both kernels**
 # (docs/archive/AKUMA_PROC_TREE_UNIFICATION.md).
 akuma-procfs = { path = "../akuma-procfs" }
@@ -61,17 +61,13 @@ akuma-syscalls-net = { path = "../akuma-syscalls-net" }
 akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 
 [features]
-# All four are forwarded from the bin, which owns the real definitions. They gate
-# exactly what they gated when this code was `src/vfs/`: `extreme-size` builds
-# --no-default-features and must not gain a byte of container, reboot-sync or
-# SysV-IPC code from the crate split.
+# Forwarded from the bin, which owns the real definitions. They gate exactly what
+# they gated when this code was `src/vfs/`.
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
 sc-containers = ["akuma-isolation/containers"]
-# Discriminates extreme-size from size in build.rs; forwarded from the bin.
-extreme = []
 sc-reboot = []
-# So build.rs can emit `kernel_smp_shared` — see its header for why that matters.
-smp-shared = []
+# So build.rs can emit `kernel_bkl_smp` — see its header for why that matters.
+bkl-smp = []
 
 [lints]
 workspace = true

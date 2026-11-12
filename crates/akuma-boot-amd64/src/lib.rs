@@ -1,6 +1,6 @@
 //! The amd64 boot kit: PVH entry, the physmap, kernel page tables, heap + PMM.
 //!
-//! Extracted 2026-10-24 from `amd64/src/{boot.s,phys.rs,paging.rs,mem.rs}` as
+//! Extracted 2026-10-24 from `crates/akuma-kernel-amd64/src/{boot.s,phys.rs,paging.rs,mem.rs}` as
 //! stage 1 of the minimal-self-hosting experiment
 //! (`docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT.md`): a composed kernel
 //! (**Taoxichuan**, `taoxichuan/`) pulls these as crates rather than inheriting
@@ -40,6 +40,7 @@
 pub mod ap;
 #[cfg(target_arch = "x86_64")]
 pub mod shootdown;
+pub mod mb2;
 pub mod mem;
 pub mod paging;
 pub mod phys;

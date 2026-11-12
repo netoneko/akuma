@@ -23,7 +23,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUDGET = os.path.join(ROOT, "docs", "reference", "addr-params-budget.json")
-PATHS = ["src", "crates", "amd64", os.path.join("taoxichuan", "src")]
+PATHS = ["src", "crates", os.path.join("taoxichuan", "src")]
 
 NAME = re.compile(r"^(?:\w+_)?(?:va|vaddr|pa|paddr|pfn|phys|addr|base)(?:_\w+)?$")
 FN = re.compile(r"\bfn\s+(\w+)\s*(?:<[^>(]*>)?\s*\(")

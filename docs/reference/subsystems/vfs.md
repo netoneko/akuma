@@ -189,7 +189,9 @@ Details that bite:
 - **`open()` on `vda`..`vdd` returns a working raw block fd**
   (`FileDescriptor::BlockDev { idx, pos, writable }`,
   [`../../archive/RAW_BLOCK_DEVICE_FD.md`](../../archive/RAW_BLOCK_DEVICE_FD.md),
-  implemented 2026-08-25) — `read`/`write`/`lseek`/`fstat` all work, backed by
+  implemented 2026-08-25) — `read`/`write`/`pread64`/`pwrite64`/`lseek`/`fstat`
+  all work (`pread64`/`pwrite64` at their offset, the position untouched, up to
+  64 KiB a call), backed by
   the block driver's byte-granular `read_bytes_at`/`write_bytes_at`
   (`crates/akuma-virtio/src/block.rs`), so no sector-alignment burden lands on
   the syscall layer. **Write-open of a *mounted* device is refused with
@@ -254,9 +256,9 @@ umount2".
   the high field is `i_dir_acl`). The first regular file past 2 GiB sets `RO_COMPAT_LARGE_FILE`
   (`archive/EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md`).
 - **`getdents64`:** directory cache fix (`archive/GETDENTS64_DIR_CACHE_FIX.md`).
-- **`fs-cache` feature** (`Cargo.toml`): large ext2 block cache (clock
-  eviction) — keeps the read-only toolchain resident across the many process
-  spawns in a self-host `cargo build`. Opt-in; not combinable with `extreme`.
+- **Block cache** (`akuma-ext2`'s `ClockBlockCache`, on in every build): large
+  ext2 block cache (clock eviction) — keeps the read-only toolchain resident
+  across the many process spawns in a self-host `cargo build`.
   Gives ~19× metadata speedup. See `archive/AKUMA_SELF_HOSTING.md` §7c.
 - **Write path:** ext2 is read-write; `write_at` avoids heap slurp.
 - **Hard links** (2026-10-14): `Filesystem::link`, real on ext2 (and the
@@ -303,9 +305,9 @@ real**, off the same per-thread microsecond counter the custom `/bin/top`
 binary's CORE column already reads via `sys_get_cpu_stats`
 (`akuma_exec::threading::get_thread_cpu_time`; bucketed by core in `proc.rs`'s
 `cpu_time_snapshot`). The bucketing key is `LAST_CORE`, which **every switch
-path must stamp**: AArch64's `commit_switch` always did, but amd64's x86 arm
-(`x86_yield_now`) did not until 2026-09-26, and every `cpuN` row there read 0
-busy. The row count is `active_core_count`, which needs `kernel_smp_shared` on
+path must stamp**: AArch64's switch always did, but amd64's x86 arm
+(`try_yield`) did not until 2026-09-26, and every `cpuN` row there read 0
+busy. The row count is `active_core_count`, which needs `kernel_bkl_smp` on
 this crate. A kernel that forgets to forward `akuma-vfs-glue/smp-shared` (amd64
 did, until the same date) gets a single `cpu0` row with no build error
 (`archive/AMD64_PROC_REPORTS_ONE_CORE.md`). There is no user/kernel-time split tracked, so all busy
@@ -352,7 +354,7 @@ or directory` rather than `can't open`, which is the only tell that the file was
 found and the *read* was what failed
 ([`../../archive/DEVBOX_ISSUES.md`](../../archive/DEVBOX_ISSUES.md) Issue 4).
 `read_at`'s whitelist must name every path `read_file` renders; the boot-suite
-check is `test_procfs_virtual_files_are_readable` (`src/process_tests.rs`),
+check is `test_procfs_virtual_files_are_readable` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`),
 which drives `openat` + `read` rather than calling `read_file` — testing the
 renderer directly is what kept the gap invisible.
 

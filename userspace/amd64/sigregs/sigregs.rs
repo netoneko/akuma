@@ -240,7 +240,7 @@ extern "C" fn on_usr1(_sig: i32, _info: *mut u8, _uc: *mut u8) {
 
 extern "C" fn on_segv(_sig: i32, _info: *mut u8, uc: *mut u8) {
     // SAFETY: `uc` is the kernel's `ucontext`; `uc_mcontext.rip` is at +40 +
-    // 128 (`amd64/src/signal.rs` asserts both offsets). `RESUME_AT` was set by
+    // 128 (`crates/akuma-kernel-amd64/src/signal.rs` asserts both offsets). `RESUME_AT` was set by
     // the window just before the faulting store.
     unsafe {
         clobber();

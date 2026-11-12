@@ -7,7 +7,7 @@ Design and invariants: [`../reference/subsystems/kvm.md`](../reference/subsystem
 ## 1. Rehearse locally (no ryzen)
 
 ```sh
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests
+cargo build -p akuma --target x86_64-unknown-none --release --features no-tests
 # a static x86_64 busybox, e.g. extracted from the amd64 root image:
 sh scripts/kvm/guest_rootfs.sh /tmp/guest.img /path/to/busybox
 # ROOT = an amd64 root ext2 image that contains /boot/vmlinux

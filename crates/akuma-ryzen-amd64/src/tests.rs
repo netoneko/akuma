@@ -411,6 +411,33 @@ fn unevenly_spaced_transports_fall_back_to_one_slot() {
 }
 
 #[test]
+fn facts_geometry_agrees_with_the_protocol_view() {
+    // `blk::init` reads the slot geometry off `Facts`; the tokio kernel reads it
+    // off `MmioDevices`. Same windows in, same answer out.
+    use akuma_machine_facts::Provenance;
+    let m = firecracker(1);
+    let mut buf = [0u8; 256];
+    let d = describe(&m, 0x6000, &mut buf).unwrap();
+    let f = d.facts(Provenance::Pvh);
+    assert_eq!(f.virtio_geometry().map(|g| (g.base, g.stride, g.slots)), d.virtio.geometry());
+    for line in [
+        "virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0009000:6",
+        "virtio_mmio.device=4K@0xd0000000:5 virtio_mmio.device=4K@0xd0001000:6",
+        "virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6",
+    ] {
+        let devs = cmdline::parse(line);
+        let mut f = akuma_machine_facts::Facts::new(Provenance::Pvh);
+        for dev in devs.as_slice() {
+            assert!(f.push_virtio(akuma_machine_facts::VirtioMmio {
+                window: akuma_machine_facts::Range::new(dev.base, dev.len),
+                irq: dev.irq,
+            }));
+        }
+        assert_eq!(f.virtio_geometry().map(|g| (g.base, g.stride, g.slots)), devs.geometry(), "{line}");
+    }
+}
+
+#[test]
 fn size_suffixes_are_one_field_spelled_three_ways() {
     assert_eq!(cmdline::parse_size("4K"), Some(4096));
     assert_eq!(cmdline::parse_size("4k"), Some(4096));
@@ -487,4 +514,40 @@ fn cmdline_complete_returns_the_whole_line_or_says_it_cannot() {
     gone.put(0x6000, &start_info_bytes(0x9000, 0, 0x7000, 0));
     let sig = StartInfo::parse(&gone, 0x6000).unwrap();
     assert_eq!(sig.cmdline_complete(&gone, &mut [0u8; 8]), Err(CmdlineError::Unreadable));
+}
+
+// ---------------------------------------------------------------------------
+// The neutral view
+// ---------------------------------------------------------------------------
+
+/// Only usable RAM becomes `Facts` RAM; the virtio list keeps command-line order and the result
+/// passes the neutral invariants.
+#[test]
+fn facts_keep_usable_ram_and_virtio_order() {
+    use akuma_machine_facts::{Provenance, Range};
+    let regions = [
+        MemRegion { addr: 0, size: 0x9_f000, kind: 1 },
+        MemRegion { addr: 0x9_f000, size: 0x6_1000, kind: 2 }, // reserved: not ours to allocate
+        MemRegion { addr: 0x10_0000, size: 0x7ff0_0000, kind: 1 },
+    ];
+    let mut m = MachineDescription::from_memory_map(&regions, None, None);
+    m.virtio = cmdline::parse(
+        "virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6",
+    );
+    let f = m.facts(Provenance::Pvh);
+    assert_eq!(f.validate(), Ok(()));
+    assert_eq!(f.ram(), &[Range::new(0, 0x9_f000), Range::new(0x10_0000, 0x7ff0_0000)]);
+    assert_eq!(f.ram_bytes(), m.usable_ram());
+    let v: std::vec::Vec<_> = f.virtio().iter().map(|d| (d.window.base, d.irq)).collect();
+    assert_eq!(v, [(0xfeb0_0000, 5), (0xfeb0_0200, 6)]);
+    assert_eq!(f.cpus, None, "no MADT, no CPU count");
+}
+
+/// Provenance is the caller's statement of which protocol it parsed, passed through untouched.
+#[test]
+fn facts_carry_the_callers_provenance() {
+    use akuma_machine_facts::Provenance;
+    let m = MachineDescription::from_memory_map(&[MemRegion { addr: 0, size: 0x1000, kind: 1 }], None, None);
+    assert_eq!(m.facts(Provenance::Multiboot2).provenance, Provenance::Multiboot2);
+    assert_eq!(m.facts(Provenance::Pvh).provenance, Provenance::Pvh);
 }

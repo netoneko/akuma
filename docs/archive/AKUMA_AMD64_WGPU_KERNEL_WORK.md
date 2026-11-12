@@ -22,9 +22,9 @@ in six slices, all in this repo:
 
 | slice | what | where |
 |---|---|---|
-| S1 | framebuffer geometry kept in a static at boot (multiboot2 tag; GRUB picks the mode, 3840×2160×32 here) | `amd64/src/multiboot2.rs` |
+| S1 | framebuffer geometry kept in a static at boot (multiboot2 tag; GRUB picks the mode, 3840×2160×32 here) | `crates/akuma-kernel-amd64/src/multiboot2.rs` |
 | S2 | a write-combining memory type for user page tables (`MemAttr::WriteCombine`); ~2.9–3.0 GB/s for whole-row copies, ~71 MB/s scattered | `crates/akuma-mmu` |
-| S3 | `/dev/fb0` (char 29:0), single owner: a second open is `EBUSY` | `amd64/src/fbdev.rs`, `crates/akuma-fbdev` (`open_decision`) |
+| S3 | `/dev/fb0` (char 29:0), single owner: a second open is `EBUSY` | `crates/akuma-kernel-amd64/src/fbdev.rs`, `crates/akuma-fbdev` (`open_decision`) |
 | S4 | `FBIOGET_VSCREENINFO`, `FBIOPUT_VSCREENINFO` (identical request OK, mode change `EINVAL`), `FBIOGET_FSCREENINFO` (`id = "akuma-fb"`), `FBIOPAN_DISPLAY` no-op | `crates/akuma-fbdev` (`Geometry::var/fix/put_accepted`) |
 | S5 | device-backed `mmap` of the pixels | `crates/akuma-fbdev` (`mmap_check`) |
 | S6 | the screen goes back to the console (fbcon) on close, exit or panic; console muted while a program owns it | `crates/akuma-fbcon` |
@@ -63,7 +63,7 @@ missing is the device nodes, master/slave fd types, `TIOCGPTN`/`TIOCSPTLCK`/
 
 Alt+key = `ESC` + key in `akuma_usb::hid` (xHCI keyboard; 3 new tests in
 `crates/akuma-usb/tests/navigation_keys.rs`) and in the PS/2 driver
-(`amd64/src/kbd.rs`, `ALT_FOLLOW`). Not yet seen on the panel (§6).
+(`crates/akuma-kernel-amd64/src/kbd.rs`, `ALT_FOLLOW`). Not yet seen on the panel (§6).
 
 
 `crates/akuma-usb/src/hid.rs` `emit_key` consults only Shift and Ctrl, so
@@ -171,7 +171,7 @@ demo's `thread-probe` and `AKUMA_PROF`):
 | ptys | `akuma-pty`, glue `pty.rs`, `PtyMaster`/`PtySlave`, `Process::ctty`, amd64 pgid/sid arms | 41 + readiness | `ptyprobe` 31/31 at SMP=1 and SMP=4 | `ptyprobe` **31/31** on kernel `8bece079` (old kernel: `posix_openpt` ENOENT). rio itself not yet run |
 | `O_APPEND` atomic | `Filesystem::append`, ext2 `write_locked`, glue `sys_write` | race test fails 3/3 on old path, passes | — | old kernel: 273/271/264 of 300 lines; **new kernel: 300/300 ×3** |
 | ext2 stress | two host tests incl. `e2fsck -fn` oracle | pass | — | **corruption reproduced on old kernel** (corruption doc §9), cause open |
-| Alt → ESC | `akuma_usb::hid`, `amd64/src/kbd.rs` | 3 new | — | not verified at the panel |
+| Alt → ESC | `akuma_usb::hid`, `crates/akuma-kernel-amd64/src/kbd.rs` | 3 new | — | not verified at the panel |
 | zombie state | amd64 exit sets `ProcessState::Zombie` | — | `lifeprobe` 21/21 | `lifeprobe` all passed (console check skipped over ssh) |
 | console VMIN/VTIME + glue termios offset | glue `fs.rs`/`term.rs` | — | `lifeprobe` | n/a over ssh |
 | fbcon handback on failed open | code read: `EBUSY` returns before any state change; `release` is CAS on owner | — | — | not verified |

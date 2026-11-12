@@ -11,7 +11,7 @@ its mini-gate runs; unverified statements are marked (U#) and settled in §6.
 
 ## 0. Leaf-crate survey first (the user's rule)
 
-`diff` of `akuma-*` dependencies: `amd64/Cargo.toml` lists **76**, `taoxichuan/Cargo.toml`
+`diff` of `akuma-*` dependencies: `crates/akuma-kernel-amd64/Cargo.toml` lists **76**, `taoxichuan/Cargo.toml`
 lists **18** (`akuma-alloc amd64 boot-amd64 comconsole cpu ext2 fdtable gdt idt-amd64 net
 net-nic pmm primitives ring3-amd64 ryzen-amd64 trap-amd64 vfs virtio`). **60 crates are
 amd64-only; all 60 were checked** (`grep -m1 '^//!' crates/<n>/src/lib.rs`). Most are
@@ -71,7 +71,7 @@ So **the aarch64 syscall gap list is already covered**; what remains is per mile
 | **wall clock** | `CLOCK_GETTIME` returns boot-relative seconds ("still no wall clock", `taoxichuan/src/main.rs:2007-2023`); same for `GETTIMEOFDAY` | the offset-store pattern: `akuma_timer::{utc_time_us,set_utc_time_us}` (`docs/reference/subsystems/syscalls/time.md:50`); pure protocol if SNTP ever wanted: `akuma-sntp` | **write new**, ~30 lines: parse `epoch=` from cmdline, store an AtomicU64 offset, add it in the two arms (see §3) |
 | **`apk update` (LAN mirror)** | repositories file + keys in image; everything syscall-side already served | host reference recipe §7 of `TAOXICHUAN_STAGE6_PLAN.md`; outbound-to-LAN path proven by H1; structs (stat/statfs/dirent/time) via `akuma-syscalls-linux`+`akuma-syscalls-abi` (= trim step 2, dedup not gap); readiness waits `akuma-syscalls-poll` (dedup, optional) | **depend** (config + trim dedup; no new arms) |
 | **`apk add curl` + world** | heavier write/rename/symlink traffic than G3's five writes; world file; keys question (U1) | ext2 write path proven (G3 PASS, RESULT-D); arms all served; `akuma-pipe`/`akuma-pipes` only if scripts appear (U2 says they don't) | **depend** (existing arms; contingency already built: `CLONE`+`EXECVE`+`WAIT4`+`PIPE2`) |
-| **`curl --version`** | `curl` is dynamically linked (U3): needs `PT_INTERP` → `/lib/ld-musl-x86_64.so.1`, auxv, MAP_FIXED in the MMAP arm (U4) | `amd64/src/loader.rs` already reads `PT_INTERP` and maps the dynamic linker (`loader.rs:6`, static-PIE `p_filesz<=1` case at `:78-80`), `amd64/src/usermode.rs:5052` errors a missing interp file; `akuma-elf` has the PT_INTERP walk note (`lib.rs:123`) | **extract**: pull the interp+auxv decision core out of `amd64/src/loader.rs` into a leaf crate (`akuma-elf-exec` or extend `akuma-elf`), `amd64/` depends on it too, then `taoxichuan/` (composition rule 3) |
+| **`curl --version`** | `curl` is dynamically linked (U3): needs `PT_INTERP` → `/lib/ld-musl-x86_64.so.1`, auxv, MAP_FIXED in the MMAP arm (U4) | `crates/akuma-kernel-amd64/src/loader.rs` already reads `PT_INTERP` and maps the dynamic linker (`loader.rs:6`, static-PIE `p_filesz<=1` case at `:78-80`), `crates/akuma-kernel-amd64/src/usermode.rs:5052` errors a missing interp file; `akuma-elf` has the PT_INTERP walk note (`lib.rs:123`) | **extract**: pull the interp+auxv decision core out of `crates/akuma-kernel-amd64/src/loader.rs` into a leaf crate (`akuma-elf-exec` or extend `akuma-elf`), `amd64/` depends on it too, then `taoxichuan/` (composition rule 3) |
 
 Per the composition rule, the per-change labels for the whole rest-of-stage-6: everything is
 **pulled** (deps added) or **extracted** (M7) except the epoch anchor, which is **written new**
@@ -132,7 +132,7 @@ the cmdline anchor for the same answer.
 note `musl` must join the mirror closure in §2). The taoxichuan loader today runs static ELFs
 and static-PIE (`PIE_BASE` is respected — `taoxichuan/src/main.rs:504` keeps the mmap region
 clear of it), but has **no PT_INTERP path**: the only interp handling in the tree is
-`amd64/src/loader.rs` (reads `PT_INTERP`, maps ldso, `p_filesz<=1` static-PIE special case at
+`crates/akuma-kernel-amd64/src/loader.rs` (reads `PT_INTERP`, maps ldso, `p_filesz<=1` static-PIE special case at
 `:78-80`) and a comment in `crates/akuma-elf/src/lib.rs:123`. M7 is therefore the one real
 kernel change: extract that decision core into a leaf crate and give taoxichuan the second
 consumer. The ldso's own syscall needs are all served already (`mprotect`, `mmap`,
@@ -174,7 +174,7 @@ touches the clock or the loader work.
 | U2 | exact curl dep closure; does any dep ship `.post-install`/trigger scripts (decides whether M6 exists) | host: `apk fetch -R -o … curl` in a temp root; `tar -tzf *.apk \| grep -E 'post-install\|trigger'` (0 boots) |
 | U3 | curl really dynamically linked (vs Alpine's static-curl variant) | host: `file` on the frozen `.apk` members (M0, 0 boots) |
 | U4 | does taoxichuan's `MMAP` arm honor `MAP_FIXED` (ldso places libs at fixed addresses) | `grep -n 'MAP_FIXED' taoxichuan/src/main.rs`; if the flag is ignored, one boot with a 3-line probe under M5 (0 boots to know, ≤1 to fix) |
-| U5 | how welded the interp logic is to `amd64` `Process`/`usermode` (decides extract cost of M5) | `analyze amd64/src/loader.rs` + focus on the interp function before touching anything (0 boots) |
+| U5 | how welded the interp logic is to `amd64` `Process`/`usermode` (decides extract cost of M5) | `analyze crates/akuma-kernel-amd64/src/loader.rs` + focus on the interp function before touching anything (0 boots) |
 
 ## 7. Ops facts this plan inherits
 

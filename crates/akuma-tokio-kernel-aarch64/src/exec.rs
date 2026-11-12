@@ -10,8 +10,6 @@ use akuma_exec::{ExecConfig, ExecRuntime};
 
 /// The kernel stack each thread runs its syscalls on: the amd64 half's 64 KiB.
 pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
-/// What `prlimit64(RLIMIT_STACK)` reports: the 8 MiB a main stack may grow to.
-pub const USER_STACK_MAX: usize = 8 << 20;
 
 /// Register the table. After the heap and the tick, before the root mount
 /// (`/proc` reads the process table through it).
@@ -35,8 +33,8 @@ fn exec_runtime() -> ExecRuntime {
         // The root, through the shared mount table.
         read_file: |path| akuma_vfs_glue::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| akuma_vfs_glue::read_at(path, off, buf).map_err(|_| -1),
-        read_at_by_inode: |path, ino, off, buf| {
-            akuma_vfs_glue::read_at_by_inode(path, ino, off, buf).map_err(|_| -1)
+        read_at_by_inode: |mount_id, ino, off, buf| {
+            akuma_vfs_glue::read_at_by_mount_inode(mount_id, ino, off, buf).map_err(|_| -1)
         },
         resolve_symlinks: akuma_vfs_glue::resolve_symlinks,
         resolve_file_id: |path| akuma_vfs_glue::resolve_file_id(path).ok_or(-1),
@@ -127,12 +125,14 @@ fn exec_config() -> ExecConfig {
         default_thread_stack_size: KERNEL_STACK_SIZE,
         system_thread_stack_size: KERNEL_STACK_SIZE,
         user_thread_stack_size: KERNEL_STACK_SIZE,
-        user_stack_size: USER_STACK_MAX,
+        // Was the flat `USER_STACK_MAX` (8 MiB) regardless of RAM; now the same
+        // RAM-proportional policy every other kernel uses (config flag sweep, 2026-11-11) —
+        // `akuma_pmm::total_count() * 4096` is the same RAM-size proxy this kernel's own
+        // `akuma_fpcache::init` call already reads (`fs.rs`).
+        user_stack_size: akuma_mem_policy::compute_user_stack_size(akuma_pmm::total_count() * 4096, 0),
         enable_stack_canaries: false,
         stack_canary: 0,
         canary_words: 0,
-        network_thread_ratio: 0,
-        prioritize_never_scheduled: false,
         deferred_thread_cleanup: false,
         thread_cleanup_cooldown_us: 0,
         process_reclaim_cooldown_us: 0,

@@ -140,9 +140,12 @@ pub use poll::run_pselect6_eintr_test;
 #[cfg(kernel_tests)]
 pub use fs::run_writev_short_write_tests;
 pub mod pipe;
+pub mod chardev;
 pub mod pty;
 pub mod poll;
 pub mod proc;
+/// The end of a process: `finish_process`, the same sequence on both kernels.
+pub mod exit;
 /// `execve`'s argument reading and its process-side commit, shared by the x86 kernels.
 pub mod execve;
 mod cred;
@@ -174,7 +177,7 @@ mod timerfd;
 /// check keys off this, so it is the one place the caller's identity is
 /// decided. It lives here rather than in `container` because `proc`'s
 /// `SPAWN_EXT` / `SET_BOX_STACK` gate on it too, and those are dispatched even
-/// when `sc-containers` is off (extreme-size).
+/// when `sc-containers` is off.
 pub fn caller_box_and_pid() -> (u64, u32) {
     akuma_exec::process::current_process_shared().map_or((0, 0), |p| (p.box_id, p.pid))
 }
@@ -439,8 +442,8 @@ pub use akuma_syscalls_linux::{
 // the native (smoltcp) socket surface; a rump-only build compiles none of it.
 #[cfg(feature = "smoltcp")]
 pub use akuma_syscalls_linux::{IfConfHdr, SockAddrHw, Timeval};
-// Split out only because `unused_imports` is `deny` and an `extreme-size` build
-// compiles no epoll surface at all.
+// Split out only because `unused_imports` is `deny` and a build without
+// `sc-epoll` compiles no epoll surface at all.
 #[cfg(feature = "sc-epoll")]
 pub use akuma_syscalls_linux::EpollEvent;
 
@@ -499,8 +502,12 @@ pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
 
 pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     let limit = user_va_limit();
-    if !BYPASS_VALIDATION.load(Ordering::Acquire)
-        && (ptr < 0x1000 || ptr >= limit) { return Err(EFAULT); }
+    // The null page is refused even under `BYPASS_VALIDATION`: the bypass lets the
+    // boot self-tests pass *kernel* buffers, and no kernel buffer lives in page 0.
+    // On amd64 page 0 reads as zeros in ring 0, so a waived check turned
+    // `openat(AT_FDCWD, NULL)` into `openat(AT_FDCWD, "")` and opened the cwd.
+    if ptr < 0x1000 { return Err(EFAULT); }
+    if !BYPASS_VALIDATION.load(Ordering::Acquire) && ptr >= limit { return Err(EFAULT); }
     let mut bytes = Vec::new();
     let mut len = 0;
     while len < max_len {
@@ -538,8 +545,8 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
 /// The crate takes the config consts as a parameter rather than reading them,
 /// which is what makes every gate combination reachable from a host test —
 /// `PROCESS_SYSCALL_STATS` and `PROC_SYSCALL_LOG_ENABLED` are `true` in every
-/// profile but `kernel_profile_extreme`, so the off-arms were previously only
-/// testable by building a different kernel.
+/// build, so the off-arms would otherwise only be testable by building a
+/// different kernel.
 ///
 /// `identity` is the one field that is a decision rather than a mirror of an
 /// existing const — see `akuma_syscalls::IdentitySource` and the note on
@@ -641,11 +648,19 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
     // blocking app signals; a `SIGTERM` landing in between made that restore
     // fail, the signal stayed blocked, and the child slept on forever
     // (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
-    let signal_state = matches!(
+    //
+    // Nor do the signal-*sending* calls: they never block, and Linux's `kill(2)`
+    // has no `EINTR` at all. Answering it here meant a `kill` that ran while a
+    // signal to the caller was landing on another core did nothing and failed:
+    // the amd64 `sigregs` probe's `kill(child, SIGKILL)` was dropped that way and
+    // left the child orphaned, once `kill` came through glue
+    // (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` "Slice 3: signals").
+    let never_interrupted = matches!(
         syscall_num,
         nr::RT_SIGPROCMASK | nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::RT_SIGRETURN | nr::SIGALTSTACK
+            | nr::KILL | nr::TKILL | nr::TGKILL | nr::AKUMA_KILL | nr::PIDFD_SEND_SIGNAL
     );
-    if !signal_state && akuma_exec::process::is_current_interrupted() {
+    if !never_interrupted && akuma_exec::process::is_current_interrupted() {
         // **`EINTR`, and nothing else.**
         //
         // This used to also stamp the caller `exited = true`, `exit_code = 130`,
@@ -663,7 +678,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         //   reported 130.
         // - The killing is the **signal's** job and has been since 2026-08-24
         //   (`docs/archive/CTRL_C_SIGINT_DELIVERY.md`): the same
-        //   `kill_process_group` that raises this flag pends `SIGINT`, whose
+        //   `kill_foreground_group` that raises this flag pends `SIGINT`, whose
         //   default action terminates at the next return to userspace. The
         //   stamp was belt-and-braces from before delivery worked, and what it
         //   actually did was overwrite the truth with a guess.
@@ -846,7 +861,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(all(feature = "exec", feature = "akuma-native"))]
         nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
         #[cfg(feature = "akuma-native")]
-        nr::AKUMA_KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
+        nr::AKUMA_KILL => signal::sys_kill(args[0], args[1]),
         #[cfg(feature = "sc-reboot")]
         nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
         #[cfg(feature = "akuma-native")]
@@ -921,10 +936,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRESUID => cred::sys_getres(args[0], args[1], args[2], false),
         nr::GETRESGID => cred::sys_getres(args[0], args[1], args[2], true),
         nr::GETGROUPS => cred::sys_getgroups(args[0] as i32, args[1]),
-        nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
+        nr::KILL => signal::sys_kill(args[0], args[1]),
         nr::SETPGID => proc::sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
         nr::SETSID => proc::sys_setsid(),
+        nr::GETSID => pty::sys_getsid(args[0] as u32),
         nr::UNAME => proc::sys_uname(args[0]),
         nr::SETHOSTNAME => proc::sys_sethostname(args[0], args[1], false),
         nr::SETDOMAINNAME => proc::sys_sethostname(args[0], args[1], true),
@@ -943,7 +959,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FTRUNCATE => fs::sys_ftruncate(args[0] as u32, args[1] as i64),
         // `posix_fadvise` — advisory by Linux's own contract; no readahead
         // state to tune, so success. The amd64 dispatcher got this arm
-        // 2026-09-22 (`amd64/src/usermode.rs`, `Syscall::Fadvise64`); this
+        // 2026-09-22 (`crates/akuma-kernel-amd64/src/usermode.rs`, `Syscall::Fadvise64`); this
         // one didn't, so parity-db's open-time `try_io!` hit ENOSYS and no
         // ParityDB could be *reopened* on aarch64 (storeprobe stage 6,
         // docs/archive/MIOT_MESH_ON_AKUMA.md finding 1).
@@ -1048,7 +1064,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
                 // `1`, so `busybox nproc` and cargo's `num_cpus` always saw one
                 // CPU and `cargo build` defaulted to `-j1` even on an SMP=2+
                 // kernel. Until 2026-11-01 the hook was read only under
-                // `kernel_smp_shared`, which Taoxichuan does not build glue
+                // `kernel_bkl_smp`, which Taoxichuan does not build glue
                 // with, so tokio started one worker there at `smp=4`.
                 let nr_cpus: usize = crate::hooks::probed_core_count();
                 let mask: u64 = if nr_cpus >= CPU_SET_BITS_PER_WORD {
@@ -1430,30 +1446,31 @@ pub fn set_hooks(h: SyscallHooks) {
     HOOKS.set(h);
 }
 
-/// Which of these has a caller depends on the feature set — the rump five need
-/// `rump` — so the parity surface is
-/// deliberately wider than any single configuration uses. Same argument the
-/// virtio-audio stub carried: the syscall layer compiles unchanged either way.
-#[allow(dead_code)]
+/// The rump five exist only with `rump`, the only feature their callers compile under.
 pub(crate) mod hooks {
     use super::HOOKS;
 
+    #[cfg(feature = "rump")]
     pub fn box_is_rump(box_id: u64) -> bool {
         HOOKS.get().is_some_and(|h| (h.box_is_rump)(box_id))
     }
+    #[cfg(feature = "rump")]
     pub fn mark_box_rump(box_id: u64) {
         if let Some(h) = HOOKS.get() {
             (h.mark_box_rump)(box_id);
         }
     }
+    #[cfg(feature = "rump")]
     pub fn attach_server(box_id: u64, server_pid: akuma_exec::process::Pid) {
         if let Some(h) = HOOKS.get() {
             (h.attach_server)(box_id, server_pid);
         }
     }
+    #[cfg(feature = "rump")]
     pub fn intercept_box_syscall(syscall_num: u64, args: &[u64; 6]) -> Option<u64> {
         HOOKS.get().and_then(|h| (h.intercept_box_syscall)(syscall_num, args))
     }
+    #[cfg(feature = "rump")]
     pub fn rump_socket_readable(rump_fd: i32) -> bool {
         HOOKS.get().is_some_and(|h| (h.rump_socket_readable)(rump_fd))
     }

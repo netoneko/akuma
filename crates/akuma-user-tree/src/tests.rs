@@ -403,3 +403,74 @@ fn aarch64_layout_reads_its_inverted_bits() {
     assert!(X86_64.is_writable(0x7000 | 1 | 2));
     assert!(X86_64.is_huge(1 | (1 << 7)));
 }
+
+// ---------------------------------------------------------------------------
+// `fork_leaf`: the decoded-leaf table amd64's fork walk uses, against `plan_clone`
+// ---------------------------------------------------------------------------
+
+/// A raw x86 leaf entry for the decoded inputs `(writable, cow)`.
+fn entry_for(writable: bool, cow: bool) -> u64 {
+    0x1234_5000 | P | if writable { W } else { 0 } | if cow { COW } else { 0 }
+}
+
+#[test]
+fn fork_leaf_truth_table() {
+    use Backing::{Device as Dev, Ram};
+    use ForkLeaf::*;
+    use Span::{Private as Pv, Shared as Sh};
+    // (backing, span, writable, cow) -> class
+    for (b, sp, w, c, want) in [
+        (Dev, Pv, false, false, Device),
+        (Dev, Sh, true, true, Device), // a device page in a shared span is still just a device page
+        (Ram, Sh, false, false, ShareWritable),
+        (Ram, Sh, true, true, ShareWritable),
+        (Ram, Pv, true, false, DemoteBoth),
+        (Ram, Pv, false, true, DemoteBoth), // already CoW: demoted again, which is a no-op on the entry
+        (Ram, Pv, true, true, DemoteBoth),
+        (Ram, Pv, false, false, ShareReadOnly),
+    ] {
+        assert_eq!(fork_leaf(b, sp, w, c), want, "{b:?} {sp:?} writable={w} cow={c}");
+    }
+}
+
+/// For every non-device input, amd64's decoded-leaf decision and `plan_clone`'s raw-entry decision must leave the
+/// same entries behind: that is the whole claim of "one decision table, two walkers".
+///
+/// Pinned: amd64's bin treats a `MAP_SHARED` span as `SharedSpans::ShareWritable` (writable in both, no CoW
+/// marker), which is **not** what the `SharedSpans::ShareFrames` doc comment says of amd64.
+#[test]
+fn fork_leaf_agrees_with_plan_clone() {
+    for in_shared in [false, true] {
+        for writable in [false, true] {
+            for cow in [false, true] {
+                let entry = entry_for(writable, cow);
+                let plan = L.plan_clone(0, entry, in_shared, SharedSpans::ShareWritable);
+                let ClonePlan::ShareLeaf { parent_entry, child_entry, demoted, .. } = plan else {
+                    panic!("a present leaf shares under ShareWritable, got {plan:?}");
+                };
+                let tag = std::format!("shared={in_shared} writable={writable} cow={cow}");
+                // The decoded outcome the walk produces, as entry properties.
+                let (parent_w, parent_cow, child_w, child_cow, changed) = match fork_leaf(Backing::Ram, if in_shared { Span::Shared } else { Span::Private }, writable, cow) {
+                    ForkLeaf::ShareWritable => (true, cow, true, cow, false),
+                    // the walk's `demoted = prot with write=false`, `cow = true`, for both sides
+                    ForkLeaf::DemoteBoth => (false, true, false, true, writable),
+                    ForkLeaf::ShareReadOnly => (false, cow, false, cow, false),
+                    ForkLeaf::Device => unreachable!(),
+                };
+                if in_shared {
+                    // shared: the entry is untouched on both sides, whatever it was
+                    assert_eq!((parent_entry, child_entry), (entry, entry), "{tag}");
+                    assert!(!demoted, "{tag}");
+                    assert_eq!(L.is_writable(entry), writable, "{tag}");
+                    continue;
+                }
+                assert_eq!(L.is_writable(parent_entry), parent_w, "{tag}: parent writable");
+                assert_eq!(L.is_writable(child_entry), child_w, "{tag}: child writable");
+                assert_eq!(parent_entry & COW != 0, parent_cow, "{tag}: parent cow");
+                assert_eq!(child_entry & COW != 0, child_cow, "{tag}: child cow");
+                assert_eq!(demoted, changed, "{tag}: the parent's entry changes exactly when it was writable");
+                assert_eq!(parent_entry, child_entry, "{tag}: both sides end identical");
+            }
+        }
+    }
+}

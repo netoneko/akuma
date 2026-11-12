@@ -20,7 +20,7 @@
 //! `GRANT_RECORDS_VS_DENY_RECORDS.md`'s bug, re-created by porting its fix.
 //!
 //! So [`Prot`] is what a region records now, and the bits live with the walker
-//! that writes them: `akuma_mmu::types` for AArch64, `amd64/src/paging.rs` for
+//! that writes them: `akuma_mmu::types` for AArch64, `crates/akuma-kernel-amd64/src/paging.rs` for
 //! x86_64. This is [`akuma_cow`](https://docs.rs/akuma-cow)'s shape — that crate
 //! takes `pte_writable: bool` and `marked: bool`, decoded booleans rather than a
 //! PTE, which is precisely why it already serves both kernels.
@@ -127,6 +127,19 @@ impl Prot {
         matches!(self.0, 2 | 3)
     }
 
+    /// The same protection with write taken away: what a writable page is
+    /// mapped as while its frame is still copy-on-write shared. Execute is
+    /// kept exactly (`RW` -> `RO`, `RW_NO_EXEC` -> `RO_NO_EXEC`), so the first
+    /// write faults and nothing else changes; a non-writable value is itself.
+    #[must_use]
+    pub const fn without_write(self) -> Self {
+        match self.0 {
+            2 => Self::RO,
+            3 => Self::RO_NO_EXEC,
+            _ => self,
+        }
+    }
+
     /// Whether the owner may *fetch instructions* from the page.
     ///
     /// Decides whether a demand-paged frame needs I-cache maintenance
@@ -202,6 +215,18 @@ mod tests {
     fn from_prot_and_is_write_agree() {
         for prot in 0u32..8 {
             assert_eq!(Prot::from_prot(prot).is_write(), prot & 0x2 != 0, "prot={prot:#x}");
+        }
+    }
+
+    #[test]
+    fn without_write_drops_only_write() {
+        for p in Prot::ALL {
+            let w = p.without_write();
+            assert!(!w.is_write(), "{p:?}");
+            assert_eq!(w.is_exec(), p.is_exec(), "{p:?} keeps execute");
+            if !p.is_write() {
+                assert_eq!(w, p, "{p:?} is its own read-only form");
+            }
         }
     }
 

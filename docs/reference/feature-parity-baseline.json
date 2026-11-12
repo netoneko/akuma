@@ -1,0 +1,14 @@
+{
+  "common": [
+    "linux-extra-syscalls",
+    "no-tests",
+    "sc-aio",
+    "sc-containers",
+    "sc-epoll",
+    "sc-eventfd",
+    "sc-pidfd",
+    "sc-timerfd",
+    "syscall-debug-info"
+  ],
+  "drift": {}
+}

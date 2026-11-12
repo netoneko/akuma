@@ -112,13 +112,13 @@ pub fn start_init_thread(path: &str, ti: &crate::TaskImage) -> ! {
     // Straight onto the heap: `Box::new([0; N])` builds the 32 KiB array on this stack first.
     let stack: &'static mut [u64] = alloc::boxed::Box::leak(alloc::vec![0u64; INIT_STACK_WORDS].into_boxed_slice());
     let top = stack.as_mut_ptr() as usize + INIT_STACK_WORDS * 8;
-    akuma_threading::x86_seed_entry(tid, top, init_thread_entry);
+    akuma_threading::seed_entry(tid, top, init_thread_entry);
     // The boot thread becomes pool slot 0 (the pool hands out 1..): it is about to
     // block, and a thread the pool has never heard of has no slot to park.
     let _ = akuma_sched_amd64::prepare_task_slot::<crate::sched::Tx>(0);
-    akuma_threading::x86_adopt_running_thread(0);
+    akuma_threading::adopt_running_thread(0);
     crate::exec_twin::set_current_slot(0);
-    akuma_threading::x86_publish(tid);
+    akuma_threading::publish_slot(tid);
     crate::PREEMPT_ARMED.store(true, core::sync::atomic::Ordering::Release);
     akuma_primitives::safe_print!(96, "[init] pid 1 on pool slot {}\n", tid);
     crate::task_done(proc::wait_init::<Amd64>())
@@ -137,7 +137,7 @@ pub fn sched_kstack_top(tid: usize) -> u64 {
 
 /// The syscall-path capture `fork_process` step 6 consumes:
 /// `get_saved_user_context(parent_tid)` resolves through the threading crate
-/// to `X86ArchHooks::read_user_context` — this twin's per-slot record
+/// to `ArchHooks::read_user_context` — this twin's per-slot record
 /// (slice 2), written here. One plain copy per syscall on a slotted task;
 /// the boot task (NO_SLOT) skips.
 pub fn capture_user_context(fr: &ring3::SyscallFrame) {

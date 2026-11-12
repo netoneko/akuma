@@ -1,5 +1,5 @@
 //! This kernel as `akuma-sched-amd64` sees it: the scheduler's machine half, shared with the metal kernel
-//! (`amd64/src/sched.rs`), over Taoxichuan's own state.
+//! (`crates/akuma-kernel-amd64/src/sched.rs`), over Taoxichuan's own state.
 //!
 //! The crate performs a switch - page-table root, ring-3 trap stack, FS/GS bases, FP/SIMD state - and decides
 //! `can_run`; the [`Tx`] platform answers what is this kernel's: roots come from the task record (so an `exec`
@@ -7,7 +7,7 @@
 //! `child::SLOT_FS`, and the syscall band and the dispatcher's task record are installed in [`Platform::after_install`].
 //! The user-context record is [`TxUser`]: the ring-3 capture `fork_process` and `clone_thread` read, and the slot's FS
 //! base. The syscall stub saves registers on the slot's own band, not in a table. Since 2026-11-01 the whole
-//! `X86ArchHooks` table is `akuma_sched_amd64::hooks::<Tx>()`: stacks, user context and FS base live in the crate's
+//! `ArchHooks` table is `akuma_sched_amd64::hooks::<Tx>()`: stacks, user context and FS base live in the crate's
 //! `Machine` table, as on amd64, where this kernel used to keep them in parallel arrays.
 //!
 //! Slot space: `0..NSLOTS` are the ring (and the pool's tids), `NSLOTS + cpu` is core `cpu`'s idle thread
@@ -151,5 +151,5 @@ pub fn mark_idle(tid: usize, cpu: usize) {
 /// Core `cpu`'s idle thread is the context it is about to run: mark and adopt it.
 pub fn adopt_idle(tid: usize, cpu: usize) {
     mark_idle(tid, cpu);
-    akuma_threading::x86_adopt_running_thread(tid);
+    akuma_threading::adopt_running_thread(tid);
 }

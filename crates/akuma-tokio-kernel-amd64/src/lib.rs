@@ -229,13 +229,6 @@ pub(crate) fn gdt_init_cpu(cpu: usize) {
 
 static IDT: idt_lib::Idt = idt_lib::Idt::new();
 
-/// The one trap handler: name the kind, the rip, the cr2, and stop. A fault in
-/// this kernel is a bug in this kernel; there is no userspace to deliver it to
-/// and no scheduler to defer it through, so the honest report is the full
-/// frame and a halt. The `[Fault]` token is the gate's vocabulary.
-/// How far a user stack may grow (8 MiB); core's, shared with aarch64.
-pub(crate) use akuma_tokio_kernel_core::loader::STACK_MAX;
-
 /// A not-present fault just under a task's stack region is the stack growing
 /// (core's `grow_user_stack`, over this machine's tree).
 fn grow_user_stack(cr2: u64) -> bool {
@@ -281,6 +274,14 @@ fn cow_prepare_write(root: u64, va: u64) -> bool {
     cow::prepare_write::<lazy::Amd64>(root, va)
 }
 
+/// The one trap handler: name the kind, the rip, the cr2, and stop. A fault in
+/// this kernel is a bug in this kernel; there is no userspace to deliver it to
+/// and no scheduler to defer it through, so the honest report is the full
+/// frame and a halt. The `[Fault]` token is the gate's vocabulary.
+///
+/// (Moved here from above `grow_user_stack` — config flag sweep, 2026-11-11 — where it had
+/// ended up misattached to the now-removed `STACK_MAX` re-export; this is the function it was
+/// actually describing.)
 fn fault_trap(t: &mut Trap<'_>) {
     let user = t.from_ring3();
     if user {
@@ -480,7 +481,7 @@ fn timer_trap_locked(t: &Trap<'_>) {
         child::deliver_fatal_on_tick();
     }
     // M4 slice 3 preemption (session pf, plan §5): a tick that interrupted
-    // ring 3 may switch — the same `x86_yield` the park loop and the idle lap
+    // ring 3 may switch — the same `try_yield` the park loop and the idle lap
     // already run, on this handler's own (per-slot, `arm_trap_stack`) trap
     // stack; the interrupted frame survives the stack switch, and `on_tick`
     // has already EOI'd, so the LAPIC can deliver the next tick to whichever
@@ -508,7 +509,7 @@ fn timer_trap_locked(t: &Trap<'_>) {
         && slot < crate::child::NSLOTS
         && PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire)
     {
-        akuma_threading::x86_yield();
+        akuma_threading::try_yield();
     }
     // **The netpoll backstop** (session ph, boot ph-5's P2 stall): the guest's
     // other pumps are all task-context (sshd's serve-loop sleep, the DHCP
@@ -1358,7 +1359,7 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
             // A slotted task's exit is a task exit — status published to its
             // parent, its pipe references dropped, the wait4-parked parent
             // woken, the threading slot terminated (never returns to the stub:
-            // `x86_finish_current` switches away for good).
+            // `finish_current` switches away for good).
             if child::is_real_task() {
                 // `exit` (60) from a thread ends that thread only; everything
                 // else (exit_group, a lone process's exit) ends the group.
@@ -1429,9 +1430,9 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
         akuma_syscalls_abi::x86_64::MSYNC => msync_arm(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::MADVISE => madvise_arm(fr.arg1(), fr.arg2(), fr.arg3()),
         akuma_syscalls_abi::x86_64::SCHED_YIELD => {
-            if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::x86_runnable_exists() {
+            if crate::exec_twin::current_slot() < child::NSLOTS && akuma_threading::runnable_exists() {
                 let stash = ring3::user_rsp_stash();
-                akuma_threading::x86_yield();
+                akuma_threading::try_yield();
                 ring3::set_user_rsp_stash(stash);
             }
             0
@@ -1465,15 +1466,15 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
             }
             e(ring3::err::ENOSYS)
         }
-        // `tkill`/`tgkill`: the x86 kernels' shared bodies - pend on the thread, and interrupt
+        // `tkill`/`tgkill`: glue's, shared by every kernel - pend on the thread, and interrupt
         // it only when the default action kills (setting the flag on the caller of musl's
         // `raise` made the mask restore after it fail with EINTR).
-        akuma_syscalls_abi::x86_64::TKILL => akuma_syscalls_glue_amd64::kill::tkill(fr.arg1() as u32, fr.arg2() as u32),
-        // `kill`: the x86 kernels' shared body - pend on the target group, each thread takes it
-        // at its own next return to ring 3.
-        akuma_syscalls_abi::x86_64::KILL => akuma_syscalls_glue_amd64::kill::kill(fr.arg1(), fr.arg2()),
+        akuma_syscalls_abi::x86_64::TKILL => akuma_syscalls_glue::signal::sys_tkill(fr.arg1() as u32, fr.arg2() as u32),
+        // `kill`: glue's, shared by every kernel since 2026-11-11 - pend on the target group,
+        // each thread takes it at its own next return to ring 3.
+        akuma_syscalls_abi::x86_64::KILL => akuma_syscalls_glue::signal::sys_kill(fr.arg1(), fr.arg2()),
         akuma_syscalls_abi::x86_64::TGKILL => {
-            akuma_syscalls_glue_amd64::kill::tgkill(fr.arg1() as u32, fr.arg2() as u32, fr.arg3() as u32)
+            akuma_syscalls_glue::signal::sys_tgkill(fr.arg1() as u32, fr.arg2() as u32, fr.arg3() as u32)
         }
         other => {
             // A guest task hit a number this table does not serve; the errno
@@ -1782,7 +1783,8 @@ fn boot(k: &Kernel) -> ! {
 
     // Heap then PMM. The no-op reapers are the honest hooks for a kernel with
     // no processes, no page cache and no retired list (each is a `|| 0`).
-    if !mem::init(&machine, cfg!(feature = "pmm-forensics"), akuma_pmm::PmmHooks {
+    let facts = machine.facts(akuma_machine_facts::Provenance::Pvh);
+    if !mem::init(&facts, cfg!(feature = "pmm-forensics"), akuma_pmm::PmmHooks {
         heap_reclaim: || 0,
         drain_retired: akuma_exec::process::reclaim::drain_retired_under_pressure,
         evict_clean_file_pages: |_| 0,

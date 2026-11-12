@@ -4,7 +4,7 @@
  * Chromium rasters in a few ms. A screencast frame is a chain of cross-thread
  * handoffs (browser IO -> renderer IO -> main -> compositor -> raster ->
  * viz -> PNG encoder -> DevTools -> pipe -> daemon -> client), and
- * `amd64/src/smp.rs` says "No wake IPI. A core in hlt learns of new work at
+ * `crates/akuma-kernel-amd64/src/smp.rs` says "No wake IPI. A core in hlt learns of new work at
  * its next timer tick" with a 10 ms tick. If each handoff waits for a tick,
  * a dozen of them is the whole 120 ms. This measures one handoff.
  *

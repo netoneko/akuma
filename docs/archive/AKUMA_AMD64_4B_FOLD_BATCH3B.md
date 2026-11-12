@@ -11,7 +11,7 @@ seam."*
 
 Five arms moved: `fstat`, `newfstatat`, `statfs`, `fstatfs`, and `statx` (which
 was **not dispatched at all** before — every call was `ENOSYS`).
-`amd64/src/fd.rs`: **+120 / −280**, 3 608 → 3 448 lines.
+`crates/akuma-kernel-amd64/src/fd.rs`: **+120 / −280**, 3 608 → 3 448 lines.
 
 ---
 

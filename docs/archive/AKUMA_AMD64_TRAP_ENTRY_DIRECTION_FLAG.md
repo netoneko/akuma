@@ -1,8 +1,8 @@
 # Akuma/amd64: the hand-written trap entries never cleared `DF` — every kernel `memcpy`/`memset` after a fault mid-`memmove` ran backwards
 
-**Status: ROOT-CAUSED and FIXED, 2026-09-23.** Fix in `amd64/src/idt.rs`
+**Status: ROOT-CAUSED and FIXED, 2026-09-23.** Fix in `crates/akuma-kernel-amd64/src/idt.rs`
 (`fixable_exception_entry!`, `timer_entry`, `debug_entry`,
-`invalid_opcode_entry`) and `amd64/src/shootdown.rs` (`shootdown_entry`): one
+`invalid_opcode_entry`) and `crates/akuma-kernel-amd64/src/shootdown.rs` (`shootdown_entry`): one
 `cld` per stub, plus a tripwire (`trap_entry_df_seen`) and a boot-suite check
 that fails without it (verified A/B, below). Deployed to the bare-metal box the
 same night. This closes the mechanism behind two photographed console deaths;
@@ -118,9 +118,9 @@ entry — six stubs, since `fixable_exception_entry!` instantiates twice:
 
 | stub | file |
 |---|---|
-| `page_fault_entry`, `general_protection_entry` | `amd64/src/idt.rs` (`fixable_exception_entry!`) |
-| `timer_entry`, `debug_entry`, `invalid_opcode_entry` | `amd64/src/idt.rs` |
-| `shootdown_entry` | `amd64/src/shootdown.rs` |
+| `page_fault_entry`, `general_protection_entry` | `crates/akuma-kernel-amd64/src/idt.rs` (`fixable_exception_entry!`) |
+| `timer_entry`, `debug_entry`, `invalid_opcode_entry` | `crates/akuma-kernel-amd64/src/idt.rs` |
+| `shootdown_entry` | `crates/akuma-kernel-amd64/src/shootdown.rs` |
 
 Kernel `cld` count went 25 → 32 (six stubs + one in the new test). Nothing
 else changed in the stubs; `iretq` restores the interrupted code's own `DF`.

@@ -97,14 +97,42 @@ bearing for `wait4`/CHILD_CHANNELS keying, so the change needs its own pass.
 
 ## execve
 
-`do_execve` → `Process::replace_image[_from_path]`
-(`crates/akuma-exec/src/process/image.rs`): **true in-place image replacement**
-(preserves PID + open fds; strips O_CLOEXEC fds). Not spawn-as-exec. Calls
-`vfork_complete(child_pid)` to wake a blocked parent.
+**One `execve` for both Akuma kernels**: `akuma_syscalls_glue::execve::run`
+over a per-kernel `ExecArch`. **True in-place image replacement** (preserves
+PID + open fds; strips O_CLOEXEC fds); not spawn-as-exec.
 
-Loader pick (see [`../../abi/linux-compat.md`](../../abi/linux-compat.md)
-"ELF loading"): `read_file()` first; on `FsError` (binary > 16 MB), fall back
-to `load_elf_from_path` (page-at-a-time via `vfs::read_at()`).
+- `read_request` (shared with Taoxichuan): path against `cwd`, argv/envp under
+  an `akuma_syscalls_proc::exec::Budget` — `MAX_ARG_STRLEN` per string, argv
+  *and* envp; NULL/empty argv becomes `[path]`.
+  Akuma's `spawn` (301) reads its arguments through the same function on both
+  kernels, and both make the child through glue's `spawn_request`
+  (`akuma_exec::process::spawn_process_named`). amd64 passes
+  `own_terminal = true`, so every 301 child gets its own `TerminalState`.
+  **Init and amd64's `SPAWN_FLAG_CONSOLE` children use the same spawn**, with
+  `Attach`: the child's I/O channel and `TerminalState` are the console's (and,
+  for init, its pid is 1) instead of fresh ones. The spawn's own fresh channel
+  stays the child's *exit* identity in both cases. `Attach` is applied before
+  the child is published, so the child cannot write before it is attached, and
+  everything init needs from the console (size, pump, keyboard) is set up
+  before the spawn, not after it.
+- `run` (shared): execute permission on the symlink-resolved path, the
+  `ETXTBSY` pin, the `#!` hop, `ExecArch::{read, load}`, then — past the point
+  of no return — `stop_siblings`, the `MAP_SHARED` write-back, and inside
+  `with_target`: `install`, `set_text`, `execve::commit` (`/proc` exe/comm/
+  cmdline, close-on-exec sweep, caught handlers to `SIG_DFL`),
+  `vfork_complete`, `enter`. Everything before `stop_siblings` returns an errno
+  with the caller's image untouched.
+- `ExecArch` is what differs. AArch64 (`NativeExec`, glue `proc.rs`): reads a
+  small binary whole (BKL-dropped window) and loads it from memory, loads a
+  large one from its path (`FsError::Internal` → `load_exec_path`,
+  demand-paged), kills siblings with `Process::kill_exec_siblings`, installs on
+  the caller's own process under `with_own_process_exclusive`, and `enter`
+  `eret`s. amd64 (`Amd64Exec`, `crates/akuma-kernel-amd64/src/usermode.rs`): reads the head,
+  maps every segment as it loads, `thread::drain`s siblings, installs on the
+  thread-group leader, and `enter` arms `exec_pending` and returns 0.
+- **`enter` may not return (AArch64)**, so nothing in `run`'s frames owns heap
+  when it is called: the shebang hop and the install closure drop every buffer
+  first ([`../thread-lifecycle.md`](../thread-lifecycle.md) §4 rule 1).
 
 **Argument size on Taoxichuan.** The initial stack's argv/envp/auxv block is
 sized by what it holds (`akuma_ring3_amd64::stack_block_len`); there is no fixed
@@ -117,8 +145,8 @@ table is how a 570-argument `rustc` line failed
 ### `#!` scripts
 
 Both `execve` **and** `spawn` resolve them, through one shared parser
-(`akuma_exec::process::{parse_shebang, shebang_hop}`): `exec_shebang`
-(`src/syscall/proc.rs`) for the exec path, `resolve_shebang_chain`
+(`akuma_exec::process::{parse_shebang, shebang_hop}`): `execve::run`
+(`crates/akuma-syscalls-glue/src/execve.rs`) for the exec path, `resolve_shebang_chain`
 (`crates/akuma-exec/src/process/spawn.rs`) for the SPAWN abi, and
 Taoxichuan's `exec_real_task` (`crates/akuma-tokio-kernel-amd64/src/child.rs`),
 which had no `#!` support until 2026-11-03
@@ -132,7 +160,7 @@ Two rules that are easy to get wrong and were both wrong here until 2026-08-16:
 
 - **`argv[0]` is the interpreter as *written* in the `#!` line, never its
   symlink-resolved target.** The resolved path is for loading the image only.
-  `exec_shebang` used to shadow one with the other, which is fatal rather than
+  The exec path used to shadow one with the other, which is fatal rather than
   cosmetic on a busybox system: busybox dispatches entirely on `argv[0]`, so
   `#!/bin/sh` ran `/bin/busybox` with `argv[0]="/bin/busybox"` and busybox never
   knew it was meant to be a shell.
@@ -202,7 +230,7 @@ What that hung was `redis:alpine`'s entrypoint, whose privilege-drop gate is
 `has_cap() { setpriv -d | grep -q 'Capability bounding set:.*\bsetuid\b'; }` —
 so `box run redis:alpine` parked before it ever reached the credential wall
 below. Fixed 2026-08-20; boot-suite check `test_prctl_capbset_is_bounded`
-(`src/process_tests.rs`). The general shape: **an accepting no-op is only safe
+(`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`). The general shape: **an accepting no-op is only safe
 for a setter. For a query that a caller uses to discover a bound, "yes" to
 everything is an infinite loop.**
 
@@ -265,27 +293,41 @@ version starved the 32-slot thread pool under Go's 50-worker goroutine pools).
   child's `set_exited()` wakes the parent immediately (no 10 ms poll).
 - `EINTR` on `is_current_interrupted()`.
 
-`wait4`/`waitid`/`waitpid` **reap** the zombie: `clear_lazy_regions(pid) +
-unregister_process(pid)` (the only paths that remove a zombie from the
-table). Linux wait-status encoding (`encode_wait_status`): normal exit
+Akuma's own `waitpid` (303) is **non-blocking** (sshd's bridge and herd poll
+it) and answers only the caller's own children: `ECHILD` unless
+`is_child_of_group(pid, caller tgid)`, the check `wait4`/`waitid` use. A
+caller with no process is tgid 0, the spawner `spawn_request` records for a
+kernel-started child. It is `wait4(pid, status, WNOHANG)`, with `0` and
+`-1` meaning any child, on both kernels; amd64 adds only `after_reap` (its
+`SPAWN`-row sweep and a reclaim drain), as it does after `wait4`/`waitid`.
+
+`wait4`/`waitid`/`waitpid` **reap** the zombie through one helper,
+`reap_exited`: status first (a failed copy is `EFAULT` and leaves the child
+reapable), then `clear_lazy_regions(pid) + unregister_process(pid) +
+reap_child_channel(pid)` (the only paths that remove a zombie from the
+table). "Exited" is the child channel's `has_exited()`, which both kernels
+set after the child's descriptors are closed
+([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md), "One waitpid"). Linux wait-status encoding (`encode_wait_status`): normal exit
 `(code & 0xFF) << 8`; signal death `(-code) & 0x7F`.
 
 ## kill / tkill
 
-`sys_kill` (`KILL` 302, Linux 129):
+`signal::sys_kill` (glue; Linux 129, Akuma 302, x86_64 62), one copy for every kernel:
 
-- **SIGKILL (9)** bypasses handlers entirely → `kill_thread_group(tgid)` +
-  `kill_process_with_signal(pid, 9)` (hard-kill). SIGKILL/SIGSTOP bypass the
-  signal mask in `take_pending_signal`.
-- Other signals: `pend_signal_for_thread` on the main thread **and** all
-  same-`tgid` siblings (each `pend` calls `wake()` internally). **Set all
-  `interrupt_thread` flags first, then pend** — the reverse order races
-  (wake before flag → thread re-blocks).
+- **Every signal, SIGKILL included, is pended** with `pend_signal_to_group` on
+  each thread of the target group, and each thread takes it at its own return
+  to user mode. SIGKILL/SIGSTOP bypass the signal mask in `take_pending_signal`.
+  There is no hard kill from the caller's core
+  ([`signal.md`](signal.md) "`kill`, `tkill` and `tgkill`: one copy, and SIGKILL is a pend").
+- `pend_signal_to_group` **sets every `interrupt_thread` flag first, then
+  pends**; the reverse order races (wake before flag → thread re-blocks).
+- Groups (`0`, `-pgid`, `-1`) walk the table once into a fixed array, leaders
+  only, then filter by `check_signal_pid` outside the IRQ-off callback.
 
 ## reboot
 
 `sys_reboot` (`REBOOT` 142, `src/syscall/reboot.rs`) — **`sc-reboot`**, in
-`default` since 2026-08-25 (only `extreme-size` excludes it — see
+`default` since 2026-08-25 (the rump devbox re-adds it explicitly — see
 [`../config-flags.md`](../config-flags.md)). Gated to box 0:
 `caller_may_reboot` returns `EPERM` for any caller with `box_id != 0`, checked
 before the magic/cmd decode — a PSCI reset/off takes every box down with it,

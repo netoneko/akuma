@@ -167,7 +167,7 @@ and is not written yet (needs a built-in font; `akuma-fbcon`'s would drag in
 - clippy and host tests for each crate you touch (`CLAUDE.md` § Testing);
   the AArch64 `cargo clippy --release -- -D warnings` covers glue;
 - `cargo check` of both kernels (`--release` for AArch64;
-  `-p akuma-amd64 --target x86_64-unknown-none --release`);
+  `-p akuma --target x86_64-unknown-none --release`);
 - the probe pass above, all green, `chromeprobe` 16/16, `capprobe` 7/7,
   `jitprobe` 9/9, `thrprobe` 96/96;
 - the standard-image boot: `731 passed, 0 failed`;

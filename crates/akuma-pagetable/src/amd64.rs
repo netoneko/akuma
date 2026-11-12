@@ -226,7 +226,7 @@ pub fn map_leaf<M: PhysMap>(
 /// Here rather than in `akuma-cpu` for the reason the AArch64 `msr ttbr0_el1` is
 /// not there: a safe wrapper would let any safe code repoint what the MMU
 /// dereferences. Here rather than at each caller because there were three
-/// byte-identical copies (`amd64/src/paging.rs` ×2, `akuma-mmu`).
+/// byte-identical copies (`crates/akuma-kernel-amd64/src/paging.rs` ×2, `akuma-mmu`).
 ///
 /// # Safety
 /// `root` must be a PML4 that maps every page the kernel is currently executing

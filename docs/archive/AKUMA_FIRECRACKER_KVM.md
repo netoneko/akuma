@@ -26,7 +26,7 @@ Note for Phase 1: firecracker's seccomp filters and `/dev/kvm` ACL hint are only
 
 ## Phase 1: census (2026-10-23)
 
-Method: `kvmapi` boot flag (with `kvmctl`, which is what makes `kvm::init` run) arms `amd64/src/kvm/api.rs`:
+Method: `kvmapi` boot flag (with `kvmctl`, which is what makes `kvm::init` run) arms `crates/akuma-kernel-amd64/src/kvm/api.rs`:
 `open("/dev/kvm")` hands out a descriptor and every `ioctl` on it is logged (fd, request decoded to
 dir/size/type/nr, argument, the argument struct before and after) and answered from a tiny table. Everything
 unknown answers 0. `mmap` of such a descriptor is served as anonymous memory and logged. Driver:
@@ -95,17 +95,17 @@ The shape of the problem is now concrete: **Firecracker wants an in-kernel PIC+I
 (`CREATE_PIT2`) and LAPIC (`GET/SET_LAPIC`), guest RAM from its own anonymous memory (4 KiB granularity), and
 a per-vCPU run page with `KVM_RUN` exits for port I/O and MMIO**, while Akuma's hypervisor has no IOAPIC, a
 PIC/PIT/LAPIC that are fully in-kernel, RAM from a reserved 2 MiB-aligned block, and a one-VM node. Stub
-and census scripts: `amd64/src/kvm/api.rs`, `scripts/kvm/fc_census.sh`.
+and census scripts: `crates/akuma-kernel-amd64/src/kvm/api.rs`, `scripts/kvm/fc_census.sh`.
 
 Added after the first census: `SET_REGS`/`SET_SREGS` show a **PVH** entry (`rip=0x201000`, `rbx=0x6000`,
 `CR0=0x11`, flat 32-bit segments, GDT at 0x500), i.e. the same entry state the hypervisor already builds.
 
 ## Phase 2: design (2026-10-23)
 
-Design (moved here from `proposals/KVM_ABI_SHIM.md`, 2026-10-23). Nothing below is built except the logging stub `amd64/src/kvm/api.rs`; evidence for what Firecracker asks for is the Phase 1 census above. Names are inferred from request direction/size/behaviour.
+Design (moved here from `proposals/KVM_ABI_SHIM.md`, 2026-10-23). Nothing below is built except the logging stub `crates/akuma-kernel-amd64/src/kvm/api.rs`; evidence for what Firecracker asks for is the Phase 1 census above. Names are inferred from request direction/size/behaviour.
 
 Status: **design for approval** (phase 2 of `docs/archive/AKUMA_FIRECRACKER_KVM.md`; nothing here is built
-except the logging stub `amd64/src/kvm/api.rs`). Evidence for every statement about what Firecracker
+except the logging stub `crates/akuma-kernel-amd64/src/kvm/api.rs`). Evidence for every statement about what Firecracker
 asks for is the phase-1 census in that archive doc. Clean room: nothing below comes from Linux/KVM or
 Firecracker source or UAPI headers; names are inferred from request direction/size/behaviour.
 
@@ -114,7 +114,7 @@ Firecracker source or UAPI headers; names are inferred from request direction/si
 Firecracker 1.16 on x86_64, `--no-api`, one drive, one vCPU, boots a **PVH** ELF kernel: at the first
 `KVM_RUN` it has set `rip=0x201000` (the ELF's PVH entry), `rbx=0x6000` (`hvm_start_info` it wrote in guest
 RAM), 32-bit flat protected mode (`CR0=0x11`, no paging, flat code/data selectors 0x8/0x10, a GDT at
-0x500), exactly the entry state `amd64/src/kvm/linux.rs` already builds for its own guests. It asks for:
+0x500), exactly the entry state `crates/akuma-kernel-amd64/src/kvm/linux.rs` already builds for its own guests. It asks for:
 
 | need | what it is | Akuma has |
 |---|---|---|
@@ -201,7 +201,7 @@ recommended).
 Option 1: new `/dev/kvm` node, new syscall-context run loop, pure ABI crate, kvm0 untouched. Honest size:
 **4-6 k lines** over a pure `akuma-kvm-abi` crate (`forbid(unsafe)`, no deps: request decode, struct layouts,
 memslot table, 4 KiB NPT encoder, run-page and completion state machine, IOAPIC model, irq routing) and a thin
-glue (`amd64/src/kvm/api/`: fd table, VMCB get/set marshalling, the run loop; the only `unsafe` is `VMRUN`
+glue (`crates/akuma-kernel-amd64/src/kvm/api/`: fd table, VMCB get/set marshalling, the run loop; the only `unsafe` is `VMRUN`
 which already exists). Phase 3 slices, each ending in a TCG rehearsal and a doc update:
 
 1. *Plumbing* (replaces the stub's canned answers): system/VM/vCPU fds, memslots + on-demand 4 KiB NPT, vCPU
@@ -231,7 +231,7 @@ Slice 1 (plumbing) started 2026-10-23. Working from this document; entries below
 
 Built: pure crate `crates/akuma-kvm-abi` (request decode per descriptor kind, `Regs`/`Sregs`/`CpuidEntry`/
 `MsrEntry` layouts, the memslot `Table`, `Irqfd`/`Ioeventfd`; 10 host tests whose vectors are the census dumps)
-and the glue `amd64/src/kvm/api.rs`: `FileDescriptor::DevKvm(u32)` (0 = `/dev/kvm0`, `n` = handle `n` of the new
+and the glue `crates/akuma-kernel-amd64/src/kvm/api.rs`: `FileDescriptor::DevKvm(u32)` (0 = `/dev/kvm0`, `n` = handle `n` of the new
 node), a static handle table and one static `Vm`; `CREATE_VM` (EBUSY while a kvm0 VM exists, and kvm0's `create`
 is EBUSY while an API VM lives; a VM whose owner process is gone is reaped by either), `CREATE_VCPU`,
 `GET_SUPPORTED_CPUID` from the host's CPUID through `cpuid::filter`, `CHECK_EXTENSION`, `SET_TSS_ADDR`,
@@ -262,12 +262,12 @@ What was built, in the order it was needed:
 * `crates/akuma-kvm-abi` (pure, `forbid(unsafe)`, 12 host tests): request decode per descriptor kind, `Regs`/`Sregs`/
   `CpuidEntry`/`MsrEntry`/FPU layouts (test vectors are the census dumps), the memslot `Table`, `Irqfd`/`Ioeventfd`,
   and `runpage` (below).
-* `amd64/src/kvm/api.rs`: `FileDescriptor::DevKvm(id)` handles (system / VM / vCPU), one static `Vm`, reaping by dead
+* `crates/akuma-kernel-amd64/src/kvm/api.rs`: `FileDescriptor::DevKvm(id)` handles (system / VM / vCPU), one static `Vm`, reaping by dead
   owner, `GET_SUPPORTED_CPUID` from the host CPUID through `cpuid::filter`, memslots on a reserved slice
   (`mm::remap_user_to_phys`), a 2 MiB-leaf NPT built at the first `RUN`, `mmap` of a vCPU fd as its two run
   frames (`mm::mmap_frames`: borrowed frames, one physical page behind every mapping), IRQFD/IOEVENTFD resolved to the
   kernel's eventfd ids (a reference held until the VM dies).
-* `amd64/src/kvm/api/vcpu.rs`: per-vCPU VMCB, host-save frame, GPR file, CPUID table (the VMM's own, 96 entries),
+* `crates/akuma-kernel-amd64/src/kvm/api/vcpu.rs`: per-vCPU VMCB, host-save frame, GPR file, CPUID table (the VMM's own, 96 entries),
   guest FPU image, and `run`: the world switch **in the VMM thread's syscall** (thread pinned to its core, SVM
   enabled on demand, host FPU saved/restored around `VMRUN`, BKL released only around `VMRUN`, a `yield_now` between
   entries so the VMM's device thread can run, signal check -> `EINTR`). Exits: CPUID from the VMM's table; MSRs;
@@ -275,7 +275,7 @@ What was built, in the order it was needed:
   run page and is completed at the next `RUN` (an `IN` or MMIO load finishes when the VMM has filled the data; a
   store finishes at once); registered doorbells signal their eventfd and never leave the kernel; irqfds are polled at
   every entry and every idle wake and raise the PIC pin `gsi` (< 16).
-* `amd64/src/kvm/api/platform.rs`: PIT, PIC pair, LAPICs, MSR policy (the `kvm0` arithmetic, minus the 16550 and
+* `crates/akuma-kernel-amd64/src/kvm/api/platform.rs`: PIT, PIC pair, LAPICs, MSR policy (the `kvm0` arithmetic, minus the 16550 and
   keyboard controller the VMM emulates itself).
 
 **The run-page layout is a hypothesis that Firecracker confirmed by behaviour.** The census cannot show it (only the VMM
@@ -351,7 +351,7 @@ says so.
   alive, the vCPU thread parked) after a test that piped `run.sh` into `grep -q`: grep exits at the first match, the pipe
   closes, and Firecracker's console writes then fail forever. Never judge a run by an early-exiting reader; give the
   output to a file. (The hang was *not* reproduced with output going to a file; the exit and idle tracing added for the hunt
-  stays, off the hot path, in `amd64/src/kvm/api/vcpu.rs`.) `kill -9` of such a process freed the VM for the next one.
+  stays, off the hot path, in `crates/akuma-kernel-amd64/src/kvm/api/vcpu.rs`.) `kill -9` of such a process freed the VM for the next one.
 * The box's own `ssh` client takes no `-o` options (`cannot resolve host '-o'`); use `ssh -p 2223 root@127.0.0.1 'cmd'`, or go
   in from the Mac.
 
@@ -435,7 +435,7 @@ herd's `cpus` applies to the spawn only, not to a later `herd` restart of an alr
 `"network-interfaces":[{"iface_id":"eth0","host_dev_name":"tap0",...}]` used to exit before the first `RUN` (`Couldn't open
 /dev/net/tun`). Built, in the order Firecracker asked for it:
 
-1. **`/dev/net/tun`** (`amd64/src/kvm/tun.rs`, `FileDescriptor::DevTun`, `FdState::DevTun`, a fifth syscall hook
+1. **`/dev/net/tun`** (`crates/akuma-kernel-amd64/src/kvm/tun.rs`, `FileDescriptor::DevTun`, `FdState::DevTun`, a fifth syscall hook
    `dev_tun_has_frame`): `TUNSETIFF` / `TUNSETVNETHDRSZ` (12) / `TUNSETOFFLOAD` / `TUNGETFEATURES` / `TUNGETIFF`; a frame behind a
    zeroed virtio-net header per `read`; `EPOLLIN` from a relaxed flag the pump and every read/write refresh. The far end is the
    `kvm0` gateway (`akuma_svm_amd64::gateway`: ARP, DHCP 10.0.2.15, ICMP/UDP echo); `tunout` on the kernel command line lets

@@ -17,8 +17,8 @@ profiles exist since the 2026-08-10 consolidation removed five that were pure
 
 | Profile | Inherits | Used by | Notes |
 |---|---|---|---|
-| `release` | — | default `cargo run` / `cargo build` | full `default` feature set, including real shared-kernel SMP (`smp-shared`) |
-| `extreme-size` | `release` | `scripts/build_extreme_size.sh` | `opt-level=z`, LTO, `codegen-units=1`; 4 MB floor; `--no-default-features` re-adds a minimal set |
+| `release` | — | default `cargo run` / `cargo build` | full `default` feature set (shared-kernel SMP is unconditional) |
+| `extreme-size` | `release` | `cargo build --profile extreme-size …` (manual) | codegen only: `opt-level=z`, LTO, `codegen-units=1`, stripped. The same kernel as `release` for a given feature set; no cfg reads the profile since the `extreme` feature was removed 2026-11-11 |
 | `release-debug` | `release` | `cargo build --profile release-debug --features ...` (manual only) | adds `debug = true` (DWARF) for source-level `lldb` against the gdbstub |
 
 `devbox` and `devbox-smoltcp` are **not** profiles — both build on plain
@@ -31,11 +31,16 @@ Source: `Cargo.toml:73-105`.
 
 `default` (`Cargo.toml:109-124`):
 ```
-smp-shared, smoltcp, sound, rump, fs-cache,
-sc-aio, sc-sysv-ipc, sc-containers,
-sc-timerfd, sc-eventfd, sc-pidfd, sc-epoll,
-many-sessions
+smoltcp, sound, linux-extra-syscalls, sc-reboot
 ```
+
+`linux-extra-syscalls` is the group of the seven extra families, with the same
+name and members on amd64: six `sc-*` features (`sc-aio`, `sc-containers`,
+`sc-timerfd`, `sc-eventfd`, `sc-pidfd`, `sc-epoll`) that stay individually
+settable, plus SysV message queues and `/proc/sysvipc/msg`, which only the group
+turns on (the `sc-sysv-ipc` kernel feature was folded into it 2026-11-11; the
+crates keep a feature of that name). `sc-reboot` is outside it because only the AArch64
+kernel has it.
 
 There is no `neko`/`kernel-tls`/`tls-rsa` feature anymore — the in-kernel
 editor, shell, and all in-kernel cryptography were deleted outright on
@@ -49,13 +54,11 @@ HTTPS client anywhere in this tree now; use a userspace tool.
 | Feature | Effect | Source |
 |---|---|---|
 | `smoltcp` | Native smoltcp TCP/IP stack on NIC0; DNS/HTTP depend on it. (No longer gates a built-in SSH server — that was deleted entirely, not just from non-smoltcp builds.) | `Cargo.toml:315` |
-| `rump` | Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack. NIC1 only exists with `RUMP_NIC=1`. | `Cargo.toml:309` |
-| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. | `Cargo.toml:378` |
-| `rump-tests` | Compiles only `rump_tests` even under `no-tests` — used by the devbox to verify rump regression guards at boot without pulling in the full boot-test suite. | `Cargo.toml:142` |
-| `userspace-sshd` | Selects the herd-less startup path: `AUTO_START_HERD` off, kernel spawns `/bin/sshd` directly via `AUTO_START_SSHD`. Drives `config::ENABLE_USERSPACE_SSHD`. There is only ever one sshd (userspace) now — this no longer toggles between a built-in and a userspace server, only who starts the userspace one. | `Cargo.toml:386` |
-| `many-sessions` | Deepens the per-listener backlog (8→32) and raises the socket budget on `small-sockets` builds — the kernel half of the process-per-session `/bin/sshd` (its `fork-sessions` feature is the userspace half). **In `default`** since 2026-08-10 — without it the stack RSTs past 8 simultaneous arrivals. Costs ~1 MB heap per listening socket + ~44 KB BSS. `kernel_profile_extreme` overrides the constants back to 8/32 regardless. | `Cargo.toml:138` |
-| `devbox` | Meta-feature = `["rump-default", "userspace-sshd", "sc-reboot"]`. Built `--no-default-features` (`scripts/build_devbox.sh`), so `sc-reboot` is listed explicitly here even though it's also in `default` now — this feature set doesn't inherit `default`'s members. | `Cargo.toml:393` |
-| `devbox-smoltcp` | Meta-feature = `["userspace-sshd", "smp-shared"]` — the **default** devbox. Keeps smoltcp; both members are no-ops here since they're already in `default` (this build does NOT pass `--no-default-features`) — `sc-reboot` used to be listed a third time for the same reason before it moved into `default` itself (2026-08-25). | `Cargo.toml:405` |
+| `rump` | **Off by default** since 2026-11-11. Raw L2 tap path on NIC1 (`/dev/net/tap0`) for a userspace NetBSD rump stack, the sysproxy client, and the rump regression guards, which every `rump` build runs at boot even with `no-tests` (the old `rump-tests`). NIC1 only exists with `RUMP_NIC=1`. Acceptance 11 builds it with box 0 on the native stack. | `Cargo.toml:309` |
+| `rump-default` | Makes the rump stack the **default** for box 0 (kernel brings up `/bin/rump_server` at boot). Implies `rump`. The rump devbox's feature; it replaces the removed `devbox` bundle. A separate feature because the AArch64 kernel reads no boot command line to choose it at runtime. | `Cargo.toml:378` |
+| (`userspace-sshd`) | **Removed 2026-11-11** with `extreme`, the only build that selected it. herd starts `/bin/sshd` on every build. |
+| (`many-sessions`) | **Removed 2026-11-11.** The listener backlog is 8 on every build; configure sshd for it or raise `MAX_BACKLOG` — [`../build-profiles.md`](../build-profiles.md) § Listener backlog. |
+| (`devbox-smoltcp`) | **Removed 2026-11-11** (it had become an empty alias). The default devbox is `--release --features no-tests`; `scripts/build_devbox_smoltcp.sh` builds it. | `Cargo.toml` |
 
 > **Drift note:** `overlays/devbox/README.md:142,211`
 > still say "Phase 2 will build with `--no-default-features`" and "smoltcp is
@@ -71,26 +74,26 @@ re-add what they need. `Cargo.toml:361-369`.
 | Feature | Tier | Notes |
 |---|---|---|
 | `sc-aio` | 1 (dead weight) | |
-| `sc-sysv-ipc` | 1 | |
+| (`sc-sysv-ipc`) | 1 | Folded into `linux-extra-syscalls` 2026-11-11; still a feature of `akuma-syscalls-glue`/`akuma-vfs-glue`. |
 | `sc-containers` | 1 | |
 | `sc-timerfd` | 1 | |
 | `sc-eventfd` | 2 (needs ExecRuntime stub when off) | |
 | `sc-pidfd` | 2 | |
 | `sc-epoll` | 2 | |
-| `sc-reboot` | — | **In `default`** since 2026-08-25 (was devbox-only before — the plan had been to land it alongside a self-hosted kexec, which was scoped and rejected, so there was no reason left to gate it). `extreme-size` still excludes it (`--no-default-features`, own explicit list). Linux `reboot(2)` (`nr` 142) → PSCI `SYSTEM_RESET`/`SYSTEM_OFF`. ABI decode in `crates/akuma-boot` (host-tested); the PSCI call reuses `smp_shared`'s existing SMC/HVC conduit code, so `sc-reboot` depends on `smp-shared`. **Box-0 only**: `caller_may_reboot` (`src/syscall/reboot.rs`) returns `EPERM` for any caller with `box_id != 0` — a whole-machine PSCI reset/off would take every other box down with it, so it gets the same host-only restriction `mount`/`umount` already have (`caller_may_mount`, `src/syscall/container.rs`). See [`syscalls/proc.md`](syscalls/proc.md#reboot) and [`../../archive/AKUMA_BOOT_EXTRACTION.md`](../../archive/AKUMA_BOOT_EXTRACTION.md). |
+| `sc-reboot` | — | **In `default`** since 2026-08-25 (was devbox-only before — the plan had been to land it alongside a self-hosted kexec, which was scoped and rejected, so there was no reason left to gate it). Linux `reboot(2)` (`nr` 142) → PSCI `SYSTEM_RESET`/`SYSTEM_OFF`. ABI decode in `crates/akuma-boot` (host-tested); the PSCI call reuses `smp_shared`'s existing SMC/HVC conduit code, so `sc-reboot` depends on `smp-shared`. **Box-0 only**: `caller_may_reboot` (`src/syscall/reboot.rs`) returns `EPERM` for any caller with `box_id != 0` — a whole-machine PSCI reset/off would take every other box down with it, so it gets the same host-only restriction `mount`/`umount` already have (`caller_may_mount`, `src/syscall/container.rs`). See [`syscalls/proc.md`](syscalls/proc.md#reboot) and [`../../archive/AKUMA_BOOT_EXTRACTION.md`](../../archive/AKUMA_BOOT_EXTRACTION.md). |
 
 ### Other
 
 | Feature | Effect | Source |
 |---|---|---|
 | `sound` | virtio-sound output (`/dev/dsp`). The only thing that still compiles `virtio-drivers` (and `zerocopy`, `safe-mmio`, `bitflags` 2, `thiserror`): block and net are driven in-tree (`archive/AKUMA_VIRTIO_IN_TREE.md`). | `Cargo.toml` |
-| `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:337` |
-| `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`. Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:356` |
-| `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:125` |
+| (`extreme`) | **Removed 2026-11-11** — it selected the 4 MB-floor constants (stacks, heap seed, socket table, no block cache). The `extreme-size` profile stays, codegen only. [`../../archive/EXTREME_SIZE_BUILD.md`](../../archive/EXTREME_SIZE_BUILD.md). | |
+| (`fs-cache`) | **Folded in 2026-11-11**: the ext2 clock-eviction block cache is on in every build (both kernels, Taoxichuan, host tests). Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`, 16 MB if the kernel never sets one. Observe it via the `[FSCACHE]` PSTATS line. | `crates/akuma-ext2` |
+| `no-tests` | Drops boot self-test suites. | `Cargo.toml:125` |
 
 ### Crate features the amd64 kernels leave off
 
-Not bin features: each is a crate's own, turned on by the AArch64 kernel's manifests and left off by `akuma-amd64` and
+Not bin features: each is a crate's own, turned on by the AArch64 kernel's manifests and left off by `akuma-amd64` (its library, `akuma-kernel-amd64`) and
 Taoxichuan, which load binaries with their own loaders and reach `akuma-exec` only through `Process::install_image`.
 
 | Feature | Effect | Source |
@@ -109,66 +112,78 @@ What a tokio program calls, and so what may be left off, is measured by B10's ce
 | `akuma-syscalls-glue/akuma-native` | Akuma's own numbers (asm-generic 300-328; `0x1000 +` that on x86_64): `spawn`, `spawn_ext`, `waitpid`, `kill`, the terminal and cursor calls, `resolve_host`, `uptime`, `time`, `get_version`, `core_init`, `set_box_stack`, `close_child_stdin`, `set_tpidr_el0`. libakuma's programs use them. In glue's `default`; named by the bin and `akuma-amd64`. Off, the numbers fall to `ENOSYS`. `spawn`/`spawn_ext` also need `exec`. | `crates/akuma-syscalls-glue/Cargo.toml` |
 | `akuma-runtime-tokio/shell` | Not a tokio feature: the 23 calls glue serves that a shell and its tools make and no tokio program does (job control, the other ids, limits and accounting, `sync`, `membarrier`, the clock and hostname setters). Taoxichuan's own `shell` feature (in its `default`) turns it on; `--no-default-features` builds a kernel that serves only the tokio surface. | `crates/akuma-runtime-tokio/Cargo.toml`, `taoxichuan/Cargo.toml` |
 
-`userspace-sshd` and `many-sessions` are documented under
-[Networking stack](#networking-stack) above, alongside the other
-sshd-related features.
+### amd64 features
 
-### The `akuma-amd64` package
-
-A separate package (`amd64/Cargo.toml`), deliberately outside `default-members`,
-so none of the features above apply to it and none of these apply to the AArch64
-kernel.
+The amd64 kernel is the root package `akuma` built with `--target x86_64-unknown-none`: one
+package, one `[features]` table, and the target picks the machine half (`Cargo.toml`'s
+per-target dependency tables). The features are defined by the kernel library,
+`akuma-kernel-amd64` (`crates/akuma-kernel-amd64/Cargo.toml`), and the root manifest forwards each under the same
+name, so `-p akuma --target x86_64-unknown-none --features X` works. A shared name
+(`no-tests`, `linux-extra-syscalls`, the `sc-*` set, `syscall-debug-info`, `pmm-forensics`)
+lists both kernels' parts; the half that names the other architecture's crates does nothing,
+because cargo does not activate an inactive target's dependencies. A feature added to the
+library needs its forwarding line in the root manifest; if it is missing, cargo reports an
+error rather than silently ignoring the feature. `default` carries both kernels' defaults, so
+an amd64 image that leaves anything out uses `--no-default-features` (`headless`, `server`).
 
 | Feature | Effect | Source |
 |---|---|---|
-| `smp-shared` | **Required, not optional.** Forwards to `akuma-exec/smp-shared`; the BKL's entry points are no-ops without the cfg, so a `--no-default-features` build would run four cores with no lock. A const assert in `amd64/src/smp.rs` fails the build rather than letting it boot corrupt. | `amd64/Cargo.toml` |
-| `console-notify` | Akuma-private syscall 322 (`/bin/wall`) — a userspace program writing a framed line straight to the console. **In `default` for this target only**: the bare-metal reference box has a display and no working keyboard, so this is the one channel to a person in front of it that is not the network. | `amd64/Cargo.toml` |
-| `no-tests` | Drops the boot self-test suite, as on AArch64. `boot::self_tests` and every `*_test`/`smoke_test` function in `amd64/src` disappear and `boot::late_init` performs the bring-up the suite otherwise does on the way past (the LAPIC, the secondaries, the console fd, the syscall MSRs, the timer, `sti`) — the same call the runtime `skiptests` command-line lever makes. Verified by booting, not only by compiling. | `amd64/Cargo.toml` |
-| `linux-file-io` | **Default on.** A `read`/`pread` of a regular file returns the whole request unless EOF comes first (up to Linux's `MAX_RW_COUNT`), as Linux does, instead of stopping at the 64 KiB `MAX_IO`. It's served as a loop of 64 KiB glue reads (`fd::read_file_full`), so the kernel buffer per call is unchanged. Remove it from `default` for an A/B. Found by Chromium's V8 snapshot read — `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 10. | `amd64/Cargo.toml` |
-| `syscall-debug-info` | Off. Forwards the AArch64 kernel's compile-time syscall debug mode (`akuma-config`, `akuma-syscalls`, `akuma-syscalls-time`, `akuma-exec`). On amd64 it prints glue's per-arm `[syscall]` lines only; the `[FORK-DBG]`/`[TRAMP]` traces never fire, because fork and exec are this target's own. For "which syscall failed" use the runtime `strace_err` flag instead: [`../../runbooks/trace-failing-syscalls-amd64.md`](../../runbooks/trace-failing-syscalls-amd64.md). | `amd64/Cargo.toml` |
+| *(no SMP feature)* | Shared-kernel SMP is unconditional: `crates/akuma-kernel-amd64/Cargo.toml` turns on `bkl-smp` on every shared crate it depends on, and `const _: () = assert!(akuma_bkl::ACTIVE)` in `crates/akuma-kernel-amd64/src/smp.rs` fails the build if one is ever missed (the BKL's entry points are no-ops without it). The `smp-shared` feature was removed 2026-11-11. | `crates/akuma-kernel-amd64/Cargo.toml` |
+| `no-tests` | Drops the boot self-test suite, as on AArch64. The bin stops linking `akuma-kernel-tests-amd64` (the suite, since 2026-11-11; it registers itself through `boot::register_self_tests` from the bin's `before_main`), and every `*_test`/`smoke_test` function still in `crates/akuma-kernel-amd64/src` disappears and `boot::late_init` performs the bring-up the suite otherwise does on the way past (the LAPIC, the secondaries, the console fd, the syscall MSRs, the timer, `sti`) — the same call the runtime `skiptests` command-line lever makes. Verified by booting, not only by compiling. Forwards to `akuma-kernel-core`, `akuma-exec` and `akuma-syscalls-glue`, as AArch64's does, so their test-only helpers leave the image too (−1.9 KB `.text`). | `crates/akuma-kernel-amd64/Cargo.toml` |
+| `all-drivers` | **Default.** Every driver in `crates/akuma-drivers-amd64` (its `all`): `fbcon`, `hda`, `kvm`, `touchpad`, `wifi`, each also a bin feature of its own. A driver whose feature is off is not compiled, and `akuma_drivers_amd64::register` does not install it, so the machine half's probe for that class (`crates/akuma-kernel-amd64/src/drivers.rs`) reads "absent". A smaller set needs `--no-default-features`. | root `Cargo.toml` |
+| `fbcon` | The framebuffer console on GRUB's framebuffer, with the boot splash, the colour band and `/dev/fb0`'s registration (the display class). Off: the multiboot2 boot is headless (`fb: none, headless (no display driver in this build ..)`), the console is the serial port, and what the screen would have drawn goes to the `fbtrace` stand-in. `akuma-fbcon` is not linked. | `crates/akuma-drivers-amd64/Cargo.toml` |
+| `hda` | Intel HD Audio behind `/dev/dsp` (the sound class). | `crates/akuma-drivers-amd64/Cargo.toml` |
+| `touchpad` | The I2C-HID touchpad behind `/dev/input/mouse0` (the pointer class). Off: no node, and the console pump's mouse bridge is a no-op. | `crates/akuma-drivers-amd64/Cargo.toml` |
+| `wifi` | `/dev/wifi0` (with the `wifisim` backend) and the RTL8852CE (rtw89) card as a WPA2 station that can be the network link (the wireless class). Off: no `/dev/wifi0`, the link is the RTL8169 or loopback, and the card's 4 MiB of receive buffers and `akuma-rtw89`'s register sequences leave the image. | `crates/akuma-drivers-amd64/Cargo.toml` |
+| `kvm` | The AMD SVM hypervisor: `/dev/kvm0`, `/dev/kvm`, `/dev/net/tun` (the hypervisor class). Off: none of the three nodes opens, as on a CPU without SVM, and `kvmtest`/`kvmctl`/`kvmserve` do nothing. | `crates/akuma-drivers-amd64/Cargo.toml` |
+| `headless` | The bare-metal **test-box** image: `--no-default-features --features headless` = the machine half's defaults and the boot suite, with no optional driver. Keeps serial, the boot disk paths (the GRUB-module ramdisk, NVMe, USB storage), the RTL8169 NIC and the xHCI keyboard, which are in the machine half; drops `fbcon`, `hda`, `touchpad`, `wifi` and `kvm`. [`../build-profiles.md`](../build-profiles.md#amd64-images). | root `Cargo.toml` |
+| `server` | `headless` without `console` and without the keyboard drivers (`akuma-drivers-amd64/storage`: NVMe, xHCI). Init's stdin is EOF; `SPAWN_FLAG_CONSOLE` is `ENODEV`. [`../build-profiles.md`](../build-profiles.md#amd64-images). | root `Cargo.toml` |
+| `console` | The interactive console: the pump task (keyboard/serial -> the console's line discipline, echo drain, touchpad poll, `/dev/fb0` owner reclaim), USB keyboard enumeration, the console's size from the framebuffer grid and `/etc/console.conf`, and 301's `SPAWN_FLAG_CONSOLE`. Off: init is attached to the console channel for output only, with stdin closed. In the bin's `default` and `headless`, not in the machine half's `default`. | `crates/akuma-kernel-amd64/Cargo.toml` |
+| `syscall-debug-info` | Off. Forwards the AArch64 kernel's compile-time syscall debug mode (`akuma-config`, `akuma-syscalls`, `akuma-syscalls-time`, `akuma-exec`). On amd64 it prints glue's per-arm `[syscall]` lines only; the `[FORK-DBG]`/`[TRAMP]` traces never fire, because fork and exec are this target's own. For "which syscall failed" use the runtime `strace_err` flag instead: [`../../runbooks/trace-failing-syscalls-amd64.md`](../../runbooks/trace-failing-syscalls-amd64.md). | `crates/akuma-kernel-amd64/Cargo.toml` |
+| `pmm-forensics` | Off, on **both kernels** (and Taoxichuan's). Compiles in `akuma-pmm`'s free and CoW-event ledgers (`crates/akuma-pmm/src/ledger.rs`), the rings the premature-free and UAF reports print a frame's history from; without it they print "no record" and `akuma_pmm::LEDGERS` is `false`. On amd64 it also turns on the UAF quarantine and the premature-free check (`PmmConfig`). | `Cargo.toml`, `crates/akuma-kernel-amd64/Cargo.toml`, `crates/akuma-pmm/Cargo.toml` |
 
 | Env knob | Effect | Source |
 |---|---|---|
 | `FEATURES=a,b` | Extra cargo features for `amd64/run.sh` — `FEATURES=no-tests sh amd64/run.sh`. Without it that feature could only be compiled, never booted, and a configuration nobody boots is one that rots. | `amd64/run.sh` |
+| `NO_DEFAULT_FEATURES=1` | Adds `--no-default-features` to `amd64/run.sh`'s build, for a smaller driver set: `NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh`. | `amd64/run.sh` |
 
 `no-tests` is also what makes `scripts/cloc_akuma.py` able to tell this target's
 kernel code from its test code: the script files an item under *tests* exactly
 when its `cfg` cannot hold in a `no-tests` world. Before the feature existed
-`amd64/src` measured **0.0% test** against ~3 300 lines of boot suite.
+`crates/akuma-kernel-amd64/src` measured **0.0% test** against ~3 300 lines of boot suite.
 
 #### build.rs-emitted cfgs for the above
 
 | cfg | Emitted when | Gates |
 |---|---|---|
-| `kernel_tests` | `!no-tests && OPT_LEVEL != "z"` | Kernel APIs the boot suite needs — `src/main.rs`'s boot self-test suite (`{tests,process_tests,sync_tests,pthread_tests,network_tests}.rs`). There is no `kernel_builtin_ssh` cfg anymore; the in-kernel SSH server, shell, and editor it used to gate were deleted outright on 2026-08-10, not compiled-out-by-cfg (`docs/archive/BUILTIN_SSH_REMOVAL.md`). |
+| `kernel_tests` | `!no-tests` | Kernel APIs the boot suite needs — `src/main.rs`'s boot self-test suite (`{tests,process_tests,sync_tests,pthread_tests,network_tests}.rs`). There is no `kernel_builtin_ssh` cfg anymore; the in-kernel SSH server, shell, and editor it used to gate were deleted outright on 2026-08-10, not compiled-out-by-cfg (`docs/archive/BUILTIN_SSH_REMOVAL.md`). |
 
 ### SMP / Big Kernel Lock
 
-`smp-shared` is the real shared-kernel SMP model — one shared kernel across
-all cores under real cross-core locks. The `no-bkl-*` features are carve-outs
-from the Big Kernel Lock and are only meaningful together with `smp-shared`;
-each is a byte-for-byte no-op on any build that doesn't set both. See
-[`locking.md`](locking.md) for the carve-out playbook and the syscall→lock map.
+Every Akuma build is the real shared-kernel SMP model — one shared kernel across
+all cores under real cross-core locks. It also runs five syscall families without
+the Big Kernel Lock: network, VFS, fork's page copy, mm and the drivers. And it makes
+`PreemptGuard` mask local IRQs for inner-lock holds, which is what makes those
+carve-outs safe. There is no compile-time switch per family. The six `no-bkl-*`
+features were folded into what is now `bkl-smp` on 2026-11-11, because every build of both
+kernels had them all on; `no-bkl-irq` had gated nothing since the SGI scheduler was
+deleted (`docs/archive/AKUMA_FEATURE_AUDIT.md` F2). A/B a family with its **runtime**
+toggle, described below. See [`locking.md`](locking.md) for the carve-out playbook
+and the syscall→lock map.
 
-| Feature | cfg emitted | In `smp-shared` by default? | Effect |
+| Feature | cfg emitted | In `default`? | Effect |
 |---|---|---|---|
-| `smp-shared` | `kernel_smp_shared` | — | One kernel across all cores; activates the BKL. **In `default`** since 2026-08-10 — this is *the* SMP now, not a separate profile/CLI opt-in (the one-kernel-per-core "multikernel" `smp` feature was removed the same day). |
-| `no-bkl-network` | `kernel_no_bkl_network` | **yes** (since 2026-07-24) | smoltcp net syscalls + socket `read`/`write` run BKL-free on `SOCKET_TABLE`/`NETWORK`. |
-| `no-bkl-vfs` | `kernel_no_bkl_vfs` | **yes** (since 2026-07-25) | fs syscalls run BKL-free on the ext2/block-cache/fd-table spinlocks. |
-| `no-bkl-process` | `kernel_no_bkl_process` | **yes** (since 2026-07-31) | `fork_process`'s CoW page-copy window runs BKL-free on the address space's `as_lock`, held in 64-page IRQ-masked chunks. Also emitted by `crates/akuma-exec/build.rs` (the only carve-out whose guard is constructed outside the bin crate). |
-| `no-bkl-mm` | `kernel_no_bkl_mm` | **yes** (since 2026-08-01) | `mprotect`/`madvise`/`munmap`/`mremap`/`mmap` run BKL-free on `as_lock`/`vm_lock`/`LAZY_REGION_TABLE`/PMM/`SHARED_FILE_MAPPINGS`. Plan-driven, not attribution-driven — bin-crate-only, nothing forwarded to `akuma-exec`. |
-| `no-bkl-drivers` | `kernel_no_bkl_drivers` | **yes** (since 2026-08-01) | `getrandom`, `/dev/urandom`, `/dev/dsp`, `fb_*` run BKL-free on their own driver spinlocks (`RNG_DEVICE`/`SOUND_DEVICE`/`FB_STATE`). Bin-crate-only. |
-| `no-bkl-irq` | `kernel_no_bkl_irq` | **yes** (since 2026-08-01) | Timer IRQ (27) dispatch runs BKL-free — the only device IRQ this kernel registers. A/B: `irq/sched` BKL contention 24.7% → 10.2%. |
+| `bkl-smp` (shared crates only) | `kernel_bkl_smp` | — | The BKL is real and the shared crates open its dropped windows. **Not a kernel feature**: both Akuma kernels enable it on every shared crate unconditionally (the root `Cargo.toml` through `akuma-kernel-glue`, `crates/akuma-kernel-amd64/Cargo.toml` directly) and assert `akuma_bkl::ACTIVE`; Taoxichuan leaves it off and serializes under its own lock ([`../../../proposals/ONE_BIG_KERNEL_LOCK.md`](../../../proposals/ONE_BIG_KERNEL_LOCK.md)). Was the `smp-shared` feature / `kernel_smp_shared` until 2026-11-11, when the single-core AArch64 build was removed. |
 | `bkl-profile` | `kernel_bkl_profile` | **no — measurement only** | Per-tag BKL-hold profiler + periodic `[BKLPROF]` histogram. Perturbs timing; never ship it. |
 | `read-profile` | *(feature only)* | **no — measurement only** | Per-stage `read(2)` accounting: `sys_read`'s `File` arm, `handle_syscall` and the EL0 handler each time themselves, and a `[READPROF]` window prints every 256 file reads — which stage of a warm read is validation, fd lookup, the staging allocation, ext2, the user copy, or the two wrappers. Answers what neither `bkl-profile` ("which syscall held the lock") nor `net-profile` ("how long was the device busy") can: the split *inside* one syscall. **Single-core only** (the wrapper spans are handed up by one flag — run `SMP=1`), and **never read wall-clock throughput off this build**: the dump's own console write is ~55 ms per window. Use `scripts/benchmarks/read_stage_profile.py`, which drops windows with mixed request sizes or preempted samples. Background: `docs/archive/EXT2_READ_PATH_STAGE_PROFILE.md`. |
-| `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on in `release`; off in `extreme-size`** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. Default-on for `release` (OPT_LEVEL != "z") since 2026-08-11 after SMP=4 verification; off in `extreme-size` (single-core target, lock is pure overhead). `CONSOLE_LOCK=0` opt-out (debug), `CONSOLE_LOCK=1` force-on in `extreme-size` (test). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
+| `CONSOLE_LOCK` (env) | `kernel_console_lock` | **default-on** | Cross-core spinlock + owner-core-ID reentrancy guard around `console::emit`'s UART write loop, so two cores under `smp-shared` can't byte-interleave each other's lines at the shared PL011 register. On in every build since 2026-11-11 (it was off under `opt-level = "z"`, the old single-core `extreme` target). `CONSOLE_LOCK=0` opt-out (debug). Background: `docs/archive/UART_SMP_INTERLEAVE_FIX.md`. |
 | `sound` + platform | `kernel_audio` | **on for QEMU virt; off for `platform-firecracker`** | The virtio-sound driver and `/dev/dsp`. Firecracker implements net/block/balloon/vsock/rng and no sound device — confirmed by the FDT it emits (`docs/reference/firecracker/fdt/`), which carries three virtio nodes, none of them sound. With this off, `src/main.rs` provides a stub `audio` module mirroring `akuma-virtio`'s own feature-off `imp`, so the syscall layer compiles unchanged and `/dev/dsp` never opens (`is_available()` is false, the gate `syscall/fs.rs` already applied). The boot probe is skipped too: walking eight virtio slots to report "not available" every boot is noise. Asserted by `test_platform_device_gates`. |
 
 Each carve-out also has a **runtime** toggle (default on) for same-binary A/B and
 as a kill switch — `set_fault_bkl_drop_enabled()`, `set_exec_bkl_drop_enabled()`,
 `set_vfs_bkl_drop_enabled()`, `set_process_bkl_drop_enabled()`,
-`set_mm_bkl_drop_enabled()`, `set_drivers_bkl_drop_enabled()`,
-`set_irq_bkl_drop_enabled()`, all reachable from `src/smp_shared.rs`. Guards
+`set_mm_bkl_drop_enabled()`, `set_drivers_bkl_drop_enabled()`, all reachable from
+`akuma-entry`'s `smp_shared` forwarder. Guards
 latch the toggle at construction and must never re-read it in `drop()` (that
 unbalances the BKL ticket FIFO).
 
@@ -178,7 +193,9 @@ unbalances the BKL ticket FIFO).
 
 | Var | Default | Effect |
 |---|---|---|
-| `MEMORY` | (per script) | Guest RAM. Devbox: 4096. Self-host: 14336. Extreme: 4096K (4.0 MB floor). |
+| `MEMORY` | (per script) | Guest RAM. Devbox: 4096. Self-host: 14336. |
+| `INIT` / `INITARGS` | unset | The kernel's `init=` / `initargs=` (comma-separated), passed to QEMU as `-append`, i.e. the DTB's `/chosen/bootargs`. Unset, the kernel starts `/bin/herd daemon`. The same names `amd64/run.sh` takes; both kernels read them through `akuma_params::init` ([`boot.md` § Init](boot.md#init)). | `cargo_runner.sh` |
+| `APPEND` | unset | Any other boot-line words, before `init=`/`initargs=`. | `cargo_runner.sh` |
 | `DISK` | `disk.img` | Disk image path. |
 | `INSTANCE` | `0` | Instance id (affects SSH port, logging). |
 | `SNAPSHOT` | unset | `1` boots from a QEMU snapshot (writes discarded). |
@@ -235,45 +252,49 @@ These are **compile-time** `pub const bool` — toggle in source and rebuild.
 | Knob | Default | Effect | Source |
 |---|---|---|---|
 | `USER_STACK_SIZE_OVERRIDE` | `0` (auto-scale) | Set e.g. `8MB` to debug Bun/JSC stack depth. | `config.rs:71` |
-| `USER_THREAD_STACK_SIZE` | `cfg(kernel_profile_extreme)`-gated (512KB release / 64KB extreme-size) | Per userspace thread stack. | `config.rs:53-56` |
-| `SYSTEM_THREAD_STACK_SIZE` | `cfg(kernel_profile_extreme)`-gated (512KB release / 96KB extreme-size) | Kernel-side system thread stack. | `config.rs:30-38` |
-| `MAX_ARG_STRLEN` | `cfg(kernel_profile_extreme)`-gated (`128KB` release / `4KB` extreme-size) | Max single arg string (Linux = 128KB). | `config.rs:167-170` |
+| `USER_THREAD_STACK_SIZE` | 512 KB | Per userspace thread stack. | `crates/akuma-config` |
+| `SYSTEM_THREAD_STACK_SIZE` | 512 KB | Kernel-side system thread stack. | `crates/akuma-config` |
+| `MAX_ARG_STRLEN` | 128 KB | Max single arg string (Linux = 128KB). | `crates/akuma-config` |
 | `KERNEL_HEAP_SIZE_MB` | `0` (auto) | Override kernel heap size. | `config.rs:351` |
 | `ENABLE_STACK_CANARIES` | `true` | Stack-overflow detection. | `config.rs:158` |
 
 ### Scheduler / concurrency
 
+**Config flag sweep (2026-11-11): `COW_FORK_ENABLED`, `VFORK_FASTPATH_ENABLED`, `SHARED_FILE_PAGES_ENABLED` and
+`ENABLE_PREEMPTION_WATCHDOG` are removed.** Each was a global on/off const, born `true` with its feature (2026-03-28,
+2026-05-31, 2026-08-05) or last flipped 2026-01-23, and never touched since — the opt-out could never be exercised, same
+shape as the Cargo features the feature audit removed for the same reason. CoW fork and the vfork fast-path are now
+unconditional in the AArch64 root kernel; the preemption watchdog always runs. `cow_fork_enabled`/`vfork_fastpath_enabled`/
+`shared_file_pages_enabled` stay as `RuntimeConfig` **fields** (`akuma-exec`) — amd64 and both tokio kernels set them to
+`false` in their own boot code, a real per-kernel difference, not a dead switch — only the global const feeding the
+AArch64 side is gone.
+
 | Knob | Default | Effect | Source |
 |---|---|---|---|
-| `COW_FORK_ENABLED` | `true` | Copy-on-Write fork. | `config.rs:301` |
-| `VFORK_FASTPATH_ENABLED` | `true` | vfork fast path. | `config.rs:311` |
-| `SHARED_FILE_PAGES_ENABLED` | `true` | Share one physical frame between all read-only mappers of a file page, keyed `(inode, file_offset)`, instead of a private copy per process. Fixes the `-jN` memory/I-O amplification. Off = per-process private file pages. | `config.rs` |
 | `FPCACHE_BASE_RAM_DIVISOR` | `8` | Base file-page cache cap as a divisor of total RAM. 8 = RAM/8 = 512 MB at `MEMORY=4096`. Lower it to starve the cache for an A/B. | `config.rs` |
 | `FPCACHE_INFLATE_PCT` | `20` | Extra cap allowed **on top of the base**, as a percent of the base, granted only while free RAM can spare it. 614 MB at `MEMORY=4096` — enough to hold a 532 MB mmap'd model that the base cap misses by 20 MB. `0` pins the cap at the base (old fixed behaviour). | `config.rs` |
 | `FPCACHE_INFLATE_HEADROOM_MULT` | `2` | Free RAM demanded before the inflation is granted, as a multiple of the inflation. Withdrawal happens at `1x`, so the two form a hysteresis band and the cap cannot flap. | `config.rs` |
-| `NETWORK_THREAD_RATIO` | `4` | Scheduler weight for the network thread. | `config.rs:222` |
-| `MAIN_THREAD_PRIORITY_BOOST` | `false` | Legacy; proportional scheduler is now default. | `config.rs:207` |
-| `ENABLE_PREEMPTION_WATCHDOG` | `true` | | `config.rs:275` |
 
 ### Service autostart
 
 | Knob | Default | Effect | Source |
 |---|---|---|---|
-| `AUTO_START_HERD` | `!(extreme && userspace-sshd)` | Spawn `/bin/herd daemon` after the network comes up. Off **only** in the extreme+`userspace-sshd` combination, where herd plus its service tree costs more RAM than a 4 MB box has to spare. | `config.rs` |
-| `AUTO_START_SSHD` | `userspace-sshd && !AUTO_START_HERD` | Spawn `/bin/sshd --port 22 --shell /bin/sh` straight from `kernel_main` when there is no supervisor — otherwise the image has no way in. Never both this and herd's sshd (they would collide on the port). | `config.rs` |
-| `ENABLE_USERSPACE_SSHD` | `cfg!(feature = "userspace-sshd")` | Legacy name from when there was a built-in server to suppress; that server no longer exists on any profile (deleted 2026-08-10), so this now just gates which startup path (`AUTO_START_HERD` vs `AUTO_START_SSHD`) spawns the one userspace `/bin/sshd`. | `config.rs` |
+| `AUTO_START_HERD` | `true` | Spawn `/bin/herd daemon` after the network comes up; herd starts `/bin/sshd`. (The herd-less `AUTO_START_SSHD` path went with the `extreme`/`userspace-sshd` features, 2026-11-11.) | `crates/akuma-config` |
 
 ### Test gates (boot self-tests)
 
 | Knob | Default | Effect | Source |
 |---|---|---|---|
 | `DISABLE_ALL_TESTS` | `false` | Skip all boot self-tests. | `config.rs:231` |
-| `SKIP_FILESYSTEM_INIT` | `false` | | `config.rs:259` |
-| `SKIP_ASYNC_NETWORK` | `false` | | `config.rs:244` |
 | `RUN_NETWORK_TESTS` | `false` | | `config.rs:247` |
-| `RUN_CONTAINER_TESTS` | `false` | | `config.rs:250` |
 | `IGNORE_THREADING_TESTS` | `false` | | `config.rs:224` |
 | `FAIL_TESTS_IF_TEST_BINARY_MISSING` | `false` | | `config.rs:196` |
+
+`SKIP_FILESYSTEM_INIT` and `SKIP_ASYNC_NETWORK` were listed here but were never actually gated by `kernel_tests` —
+each had one unconditional call site in `akuma-kernel-glue`, a debug escape hatch in the live boot path, not a test
+gate. Removed in the same 2026-11-11 sweep as the Scheduler/concurrency consts above, for the same reason (never
+flipped). `RUN_CONTAINER_TESTS` was already gone from the tree with no call site anywhere — this row was stale; it
+pointed at a `config.rs:250` that now holds something else.
 
 ## Build flags for `populate_disk.sh`
 

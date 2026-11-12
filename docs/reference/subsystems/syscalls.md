@@ -94,8 +94,8 @@ setup and dispatch a kernel depends on to run tokio programs over glue
 
 ## Feature gates & ExecRuntime stubs
 
-The `sc-*` features are compile-time gates. **Tier 1** (`sc-aio, sc-sysv-ipc,
-sc-containers, sc-timerfd`) are pure dead weight when off —
+The `sc-*` features are compile-time gates. **Tier 1** (`sc-aio`, `sc-sysv-ipc` — a crate feature, set by the kernels'
+`linux-extra-syscalls` —, `sc-containers`, `sc-timerfd`) are pure dead weight when off —
 nothing else references them. **Tier 2** (`sc-eventfd, sc-pidfd, sc-epoll`)
 each need a no-op `ExecRuntime` callback stub when off (e.g.
 `eventfd_close: noop_u32`, `epoll_destroy: noop_u32` — `src/main.rs:412,451`).
@@ -152,7 +152,7 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
     this VA been filled in yet", where a `PROT_NONE` guard must read as present.
 - **musl compatibility:** `archive/MUSL_COMPATIBILITY.md`. musl is the userspace
   libc; the kernel aims to run unmodified musl-linked binaries.
-- **`MAX_ARG_STRLEN`:** 128 KB release / 8 KB size / 4 KB extreme (`config.rs:147`). The Go forktest 128 KB fix is a notable regression guard.
+- **`MAX_ARG_STRLEN`:** 128 KB (`crates/akuma-config`). The Go forktest 128 KB fix is a notable regression guard.
 
 ## Blocking vs non-blocking
 

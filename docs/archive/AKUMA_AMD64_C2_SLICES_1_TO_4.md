@@ -3,7 +3,7 @@
 **Dates:** 2026-09-09. Slices 1–3 verified end-to-end; slice 4 verified on
 Firecracker, and its wedge bug found on the metal the same day (see § "The
 wedge").
-**Plan:** `proposals/NEXT_AGENT_AMD64_C2_FD.md` — retire `amd64/src/fd.rs` in
+**Plan:** `proposals/NEXT_AGENT_AMD64_C2_FD.md` — retire `crates/akuma-kernel-amd64/src/fd.rs` in
 favour of `akuma-syscalls-glue`'s file surface, sliced, with a boot between
 slices. This document records what each slice actually was, including the two
 bugs the table work charged and the fix-shaped lesson in each.
@@ -23,11 +23,11 @@ before the fix and by the same ladder after it.
 Two changes, both in the slice-1 spirit ("a handful of lines, fixes the live
 crash"):
 
-- `amd64/src/main.rs`: the OOM handler releases the BKL (`smp::bkl_abandon()`)
+- `crates/akuma-kernel-amd64/src/main.rs`: the OOM handler releases the BKL (`smp::bkl_abandon()`)
   before halting. The allocation that OOMs on this path ran while this core
   held the lock; a halted owner leaves every peer in `[BKL] stuck` forever.
   Releasing it degrades the machine to N-1 cores instead of stopping it.
-- `amd64/src/fd.rs`: the write path uses `try_reserve` with exact growth
+- `crates/akuma-kernel-amd64/src/fd.rs`: the write path uses `try_reserve` with exact growth
   instead of `resize`'s doubling; failure returns `ENOMEM` to ring 3, which is
   what Linux does.
 
@@ -177,7 +177,7 @@ combination (`AKUMA_AMD64_TLB_SHOOTDOWN.md` carries that invariant).
 The discovery that made this slice cheap: **the partial-I/O surface already
 existed**. `akuma-vfs-glue` had `read_at` *and* `write_at` (path, offset,
 bounded buffer), ext2 implements both as real block-level partial I/O, and
-`amd64/src/fs.rs` re-exports `read_at` — nobody had ever wired a descriptor
+`crates/akuma-kernel-amd64/src/fs.rs` re-exports `read_at` — nobody had ever wired a descriptor
 to them. Slice 5 is pure rewiring in `fd.rs`:
 
 - **`openat`** hands out descriptors with an **empty** buffer. Existence is a

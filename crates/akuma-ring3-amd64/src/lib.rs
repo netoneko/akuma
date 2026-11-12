@@ -4,8 +4,8 @@
 //! the ring boundary in both directions —
 //! extracted as a crate rather than grown inline in `taoxichuan/`, per the
 //! experiment's composition rule. The full kernel's counterparts live in
-//! `amd64/src/usermode.rs` (9 k lines: demand paging, signals, threads, an
-//! interpreter loader) and `amd64/src/loader.rs` (over `akuma-elf` +
+//! `crates/akuma-kernel-amd64/src/usermode.rs` (9 k lines: demand paging, signals, threads, an
+//! interpreter loader) and `crates/akuma-kernel-amd64/src/loader.rs` (over `akuma-elf` +
 //! `akuma-mmu`); none of that serves a task that only prints and exits, and
 //! pulling it would pull the whole MMU. What is here is the irreducible core:
 //!
@@ -98,7 +98,7 @@ static SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
 /// `gs:[32]` the running slot. Replaces the two single-core statics
 /// (`USER_RSP_STASH`, `SYSCALL_STACK_TOP`) this crate used to keep.
 ///
-/// Invariant (the amd64 kernel's, `amd64/src/smp.rs`): in ring 0 `GS_BASE` is
+/// Invariant (the amd64 kernel's, `crates/akuma-kernel-amd64/src/smp.rs`): in ring 0 `GS_BASE` is
 /// this core's block and `KERNEL_GS_BASE` is the program's; the stub, the
 /// IDT stubs and [`enter_user`] `swapgs` at every ring crossing.
 #[cfg(target_arch = "x86_64")]

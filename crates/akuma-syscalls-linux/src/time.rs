@@ -12,8 +12,8 @@
 //! | `src/syscall/mod.rs::Timespec` | `i64`/`i64` | this |
 //! | `src/syscall/timerfd.rs::LocalTimespec` | `u64`/`u64` | this |
 //! | `crates/akuma-syscalls-time::LocalTimespec` | `u64`/`u64` | this |
-//! | `src/sync_tests.rs::Timespec` | `i64`/`i64` | this |
-//! | `src/process_tests.rs::Timespec` | `i64`/`i64` | this |
+//! | `crates/akuma-kernel-tests-aarch64/src/sync_tests.rs::Timespec` | `i64`/`i64` | this |
+//! | `crates/akuma-kernel-tests-aarch64/src/process_tests.rs::Timespec` | `i64`/`i64` | this |
 //!
 //! **The signedness split was a real divergence, not a typo.** Linux's
 //! `struct timespec` on aarch64 is `{ time_t tv_sec; long tv_nsec; }` — both

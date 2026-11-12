@@ -19,8 +19,8 @@ no interrupt line in use: it is **polled**.
 | `akuma-i2c-hid` | `crates/` | HID-over-I²C framing: descriptor, commands, input-report length word |
 | `akuma-hid` | `crates/` | report-descriptor parser (OpenBSD `hid.c` port) |
 | `akuma-touchpad` | `crates/` | `ptp` (report layout + id-keyed finger slots + wire format + control lines), `Clickpad` policy (click, right-click, scroll, natural direction, tap-to-click, `Lift`), `tty` (pointer events → xterm mouse reports) |
-| `amd64/src/i2c.rs` | kernel | AOAC wake, MMIO mapping, polled transactions — every wait is TSC-bounded |
-| `amd64/src/touchpad.rs` | kernel | discovery, bring-up, polling, `/dev/input/mouse0`, the console bridge |
+| `crates/akuma-kernel-amd64/src/i2c.rs` | kernel | AOAC wake, MMIO mapping, polled transactions — every wait is TSC-bounded |
+| `crates/akuma-kernel-amd64/src/touchpad.rs` | kernel | discovery, bring-up, polling, `/dev/input/mouse0`, the console bridge |
 | `akuma-fbcon` | `crates/` | records the mouse modes a program sets; draws the pointer cell |
 
 All four `crates/` pieces forbid `unsafe`. Decisions live there and are host

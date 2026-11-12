@@ -24,7 +24,7 @@
 //!   module existed (`main.rs`); nothing here changes that.
 //! - **The allocator never frees.** A single eager `mmap` (this target's
 //!   `mmap` is fully eager and W^X-enforced — real physical frames at
-//!   `mmap()` time, not on first fault; see `amd64/src/mm.rs`) backs a bump
+//!   `mmap()` time, not on first fault; see `crates/akuma-kernel-amd64/src/mm.rs`) backs a bump
 //!   allocator whose `dealloc` is a no-op. tcc's own C code does call `free`
 //!   through the `malloc`/`free`/`realloc` trio `main.rs` defines, and those
 //!   calls reach this allocator's `dealloc` — they just do not reclaim
@@ -35,7 +35,7 @@
 //!   module is.
 //! - **No `unlink`/`rename`/`mkdir` on the kernel side.** The raw syscalls
 //!   below (87/82/83) issue real x86_64 syscalls, but nothing in
-//!   `amd64/src/usermode.rs`'s dispatch answers those numbers yet, so they
+//!   `crates/akuma-kernel-amd64/src/usermode.rs`'s dispatch answers those numbers yet, so they
 //!   come back `ENOSYS`. That is fine for tcc's own use:
 //!   `tcc_write_elf_file` (`tinycc/tccelf.c`) calls `unlink(filename)` before
 //!   `open(..., O_CREAT|O_TRUNC)` and never checks its return value — the
@@ -59,7 +59,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 /// x86_64 Linux syscall numbers this module issues. Spelled out rather than
 /// pulled from `akuma-syscalls-abi`: this crate builds standalone (via
-/// `amd64/build.rs`'s `cargo build -p tcc --target x86_64-unknown-none`, not
+/// `crates/akuma-kernel-amd64/build.rs`'s `cargo build -p tcc --target x86_64-unknown-none`, not
 /// as a workspace member — see `Cargo.toml`), so it cannot see that crate any
 /// more than `userspace/amd64/hello/hello.rs` can (that program's own header
 /// makes the same choice, for the same reason).
@@ -244,7 +244,7 @@ pub fn args() -> Args {
 /// Terminate the process. `exit_group` (231), not the single-thread `exit`
 /// (60): this target has no threads, so the two are equivalent, and
 /// `exit_group` is what every other exit path on this target already uses
-/// (`amd64/src/usermode.rs`'s `Syscall::Exit | Syscall::ExitGroup` arm).
+/// (`crates/akuma-kernel-amd64/src/usermode.rs`'s `Syscall::Exit | Syscall::ExitGroup` arm).
 ///
 /// `#[no_mangle]`, unlike everything else in this file, because it needs to
 /// exist as the C symbol `exit` — `tinycc/tcc.c`'s own C code (`tcc_relocate`,
@@ -304,13 +304,13 @@ const PROT_RW: u64 = 0x1 | 0x2;
 const MAP_PRIVATE_ANON: u64 = 0x02 | 0x20;
 
 /// One heap arena, reserved in a single `mmap` at first allocation. This
-/// target's `mmap` is capped at 64 MiB per call (`amd64/src/mm.rs`'s
+/// target's `mmap` is capped at 64 MiB per call (`crates/akuma-kernel-amd64/src/mm.rs`'s
 /// `MAX_MAPPING`) and is fully eager — every page becomes a real physical
 /// frame immediately, not on first touch — so this number is real memory
 /// committed up front, not a reservation. 16 MiB is comfortably under that
 /// cap and well above the ~4 MiB peak working set tcc's own aarch64
 /// acceptance test measures for a `-static` compile
-/// (`acceptance/05_meow_tcc_extreme_4mb.md`) on a much tighter machine; if a
+/// (`acceptance/archive/05_meow_tcc_extreme_4mb.md`) on a much tighter machine; if a
 /// larger source file needs more, this is the number to raise, not the design
 /// to replace — `sys_mmap`'s frame budget is set by the PMM's free pool, not
 /// by anything this crate can see, and QEMU's default run boots with
@@ -424,7 +424,7 @@ pub mod seek_mode {
 }
 
 /// The x86_64 `struct stat` — 144 bytes, field-for-field what
-/// `amd64/src/fd.rs`'s `encode_stat` writes on the kernel side (that
+/// `crates/akuma-kernel-amd64/src/fd.rs`'s `encode_stat` writes on the kernel side (that
 /// function's own doc has the layout table this mirrors).
 ///
 /// A private copy because this shim is deliberately independent of `libakuma`
@@ -462,7 +462,7 @@ pub struct Stat {
 const _: () = assert!(core::mem::size_of::<Stat>() == 144);
 
 pub fn open(path: &str, flags: u32) -> i32 {
-    // Real syscall 2 (`open`), not `openat` — `amd64/src/usermode.rs` wires
+    // Real syscall 2 (`open`), not `openat` — `crates/akuma-kernel-amd64/src/usermode.rs` wires
     // this to the exact same handler openat's `AT_FDCWD` form reaches
     // (`crate::fd::sys_openat`), so there is no `AT_FDCWD` sentinel to spell
     // here the way `libakuma::open` (which only has `openat` on aarch64) has
@@ -540,7 +540,7 @@ pub fn rename(old_path: &str, new_path: &str) -> i32 {
 }
 
 /// This target has no per-process working directory
-/// (`amd64/src/usermode.rs`'s `getcwd` — x86_64 syscall 79 — always answers
+/// (`crates/akuma-kernel-amd64/src/usermode.rs`'s `getcwd` — x86_64 syscall 79 — always answers
 /// `/`), so this mirrors that rather than caching a wrong answer.
 #[must_use]
 pub fn getcwd() -> &'static str {
@@ -554,7 +554,7 @@ pub fn getcwd() -> &'static str {
 pub fn mmap(addr: usize, len: usize, prot: u32, flags: u32) -> usize {
     // SAFETY: anonymous-only on this target in practice (a file-backed
     // request is refused by the kernel, not by this wrapper — see
-    // `amd64/src/mm.rs`), so there is no descriptor or offset to pass; `-1`/`0`
+    // `crates/akuma-kernel-amd64/src/mm.rs`), so there is no descriptor or offset to pass; `-1`/`0`
     // match what a real anonymous `mmap(2)` call passes for `fd`/`offset`.
     let ret = unsafe { syscall6(nr::MMAP, addr as u64, len as u64, prot as u64, flags as u64, u64::MAX, 0) };
     ret as usize
@@ -570,10 +570,10 @@ pub fn munmap(addr: usize, len: usize) -> isize {
 // Misc
 // ============================================================================
 
-/// A real `time(2)` since `amd64/src/clock.rs` (2026-09-05, boot-time SNTP)
+/// A real `time(2)` since `crates/akuma-kernel-amd64/src/clock.rs` (2026-09-05, boot-time SNTP)
 /// — `0` before that module's `sync_via_sntp` has run or if it failed
 /// (no route, DNS blocked, …), matching `time(2)`'s own "seconds since the
-/// epoch" contract rather than inventing a value. `amd64/src/fs.rs`'s
+/// epoch" contract rather than inventing a value. `crates/akuma-kernel-amd64/src/fs.rs`'s
 /// `no_clock` (inode timestamps) is a different, still-open gap — this only
 /// answers the *wall-clock* question, not "does every file have a real
 /// mtime".

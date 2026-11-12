@@ -11,7 +11,7 @@ CoW-shared frame out from under the peer process.
 > across `src/`, `crates/`, `scripts/` and `userspace/` point at it for context
 > that has no other home: the D8/D9 mmap-region-extent work, the UAF quarantine
 > instrument, the `EAGER-UPGRADE` report, and the traps below. It was
-> `proposals/CARGO_HEAP_NULL_RC.md` until the move into `docs/archive/` — the
+> `docs/archive/CARGO_HEAP_NULL_RC.md` until the move into `docs/archive/` — the
 > `proposals/` directory is gitignored, so every one of those references was
 > dangling in a fresh clone.
 

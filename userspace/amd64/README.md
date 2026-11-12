@@ -4,7 +4,7 @@ Guest programs for the amd64 bring-up target (`amd64/`, package `akuma-amd64`).
 
 These are **not** members of the `userspace/` cargo workspace and have no
 `Cargo.toml`. Each is a single `.rs` file compiled straight by `rustc` from
-`amd64/build.rs`, linked with `user.ld`, and embedded in the kernel image with
+`crates/akuma-kernel-amd64/build.rs`, linked with `user.ld`, and embedded in the kernel image with
 `include_bytes!` — because the amd64 kernel has no disk driver yet, so there is
 nowhere to *put* a binary it could open by path.
 
@@ -64,11 +64,11 @@ way. The moment one of these wants a libc, that choice has to be revisited.
 ## Adding one
 
 Write `userspace/amd64/<name>/<name>.rs`, then add
-`build_user_program(&dir, "<name>")` to `amd64/build.rs`. The build script
+`build_user_program(&dir, "<name>")` to `crates/akuma-kernel-amd64/build.rs`. The build script
 exports the path as `USER_<NAME>_ELF`; the kernel reads it with
 `include_bytes!(env!("USER_<NAME>_ELF"))`.
 
 A program reports what it checked through its **exit status**, not through
 `write`: the kernel's self-test compares that status against a value computed in
-`amd64/src/usermode.rs`, so a wrong load fails the boot instead of scrolling
+`crates/akuma-kernel-amd64/src/usermode.rs`, so a wrong load fails the boot instead of scrolling
 past. See the table at the top of `hello/hello.rs`.

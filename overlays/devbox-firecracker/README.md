@@ -1,6 +1,6 @@
 # devbox-firecracker
 
-Akuma as a Firecracker microVM. The sibling of `overlays/devbox-smoltcp` (QEMU,
+Akuma as a Firecracker microVM. The sibling of `overlays/devbox/run-smoltcp.sh` (QEMU,
 smoltcp, real SMP) and `overlays/devbox` (QEMU, rump).
 
 **Status: works at 1 vCPU, SSH included.** Boots, mounts its ext2 root, passes
@@ -75,7 +75,7 @@ overlays/devbox-firecracker/run.sh            # add --local on metal
 `run.sh --help` lists `--no-disk`, `--no-net`, `--vcpus`, `--mem`,
 `--interactive`, `--timeout`. Build a devbox-shaped image (userspace sshd via
 herd, boot suite skipped) with
-`FC_FEATURES=devbox-smoltcp,no-tests overlays/devbox-firecracker/build.sh`.
+`FC_FEATURES=no-tests overlays/devbox-firecracker/build.sh`.
 
 SSH is forwarded on host port **4444**, deliberately not 2222: QEMU's devbox
 runner uses that, and Lima forwards guest listeners to the host, so both would

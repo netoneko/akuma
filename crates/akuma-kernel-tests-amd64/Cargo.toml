@@ -1,0 +1,37 @@
+[package]
+name = "akuma-kernel-tests-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The amd64 kernel's boot self-test suite (moved out of crates/akuma-kernel-amd64/src so the machine half carries no test driver). Registered through akuma_kernel::entry!'s before_main."
+
+[lints]
+workspace = true
+
+# Each is a flag the suite reads with `cfg(feature = ...)`, and nothing else: the bin
+# (the root package `akuma`) forwards its own feature of the same name here, and it, not this crate,
+# turns the kernel's features on.
+[features]
+# The whole crate compiles to an empty `register`, and the bin does not call even that.
+no-tests = []
+ring0-preempt = []
+
+# Kernel-only, like the suite. Specs are copied from `crates/akuma-kernel-amd64/Cargo.toml` **exactly**, default
+# features included: a dependency named here with more features than the kernel names would
+# turn them on for the whole kernel through feature unification.
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+akuma-kernel-amd64 = { path = "../akuma-kernel-amd64", default-features = false }
+akuma-bkl = { path = "../akuma-bkl" }
+akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-exec = { path = "../akuma-exec", features = ["bkl-smp"] }
+akuma-kernel-core = { path = "../akuma-kernel-core", features = ["bkl-smp"] }
+akuma-mmap = { path = "../akuma-mmap" }
+akuma-mmu = { path = "../akuma-mmu" }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-selftest = { path = "../akuma-selftest" }
+akuma-syscalls-abi = { path = "../akuma-syscalls-abi" }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-threading = { path = "../akuma-threading" }
+akuma-user-access = { path = "../akuma-user-access" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue", features = ["bkl-smp"] }

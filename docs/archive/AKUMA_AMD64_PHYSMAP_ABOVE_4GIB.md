@@ -168,8 +168,8 @@ this section predicted is zero.
 
 ## Background
 
-- `amd64/src/phys.rs` — `PHYSMAP_LIMIT`, `PHYSMAP_PDS`, and why the limit moved twice
-- `amd64/src/boot.s` — the fill loop and the `%edx` note
-- `amd64/src/smp.rs` — `ap_boot_root`
+- `crates/akuma-kernel-amd64/src/phys.rs` — `PHYSMAP_LIMIT`, `PHYSMAP_PDS`, and why the limit moved twice
+- `crates/akuma-kernel-amd64/src/boot.s` — the fill loop and the `%edx` note
+- `crates/akuma-kernel-amd64/src/smp.rs` — `ap_boot_root`
 - [`AKUMA_SELF_HEALING_PORT.md`](AKUMA_SELF_HEALING_PORT.md) — where the 4 GiB ceiling was first written down as debt
 - [`AMD64_SMP_BRINGUP.md`](AMD64_SMP_BRINGUP.md) — the trampoline and mailbox this rests on

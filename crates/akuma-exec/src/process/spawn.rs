@@ -10,8 +10,7 @@ use alloc::format;
 
 use crate::runtime::{runtime, config};
 use crate::process::types::{Pid, DEFAULT_ENV};
-use crate::process::channel::{ProcessChannel, register_channel, remove_channel};
-use crate::process::table::{register_process};
+use crate::process::channel::{ProcessChannel, register_channel};
 use crate::process::children::{lookup_process_shared, current_terminal_state};
 use crate::process::lifecycle::LifecycleGuard;
 
@@ -111,7 +110,7 @@ fn shebang_line_of(path: &str) -> Option<(String, Option<String>)> {
 /// `interp1`.
 ///
 /// Public so the boot suite can drive it against the real VFS
-/// (`spawn_resolves_a_shebang_script` in `src/process_tests.rs`) without
+/// (`spawn_resolves_a_shebang_script` in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`) without
 /// spawning a process during boot; the pure halves it is built from are
 /// host-tested in `shebang_tests` below.
 pub fn resolve_shebang_chain(resolved: &str, display: &str) -> (String, Vec<String>) {
@@ -259,6 +258,50 @@ pub fn spawn_process_with_creds(
     pty: bool,
     creds: Option<super::Creds>,
 ) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
+    spawn_process_named(path, None, false, args, env, stdin, cwd, box_id, pty, creds, None)
+}
+
+/// A process that takes over a terminal that already exists, instead of being
+/// given a channel of its own: a console's shell, or a kernel's init.
+///
+/// `channel` becomes the child's **I/O** channel (`Process::channel`) and
+/// `terminal` its `TerminalState`, both set before the process is published, so
+/// its first write cannot land anywhere else (a `reattach` after the spawn would
+/// race the child's first instructions). The spawn's own fresh channel is still
+/// what the child's tid and its parent's `wait` see, as for any spawn: it carries
+/// the exit status and nothing else. `pid` fixes the child's pid (init is 1);
+/// `None` keeps the one the loader allocated.
+pub struct Attach {
+    pub channel: Arc<ProcessChannel>,
+    pub terminal: Arc<spinning_top::Spinlock<akuma_tty::TerminalState>>,
+    pub pid: Option<Pid>,
+}
+
+#[cfg(feature = "elf-loader")]
+/// [`spawn_process_with_creds`] with the child's `argv[0]` chosen by the
+/// caller, as `execve` and `posix_spawn` do; `None` names it by `path`. A
+/// multi-call binary dispatches on it (`/bin/busybox` as `ls`). A `#!` script
+/// replaces it with the interpreter, as Linux does.
+///
+/// `own_terminal` gives the child a fresh `TerminalState` even where
+/// [`spawn_inherits_terminal`] would share the caller's: amd64's `spawn` always
+/// has (a session's window size must land on the child, and a multiplexing
+/// `sshd`'s non-pty sessions must not share one waker slot); AArch64 passes
+/// `false`.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process_named(
+    path: &str,
+    argv0: Option<&str>,
+    own_terminal: bool,
+    args: Option<&[&str]>,
+    env: Option<&[String]>,
+    stdin: Option<&[u8]>,
+    cwd: Option<&str>,
+    box_id: u64,
+    pty: bool,
+    creds: Option<super::Creds>,
+    attach: Option<Attach>,
+) -> Result<(usize, Arc<ProcessChannel>, Pid), String> {
     // NOTE: the LifecycleGuard is acquired at the PUBLISH point (just before
     // `register_process`, below), NOT here. The whole load phase above it — path/
     // namespace resolution, stat, the ELF read from ext2 — does block I/O and
@@ -306,7 +349,7 @@ pub fn spawn_process_with_creds(
 
     let mut full_args = Vec::new();
     if shebang_prefix.is_empty() {
-        full_args.push(path.to_string());
+        full_args.push(argv0.unwrap_or(path).to_string());
     } else {
         full_args.extend_from_slice(&shebang_prefix);
     }
@@ -339,13 +382,6 @@ pub fn spawn_process_with_creds(
     // demand-paged path loader (`from_elf_path`), which maps segments lazily
     // from the file and keeps heap use flat regardless of binary size.  Small
     // binaries keep the well-trodden whole-file path.
-    //
-    // On the size profile every binary uses the demand-paged path so the kernel
-    // heap never needs a scratch buffer sized to the binary (tcc is 723 KB —
-    // the whole reason 8 MB couldn't load it despite having >700 KB PMM free).
-    #[cfg(kernel_profile_extreme)]
-    const HEAP_SLURP_MAX: usize = 0;
-    #[cfg(not(kernel_profile_extreme))]
     const HEAP_SLURP_MAX: usize = 1024 * 1024; // 1 MiB
     // Marked as being executed BEFORE the file is read or stat'ed for loading (`ETXTBSY`), inside the namespace override the read uses.
     let text = match (runtime().text_pin)(elf_path) {
@@ -357,19 +393,16 @@ pub fn spawn_process_with_creds(
     };
     let stat_size = (runtime().file_size)(elf_path).ok().map(|s| s as usize);
 
-    // Pick the loader. Prefer the demand-paged path loader whenever slurping is
-    // disabled (size profile, HEAP_SLURP_MAX == 0) OR the binary is large.
+    // Pick the loader. Prefer the demand-paged path loader when the binary is
+    // large.
     //
     // CRITICAL: this must NOT fall back to a whole-file read_file() merely
     // because file_size() returned None. That hole meant a transient stat
     // failure under memory pressure routed a 723 KB binary (tcc) into a single
     // ~706 KB kernel-heap slurp; with the heap watermark already high the alloc
     // failed in a kernel thread with no current process, so alloc_error_handler
-    // had nothing to kill and panicked the whole kernel (EC=0x3c BRK). On the
-    // size profile we now always use the path loader and re-stat if needed,
-    // never slurp.
-    let want_demand_paged =
-        HEAP_SLURP_MAX == 0 || matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX);
+    // had nothing to kill and panicked the whole kernel (EC=0x3c BRK).
+    let want_demand_paged = matches!(stat_size, Some(sz) if sz > HEAP_SLURP_MAX);
 
     let mut process = if want_demand_paged {
         // The path loader needs a size; re-stat if the first stat failed rather
@@ -442,7 +475,21 @@ pub fn spawn_process_with_creds(
     }
 
     // Set the channel in the process struct (UNIFIED I/O)
-    process.channel = Some(channel.clone());
+    let attach_terminal = match attach {
+        Some(Attach { channel: io, terminal, pid }) => {
+            process.channel = Some(io);
+            if let Some(pid) = pid {
+                process.pid = pid;
+                process.tgid = pid;
+                process.pgid = pid;
+            }
+            Some(terminal)
+        }
+        None => {
+            process.channel = Some(channel.clone());
+            None
+        }
+    };
 
     // Inherit terminal state from caller if available — but NOT for a `pty`
     // spawn, and NOT for a spawn that crosses into a different box. `pty`
@@ -479,7 +526,9 @@ pub fn spawn_process_with_creds(
     // `Process::new` already gives every process its own fresh
     // `TerminalState` (`process/mod.rs`), so either condition just keeps
     // that instead of overwriting it.
-    if spawn_inherits_terminal(pty, box_id) && let Some(shared_state) = current_terminal_state() {
+    if let Some(terminal) = attach_terminal {
+        process.terminal_state = terminal;
+    } else if !own_terminal && spawn_inherits_terminal(pty, box_id) && let Some(shared_state) = current_terminal_state() {
         if config().syscall_debug_info_enabled {
             log::debug!("[Process] Inheriting shared terminal state at {:p} for PID {}", Arc::as_ptr(&shared_state), process.pid);
         }
@@ -557,6 +606,10 @@ pub fn spawn_process_with_creds(
     // Get the PID before boxing
     let pid = process.pid;
 
+    // The table slot, while a refusal still has nothing to undo: see `ProcessSlot`.
+    let slot = super::table::reserve_process_slot()
+        .ok_or_else(|| format!("{} spawning {path}", super::table::PROCESS_TABLE_FULL))?;
+
     // Box the process for heap allocation (fallible to avoid kernel panic on OOM)
     let boxed_process = Box::try_new(process)
         .map_err(|_| format!("Failed to allocate Process struct for {path}"))?;
@@ -570,11 +623,13 @@ pub fn spawn_process_with_creds(
     // CRITICAL: Register the process in the table immediately.
     // This ensures that lookup_process_shared(pid) works as soon as this function returns,
     // allowing reattach() to succeed without races.
-    register_process(pid, boxed_process);
+    super::table::register_reserved(pid, boxed_process, slot);
 
-    // Register the channel for the thread ID placeholder (0 for now, will be updated)
-    // Actually, current_channel() now uses the field in Process struct, so this is mostly for legacy.
-    register_channel(0, channel.clone());
+    // No per-tid channel is registered until the child's thread exists (below).
+    // This used to park the channel under a placeholder tid 0 and remove it from
+    // there — but tid 0 is a real thread, amd64's boot task, whose console
+    // channel each spawn replaced and then deleted. Nothing read the placeholder:
+    // `current_channel()` consults the `Process` field first.
 
     // The channel THIS spawn created, captured now rather than re-read from the
     // process below. `p.channel` is the process's *I/O* channel and can be
@@ -642,8 +697,6 @@ pub fn spawn_process_with_creds(
                 // the per-thread identity cache (same critical section).
                 crate::process::table::thread_pid_map_insert(tid, pid);
 
-                // Move the channel registration to the correct TID
-                remove_channel(0);
                 register_channel(tid, spawn_channel);
 
                 // Execute the process (already in the table)

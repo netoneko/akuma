@@ -28,7 +28,7 @@ ap.add_argument('--boot', type=int, default=40)
 ap.add_argument('--key', action='append', default=[], help='NAME_OR_TEXT:SECONDS_TO_WAIT_AFTER')
 ap.add_argument('--out', default='.')
 ap.add_argument('--smp', default='2')
-ap.add_argument('--kernel', default='target/x86_64-unknown-none/release/akuma-amd64')
+ap.add_argument('--kernel', default='target/x86_64-unknown-none/release/akuma')
 a = ap.parse_args()
 
 q = subprocess.Popen(

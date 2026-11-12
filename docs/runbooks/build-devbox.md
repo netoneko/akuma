@@ -116,12 +116,13 @@ Equivalent build-only: `scripts/build_devbox.sh`.
 
 ```
 cargo run --release --no-default-features --features \
-  devbox,sound,no-tests,rump-tests,sc-aio,sc-sysv-ipc,sc-framebuffer,sc-containers,\
-  sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll
+  rump-default,sc-reboot,sound,no-tests,linux-extra-syscalls
 ```
 
 (There is no `devbox` Cargo *profile* — only `release`, `extreme-size`, and
-`release-debug` exist; `devbox` is a feature layered on plain `release`.)
+`release-debug` exist — and since 2026-11-11 no `devbox` feature either: the
+list names `rump-default` and the rest directly. `rump-default` implies `rump`,
+which always runs the rump regression guards at boot.)
 
 `--no-default-features` compiles **smoltcp out entirely**. Rump is the only
 stack. The built-in SSH server, `kernel-tls`, and `tls-rsa` aren't part of

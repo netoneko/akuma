@@ -130,10 +130,8 @@ Wikipedia page (`userspace/kami/README.md`).
   bare alias of the sender's.
 - **Not collected.** A socket sent over itself and never read keeps itself
   alive; Linux's unix garbage collector exists to break that cycle.
-- **amd64 routing.** amd64 `sendmsg`/`recvmsg` on a unix fd now go to glue
-  (`amd64/src/usermode.rs`). Until 2026-10-08 they went to `crate::sock`,
-  which knows only `AF_INET` and answered `ENOTSOCK`, so plain unix `sendmsg`
-  did not work on that target at all.
+- **amd64 routing.** Every socket syscall on amd64 is glue's, both families
+  (see "One implementation, both kernels" below).
 
 Gate: `userspace/forktest/c_stress/chromeprobe.c`. Its seven `SCM_RIGHTS`
 checks pass identically on Linux and on the amd64 kernel under Firecracker.
@@ -292,6 +290,41 @@ classification and the errno mapping are pure functions with host tests
 (`connect_state_tests`, `crates/akuma-net/src/tests.rs`) — the socket table and
 smoltcp are not needed to test them. Background:
 [`../../../archive/REDIS_END_TO_END.md`](../../../archive/REDIS_END_TO_END.md) §2.
+
+## One implementation, both kernels
+
+The amd64 kernel serves every socket syscall through
+`akuma_syscalls_glue::net`'s `dispatch_*` (`crates/akuma-kernel-amd64/src/usermode/dispatch.rs`,
+`net`), which picks AF_UNIX or AF_INET itself. **Do not add a socket arm that
+calls anything but `to_glue`**: amd64 had its own AF_INET implementation over
+the same `akuma_net::socket` table until 2026-11-11, and the two had drifted in
+the argument errnos below. What is left in `crates/akuma-kernel-amd64/src/sock.rs` is the
+`recvfrom` busy-loop tripwire, the `close` hook and the boot self-test.
+
+Argument errnos, as Linux gives them:
+
+| Call | Input | Errno |
+|---|---|---|
+| `socket` | family other than `AF_INET`/`AF_UNIX` | `EAFNOSUPPORT` |
+| `socket` | type other than stream/datagram, or a flag bit other than `SOCK_NONBLOCK`/`SOCK_CLOEXEC` | `EINVAL` |
+| any AF_INET call | descriptor open but not a socket | `ENOTSOCK` |
+| any AF_INET call | descriptor not open | `EBADF` |
+| `accept4` | flag bit other than `SOCK_NONBLOCK`/`SOCK_CLOEXEC` | `EINVAL`, before anything is dequeued |
+| `listen` | backlog `0` / negative | one / the maximum (clamped, not refused) |
+| `sendmsg`/`recvmsg` | `msg_iovlen` over `UIO_MAXIOV` (1024) | `EMSGSIZE` |
+| blocking `recv`/`send` | `SO_RCVTIMEO`/`SO_SNDTIMEO` ran out | `EAGAIN` |
+
+AF_INET `sendmsg`/`recvmsg` gather and scatter every iovec, as AF_UNIX's do. A blocking UDP receive
+with no `SO_RCVTIMEO` still gives up after 10 s with `ETIMEDOUT` (`akuma_net::socket::socket_recv_udp`),
+where Linux blocks forever: a pinned divergence, kept while an unanswered DNS query wedges the amd64
+kernel either way. An `accept` of a loopback connect reports the interface address (`10.0.2.15`), not
+`127.0.0.1`, as the peer.
+
+`accept`/`accept4` write `*addrlen` when an address is asked for, and an
+`EAGAIN` re-arms the listener's `EPOLLET` edge (`poll::epoll_on_fd_drained`),
+which tokio's accept loop waits on. Background:
+[`../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md),
+"Slice 1: sockets".
 
 ## No IPv6
 

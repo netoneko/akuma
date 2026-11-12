@@ -203,7 +203,7 @@ Contrast run — same everything at `MEMORY=64M` (cap 2048) — completes clean.
 - `docs/reference/subsystems/memory.md` — PMM / page lifecycle.
 - `docs/archive/BUILTIN_SSH_REMOVAL.md` — the measurement session that surfaced
   this; its free-RAM tables are the same boots quoted above.
-- `acceptance/05_meow_tcc_extreme_4mb.md` — the 4.5 MB profile this degrades.
+- `acceptance/archive/05_meow_tcc_extreme_4mb.md` — the 4.5 MB profile this degrades.
   Its recorded ~2520 KB post-boot idle predates the observation, and the compile
   peak it documents (~1988 KB free) leaves little room for duplicate text.
 - `docs/archive/EXECVE_STACK_LEAK_OOM_HANG.md` — the *other* small-box

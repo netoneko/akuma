@@ -58,6 +58,69 @@ pub fn peek_ram(pa: PhysAddr, out: &mut [u8]) -> bool {
     true
 }
 
+/// A span of RAM the holder owns outright, read and written by copy.
+///
+/// The boot module used as a RAM disk. Made only by [`RamSpan::claim`], whose caller states the ownership once; reads and writes
+/// are bounds-checked against the span and take `&self` / `&mut self` as a slice would, so two
+/// writers cannot race through one value.
+#[derive(Debug)]
+pub struct RamSpan {
+    base: PhysAddr,
+    len: usize,
+}
+
+impl RamSpan {
+    /// Name `[base, base + len)` as this value's memory. `None` if the span is empty or does not
+    /// lie entirely inside the physmap.
+    ///
+    /// # Safety
+    /// The span is RAM that nothing else uses for the life of the kernel: no allocator will hand
+    /// out any of its frames (the PMM was told to reserve them), and no other reference or
+    /// `RamSpan` names any of its bytes.
+    #[must_use]
+    pub unsafe fn claim(base: PhysAddr, len: usize) -> Option<Self> {
+        let end = base.as_usize().checked_add(len)?;
+        let inside = |a: usize| akuma_primitives::addr::physmap_contains(a);
+        (len != 0 && inside(base.as_usize()) && inside(end - 1)).then_some(Self { base, len })
+    }
+
+    /// Length in bytes.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Never true: [`RamSpan::claim`] refuses an empty span.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    fn range(&self, off: usize, n: usize) -> Option<*mut u8> {
+        let end = off.checked_add(n)?;
+        (end <= self.len).then(|| phys_ptr::<u8>(self.base).wrapping_add(off))
+    }
+
+    /// Copy `dst.len()` bytes from offset `off`. `false` (nothing copied) if that runs past the end.
+    #[must_use]
+    pub fn read(&self, off: usize, dst: &mut [u8]) -> bool {
+        let Some(p) = self.range(off, dst.len()) else { return false };
+        // SAFETY: `claim`'s contract makes the span this value's own memory, mapped by the physmap
+        // (checked there); the range is inside it, and `dst` is a distinct live slice.
+        unsafe { core::ptr::copy_nonoverlapping(p.cast_const(), dst.as_mut_ptr(), dst.len()) };
+        true
+    }
+
+    /// Copy `src` in at offset `off`. `false` (nothing copied) if that runs past the end.
+    #[must_use]
+    pub fn write(&mut self, off: usize, src: &[u8]) -> bool {
+        let Some(p) = self.range(off, src.len()) else { return false };
+        // SAFETY: as `read`, and `&mut self` excludes every other access through this value.
+        unsafe { core::ptr::copy_nonoverlapping(src.as_ptr(), p, src.len()) };
+        true
+    }
+}
+
 /// `akuma-pagetable`'s view of the physmap: a table frame's kernel-virtual address.
 pub struct Physmap;
 

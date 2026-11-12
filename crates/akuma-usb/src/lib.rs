@@ -7,7 +7,7 @@
 //! # Why this exists
 //!
 //! The reference machine (HP 500-502nj, `docs/archive/AKUMA_AMD64_ON_HP_500_502NJ.md`)
-//! has a USB keyboard and no PS/2 controller — `amd64/src/kbd.rs`'s i8042 driver
+//! has a USB keyboard and no PS/2 controller — `crates/akuma-drivers-amd64/src/kbd.rs`'s i8042 driver
 //! finds nothing there. Typing at that box on bare metal needs a USB stack, and
 //! a USB stack is mostly two things a host can test without a controller:
 //!

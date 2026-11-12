@@ -8,8 +8,8 @@ negative, this pass gives it a real, working, boot-verified x86_64 arm —
 proven by three page faults actually taken inside the copy loop and recovered,
 not by a clean build.
 
-Unlike `akuma-mmu` (`amd64/src/paging.rs`) and `akuma-threading`
-(`amd64/src/sched.rs`), there was **no proven port target to copy from**: amd64
+Unlike `akuma-mmu` (`crates/akuma-kernel-amd64/src/paging.rs`) and `akuma-threading`
+(`crates/akuma-kernel-amd64/src/sched.rs`), there was **no proven port target to copy from**: amd64
 dereferenced user pointers raw and its `#PF` handler was purely diagnostic. The
 mechanism had to be built here.
 
@@ -59,7 +59,7 @@ rewrites the saved `rip` to `__arch_copy_user_fault`. That is Linux's
 a flag. Nothing to arm, nothing to disarm, no window, and a fault anywhere else
 is exactly as fatal as before.
 
-### The hand-assembled `#PF` entry (`amd64/src/idt.rs`)
+### The hand-assembled `#PF` entry (`crates/akuma-kernel-amd64/src/idt.rs`)
 
 This is the piece the gate-fix experiment showed was needed. Vector 14 no
 longer goes through rustc's `extern "x86-interrupt"`; it enters at
@@ -185,7 +185,7 @@ one on purpose (`copy_from_user_safe` from `0x0000_8000_0000_0000` →
 `Err(14)`) and the fixup counter pins four recovered faults: three `#PF`, one
 `#GP`.
 
-**The raw dereferences.** `amd64/src/uaccess.rs` is new: `range_ok` (null
+**The raw dereferences.** `crates/akuma-kernel-amd64/src/uaccess.rs` is new: `range_ok` (null
 page, wrap, kernel half, non-canonical), `read_bytes`/`write_bytes` over
 `copy_from_user_safe`/`copy_to_user_safe`, `read_val`/`write_val` for the
 small fixed-layout ABI structs, and `read_cstr`, which reads to the end of the
@@ -224,7 +224,7 @@ crate clippy clean on both bare-metal targets, workspace host tests green.
 
 ## Part 3, same day: SMAP and SMEP
 
-`amd64/src/uaccess.rs::init_smap` reads `CPUID.7.0:EBX` and sets `CR4.SMEP`
+`crates/akuma-kernel-amd64/src/uaccess.rs::init_smap` reads `CPUID.7.0:EBX` and sets `CR4.SMEP`
 (bit 20, `EBX[7]`) and `CR4.SMAP` (bit 21, `EBX[20]`) where advertised, right
 after `idt::init`. Conditional because `stac`/`clac` are `#UD` without SMAP,
 and that is a real machine in this tree: Haswell (the HP 500-502nj's i5-4460)

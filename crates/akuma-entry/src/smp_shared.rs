@@ -30,9 +30,8 @@
 //! cross-core locks. A `static` in this build is genuinely shared across cores — not
 //! replicated — which is the whole point.
 //!
-//! Everything here is behind `cfg(kernel_smp_shared)` (the `smp-shared` feature);
-//! the default and multikernel (`smp`) builds compile none of it, and build.rs makes
-//! `smp` and `smp-shared` mutually exclusive.
+//! Every Akuma kernel build compiles this (the `smp-shared` feature that gated it,
+//! and the single-core build without it, were removed 2026-11-11).
 //!
 //! **Milestone M0 (this file):** bring N cores up on the shared boot page tables and
 //! the single shared PMM/heap — no isolation, no partitions. Each secondary sets up
@@ -88,6 +87,28 @@ static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// wait there is a single load.
 static BSP_IRQ_READY: AtomicBool = AtomicBool::new(false);
 
+/// The hooked scheduler's half of a secondary's start (`hooked-sched`, M6).
+///
+/// Which slot becomes the core's idle thread and what that thread runs. The kernel's glue
+/// owns both (its idle loop and its record of which slots are idle), and this crate sits
+/// below it, so it registers them here before [`bringup_secondaries`].
+#[derive(Clone, Copy)]
+pub struct HookedSecondary {
+    /// Make the running context core `core`'s idle thread on its boot stack (`base`,
+    /// `size` bytes), returning the slot; `None` parks the core. Interrupts are masked.
+    pub adopt: fn(core: usize, base: akuma_primitives::addr::VirtAddr, size: usize) -> Option<usize>,
+    /// The core's idle loop: entered with interrupts open and the lock not held.
+    pub idle: fn() -> !,
+}
+
+static HOOKED_SECONDARY: akuma_not_even_once::Registered<HookedSecondary> =
+    akuma_not_even_once::Registered::new("akuma-entry: HookedSecondary not registered");
+
+/// Register [`HookedSecondary`]. Once, before [`bringup_secondaries`].
+pub fn register_hooked_secondary(h: HookedSecondary) {
+    HOOKED_SECONDARY.register(h);
+}
+
 /// Let the secondaries start taking interrupts. Called by `kernel_main` once the
 /// exception hooks are registered, the BSP's vectors are installed and the timer
 /// is initialised. Idempotent.
@@ -121,17 +142,16 @@ pub use akuma_bkl::policy::{
     drivers_bkl_drop_enabled, exec_bkl_drop_enabled, mm_bkl_drop_enabled,
     vfs_bkl_drop_enabled,
 };
-// The A/B setters, and the three getters whose last production reader was the
+// The A/B setters, and the getter whose last production reader was the
 // exception path (which reads `akuma_bkl::policy::` directly since 2026-09-01),
 // are now touched only by the boot self-tests — `process_tests.rs`, which
-// `no-tests` builds (`devbox-smoltcp`, extreme-size) compile out while denying
+// `no-tests` builds (`devbox-smoltcp`, the rump devbox) compile out while denying
 // unused imports. Same shape as `pmm.rs`'s tests-only re-exports.
 #[allow(unused_imports)]
 pub use akuma_bkl::policy::{
-    irq_bkl_drop_enabled, sched_bklfree_el0_enabled, set_drivers_bkl_drop_enabled,
-    set_exec_bkl_drop_enabled, set_fault_bkl_drop_enabled, set_irq_bkl_drop_enabled,
-    set_mm_bkl_drop_enabled, set_sched_bklfree_el0_enabled, set_syscall_bkl_optout,
-    set_vfs_bkl_drop_enabled, syscall_bkl_optout,
+    set_drivers_bkl_drop_enabled, set_exec_bkl_drop_enabled, set_fault_bkl_drop_enabled,
+    set_mm_bkl_drop_enabled, set_syscall_bkl_optout, set_vfs_bkl_drop_enabled,
+    syscall_bkl_optout,
 };
 
 /// Runtime toggle (default **on**) for `no-bkl-process`.
@@ -322,13 +342,11 @@ pub fn bringup_secondaries() {
 ///
 /// Consumed by the boot self-test in `process_tests.rs` (compiled out under `no-tests`,
 /// e.g. the devbox-smoltcp runtime image — hence `allow(dead_code)`).
-#[allow(dead_code)]
 pub fn online_secondary_count() -> usize {
     ONLINE_COUNT.load(Ordering::Acquire)
 }
 
 /// Number of cores the DTB reported (including the BSP). See `online_secondary_count`.
-#[allow(dead_code)]
 pub fn probed_core_count() -> usize {
     NUM_CORES.load(Ordering::Relaxed)
 }
@@ -352,7 +370,6 @@ fn dsb_sy() {
 /// `gic_v3::init`'s CPU-interface sequence — was **three `unsafe` blocks that
 /// already existed elsewhere**, so consolidating removed them rather than
 /// relocating them (`docs/archive/AKUMA_GIC_CONSOLIDATION.md`).
-#[cfg(kernel_smp_shared)]
 fn redistributor_layout() -> akuma_gic::RedistributorLayout {
     akuma_gic::RedistributorLayout {
         base_pa: akuma_kernel_core::platform::gicr_base_pa(),
@@ -374,16 +391,6 @@ pub fn secondary_stack_base(core: usize) -> usize {
     akuma_boot_aarch64::secondary::stack_base(core)
 }
 
-/// Set `VBAR_EL1` to the shared exception vector table (the BSP's) so this core takes
-/// syscalls/IRQs/faults through the same handlers.
-///
-/// This had its own `adrp`/`add`/`msr` sequence until 2026-09-01. It is the same
-/// install `exceptions::init` does on the BSP — and "the same" is the whole
-/// point of shared-kernel SMP — so it now calls the one implementation instead
-/// of carrying a second copy that could drift from it.
-fn set_shared_vbar() {
-    crate::exceptions::install_vbar();
-}
 
 /// Per-core counter of scheduler ticks each core has serviced a worker on — the M2c
 /// proof that threads execute across cores. Genuinely shared (not replicated).
@@ -583,8 +590,12 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
 
     // Adopt the current (boot) context as this core's idle thread so the shared
     // scheduler can switch away from it and back. Sets TPIDRRO_EL0.
-    let idle =
-        akuma_exec::threading::adopt_current_as_core_idle(core, exc_top, stack_base, stack_size);
+    // The hooked path's adoption is the kernel's (it owns which slots are idle); the
+    // exception stack is the SGI path's and has no counterpart there.
+    let _ = exc_top;
+    let idle = HOOKED_SECONDARY
+        .get()
+        .and_then(|h| (h.adopt)(core, akuma_primitives::addr::VirtAddr::new(stack_base), stack_size));
 
     ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
     let Some(slot) = idle else {
@@ -604,7 +615,7 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
 
     // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
     akuma_gic::secondary_init(core, redistributor_layout());
-    set_shared_vbar();
+    crate::hooked::install_on_this_core();
     // Arm this core's periodic tick from the shared choice (BSP's probe /
     // override result, published via akuma-timer's registry).
     akuma_kernel_core::timer::enable_timer_interrupts(akuma_kernel_core::timer::current_tick_us());
@@ -614,6 +625,12 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     // interrupts, so a tick already pending must be taken before the idle loop is
     // entered rather than at some later synchronization point.
     akuma_primitives::irq::unmask_irqs_sync();
+
+    // The hooked path's idle loop is the kernel's: it yields to whatever is runnable,
+    // since nothing preempts a kernel thread there, and halts without the lock.
+    if let Some(h) = HOOKED_SECONDARY.get() {
+        (h.idle)();
+    }
 
     // Idle loop. Two requirements pull against each other: (1) don't hammer the BKL
     // when there's nothing to run (a `yield_now()` every iteration livelocks SMP=4 as

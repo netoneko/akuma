@@ -1,6 +1,6 @@
 #!/bin/bash
 # Boot the simple-kernel-devbox: the kernel built from THIS checkout with the
-# devbox-smoltcp feature set (userspace sshd via herd + real shared-kernel SMP,
+# devbox feature set (default + no-tests: userspace sshd via herd, shared-kernel SMP,
 # native smoltcp stack — no rump), mounting the minimal rootfs built by
 # overlays/simple-kernel-devbox/bootstrap.sh (sshd, busybox, nightly rust+cargo).
 #
@@ -45,5 +45,5 @@ echo
 
 # MUST stay in sync with scripts/build_devbox_smoltcp.sh (this cargo run will
 # otherwise silently rebuild a kernel without the feature set that script built).
-DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
+DEVBOX_SMOLTCP_FEATURES="no-tests"
 exec cargo run --release --features "$DEVBOX_SMOLTCP_FEATURES"

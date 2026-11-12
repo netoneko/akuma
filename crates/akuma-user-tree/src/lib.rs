@@ -83,8 +83,8 @@ pub enum SharedSpans {
     /// Copy the frame eagerly: parent and child stop sharing writes through the fork, which a `MAP_SHARED`
     /// mapping must NOT do. The answer for a kernel with nothing to keep the copies coherent.
     Copy,
-    /// Share the frame like any other leaf, demoted to copy-on-write (amd64, whose `akuma-fpcache-rw` and fault
-    /// path re-share a shared writable page instead of breaking it).
+    /// Share the frame like any other leaf, demoted to copy-on-write. (amd64 once did this; since 2026-10-03 its
+    /// fork walk uses [`SharedSpans::ShareWritable`] for `MAP_SHARED` spans, via [`fork_leaf`].)
     ShareFrames,
     /// Share the frame and leave the entry as it is: writable stays writable in both trees and no CoW marker is
     /// set, so a store by either side is seen by the other (taoxichuan). That is what `MAP_SHARED` means; the
@@ -208,6 +208,58 @@ impl PteLayout {
             return None;
         }
         Some(if depth == 0 { FreeStep::Leaf(self.frame(entry)) } else { FreeStep::Table(self.frame(entry)) })
+    }
+}
+
+/// What `fork` does with one **decoded** leaf.
+///
+/// This is the decision `crates/akuma-kernel-amd64/src/usermode.rs`'s fork walk (`share_parent_memory_into`) makes per page,
+/// where the walker hands over `(prot, cow, attr)` rather than a raw entry and so cannot call
+/// [`PteLayout::plan_clone`].
+///
+/// Pure, so the two decision tables can be checked against each other: `tests::fork_leaf_agrees_with_plan_clone`
+/// derives the raw entry for every input and requires `plan_clone(.., SharedSpans::ShareWritable)` to produce
+/// the same parent and child entries. If either table changes, that test is what notices.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ForkLeaf {
+    /// Not ordinary RAM (a write-combining framebuffer): the child maps the same device memory the same way. No
+    /// share count and no copy-on-write; counting it would hand the device to the page allocator at exit.
+    Device,
+    /// Inside a `MAP_SHARED` span: the same frame, **writable in both**, no CoW marker, the parent's entry left alone.
+    ShareWritable,
+    /// Private and writable, or already copy-on-write: the child maps read-only + CoW and the parent is demoted to
+    /// read-only + CoW in place (both sides, or the parent writes straight through to what the child sees).
+    DemoteBoth,
+    /// Private, read-only and not CoW (`.rodata`, an `mprotect(PROT_READ)` region): left exactly as it is in both
+    /// spaces, with a reference for the child. Marking it would turn a legitimate `SIGSEGV` into a silent write.
+    ShareReadOnly,
+}
+
+/// What backs a leaf: ordinary RAM or device memory (a write-combining framebuffer).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Backing {
+    Ram,
+    Device,
+}
+
+/// Whether a leaf lies in a `MAP_SHARED` span.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Span {
+    Private,
+    Shared,
+}
+
+/// Classify one leaf for `fork`.
+///
+/// Order is the substance: a device page is never counted or marked, whatever span it is in; a shared span
+/// outranks the private rules; only then does writability decide between demotion and sharing.
+#[must_use]
+pub const fn fork_leaf(backing: Backing, span: Span, writable: bool, cow: bool) -> ForkLeaf {
+    match (backing, span) {
+        (Backing::Device, _) => ForkLeaf::Device,
+        (Backing::Ram, Span::Shared) => ForkLeaf::ShareWritable,
+        (Backing::Ram, Span::Private) if writable || cow => ForkLeaf::DemoteBoth,
+        (Backing::Ram, Span::Private) => ForkLeaf::ShareReadOnly,
     }
 }
 

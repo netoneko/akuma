@@ -7,7 +7,7 @@
 //!
 //! # Why this is a crate
 //!
-//! `amd64/src/port.rs` was four `unsafe fn`s — `inb`, `outb`, `inl`, `outl` —
+//! `crates/akuma-kernel-amd64/src/port.rs` was four `unsafe fn`s — `inb`, `outb`, `inl`, `outl` —
 //! and 22 call sites in seven files, each of which carried an `unsafe` block
 //! and a comment saying which device it believed was at that port. That is the
 //! wrong shape for the obligation. "This port is the i8042" is a fact about the

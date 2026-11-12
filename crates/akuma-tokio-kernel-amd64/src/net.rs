@@ -15,7 +15,7 @@
 //! PIT — the same
 //! 8254 reference `akuma-amd64` uses, and the one device kvm0 emulates well
 //! enough to answer the channel-2 gate/output handshake through port 0x61
-//! (`amd64/src/kvm/linux.rs` wires 0x40–0x43 and 0x61). The calibration is
+//! (`crates/akuma-kvm-amd64/src/linux.rs` wires 0x40–0x43 and 0x61). The calibration is
 //! bounded: if the PIT never reports its output pin, the TSC rate stays a
 //! guess and the boot says so — timers that drift make TCP slower, not
 //! wrong.
@@ -188,7 +188,7 @@ fn weak_fill(buf: &mut [u8]) {
 /// One word from `RDRAND`, retrying transient failures ten times; `None`
 /// when the hardware stays out of entropy. The instruction (and those
 /// retries — Intel's own recommendation) is `akuma_cpu::rng::rdrand`'s, a
-/// byte-identical twin of the copy this file and `amd64/src/net.rs` each
+/// byte-identical twin of the copy this file and `crates/akuma-kernel-amd64/src/net.rs` each
 /// carried until it moved there.
 #[cfg(target_arch = "x86_64")]
 fn rdrand_word() -> Option<u64> {

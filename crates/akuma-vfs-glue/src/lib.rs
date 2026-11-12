@@ -130,21 +130,6 @@ pub fn replace_box_root(box_id: u64, fs: Arc<dyn Filesystem>) -> Result<(), FsEr
     ns.mount.lock().replace_pristine_root("subdirfs", fs)
 }
 
-/// Unmount a path from a specific box's namespace.
-#[allow(dead_code)]
-pub fn unmount_in_namespace(box_id: u64, path: &str) -> Result<(), FsError> {
-    let namespaces = BOX_NAMESPACES.lock();
-    let ns = namespaces.get(&box_id).ok_or(FsError::NotFound)?;
-    ns.mount.lock().unmount(path)
-}
-
-/// List mounts in a specific box's namespace.
-#[allow(dead_code)]
-pub fn list_namespace_mounts(box_id: u64) -> Vec<MountInfo> {
-    let namespaces = BOX_NAMESPACES.lock();
-    namespaces.get(&box_id).map_or_else(Vec::new, |ns| ns.mount.lock().list_mounts())
-}
-
 /// Resolve `path` with no process CWD to resolve against — i.e. as if the CWD
 /// were `/`.
 ///
@@ -191,8 +176,8 @@ pub fn init() {
 /// and must not run under a mount-table lock.
 ///
 /// Was gated on `sc-reboot` while that syscall was its only caller;
-/// `sync(2)`'s ungated arm is a caller on every build now, so the gate (and
-/// its extreme-size dead-code rationale) is gone.
+/// `sync(2)`'s ungated arm is a caller on every build now, so the gate is
+/// gone.
 pub fn sync_all_filesystems() -> Result<(), FsError> {
     let mut seen: Vec<Arc<dyn Filesystem>> = Vec::new();
     {
@@ -239,7 +224,7 @@ pub fn sync_all_filesystems() -> Result<(), FsError> {
 /// virtio, a GRUB-placed RAM image and a USB partition, two of which are not block
 /// devices this crate can name. So that kernel had orphaned-lock recovery silently off
 /// while every hook *looked* wired, and the first fix for it was a second registry in
-/// `amd64/src/fs.rs`. One registry over the trait object both kernels already mount
+/// `crates/akuma-kernel-amd64/src/fs.rs`. One registry over the trait object both kernels already mount
 /// through is the shape that cannot drift again
 /// (`docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md` §8.3).
 ///
@@ -702,6 +687,18 @@ pub fn read_at_open_file(
 ) -> Result<usize, FsError> {
     if inode == 0 {
         return read_at(path, offset, buf);
+    }
+    let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
+    fs.read_at_by_inode(inode, offset, buf)
+}
+
+/// Read a file named only by `(mount id, inode)` — a lazy file region's record.
+///
+/// [`read_at_open_file`] without its by-path fallback: a region records no
+/// path, so `inode == 0` or an unknown mount is an error, never a guess.
+pub fn read_at_by_mount_inode(mount_id: u32, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    if inode == 0 {
+        return Err(FsError::NotFound);
     }
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     fs.read_at_by_inode(inode, offset, buf)
@@ -1482,7 +1479,7 @@ pub fn is_dev_dir(path: &str) -> bool {
 ///
 /// This is the check that keeps a raw
 /// write-open off a device `Ext2Filesystem` is caching
-/// (`proposals/RAW_BLOCK_DEVICE_FD.md` §3). Root mounts with source
+/// (`docs/archive/RAW_BLOCK_DEVICE_FD.md` §3). Root mounts with source
 /// `/dev/vda` (`src/fs.rs`), so this strips an optional `/dev/` prefix off
 /// each recorded source before comparing.
 ///
@@ -1757,6 +1754,26 @@ pub fn set_mapped_file_hooks(h: MappedFileHooks) {
     MAPPED_FILE_HOOKS.set(h);
 }
 
+/// Wire `akuma_exec::shm`, the shared writable page table, to the filesystem.
+///
+/// The same on both kernels: every `write(2)`/truncate reaches the mapped frames,
+/// and ext2 freeing an inode number drops both caches' pages for it. Before any
+/// mapping can be made: ext2 reissues inode numbers, so without the hook a new
+/// file inherits the cached pages of whatever last held its number
+/// (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §15).
+pub fn init_shared_write() {
+    fn inode_freed(inode: u32) {
+        akuma_fpcache::invalidate_inode(inode);
+        akuma_exec::shm::inode_freed(inode);
+    }
+    akuma_ext2::init_inode_freed_hook(inode_freed);
+    set_mapped_file_hooks(MappedFileHooks {
+        active: akuma_exec::shm::active,
+        wrote: akuma_exec::shm::wrote,
+        zeroed: akuma_exec::shm::zeroed,
+    });
+}
+
 /// The registered observers, if any and if they have anything to observe.
 fn mapped_file_hooks() -> Option<MappedFileHooks> {
     MAPPED_FILE_HOOKS.get().filter(|h| (h.active)())
@@ -1821,7 +1838,7 @@ fn fpcache_init(total_ram_bytes: usize) {
 /// This crate briefly carried a `VfsGlueConfig` struct and `src/vfs.rs` populated
 /// it at boot. That is the pattern `akuma-config` exists to retire: a `const`
 /// that becomes runtime config stops const-folding whatever it gates, and the
-/// two `/proc` flags below cost a page of `extreme-size` while they were loads.
+/// two `/proc` flags below cost a page of `.text` while they were loads.
 /// They fold again now, with no `#[cfg]` duplication needed here at all.
 const fn cfg_proc_syscall_log_enabled() -> bool {
     akuma_config::PROC_SYSCALL_LOG_ENABLED
@@ -1832,7 +1849,10 @@ const fn cfg_proc_sysvipc_enabled() -> bool {
 }
 
 const fn cfg_shared_file_pages_enabled() -> bool {
-    akuma_config::SHARED_FILE_PAGES_ENABLED
+    // `akuma_config::SHARED_FILE_PAGES_ENABLED` removed (config flag sweep,
+    // 2026-11-11): never flipped since 2026-08-05. Kept as a function so every
+    // call site here is unchanged.
+    true
 }
 
 const fn cfg_syscall_debug_info_enabled() -> bool {

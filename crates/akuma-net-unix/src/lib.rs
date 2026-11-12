@@ -1093,10 +1093,6 @@ impl UnixTable {
         self.channels.get(&pipe_id)
     }
 
-    pub fn channel_mut(&mut self, pipe_id: u32) -> Option<&mut Channel> {
-        self.channels.get_mut(&pipe_id)
-    }
-
     /// Register a channel for a pipe that already exists (the kernel creates
     /// the pipes; this attaches the framing metadata to them).
     pub fn attach_channel(&mut self, pipe_id: u32) {

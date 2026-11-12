@@ -1,0 +1,507 @@
+//! i8042 PS/2 keyboard, polled.
+//!
+//! **Superseded on the reference machine (2026-10-01).** This reads the firmware's
+//! PS/2 emulation, which ends when `xhci::init` takes the controller (the BIOS
+//! handoff and `HCRST`), and on that box the i8042 status byte sits at `0x7c` and never
+//! delivers a byte. The keyboard there is driven natively by `xhci::init_keyboard`
+//! and reaches the console through `input::getb`. This module remains for
+//! machines where the emulation is live (QEMU `pc`/`q35` with `-device i8042`,
+//! firmware that keeps SMM legacy support on) and logs the first raw scancodes
+//! and a poll heartbeat to `dmesg` (`[kbd] ...`) so "is the emulation there?" is
+//! answerable over ssh. The original reasoning follows.
+//!
+//! The reference machine's keyboard is USB and this kernel had no USB stack —
+//! and yet the keyboard's LEDs were lit when Akuma ran, because the *firmware*
+//! brought USB up. PC firmware has, since the first USB keyboards, presented
+//! them to a USB-unaware OS through the one interface every PC OS knows: the
+//! i8042 keyboard controller at ports `0x60`/`0x64`, with an SMM handler
+//! translating HID reports into PS/2 scancodes for as long as nobody takes the
+//! USB controllers away from it. Akuma never touches USB, so the emulation
+//! stays live for the whole boot. That is what this driver reads.
+//!
+//! **Polled, like the UART.** No IRQ 1, no IOAPIC: `has_byte` and `getb` are
+//! called from the console read and `poll(2)` paths, which already spin (and
+//! yield) waiting for input. Scancode **set 1** — the controller's translation
+//! mode, which is what firmware emulation and every PC's power-on state give.
+//!
+//! What it does not do: function keys (dropped), key repeat
+//! (the keyboard does that itself), LEDs, any command to the keyboard beyond
+//! draining what it has already sent. Extended (0xE0-prefixed) keys — arrows,
+//! Home/End, Insert/Delete, PgUp/PgDn — emit the same escape sequences the
+//! native USB keyboard does (`akuma_usb::keymap`), so both keyboards look
+//! alike to a terminal; a small queue holds the bytes after the first. Enough for a shell.
+//!
+//! # Absent controller
+//!
+//! An absent x86 I/O port reads `0xFF` — the same fact `serial` learned the hard
+//! way. `0xFF` as an i8042 status byte would say "output buffer full, from the
+//! mouse", so an unguarded reader would spin swallowing phantom mouse bytes.
+//! [`init`] refuses a status of `0xFF` and everything else is gated on that.
+//! QEMU `microvm` has no i8042 at all (absent, correctly); Firecracker's is a
+//! reset-only stub whose buffer never fills; QEMU `pc` and real firmware have
+//! the real thing.
+
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use akuma_port::I8042;
+use spinning_top::Spinlock;
+
+/// Status bit 0: a byte is waiting in the output buffer.
+const STS_OUTPUT_FULL: u8 = 1 << 0;
+/// Status bit 1: the input buffer is still holding our last command.
+const STS_INPUT_FULL: u8 = 1 << 1;
+/// Status bit 5: the waiting byte came from the second (mouse) port.
+const STS_FROM_AUX: u8 = 1 << 5;
+
+/// Controller command: enable the first (keyboard) port.
+const CMD_ENABLE_KBD: u8 = 0xAE;
+
+/// Modifier state, one bit each.
+const MOD_SHIFT: u8 = 1 << 0;
+const MOD_CTRL: u8 = 1 << 1;
+const MOD_CAPS: u8 = 1 << 2;
+/// The last scancode was the `0xE0` extended prefix.
+const MOD_E0: u8 = 1 << 3;
+/// Either Alt held (left `0x38`, right `E0 38`).
+const MOD_ALT: u8 = 1 << 4;
+
+static PRESENT: AtomicBool = AtomicBool::new(false);
+
+/// All per-keyboard state, behind one spinlock. **Every** entry point
+/// ([`getb`], [`has_byte`]) takes the lock before touching the controller or
+/// this state: the i8042 is polled, and under SMP several cores can be inside
+/// `poll(2)`/console reads at once — two cores both seeing "output full" and
+/// both reading port `0x60` steal each other's bytes (the second gets the
+/// next scancode, or the `E0` second byte of an extended key), which is what
+/// killed the keyboard on ryzen under SMP (2026-10-07: 267 scancodes logged,
+/// none decoded). Single-core boots serialise naturally; this makes it
+/// explicit.
+struct Kbd {
+    /// Modifier state, one bit each (`MOD_*`).
+    mods: u8,
+    /// A decoded byte that [`has_byte`] pulled off the controller and
+    /// [`getb`] has not returned yet: `0x100 | byte`, or 0 for none. `poll(2)`
+    /// must be able to say "readable" without consuming the key.
+    pending: u16,
+    /// The key byte of an Alt+key, queued behind the `ESC` [`decode`]
+    /// returned for it ("meta sends escape"): same encoding as `pending`.
+    /// Drained after it.
+    alt_follow: u16,
+    /// Bytes of escape sequences decoded but not yet returned. A decoded
+    /// sequence's first byte comes back from [`Kbd::pump`] directly and the
+    /// rest wait here, so a sequence is never interleaved with a later key.
+    /// Ring over `qbuf`, `Q_CAP` entries.
+    qbuf: [u8; Q_CAP],
+    q_head: usize,
+    q_tail: usize,
+}
+
+impl Kbd {
+    const fn new() -> Self {
+        Self { mods: 0, pending: 0, alt_follow: 0, qbuf: [0; Q_CAP], q_head: 0, q_tail: 0 }
+    }
+
+    /// Queue one slice; drops bytes if (impossibly — the longest sequence is
+    /// 4 and one key's bytes are drained before the next is decoded) full.
+    fn q_push(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.q_tail.wrapping_sub(self.q_head) >= Q_CAP {
+                return;
+            }
+            self.qbuf[self.q_tail % Q_CAP] = b;
+            self.q_tail = self.q_tail.wrapping_add(1);
+        }
+    }
+
+    /// Take one queued byte, if any.
+    fn q_pop(&mut self) -> Option<u8> {
+        if self.q_head == self.q_tail {
+            return None;
+        }
+        let b = self.qbuf[self.q_head % Q_CAP];
+        self.q_head = self.q_head.wrapping_add(1);
+        Some(b)
+    }
+
+    fn q_has(&self) -> bool {
+        self.q_head != self.q_tail
+    }
+}
+
+static KBD: BoundedLock = BoundedLock { state: Spinlock::new(Kbd::new()) };
+
+/// The keyboard lock, in the shape `serial.rs` uses for the UART: a bounded
+/// try-lock spin that **gives up** after [`LOCK_BUDGET`] attempts instead of
+/// hanging. A caller that cannot take it simply reports "no key" — the scancode
+/// stays in the controller and the next poll tries again. The unbounded
+/// alternative (a plain `lock()`) hangs the machine: this kernel preempts
+/// threads that hold spinlocks, so the holder can be descheduled while a
+/// poller spins forever behind it — which is what froze the SMP boot of
+/// 2026-10-07 before klog's first flush.
+struct BoundedLock {
+    state: Spinlock<Kbd>,
+}
+
+const LOCK_BUDGET: u32 = 1 << 22;
+
+impl BoundedLock {
+    fn lock(&self) -> Option<KbdGuard<'_>> {
+        for spins in 0..LOCK_BUDGET {
+            if let Some(g) = self.state.try_lock() {
+                return Some(KbdGuard(g));
+            }
+            if spins % 64 == 63 {
+                core::hint::spin_loop();
+            }
+        }
+        None
+    }
+}
+
+struct KbdGuard<'a>(spinning_top::guard::SpinlockGuard<'a, Kbd>);
+
+impl KbdGuard<'_> {
+    fn kbd(&mut self) -> &mut Kbd {
+        &mut self.0
+    }
+}
+
+/// What the Backspace key sends: DEL, as every terminal's does, and the
+/// line discipline's own `VERASE` (`c_cc[2] = 0x7f`).
+///
+/// This was `0x08` (`^H`) until 2026-10-01, which a raw-mode line editor such as
+/// busybox's accepts but a cooked-mode read does not: with `ICANON` set only
+/// `VERASE` erases, so Backspace at a plain `read(0)` — the boot's
+/// `init=/bin/sh`, or any program that does not edit its own line — inserted a
+/// literal `^H` instead of deleting a character.
+const BACKSPACE: u8 = 0x7F;
+
+/// Set-1 make codes to ASCII, unshifted. 0 = no character (a modifier, a
+/// function key, or nothing).
+const PLAIN: [u8; 0x59] = [
+    0, 0x1B, b'1', b'2', b'3', b'4', b'5', b'6', b'7', b'8', b'9', b'0', b'-', b'=', BACKSPACE, b'\t',
+    b'q', b'w', b'e', b'r', b't', b'y', b'u', b'i', b'o', b'p', b'[', b']', b'\r', 0, b'a', b's',
+    b'd', b'f', b'g', b'h', b'j', b'k', b'l', b';', b'\'', b'`', 0, b'\\', b'z', b'x', b'c', b'v',
+    b'b', b'n', b'm', b',', b'.', b'/', 0, b'*', 0, b' ', 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, b'7', b'8', b'9', b'-', b'4', b'5', b'6', b'+', b'1',
+    b'2', b'3', b'0', b'.', 0, 0, 0, 0, 0,
+];
+
+/// The same keys with Shift held.
+const SHIFTED: [u8; 0x59] = [
+    0, 0x1B, b'!', b'@', b'#', b'$', b'%', b'^', b'&', b'*', b'(', b')', b'_', b'+', BACKSPACE, b'\t',
+    b'Q', b'W', b'E', b'R', b'T', b'Y', b'U', b'I', b'O', b'P', b'{', b'}', b'\r', 0, b'A', b'S',
+    b'D', b'F', b'G', b'H', b'J', b'K', b'L', b':', b'"', b'~', 0, b'|', b'Z', b'X', b'C', b'V',
+    b'B', b'N', b'M', b'<', b'>', b'?', 0, b'*', 0, b' ', 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, b'7', b'8', b'9', b'-', b'4', b'5', b'6', b'+', b'1',
+    b'2', b'3', b'0', b'.', 0, 0, 0, 0, 0,
+];
+
+const SC_LSHIFT: u8 = 0x2A;
+const SC_RSHIFT: u8 = 0x36;
+const SC_CTRL: u8 = 0x1D;
+const SC_ALT: u8 = 0x38;
+const SC_CAPS: u8 = 0x3A;
+const SC_ENTER: u8 = 0x1C;
+const SC_KP_SLASH: u8 = 0x35;
+const SC_E0: u8 = 0xE0;
+const SC_BREAK: u8 = 0x80;
+
+/// Extended (0xE0-prefixed) set-1 make codes to terminal escape sequences —
+/// the same bytes `akuma_usb::keymap` emits, so a program cannot tell which
+/// keyboard a key came from. Same table shape: arrows `ESC [ A..D`,
+/// Home/End `ESC [ H`/`F`, `ESC [ n ~` for Insert, Delete, PgUp, PgDn.
+const EXTENDED: &[(u8, &[u8])] = &[
+    (0x47, b"\x1b[H"), // Home
+    (0x48, b"\x1b[A"), // Up
+    (0x49, b"\x1b[5~"), // PgUp
+    (0x4B, b"\x1b[D"), // Left
+    (0x4D, b"\x1b[C"), // Right
+    (0x4F, b"\x1b[F"), // End
+    (0x50, b"\x1b[B"), // Down
+    (0x51, b"\x1b[6~"), // PgDn
+    (0x52, b"\x1b[2~"), // Insert
+    (0x53, b"\x1b[3~"), // Delete
+];
+
+/// Bytes of escape sequences decoded but not yet returned live in [`Kbd`];
+/// the queue there is drained by [`Kbd::getb_from`] before the controller is
+/// touched, so a sequence is never interleaved with a later key.
+const Q_CAP: usize = 16;
+
+fn status() -> u8 {
+    I8042.status()
+}
+
+/// Wait, bounded, for the controller to accept a command.
+fn wait_input_empty() -> bool {
+    for _ in 0..100_000 {
+        if status() & STS_INPUT_FULL == 0 {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    false
+}
+
+/// Probe for a controller, drain whatever it holds, enable the keyboard port.
+/// Returns whether one answered.
+pub fn init() -> bool {
+    let st = status();
+    // `0xFF` is an empty bus, not a status. Every real controller has at
+    // least one of bits 2 (system flag) or 3 (command/data) meaningful and the
+    // top bits clear; `0xFF` never is.
+    if st == 0xFF {
+        PRESENT.store(false, Ordering::Release);
+        return false;
+    }
+    // Drain: firmware may have left keystrokes (or its own replies) queued.
+    for _ in 0..32 {
+        if status() & STS_OUTPUT_FULL == 0 {
+            break;
+        }
+        // Reading the data port consumes one queued byte.
+        let _ = I8042.read_data();
+    }
+    if wait_input_empty() {
+        // An architectural controller command with no argument; on a
+        // controller that already has the port enabled it is a no-op.
+        I8042.write_command(CMD_ENABLE_KBD);
+    }
+    PRESENT.store(true, Ordering::Release);
+    true
+}
+
+/// Did [`init`] find a controller?
+#[must_use]
+pub fn present() -> bool {
+    PRESENT.load(Ordering::Relaxed)
+}
+
+/// Turn one scancode into a byte, updating modifier state. `None` for a
+/// modifier, a break code, an ignored key, or the extended prefix.
+impl Kbd {
+    fn decode(&mut self, sc: u8) -> Option<u8> {
+        let mods = self.mods;
+        if sc == SC_E0 {
+            self.mods = mods | MOD_E0;
+            return None;
+        }
+        let extended = mods & MOD_E0 != 0;
+        if extended {
+            self.mods = mods & !MOD_E0;
+        }
+        let released = sc & SC_BREAK != 0;
+        let code = sc & !SC_BREAK;
+
+        // Modifiers, on both the plain and the extended (right-hand) codes.
+        match code {
+            SC_LSHIFT | SC_RSHIFT => {
+                let m = if released { mods & !MOD_SHIFT } else { mods | MOD_SHIFT };
+                self.mods = m & !MOD_E0;
+                return None;
+            }
+            SC_CTRL => {
+                let m = if released { mods & !MOD_CTRL } else { mods | MOD_CTRL };
+                self.mods = m & !MOD_E0;
+                return None;
+            }
+            SC_ALT => {
+                let m = if released { mods & !MOD_ALT } else { mods | MOD_ALT };
+                self.mods = m & !MOD_E0;
+                return None;
+            }
+            SC_CAPS => {
+                if !released {
+                    self.mods = (mods ^ MOD_CAPS) & !MOD_E0;
+                }
+                return None;
+            }
+            _ => {}
+        }
+        if released {
+            return None;
+        }
+        if extended {
+            // Only two non-sequence extended keys produce a character worth
+            // having: keypad Enter and keypad `/`. Everything else in the
+            // table above goes out as its terminal escape sequence.
+            return match code {
+                SC_ENTER => Some(b'\r'),
+                SC_KP_SLASH => Some(b'/'),
+                _ => {
+                    if let Some(&(_, seq)) = EXTENDED.iter().find(|&&(c, _)| c == code) {
+                        // Alt+extended-key: the ESC prefix, then the sequence
+                        // (the "meta sends escape" rule, matching plain keys).
+                        if mods & MOD_ALT != 0 {
+                            self.q_push(&[0x1B]);
+                        }
+                        // first byte now, the rest through the queue
+                        self.q_push(&seq[1..]);
+                        Some(seq[0])
+                    } else {
+                        None
+                    }
+                }
+            };
+        }
+        let idx = code as usize;
+        if idx >= PLAIN.len() {
+            return None;
+        }
+        let shift = mods & MOD_SHIFT != 0;
+        let mut c = if shift { SHIFTED[idx] } else { PLAIN[idx] };
+        if c == 0 {
+            return None;
+        }
+        // Caps Lock inverts the case of letters only.
+        if mods & MOD_CAPS != 0 && c.is_ascii_alphabetic() {
+            c ^= 0x20;
+        }
+        // Ctrl-letter is the control character, as a terminal sends it: Ctrl-D
+        // is 0x04 (EOF to the line discipline), Ctrl-C 0x03.
+        if mods & MOD_CTRL != 0 && c.is_ascii_alphabetic() {
+            c = c.to_ascii_lowercase() - b'a' + 1;
+        }
+        // Alt+key is `ESC` then the key — the USB decoder's rule
+        // (`akuma_usb::hid`), so both keyboards say Alt the same way.
+        if mods & MOD_ALT != 0 {
+            self.alt_follow = 0x100 | u16::from(c);
+            return Some(0x1B);
+        }
+        Some(c)
+    }
+
+    /// Pull queued sequence bytes first, then scancodes, until one decodes to
+    /// a byte, or everything is empty. Caller holds the lock.
+    fn pump(&mut self) -> Option<u8> {
+        if let Some(b) = self.q_pop() {
+            return Some(b);
+        }
+        heartbeat();
+        for _ in 0..64 {
+            let st = status();
+            if st & STS_OUTPUT_FULL == 0 {
+                return None;
+            }
+            // The output buffer is full; reading the data port takes the byte
+            // and clears the flag.
+            let sc = I8042.read_data();
+            if st & STS_FROM_AUX != 0 {
+                continue; // the mouse; not ours
+            }
+            log_scancode(sc);
+            if let Some(c) = self.decode(sc) {
+                return Some(c);
+            }
+        }
+        None
+    }
+}
+
+/// How many raw scancodes [`log_scancode`] reports before going quiet.
+const SCANCODE_LOG_CAP: u32 = 48;
+
+static SCANCODES_SEEN: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Report the first [`SCANCODE_LOG_CAP`] raw scancodes of the boot to `dmesg`.
+///
+/// **Whether the firmware's emulation delivers anything at all** is the question
+/// a dark television cannot answer and an `ssh` session can: press a key, then
+/// `dmesg | grep '\[kbd\]'`. A `[kbd] sc=0x1e` line means bytes reached the
+/// controller and the fault, if any, is above this; no line means the emulation
+/// is not there (the USB controller was reset, the keyboard is on a port the
+/// firmware does not emulate, or SMM legacy support is off). Capped so a stuck
+/// key cannot flood the 64 KiB ring; and the framebuffer never shows it, because
+/// `set_fb_quiet` keeps diagnostics off the TV while the shell is up.
+fn log_scancode(sc: u8) {
+    if SCANCODES_SEEN.fetch_add(1, Ordering::Relaxed) < SCANCODE_LOG_CAP {
+        akuma_kernel_amd64::drivers::services::serial::puts("[kbd] sc=0x");
+        akuma_kernel_amd64::drivers::services::serial::put_hexn(u64::from(sc), 2);
+        akuma_kernel_amd64::drivers::services::serial::puts("\n");
+    }
+}
+
+/// Polls between heartbeat lines, and how many lines in all.
+const HEARTBEAT_EVERY: u32 = 1500;
+const HEARTBEAT_LINES: u32 = 12;
+
+static POLLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static STATUS_OR: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
+/// Passive proof of life for the polling loop, for `dmesg`.
+///
+/// "No `[kbd]` scancode lines" has two very different causes: the controller
+/// never has data (the firmware's emulation is not running on this boot), or the
+/// loop that should read it is not running at all. This separates them: `polls`
+/// is how many times this ran, `st` the status byte it just read, and `or` the OR
+/// of **every** status byte seen so far — bit 0 (`output full`) ever set means
+/// bytes did arrive, and any bit other than the idle ones moving means the
+/// controller is live. Read-only: no command is sent. Capped, and off the TV
+/// like all diagnostics (`serial::set_fb_quiet`).
+fn heartbeat() {
+    let st = status();
+    STATUS_OR.fetch_or(st, Ordering::Relaxed);
+    let n = POLLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(HEARTBEAT_EVERY) && n / HEARTBEAT_EVERY <= HEARTBEAT_LINES {
+        akuma_kernel_amd64::drivers::services::serial::puts("[kbd] polls=");
+        akuma_kernel_amd64::drivers::services::serial::put_dec(u64::from(n));
+        akuma_kernel_amd64::drivers::services::serial::puts(" st=0x");
+        akuma_kernel_amd64::drivers::services::serial::put_hexn(u64::from(st), 2);
+        akuma_kernel_amd64::drivers::services::serial::puts(" or=0x");
+        akuma_kernel_amd64::drivers::services::serial::put_hexn(u64::from(STATUS_OR.load(Ordering::Relaxed)), 2);
+        akuma_kernel_amd64::drivers::services::serial::puts(" scancodes=");
+        akuma_kernel_amd64::drivers::services::serial::put_dec(u64::from(SCANCODES_SEEN.load(Ordering::Relaxed)));
+        akuma_kernel_amd64::drivers::services::serial::puts("\n");
+    }
+}
+
+/// Take a decoded key, or `None` if none is waiting. A poller that cannot
+/// take the lock reports "no key" (see [`BoundedLock`]); the scancode stays
+/// in the controller.
+#[must_use]
+pub fn getb() -> Option<u8> {
+    if !present() {
+        return None;
+    }
+    let mut guard = KBD.lock()?;
+    let k = guard.kbd();
+    if let Some(b) = k.q_pop() {
+        return Some(b);
+    }
+    let pending = k.pending;
+    if pending != 0 {
+        k.pending = 0;
+        return Some(pending as u8);
+    }
+    let follow = k.alt_follow;
+    if follow != 0 {
+        k.alt_follow = 0;
+        return Some(follow as u8);
+    }
+    k.pump()
+}
+
+/// Is a key waiting? Non-destructive: a key decoded here is kept for the next
+/// [`getb`].
+#[must_use]
+pub fn has_byte() -> bool {
+    if !present() {
+        return false;
+    }
+    let mut guard = match KBD.lock() {
+        Some(g) => g,
+        None => return false,
+    };
+    let k = guard.kbd();
+    if k.pending != 0 || k.alt_follow != 0 || k.q_has() {
+        return true;
+    }
+    match k.pump() {
+        Some(c) => {
+            k.pending = 0x100 | u16::from(c);
+            true
+        }
+        None => false,
+    }
+}

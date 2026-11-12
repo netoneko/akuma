@@ -37,12 +37,12 @@
 
 #[cfg(target_os = "none")]
 pub mod boot;
-/// The exception vector table, its handlers' `#[no_mangle]` shims and the control-flow register
-/// writes, moved out of `akuma-exceptions` 2026-11-06.
 #[cfg(target_os = "none")]
 pub mod exceptions;
-#[cfg(all(target_os = "none", kernel_smp_shared))]
+#[cfg(target_os = "none")]
 pub mod smp_shared;
+#[cfg(target_os = "none")]
+pub mod hooked;
 
 /// The absolute symbols `linker.ld` exports, in `akuma-boot-aarch64` beside the
 /// assembly that consumes them since 2026-11-04.

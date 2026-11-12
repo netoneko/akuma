@@ -2,7 +2,7 @@
  * jit_probe — can a userspace JIT run on this kernel under its W^X policy?
  *
  * Question (from netoneko/akuma-cli-wgpu, docs/fbdev-wgpu-plan.md §5b): the
- * kernel refuses PROT_WRITE|PROT_EXEC in one call (amd64/src/mm.rs sys_mmap and
+ * kernel refuses PROT_WRITE|PROT_EXEC in one call (crates/akuma-kernel-amd64/src/mm.rs sys_mmap and
  * sys_mprotect), so the plan assumed a JIT needs memfd_create dual-mapping.
  * But cranelift-jit and most JITs never hold a W+X page: they mmap RW, emit
  * code, mprotect to R+X, run, and (to patch) mprotect back to RW. If that

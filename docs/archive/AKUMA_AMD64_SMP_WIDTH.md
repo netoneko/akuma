@@ -24,7 +24,7 @@ is 8.
 
 ## Diagnosis: four tables sized for 8 cores on a 16-core target
 
-`amd64/src/smp.rs` runs up to `MAX_CPUS = 16`. Shared crates written for
+`crates/akuma-kernel-amd64/src/smp.rs` runs up to `MAX_CPUS = 16`. Shared crates written for
 AArch64 (4–8 cores) carry per-core tables sized 8, and indexing past them does
 one of three things:
 
@@ -37,7 +37,7 @@ one of three things:
 
 `MAX_CORES = 8` in `akuma-exec-core` is what the third row (and a few
 `if core < MAX_CORES` guards in `akuma-threading`) read.
-**Not a cause**: `YIELD_TAG` in `amd64/src/sched.rs` (indexed with `.get()` /
+**Not a cause**: `YIELD_TAG` in `crates/akuma-kernel-amd64/src/sched.rs` (indexed with `.get()` /
 `% 8`, a debug tag), and `shootdown.rs`'s `u64` masks (16 fits).
 
 Why 2/4/8 were stable and 16 wedged: cores 0–7 are tracked everywhere; every
@@ -86,7 +86,7 @@ points at P-states, not parking.
 **Next:** soak (hours, rio running, a build), and the open question of why the
 `[BKL] stuck` lines appear at all at boot. If a regression ever appears at 9+
 cores, the first thing to rule out is another table sized for 8 — `grep -rn
-'; 8\]\|% 8\b\|MAX_CORES' crates amd64/src`.
+'; 8\]\|% 8\b\|MAX_CORES' crates crates/akuma-kernel-amd64/src`.
 
 ## Dynamic cores for power saving: a design, not built
 

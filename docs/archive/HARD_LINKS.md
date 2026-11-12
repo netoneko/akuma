@@ -19,7 +19,7 @@
 | Linking a directory "works" or fails with an fs error, never `EPERM` | same |
 | `st_nlink` is always the conventional 1 / 2: ext2's `metadata_of` returns `links: None` | `ext2.rs:3211` |
 | `akuma-tar` turns every hard-link entry into a **relative symlink**, because `linkat` copied | `userspace/tar/src/extract.rs:251-293` |
-| amd64: x86_64 `link` (86) has no `AT_FDCWD` shim → reaches nothing | `amd64/src/usermode.rs` (only `linkat` 265 routes) |
+| amd64: x86_64 `link` (86) has no `AT_FDCWD` shim → reaches nothing | `crates/akuma-kernel-amd64/src/usermode.rs` (only `linkat` 265 routes) |
 | No `Filesystem::link` in the VFS trait | `akuma-vfs/src/types.rs` |
 
 What **already works**, which makes this small:

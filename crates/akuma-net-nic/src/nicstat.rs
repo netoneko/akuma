@@ -63,7 +63,8 @@ pub struct NicStat {
     pub tx_max_us: u64,
     /// Sends that returned an error (queue full) and were dropped.
     pub tx_drops: u64,
-    /// Frames whose device completion was reaped (`net-noalloc` only).
+    /// Frames whose device completion was reaped. Always 0 since the async
+    /// transmit ring (`net-noalloc`) was removed 2026-11-11.
     pub tx_flight: u64,
     /// Cumulative µs from `transmit_begin` to that completion being observed.
     ///
@@ -330,21 +331,6 @@ recorder! {
         if let Some(us) = elapsed(s) {
             imp::add(&imp::TX_US, us);
             imp::max(&imp::TX_MAX_US, us);
-        }
-    }
-}
-
-recorder! {
-    /// One asynchronously submitted frame, completed by the device.
-    ///
-    /// `s` is the `Started` opened at `transmit_begin`, so this measures how
-    /// long the host took to consume the descriptor — the cost `transmit_begin`
-    /// stopped charging the caller for, but that did not stop existing.
-    pub fn record_tx_complete(s: Started) {
-        imp::add(&imp::TX_FLIGHT, 1);
-        if let Some(us) = elapsed(s) {
-            imp::add(&imp::TX_FLIGHT_US, us);
-            imp::max(&imp::TX_FLIGHT_MAX_US, us);
         }
     }
 }

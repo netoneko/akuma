@@ -128,8 +128,7 @@ which also explains why the in-guest arm is the *slower* one here.
 
 `-c 20` is comfortable. **`-c 50` fails** with `Can't create socket: No file
 descriptors available` — that is the kernel socket budget, not Redis: each
-listener pre-allocates `MAX_BACKLOG` (32 with the default `many-sessions`
-feature) smoltcp sockets at 32 KB each, and closed sockets sit in a deferred
+listener pre-allocates `MAX_BACKLOG` (8; 32 before 2026-11-11) smoltcp sockets at 32 KB each, and closed sockets sit in a deferred
 `pending_removal` queue before their slots come back. Back-to-back benchmark
 runs can exhaust it even below 50 clients; wait ~20 s between runs.
 

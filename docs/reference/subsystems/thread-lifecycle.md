@@ -21,7 +21,7 @@ stateDiagram-v2
         [*] --> Free
         Free --> Initializing : claim_free_slot CAS
         Initializing --> Ready : spawn or clone_thread
-        Ready --> Running : schedule_indices (POOL try_lock, IRQ ctx)
+        Ready --> Running : pick_next (ON_CPU gate CAS)
         Running --> Ready : preempt or yield
         Running --> Blocked : schedule_blocking
         Blocked --> Ready : ThreadWaker.wake (lock-free)
@@ -111,7 +111,7 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 | spawn thread | `spawn_user_thread_initializing`, `spawn_*_fn` | `POOL` M | stack alloc from PMM **inside** the `POOL` hold (`threading/mod.rs:754,895`); slot-exhaustion reclaim-retry sits **outside** it — see §2.1 |
 | clone thread | `clone_thread` | `THREAD_PID_MAP` M; `LAZY_REGION_TABLE` M | P held across the whole clone incl. **raw user writes** of parent/child tid (`process/mod.rs:2799,2803`) |
 | fork | `fork_process` | `THREAD_PID_MAP` M; `SHARED_L0_TABLE` M | `SHARED_L0_TABLE` insert **allocates under the lock** (`mmu/mod.rs:421-430`) |
-| execve | `do_execve` → `replace_image*` → `enter_user_mode` | VFS/ext2/block (BKL-dropped window); `as_lock` via exclusive access | **eret leaf** — see §4. Frame abandoned on success |
+| execve | `execve::run` → `NativeExec::{load,install}` (`load_exec_*`, `install_loaded`) → `enter_user_mode_checked` | VFS/ext2/block (BKL-dropped window); `as_lock` via exclusive access | **eret leaf** — see §4. Frame abandoned on success |
 | run → terminated | `mark_thread_terminated`, kill-request consume | none (atomics) | consume site holds the **BKL** across the terminal yield loop |
 | exit / exit_group | `sys_exit*` → `return_to_kernel` | `PROCESS_CHANNELS` M, `THREAD_PID_MAP` M, `LAZY_REGION_TABLE` M, pipe/VFS via `cleanup_process_fds` | P for most of it; robust-futex walk touches user memory under P; **`!` leaf** — see §4 |
 | kill group P1 | `kill_thread_group` | none (atomics + wakers) | up to 2 s grace-wait under the caller's P; grace-expiry termination is now ownership-gated (`grace_kill_should_terminate`, fixed 2026-08-06 — see Background). **AArch64 only**: amd64's `kill(2)` never reaches it since 2026-10-09 — that target has no consumer for the deferred kill, so the grace always expired and the hard mark skipped the victims' own teardown (`archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`) |
@@ -120,15 +120,15 @@ Lock legend: **M** = acquisition wrapped in `with_irqs_disabled`/`IrqGuard`;
 | slot recycle | `cleanup_terminated_internal` | `POOL` M (short holds) | `CLEANUP_CALLBACK` re-enters process subsystem (`THREAD_PID_MAP` ×3, `unregister_process`) with no lock held |
 | retired reclaim | `reclaim_retired_processes` | none in sweep | `drop(Box<Process>)` = the whole §3 tree |
 | pressure drain | `drain_retired_under_pressure` (from `alloc_page_zeroed_user`) | same as reclaim | ambient context = **whatever faulted** — see §5.2 |
-| scheduler (IRQ) | `sgi_scheduler_handler_with_sp` | `POOL` **try_lock** M | never blocks; no other subsystem lock reachable from IRQ context |
+| scheduler (tick) | `irq_hooked` → `yield_now` | `POOL` M, only for the CPU-time bill; the tick does not preempt while `POOL` is held (`el1_preemptible`) | the pick is the `ON_CPU` CAS, not a lock |
 
 ### 2.0 "Is that thread running?" is the `ON_CPU` gate, never the state word (hooked scheduler)
 
 On the hooked scheduler (amd64 and both Taoxichuan machines) a thread is
-executing exactly when its `ON_CPU` gate is held. `x86_pick_next` reads `READY`,
+executing exactly when its `ON_CPU` gate is held. `pick_next` reads `READY`,
 **claims the gate**, then switches in, so a `TERMINATED` stored over a `READY`
 thread from another core does not stop it. Code that ends another thread *in
-place* must first hold its gate (`akuma_threading::x86_hold_off_cpu`), mark it
+place* must first hold its gate (`akuma_threading::hold_off_cpu`), mark it
 `TERMINATED`, then release the gate. A thread whose gate it cannot hold is on a
 core: ask it (`request_thread_kill`) and wait, and never end it where it runs.
 `akuma-tokio-kernel-core::proc::kill_siblings` is the implementation, and it
@@ -169,10 +169,21 @@ thread-slot echo of the `register_process` rule in
 [`locking.md`](locking.md#no-bkl-process): on-demand reclaim is safe exactly
 where the caller controls its own lock context.
 
-> ⚠ **Untested by the boot suite.** `test_thread_slot_reclaim_on_spawn`
-> (`src/process_tests.rs:1273`) drives `spawn_user_thread_fn`, i.e. only the
-> `_fn_internal` row. The `_initializing` row is covered only by the userspace
-> repro (`userspace/forktest/c_stress/futextest.c` phase 2).
+**The retry is keyed on the error string `NO_FREE_USER_SLOTS`.** A producer that
+spells exhaustion any other way silently opts out of the reclaim. The closure path
+(`ThreadPool::spawn_user_closure_initializing`) returns it whenever `akuma-threading`'s
+`collector-recycles` feature is on, as it is on the AArch64 kernel. There `claim_slot`
+takes only `FREE` slots, so the retry is what recycles `TERMINATED` ones. On amd64,
+where `claim_slot` already takes cooled-down `TERMINATED` slots, it returns a
+distinct string and skips the retry
+([`../../archive/AARCH64_SPAWN_RECLAIM_SKIPPED.md`](../../archive/AARCH64_SPAWN_RECLAIM_SKIPPED.md)).
+
+Boot-suite coverage: `test_thread_slot_reclaim_on_spawn` drives the `_fn_internal`
+row and `test_thread_slot_reclaim_on_spawn_initializing` the `_initializing` row
+(both in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`). Both report
+INCONCLUSIVE rather than PASS when the idle collector frees the slots first, which
+on a fast host is the common case. QEMU HVF at `SMP=1` is the configuration that
+reliably forces the reclaim.
 
 ## 3. The `drop(Box<Process>)` lock tree (teardown leaf)
 
@@ -265,8 +276,10 @@ LazyRegion>>>` in `process/table.rs`. A `BTreeMap::insert` that OOM'd inside
 abandoned frame still held, and (since there is no unwinding) wedging that lock
 for the rest of the boot. That was the `-j4` self-host freeze of 2026-08-02.
 
-It now lives on the process: `Process::lazy_regions: Spinlock<LazyRegionMap>`
-(fix direction (3), "structural (durable)", in the archive doc). Consequences:
+It now lives on the process: lazy regions are records in `Process::mmap_regions`
+(fix direction (3), "structural (durable)", in the archive doc; a per-process
+`lazy_regions` map until mm convergence step 4 folded it into the one list).
+Consequences:
 
 - The lock is reachable only through a `Process`, and each process has its own,
   so a hang would need the dying thread's *own* map — and the teardown paths no
@@ -275,9 +288,10 @@ It now lives on the process: `Process::lazy_regions: Spinlock<LazyRegionMap>`
   calls; the field is released by `Process::drop` on the existing reclaim path.
 - `clear_lazy_regions` survives only for the `sys_wait4`/`sys_waitid` zombie
   reap, which runs in the *parent's* syscall context holding no lazy-region lock.
-- `LazyRegionMap` (in `process/children.rs`) is the pure data structure and is
-  unit-tested on the host; the pid-keyed free functions are thin wrappers that
-  resolve `pid` → `Process` first.
+- The list edits (`insert_lazy_region`, `detach_lazy`, `lazy_lookup` in
+  `process/children.rs`, over `akuma-mmap`'s region algebra) are unit-tested on
+  the host; the pid-keyed free functions are thin wrappers that resolve
+  `pid` → `Process` first.
 
 Full audit, the deadlock chain, and why the tactical `try_lock`-and-skip fix
 would *not* have been sufficient:
@@ -345,8 +359,8 @@ inside `with_irqs_disabled` process-table scans
 (`process/mod.rs:1077,1226,1251,1302`). Any of these failing under heap pressure
 becomes rule-2 hang fuel.
 
-The lazy-region writers (`push_lazy_region*`, `update_lazy_region_flags`,
-`munmap_lazy_region_overlapping`, `clone_lazy_regions`) used to belong on this
+The lazy-region writers (`push_lazy_region*`, `update_eager_region_flags`,
+`munmap_lazy_regions_in_range`) used to belong on this
 list and no longer do — see §5.1b for why owning the map per-process took them
 out of rule-2's reach. That is the template for retiring the rest: give the
 state an owner whose drop is already on the teardown path, rather than a global

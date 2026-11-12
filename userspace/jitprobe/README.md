@@ -4,7 +4,7 @@
 `netoneko/akuma-cli-wgpu`, whose wgpu backend interprets WGSL and wants to compile it.)
 
 The kernel refuses a page that is writable *and* executable in a single call
-(`amd64/src/mm.rs`: `sys_mmap` and `sys_mprotect` return `EINVAL` for
+(`crates/akuma-kernel-amd64/src/mm.rs`: `sys_mmap` and `sys_mprotect` return `EINVAL` for
 `PROT_WRITE|PROT_EXEC`). A JIT does not need such a page: it `mmap`s RW, emits code,
 `mprotect`s to R+X, runs it, and flips back to RW to patch. The probe checks that whole
 sequence works here.

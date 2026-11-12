@@ -16,7 +16,7 @@ both kernels used it. What each kernel additionally had was **its own instance**
 
 | | AArch64 | amd64 (before) |
 |---|---|---|
-| the static | `PipeTable<WakeHandle>` in `akuma-syscalls-glue/src/pipe.rs` | `PipeTable<()>` in `amd64/src/pipe.rs` |
+| the static | `PipeTable<WakeHandle>` in `akuma-syscalls-glue/src/pipe.rs` | `PipeTable<()>` in `crates/akuma-kernel-amd64/src/pipe.rs` |
 | the wake | `wake_by_handle(handle)` | `sched::wake(tid)` |
 | the ids | its own 1, 2, 3… | its own 1, 2, 3… |
 
@@ -44,7 +44,7 @@ call site, both boot protocols, before any pipe can exist. Unregistered (every
 AArch64 build) the default `wake_by_handle` runs, so that kernel's behaviour is
 unchanged by construction.
 
-`amd64/src/pipe.rs` went from a 231-line second implementation to a shim: every
+`crates/akuma-kernel-amd64/src/pipe.rs` went from a 231-line second implementation to a shim: every
 function is now a name for a `glue::pipe` call. Four small accessors were added
 to glue for what the shim genuinely needs — `pipe_exists`, `pipe_counts`,
 `pipe_live_count`, `pipe_destroy` (deleted 2026-10-18: the hand-managed spawn

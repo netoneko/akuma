@@ -8,12 +8,24 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 
 - `src/` — Kernel (no_std Rust)
 - `crates/` — Host-testable extracted crates:
-  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,svm-amd64,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
+  `akuma-{bkl,cow,dma,dmesg,dns,exec,ext2,fdtable,firecracker,fpcache,gdt,gic,ieee80211,isolation,kacho,machine-facts,mmap,net,net-nic,net-unix,net-yarn,pmm,port,primitives,procfs,psci,rtw89,rump,svm-amd64,terminal,timer,trap-aarch64,user-space,vfs,virtio}`
   plus the `akuma-syscalls*` family below and `akuma-cpu`.
   `akuma-middleware` is the optional syscall **middleware** (B22): one table per kernel of a `pre`
   guard, a `handler` for calls the kernel does not serve, and one exec policy; a kernel wires it behind
   its `middleware` feature, and `akuma-params` (the boot command line's narrowed `Params` views) sits
   beneath it so the kernels can capture the line without it. Guide: `crates/akuma-middleware/docs/middleware.md`.
+  `akuma-kernel-tests-amd64` is the amd64 boot suite (2026-11-11), the counterpart of
+  `akuma-kernel-tests-aarch64`: it reaches the kernel only through `akuma_kernel_amd64::testing`
+  (one re-export per item) and installs itself with `boot::register_self_tests` from the bin's
+  `before_main`; a `no-tests` image does not link it. `akuma-drivers-amd64` is the amd64 driver
+  wiring, **one feature per driver** (`fbcon`, `hda`, `i8042`, `kvm`, `nvme`, `touchpad`, `wifi`, `xhci`; `all` is the bin's default,
+  `headless` the lean test-box set — `docs/reference/build-profiles.md` § amd64 images): each
+  driver registers a per-class table (`crates/akuma-kernel-amd64/src/drivers.rs`: display, sound, pointer, wireless,
+  hypervisor, usb, nvme, keyboard) whose
+  forwarders read "absent" when nothing registered, and reaches the kernel only through
+  `drivers::services`. **Never add a driver `cfg` to the machine half**; add a class slot.
+  It is `forbid(unsafe_code)`; the hypervisor is its own crate, `akuma-kvm-amd64` (the `kvm`
+  feature pulls it in), split out when entering a guest still needed `unsafe`; it forbids it too now.
   `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
   dup/close/sweep/fork decisions, effects returned not performed, `forbid`,
   no locks; `SharedFdTable` in `akuma-exec` keeps the locks and performs the
@@ -48,7 +60,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   the `static` itself, a length and alignment in its type, a borrow word that turns a
   second overlapping `&mut` into a panic, volatile `get`/`set` for cells a *device*
   writes, and a bounds-checked cache `flush` — plus `FrameArena`/`FrameLease`, moved
-  from `akuma-net-nic`. It is why `amd64/src/{xhci,hda}.rs` hold no `unsafe`. **Never
+  from `akuma-net-nic`. It is why `crates/akuma-kernel-amd64/src/{xhci,hda}.rs` hold no `unsafe`. **Never
   write `from_raw_parts_mut((&raw mut BUF).cast(), N)` for a DMA buffer again.** Its
   counterpart for registers is `akuma_primitives::mmio::MmioWindow` (bounds- and
   alignment-checked, one `unsafe` per mapped BAR in `pci::map_bar_window`).
@@ -58,11 +70,20 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `fn(&mut Trap)` registered per `Kind`; and the 256-gate table as atomics with `lidt`
   its only `unsafe`. They replaced `idt.rs`'s five hand-written asm entries and
   eighteen `&mut *frame` sites (38 -> 4 sites in `idt.rs`). **Add a trap = one
-  `Kind` arm + one `register` line; never `&mut *` a stub's pointer in `amd64/`.**
+  `Kind` arm + one `register` line; never `&mut *` a stub's pointer in `crates/akuma-kernel-amd64/`.**
   The AArch64 counterpart is `akuma-trap-aarch64` (2026-10-19): a `FrameHandle` over the
   EL0 `UserTrapFrame` (volatile accessors, `snapshot`/`store`), made once at
   `rust_sync_el0_handler`; `akuma-exceptions` went 83 -> 38 sites. **Never write
   `(*frame).x0` in a handler.**
+  `akuma-usermode-amd64` (2026-11-12) is the full amd64 kernel's **ring-3 crossing**: `syscall_entry`,
+  `enter`/`enter_forked` (safe: the stubs refuse a non-user `rip` and a null per-CPU `UserCtx`),
+  `unwind`, the STAR/LSTAR/FMASK install, and the `UserCtx` layout the assembly indexes (`kernel_rsp`
+  is private to it), plus `PerCpuHead`, the `gs`-read head of the per-CPU block, and the safe
+  `install_percpu` that points `GS_BASE` at one. Taoxichuan's counterpart is `akuma-ring3-amd64`; the
+  two are to merge. `akuma_boot_amd64::mb2` makes the multiboot2 claims (info block, framebuffer
+  window, RAM-disk module) from the address `boot.s` recorded. **`crates/akuma-kernel-amd64/` has no
+  `unsafe` site and forbids it in the shipped (`no-tests`) image (2026-11-13; boot-suite probes carry
+  a per-function `allow`); keep it at 0 — put the operation in the crate that owns the fact.**
   `akuma_cpu::msr` is the closed set of MSRs the kernel touches (`Msr` enum): reads
   safe, `write` unsafe (so the kernel's own `GS_BASE`, which every per-CPU read
   dereferences, stays `unsafe` at its one call site), and `set_fs_base`/`set_user_gs_base`
@@ -171,7 +192,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `docs/reference/subsystems/networking.md` records), the netmask/broadcast
   derivation, the `/proc/net/dev` column format. It was inside
   `akuma-syscalls-glue`, which does not build for `x86_64-unknown-none`; now
-  both `akuma-syscalls-glue::net` and `amd64/src/fd.rs` consume it and cannot
+  both `akuma-syscalls-glue::net` and `crates/akuma-kernel-amd64/src/fd.rs` consume it and cannot
   drift. Depends only on `akuma-syscalls-linux`; the user-memory copies and the
   `FileDescriptor::Socket` gate stay with each caller.
   Further families move out on the same model when a family has real
@@ -184,7 +205,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   generating the enum, both decodes, both encodes and `ALL` together, so a
   transposed digit can only be transposed once; the x86_64 number is a literal
   and the aarch64 one is a **path into `akuma-syscalls-linux`**, which is what
-  stops the tables drifting. `amd64/src/usermode.rs` decodes through it and a
+  stops the tables drifting. `crates/akuma-kernel-amd64/src/usermode.rs` decodes through it and a
   folded arm hands glue `to_aarch64()`; **glue's own `match syscall_num` is
   untouched**, so the AArch64 `.text` stays byte-identical and the cost —
   asm-generic numbers inside glue on an x86_64 kernel — is pinned rather than
@@ -193,7 +214,9 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   *host* under `cargo test`, so it would silently retarget every host test), and
   **never invent an asm-generic number for an x86-only legacy spelling** —
   `open`, `stat`, `poll`, `select`, `fork`, `mkdir`, `symlink`, `arch_prctl`,
-  `time` and 12 more have none, and stay as `AT_FDCWD` shims in `amd64/`. The
+  `time` and 12 more have none. The fixed rewrites (`open` -> `openat(AT_FDCWD, ..)` and
+  18 more) are `akuma_syscalls_abi::legacy::fold`, applied by both x86_64 kernels before
+  dispatch so a legacy spelling reaches its modern spelling's arm; the rest stay arms in `crates/akuma-kernel-amd64/`. The
   first pass over that list found x86_64 88 (`symlink`) dispatching to
   `sys_utimensat`, which returns 0 — so `ln -s` reported success and created
   nothing for months.
@@ -273,7 +296,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   own comment listed 44, and a `comm` truncation that could panic the kernel on
   a UTF-8 boundary (`docs/archive/AKUMA_AMD64_STREAMLINING.md` §4b).
   `akuma-svm-amd64` is the **SVM hypervisor's vocabulary and device models** (2026-10-22;
-  `forbid(unsafe_code)`, no dependencies; `amd64/src/kvm*.rs` owns every `unsafe`): the VMCB
+  `forbid(unsafe_code)`, no dependencies; the instructions are `akuma-svm-switch-amd64`'s): the VMCB
   layouts each pinned to its APM table, `cpuid::filter`, NPT encodings, PVH/ELF loading, and the
   pure models a Linux guest — and, since 2026-10-22, **Akuma's own kernel** (`kvmakuma`,
   `docs/archive/AKUMA_KVM_AKUMA_GUEST.md`) — runs on: 8254 `pit`, 8259 `pic`, xAPIC `lapic`
@@ -286,11 +309,22 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   store. **Never set FADT `HW_REDUCED_ACPI`** (Linux then drops the PIC/PIT and the device IRQ
   vanishes) and **no Linux/KVM source may be read** — only the APM, the virtio/ACPI specs and
   datasheets (`docs/reference/subsystems/kvm.md`, `docs/runbooks/kvm-linux-guest.md`).
+  `akuma-svm-switch-amd64` is the **world switch** (2026-11-11): the only crate that executes
+  `VMRUN`/`VMSAVE`/`VMLOAD` or writes `EFER.SVME`/`VM_HSAVE_PA`. `enable` takes a `HostSaveArea`
+  (made only by giving up a `FreshFrame`, consumed, so no page is two cores' save area) and
+  checks CPUID and `VM_CR.SVMDIS` first; `HostState::save` is `VMSAVE` into an owned page. Since
+  2026-11-12 entering a guest is **safe** (`Guest::run`): the crate owns guest RAM (`GuestRam`,
+  from the PMM or the `kvmmem=` `reserve`), the nested page table (`Npt`, which maps only memory
+  it adopted), the `Asid` and the all-intercept permission maps, and rewrites every VMCB
+  confinement field from them on each entry; `akuma-kvm-amd64` is `forbid(unsafe_code)`
+  (`docs/archive/AKUMA_SAFE_GUEST_ENTRY.md`). **Never open-code an SVM instruction in the wiring,
+  never map a page into a guest that its `Npt` does not own, and never add a second way into
+  `VMRUN`.**
   `akuma-vm-spec` is **what a VM is, before anything runs it** (2026-10-22; `forbid(unsafe_code)`,
   no dependencies): the `Spec` (kernel, cmdline, RAM, vCPUs, disk, forwards, backend), its parser and
   `key=value` wire text, Firecracker's field names as aliases, the first-fit `arena` over the
   `kvmmem=` reserve and the `kvmcores=` list. herd builds a spec from `vm_*` keys and the kernel
-  parses the same text off `/dev/kvm0` (`amd64/src/kvm/ctl.rs`), so the two cannot disagree.
+  parses the same text off `/dev/kvm0` (`crates/akuma-kvm-amd64/src/ctl.rs`), so the two cannot disagree.
   **Never parse a VM description anywhere else, and never put guest RAM anywhere but the reserve
   when `kvmmem=` is set — a request that does not fit is refused**
   (`docs/reference/subsystems/kvm.md` § VMs as services).
@@ -309,7 +343,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   no hook. The four `src/config.rs` tunables arrive at `init` as an
   `FpcacheConfig`, which is the one real cost: the kill switch stopped being a
   const-folded branch and became a relaxed atomic load (+304 B `.text`, +16 B
-  `.bss`, 0 B of `extreme-size` image). **`src/config.rs` stays the single source
+  `.bss`, 0 B of the old 4 MB `extreme` image). **`src/config.rs` stays the single source
   of truth** — the `src/file_page_cache.rs` shim reads the consts and hands them
   over, so do not add a second copy in the crate.
   The **networking family** is four crates since 2026-08-30
@@ -317,7 +351,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   forbid `unsafe`. `akuma-net` is the smoltcp stack (`smoltcp_net/`, 14 modules)
   plus the AF_INET socket table and DNS; it holds **no `unsafe`**.
   `akuma-net-nic` is the device — DMA frame arenas (`frames`), the virtio-net
-  wrapper (`nic`), the `net-noalloc` rings, `nicstat`, the NIC MMIO doorbell
+  wrapper (`nic`), `nicstat`, the NIC MMIO doorbell
   (`irq`), the rump tap, and smoltcp's two `Device` impls. **Every `unsafe` line
   in networking is in it**, behind one stated DMA contract at the top of
   `nic.rs`: a buffer handed to `receive_begin`/`transmit_begin` is owned by the
@@ -375,7 +409,9 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   is not one.
   `akuma-bkl` is the BKL protocol and the spinlocks under it — and since
   2026-09-01 also `akuma_bkl::policy`, the **decision** to take it or skip it:
-  the seven `no-bkl-*` phase toggles and the per-syscall opt-out bitmap, moved
+  the five `no-bkl-*` phase toggles (runtime atomics; the compile-time
+  `no-bkl-*` features were folded into `smp-shared`; `no-bkl-irq` and `sched_bklfree_el0`
+  went with the SGI scheduler, 2026-11-11) and the per-syscall opt-out bitmap, moved
   out of `src/smp_shared.rs` (which went 1173 -> 808 lines,
   `docs/archive/AKUMA_SMP_SHARED_SPLIT.md`). Each toggle is a relaxed atomic load
   with a **paired setter that is not test-only** — every phase in
@@ -422,8 +458,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `required-features = ["cli"]` so a bare `cargo build`/`test` at the repo root
   never tries to cross-compile it for the kernel's own target.
   `akuma-boot` holds the Linux `reboot(2)` ABI decode for the `sc-reboot`
-  syscall (`src/syscall/reboot.rs`) — in `default` since 2026-08-25 (only
-  `extreme-size`, which builds `--no-default-features`, excludes it) — **and
+  syscall (`src/syscall/reboot.rs`) — in `default` since 2026-08-25 — **and
   since 2026-09-01 `system_reset`/`system_off` themselves**, so it decodes *and*
   performs. It keeps `#![forbid(unsafe_code)]` because the `smc`/`hvc` lives in
   the sibling `akuma-psci`, not here — absorbing it would have cost the ban, the
@@ -449,9 +484,10 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
 - `scripts/` — Build and debug helpers
 - `overlays/devbox/` — Devbox distro rootfs + `run.sh` / `run-smoltcp.sh`
 - `bootstrap/` — Alpine apk bootstrap assets
-- `acceptance/` — Numbered acceptance test playbooks: 05, 10, 11, 13 are the
-  live set (extreme-size 4 MB floor, self-host, rump, `cargo install`-built
-  agent); `acceptance/archive/` holds the rest, superseded or subsumed
+- `acceptance/` — Numbered acceptance test playbooks: 10, 11, 13 are the
+  live set (self-host, rump, `cargo install`-built agent); `acceptance/archive/`
+  holds the rest, superseded or subsumed — 05 (the 4 MB floor) since the
+  `extreme` feature was removed 2026-11-11
   (`docs/archive/TRIM_FAT_PROFILES_AND_ACCEPTANCE.md`).
 - `proposals/` — In-flight design proposals
 
@@ -523,6 +559,7 @@ cargo build --release
 cargo run --release                     # QEMU via scripts/cargo_runner.sh
 MEMORY=2048 cargo run --release         # Override RAM
 GDB=1 cargo run --release               # QEMU gdbstub on :1234
+INIT=/bin/sshd INITARGS=--port,22 cargo run --release  # init= other than herd (both kernels: boot.md § Init)
 scripts/create_disk.sh                  # (Re)create ext2 disk image
 scripts/populate_disk.sh                # Populate disk with userspace binaries
 userspace/build.sh                      # Build all userspace binaries
@@ -537,19 +574,61 @@ A build target is **profile + feature set**, always selected together. Details
 and tradeoffs in `docs/reference/build-profiles.md`.
 
 ```bash
-scripts/build_extreme_size.sh                             # extreme-size (4.0 MB floor, userspace sshd + paws, single-core)
 scripts/build_devbox_smoltcp.sh && overlays/devbox/run-smoltcp.sh  # default devbox (userspace sshd)
 scripts/build_devbox.sh && overlays/devbox/run.sh         # rump devbox (deferred; needs RUMP_NIC=1)
 ```
 
-**`cargo build --release` is real SMP.** `smp-shared` — one shared kernel across
-all cores under real locks — is in the default feature set; run it with `SMP=N`.
-That is *the* SMP. The `smp` feature is the separate, experimental
-**multikernel** (one whole kernel per core); the two are mutually exclusive
-(build.rs panics), so building it needs `--no-default-features`.
+**Every Akuma build is real SMP**: one shared kernel across all cores under
+`akuma-bkl` (run it with `SMP=N`; `SMP=1` is the same image on one core). It is
+not a feature any more: the `smp-shared` feature and the single-core build
+without it were removed 2026-11-11. The shared crates still carry the switch as
+`bkl-smp` (cfg `kernel_bkl_smp`) because Taoxichuan builds them without it and
+serializes under its own lock — `proposals/ONE_BIG_KERNEL_LOCK.md`. The
+multikernel (`smp`, one whole kernel per core) was removed 2026-08-10.
 
 Profiles are only `release`, `extreme-size` and `release-debug` — a build target
-is `--release` plus a feature set.
+is `--release` plus a feature set. `extreme-size` is **codegen only**
+(`opt-level = "z"`, fat LTO): no cfg reads the profile, so it builds the same
+kernel as `--release` for a given feature set. The 4 MB-floor `extreme` feature,
+`userspace-sshd` and `fs-cache` (the ext2 block cache, now always on) were
+removed 2026-11-11 (`docs/archive/AKUMA_FEATURE_AUDIT.md`).
+
+### amd64 builds: default to `headless`
+
+```bash
+cargo build -p akuma --target x86_64-unknown-none --release \
+    --no-default-features --features headless      # build/check, Firecracker/TCG smoke boots
+```
+
+**One kernel package for both architectures** (2026-11-12): the root `akuma` is the AArch64
+kernel by default and the amd64 one with `--target x86_64-unknown-none` (artifact
+`target/x86_64-unknown-none/release/akuma`). Its dependencies are per-target tables and its
+`[features]` table serves both; `src/main.rs` is the root, `src/{aarch64,amd64}.rs` each half's
+bin items. The old `amd64/bin` package `akuma-amd64` is gone; installed kernels on the boxes
+keep their file names (`/boot/akuma-amd64`, the ESP's `EFI/akuma/akuma-amd64`). The amd64
+machine half is the crate `crates/akuma-kernel-amd64` (it was `amd64/` until 2026-11-12);
+`amd64/` keeps only its run, disk and staging scripts (`run.sh`, `mkdisk.sh`,
+`run-firecracker.sh`, ...).
+
+**Build `headless` unless the kernel actually has to run on ryzen or trashcan as
+the host.** The plain `--release` default pulls in `akuma-fbcon` (`fbcon` is in
+`all`), which needs the `crates/akuma-fbcon/vendor/spleen` git submodule — a
+clone over the network the first time it's fetched. `headless`
+(`storage-and-input`: NVMe, xHCI, i8042) never touches that crate, so a
+compile check, a clippy pass or a Firecracker/TCG boot gate neither needs the
+submodule nor pays for cloning it.
+
+Use the plain default (every driver: `fbcon hda i8042 kvm nvme touchpad wifi
+xhci`) only when the point of the build is to actually boot on real hardware —
+ryzen (the machine with the SVM hypervisor and a real GRUB framebuffer) or
+trashcan (the Intel test box with a serial line; it already builds `headless`
+in practice since it has no hypervisor and no framebuffer use). Table and full
+feature list: `docs/reference/build-profiles.md` § amd64 images.
+
+`server` is `headless` without the interactive console (the machine half's `console`
+feature: no pump task, no keyboard, init's stdin EOF, `SPAWN_FLAG_CONSOLE` = `ENODEV`) —
+for a machine whose console is ssh. Anything that types into the serial console needs
+`headless` or the default.
 
 ## VM Access
 
@@ -593,8 +672,7 @@ the "ssh never came up at all" diagnostic path only.
 
 If you *are* reading a boot log for something else, `-a` is mandatory — QEMU
 emits a control byte that makes plain `grep` treat the log as binary and print
-nothing. And note there are two startup paths for sshd: `extreme-size` has the
-kernel spawn it, every other profile lets herd do it.
+nothing. herd starts sshd on every build.
 
 **Never `pkill -f qemu-system-aarch64`.** Other VMs belonging to the user may be
 running (they use `INSTANCE=N`, which maps ssh to `2222 + 100*N`). Kill only the

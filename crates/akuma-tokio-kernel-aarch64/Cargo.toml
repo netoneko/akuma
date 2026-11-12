@@ -16,6 +16,8 @@ akuma-firecracker = { path = "../akuma-firecracker" }
 akuma-gic = { path = "../akuma-gic" }
 akuma-mmu = { path = "../akuma-mmu" }
 akuma-pmm = { path = "../akuma-pmm" }
+# user_stack_size's policy (config flag sweep, 2026-11-11), shared with every other kernel.
+akuma-mem-policy = { path = "../akuma-mem-policy" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-psci = { path = "../akuma-psci" }
 akuma-timer = { path = "../akuma-timer" }
@@ -36,8 +38,7 @@ akuma-fpcache = { path = "../akuma-fpcache" }
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "sc-epoll", "sc-eventfd"] }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
-# The hooked cooperative scheduler (B21 A4), not the full kernel's SGI one.
-akuma-threading = { path = "../akuma-threading", features = ["hooked"] }
+akuma-threading = { path = "../akuma-threading" }
 akuma-exec = { path = "../akuma-exec" }
 # The task's page tables: frames, the AArch64 walker and leaf encoding, the fork plans.
 akuma-phys = { path = "../akuma-phys" }

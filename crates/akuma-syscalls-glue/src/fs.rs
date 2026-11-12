@@ -25,14 +25,14 @@ use akuma_net::socket::{self, libc_errno};
 pub(super) struct VfsBkl;
 
 impl GuardToggle for VfsBkl {
-    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_vfs));
+    const COMPILED_IN: bool = cfg!(kernel_bkl_smp);
     #[inline]
     fn enabled() -> bool {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         {
             akuma_bkl::policy::vfs_bkl_drop_enabled()
         }
-        #[cfg(not(kernel_smp_shared))]
+        #[cfg(not(kernel_bkl_smp))]
         {
             false
         }
@@ -84,14 +84,14 @@ pub(super) type VfsBklGuard = ToggledGuard<VfsBkl>;
 pub(super) struct DriverBkl;
 
 impl GuardToggle for DriverBkl {
-    const COMPILED_IN: bool = cfg!(all(kernel_smp_shared, kernel_no_bkl_drivers));
+    const COMPILED_IN: bool = cfg!(kernel_bkl_smp);
     #[inline]
     fn enabled() -> bool {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         {
             akuma_bkl::policy::drivers_bkl_drop_enabled()
         }
-        #[cfg(not(kernel_smp_shared))]
+        #[cfg(not(kernel_bkl_smp))]
         {
             false
         }
@@ -355,6 +355,13 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         (proc.pid, fd)
     };
     rec.lap(crate::utils::read_profile::S_FD);
+    // A file not opened for reading (`O_WRONLY`, `O_PATH`) is `EBADF`, as on Linux
+    // (`userspace/forktest/c_stress/fdrefuse.c`).
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_read(f.flags)
+    {
+        return EBADF;
+    }
 
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED && fd_num == 0 {
         akuma_primitives::safe_print!(128, "[syscall] read(stdin, count={})\n", count);
@@ -363,6 +370,10 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // Pseudo-terminals read through their own module: fixed buffers, no heap
     // copy of `count` (the arms below allocate one), and the pty's own
     // `VMIN`/`VTIME`, `O_NONBLOCK` and hangup answers.
+    // A device its kernel serves itself (`chardev`).
+    if let Some(r) = super::chardev::read(fd_num as u32, &fd, buf_ptr, count) {
+        return r;
+    }
     match fd {
         akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::read(fd_num as u32, n, true, buf_ptr, count),
         akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::read(fd_num as u32, n, false, buf_ptr, count),
@@ -658,28 +669,20 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
         }
         akuma_exec::process::FileDescriptor::BlockDev { idx, pos, .. } => {
-            // Raw block read (`proposals/RAW_BLOCK_DEVICE_FD.md`) — same BKL
+            // Raw block read (`docs/archive/RAW_BLOCK_DEVICE_FD.md`) — same BKL
             // discipline as the `File` arm above, since it's the same
             // underlying disk I/O `akuma_vfs_glue::ext2` drives.
             let _vfs_bkl = VfsBklGuard::new();
-            let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
-            if pos >= capacity {
-                0 // EOF: dd reading past the end of the device
-            } else {
-                let to_read = count.min((capacity - pos) as usize).min(64 * 1024);
-                let mut temp = alloc::vec![0u8; to_read];
-                match akuma_virtio::block::read_bytes_at(idx as usize, pos, &mut temp) {
-                    Ok(()) => {
-                        if copy_to_user(buf_ptr, &temp).is_err() {
-                            return EFAULT;
-                        }
-                        if let Some(proc) = akuma_exec::process::current_process_shared() {
-                            proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = entry { *pos += to_read as u64; });
-                        }
-                        to_read as u64
+            match blockdev_read_at(idx, pos, buf_ptr, count) {
+                Ok(n) => {
+                    if n > 0
+                        && let Some(proc) = akuma_exec::process::current_process_shared()
+                    {
+                        proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = entry { *pos += n as u64; });
                     }
-                    Err(_) => EIO,
+                    n as u64
                 }
+                Err(e) => e,
             }
         }
         #[cfg(feature = "smoltcp")]
@@ -981,15 +984,21 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 
 /// `pread64(fd, buf, count, offset)`.
 ///
-/// `pub` since the amd64 `pread64` preamble delegates to it (4b batch 3a),
-/// behind the two answers that kernel keeps: a `len == 0` short-circuit and
-/// `ESPIPE` — not the `_ => EBADF` below — for a pipe, socket or console
-/// descriptor.
+/// A descriptor with no file position (a pipe, socket, terminal, eventfd, a
+/// kernel's own character device) is `ESPIPE`, and a file not opened for
+/// reading is `EBADF`, as on Linux (`userspace/forktest/c_stress/fdrefuse.c`).
+/// `pub` since amd64's `pread64` delegates to it, behind the one answer that
+/// kernel keeps: its unbound console descriptors, which are not in the table.
 pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_read(f.flags)
+    {
+        return EBADF;
+    }
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
@@ -1033,15 +1042,57 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
-        _ => EBADF
+        // At `offset`, leaving the descriptor's position alone, as `read` would
+        // read at it.
+        akuma_exec::process::FileDescriptor::BlockDev { idx, .. } => {
+            let _vfs_bkl = VfsBklGuard::new();
+            blockdev_read_at(idx, offset as u64, buf_ptr, count).map_or_else(|e| e, |n| n as u64)
+        }
+        _ => ESPIPE
     }
 }
 
+/// Up to 64 KiB of block device `idx` from byte `pos` into user memory; `Ok(0)` at
+/// or past its end (`dd` reading off the end). The caller holds the VFS BKL: this
+/// is the disk I/O `akuma_vfs_glue::ext2` drives (`docs/archive/RAW_BLOCK_DEVICE_FD.md`).
+/// The bounce buffer is allocated fallibly (`ENOMEM`).
+fn blockdev_read_at(idx: u32, pos: u64, buf_ptr: u64, count: usize) -> Result<usize, u64> {
+    let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
+    if pos >= capacity {
+        return Ok(0);
+    }
+    let to_read = count.min(usize::try_from(capacity - pos).unwrap_or(usize::MAX)).min(64 * 1024);
+    let mut temp = alloc::vec::Vec::new();
+    temp.try_reserve_exact(to_read).map_err(|_| ENOMEM)?;
+    temp.resize(to_read, 0u8);
+    akuma_virtio::block::read_bytes_at(idx as usize, pos, &mut temp).map_err(|_| EIO)?;
+    copy_to_user(buf_ptr, &temp).map_err(|_| EFAULT)?;
+    Ok(to_read)
+}
+
+/// `data` onto block device `idx` at byte `pos`, cut short at its end; `ENOSPC` at
+/// or past it. The caller holds the VFS BKL, as for [`blockdev_read_at`].
+fn blockdev_write_at(idx: u32, pos: u64, data: &[u8]) -> Result<usize, u64> {
+    let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
+    if pos >= capacity {
+        return Err(ENOSPC);
+    }
+    let clamped = data.len().min(usize::try_from(capacity - pos).unwrap_or(usize::MAX));
+    akuma_virtio::block::write_bytes_at(idx as usize, pos, &data[..clamped]).map_err(|_| EIO)?;
+    Ok(clamped)
+}
+
+/// `pwrite64(fd, buf, count, offset)`: the refusals of [`sys_pread64`], for writing.
 pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     let fd = match proc.get_fd(fd_num) { Some(e) => e, None => return EBADF };
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_write(f.flags)
+    {
+        return EBADF;
+    }
 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
@@ -1058,7 +1109,24 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
             }
         }
         akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => count as u64,
-        _ => EBADF
+        // At `offset`, position untouched; at most 64 KiB, a short write like `read`'s.
+        akuma_exec::process::FileDescriptor::BlockDev { idx, writable, .. } => {
+            if !writable {
+                return EBADF;
+            }
+            let _vfs_bkl = VfsBklGuard::new();
+            let len = count.min(64 * 1024);
+            let mut buf = alloc::vec::Vec::new();
+            if buf.try_reserve_exact(len).is_err() {
+                return ENOMEM;
+            }
+            buf.resize(len, 0u8);
+            if copy_from_user(&mut buf, buf_ptr).is_err() {
+                return EFAULT;
+            }
+            blockdev_write_at(idx, offset as u64, &buf).map_or_else(|e| e, |n| n as u64)
+        }
+        _ => ESPIPE
     }
 }
 
@@ -1079,8 +1147,18 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
         match proc.get_fd(fd_num as u32) { Some(e) => (proc.pid, e), None => return EBADF }
     };
+    // A file not opened for writing (`O_RDONLY`, `O_PATH`) is `EBADF`, as on Linux.
+    if let akuma_exec::process::FileDescriptor::File(ref f) = fd
+        && !akuma_syscalls_linux::flags::open::may_write(f.flags)
+    {
+        return EBADF;
+    }
 
     // Pseudo-terminals: see the matching arm in `sys_read`.
+    // A device its kernel serves itself (`chardev`).
+    if let Some(r) = super::chardev::write(fd_num as u32, &fd, buf_ptr, count) {
+        return r;
+    }
     match fd {
         akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::write(fd_num as u32, n, true, buf_ptr, count),
         akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::write(fd_num as u32, n, false, buf_ptr, count),
@@ -1116,7 +1194,7 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
     } else if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = fd {
         // No `reserve_write_pos`-style upfront reservation — the one intended
-        // consumer (`dd` onto the drop-off drive, `proposals/RAW_BLOCK_DEVICE_FD.md`)
+        // consumer (`dd` onto the drop-off drive, `docs/archive/RAW_BLOCK_DEVICE_FD.md`)
         // is a single sequential writer; two processes racing writable fds on
         // the same unmounted device is unguarded, same as Linux raw block I/O.
         pos as usize
@@ -1294,16 +1372,13 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     if total_written > 0 { return total_written as u64; }
                     return EBADF;
                 }
-                let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
-                if write_pos as u64 >= capacity {
-                    if total_written > 0 { return total_written as u64; }
-                    return ENOSPC;
-                }
-                let clamped = this_chunk.min((capacity - write_pos as u64) as usize);
-                if akuma_virtio::block::write_bytes_at(idx as usize, write_pos as u64, &buf_slice[..clamped]).is_err() {
-                    if total_written > 0 { return total_written as u64; }
-                    return EIO;
-                }
+                let clamped = match blockdev_write_at(idx, write_pos as u64, &buf_slice[..this_chunk]) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if total_written > 0 { return total_written as u64; }
+                        return e;
+                    }
+                };
                 write_pos += clamped;
                 let new_pos = write_pos as u64;
                 if let Some(proc) = akuma_exec::process::current_process_shared() {
@@ -1779,12 +1854,26 @@ pub fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> SysResult {
     }
 }
 
+/// `RLIMIT_NOFILE`, as both kernels report and enforce it.
+const NOFILE: u64 = akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT;
+
+/// Is `proc`'s table full, so a fresh descriptor would land at or past
+/// [`NOFILE`]? A count, not "is the lowest free number `>= NOFILE`": the two
+/// agree while no descriptor sits at or past the limit, and nothing here can
+/// put one there (every `dup` target and `F_DUPFD` floor is bounded below).
+fn fd_table_full(proc: &akuma_exec::process::Process) -> bool {
+    proc.fds.table.lock().len() as u64 >= NOFILE
+}
+
 pub fn sys_dup(oldfd: u32) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
         None => return EBADF,
     };
+    if fd_table_full(proc) {
+        return EMFILE;
+    }
     // One list, in `akuma_exec::process::clone_fd_refs`. This was a local
     // four-arm copy that had drifted: `EventFd` and `RumpSocket` are
     // refcounted but were handled only on the fork path, so a dup of
@@ -1808,6 +1897,7 @@ pub fn sys_dup(oldfd: u32) -> u64 {
 
 pub fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     if oldfd == newfd { return EINVAL; }
+    if u64::from(newfd) >= NOFILE { return EBADF; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
@@ -1914,6 +2004,43 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult
     openat_path(dirfd, &raw_path, flags, mode)
 }
 
+/// The four refusals `openat` makes from what is at `path` (resolved, its last
+/// component not followed), in Linux's order (`userspace/forktest/c_stress/fdrefuse.c`):
+///
+/// - `O_NOFOLLOW` on a symlink is `ELOOP` (unless `O_PATH`, which opens the link);
+/// - `O_CREAT | O_EXCL` on anything present is `EEXIST`;
+/// - `O_CREAT` on a directory is `EISDIR`;
+/// - `O_DIRECTORY` on anything but a directory is `ENOTDIR`.
+///
+/// No lookup at all unless one of those flags is set.
+fn open_refusal(path: &str, flags: u32) -> Result<(), u64> {
+    use akuma_exec::process::open_flags::{O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH};
+    let nofollow = flags & (O_NOFOLLOW | O_PATH) == O_NOFOLLOW;
+    let creating = flags & O_CREAT != 0;
+    let wants_dir = flags & O_DIRECTORY != 0;
+    if !(nofollow || creating || wants_dir) {
+        return Ok(());
+    }
+    let _vfs_bkl = VfsBklGuard::new();
+    if nofollow && akuma_vfs_glue::is_symlink(path) {
+        return Err(ELOOP);
+    }
+    if !(creating || wants_dir) {
+        return Ok(());
+    }
+    let Ok(md) = akuma_vfs_glue::metadata(path) else { return Ok(()) };
+    if creating && flags & O_EXCL != 0 {
+        return Err(EEXIST);
+    }
+    if creating && md.is_dir {
+        return Err(EISDIR);
+    }
+    if wants_dir && !md.is_dir {
+        return Err(ENOTDIR);
+    }
+    Ok(())
+}
+
 /// `openat(2)` on a path already in kernel memory — the whole of the arm
 /// except the user copy.
 ///
@@ -1946,6 +2073,24 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         return Err(EINVAL);
     }
 
+    // An empty path names nothing (`openat` has no `AT_EMPTY_PATH`). Resolved,
+    // `""` is the dirfd itself, so `open("")` used to open the cwd. Linux
+    // checks this when it copies the name in: after the flag checks above,
+    // before the descriptor is allocated.
+    if raw_path.is_empty() {
+        return Err(ENOENT);
+    }
+
+    // `RLIMIT_NOFILE`: Linux allocates the descriptor before it looks the path
+    // up, so a full table is `EMFILE` whatever the path. amd64 enforced this
+    // alone (`MAX_FDS`) until 2026-11-12; the AArch64 kernel reported the limit
+    // through `getrlimit` and never applied it.
+    if let Some(proc) = akuma_exec::process::current_process_shared()
+        && fd_table_full(proc)
+    {
+        return Err(EMFILE);
+    }
+
     // Was an eighth copy of the `AT_FDCWD` ladder, and one of the two that
     // resolved a bogus negative `dirfd` against `/` instead of failing — which
     // turned `openat(-5, "rel")` into a successful open of a *different file*.
@@ -1959,6 +2104,13 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             return Err(e);
         }
     };
+
+    open_refusal(&path, flags)?;
+
+    // A device its kernel serves itself (`chardev`): the resolved path names it.
+    if let Some(r) = super::chardev::open(&path, flags) {
+        return if (r as i64) < 0 { Err(r) } else { Ok(r) };
+    }
 
     // `open("/proc/self/fd/N")` is a *magic* link on Linux: it reopens the file
     // the descriptor holds, whatever its name is now. Here `/proc/<pid>/fd/N`
@@ -2019,7 +2171,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     // measurement window the audit flagged (`BKL_PHASE7_AUDIT.md` §5, 7c: "10.5% for
     // a converted syscall's prologue/epilogue is high enough that either the window
     // starts too late or the re-acquire costs more than expected"). This guard's only
-    // live cfg is `kernel_smp_shared`+`kernel_no_bkl_vfs`; without both it's a no-op.
+    // live cfg is `kernel_bkl_smp`; without it it's a no-op.
     let _vfs_bkl = VfsBklGuard::new();
 
     let path = akuma_vfs_glue::resolve_symlinks(&path);
@@ -2151,7 +2303,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         return Err(ESRCH);
     }
 
-    // Raw block device open (`/dev/vdX`) — `proposals/RAW_BLOCK_DEVICE_FD.md`.
+    // Raw block device open (`/dev/vdX`) — `docs/archive/RAW_BLOCK_DEVICE_FD.md`.
     // `dev_node` only reports a block node here for the host (box_id == 0);
     // boxes get no synthetic /dev, so this never fires for a box process.
     if let Some(node) = akuma_vfs_glue::dev_node(&path)
@@ -2354,6 +2506,7 @@ pub fn sys_close(fd: u32) -> u64 {
             // concurrent `cargo build` spawns from nca's multi-threaded runtime.
             proc.clear_cloexec(fd);
             proc.clear_nonblock(fd);
+            super::chardev::close(fd, &entry);
             match entry {
                 akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
                 akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -2419,6 +2572,7 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
             // number while this fd's `nonblock` bit is still stale.
             proc.clear_cloexec(fd);
             proc.clear_nonblock(fd);
+            super::chardev::close(fd, &entry);
             match entry {
                 akuma_exec::process::FileDescriptor::Socket(idx) => { akuma_net::socket::remove_socket(idx); }
                 akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
@@ -2450,13 +2604,24 @@ pub fn sys_close_range(first: u32, last: u32, flags: u32) -> u64 {
 
 /// `lseek(fd, offset, whence)`.
 ///
-/// `pub` since the amd64 `lseek` preamble delegates to it (4b batch 3a): that
-/// kernel keeps one arm of its own — a `/dev` character node, which Linux seeks
-/// to the offset asked for and this function answers `0`/`ESPIPE` for — and
-/// hands everything else here.
+/// As on Linux (`userspace/forktest/c_stress/fdrefuse.c`): a missing
+/// descriptor is `EBADF` before a `whence` past `SEEK_HOLE` is `EINVAL`, and
+/// `/dev/null`, `/dev/zero` and `/dev/urandom` answer `0` whatever the offset.
 pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
+    /// `SEEK_MAX` (`SEEK_HOLE`).
+    const SEEK_MAX: u32 = 4;
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        if matches!(proc.get_fd(fd), Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero)) {
+        let Some(entry) = proc.get_fd(fd) else { return EBADF };
+        // `whence` is an `unsigned int` on Linux: a negative one is past the end too.
+        if whence as u32 > SEEK_MAX {
+            return EINVAL;
+        }
+        if matches!(
+            entry,
+            akuma_exec::process::FileDescriptor::DevNull
+                | akuma_exec::process::FileDescriptor::DevZero
+                | akuma_exec::process::FileDescriptor::DevUrandom
+        ) {
             return 0;
         }
         // SEEK_END needs the on-disk size, so lseek on a real file is a VFS call. It
@@ -2464,8 +2629,8 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
         // `with_irqs_disabled`), so the ext2 work below is already IRQ-masked — no nested
         // exception can wait on the BKL from inside it, which is what makes the drop safe.
         let _vfs_bkl = VfsBklGuard::new_if(matches!(
-            proc.get_fd(fd),
-            Some(akuma_exec::process::FileDescriptor::File(_) | akuma_exec::process::FileDescriptor::BlockDev { .. })
+            entry,
+            akuma_exec::process::FileDescriptor::File(_) | akuma_exec::process::FileDescriptor::BlockDev { .. }
         ));
 
         let mut new_pos = 0i64;
@@ -2534,7 +2699,12 @@ pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
     let proc = akuma_exec::process::current_process_shared().ok_or(ESRCH)?;
 
     let mut stat = Stat::default();
-    let res = match proc.get_fd(fd) {
+    let entry = proc.get_fd(fd);
+    // A device its kernel serves itself (`chardev`).
+    if let Some(r) = entry.as_ref().and_then(super::chardev::fstat) {
+        return r;
+    }
+    let res = match entry {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             // Only this arm reaches the on-disk VFS; every other arm below synthesizes a
             // Stat from constants (or forwards cross-core, which must keep the BKL).
@@ -3322,6 +3492,12 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let entry = match proc.get_fd(fd) { Some(e) => e, None => return EBADF };
+            if arg >= NOFILE {
+                return EINVAL;
+            }
+            if fd_table_full(proc) {
+                return EMFILE;
+            }
             // Bump refcounts before inserting the duplicate entry. One list, in
             // `akuma_exec::process::clone_fd_refs`. This was a local four-arm
             // copy that had drifted: `EventFd` and `RumpSocket` are refcounted

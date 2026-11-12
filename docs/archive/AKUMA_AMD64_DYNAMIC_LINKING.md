@@ -13,7 +13,7 @@ same boot.
 
 ### What was wrong
 
-`amd64/src/loader.rs`'s `FrameSet` was a `Box<[usize]>` of 2048 entries — 16 KiB
+`crates/akuma-kernel-amd64/src/loader.rs`'s `FrameSet` was a `Box<[usize]>` of 2048 entries — 16 KiB
 of heap per live process — with `free_all` calling `free_page` unconditionally
 on every entry. Three defects, all now gone:
 

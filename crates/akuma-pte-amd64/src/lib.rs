@@ -5,7 +5,7 @@
 //! # Why this is a crate
 //!
 //! Two walkers on this target read and write the same 64-bit entries —
-//! `amd64/src/paging.rs` for the kernel's own mappings and `akuma-mmu`'s
+//! `crates/akuma-kernel-amd64/src/paging.rs` for the kernel's own mappings and `akuma-mmu`'s
 //! `UserAddressSpace` for every process's — and each carried its own spelling of
 //! the bits (`P`/`RW`/`US` in one, `X86_P`/`X86_RW`/`X86_US` in the other), its
 //! own `index`, and its own copy of the rule for stepping through an

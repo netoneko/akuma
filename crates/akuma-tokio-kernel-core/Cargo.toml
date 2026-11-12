@@ -47,7 +47,7 @@ spinning_top = { version = "0.3", optional = true }
 akuma-user-tree = { path = "../akuma-user-tree", optional = true }
 akuma-elf-exec = { path = "../akuma-elf-exec", optional = true }
 akuma-exec = { path = "../akuma-exec", optional = true }
-akuma-threading = { path = "../akuma-threading", features = ["hooked"], optional = true }
+akuma-threading = { path = "../akuma-threading", optional = true }
 akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, optional = true }
 akuma-syscalls-proc = { path = "../akuma-syscalls-proc", optional = true }
 akuma-net = { path = "../akuma-net", optional = true }

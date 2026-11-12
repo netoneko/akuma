@@ -298,7 +298,7 @@ pass kept 05, 08, 10, 11 and archived the other eight. Second pass, once it
 was clear 05 and 08 were near-duplicates of each other (see below), dropped 08
 too. Final kept set: **05, 10, 11**. Moved to `acceptance/archive/`: 01, 02,
 03, 04, 06, 07, 08, 09, 12. `acceptance/` itself is now three files; the kept
-three didn't move, so `acceptance/05_meow_tcc_extreme_4mb.md`,
+three didn't move, so `acceptance/archive/05_meow_tcc_extreme_4mb.md`,
 `10_selfhost_compile_akuma.md`, and `11_netbsd_rumpkernel_irc.md` are still
 the same paths they always were.
 

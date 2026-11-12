@@ -27,7 +27,7 @@ Script: `a throwaway `count_clones.py` (not kept; `scripts/cloc_akuma.py`'s `cop
 
 What the counter does:
 
-- **Files.** It reads every `*.rs` under `<component>/src/`. It skips `tests/`, `benches/`, `examples/` and `build.rs`, and it skips a library crate's `src/main.rs` and `src/bin/`. The only file in scope that this rule drops is `crates/akuma-locks-rw-cell/src/main.rs`. `amd64/src/main.rs` and `taoxichuan/src/main.rs` are the kernels and are counted.
+- **Files.** It reads every `*.rs` under `<component>/src/`. It skips `tests/`, `benches/`, `examples/` and `build.rs`, and it skips a library crate's `src/main.rs` and `src/bin/`. The only file in scope that this rule drops is `crates/akuma-locks-rw-cell/src/main.rs`. `crates/akuma-kernel-amd64/src/main.rs` and `taoxichuan/src/main.rs` are the kernels and are counted.
 - **Lexing.** Before matching, it blanks `//` and `/* */` comments (nested), string literals (`"…"`, `b"…"`, `r#"…"#`) and char literals, so a lifetime such as `'a` is not mistaken for a char literal.
 - **Test code.** It drops the item that follows `#[cfg(test)]` or `#[cfg(all(test, …))]`, whether that item is a braced body or ends in `;`. When the item is `mod x;`, it also drops `x.rs` and `x/`.
   - `#[cfg(any(test, …))]` is **kept**, because that code is production under the other predicate. Two such sites exist (`akuma-net-rtl8169` and `akuma-trap-amd64`); neither contains a clone.
@@ -68,7 +68,7 @@ A naive `grep -c '\.clone()'` gives **235**. The production-only count is **125*
 
 The other **75 components in scope have zero** production sites in every column.
 
-† `Process::get_fd` (`crates/akuma-exec/src/process/fd.rs:318`) and amd64's `table_get` (`amd64/src/fd.rs:324`) are **deep clones by another name**: `.get(&fd).cloned()` of a `FileDescriptor`. A `.clone()`-only gate cannot see the most expensive clones in the tree, because they sit behind these two wrappers (see F1 and F2). The gate should count `.cloned()` as well, and should either budget calls to these two wrappers or make them return a borrow.
+† `Process::get_fd` (`crates/akuma-exec/src/process/fd.rs:318`) and amd64's `table_get` (`crates/akuma-kernel-amd64/src/fd.rs:324`) are **deep clones by another name**: `.get(&fd).cloned()` of a `FileDescriptor`. A `.clone()`-only gate cannot see the most expensive clones in the tree, because they sit behind these two wrappers (see F1 and F2). The gate should count `.cloned()` as well, and should either budget calls to these two wrappers or make them return a borrow.
 
 ‡ 4 of the 6 are `"test".to_string()` in `make_test_process` (`process/mod.rs:4094`), a boot-test helper compiled into production.
 
@@ -101,7 +101,7 @@ Cloning any other variant is a plain memcpy.
 
 ### F1 [HIGH, hot: amd64 syscall dispatch]: `table_get` deep-clones a descriptor to test its variant
 
-`amd64/src/fd.rs:332` is `t.table.lock().get(&(fd as u32)).cloned()`, and it is reached through `table_get`. Every production caller only matches a variant or tests for presence:
+`crates/akuma-kernel-amd64/src/fd.rs:332` is `t.table.lock().get(&(fd as u32)).cloned()`, and it is reached through `table_get`. Every production caller only matches a variant or tests for presence:
 
 - `console_end` (`fd.rs:401`). This is called by `usermode::sys_write` on **every `write(2)`** (`usermode.rs:2969`), by `sys_pread64` (`fd.rs:1316`), by `sys_fstat` (`fd.rs:1868`), by `sys_ioctl` (`fd.rs:2255`), by the poll console hook (`fd.rs:2128`) and by `sendfile` (`fd.rs:2883/2885`).
 - `socket_index` (`fd.rs:462`), which serves 10 socket syscalls in `sock.rs`.
@@ -172,7 +172,7 @@ The result is one copy per exec instead of four.
 
 ### F6 [MEDIUM-HIGH]: amd64 `madvise(DONTNEED)` clones the path once per present page, with IRQs masked
 
-`amd64/src/mm.rs:2863` and `amd64/src/mm.rs:2868` push `DontneedFlush { path: sw.path.clone(), … }` once per present page of a shared-writable file region. This runs inside `with_current_regions` (`IrqGuard` plus the region lock, `usermode.rs:3691`) and `with_current_address_space` → `rewrite_leaves_in_range`. An N-page `DONTNEED` makes N identical `String` allocations under two spinlocks with IRQs off.
+`crates/akuma-kernel-amd64/src/mm.rs:2863` and `crates/akuma-kernel-amd64/src/mm.rs:2868` push `DontneedFlush { path: sw.path.clone(), … }` once per present page of a shared-writable file region. This runs inside `with_current_regions` (`IrqGuard` plus the region lock, `usermode.rs:3691`) and `with_current_address_space` → `rewrite_leaves_in_range`. An N-page `DONTNEED` makes N identical `String` allocations under two spinlocks with IRQs off.
 
 **Fix.** Record the path once per region (for example `Vec<(String, mount, inode)>` plus a per-page index), or make `SharedWriteBack::path` an `Arc<str>` (see S1).
 
@@ -188,7 +188,7 @@ The result is one copy per exec instead of four.
 
 **Fix.** Add a borrowing `LazyRegionMap::get(va) -> Option<&LazyRegion>` (or `is_file_at(va)`) and keep the cloning `lookup` for the fault path, which drops the lock before I/O.
 
-**Reach.** amd64 has its own `mm::sys_madvise` and registers its own prefault hook (`amd64/src/boot.rs:242`). These paths are therefore AArch64-hot, but they compile into both kernels and count against the budget.
+**Reach.** amd64 has its own `mm::sys_madvise` and registers its own prefault hook (`crates/akuma-kernel-amd64/src/boot.rs:242`). These paths are therefore AArch64-hot, but they compile into both kernels and count against the budget.
 
 ### F8 [MEDIUM, munmap/mprotect on lazy regions]: `LazySource` cloned before the branch that decides whether it is needed
 
@@ -255,7 +255,7 @@ All five feed `can_access_box` or `cascade_kill_order`, which are pure (`box_reg
 
 ### F15 [LOW, per call; cold]: smaller clear cases
 
-- **Taoxichuan `fd_inode`** (`taoxichuan/src/main.rs:1073`) clones the whole `KernelFile` to read `inode()`; the path is used only when `inode == 0`. This is the same shape amd64 already fixed in `file_bytes_at` (`amd64/src/fd.rs:1384-1391`, after a documented 76,800-allocation incident). It runs on every file `mmap` (every `PT_LOAD` musl ldso maps).
+- **Taoxichuan `fd_inode`** (`taoxichuan/src/main.rs:1073`) clones the whole `KernelFile` to read `inode()`; the path is used only when `inode == 0`. This is the same shape amd64 already fixed in `file_bytes_at` (`crates/akuma-kernel-amd64/src/fd.rs:1384-1391`, after a documented 76,800-allocation incident). It runs on every file `mmap` (every `PT_LOAD` musl ldso maps).
   - **Fix:** `Some((f.inode(), (f.inode() == 0).then(|| f.path.clone())))` inside the closure.
 - **glue `sys_fchdir`** (`fs.rs:3755`): `let new_cwd = path.clone();` exists only so the const-gated debug print can show `path` after the move. Print first, or print from `p.cwd`.
 - **akuma-mmap `munmap` clip** (`crates/akuma-mmap/src/region.rs:720`): `regions[i].shared_write.clone()` is used only as `.as_ref().map(|sw| sw.advance(..))` (`region.rs:762`). Call `advance` on `regions[i].shared_write.as_ref()` directly; `advance` already makes its own copy.

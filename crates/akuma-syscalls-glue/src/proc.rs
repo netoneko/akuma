@@ -402,9 +402,9 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // sys_exit() for a non-leader thread must NOT close the shared FD
         // table; only sys_exit_group() (or the last thread) does that.
         if proc.tgid == proc.pid {
-            // Flush any writable MAP_SHARED file mappings to disk before teardown,
-            // so a process that exits without munmap still persists its writes.
-            super::mem::flush_and_clear_shared_file_mappings(proc.tgid);
+            // Writable MAP_SHARED file mappings get `munmap`'s treatment before
+            // teardown: written back, and released from the shared table.
+            super::mem::release_shared_write_mappings(proc);
             proc.fds.close_all();
         }
         // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake any
@@ -482,6 +482,17 @@ pub fn sys_exit_group_pub(code: i32) -> ! {
 
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
+        // One teardown per group. A sibling already claimed it: that sibling's
+        // `kill_thread_group` is (or will be) waiting for this thread to die, so
+        // die here, the way a posted deferred kill ends a thread at its EL0
+        // boundary. Running a second teardown would make the two wait on each
+        // other for the full 2 s grace (`SharedSignalTable::claim_group_exit`).
+        if !proc.signal_actions.claim_group_exit() {
+            akuma_exec::threading::mark_thread_terminated(akuma_exec::threading::current_thread_id());
+            loop {
+                akuma_exec::threading::yield_now();
+            }
+        }
         if akuma_config::FUTEX_DBG_ENABLED {
             akuma_primitives::tprint!(96, "[exit94] tid={} pid={} tgid={}\n",
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.tgid);
@@ -512,6 +523,11 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         let tgid = proc.tgid;
         let proc_tid = proc.thread_id;
         let l0_phys = proc.address_space.l0_phys();
+        // Marked exited here as well as in `finish_process` (the same values, so
+        // the second store changes nothing): from this point the siblings that
+        // `kill_thread_group` ends count this table as having no live leader in
+        // `cleanup_process_fds`, as they always have. A pinned difference from
+        // amd64, which marks only in `finish_process` (`proposals/AKUMA_ONE_EXIT.md`).
         akuma_exec::process::with_current_process(|p| {
             p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
             p.exit_code.store(code, core::sync::atomic::Ordering::Relaxed);
@@ -520,9 +536,15 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if akuma_config::PROC_SYSCALL_LOG_ENABLED {
             crate::log::mark_exited(pid);
         }
-        // Flush writable MAP_SHARED file mappings to disk while the address space
-        // is still intact (kill_thread_group below tears it down).
-        super::mem::flush_and_clear_shared_file_mappings(tgid);
+        // Writable MAP_SHARED file mappings: written back and released while the
+        // address space is still intact (kill_thread_group below tears it down).
+        if let Some(p) = akuma_exec::process::lookup_process_shared(tgid) {
+            super::mem::release_shared_write_mappings(p);
+        }
+        // Every pid of the group, before `kill_thread_group` retires the siblings'
+        // rows: a child records the *forking thread's* pid as its parent, so each
+        // member is a possible parent `finish_process` must reparent for.
+        let members = crate::exit::group_members(proc);
         // Reap sibling threads BEFORE notifying the parent.
         //
         // ORDERING IS LOAD-BEARING: notify_child_channel_exited() wakes the parent's
@@ -535,49 +557,22 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         // (docs §7g). Killing the thread group first guarantees every sibling is
         // terminated + woken regardless of when the parent runs.
         akuma_exec::process::kill_thread_group(pid, l0_phys, code);
-        // Close all fds immediately so pipe write-ends are decremented and
-        // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
-        // woken now. close_all() is idempotent — cleanup_process_fds() later
-        // will find an empty table and skip any double-close.
+        // The rest is both kernels' one sequence (`exit::finish_process`): close
+        // the fds, mark the zombie, reparent the group's children to init, publish
+        // the exit (the leader's channel too when `tgid != pid`), complete a vfork.
         //
         // ORDERING IS LOAD-BEARING, for the same reason as kill_thread_group above:
-        // this MUST happen before notify_child_channel_exited(). That notify wakes the
-        // parent's wait4, which can immediately reap this process on the peer core;
-        // `unregister_process` then calls `mark_thread_terminated` on *this* thread, so
-        // a reap that lands mid-syscall stops us dead before we release our own fds.
-        //
-        // That race was survivable only by accident until Phase 7e: the reap used to
-        // free the `Process` synchronously, and `SharedFdTable`'s Drop closes the fd
-        // table, so the reaper released them on our behalf. Phase 7e defers that drop
-        // to `reclaim_retired_processes`, which during the boot self-test suite never
-        // runs at all (it is wired into `netpoll_maint`) — so losing the race meant the
-        // fds were held indefinitely. Concretely, in `yes | head -n 1`: `head`'s pipe
-        // read end was never released, `yes` never saw read_count reach 0, never got
-        // EPIPE/SIGPIPE, and slept forever on a full pipe
-        // (`test_sigpipe_terminate_no_deadlock`). Closing first makes releasing our own
-        // fds independent of who wins the reap race.
-        proc.fds.close_all();
-        notify_child_channel_exited(pid, code);
-        // If a goroutine thread (tgid != pid) is calling exit_group, the parent's
-        // wait4 waits on CHILD_CHANNELS[tgid], not CHILD_CHANNELS[pid].  Notify
-        // the tgid leader's channel too so the parent doesn't hang.
-        if tgid != pid {
-            notify_child_channel_exited(tgid, code);
-        }
-        // Children outliving the group go to init — in BOTH views of parenthood
-        // (`reparent_children_to`: the child-channel registry that `wait4(-1)`
-        // reads, and the table row). `fork` records the *forking thread's* pid
-        // as the parent, so every member of the group is a possible parent.
-        // Until 2026-09-23 nothing on this route reparented at all: an orphan
-        // kept its dead parent, init's `wait4(-1)` answered `ECHILD`, and it
-        // was a zombie for the life of the boot. It lives here and not in
-        // `return_to_kernel` because that function's own teardown never runs
-        // for this route — `current_process_shared()` is already gone by then.
-        // `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`.
-        for member in akuma_exec::process::collect_pids(|p| p.tgid == tgid) {
-            let _ = akuma_exec::process::reparent_children_to(member, 1);
-        }
-        vfork_complete(pid);
+        // the fds close before the publish. The publish wakes the parent's wait4,
+        // which can reap this process on the peer core at once; `unregister_process`
+        // then calls `mark_thread_terminated` on *this* thread, so a reap that lands
+        // mid-syscall would stop us before we released our own fds — in
+        // `yes | head -n 1`, `head`'s pipe read end held forever and `yes` never got
+        // EPIPE (`test_sigpipe_terminate_no_deadlock`). Orphans are reparented in
+        // both views of parenthood; until 2026-09-23 nothing on this route did,
+        // and an orphan stayed a zombie for the life of the boot
+        // (`docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`). This route never
+        // reaches `return_to_kernel`'s teardown, so it has to happen here.
+        crate::exit::finish_process(proc, &members, code);
 
         // Terminate the calling thread — exit_group() must never return to EL0.
         // Only do this if the calling thread IS the process's own thread;
@@ -594,6 +589,77 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         }
     }
     code as u64
+}
+
+/// `clone(CLONE_VM | CLONE_THREAD | ...)`: one more thread of the caller's group.
+///
+/// Asm-generic argument order. Every kernel's thread arm; the flags are already
+/// validated (`akuma_syscalls_proc::clone::decode`).
+///
+/// The child inherits the caller's signal mask and, without `CLONE_SETTLS`, its
+/// TLS base (both in `akuma_exec::process::clone_thread`). A thread-slot or
+/// process-table limit is `EAGAIN`, which `pthread_create` reports as such; a
+/// zero stack is `EINVAL` (Linux would run the child on the caller's stack, which
+/// is never what a caller of this arm meant); being out of memory is `ENOMEM`.
+/// Run a process- or thread-creating `f`, waiting out a full table.
+///
+/// An exited thread holds its thread slot for the cleanup cooldown and then its
+/// process row for the reclaim cooldown, 10 ms each, so a create/join loop
+/// (`thrchurn`, `futextest` step 6) can have all 248 slots or all 256 rows held
+/// by threads that have already exited. Linux does not fail `pthread_create`
+/// for that, and the capacity comes back on its own; so a refusal for either
+/// table ([`PROCESS_TABLE_FULL`](akuma_exec::process::PROCESS_TABLE_FULL),
+/// [`NO_FREE_USER_SLOTS`](akuma_exec::threading::NO_FREE_USER_SLOTS)) parks
+/// 1 ms and tries again, for up to 100 ms, before it reaches the caller as an
+/// error. Any other error returns at once.
+///
+/// **Collect before claiming.** The drain at the top of each attempt is what
+/// returns RETIRED rows (and, on AArch64, their ASIDs) to the table; the drain
+/// sites are otherwise on exit and reap paths, which a churning workload
+/// outruns. Syscall entry holds no address-space, region or lifecycle lock, only
+/// the BKL, which is the context the other drain sites run in; and a row is
+/// dropped only past its cooldown, so this never frees the caller's own.
+/// A refused reservation requests the drain, so the retry is the one that
+/// collects.
+pub fn retry_while_full<T>(mut f: impl FnMut() -> Result<T, &'static str>) -> Result<T, &'static str> {
+    const PARK_US: u64 = 1_000;
+    const BUDGET_US: u64 = 100_000;
+    let start = akuma_primitives::clock::uptime_us();
+    loop {
+        akuma_exec::process::reclaim::drain_retired_if_requested();
+        match f() {
+            Err(e)
+                if (e == akuma_exec::process::PROCESS_TABLE_FULL
+                    || e == akuma_exec::threading::NO_FREE_USER_SLOTS)
+                    && akuma_primitives::clock::uptime_us().saturating_sub(start) < BUDGET_US =>
+            {
+                let now = akuma_primitives::clock::uptime_us();
+                akuma_exec::threading::schedule_blocking(now + PARK_US);
+            }
+            r => return r,
+        }
+    }
+}
+
+pub fn clone_thread(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
+    match retry_while_full(|| akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid, flags)) {
+        Ok(tid) => {
+            if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
+                akuma_primitives::tprint!(64, "[clone] new thread TID={}\n", tid);
+            }
+            u64::from(tid)
+        }
+        Err(e) => {
+            akuma_primitives::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
+            if e.contains("stack must be non-zero") {
+                EINVAL
+            } else if e.contains("memory") || e.contains("address space") {
+                ENOMEM
+            } else {
+                EAGAIN
+            }
+        }
+    }
 }
 
 pub(super) fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
@@ -625,22 +691,16 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         return ENOSYS;
     }
 
+    // Linux's two `EINVAL` combinations: `CLONE_THREAD` without `CLONE_SIGHAND`,
+    // `CLONE_SIGHAND` without `CLONE_VM`. The rule is the shared decode's, which
+    // the x86 kernels already asked; this arm made a thread of the first and
+    // answered `ENOSYS` for the second (`userspace/forktest/c_stress/cloneflags.c`).
+    if akuma_syscalls_proc::clone::decode(flags, stack).is_err() {
+        return EINVAL;
+    }
+
     if flags & CLONE_THREAD != 0 && flags & CLONE_VM != 0 {
-        // POSIX: a new thread inherits the creating thread's (per-thread) signal mask.
-        let parent_mask = akuma_exec::threading::thread_signal_mask();
-        match akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid, flags) {
-            Ok(tid) => {
-                akuma_exec::threading::seed_thread_signal_mask(tid as usize, parent_mask);
-                if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
-                    akuma_primitives::tprint!(64, "[clone] new thread TID={}\n", tid);
-                }
-                return u64::from(tid);
-            }
-            Err(e) => {
-                akuma_primitives::safe_print!(128, "[syscall] clone_thread failed: {}\n", e);
-                return EAGAIN;
-            }
-        }
+        return clone_thread(flags, stack, parent_tid, tls, child_tid);
     }
 
     // Route to fork_process for known fork-like flag combinations:
@@ -681,11 +741,13 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
         // use the full copy.  Gated by config so it can be toggled off.
         let use_vfork_fastpath = flags & CLONE_VFORK != 0
             && akuma_exec::runtime::config().vfork_fastpath_enabled;
-        let fork_result = if use_vfork_fastpath {
-            akuma_exec::process::vfork_process(child_pid, stack)
-        } else {
-            akuma_exec::process::fork_process(child_pid, stack)
-        };
+        let fork_result = retry_while_full(|| {
+            if use_vfork_fastpath {
+                akuma_exec::process::vfork_process(child_pid, stack)
+            } else {
+                akuma_exec::process::fork_process(child_pid, stack)
+            }
+        });
         match fork_result {
             Ok(new_pid) => {
                 // POSIX/Linux: a fork() child inherits the parent's signal mask. Only the
@@ -793,329 +855,179 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
 
 #[cfg(feature = "exec")]
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
-    let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let path = match copy_from_user_str(path_ptr, 1024) {
-        Ok(p) => p,
-        Err(e) => {
-            akuma_primitives::safe_print!(64, "[syscall] execve: path copy failed with {} pid={}\n", e as i64, pid);
-            return e;
-        },
+    // Linux bounds the bytes (`ARG_MAX`) and each string (`MAX_ARG_STRLEN`),
+    // never the count: the counts here are only a sanity bound, and the real
+    // byte limit is the stack builder's refusal (`E2BIG`) once the strings
+    // and their pointer arrays do not fit the eager stack.
+    let req = match super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget()) {
+        Ok(r) => r,
+        Err(e) => return e,
     };
+    // Gated 2026-08-30: once per `execve` at up to 2048 bytes, a `cargo build`
+    // prints a full rustc/ld command line per compilation unit. Turn
+    // `syscall-debug-info` on to get it back (`scripts/bkl_smp_regimen/
+    // analyze_workload.py` needs it); 2048 so a linker's `-o <output>` survives
+    // (`docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §4.5).
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        akuma_primitives::tprint!(128, "[syscall] execve(path=\"{}\", argv_ptr=0x{:x}, envp_ptr=0x{:x}) PID {}\n", path, argv_ptr, envp_ptr, pid);
+        let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
+        akuma_primitives::tprint!(2048, "[syscall] execve(path=\"{}\", args={}) PID {}\n", req.path, ArgvDisplay(&req.argv), pid);
     }
+    do_execve(req)
+}
 
-    let resolved_path = if path.starts_with('/') {
-        path
-    } else if let Some(proc) = akuma_exec::process::current_process_shared() {
-        akuma_vfs_glue::resolve_path(&proc.cwd, &path)
-    } else {
-        path
-    };
-    let resolved_path = akuma_vfs_glue::resolve_symlinks(&resolved_path);
+/// The most argv (and, separately, envp) entries `execve` and `spawn` read;
+/// see [`sys_execve`].
+#[cfg(feature = "exec")]
+const EXEC_MAX_STRINGS: usize = 1 << 20;
 
-    let mut args = Vec::new();
-    if argv_ptr != 0 {
-        let mut i = 0;
-        loop {
-            let mut str_ptr: u64 = 0;
-            if read_user_into(&mut str_ptr, argv_ptr + i * 8).is_err() {
-                break;
+/// `execve`'s and `spawn`'s argument budget: `MAX_ARG_STRLEN` per string and
+/// the user stack in all. The stack builder's `E2BIG` is the real limit; this
+/// one stops the copy out of user memory before it gets that far.
+#[cfg(feature = "exec")]
+fn native_arg_budget() -> akuma_syscalls_proc::exec::Budget {
+    let stack = akuma_exec::runtime::config().user_stack_size;
+    akuma_syscalls_proc::exec::Budget::new(usize::MAX, akuma_config::MAX_ARG_STRLEN, stack)
+}
+
+/// A string from user memory as UTF-8, without a copy when it already is.
+#[cfg(feature = "exec")]
+fn utf8_lossy_owned(b: Vec<u8>) -> String {
+    String::from_utf8(b).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
+}
+
+/// An argv as the debug line prints it, `["a", "b"]`, without building it on the heap.
+#[cfg(feature = "exec")]
+struct ArgvDisplay<'a>(&'a [Vec<u8>]);
+
+#[cfg(feature = "exec")]
+impl core::fmt::Display for ArgvDisplay<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("[")?;
+        for (i, a) in self.0.iter().enumerate() {
+            if i > 0 {
+                f.write_str(", ")?;
             }
-            if str_ptr == 0 { break; }
-            // Fail the whole execve (E2BIG, Linux semantics) if an argument can't
-            // be copied — most often because it exceeds MAX_ARG_STRLEN. Previously
-            // this `break`d, which silently dropped the over-long arg AND every arg
-            // after it, then exec'd a corrupt argv (e.g. rustc saw `--check-cfg`
-            // with its giant value truncated away → "Argument to option missing").
-            if let Ok(s) = copy_from_user_str(str_ptr, akuma_config::MAX_ARG_STRLEN) { args.push(s) } else {
-                akuma_primitives::safe_print!(96, "[syscall] execve: argv[{}] too long or unreadable (cap={}) — E2BIG\n",
-                    i, akuma_config::MAX_ARG_STRLEN);
-                return E2BIG;
-            }
-            i += 1;
+            write!(f, "{:?}", core::str::from_utf8(a).unwrap_or("<non-utf8>"))?;
         }
+        f.write_str("]")
     }
+}
 
-    let env = parse_argv_array(envp_ptr);
+/// `execve` once its arguments are in the kernel: the shared
+/// [`super::execve::run`] over this kernel's [`NativeExec`].
+#[cfg(feature = "exec")]
+pub fn do_execve(req: super::execve::Request) -> u64 {
+    super::execve::run(&NativeExec, req)
+}
 
-    // Gated 2026-08-30, same reasoning as the `[PROC-EXIT]` line above: it was
-    // unconditional for the reason below, and that reason has aged out. The line
-    // fires once per `execve` at up to 2048 bytes — a `cargo build` in the guest
-    // prints a full rustc/ld command line per compilation unit, which is what
-    // makes the serial log unreadable during an in-VM build. Turn
-    // `syscall-debug-info` on to get it back (that also re-enables the
-    // pre-resolution `argv_ptr`/`envp_ptr` line above, and is what
-    // `scripts/bkl_smp_regimen/analyze_workload.py` now needs).
-    //
-    // Was: unconditional. 192 bytes truncated a linker's full argv (output path
-    // included) well before the interesting part — see
-    // docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §4.5,
-    // "no `ld` line names the crate proves nothing". Widened so the `-o <output>`
-    // argument survives for `cc`/`collect2`/`ld` invocations.
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        akuma_primitives::tprint!(2048, "[syscall] execve(path=\"{}\", args={:?}) PID {}\n", resolved_path, args, pid);
-    }
+/// The AArch64 kernel's half of `execve`.
+///
+/// A file the heap can take is read whole and loaded from memory; one it
+/// cannot (`FsError::Internal` from the read) is loaded from its path, its
+/// segments demand-paged. The new image starts with an `eret` from inside the
+/// syscall, so [`ExecArch::enter`](super::execve::ExecArch::enter) never returns.
+#[cfg(feature = "exec")]
+struct NativeExec;
 
-    do_execve(resolved_path, args, env)
+#[cfg(feature = "exec")]
+enum NativeImage {
+    /// The whole file.
+    Bytes(Vec<u8>),
+    /// Too big to read whole: loaded from the path. No head, so no `#!` check.
+    Path { size: usize },
 }
 
 #[cfg(feature = "exec")]
-pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
-    // Execute permission (`EACCES`). Root passes on any file with some x bit;
-    // see `akuma_isolation::dac::may`. Set-user-ID bits are never honoured:
-    // credentials pass through `execve` unchanged.
-    if let Err(e) = super::perm::check(&resolved_path, akuma_isolation::dac::MAY_EXEC) {
-        return e;
-    }
-    // Mark the file as being executed BEFORE its bytes are read, so it cannot be rewritten between the read and the mark (`ETXTBSY`,
-    // `docs/archive/ETXTBSY_TEXT_BUSY.md`). It must reach `Process::set_text` or be dropped before the `eret` below: this frame is
-    // abandoned on success, and a pin left in it would keep the file busy forever.
-    let Ok(text) = akuma_vfs_glue::text_pin(&resolved_path) else {
-        return ENOMEM;
-    };
-    // On the size profile the heap seed is 1 MB. Reading a large binary
-    // (e.g. the 700+ KB system linker that tcc invokes) would exhaust it.
-    // Read just the first 256 bytes — enough for shebang detection — and
-    // use the path-based loader for the actual ELF.
-    #[cfg(kernel_profile_extreme)]
-    let mut file_data: Option<alloc::vec::Vec<u8>> = {
-        let mut head = alloc::vec![0u8; 256];
-        match akuma_vfs_glue::fs::read_at(&resolved_path, 0, &mut head) {
-            Ok(n) => { head.truncate(n); Some(head) }
-            Err(akuma_vfs_glue::FsError::Internal) => None,
-            Err(e) => {
-                // Gated 2026-08-30: this is the PATH search, not an error. A shell
-                // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
-                // so a miss per entry is the NORMAL case and the flood scales with
-                // PATH length x exec count. A genuinely unreadable binary still
-                // surfaces as the execve's errno to the caller.
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
+impl super::execve::ExecArch for NativeExec {
+    type Image = NativeImage;
+    type Loaded = akuma_exec::process::LoadedExec;
+
+    fn read(&self, path: &str) -> Result<NativeImage, u64> {
+        // M5c hold-shortening: the BKL is DROPPED around the whole-file read so
+        // peer cores can enter the kernel while this core waits on disk
+        // (execve's dominant BKL-held window). Safe: nothing has touched the
+        // process yet, and the read goes only through the VFS/ext2/block locks.
+        // The dropped-window ledger keeps the window BKL-free across timer
+        // ticks; the syscall wrapper's leave_kernel still balances it.
+        #[cfg(kernel_bkl_smp)]
+        let dropped = akuma_bkl::policy::exec_bkl_drop_enabled();
+        #[cfg(kernel_bkl_smp)]
+        if dropped { akuma_exec::bkl::dropped_window_open(); }
+        let read = akuma_vfs_glue::fs::read_file(path);
+        #[cfg(kernel_bkl_smp)]
+        if dropped { akuma_exec::bkl::dropped_window_close(); }
+        match read {
+            Ok(data) => Ok(NativeImage::Bytes(data)),
+            Err(akuma_vfs_glue::FsError::Internal) => match akuma_vfs_glue::file_size(path) {
+                Ok(size) => Ok(NativeImage::Path { size: size as usize }),
+                Err(e) => {
+                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to stat {}\n", path);
+                    Err(super::fs::fs_error_to_errno(e))
                 }
-                return super::fs::fs_error_to_errno(e);
-            }
-        }
-    };
-    #[cfg(not(kernel_profile_extreme))]
-    let mut file_data = {
-        // M5c hold-shortening: DROP the BKL around the whole-file ELF read so peer cores can
-        // enter the kernel while this core waits on disk (execve's dominant BKL-held window).
-        // Safe: this runs before `replace_image` touches the process, and the read goes only
-        // through the VFS/ext2/block locks (all BKL-independent) — the same profile as the
-        // proven file-fault drop. The dropped-window ledger keeps the window BKL-free across
-        // timer ticks (a bare leave/enter pair let the first tick re-hold the BKL for the
-        // rest of the read); the syscall wrapper's leave_kernel still balances it.
-        #[cfg(kernel_smp_shared)]
-        let exec_dropped_bkl = akuma_bkl::policy::exec_bkl_drop_enabled();
-        #[cfg(kernel_smp_shared)]
-        if exec_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
-        let read_result = akuma_vfs_glue::fs::read_file(&resolved_path);
-        #[cfg(kernel_smp_shared)]
-        if exec_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
-        match read_result {
-            Ok(data) => Some(data),
-            Err(akuma_vfs_glue::FsError::Internal) => None,
-            Err(e) => {
-                // Gated 2026-08-30: this is the PATH search, not an error. A shell
-                // or cargo resolving `cc`/`rustc` probes every PATH entry in turn,
-                // so a miss per entry is the NORMAL case and the flood scales with
-                // PATH length x exec count. A genuinely unreadable binary still
-                // surfaces as the execve's errno to the caller.
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    akuma_primitives::safe_print!(128, "[syscall] execve: failed to read {}\n", resolved_path);
-                }
-                return super::fs::fs_error_to_errno(e);
-            }
-        }
-    };
-
-    if file_data.as_ref().is_some_and(|d| d.len() >= 2 && d[0] == b'#' && d[1] == b'!') {
-        // Owned handoff: exec_shebang frees the script bytes (and the original
-        // argv) BEFORE recursing into do_execve — the inner exec's eret abandons
-        // every frame below it, so nothing big may still be owned here.
-        let data = file_data.take().unwrap_or_default();
-        // The script is data; its interpreter is what runs, and the recursion marks that.
-        drop(text);
-        return exec_shebang(resolved_path, data, args, env);
-    }
-
-
-    // On the size profile file_data only holds the 256-byte shebang probe —
-    // always use replace_image_from_path for the actual ELF load.
-    #[cfg(kernel_profile_extreme)]
-    let mut file_data: Option<alloc::vec::Vec<u8>> = None;
-
-    // Resolve the on-demand load's file size before entering the exclusive
-    // window so the stat-failure early return stays outside it.
-    let file_size = if file_data.is_none() {
-        match akuma_vfs_glue::file_size(&resolved_path) {
-            Ok(sz) => sz as usize,
-            Err(e) => {
-                akuma_primitives::safe_print!(128, "[syscall] execve: failed to stat {}\n", resolved_path);
-                return super::fs::fs_error_to_errno(e);
-            }
-        }
-    } else {
-        0
-    };
-
-    // The destructive window. `with_own_process_exclusive` resolves the pid from
-    // this thread itself and checks the BKL, so the two mechanical clauses of
-    // `with_process_exclusive`'s contract are discharged in the crate that owns
-    // `Process` rather than asserted here; the no-nesting clause is why this stays
-    // the one enumerated call site (Phase 7f owns converting the window itself).
-    let ret = {
-        akuma_exec::process::with_own_process_exclusive(move |proc| {
-    let replace_result = if let Some(data) = file_data.take() {
-        let r = proc.replace_image(&data, &args, &env);
-        // Free the whole-file image buffer HERE, success or failure. The
-        // enter_user_mode below erets to EL0 and never returns, so any heap
-        // still owned by this frame at that point is leaked kernel heap —
-        // this exact leak (~1.1 MB per `busybox sh` execve) ratcheted the
-        // heap into the [OOM] wall under exec-heavy load (the rustc hammer).
-        drop(data);
-        r
-    } else {
-        proc.replace_image_from_path(&resolved_path, file_size, &args, &env)
-    };
-
-    if let Err(e) = replace_result {
-        akuma_primitives::safe_print!(128, "[syscall] execve: replace_image failed for {}: {}\n", resolved_path, e);
-        // `replace_image` returns a stringly-typed error from the ELF loader;
-        // a "Failed to load ELF: ..." message means the binary is malformed
-        // (missing PT_LOAD, bad magic, etc.) — Linux returns ENOEXEC for that.
-        //
-        // NOTE: close-on-exec fds are *not* closed until after this point.  On
-        // Linux, `execve` only closes O_CLOEXEC descriptors once it has
-        // committed to replacing the image (the point of no return).  If we
-        // closed them earlier and then failed here, the process would resume at
-        // the failed `execve` with a corrupted fd table.  For a libstd
-        // fork+exec child that means its O_CLOEXEC error-report pipe would
-        // already be gone, so it could neither report the exec failure to the
-        // parent nor leave the parent's handshake pipe in a coherent state.
-        return if e.contains("Failed to load ELF") { ENOEXEC } else { ENOMEM };
-    }
-    // `/proc/<pid>/exe` follows the new image (`ProcessImage::exe`). This
-    // kernel never refreshed it, so an exec'd process kept reporting whatever
-    // it was spawned as. `name` (the `comm`) is left as it was.
-    {
-        proc.image.lock().exe.clone_from(&resolved_path);
-    }
-    // The new image's executable is busy for as long as it runs (the old image's mark is released).
-    proc.set_text(text);
-
-    // Image replacement committed — *now* close the close-on-exec descriptors.
-    // This is the POSIX "point of no return": a successful execve closes every
-    // O_CLOEXEC fd, while a failed one (handled above) leaves them untouched.
-    let closed_fds = proc.close_cloexec_fds();
-    for (_fd, entry) in closed_fds {
-        match entry {
-            akuma_exec::process::FileDescriptor::PipeWrite(pipe_id) => super::pipe::pipe_close_write(pipe_id),
-            akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => super::pipe::pipe_close_read(pipe_id),
-            akuma_exec::process::FileDescriptor::UnixSocket { rx, tx, sock } => {
-                super::pipe::pipe_close_read(rx);
-                super::pipe::pipe_close_write(tx);
-                super::unixsock::unix_sock_close(sock);
-            }
-            akuma_exec::process::FileDescriptor::Socket(idx) => akuma_net::socket::remove_socket(idx),
-            akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
-                akuma_exec::process::remove_child_channel(child_pid);
-            }
-            #[cfg(feature = "sc-eventfd")]
-            akuma_exec::process::FileDescriptor::EventFd(efd_id) => super::eventfd::eventfd_close(efd_id),
-            #[cfg(feature = "sc-epoll")]
-            akuma_exec::process::FileDescriptor::EpollFd(epoll_id) => super::poll::epoll_destroy(epoll_id),
-            #[cfg(feature = "sc-pidfd")]
-            akuma_exec::process::FileDescriptor::PidFd(pidfd_id) => super::pidfd::pidfd_close(pidfd_id),
-            akuma_exec::process::FileDescriptor::PtyMaster(n) => super::pty::pty_close(n, true),
-            akuma_exec::process::FileDescriptor::PtySlave(n) => super::pty::pty_close(n, false),
-            _ => {}
+            },
+            // A PATH search misses once per entry, so a miss is the normal case
+            // and is not printed.
+            Err(e) => Err(super::fs::fs_error_to_errno(e)),
         }
     }
 
-    proc.image.lock().name.clone_from(&resolved_path);
-
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        akuma_primitives::safe_print!(128, "[syscall] execve: replaced image for PID {} with {}\n", proc.pid, resolved_path);
+    fn head<'a>(&self, image: &'a NativeImage) -> &'a [u8] {
+        match image {
+            NativeImage::Bytes(d) => d,
+            NativeImage::Path { .. } => &[],
+        }
     }
 
-    // This frame is abandoned by the eret below (enter_user_mode never
-    // returns), so destructors will not run: explicitly free every heap
-    // local the closure still owns. args/env were last used by
-    // replace_image*; resolved_path by the name/debug lines above.
-    drop(args);
-    drop(env);
-    drop(resolved_path);
-
-    // Wake any CLONE_VFORK parent that was blocked waiting for this exec.
-    // Must happen before enter_user_mode (which never returns).
-    let pid = proc.pid;
-    vfork_complete(pid);
-
-    proc.address_space.activate();
-
-    // Never returns. The `_checked` form refuses a context whose SPSR does not
-    // target EL0, which is what let the raw one be `unsafe`.
-    let ctx = proc.image.lock().context;
-    akuma_exec::process::enter_user_mode_checked(&ctx);
+    fn load(&self, image: NativeImage, path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Self::Loaded, u64> {
+        let r = match image {
+            // The whole-file buffer is freed as this arm ends, success or not:
+            // a heap buffer still owned when `enter` `eret`s is leaked (~1.1 MB
+            // per `busybox sh` exec once ratcheted the heap into the OOM wall).
+            NativeImage::Bytes(data) => akuma_exec::process::load_exec_bytes(&data, argv, envp),
+            NativeImage::Path { size } => akuma_exec::process::load_exec_path(path, size, argv, envp),
+        };
+        r.map_err(|e| {
+            akuma_primitives::safe_print!(128, "[syscall] execve: load failed for {}: {}\n", path, e);
+            // A "Failed to load ELF: ..." string means the binary is malformed
+            // (no PT_LOAD, bad magic) — Linux's `ENOEXEC`. "do not fit" is the
+            // stack builder refusing argv/envp.
+            if e.contains("do not fit") {
+                E2BIG
+            } else if e.contains("Failed to load ELF") {
+                ENOEXEC
+            } else {
+                ENOMEM
+            }
         })
-    };
-    // `None` means the process vanished between `current_pid` and the lookup;
-    // a successful exec never gets here (enter_user_mode does not return).
-    ret.unwrap_or(ESRCH)
-}
+    }
 
-#[cfg(feature = "exec")]
-fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<String>, env: Vec<String>) -> u64 {
-    // Parse everything we need out of `file_data` into OWNED strings first:
-    // this function recurses into do_execve, whose successful exec erets and
-    // abandons every frame below it — so the script bytes and the original
-    // argv must be freed BEFORE the recursion, not after it "returns".
-    // Shared with `spawn`'s shebang path so the two cannot drift: one parser, one
-    // argv-construction rule, both host-tested in akuma-exec's `shebang_tests`.
-    let head = &file_data[..file_data.len().min(akuma_exec::process::SHEBANG_MAX)];
-    let Some((interpreter, shebang_arg)) = akuma_exec::process::parse_shebang(head) else {
-        akuma_primitives::safe_print!(128, "[syscall] execve: invalid shebang in {}\n", script_path);
-        return ENOENT;
-    };
-
-    // TWO different strings, and collapsing them is a real bug. `interp_argv0` is
-    // the interpreter AS WRITTEN in the `#!` line and is what Linux puts in
-    // argv[0]; `interp_path` is the symlink-resolved file to actually load. This
-    // used to shadow one with the other, so an interpreter reached through a
-    // symlink lost its identity — and busybox is a multi-call binary that
-    // dispatches ENTIRELY on argv[0], so `#!/bin/sh` ran as `/bin/busybox` with
-    // argv[0]="/bin/busybox" and busybox had no idea it was meant to be a shell.
-    // See docs/archive/DEVBOX_ISSUES.md Issue 14.
-    let interp_argv0 = String::from(interpreter);
-    let interp_arg = shebang_arg.map(String::from);
-    drop(file_data); // last borrow (interpreter/shebang_arg) ended above
-
-    let interp_path = akuma_vfs_glue::resolve_symlinks(&interp_argv0);
-
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-        if let Some(ref arg) = interp_arg {
-            akuma_primitives::safe_print!(128, "[syscall] execve: shebang {} {} {}\n", interp_argv0, arg, script_path);
-        } else {
-            akuma_primitives::safe_print!(128, "[syscall] execve: shebang {} {}\n", interp_argv0, script_path);
+    fn stop_siblings(&self) {
+        if let Some(p) = akuma_exec::process::current_process_shared() {
+            p.kill_exec_siblings();
         }
     }
 
-    let mut new_args =
-        akuma_exec::process::shebang_hop(&interp_argv0, interp_arg.as_deref(), &script_path, &[]);
-    if original_args.len() > 1 {
-        new_args.extend_from_slice(&original_args[1..]);
+    fn with_target(&self, f: impl FnOnce(&akuma_exec::process::Process) -> u64) -> u64 {
+        // Resolves the pid from this thread and checks the BKL, discharging
+        // `with_process_exclusive`'s two mechanical clauses in the crate that
+        // owns `Process`. `None`: the process vanished.
+        akuma_exec::process::with_own_process_exclusive(f).unwrap_or(ESRCH)
     }
-    drop(original_args);
-    drop(script_path);
 
-    // If `interp_path` is ITSELF a script, do_execve recurses here and this
-    // function sees the resolved path as its `script_path` — one level deeper the
-    // as-written name is gone. `spawn`'s `resolve_shebang_chain` walks the whole
-    // chain in one pass and does not have that hole; matching it here means
-    // threading both names through do_execve's signature.
-    do_execve(interp_path, new_args, env)
+    fn install(&self, proc: &akuma_exec::process::Process, loaded: Self::Loaded) -> Result<(), u64> {
+        proc.install_loaded(loaded, &[]).map_err(|e| {
+            akuma_primitives::safe_print!(128, "[syscall] execve: install failed: {}\n", e);
+            ENOMEM
+        })
+    }
+
+    fn enter(&self, proc: &akuma_exec::process::Process) -> u64 {
+        proc.address_space.activate();
+        // Never returns. The `_checked` form refuses a context whose SPSR does
+        // not target EL0.
+        let ctx = proc.image.lock().context;
+        akuma_exec::process::enter_user_mode_checked(&ctx);
+    }
 }
 
 /// Fill `wait4`'s `rusage` for the child being reaped: its CPU time as `ru_utime`
@@ -1126,6 +1038,33 @@ fn report_child_rusage(rusage_ptr: u64, cpu_time_us: u64) {
     if rusage_ptr != 0 {
         let _ = write_user_val(rusage_ptr, &akuma_syscalls_linux::Rusage::with_cpu_time_us(cpu_time_us));
     }
+}
+
+/// Collect an exited child: its wait status to `status_ptr`, its rusage, and the
+/// reap (lazy regions, registration, child channel). Every reaping path in this
+/// file ends here: `wait4`'s four and `waitpid` (303).
+///
+/// **Report before reaping, and refuse to reap if the report failed.** The zombie
+/// is the only remaining copy of the exit status: reaping after a failed copy
+/// destroys it and hands the caller a pid as though it had been reported. Linux
+/// returns `EFAULT` here and leaves the child reapable, and so does this.
+///
+/// The CPU time is the child channel's, recorded when the exit was published:
+/// the thread slot it ran on may be recycled by now.
+fn reap_exited(pid: u32, ch: &akuma_exec::process::ProcessChannel, status_ptr: u64, rusage_ptr: u64) -> u64 {
+    let code = ch.exit_code();
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
+        let st = encode_wait_status(code);
+        akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", pid, code, st);
+    }
+    if status_ptr != 0 && write_user_val(status_ptr, &encode_wait_status(code)).is_err() {
+        return EFAULT;
+    }
+    report_child_rusage(rusage_ptr, ch.cpu_time_us());
+    akuma_exec::process::clear_lazy_regions(pid);
+    let _ = akuma_exec::process::unregister_process(pid);
+    akuma_exec::process::reap_child_channel(pid);
+    u64::from(pid)
 }
 
 pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
@@ -1161,31 +1100,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         if let Some(ch) = akuma_exec::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
-                    let code = ch.exit_code();
-                    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                        let st = encode_wait_status(code);
-                        akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", p, code, st);
-                    }
-                    if status_ptr != 0 {
-                        let status = encode_wait_status(code);
-                        // Report BEFORE reaping, and refuse to reap if the report failed.
-                        // The zombie is the only remaining copy of this exit status: reaping
-                        // after a failed copy_to_user destroys it permanently and hands the
-                        // caller a pid as though it had been reported, with nothing left to
-                        // wait on. Linux returns EFAULT here and leaves the child reapable.
-                        if write_user_val(status_ptr, &status).is_err() {
-                            return EFAULT;
-                        }
-                    }
-                    // Reap the zombie: remove from process table + child channels.
-                    // On Linux, waitpid is the only way to reap a zombie.
-                    // The child's CPU time, recorded when its exit was published: the
-                    // thread slot it came from may be recycled by now.
-                    report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                    akuma_exec::process::clear_lazy_regions(p);
-                    let _ = akuma_exec::process::unregister_process(p);
-                    akuma_exec::process::reap_child_channel(p);
-                    return u64::from(p);
+                    return reap_exited(p, &ch, status_ptr, rusage_ptr);
                 }
 
                 if wnohang {
@@ -1195,25 +1110,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 ch.add_poller(waiter_tid);
                 // Double-check after registering to avoid missed wakeup race.
                 if ch.has_exited() {
-                    let code = ch.exit_code();
-                    if status_ptr != 0 {
-                        let status = encode_wait_status(code);
-                        // Report BEFORE reaping, and refuse to reap if the report failed.
-                        // The zombie is the only remaining copy of this exit status: reaping
-                        // after a failed copy_to_user destroys it permanently and hands the
-                        // caller a pid as though it had been reported, with nothing left to
-                        // wait on. Linux returns EFAULT here and leaves the child reapable.
-                        if write_user_val(status_ptr, &status).is_err() {
-                            return EFAULT;
-                        }
-                    }
-                    // The child's CPU time, recorded when its exit was published: the
-                    // thread slot it came from may be recycled by now.
-                    report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                    akuma_exec::process::clear_lazy_regions(p);
-                    let _ = akuma_exec::process::unregister_process(p);
-                    akuma_exec::process::reap_child_channel(p);
-                    return u64::from(p);
+                    return reap_exited(p, &ch, status_ptr, rusage_ptr);
                 }
                 // Tested *before* blocking so that on wake the loop re-runs
                 // has_exited() first: a reapable child outranks EINTR. SIGCHLD
@@ -1235,30 +1132,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
 
         loop {
             if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
-                let code = ch.exit_code();
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    let st = encode_wait_status(code);
-                    akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
-                }
-                if status_ptr != 0 {
-                    let status = encode_wait_status(code);
-                    // Report BEFORE reaping, and refuse to reap if the report failed.
-                    // The zombie is the only remaining copy of this exit status: reaping
-                    // after a failed copy_to_user destroys it permanently and hands the
-                    // caller a pid as though it had been reported, with nothing left to
-                    // wait on. Linux returns EFAULT here and leaves the child reapable.
-                    if write_user_val(status_ptr, &status).is_err() {
-                        return EFAULT;
-                    }
-                }
-                // Reap the zombie
-                // The child's CPU time, recorded when its exit was published: the
-                // thread slot it came from may be recycled by now.
-                report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                akuma_exec::process::clear_lazy_regions(child_pid);
-                let _ = akuma_exec::process::unregister_process(child_pid);
-                akuma_exec::process::reap_child_channel(child_pid);
-                return u64::from(child_pid);
+                return reap_exited(child_pid, &ch, status_ptr, rusage_ptr);
             }
 
             if wnohang {
@@ -1268,30 +1142,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             akuma_exec::process::add_poller_to_all_children(waiter_tgid, waiter_tid);
             // Double-check after registering to avoid missed-wakeup race.
             if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
-                let code = ch.exit_code();
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    let st = encode_wait_status(code);
-                    akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
-                }
-                if status_ptr != 0 {
-                    let status = encode_wait_status(code);
-                    // Report BEFORE reaping, and refuse to reap if the report failed.
-                    // The zombie is the only remaining copy of this exit status: reaping
-                    // after a failed copy_to_user destroys it permanently and hands the
-                    // caller a pid as though it had been reported, with nothing left to
-                    // wait on. Linux returns EFAULT here and leaves the child reapable.
-                    if write_user_val(status_ptr, &status).is_err() {
-                        return EFAULT;
-                    }
-                }
-                // Reap the zombie
-                // The child's CPU time, recorded when its exit was published: the
-                // thread slot it came from may be recycled by now.
-                report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                akuma_exec::process::clear_lazy_regions(child_pid);
-                let _ = akuma_exec::process::unregister_process(child_pid);
-                akuma_exec::process::reap_child_channel(child_pid);
-                return u64::from(child_pid);
+                return reap_exited(child_pid, &ch, status_ptr, rusage_ptr);
             }
             // Before blocking, so a child that became reapable while we slept is
             // returned ahead of EINTR (see the pid>0 arm).
@@ -1466,7 +1317,10 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
                 let stack_size = akuma_exec::runtime::config().user_stack_size as u64;
                 (stack_size, stack_size)
             },
-            7 => (1024, 1024),
+            7 => (
+                akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT,
+                akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT,
+            ),
             _ => (RLIM_INFINITY, RLIM_INFINITY),
         };
         let rlim = Rlimit { rlim_cur: cur, rlim_max: max };
@@ -1489,7 +1343,9 @@ pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
         uptime: (akuma_primitives::clock::uptime_us() / 1_000_000).cast_signed(),
         totalram: akuma_exec::pmm::total_count() as u64 * 4096,
         freeram: akuma_exec::pmm::free_count() as u64 * 4096,
-        procs: 1,
+        // Registered processes, what `ps` lists (amd64's answer before the fold;
+        // this was a literal 1).
+        procs: u16::try_from(akuma_exec::process::process_count()).unwrap_or(u16::MAX),
         mem_unit: 1,
         ..Sysinfo::default()
     };
@@ -1786,17 +1642,11 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     // as a terminal so the kernel line discipline runs (sshd sets it for an
     // interactive login shell — the client's `pty-req`).
     let pty = (flags & SPAWN_FLAG_PTY) != 0;
-    let path = copy_from_user_str(path_ptr, 512)?;
-    
-    let args_vec = parse_argv_array(argv_ptr);
-    let env_vec = parse_argv_array(envp_ptr);
-    
-    let args_refs: Vec<&str> = if args_vec.len() > 1 {
-        args_vec.iter().skip(1).map(alloc::string::String::as_str).collect()
-    } else {
-        Vec::new()
-    };
-    
+    // Path against the caller's `cwd`, argv/envp under one budget: the same
+    // reader as `execve` and as the amd64 kernel's `spawn`. An over-long or
+    // unreadable string fails the call (`E2BIG`/`EFAULT`) instead of ending
+    // the list where it stood.
+    let req = super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
     let stdin_data = if stdin_ptr != 0 {
         if !BYPASS_VALIDATION.load(Ordering::Acquire)
             && !validate_user_ptr(stdin_ptr, stdin_len) { return Err(EFAULT); }
@@ -1808,21 +1658,54 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     } else {
         None
     };
-    
-    let stdin_slice = stdin_data.as_deref();
+    let pid = spawn_request(req, stdin_data.as_deref(), pty, false, None)?;
+    let Some(proc) = akuma_exec::process::current_process_shared() else {
+        return Err(ESRCH);
+    };
+    Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32))
+}
 
-    match akuma_exec::process::spawn_process_with_channel_ext(&path, Some(&args_refs), Some(&env_vec), stdin_slice, None, 0, pty) {
+/// Akuma's `spawn` (301) once its arguments are in the kernel, for both kernels.
+///
+/// The child is made by `akuma-exec`'s spawn, named by the caller's
+/// `argv[0]`, and its exit channel registered to the caller (pid 0 for a
+/// kernel task). The caller installs the `ChildStdout` descriptor, which is
+/// per kernel (amd64 has a table for kernel tasks).
+///
+/// An image that cannot be stat'ed is that errno (`ENOENT` for a missing
+/// file); any other failure is `ENOMEM`, with the reason printed.
+/// `own_terminal` and `attach`: see `akuma_exec::process::spawn_process_named`
+/// and `Attach` (a console's shell, a kernel's init).
+#[cfg(feature = "exec")]
+pub fn spawn_request(
+    req: super::execve::Request,
+    stdin: Option<&[u8]>,
+    pty: bool,
+    own_terminal: bool,
+    attach: Option<akuma_exec::process::Attach>,
+) -> Result<u32, u64> {
+    let super::execve::Request { path, argv, envp } = req;
+    if let Err(e) = akuma_vfs_glue::file_size(&akuma_vfs_glue::resolve_symlinks(&path)) {
+        return Err(super::fs::fs_error_to_errno(e));
+    }
+    let mut argv = argv.into_iter().map(utf8_lossy_owned);
+    let argv0 = argv.next();
+    let args_vec: Vec<String> = argv.collect();
+    let env_vec: Vec<String> = envp.into_iter().map(utf8_lossy_owned).collect();
+    let args_refs: Vec<&str> = args_vec.iter().map(String::as_str).collect();
+    match akuma_exec::process::spawn_process_named(
+        &path, argv0.as_deref(), own_terminal, Some(&args_refs), Some(&env_vec), stdin, None, 0, pty, None, attach,
+    ) {
         Ok((_tid, ch, pid)) => {
-            if let Some(proc) = akuma_exec::process::current_process_shared() {
-                akuma_exec::process::register_child_channel(pid, ch, proc.pid);
-                return Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32));
-            }
+            let spawner = akuma_exec::process::current_process_shared().map_or(0, |p| p.pid);
+            akuma_exec::process::register_child_channel(pid, ch, spawner);
+            Ok(pid)
         }
         Err(e) => {
-            akuma_primitives::safe_print!(128, "[sys_spawn] path={} failed: {}\n", path, e);
+            akuma_primitives::safe_print!(128, "[spawn] path={} failed: {}\n", path, e);
+            Err(ENOMEM)
         }
     }
-    Err(ENOMEM)
 }
 
 #[cfg(feature = "exec")]
@@ -2003,53 +1886,39 @@ pub fn sys_close_child_stdin(pid: u32) -> u64 {
     }
 }
 
-pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
-    if pid == 0 { return 0; }
-    // Linux: kill(pid <= 0, ...) targets a process group; we don't support
-    // those semantics, so return EPERM for "operation not permitted".
-    if pid <= 1 { return EPERM; }
-
-    // Box, then uid (`check_signal`). Before the probe below, so `kill(pid, 0)`
-    // cannot reveal a process in a box the caller cannot see.
-    if let Err(e) = akuma_exec::process::check_signal_pid(pid) {
-        return super::signal::deny_errno(e);
-    }
-
-    // sig=0 is a "does the process exist?" probe — don't actually send anything.
-    if sig == 0 {
-        return if akuma_exec::process::lookup_process_shared(pid).is_some() { 0 } else { ESRCH };
-    }
-
-    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED || akuma_config::SYSCALL_DEBUG_NET_ENABLED {
-        akuma_primitives::tprint!(96, "[signal] kill(pid={}, sig={})\n", pid, sig);
-    }
-
-    // Per-pid delivery (thread-group interrupt+pend, SIGKILL hard-kill, and
-    // the no-live-thread fallback) lives in `akuma_exec::process::deliver_signal`
-    // now, shared with `kill_process_group`'s per-member broadcast (used by the
-    // kernel's Ctrl-C/SIGINT handling — see `write_to_process_stdin`).
-    if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
-}
-
+/// Akuma's `waitpid` (303): `wait4(pid, status, WNOHANG)` for both kernels.
+///
+/// `pid` 0 and `u32::MAX` are any child. The answer is the reaped pid, `0` for a
+/// child that has not exited, or `ECHILD`. libakuma's `waitpid_status` (sshd,
+/// herd) polls it. The reap is `wait4`'s ([`reap_exited`]), and the "done"
+/// signal is the child channel's, which is published after the child's
+/// descriptors are closed, so a reap never runs while the child is still inside
+/// its exit path (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "One waitpid").
 #[cfg(feature = "akuma-native")]
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
-    if let Some(ch) = akuma_exec::process::get_child_channel(pid)
-        && ch.has_exited() {
-            if status_ptr != 0 {
-                let status = encode_wait_status(ch.exit_code());
-                if write_user_val(status_ptr, &status).is_err() {
-                    return EFAULT;
-                }
-            }
-            // Reap the zombie
-            akuma_exec::process::clear_lazy_regions(pid);
-            let _ = akuma_exec::process::unregister_process(pid);
-            akuma_exec::process::reap_child_channel(pid);
-            return u64::from(pid);
+    // **Only the parent's thread group may reap**, the rule `wait4` and
+    // `waitid` enforce through the same lookups. A caller with no process (a
+    // kernel thread) is tgid 0, which is what `spawn_request` records as the
+    // spawner of a child it starts; `wait4` has no such caller.
+    let waiter_tgid = akuma_exec::process::current_process_shared().map_or(0, |p| p.tgid);
+
+    // `0` and `-1` (`u32::MAX`) are any child, as `wait4(-1)`.
+    if pid == 0 || pid == u32::MAX {
+        if !akuma_exec::process::has_children(waiter_tgid) {
+            return ECHILD;
         }
-    0
+        return akuma_exec::process::find_exited_child(waiter_tgid)
+            .map_or(0, |(child, ch)| reap_exited(child, &ch, status_ptr, 0));
+    }
+    if !akuma_exec::process::is_child_of_group(pid, waiter_tgid) {
+        return ECHILD;
+    }
+    match akuma_exec::process::get_child_channel(pid) {
+        Some(ch) if ch.has_exited() => reap_exited(pid, &ch, status_ptr, 0),
+        _ => 0,
+    }
 }
 
 /// prctl - process control

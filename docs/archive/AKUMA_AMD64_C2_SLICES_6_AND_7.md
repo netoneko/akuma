@@ -307,7 +307,7 @@ evidence came from a plain interactive `sh`, not from the command under test.
 **`INITARGS` cannot carry spaces.** A one-shot applet (`INITARGS=uname,-a`) is
 what it is for; anything with a redirect, a `;` or a quoted string has to be
 run over ssh against a booted guest. The corrected measurements above were
-taken that way, against `git checkout HEAD -- amd64/src/` in the worktree.
+taken that way, against `git checkout HEAD -- crates/akuma-kernel-amd64/src/` in the worktree.
 
 ## Verification
 

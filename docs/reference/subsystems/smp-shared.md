@@ -2,9 +2,12 @@
 
 Classic symmetric multiprocessing: ONE shared kernel across all cores — one
 page-table set, one PMM/heap, one global run queue, real cross-core locking. Source:
-`src/smp_shared.rs`. Behind `cfg(kernel_smp_shared)` (the `smp-shared` feature).
-**In the default feature set since 2026-08-10** — a plain `cargo build --release`
-carries it.
+`crates/akuma-entry/src/smp_shared.rs`. **Every Akuma build** (AArch64 and amd64)
+is this; there is no feature to turn it off. The shared crates carry it as
+`bkl-smp` (cfg `kernel_bkl_smp`), which both Akuma kernels always enable and
+Taoxichuan does not (it serializes under its own lock —
+[`../../../proposals/ONE_BIG_KERNEL_LOCK.md`](../../../proposals/ONE_BIG_KERNEL_LOCK.md)).
+`akuma_bkl::ACTIVE` is asserted at compile time by both kernels.
 
 > **Stability: C (active development).** M0–M4 done as of 2026-07-19 (userspace runs +
 > migrates across cores; one open boot item, below). Progress log:
@@ -18,8 +21,8 @@ The one-kernel-per-core "multikernel" alternative (share-nothing, replicated
 ## Build & run
 
 ```bash
-cargo build --release --features smp-shared   # already the default feature set
-SMP=2 cargo run --release   # -smp 2 in QEMU
+cargo build --release
+SMP=2 cargo run --release   # -smp 2 in QEMU; SMP=1 is the same image on one core
 ```
 
 `SMP=N` (cargo_runner.sh) sets QEMU `-smp N`. The primary test image is
@@ -39,14 +42,14 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
   no per-thread depth crosses context switches. Contended acquisition is a **fair FIFO
   ticket wait** (M5c) so no core is starved — the reentrant/reconcile acquires take no
   ticket, keeping the counters balanced across context switches. Zero-cost no-op unless
-  `cfg(kernel_smp_shared)`. M1 wires it on the syscall path (`rust_sync_el0_handler`
+  `cfg(kernel_bkl_smp)`. M1 wires it on the syscall path (`rust_sync_el0_handler`
   wrapper + `enter_user_mode`); the IRQ/scheduler reconciliation is M2.
 - **Single global run queue + lock**; each core's current thread is `TPIDRRO_EL0`
   (already per-core hardware). The single `ThreadPool.current_idx`/`round_robin_idx`
   do not generalize and are being retired.
 - **TLB (M3, done):** the page-table *modification* flushes (`flush_tlb_all`/`_asid`/
   `_page`/`_range_all_asid`) broadcast over the inner-shareable domain (`...is`) under
-  `kernel_smp_shared`, so a user address space edited on one core is coherent on peers
+  `kernel_bkl_smp`, so a user address space edited on one core is coherent on peers
   running it. Real per-AS ASIDs are deferred (a perf optimization; all use ASID 0 today,
   which is correct given private per-core TLBs + IS edits + the **cross-AS**
   switch-flush). Since 2026-08-19 the switch-flush is conditional: a switch whose
@@ -69,7 +72,7 @@ real SMP) — see `scripts/build_devbox_smoltcp.sh` and
    `secondary_entry_shared` trampoline (asm, `.text.boot`), which loads the BSP's
    **shared** boot `TTBR0`/`TTBR1` and tail-calls `secondary_shared_start`.
 3. `secondary_shared_start(_ctx, core_idx)` (M2c) adopts its boot context as this core's
-   idle thread (`adopt_current_as_core_idle` → `TPIDRRO_EL0`, `register_core_idle`),
+   idle thread (`adopt_core_idle` → `TPIDRRO_EL0`, `register_core_idle`),
    inits its per-PE GIC receive path (CPU interface + redistributor + scheduler SGI 0 +
    timer PPI 27; device space is identity-mapped via boot L1[0]), installs the shared
    `exception_vector_table`, arms the shared 10 ms CNTV tick, enables IRQs, and enters an
@@ -94,7 +97,7 @@ they run on more than one core.
 | M5a — network SMP-safety, devbox boots to sshd under SMP | ✅ SMP=2 clean, SMP=4 works |
 | M5b — BKL-free user page-fault path (per-AS `as_lock`) | ✅ Stages 1–3 + 4a: fault PTE edits under `as_lock`, file read/install split, **file-fault block I/O runs BKL-dropped** (A/B measured a BKL-wait reduction on a busybox ELF-fault storm). 4b (full flip) deferred |
 | M5b BKL-hold profiler | ✅ Gated (`set_profiling`, default off). **Finding: IRQ/scheduler ≈70 % of contended BKL time, faults ≈20 %** under multi-process load |
-| M5c — split the run-queue lock out of the BKL | ✅ Step 1 (POOL covers the whole context switch — switch atomic on POOL alone) done + verified SMP=2/4. Step 2 (scheduler runs BKL-free on EL0 preemption) implemented + its SMP≥4 deadlock **fixed** (lldb-confirmed 2026-07-20 cross-core circular deadlock, *not* the earlier "fairness/monopoly" guess): a BKL-free secondary claimed a thread `RUNNING` without the BKL while the BSP held the BKL in a cooperative `yield_now` wait. Two-part fix, both landed: (1) don't hold the BKL across a cooperative wait — `idle_halt` in `exec_with_io_cwd` + `test_parallel_processes`; (2) a **fair FIFO ticket `KernelLock`** to kill the residual livelock. Validated 3/3 at SMP=4 (`test_smp_shared_cooperative_wait`) + fixed the pre-existing SMP=4 `parallel_processes` race. The step-2 toggle (`sched_bklfree_el0`) was briefly flipped on (2026-07-20) and reverted the same day for a separate bug: under heavy fork/exec churn at SMP≥4 the BKL-free path **leaked a fair-`KernelLock` ticket** (it was the only path that `reconcile`-acquired the BKL without a paired `enter_kernel`), drifting `next_ticket`/`now_serving` until the lock hard-deadlocked with `owner==0`. lldb-confirmed. **Fixed 2026-07-24**: the reconcile now goes through `reconcile_for_spsr_no_ticket`/`KernelLock::acquire_no_ticket`, a variant that never takes a ticket on this path, so there's nothing to leak. **`sched_bklfree_el0` defaults ON again since 2026-07-24.** See `debug-smp.md` §"M5c step-2". |
+| M5c — split the run-queue lock out of the BKL | ✅ Step 1 (POOL covers the whole context switch — switch atomic on POOL alone) done + verified SMP=2/4. Step 2 (scheduler runs BKL-free on EL0 preemption) implemented + its SMP≥4 deadlock **fixed** (lldb-confirmed 2026-07-20 cross-core circular deadlock, *not* the earlier "fairness/monopoly" guess): a BKL-free secondary claimed a thread `RUNNING` without the BKL while the BSP held the BKL in a cooperative `yield_now` wait. Two-part fix, both landed: (1) don't hold the BKL across a cooperative wait — `idle_halt` in `exec_with_io_cwd` + `test_parallel_processes`; (2) a **fair FIFO ticket `KernelLock`** to kill the residual livelock. Validated 3/3 at SMP=4 (`test_smp_shared_cooperative_wait`) + fixed the pre-existing SMP=4 `parallel_processes` race. The step-2 toggle (`sched_bklfree_el0`) was briefly flipped on (2026-07-20) and reverted the same day for a separate bug: under heavy fork/exec churn at SMP≥4 the BKL-free path **leaked a fair-`KernelLock` ticket** (it was the only path that `reconcile`-acquired the BKL without a paired `enter_kernel`), drifting `next_ticket`/`now_serving` until the lock hard-deadlocked with `owner==0`. lldb-confirmed. **Fixed 2026-07-24**: the reconcile now goes through `reconcile_for_spsr_no_ticket`/`KernelLock::acquire_no_ticket`, a variant that never takes a ticket on this path, so there's nothing to leak. **`sched_bklfree_el0` defaults ON again since 2026-07-24.** See `debug-smp.md` §"M5c step-2". **Step 2 and its toggle were removed 2026-11-11 with the SGI scheduler** ([`SGI_SCHEDULER_RESIDUE.md`](../../archive/SGI_SCHEDULER_RESIDUE.md)); the notes below on `sched_bklfree_el0` are history. |
 | M5d — blocking waits drop the BKL (`threading::blocking_relax`) | ✅ A thread parked in a blocking poll-wait must not hold the BKL, or it freezes every peer core. Fixed the **socket recv/accept/connect/send-space wait** (`akuma_net::socket::wait_until`), the **DNS-resolve wait** (`smoltcp_net.rs`, fires first on connect-by-hostname), the **demand-paging fault-slot spin** (`children.rs`), the **rump tap read** (rump-only), and hardened two fatal spawn parks (`spawn.rs`) to `mark_current_terminated` first. All route through one `blocking_relax()` (= `yield_now` then, under smp-shared, `idle_halt`); off smp-shared it is a plain `yield_now` (default build byte-identical). Regression test: `test_smp_shared_blocking_wait_peer_progress` (every core parked in `blocking_relax`, BSP still exec+reaps; 5/5 SMP=4). **Root cause**: the meow→LLM freeze — meow `connect`ed to the LLM then sat in the recv holding the BKL, freezing all 4 cores (thousands of `[BKL] stuck`). **After the fix**: meow streams full LLM responses at SMP=4 with **0** `[BKL] stuck`. |
 | M5e — deferred sibling kill at the EL1→EL0 boundary | ✅ `kill_thread_group` PHASE 1 no longer hard-marks siblings `TERMINATED` under smp-shared (which stranded spinlocks held by a sibling preempted mid-EL1 — lldb-confirmed: a forktest child died holding `BLOCK_DEVICE`, freezing every later disk I/O = the sshd "freeze"). It posts a per-thread pending-kill (`threading::request_thread_kill`), leaves the sibling schedulable, and grace-waits; each sibling self-terminates at its next kernel-exit boundary (`take_thread_kill_request`, checked in `rust_sync_el0_handler`'s BKL wrapper) where every lock has been released. Single-core keeps the direct mark (default build unchanged). Host tests + `test_deferred_kill_does_not_strand_locks`. |
 | M5 — fine-grained locking (real ASIDs, split BKL, cross-core wakeup) | in progress (see M5b/M5d/M5e) |

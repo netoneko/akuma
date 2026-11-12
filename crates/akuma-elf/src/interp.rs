@@ -37,14 +37,10 @@ fn resolve_interp_path(ipath: &str, prefix: Option<&str>) -> String {
 
 /// Resolve and load the interpreter named by a binary's PT_INTERP.
 ///
-/// The source is chosen by build profile, not by how the main binary was
-/// loaded. On the size profile the heap seed is only 1 MB: slurping a ~600 KB
-/// interpreter into the heap exhausts the seed before `PmmOomHandler` can grow
-/// it, leaving no room for the process being spawned. `ElfSource::Path` reads
-/// each PT_LOAD page with a single `read_at` (4 KB scratch buffer, freed
-/// immediately), keeping peak heap use under 10 KB regardless of interpreter
-/// size. Every other profile can afford the slurp and prefers it, because one
-/// large sequential read beats hundreds of 4 KB ones.
+/// The interpreter is slurped whatever way the main binary was loaded: one large
+/// sequential read beats hundreds of 4 KB ones. (`ElfSource::Path`, which reads
+/// each PT_LOAD page with its own `read_at`, kept peak heap under 10 KB for the
+/// removed 4 MB `extreme-size` build.)
 pub(super) fn load_interp_for<A: UserPages>(
     ipath: &str,
     prefix: Option<&str>,
@@ -61,10 +57,7 @@ pub(super) fn load_interp_for<A: UserPages>(
         log::debug!("[ELF] Loading interpreter: {}", resolved);
     }
 
-    #[cfg(kernel_profile_extreme)]
-    let interp_info = load_interpreter(ElfSource::Path(&resolved), address_space)?;
 
-    #[cfg(not(kernel_profile_extreme))]
     let interp_info = {
         // M5c hold-shortening: drop the BKL around the dynamic-interpreter whole-file read
         // (a second ~1 MB read for dynamically-linked binaries), mirroring the main-binary

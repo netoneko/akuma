@@ -50,7 +50,7 @@ sees the data. The tty findings below are that seam.
   documented as *the* input path ("there is currently no caller — this note is
   for whoever wires one up"). Zero callers anywhere, tests included. Real
   input arrives via `ProcessChannel::write_stdin` + the amd64 console pump,
-  which fires `input_waker` directly (`amd64/src/console.rs:385`), bypassing
+  which fires `input_waker` directly (`crates/akuma-kernel-amd64/src/console.rs:385`), bypassing
   `input_buffer` entirely. **A vestigial second view of stdin next to the
   real one is exactly the incident's shape.**
 - **`ProcessChannel::is_raw_mode`** (`akuma-exec/src/process/channel.rs:556`)
@@ -96,7 +96,7 @@ churn test; the 80-session run was QEMU only.
   kernel-core ring's clear is orphaned and aarch64 has no syslog handler.
   Divergent `dmesg -c` semantics, medium.
 - `Pipe::is_write_closed` / `is_readable` (`akuma-pipe/src/lib.rs:111,117`) —
-  the EOF/readiness predicates, unused; `amd64/src/pipe.rs` re-tests
+  the EOF/readiness predicates, unused; `crates/akuma-kernel-amd64/src/pipe.rs` re-tests
   emptiness by hand. Predicate-drift trap, low–medium.
 
 ### 1.3 Self-tuning machinery whose adaptive half never runs
@@ -504,7 +504,7 @@ at every call site. The four `in`/`out` instructions are the crate's only `unsaf
 against a fake bus and assert each device's access sequence, that it stays inside
 its range, and that the registry has no overlaps except the named `0xCF9`-inside-
 `0xCF8` alias. Moved: `serial`, `reboot`, `clock`, `lapic`, `kbd`, `pci`,
-`multiboot2`; `amd64/src/port.rs` is deleted. Measured with
+`multiboot2`; `crates/akuma-kernel-amd64/src/port.rs` is deleted. Measured with
 `cloc_akuma.py src crates amd64`: `unsafe` 812 -> 789 sites, 2838 -> 2745 lines
 tree-wide (amd64 alone 342 -> 315 sites). **Still open from tier 1:** `gdt.rs`
 (the invariant is the `sysret`/`syscall` selector order, so a wrapper has to encode
@@ -576,7 +576,7 @@ component with any `unsafe`, or a lost `forbid` fails; a decrease is a note that
 
 2. **Finish the fold on drivers that already have pure twins.** The xHCI split
    is the model — `crates/akuma-xhci` is 2,178 lines of pure layout/bit math
-   under `#![forbid(unsafe_code)]` while `amd64/src/xhci.rs` (2,548 lines) is
+   under `#![forbid(unsafe_code)]` while `crates/akuma-kernel-amd64/src/xhci.rs` (2,548 lines) is
    the acting half. Same shape for hda (1,700 vs 1,138), rtw89 (3,809 vs
    865+1,532), touchpad (2,386 vs 786). The remaining lift: MMIO register
    access behind wrappers, so acting halves shrink toward interrupt + DMA
@@ -586,9 +586,9 @@ component with any `unsafe`, or a lost `forbid` fails; a decrease is a note that
    is *M1 groundwork*: EPT is the same data structure with different flags, and
    the microVM runner reuses the walker directly. `lapic.rs` wants to sit next
    to the aarch64 timer/GIC crates. And the split between `akuma-exceptions`
-   (3,126 lines, exists) and `amd64/src/idt.rs` (2,482 lines, still 83
+   (3,126 lines, exists) and `crates/akuma-kernel-amd64/src/idt.rs` (2,482 lines, still 83
    `unsafe`) deserves an audit — the boundary is undefined.
-4. **`amd64/src/dns.rs` — the one genuine duplication, and it is a live §1
+4. **`crates/akuma-kernel-amd64/src/dns.rs` — the one genuine duplication, and it is a live §1
    hit.** The shared, tested `akuma_net::dns::resolve_host_blocking` hung on
    its *first-ever amd64 caller* (SNTP bootstrap, 2026-09-05, 90 s, no
    timeout); `dns.rs` is the hand-rolled A-record client routed around it,
@@ -601,7 +601,7 @@ component with any `unsafe`, or a lost `forbid` fails; a decrease is a note that
 The amd64 kernel was built stage-by-stage *wiring the shared crates in
 unmodified* wherever the code decides anything (`blk.rs`: "the first time it
 runs a driver from the shared crates"; `sock.rs`: "Wiring, not implementation";
-`futex.rs`: "The decisions are not here"). Each amd64/src file that pairs with
+`futex.rs`: "The decisions are not here"). Each crates/akuma-kernel-amd64/src file that pairs with
 a crate is the deliberate **acting half** — `xhci.rs` is "the MMIO / DMA half
 of the xHCI driver, over `akuma_xhci`" — and both halves are always used
 together: the crate is compiled into the amd64 kernel, the acting half is what
@@ -625,7 +625,7 @@ while `dns.rs` walked a resolver list on a timeout *or* an answer without a reco
 *client*, not the call site: `crates/akuma-dns` (pure, `forbid(unsafe_code)`, 22
 host tests where `dns.rs` had none) holds the wire format and the walk/retransmit
 loop over effects (the `akuma-sntp` shape); `akuma_net::dns::resolve_ipv4` wires
-it to the UDP sockets and is now the resolver for every target. `amd64/src/dns.rs`,
+it to the UDP sockets and is now the resolver for every target. `crates/akuma-kernel-amd64/src/dns.rs`,
 `smoltcp_net::dns_query` and smoltcp's DNS socket (one socket slot) are deleted.
 **Policy stayed per-kernel:** amd64 sets fallbacks (1.1.1.1, 8.8.8.8) at net
 bring-up; AArch64 sets none, so its behaviour is unchanged — an `NXDOMAIN` from the
@@ -643,7 +643,7 @@ case) was not exercised on metal.
 
 Ordering: tier 1 immediately (days); tier 4's `dns.rs` fix rides the §3.30
 bug; tier 3's `akuma-paging` before §3.4 M1 so the hypervisor starts on an
-extracted, tested walker instead of a fork of `amd64/src/paging.rs`.
+extracted, tested walker instead of a fork of `crates/akuma-kernel-amd64/src/paging.rs`.
 
 **Next fold: platform crates for the acting halves.** The pure/acting split
 already works *within* one kernel; the natural extension is giving each

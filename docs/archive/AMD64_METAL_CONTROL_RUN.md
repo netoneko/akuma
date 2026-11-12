@@ -16,7 +16,7 @@ Both failures are **pre-existing**: neither is caused by the unsafe audit.
 
 ## Open items (not root-caused)
 
-1. `physmap: reaches PHYSMAP_LIMIT` (`amd64/src/mem.rs`): **bisected 2026-10-18 to
+1. `physmap: reaches PHYSMAP_LIMIT` (`crates/akuma-kernel-amd64/src/mem.rs`): **bisected 2026-10-18 to
    `410117ce` (akuma-fbdev + akuma-fbcon)** — fails on every GRUB/multiboot2 boot
    with the fb console up (metal and the ryzen QEMU rehearsal), passes under PVH
    or `nofb`. The CPUID suspects below are ruled out (a software walk reads RAM),
@@ -32,13 +32,13 @@ Both failures are **pre-existing**: neither is caused by the unsafe audit.
 
 ## Same day: items 3-4 of the audit (600 -> 589 sites)
 
-- `amd64/src/mm.rs`: 9 -> 0. The physmap views went onto the checked helpers
+- `crates/akuma-kernel-amd64/src/mm.rs`: 9 -> 0. The physmap views went onto the checked helpers
   `akuma-mmu` already had (`with_phys_bytes_mut`, `copy_to_phys`,
   `copy_from_phys`, bounds-checked by `akuma_pmm::contains`) and
   `alloc_page_zeroed`, so no new `unsafe` anywhere. Zeroing a live frame copies
   from a `static ZERO_PAGE`. The two write-back paths copy a page into a stack
   buffer instead of borrowing a view of a frame userspace may be storing into.
-- `amd64/src/uaccess.rs`: `clac` moved into a new safe `akuma_cpu::smap::clac()`
+- `crates/akuma-kernel-amd64/src/uaccess.rs`: `clac` moved into a new safe `akuma_cpu::smap::clac()`
   (`akuma-cpu` +1, `amd64` -1: isolated, not removed); `write_val` uses
   `akuma_user_access::as_user_bytes`; three self-test frame fills use
   `copy_to_phys`. Kept as they were: the `cr0`/`cr4` writes (writes stay
@@ -46,7 +46,7 @@ Both failures are **pre-existing**: neither is caused by the unsafe audit.
   `read_val`'s `MaybeUninit` and the volatile read-backs in the self-tests (a
   non-volatile read could be forwarded from the preceding store and make "the
   page is unchanged" pass vacuously).
-- `amd64/src/net.rs`: the open-coded `rdtsc` in `weak_fill` -> `akuma_cpu::tsc`.
+- `crates/akuma-kernel-amd64/src/net.rs`: the open-coded `rdtsc` in `weak_fill` -> `akuma_cpu::tsc`.
 
 Verification: host tests for `akuma-cpu` and `akuma-mmu` pass. QEMU SMP=4: two
 runs of 824 passed / 0 failed. A first run printed 3 failures
@@ -159,7 +159,7 @@ p3 state: `/boot/akuma-amd64` = head `no-tests` built natively at `b37eb82f`
   pattern kill.
 - Left: `akuma-threading` 65 and `akuma-cpu` 65 (context switch and instruction
   wrappers - irreducible by design), `akuma-virtio` 38, `akuma-net-nic` 29,
-  `akuma-alloc` 24, `akuma-user-access` 20, `amd64/src` 81 (mostly MSR/CR
+  `akuma-alloc` 24, `akuma-user-access` 20, `crates/akuma-kernel-amd64/src` 81 (mostly MSR/CR
   writes, extern symbols and `MmioWindow::new` claims).
 
 ## 2026-10-19: `akuma-virtio` 38 -> 12, `akuma-net-nic` 29 -> 14, total 486 -> 446
@@ -183,7 +183,7 @@ p3 state: `/boot/akuma-amd64` = head `no-tests` built natively at `b37eb82f`
   `&self` methods could reach `&mut VirtIOBlk`, but the only access path is a
   `Spinlock`, which already hands out `&mut`. The methods take `&mut self`;
   `with_device_at`/`with_device` now pass `&mut VirtioBlockDevice` (five callers
-  in `akuma-syscalls-glue` and `amd64/src/blk.rs` became closures).
+  in `akuma-syscalls-glue` and `crates/akuma-kernel-amd64/src/blk.rs` became closures).
 - **`virtio/probe.rs` 3 -> 2:** the two `MmioTransport::new` sites share
   `transport_at`. New safe `probe::transport_at_slot(addr)` checks `addr` against
   the slot table before constructing, so `rump_tap::init_at` lost its `unsafe`.

@@ -2,7 +2,7 @@
 name = "akuma-boot-amd64"
 version = "0.1.0"
 edition = "2024"
-description = "The amd64 boot kit, extracted from amd64/src: the PVH/multiboot2 trampoline (boot.s), the physmap translations (phys.rs), the kernel's own page-table mappings (paging.rs), and the heap+PMM bring-up (mem.rs) — everything a composed amd64 kernel needs before it can allocate, pulled as crates instead of inherited as modules"
+description = "The amd64 boot kit, extracted from crates/akuma-kernel-amd64/src: the PVH/multiboot2 trampoline (boot.s), the physmap translations (phys.rs), the kernel's own page-table mappings (paging.rs), and the heap+PMM bring-up (mem.rs) — everything a composed amd64 kernel needs before it can allocate, pulled as crates instead of inherited as modules"
 
 [lints]
 workspace = true
@@ -20,9 +20,10 @@ akuma-pmm = { path = "../akuma-pmm" }
 akuma-phys = { path = "../akuma-phys" }
 # The kernel heap allocator `mem.rs` brings up.
 akuma-alloc = { path = "../akuma-alloc" }
-# `MachineDescription`/`MemRegion` — the memory map `mem.rs` walks. No other
-# dependency of that crate, so this edge stays cheap.
-akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
+# `Facts` — the RAM regions `mem.rs` walks, in the neutral shape both boot
+# protocols (PVH, multiboot2) produce. Not the protocol crate: a parser change
+# there cannot change what memory bring-up believes. Dependency-free.
+akuma-machine-facts = { path = "../akuma-machine-facts" }
 # The amd64 page-table walker (`paging.rs` is its machine half: the active root,
 # the physmap as `PhysMap`, and the map/unmap/translate wrappers).
 akuma-pagetable = { path = "../akuma-pagetable" }
@@ -30,3 +31,9 @@ akuma-pagetable = { path = "../akuma-pagetable" }
 akuma-pte-amd64 = { path = "../akuma-pte-amd64" }
 # `cr3` reads, `invlpg`, `load_cr3` — the register half of `paging.rs`.
 akuma-cpu = { path = "../akuma-cpu" }
+# The RAM-proportional heap-sizing fallback `mem.rs` retries with — pure, no deps, shared with
+# AArch64's `akuma-kernel-glue` (config flag sweep, 2026-11-11).
+akuma-mem-policy = { path = "../akuma-mem-policy" }
+# `mb2`: the information block parser, and the lock its one copy lives behind.
+akuma-multiboot2 = { path = "../akuma-multiboot2" }
+spinning_top = "0.3"

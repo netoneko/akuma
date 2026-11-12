@@ -40,9 +40,7 @@ which writes the UART directly with IRQs disabled on the current core
 > `build.rs`). With it on, the whole per-call byte sequence is atomic
 > across cores, and a panic / sync exception landing while this core
 > already holds the lock takes the reentrant fast path instead of
-> self-deadlocking. Off in size/extreme (single-core targets); opt out
-> in `release` with `CONSOLE_LOCK=0`, force-on in size with
-> `CONSOLE_LOCK=1`. Background and verification:
+> self-deadlocking. On in every build; opt out with `CONSOLE_LOCK=0`. Background and verification:
 > `docs/archive/UART_SMP_INTERLEAVE_FIX.md`.
 
 ## Formatting without heap allocation
@@ -108,6 +106,15 @@ Concretely:
   heap-free by construction, padding included. The risk is always an
   *argument expression* that allocates before formatting starts.
 
+- **Don't** allocate while holding a console sink's lock. The allocator itself
+  prints: `akuma-alloc`'s heap monitor reports a crossed threshold through
+  `safe_print!`, and on amd64 every print reaches the framebuffer console's
+  `CONSOLE` lock (`multiboot2::mirror_byte`). An allocation made under that lock
+  that crosses a threshold re-enters the lock and spins forever. Size the
+  allocation under the lock, drop the lock, allocate, then lock again to install
+  it (`multiboot2::fb_enable_double_buffer`;
+  [`AMD64_FB_BACK_BUFFER_DEADLOCK.md`](../../archive/AMD64_FB_BACK_BUFFER_DEADLOCK.md)).
+
 Two narrow exemptions, both established by the audit rather than assumed:
 
 1. **Genuinely variable-cardinality output** — a loop over a runtime-sized
@@ -126,7 +133,7 @@ Two narrow exemptions, both established by the audit rather than assumed:
    `is_print_registered()` and skips the format-and-print entirely when unset.
    A diagnostic must never be the thing that panics.
 
-Boot self-tests (`src/tests.rs`, `src/process_tests.rs`, `src/shell_tests.rs`)
+Boot self-tests (`crates/akuma-kernel-tests-aarch64/src/tests.rs`, `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `src/shell_tests.rs`)
 are out of scope — they run in ordinary thread context at boot, never inside
 IRQ/lock/allocator-reentrant code, and their `format!` calls mostly build test
 fixture paths rather than console content. Likewise `/proc` file *contents*

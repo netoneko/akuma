@@ -177,7 +177,7 @@ pub mod syscall {
         pub const GETRANDOM: u64 = 278;
         pub const RESOLVE_HOST: u64 = 300;
         /// `console_notify` — put a line on the kernel console. Wired only on
-        /// the amd64 target (behind its `console-notify` feature); on AArch64
+        /// the amd64 target; on AArch64
         /// the number is reserved but the call returns `ENOSYS`.
         pub const CONSOLE_NOTIFY: u64 = 322;
         pub const SPAWN: u64 = 301;
@@ -223,6 +223,7 @@ pub mod syscall {
         pub const FCHOWNAT: u64 = 54;
         pub const CLONE: u64 = 220;
         pub const WAIT4: u64 = 260;
+        pub const PPOLL: u64 = 73;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
         pub const SET_BOX_STACK: u64 = 324;
         /// Real Linux asm-generic numbers, used only by the `linux-abi`
@@ -232,6 +233,14 @@ pub mod syscall {
         /// has no handler for at all.
         pub const EXECVE: u64 = 221;
         pub const DUP3: u64 = 24;
+        /// `setsid(2)`, for the pty child: a session of its own before `TIOCSCTTY`.
+        pub const SETSID: u64 = 157;
+        /// `rt_sigaction(2)` / `rt_sigprocmask(2)`, for the pty child's reset to
+        /// default dispositions and an empty mask before `execve`.
+        pub const RT_SIGACTION: u64 = 134;
+        pub const RT_SIGPROCMASK: u64 = 135;
+        /// `close_range(2)`: 436 in both tables.
+        pub const CLOSE_RANGE: u64 = 436;
         /// asm-generic `reboot(2)`. See [`super::super::reboot`].
         pub const REBOOT: u64 = 142;
     }
@@ -272,8 +281,8 @@ pub mod syscall {
         pub const GETRANDOM: u64 = 318;
         pub const RESOLVE_HOST: u64 = AKUMA_PRIVATE_BASE + 300;
         /// `console_notify` — put a line straight on the framebuffer/serial
-        /// console. Wired on this target behind the kernel's `console-notify`
-        /// feature (default-on); `/bin/wall` is the front end.
+        /// console. Always wired on this target;
+        /// `/bin/wall` is the front end.
         pub const CONSOLE_NOTIFY: u64 = AKUMA_PRIVATE_BASE + 322;
         pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
         /// Akuma-private `kill(pid, sig)` (Linux `kill` is not in this table).
@@ -319,6 +328,7 @@ pub mod syscall {
         pub const FCHOWNAT: u64 = 260;
         pub const CLONE: u64 = 56;
         pub const WAIT4: u64 = 61;
+        pub const PPOLL: u64 = 271;
         /// Select a box's network stack (`0` smoltcp, `1` NetBSD rump).
         pub const SET_BOX_STACK: u64 = AKUMA_PRIVATE_BASE + 324;
         /// Real x86_64 numbers for the `linux-abi` `spawn_full` path, the
@@ -330,9 +340,16 @@ pub mod syscall {
         /// `--features linux-net` a build error on this target.
         pub const EXECVE: u64 = 59;
         pub const DUP3: u64 = 292;
+        /// `setsid(2)` — x86_64 112 (asm-generic 157 is `setregid` territory here).
+        pub const SETSID: u64 = 112;
+        /// `rt_sigaction(2)` / `rt_sigprocmask(2)` — x86_64 13 / 14.
+        pub const RT_SIGACTION: u64 = 13;
+        pub const RT_SIGPROCMASK: u64 = 14;
+        /// `close_range(2)`: 436, the same as asm-generic.
+        pub const CLOSE_RANGE: u64 = 436;
         /// Real x86_64 `reboot(2)` — **169**, not the asm-generic 142 (which is
         /// `s390_pci_mmio_write`-adjacent territory on this arch, not reboot).
-        /// `amd64/src/usermode.rs` dispatches `Syscall::Reboot` straight to
+        /// `crates/akuma-kernel-amd64/src/usermode.rs` dispatches `Syscall::Reboot` straight to
         /// `crate::reboot::sys_reboot`. See [`super::super::reboot`].
         pub const REBOOT: u64 = 169;
     }
@@ -420,7 +437,7 @@ pub struct ProcessInfo {
 ///
 /// * The `linux-abi` feature — the page is not a thing on standard Linux.
 /// * **`target_arch = "x86_64"`, unconditionally.** The amd64 kernel does not
-///   map it: `amd64/src/usermode.rs` states `process_info_phys: 0` — "the
+///   map it: `crates/akuma-kernel-amd64/src/usermode.rs` states `process_info_phys: 0` — "the
 ///   ProcessInfo page is **not mapped, not allocated, and not missed**" —
 ///   reasoning about the *kernel's* `read_current_pid`, which on that target
 ///   resolves identity through `THREAD_PID_MAP` instead. That reasoning is
@@ -1125,6 +1142,35 @@ pub fn listen(fd: i32, backlog: i32) -> i32 {
     ) as i32
 }
 
+/// One `struct pollfd`: the fd, the events asked for, the events that happened.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PollFd {
+    pub fd: i32,
+    pub events: i16,
+    pub revents: i16,
+}
+
+/// Readable (or, on a listening socket, a connection is waiting to be accepted).
+pub const POLLIN: i16 = 0x001;
+
+/// Wait until one of `fds` is ready or `timeout_ms` passes (`< 0`: no timeout), as
+/// `poll(2)`. Issued as `ppoll` with no signal mask, which both architectures have.
+/// Returns how many fds have events (0 on timeout), or a negative errno.
+pub fn poll(fds: &mut [PollFd], timeout_ms: i32) -> isize {
+    let ts;
+    let tsp = if timeout_ms < 0 {
+        0
+    } else {
+        ts = Timespec {
+            tv_sec: i64::from(timeout_ms / 1000),
+            tv_nsec: i64::from(timeout_ms % 1000) * 1_000_000,
+        };
+        &ts as *const Timespec as u64
+    };
+    syscall(syscall::PPOLL, fds.as_mut_ptr() as u64, fds.len() as u64, tsp, 0, 0, 0) as i64 as isize
+}
+
 /// Accept a connection
 pub fn accept(fd: i32) -> i32 {
     accept_addr(fd).0
@@ -1241,8 +1287,8 @@ pub fn resolve_host(hostname: &str) -> Result<[u8; 4], i32> {
 /// there is. The kernel frames the message and strips control bytes; at most
 /// 512 bytes are taken.
 ///
-/// Returns `Err(ENOSYS)` on a kernel built without the `console-notify` feature
-/// (every target but amd64, today).
+/// Returns `Err(ENOSYS)` on a kernel that does not serve it (every target but
+/// amd64, today).
 pub fn console_notify(msg: &str) -> Result<(), i32> {
     let ret = syscall(
         syscall::CONSOLE_NOTIFY,
@@ -1364,7 +1410,7 @@ pub struct Stat {
 
 /// The x86_64 `struct stat` — 144 bytes. See [`Stat`]'s doc above for why this
 /// is a separate definition rather than a shared one; it mirrors
-/// `amd64/src/fd.rs`'s `encode_stat` field for field.
+/// `crates/akuma-kernel-amd64/src/fd.rs`'s `encode_stat` field for field.
 #[cfg(target_arch = "x86_64")]
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default)]
@@ -2047,6 +2093,12 @@ pub struct SpawnResult {
     /// kernel owns the child's stdin channel; reach it through
     /// `/proc/<pid>/fd/0` and end it with [`close_child_stdin`].
     pub stdin_fd: Option<u32>,
+    /// The child's stdio is a real terminal (`/dev/pts/N`, made by the
+    /// `linux-abi` spawn for `SPAWN_FLAG_PTY`): its line discipline already
+    /// turns `\n` into `\r\n`, so a caller relaying `stdout_fd` to a remote
+    /// terminal must not cook it a second time. `false` for a pipe, and for
+    /// the native spawn, whose output has always been relayed raw.
+    pub terminal: bool,
 }
 
 /// Spawn a child process
@@ -2093,7 +2145,7 @@ pub fn spawn_pty(path: &str, args: Option<&[&str]>, env: &[&str]) -> Option<Spaw
 /// getting a pipe or a session channel of its own. Honoured only by the amd64
 /// kernel (the one whose console is an input device); the AArch64 kernel
 /// ignores the bit and spawns an ordinary piped child. Keep in sync with
-/// `SPAWN_FLAG_CONSOLE` in `amd64/src/usermode.rs`.
+/// `SPAWN_FLAG_CONSOLE` in `crates/akuma-kernel-amd64/src/usermode.rs`.
 pub const SPAWN_FLAG_CONSOLE: u64 = 2;
 
 /// Spawn a child attached to the machine's console (see [`SPAWN_FLAG_CONSOLE`]).
@@ -2206,7 +2258,7 @@ fn spawn_full(
     // Extract PID (low 32 bits) and stdout_fd (high 32 bits)
     let pid = (result & 0xFFFF_FFFF) as u32;
     let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
-    Some(SpawnResult { pid, stdout_fd, stdin_fd: None })
+    Some(SpawnResult { pid, stdout_fd, stdin_fd: None, terminal: false })
 }
 
 /// `linux-abi` process spawn: Akuma's own `SPAWN` (301) is a single private
@@ -2219,7 +2271,8 @@ fn spawn_full(
 /// Built from the real Linux primitives instead: two `pipe2`s (the child's
 /// stdout and stdin), [`fork`] (already a genuine `CLONE` syscall — this part
 /// was never broken), `dup3` to move the pipes' ends onto the child's fds 1 and
-/// 0, then `execve`. `flags` (pty) is not wired up on this path.
+/// 0, then `execve`. With [`SPAWN_FLAG_PTY`] the child gets a pseudo-terminal
+/// instead of pipes ([`spawn_pty_linux`]), when the kernel has one.
 ///
 /// **The stdin pipe is the half that was missing until 2026-11-01.** Without it
 /// the child inherited the spawner's own fd 0, and sshd's pump — which writes
@@ -2237,14 +2290,18 @@ fn spawn_full(
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
     env: &[&str],
-    _flags: u64,
+    flags: u64,
 ) -> Option<SpawnResult> {
     let (path_terminated, _args_terminated, argv, _env_terminated, envp) = build_argv_envp(path, args, env);
     let envp_arg = if env.is_empty() { core::ptr::null() } else { envp.as_ptr() };
 
-    let Some((out_read, out_write)) = pipe_cloexec() else {
-        return None;
-    };
+    if flags & SPAWN_FLAG_PTY != 0 && stdin.is_none() {
+        if let Some(r) = spawn_pty_linux(path_terminated.as_bytes(), &argv, envp_arg) {
+            return Some(r);
+        }
+    }
+
+    let (out_read, out_write) = pipe_cloexec()?;
     let Some((in_read, in_write)) = pipe_cloexec() else {
         close(out_read);
         close(out_write);
@@ -2262,6 +2319,13 @@ fn spawn_full(
             close(out_read);
             close(in_read);
             close(in_write);
+            // And everything else the spawner holds: the child is a fresh
+            // program, as 301's is, not an heir to the spawner's descriptors.
+            // sshd's listening and connection sockets are not close-on-exec,
+            // and every session shell held both until 2026-11-12 (1019 free
+            // descriptors where Linux gives 1021). A kernel without it says
+            // `ENOSYS` and the child inherits them, as before.
+            syscall(syscall::CLOSE_RANGE, 3, u64::from(u32::MAX), 0, 0, 0, 0);
             syscall(
                 syscall::EXECVE,
                 path_terminated.as_ptr() as u64,
@@ -2294,13 +2358,116 @@ fn spawn_full(
                     None
                 }
             };
-            Some(SpawnResult { pid, stdout_fd: out_read as u32, stdin_fd })
+            Some(SpawnResult { pid, stdout_fd: out_read as u32, stdin_fd, terminal: false })
         }
         Err(_) => {
             close(out_read);
             close(out_write);
             close(in_read);
             close(in_write);
+            None
+        }
+    }
+}
+
+/// The `linux-abi` pty spawn: what `openpty` + `login_tty` do, by hand.
+///
+/// `/dev/ptmx` (close-on-exec), unlock it, ask its number; then the child makes
+/// a session of its own (`setsid`), opens `/dev/pts/N`, takes it as its
+/// controlling terminal (`TIOCSCTTY`) and puts it on 0, 1 and 2 before
+/// `execve`. The caller gets the master twice: `stdout_fd` to read the
+/// terminal's output (and `TIOCSWINSZ`, which sshd sends to it) and `stdin_fd`,
+/// a duplicate, to type into it, so closing one leaves the other working.
+///
+/// `None` when the kernel has no ptys (`/dev/ptmx` does not open, as on
+/// Taoxichuan) or a step before the fork fails; the caller then falls back to
+/// pipes, which is what every pty spawn on this path was until 2026-11-12. With
+/// a pty the line discipline, echo and `^C` are the kernel's pty, the same code
+/// a Linux terminal emulator talks to (`crates/akuma-syscalls-glue/src/pty.rs`).
+#[cfg(feature = "linux-abi")]
+fn spawn_pty_linux(path_terminated: &[u8], argv: &[*const u8], envp_arg: *const *const u8) -> Option<SpawnResult> {
+    const O_RDWR: u64 = 2;
+    const O_NOCTTY: u64 = 0o400;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const TIOCGPTN: u64 = 0x8004_5430;
+    const TIOCSPTLCK: u64 = 0x4004_5431;
+    const TIOCSCTTY: u64 = 0x540e;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+    const AT_FDCWD: u64 = -100i64 as u64;
+
+    let master = syscall(syscall::OPENAT, AT_FDCWD, c"/dev/ptmx".as_ptr() as u64, O_RDWR | O_NOCTTY | O_CLOEXEC, 0, 0, 0) as i64;
+    if master < 0 {
+        return None;
+    }
+    let master = master as i32;
+    let unlock: i32 = 0;
+    let mut n: u32 = 0;
+    if (syscall(syscall::IOCTL, master as u64, TIOCSPTLCK, core::ptr::addr_of!(unlock) as u64, 0, 0, 0) as i64) < 0
+        || (syscall(syscall::IOCTL, master as u64, TIOCGPTN, core::ptr::addr_of_mut!(n) as u64, 0, 0, 0) as i64) < 0
+    {
+        close(master);
+        return None;
+    }
+    // `/dev/pts/N\0`, built before the fork: the child allocates nothing.
+    let mut slave_path = [0u8; 24];
+    let prefix = b"/dev/pts/";
+    slave_path[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut v = n;
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..d {
+        slave_path[prefix.len() + i] = digits[d - 1 - i];
+    }
+    let input = syscall(syscall::FCNTL, master as u64, F_DUPFD_CLOEXEC, 3, 0, 0, 0) as i64;
+    if input < 0 {
+        close(master);
+        return None;
+    }
+    let input = input as i32;
+
+    match fork() {
+        Ok(ForkResult::Child) => {
+            syscall(syscall::SETSID, 0, 0, 0, 0, 0, 0);
+            let slave = syscall(syscall::OPENAT, AT_FDCWD, slave_path.as_ptr() as u64, O_RDWR, 0, 0, 0) as i64;
+            if slave < 0 {
+                exit(127);
+            }
+            syscall(syscall::IOCTL, slave as u64, TIOCSCTTY, 0, 0, 0, 0);
+            // A login session starts from default dispositions and an empty
+            // mask, whatever its spawner inherited (`posix_spawn`'s SETSIGDEF +
+            // SETSIGMASK). An ignored SIGINT survives `execve`, and ash keeps a
+            // signal ignored on entry ignored for good, so an sshd that was
+            // itself started from a script's `&` job (which ignores SIGINT)
+            // handed every session a `^C` that did nothing. A zeroed kernel
+            // `struct sigaction` is `SIG_DFL` on both architectures;
+            // SIGKILL/SIGSTOP refuse with `EINVAL`, harmlessly.
+            let dfl = [0u64; 4];
+            for signo in 1..=64u64 {
+                syscall(syscall::RT_SIGACTION, signo, dfl.as_ptr() as u64, 0, 8, 0, 0);
+            }
+            let empty: u64 = 0;
+            syscall(syscall::RT_SIGPROCMASK, 2 /* SIG_SETMASK */, core::ptr::addr_of!(empty) as u64, 0, 8, 0, 0);
+            for target in [fd::STDIN, fd::STDOUT, fd::STDERR] {
+                syscall(syscall::DUP3, slave as u64, target as u64, 0, 0, 0, 0);
+            }
+            // Everything else the spawner holds, the master pair included, as in
+            // the pipe path below.
+            syscall(syscall::CLOSE_RANGE, 3, u64::from(u32::MAX), 0, 0, 0, 0);
+            syscall(syscall::EXECVE, path_terminated.as_ptr() as u64, argv.as_ptr() as u64, envp_arg as u64, 0, 0, 0);
+            exit(127);
+        }
+        Ok(ForkResult::Parent(pid)) => Some(SpawnResult { pid, stdout_fd: master as u32, stdin_fd: Some(input as u32), terminal: true }),
+        Err(_) => {
+            close(master);
+            close(input);
             None
         }
     }
@@ -2354,7 +2521,7 @@ pub const SIGKILL: u32 = 9;
 /// Request a whole-machine restart via `reboot(2)` — the same magic/cmd musl's
 /// `reboot()` wrapper sends. Both kernels decode it through the shared,
 /// host-tested `akuma_boot::decode` (`crates/akuma-syscalls-glue/src/reboot.rs`
-/// on AArch64, `amd64/src/reboot.rs` on x86_64), so this is the one call a
+/// on AArch64, `crates/akuma-kernel-amd64/src/reboot.rs` on x86_64), so this is the one call a
 /// userspace program needs — no `/bin/busybox reboot` or any other on-disk
 /// binary required, which is the point: it works even when nothing else on
 /// the disk can be exec'd. `paws`'s `reboot` builtin (`userspace/paws`) is the

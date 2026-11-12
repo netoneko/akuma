@@ -19,7 +19,7 @@ been checked.
 |---|---|
 | `akuma-mmu`, `akuma-exec-core`, `akuma-vfs`, `akuma-net`, `akuma-ext2`, `akuma-isolation`, `akuma-scheduler`, `akuma-timer`, `akuma-bkl` | `akuma-el0-entry`, `akuma-elf`, `akuma-exec`, `akuma-vfs-glue`, `akuma-syscalls-glue`, `akuma-kernel-core`, `akuma-gic` |
 
-**`akuma-mmu` builds for x86_64.** The `amd64/Cargo.toml` comment saying the
+**`akuma-mmu` builds for x86_64.** The `crates/akuma-kernel-amd64/Cargo.toml` comment saying the
 AArch64 loader "is written against `akuma-mmu`" is misleading — the crate is
 fine; what is AArch64-only is the `UserAddressSpace` *type* inside it
 (`#[cfg(target_arch = "aarch64")]`, the L0–L3 walker with ASIDs and `TTBR`).

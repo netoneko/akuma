@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""Test the ticket-leak fix for sched_bklfree_el0 (M5c step-2)."""
+"""SMP=4 fork/exec stress that checks the BKL ticket FIFO stays sound.
+
+Written for the sched_bklfree_el0 ticket-leak fix (M5c step-2). That path and its
+toggle went with the SGI scheduler on 2026-11-11; the script never flipped the toggle
+(it was default-on), so it still runs as a plain fork-stress ticket check."""
 
 import subprocess
 import time

@@ -70,7 +70,7 @@ the pattern to copy.
 Not in the table above and not a workspace member. `userspace/amd64/<name>/<name>.rs`
 holds single-file guest programs for the **amd64** bring-up target: `#![no_std]`,
 raw Linux x86_64 syscalls, no `libakuma`, no musl, no `Cargo.toml`. Each is
-compiled straight by `rustc --target x86_64-unknown-none` from `amd64/build.rs`,
+compiled straight by `rustc --target x86_64-unknown-none` from `crates/akuma-kernel-amd64/build.rs`,
 linked with `userspace/amd64/user.ld` at `0x40_0000`, and embedded in the amd64
 kernel image with `include_bytes!` — that target has no disk driver, so there is
 nowhere to put a file it could open by path.

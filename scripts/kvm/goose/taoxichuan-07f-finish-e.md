@@ -31,14 +31,14 @@ Table stage 6 (`apk add curl`) is about half done: offline `apk add` passes and 
 `docs/archive/TAOXICHUAN_STAGE7_TRIM_PLAN.md` (steps 2-4: where the trim fits), `docs/archive/KVM_OUTBOUND_NETWORKING.md` (the host's DNS forwarder at `10.0.2.3`),
 `docs/reference/subsystems/syscalls/time.md` and `crates/akuma-syscalls-time` (the SNTP client and what is callable), `docs/archive/APK_MISSING_SYSCALLS.md`, and `userspace/nettest`
 (`nettest-std` is a ready client). The plan must contain: (1) the syscall/feature gap per milestone, diffed against what `taoxichuan/src` serves today, each row with the existing crate or
-`amd64/src` function that already does it and a verdict (depend / extract / write new); (2) how the LAN mirror is built and served reproducibly (which packages, signed or `--allow-untrusted`,
+`crates/akuma-kernel-amd64/src` function that already does it and a verdict (depend / extract / write new); (2) how the LAN mirror is built and served reproducibly (which packages, signed or `--allow-untrusted`,
 how its checksums are compared with a Linux reference); (3) the clock: cheapest correct source; (4) dynamic linking: is `curl` static or does it need `PT_INTERP`/`ld-musl`, and what the
 loader has; (5) milestones with a mini-gate command each, boots and token estimates, session boundaries, the cheapest first milestone, and where trim steps 2-3 should be interleaved;
 (6) at most five unknowns with their read-only settle. Do not describe unverified fixes as facts.
 
 
 ## Addition from the user (applies to Job 3): the leaf-crate survey comes first
-`diff` the `akuma-*` dependencies of `amd64/Cargo.toml` against `taoxichuan/Cargo.toml` (taoxichuan has 17; amd64 about 70). For every milestone of the rest of stage 6, name which of the crates
+`diff` the `akuma-*` dependencies of `crates/akuma-kernel-amd64/Cargo.toml` against `taoxichuan/Cargo.toml` (taoxichuan has 17; amd64 about 70). For every milestone of the rest of stage 6, name which of the crates
 amd64 uses and Taoxichuan does not covers it (candidates: `akuma-sntp` and `akuma-cmos-rtc` for the clock, `akuma-syscalls-poll` for select/ppoll, `akuma-syscalls-mem`, `akuma-syscalls-net`,
 `akuma-syscalls-{linux,abi}` wire types, `akuma-pipe`, `akuma-exec-core`, `akuma-port`, `akuma-tty`). The last plan checked 11 crates; check them all, cheaply (`grep -n "^//!" crates/<name>/src/lib.rs | head -8`
 gives each crate's purpose). Where the useful logic is welded to `akuma-exec`/`Process`, say whether a seam (a pure leaf crate, as `akuma-sntp` was cut out of `akuma-syscalls-time`) or a cargo
@@ -48,11 +48,11 @@ feature (making `akuma-exec` optional) would free it, and roughly what that cost
 `taoxichuan/` is a **composition root**, not a kernel written from scratch. At the start of stage 7 it was 4,450 hand-written lines
 (`main.rs` 2,928) next to 101 existing crates and a full amd64 kernel that already implements nearly every syscall you will meet.
 Before you write any syscall arm, subsystem or helper of more than about 20 lines:
-1. **Look first**: `grep -rn "<name>" crates/ amd64/src/` for the syscall or concept; skim `docs/reference/crate-safety.md` and
+1. **Look first**: `grep -rn "<name>" crates/ crates/akuma-kernel-amd64/src/` for the syscall or concept; skim `docs/reference/crate-safety.md` and
    `ls crates/` for the crate that owns it (`akuma-syscalls-glue` and the `akuma-syscalls-*` family, `akuma-fdtable`, `akuma-vfs`,
    `akuma-ext2`, `akuma-net`, `akuma-exec`, `akuma-ring3-amd64`, `akuma-svm-amd64`).
 2. **It exists in a crate**: add a path dependency and call it. Do not copy it.
-3. **It exists only in `amd64/src/`**: extract it into a crate first (`akuma-<thing>`, named for what it owns; keep `#![forbid(unsafe_code)]`
+3. **It exists only in `crates/akuma-kernel-amd64/src/`**: extract it into a crate first (`akuma-<thing>`, named for what it owns; keep `#![forbid(unsafe_code)]`
    where it can, `scripts/check_unsafe_budget.py` gates new `unsafe`), make `amd64/` depend on the crate too, then depend on it from
    `taoxichuan/`. One implementation, two consumers.
 4. **It exists nowhere**: write it, in a crate with host tests where the logic is pure, and say why in the RESULT file.

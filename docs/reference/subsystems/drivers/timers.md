@@ -44,7 +44,6 @@ demotes the tick to 5 ms if the host stops honouring WFI after boot —
 latched, never re-promotes. Since 2026-08-19 the latch itself is
 `akuma_kacho::Latch`, the shared primitive behind every self-tuning policy in
 the tree; the thresholds and the verdict are unchanged.
-`kernel_profile_extreme` skips the probe and keeps 10 ms.
 
 > **Caveat: the sensor is desensitised at SMP>1 (OPEN, 2026-08-19).**
 > `NETPOLL_ITERS` is incremented only by the BSP netpoll loop

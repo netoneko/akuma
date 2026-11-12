@@ -39,7 +39,6 @@ const TOP_N: usize = 6;
 /// Previous-window snapshot of each bucket, so we can print deltas.
 static PREV: [AtomicU64; BUCKETS] = [const { AtomicU64::new(0) }; BUCKETS];
 static PREV_TOTAL: AtomicU64 = AtomicU64::new(0);
-static PREV_PRESERVED: AtomicU64 = AtomicU64::new(0);
 static LAST_DUMP_US: AtomicU64 = AtomicU64::new(0);
 static WINDOW: AtomicU64 = AtomicU64::new(0);
 
@@ -129,18 +128,14 @@ pub fn maybe_dump(now_us: u64) {
 
     let total_now = contention_spins();
     let total_delta = total_now.saturating_sub(PREV_TOTAL.swap(total_now, Ordering::Relaxed));
-    let preserved_now = akuma_exec::bkl::dropped_windows_preserved();
-    let preserved_delta =
-        preserved_now.saturating_sub(PREV_PRESERVED.swap(preserved_now, Ordering::Relaxed));
 
     crate::safe_print!(
         200,
-        "[BKLPROF] w{} t={}s spins={} attributed={} windows_preserved={}\n",
+        "[BKLPROF] w{} t={}s spins={} attributed={}\n",
         window,
         now_us / 1_000_000,
         total_delta,
-        window_total,
-        preserved_delta
+        window_total
     );
     if window_total == 0 {
         return;

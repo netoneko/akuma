@@ -4,7 +4,7 @@
 
 **Stability: C** (a decision doc: the target is decided, the slices are not yet
 executed). Plan: `TAOXICHUAN_STAGE8_PM_STANDARD_SLOTS_PLAN.md` (session pm). Everything here was
-checked against the tree and `amd64/src/` on 2026-10-29 unless marked UNCHECKED.
+checked against the tree and `crates/akuma-kernel-amd64/src/` on 2026-10-29 unless marked UNCHECKED.
 
 ## The decision
 
@@ -13,7 +13,7 @@ scaffolding. Every process/scheduling decision moves to the crates the other
 kernels use — `akuma-exec` (+ `akuma-exec-core`, `akuma-slot-table`,
 `akuma-threading`), `akuma-fdtable`, `akuma-pipes`, `akuma-syscalls-abi` /
 `akuma-syscalls-glue` — and `taoxichuan/src/` keeps only target glue (trap entry,
-CR3/fs effects, device arms), the way `amd64/src/` is composed today.
+CR3/fs effects, device arms), the way `crates/akuma-kernel-amd64/src/` is composed today.
 
 What dies: the `SpawnSlot` ring and `CrossSave`/`SlotCross` records
 (`src/child.rs:40-265`), the M2 SPAWN crossing (`child.rs:919-1454`:
@@ -23,12 +23,12 @@ private `SPAWN`/`WAITPID`/`CLOSE_CHILD_STDIN` syscalls, `PARENT_OF`
 `exec_twin.rs`'s coupling of the hooks to the ring. ≈1,600-1,900 lines deleted in
 total; the twin's hook tables, `switch_to`'s five machine effects and the fs
 shadow stay (they are the kernel glue the crates require — amd64 keeps the same
-kind of code in `amd64/src/sched.rs` and `exec_runtime.rs`).
+kind of code in `crates/akuma-kernel-amd64/src/sched.rs` and `exec_runtime.rs`).
 
 ## The target, in five rules
 
 1. **init is the first `Process`, with a real slot** — registered at boot like
-   amd64's `run_init` (`amd64/src/usermode.rs:8845`: `register_exec_process(1, …)`,
+   amd64's `run_init` (`crates/akuma-kernel-amd64/src/usermode.rs:8845`: `register_exec_process(1, …)`,
    `reserve_pid_floor(2)` first, `exec_runtime.rs:625-632`). `fork`, `execve`,
    `wait4` then work from init; today they answer `EPERM`/`ENOSYS` from the boot
    task (`child.rs:868-886`), which is the only reason sshd needs private `SPAWN`.

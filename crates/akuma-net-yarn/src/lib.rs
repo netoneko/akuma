@@ -94,10 +94,14 @@ pub enum WaitError {
 
 /// How the waiter should sleep when the condition does not hold.
 ///
-/// The first two are implemented in the kernel and selected by the
-/// `net-waker-park` feature. The third is this crate's proposal. The fourth is
-/// a model only — do not add a kernel arm for it without the scheduler support
-/// its docs describe.
+/// [`Self::Promiscuous`] is what `wait_until` uses and [`Self::ScanRegistered`]
+/// what the epoll family uses. [`Self::LightSleep`] is a model only — do not
+/// add a kernel arm for it without the scheduler support its docs describe.
+///
+/// Two targeted kinds, a waker on the kernel socket's list (`net-waker-park`)
+/// and one on the smoltcp socket (`net-direct-waker`), were implemented and
+/// measured worse or no better than [`Self::Promiscuous`] (`docs/archive/AKUMA_NET_ISSUES.md`
+/// §8, `LONG_ROAD_TO_REDIS_PART_2.md`). They were removed 2026-11-11.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParkKind {
     /// Yield, then halt until **any** interrupt. Untargetable — the thread
@@ -105,19 +109,6 @@ pub enum ParkKind {
     /// but under load the NIC raises one interrupt every ~0.8 ms, so the wake
     /// is imprecise and plentiful. Today's default, and the one to beat.
     Promiscuous,
-    /// Register the thread's waker on the socket, re-check, then park until the
-    /// backstop. Targetable but **lossy**: `wake_all` drains the list, so the
-    /// registration survives exactly one wake. Measured *worse* than
-    /// [`Self::Promiscuous`]: parks 3,918 → 2,565 but µs/park 1,172 → 1,787.
-    Targeted,
-    /// Register the thread's waker on the **smoltcp socket itself**, so the
-    /// wake fires from inside `process_tcp` at the state transition rather than
-    /// from a list walked after `poll()` releases `NETWORK`.
-    ///
-    /// Still one-shot — `smoltcp::socket::WakerRegistration::wake` also
-    /// `take()`s — but the window it can be lost in is a few instructions
-    /// instead of a whole 64-poll drain.
-    DirectWaker,
     /// The waker was already registered during the readiness scan, so the park
     /// step just sleeps until the deadline.
     ///
@@ -251,18 +242,6 @@ impl WaitPolicy {
             backstop_us,
             park: ParkKind::ScanRegistered,
         }
-    }
-
-    /// What the `net-waker-park` feature selects today.
-    #[must_use]
-    pub const fn targeted() -> Self {
-        Self { park: ParkKind::Targeted, ..Self::promiscuous() }
-    }
-
-    /// This crate's proposal: wakers registered on the smoltcp socket.
-    #[must_use]
-    pub const fn direct_waker() -> Self {
-        Self { park: ParkKind::DirectWaker, ..Self::promiscuous() }
     }
 }
 

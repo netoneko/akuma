@@ -16,7 +16,7 @@
  * compiler working over an AST, not numeric code — and the AArch64 sibling
  * saving d8-d15 is not proof otherwise: this target's kernel is already
  * documented as carrying no FP/SIMD save of its own on a context switch
- * (`amd64/README.md`, "What is deliberately missing"), so a setjmp that
+ * (`crates/akuma-kernel-amd64/README.md`, "What is deliberately missing"), so a setjmp that
  * *did* save vector state would be promising a guarantee nothing else here
  * keeps.
  */

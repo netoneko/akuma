@@ -69,9 +69,8 @@ harnesses, container/env helpers).
 
 ### Devbox overlays
 
-[`overlay/`](overlay/) — the `overlays/devbox/` and `overlays/devbox-smoltcp/`
-dev-VM images: what each is for, and how to tell apart the two
-similarly-named "devbox-smoltcp" things.
+[`overlay/`](overlay/) — the `overlays/devbox/` dev-VM images: the default
+smoltcp devbox and the deferred rump one.
 
 ## Not yet written (deferred gap list)
 

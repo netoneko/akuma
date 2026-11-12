@@ -131,13 +131,6 @@ pub use akuma_primitives::safe_print;
 // See docs/WAIT_QUEUES.md for detailed documentation.
 // ============================================================================
 
-/// Get the current exception stack pointer from TPIDR_EL1
-#[inline]
-#[allow(dead_code)]
-pub fn get_current_exception_stack() -> u64 {
-    akuma_cpu::sysreg::tpidr_el1()
-}
-
 pub use akuma_exec::threading::UserTrapFrame;
 
 /// ESR_EL1 exception class values
@@ -441,11 +434,11 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     let ttbr0_proc = akuma_exec::process::current_process_shared()
         .map_or(0, |p| p.address_space.ttbr0());
     // Compare the L0 base (bits 47:0) and the ASID (bits 63:48) separately —
-    // they mean very different things here. A CLONE_THREAD child is *supposed*
-    // to run under a ttbr0 whose ASID differs from its own `Process`: it is
-    // handed the parent's ttbr0 verbatim (`shared_ttbr0` in `clone_thread`)
-    // while `new_shared` gives its Process a fresh ASID over the same L0. So
-    // "ASID differs" is routine and must not be flagged. A differing **L0
+    // they mean very different things here. A CLONE_THREAD child runs under
+    // the parent's ttbr0 verbatim (`shared_ttbr0` in `clone_thread`), and its
+    // `Process` holds that same ASID (`new_thread_view`); a vfork child's
+    // `Process` has an ASID of its own over the same L0. So "ASID differs" is
+    // not a defect and must not be flagged. A differing **L0
     // base** is the real defect: the core is executing in a third party's page
     // tables, which is the cross-address-space aliasing theory (T1) in
     // docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md §3c.
@@ -457,7 +450,7 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
         if base_differs {
             "  *** AS MISMATCH: L0 BASE DIFFERS (foreign page tables) ***"
         } else if asid_differs {
-            "  (asid differs only — normal for a cloned thread)"
+            "  (asid differs only — not a defect)"
         } else { "" });
     // Discriminators for the AS MISMATCH stories (see thread_expected_l0 /
     // thread_switch_ins docs): expected==0 ⇒ the thread ran with the tripwire
@@ -590,6 +583,36 @@ fn demand_page_lazy_region(
     let _fault_guard = fault_slot_hold(pid, as_owner, page_va);
 
     let file_backed = matches!(source, akuma_exec::process::LazySource::File { .. });
+
+    // A writable `MAP_SHARED` file page is the shared writable table's frame,
+    // the same one every mapper maps; and a page of a read-only mapping of that
+    // file is that frame too while a writer has it, as Linux's one page cache
+    // would give it (`shmregionprobe`). `PROT_READ` is EL0-executable here
+    // (`Prot::RO` has no `UXN`), so an executable mapping takes this path too and
+    // gets the I-cache maintenance the private path below would have given it.
+    if file_backed
+        && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner)
+        && let Some((key, shared_write)) = akuma_exec::shm::region_key(owner, page_va)
+    {
+        let mapped = if shared_write {
+            Some(akuma_exec::shm::fault_page(owner, page_va, flags, key))
+        } else if akuma_exec::mmu::user_flags::is_write(flags) {
+            // A private writable mapping must never be handed the writer's
+            // frame, or its stores would land in every mapper.
+            None
+        } else {
+            akuma_exec::shm::map_existing(owner, page_va, flags, key).filter(|ok| *ok)
+        };
+        if let Some(ok) = mapped {
+            if ok && akuma_exec::mmu::user_flags::is_exec(flags)
+                && let Some(pa) = owner.with_address_space(|a| a.translate(page_va))
+            {
+                let kva = akuma_exec::mmu::phys_to_virt(pa & !0xFFF) as usize;
+                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
+            }
+            return ok;
+        }
+    }
     let map_flags = akuma_exec::mmu::lazy_map_flags(access, flags, file_backed);
     // I-cache maintenance is a property of the *mapping* this fault installs, not of
     // the arm the fault arrived through: a page mapped non-exec cannot be fetched
@@ -612,7 +635,7 @@ fn demand_page_lazy_region(
     let shareable_mapping = akuma_fpcache::is_shareable_mapping(map_flags);
 
     if let akuma_exec::process::LazySource::File {
-        ref path, inode, mount_id, file_offset, filesz, segment_va, ..
+        inode, mount_id, file_offset, filesz, segment_va, ..
     } = *source
     {
         if demand_page_log_enabled() {
@@ -718,9 +741,7 @@ fn demand_page_lazy_region(
         // Concurrent munmap clears PTEs but never frees the intermediate tables this
         // loop's page-table reads walk (freed only at teardown, which can't run while
         // this thread faults).
-        #[cfg(kernel_smp_shared)]
         let fault_dropped_bkl = akuma_bkl::policy::fault_bkl_drop_enabled();
-        #[cfg(kernel_smp_shared)]
         if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
         let mut cur_va = page_va;
         while cur_va < ra_end {
@@ -743,11 +764,7 @@ fn demand_page_lazy_region(
                 if fpcache_verify_hits() {
                     let file_off = file_offset + (cur_va - segment_va);
                     let mut disk = alloc::vec![0u8; 0x1000];
-                    let got = if inode != 0 {
-                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, &mut disk)
-                    } else {
-                        (akuma_exec::runtime::runtime().read_at)(path, file_off, &mut disk)
-                    };
+                    let got = (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, &mut disk);
                     let mut cached_page = alloc::vec![0u8; 0x1000];
                     (services().read_frame_bytes)(pf.addr, &mut cached_page);
                     let cached = cached_page.as_slice();
@@ -796,11 +813,7 @@ fn demand_page_lazy_region(
                     let file_off = file_offset + (pg_data_start - segment_va);
                     let len = pg_data_end - pg_data_start;
                     let got = staged.fill_with(dst_off, len, |page_buf| {
-                        if inode != 0 {
-                            (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                        } else {
-                            (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                        }
+                        (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, page_buf)
                     });
                     // The range is already clamped to `filesz`, so anything less than
                     // `len` is a defect, not EOF. The frame came from
@@ -811,8 +824,8 @@ fn demand_page_lazy_region(
                     if !fill_complete {
                         akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
                         safe_print!(288,
-                            "[FILL-SHORT] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={} — page left zero-filled\n",
-                            pid, inode, file_off, len, got, cur_va, path);
+                            "[FILL-SHORT] pid={} mount={} inode={} file_off={:#x} want={} got={:?} va={:#x} — page left zero-filled\n",
+                            pid, mount_id, inode, file_off, len, got, cur_va);
                     }
                 }
             }
@@ -864,7 +877,6 @@ fn demand_page_lazy_region(
         }
         // Close the window: re-takes the BKL for the install pass (unless a
         // still-open outer window means it must stay dropped).
-        #[cfg(kernel_smp_shared)]
         if fault_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
 
         // Pass C — INSTALL (under `as_lock`): atomically map each filled frame +
@@ -965,11 +977,7 @@ fn demand_page_lazy_region(
                 let file_off = file_offset + (pg_data_start - segment_va);
                 let len = pg_data_end - pg_data_start;
                 let got = staged.fill_with(dst_off, len, |page_buf| {
-                    if inode != 0 {
-                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                    } else {
-                        (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                    }
+                    (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, page_buf)
                 });
                 // This arm never publishes to `file_page_cache`, so a short read here
                 // poisons only the faulting process — but it is the same defect and
@@ -978,8 +986,8 @@ fn demand_page_lazy_region(
                 if got != Ok(len) {
                     akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
                     safe_print!(288,
-                        "[FILL-SHORT/single] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={}\n",
-                        pid, inode, file_off, len, got, page_va, path);
+                        "[FILL-SHORT/single] pid={} mount={} inode={} file_off={:#x} want={} got={:?} va={:#x}\n",
+                        pid, mount_id, inode, file_off, len, got, page_va);
                 }
             }
             // Filled; from here the frame is mapped-or-freed by hand below.
@@ -1980,8 +1988,7 @@ pub struct ExceptionHooks {
     pub dispatch_irq: fn(u32),
     /// `src/smp_shared.rs` `record_el0_trap` — the per-core "this core serviced
     /// a user trap" diagnostic counter (M3 cross-core-userspace proof). Only
-    /// exists under `kernel_smp_shared`, like the module that owns it.
-    #[cfg(kernel_smp_shared)]
+    /// exists under `kernel_bkl_smp`, like the module that owns it.
     pub record_el0_trap: fn(),
     /// `akuma_exec::process::reclaim::report_poison_value` — quarantine-poison
     /// decode for the wild-data-abort dump. Lives in akuma-exec's reclaim
@@ -2195,209 +2202,120 @@ fn alloc_page_zeroed_user() -> Option<akuma_exec::PhysFrame> {
     akuma_pmm::alloc_page_zeroed_user().map(akuma_exec::PhysFrame::new)
 }
 
-/// Default exception handler - logs unexpected exceptions
-/// CRITICAL: Must NOT return if ELR/SPSR are invalid, or ERET will crash!
-pub fn default_exception() {
-    note_exception_entry();
-    note_exc_class(3);
-    let esr = akuma_cpu::sysreg::esr_el1();
-    let elr = akuma_cpu::sysreg::elr_el1();
-    let spsr = akuma_cpu::sysreg::spsr_el1();
-    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
-    let sp = akuma_cpu::reg::sp() as u64;
-    let ec = (esr >> 26) & 0x3F;
-    let tid = akuma_exec::threading::current_thread_id();
-    
-    // Use stack-only print to avoid heap allocation in exception context
-    crate::safe_print!(128, "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
-        ec, elr, spsr);
-    crate::safe_print!(96, "  Thread={}, TTBR0={:#x}, SP={:#x}\n", tid, ttbr0, sp);
-    
-    // Check for dangerous ERET conditions
-    let target_el = spsr & 0xF;
-    if target_el == 0 {
-        crate::safe_print!(128, "  WARNING: SPSR indicates EL0 - ERET would go to user mode!\n");
-    }
-    if elr == 0 {
-        crate::safe_print!(128, "  WARNING: ELR=0 - ERET would jump to address 0!\n");
-    }
-    if elr < 0x4000_0000 && target_el != 0 {
-        crate::safe_print!(96, "  WARNING: ELR={:#x} looks like user address but SPSR is EL1!\n", elr);
-    }
-    
-    // If ERET would be dangerous, halt instead of returning
-    if elr == 0 || (target_el == 0 && elr < 0x4000_0000) {
-        crate::safe_print!(64, "  HALTING to prevent invalid ERET\n");
-        loop {
-            akuma_cpu::park::wfe();
-        }
-    }
-}
-
-/// UNIFIED IRQ handler for stack-based context switching
-/// 
-/// Used by both irq_el0_handler (user mode IRQs) and irq_handler (kernel mode IRQs).
-/// 
-/// Takes current SP, returns new SP if context switch needed (or 0 if no switch).
-/// The assembly does the actual SP switch AFTER this returns.
-/// Tripwire for the SMP=4 mixed-EL corruption (BKL_RUSTC_SCALING_BASELINE.md §5.1):
-/// inspect the IRQ frame the asm epilogue is about to restore. An EL0-target frame
-/// whose ELR sits in kernel text would eret userspace into kernel text. Covers BOTH
-/// epilogue outcomes (switch and no-switch); complements `[SGI-S POISON]`, which only
-/// sees the switch branch. The frame layout (ELR at +240, SPSR at +248) is
-/// `akuma_trap_aarch64::irq_frame`'s, shared with `setup_fake_irq_frame`.
-#[inline]
-fn irq_eret_poison_check(final_sp: u64, switched: bool) {
-    let frame = (services().irq_frame_at)(final_sp);
-    let elr = frame.elr();
-    let kernel_text = akuma_exec::mmu::is_kernel_text(elr as usize);
-    // EL0-target frames must not eret into kernel text; EL1-target frames must
-    // eret INTO kernel text (an EL1 ELR like 0x8 is the boot-storm crash shape).
-    let poison = if frame.from_el0() { kernel_text } else { !kernel_text };
-    if poison {
-        crate::safe_print!(160,
-            "[IRQ POISON] eret elr={:#x} spsr={:#x} switched={} tid={} core={}\n",
-            elr, frame.spsr(), u64::from(switched),
-            akuma_exec::threading::current_thread_id(),
-            akuma_exec::bkl::current_core_id());
-    }
-}
-
-/// IRQ / SGI entry from the vector asm. Under real shared-kernel SMP this runs the
-/// scheduler and device handlers holding the Big Kernel Lock, then reconciles the BKL
-/// to the EL the pending `eret` will enter (release when returning to EL0, keep for
-/// EL1) using the SPSR of the frame we're about to restore — which, after a context
-/// switch, is the *incoming* thread's frame. No-op unless `cfg(kernel_smp_shared)`.
-pub fn irq_with_sp(current_sp: u64) -> u64 {
+/// IRQ / SGI entry: the root kernel's `akuma-vectors-aarch64` front end calls this from its
+/// `El0Irq`/`El1Irq` handlers.
+///
+/// The switch is an ordinary call ([`akuma_exec::threading::yield_now`]) made on the interrupted
+/// thread's own kernel stack, where the vector stub saved its frame, so there is no frame to
+/// hand back and nothing to reconcile against an SPSR. The BKL is taken for the dispatch
+/// unless this core already holds it (an EL1 window opened by code that holds it), and
+/// released at the end only if this entry took it — after a switch that is the resumed
+/// thread releasing the lock its core holds on its behalf, which is the return to EL0.
+///
+/// The tick and the scheduler SGI preempt EL0 always and EL1 when
+/// [`akuma_exec::threading::el1_preemptible`] says so (preemption not disabled, `POOL` free,
+/// the thread `RUNNING`). A kernel thread that holds the BKL gives up the core's hold for as
+/// long as it is switched out, and takes it again when it resumes.
+///
+/// An interrupt from EL0 is also a **return to user mode**, and it is the only one a thread
+/// in a pure compute loop ever makes. So, as Linux does on every return to user mode, the
+/// thread resuming into `el0` first takes a deferred kill and then one pending signal (see
+/// [`deliver_on_irq_return`]). Without it `kill -TERM` of a spinner did nothing and its
+/// handlers never ran (`userspace/forktest/c_stress/sigspin.c`,
+/// `docs/archive/HOOKED_IRQ_SIGNAL_DELIVERY.md`).
+pub fn irq_hooked(el0: Option<FrameHandle>) {
+    let from_el0 = el0.is_some();
     note_exception_entry();
     note_exc_class(2);
-    // Under shared SMP, read the interrupted frame's SPSR up front: SPSR.M[3:0]==0 means
-    // we preempted EL0 (userspace), where this core holds NO BKL (the invariant is "held
-    // iff in EL1"). That is exactly the case where the scheduler SGI can run BKL-FREE
-    // (M5c) — the switch is made atomic by POOL alone, so peer cores' timer ticks no
-    // longer serialize on the BKL. A scheduler SGI that preempted EL1 (a syscall/fault
-    // holding the BKL) must keep it — releasing would expose the interrupted excursion's
-    // shared state to peers.
-    #[cfg(kernel_smp_shared)]
-    let interrupted_el0 = {
-        // SAFETY: `current_sp` is the live interrupted IRQ trap frame the vector
-        // asm just built. SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
-        (services().irq_frame_at)(current_sp).from_el0()
-    };
-    // If this IRQ interrupted EL0, userspace was running on this core — count it (captures
-    // pure compute loops that only get timer-preempted, not just syscalls).
-    #[cfg(kernel_smp_shared)]
-    if interrupted_el0 {
+    let held = akuma_exec::bkl::held_by_current();
+    if !held {
+        akuma_exec::bkl::enter_kernel();
+    }
+    // BKL-hold profiler only (one relaxed load unless `bkl-profile` turned it on): this
+    // excursion is the interrupt's, not the interrupted thread's.
+    akuma_exec::sync::set_core_tag_transient(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
+    if from_el0 {
         (hooks().record_el0_trap)();
     }
-
-    // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
-    let irq_opt = akuma_gic::acknowledge_irq();
-    match irq_opt {
-        Some(intid) => note_irq_intid(intid),
-        // IAR said "spurious" (1023): the vector fired but the interrupt was
-        // already consumed (peer core, or a de-asserted level source). These
-        // entries are invisible to the per-INTID counters yet still count in
-        // EXCEPTION_ENTRIES — exactly the gap the ~140K/s/core unattributed
-        // exception storm hid in (CROSS_CORE_THREAD_COLLAPSE.md §3).
+    let mut preempt = false;
+    match akuma_gic::acknowledge_irq() {
+        Some(irq) => {
+            note_irq_intid(irq);
+            if irq != akuma_gic::SGI_SCHEDULER {
+                (hooks().dispatch_irq)(irq);
+            }
+            akuma_gic::end_of_interrupt(irq);
+            // The tick preempts EL1 code as well as EL0, under `el1_preemptible`: kernel
+            // threads need not yield to share a core. The timer interrupt is a preemption
+            // point by itself; the tick rings no self-SGI (`timer_irq_handler`).
+            preempt = (irq == akuma_gic::SGI_SCHEDULER || irq == akuma_gic::TIMER_PPI)
+                && (from_el0 || akuma_exec::threading::el1_preemptible());
+        }
         None => {
             SPURIOUS_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
-
-    // BKL-free fast path (M5c): a scheduler SGI that preempted EL0. This core held no BKL,
-    // and `sgi_scheduler_handler_with_sp` makes the switch atomic on POOL. Reconcile at
-    // the end (re)acquires the BKL only if the thread we resume into is EL1.
-    // IMPORTANT: use reconcile_for_spsr_no_ticket here because we never called
-    // enter_kernel — a normal reconcile would leak a ticket.
-    #[cfg(kernel_smp_shared)]
-    if interrupted_el0
-        && akuma_bkl::policy::sched_bklfree_el0_enabled()
-        && matches!(irq_opt, Some(i) if i == akuma_gic::SGI_SCHEDULER)
-    {
-        let new_sp =
-            akuma_exec::threading::sgi_scheduler_handler_with_sp(akuma_gic::SGI_SCHEDULER, current_sp);
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = (services().irq_frame_at)(final_sp).spsr();
-        akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
-        irq_eret_poison_check(final_sp, new_sp != 0);
-        return new_sp;
+    if preempt {
+        akuma_exec::threading::yield_now();
+        // The thread resumed here is finishing its own interrupt return, whatever its tag
+        // says it was last doing; and the core may be another one now.
+        akuma_exec::sync::set_core_tag_transient(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
     }
-
-    // BKL-free device-IRQ dispatch (Phase 7a, docs/archive/BKL_PHASE7_AUDIT.md §2.3/§5).
-    // The timer is the only device IRQ this kernel registers
-    // (`irq::register_handler(27, timer::timer_irq_handler)`), and its handler
-    // (`akuma_exec::alarms::on_timer_interrupt`'s alarm queue, the preemption watchdog, the
-    // scheduler-SGI trigger) no longer touches anything the BKL alone protects: the
-    // alarm queue has its own `Spinlock`, the watchdog reads are per-thread atomics, and
-    // `trigger_sgi_self`/GIC ack/EOI are raw MMIO. Unlike the M5c fast path above, this
-    // has no context switch and never calls `enter_kernel`, so there is nothing to
-    // reconcile — the interrupted thread's BKL hold state (held or not, EL0 or EL1) is
-    // left completely untouched by this excursion.
-    #[cfg(all(kernel_smp_shared, kernel_no_bkl_irq))]
-    if akuma_bkl::policy::irq_bkl_drop_enabled()
-        && let Some(irq) = irq_opt
-        && irq != akuma_gic::SGI_SCHEDULER
-    {
-        (hooks().dispatch_irq)(irq);
-        akuma_gic::end_of_interrupt(irq);
-        return 0;
+    if let Some(frame) = el0 {
+        deliver_on_irq_return(frame);
     }
-
-    // Device IRQ, or a scheduler SGI that preempted EL1 (BKL held): run holding the BKL.
-    akuma_exec::bkl::enter_kernel();
-    // Profiler bookkeeping only (no-op unless `bkl-profile` is on): the IRQ dispatch is a
-    // TRANSIENT excursion that does not belong to the interrupted thread, so it stamps the
-    // per-core sampling cache alone and leaves the interrupted thread's own per-thread tag
-    // intact. Without this the core would stay mislabeled "irq/sched" for the rest of the
-    // syscall it interrupted, attributing peer contention against the *remainder* of a long
-    // syscall to the brief IRQ instead.
-    #[cfg(kernel_smp_shared)]
-    akuma_exec::sync::set_core_tag_transient(
-        akuma_exec::bkl::current_core_id(),
-        akuma_exec::sync::HOLD_TAG_IRQ,
-    );
-
-    let new_sp = if let Some(irq) = irq_opt {
-        if irq == akuma_gic::SGI_SCHEDULER {
-            akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp)
-        } else {
-            // Normal device IRQ: dispatch then EOI.
-            (hooks().dispatch_irq)(irq);
-            akuma_gic::end_of_interrupt(irq);
-            0
-        }
-    } else {
-        0
-    };
-
-    // End of the transient excursion: point the sampling cache back at whichever thread
-    // this core is about to run. ONE rule covers both outcomes, which is why the old
-    // `if new_sp == 0 { restore saved tag }` special case is gone — after a switch
-    // (`new_sp != 0`) `current_thread_id()` is the INCOMING thread and we install its own
-    // tag (previously it inherited `irq/sched` and kept it for the rest of its syscall);
-    // with no switch it is the interrupted thread and we reinstall the tag it never lost.
-    #[cfg(kernel_smp_shared)]
     akuma_exec::sync::load_thread_tag_to_core(
         akuma_exec::bkl::current_core_id(),
         akuma_exec::threading::current_thread_id(),
     );
+    if !held {
+        akuma_exec::bkl::leave_kernel();
+    }
+}
 
-    #[cfg(kernel_smp_shared)]
-    {
-        // The asm erets into `new_sp`'s frame after a switch, else the interrupted
-        // `current_sp` frame. Reconcile the BKL to that frame's target EL.
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-        let spsr = (services().irq_frame_at)(final_sp).spsr();
-        akuma_exec::bkl::reconcile_for_spsr(spsr);
+/// The return-to-user-mode work of an interrupt from EL0 under the hooked scheduler, run
+/// by the thread that is about to resume into `frame` (after any switch), BKL held.
+///
+/// 1. A **deferred kill** posted by a peer's `kill_thread_group` ends the thread here, as
+///    it does at the syscall boundary in [`sync_el0`]: nothing is held below this frame but
+///    the BKL, which the terminal mark+yield reconciles.
+/// 2. One **pending signal** is delivered into `frame`, exactly as on syscall return, with
+///    two differences that both follow from there being no syscall: the ESR passed is 0, so
+///    `SA_RESTART` never backs `ELR` up onto an `svc` that was not there; and `x0` is the
+///    interrupted code's live register, which the signal frame saves as it stands, so it is
+///    replaced only by the handler's argument. There is no [`akuma_exec::threading::sigframe_active`]
+///    bound either: that bound protects a syscall return the program has not observed yet,
+///    and an interrupt carries none.
+///
+/// Interrupts are open for the delivery: building the frame may fault in the user stack,
+/// and the sync path does that work with them open too. The interrupt that brought us here
+/// has had its EOI, so a nested one is an ordinary EL1 interrupt window.
+fn deliver_on_irq_return(frame: FrameHandle) {
+    if akuma_exec::threading::take_thread_kill_request() {
+        let tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(tid);
+        loop {
+            akuma_exec::threading::yield_now();
+        }
     }
-    {
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        irq_eret_poison_check(final_sp, new_sp != 0);
+    let sig_mask = akuma_exec::threading::thread_signal_mask();
+    let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) else {
+        return;
+    };
+    let thread_slot = akuma_exec::threading::current_thread_id();
+    // Go's SIGURG before its thread has a sigaltstack: not ready yet, keep it pending —
+    // the same rule as the syscall-return path.
+    if sig == 23 && akuma_exec::threading::get_sigaltstack(thread_slot).0 == 0 {
+        akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
+        return;
     }
-    new_sp
+    akuma_primitives::irq::unmask_irqs_sync();
+    if try_deliver_signal(frame, sig, 0, false, 0) {
+        frame.set_x0(u64::from(sig));
+    } else {
+        apply_default_signal_action(sig); // diverges if fatal
+    }
+    akuma_primitives::irq::mask_irqs_sync();
 }
 
 /// Landing pad for EL1 fault recovery.
@@ -3246,7 +3164,7 @@ pub fn spurious_svc_count() -> u64 {
 /// Big Kernel Lock (real shared-kernel SMP): a thread executing kernel code on behalf
 /// of an EL0 trap holds the BKL for the whole excursion, so its shared-state access
 /// (process table, VFS, net, page tables) is serialized against other cores. No-op
-/// unless `cfg(kernel_smp_shared)` (see `akuma_exec::bkl`). The IRQ/scheduler path's
+/// unless `cfg(kernel_bkl_smp)` (see `akuma_exec::bkl`). The IRQ/scheduler path's
 /// BKL reconciliation is added in M2; here the syscall thread may still be preempted
 /// mid-excursion, which is correct on the single active core of M0/M1.
 /// `esr`/`far` are the trap syndrome snapshotted by the vector asm at exception
@@ -3279,11 +3197,8 @@ pub fn sync_el0(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     // the body's now-redundant carve-out guard nests as an inner (depth-2) window.
     // Faults (EC != SVC64) always take the lock. `frame` is this thread's own
     // kernel stack — reading x8 pre-acquire touches no shared state.
-    #[cfg(kernel_smp_shared)]
     let bkl_optout = ((esr >> 26) & 0x3F) == esr::EC_SVC64
         && akuma_bkl::policy::syscall_bkl_optout(frame.x8());
-    #[cfg(not(kernel_smp_shared))]
-    let bkl_optout = false;
     if !bkl_optout {
         akuma_exec::bkl::enter_kernel();
     }
@@ -3293,7 +3208,6 @@ pub fn sync_el0(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     // left in place it would make this excursion's IRQ epilogues silently RELEASE the
     // BKL mid-syscall. Heal it and say so. Must stay AHEAD of the opt-out window open
     // below so it can never mistake this excursion's own legitimate window for a leak.
-    #[cfg(kernel_smp_shared)]
     if akuma_exec::bkl::in_dropped_window() {
         let leaked = akuma_exec::bkl::reset_dropped_windows();
         if leaked != 0 {
@@ -3318,7 +3232,6 @@ pub fn sync_el0(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     }
     // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
     // proof (an EL0 trap only comes from userspace running on this core).
-    #[cfg(kernel_smp_shared)]
     (hooks.record_el0_trap)();
     let ret = rust_sync_el0_handler_inner(frame, esr, far);
     // Deferred thread-kill (real shared-kernel SMP): if a peer core's
@@ -3333,7 +3246,6 @@ pub fn sync_el0(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     // its window and takes the lock — it never returns to EL0, so this is the
     // window's real end, and the terminal mark+yield must run in the same
     // BKL-held state every other path gives it.
-    #[cfg(kernel_smp_shared)]
     if akuma_exec::threading::take_thread_kill_request() {
         if bkl_optout {
             akuma_exec::bkl::dropped_window_close_no_reacquire();
@@ -3375,11 +3287,9 @@ pub fn sync_el0(frame: FrameHandle, esr: u64, far: u64) -> u64 {
 /// window leaked past an excursion's end (abnormal unwind skipping a guard destructor,
 /// or a recycled thread slot inheriting depth) and is part of every phase's pass
 /// criterion; the boot suite asserts it stays 0 (see `process_tests`).
-#[cfg(kernel_smp_shared)]
 static STALE_WINDOW_HEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read the stale-window heal counter (see [`STALE_WINDOW_HEALS`]).
-#[cfg(kernel_smp_shared)]
 #[cfg_attr(not(kernel_tests), allow(dead_code))]
 pub fn stale_window_heal_count() -> u64 {
     STALE_WINDOW_HEALS.load(core::sync::atomic::Ordering::Relaxed)
@@ -3396,7 +3306,6 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
             let syscall_num = frame_ref.x8;
             // BKL-hold profiler: tag this core's excursion with the syscall number so a
             // waiting peer can attribute its BKL wait to this syscall (shared-kernel SMP).
-            #[cfg(kernel_smp_shared)]
             akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), syscall_num);
 
             // Stale-I-cache spurious-SVC guard (§7k.4 root cause). At an EC_SVC64
@@ -3812,7 +3721,6 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
             // Thread-group leader: mmap_regions and fault_mutex live on the leader Process
             // (CLONE_VM worker threads have their own Process slot but empty mmap_regions).
             let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
-            #[cfg(kernel_smp_shared)]
             akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_FAULT);
 
             // Translation/permission fault (ISS bits [5:2]) — try demand paging
@@ -4294,7 +4202,6 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
             // `far` is the entry snapshot (see rust_sync_el0_handler).
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
-            #[cfg(kernel_smp_shared)]
             akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_FAULT);
 
             let fault_type = iss & 0x3C;

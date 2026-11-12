@@ -140,6 +140,14 @@ pub fn schedule_wake(at_us: u64, waker: &Waker) {
     update_hardware_timer(&queue);
 }
 
+/// The earliest pending alarm's deadline (uptime µs), for an idle core deciding how long it
+/// may halt with its tick stopped. `None`: no alarm is pending.
+pub fn next_deadline() -> Option<u64> {
+    let _irq_guard = crate::runtime::IrqGuard::new();
+    let queue = ALARM_QUEUE.lock();
+    queue.iter().filter(|e| e.waker.is_some()).map(|e| e.at).min()
+}
+
 /// Alarm servicing is driven by the periodic preemption tick, which owns the
 /// virtual timer hardware (CNTV_CVAL) — see `timer::timer_irq_handler`. There is
 /// only one virtual timer compare register, and the scheduler must keep it armed

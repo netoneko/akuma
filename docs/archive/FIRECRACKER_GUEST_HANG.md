@@ -21,7 +21,7 @@ and then every run stopped before `udp probe:` was printed:
 
 ## Method (what found it)
 
-* **An event ring in the host** (`amd64/src/kvm/api/vcpu.rs`, `evring`): the last 160 of {entry: guest `rflags`, offered vector, V_INTR,
+* **An event ring in the host** (`crates/akuma-kernel-amd64/src/kvm/api/vcpu.rs`, `evring`): the last 160 of {entry: guest `rflags`, offered vector, V_INTR,
   time to the next timer event; exit: code, rip, info; each emulated LAPIC store; each accepted vector}, in 5 KiB of statics, dumped
   once by `idle_note` when a guest halts with `due == None && !can_wake` (the lost-interrupt signature). The earlier tracing kept the first 24
   exits and then one in 8192, which cannot show a window a few microseconds wide.

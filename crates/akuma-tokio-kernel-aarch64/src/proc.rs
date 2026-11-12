@@ -105,13 +105,13 @@ pub fn start_init(path: &str, ti: &TaskImage) -> ! {
         crate::halt();
     };
     akuma_tokio_kernel_core::bkl::born_locked(tid);
-    akuma_threading::x86_seed_entry(tid, top, init_entry);
+    akuma_threading::seed_entry(tid, top, init_entry);
     // The boot thread becomes slot 0: it is about to block, and a thread the
     // pool has never heard of has no slot to park.
     let _ = sched::prepare(0);
-    akuma_threading::x86_adopt_running_thread(0);
+    akuma_threading::adopt_running_thread(0);
     sched::set_current_slot(0);
-    akuma_threading::x86_publish(tid);
+    akuma_threading::publish_slot(tid);
     safe_print!(64, "[init] pid 1 on pool slot {}\n", tid);
     let code = proc::wait_init::<Aarch64>();
     safe_print!(96, "[init] {} exited with {}\n", path, code);

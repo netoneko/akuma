@@ -17,7 +17,7 @@ which is the outcome this document is for.
 ## 1. The `mmap` argument decode
 
 **Written:** a local decode of `MAP_ANONYMOUS`, `MAP_FIXED`, `PROT_WRITE|EXEC`
-and the file-backed case, ~25 lines in `amd64/src/mm.rs`.
+and the file-backed case, ~25 lines in `crates/akuma-kernel-amd64/src/mm.rs`.
 
 **Existed:** `crates/akuma-syscalls-mem::mmap::plan(prot, flags, fd, pages,
 eager_max_pages) -> Plan`, plus `fixed_addr_unaligned_einval` and
@@ -82,7 +82,7 @@ path"*.
 
 **Written:** a decode of `struct sockaddr_in` — the `AF_INET` family check, the
 **big-endian** port, the octet order — plus local `AF_INET`/`SOCK_STREAM`
-constants, in `amd64/src/sock.rs`.
+constants, in `crates/akuma-kernel-amd64/src/sock.rs`.
 
 **Existed:** `akuma_net::socket::SockAddrIn` with `to_addr()` and `from_addr()`,
 in the crate that owns sockets, alongside
@@ -108,7 +108,7 @@ Four duplications survive, each with a checked reason:
 | the file syscall *bodies* (`sys_read`, `sys_openat`, `sys_lseek`) | `akuma-syscalls-glue` | **Does not build.** `error: invalid instruction mnemonic 'cbz'` — AArch64 asm reaching it through `akuma-user-access`. Its dependency list is 25 crates deep including `akuma-exec`, `akuma-mmu` and `akuma-bkl` |
 | `copy_from_user` / `copy_to_user` | `akuma-user-access` | **Does not build.** Its copy loop is AArch64 `global_asm!` |
 | the fd *array* | `akuma-exec`'s `Process` | Does not build here. The descriptor *type* is shared; only the table is local |
-| the pipe *table* (`static [Pipe; N]` + spinlock + `PipeId`) in `amd64/src/pipe.rs` | `akuma-syscalls-glue::pipe` | Same wall as the file-syscall bodies. The **buffer half** was extracted this time rather than re-derived — `crates/akuma-pipe`, `#![forbid(unsafe_code)]`, host-tested — so what stays local is only the `static` and the lock, the same split as `akuma-fpcache` / `file_page_cache.rs` |
+| the pipe *table* (`static [Pipe; N]` + spinlock + `PipeId`) in `crates/akuma-kernel-amd64/src/pipe.rs` | `akuma-syscalls-glue::pipe` | Same wall as the file-syscall bodies. The **buffer half** was extracted this time rather than re-derived — `crates/akuma-pipe`, `#![forbid(unsafe_code)]`, host-tested — so what stays local is only the `static` and the lock, the same split as `akuma-fpcache` / `file_page_cache.rs` |
 
 The raw-vs-canonical console split is not duplication either: `read(0)` goes
 through `akuma-terminal`'s canonical mode, and Akuma's own `poll_input_event`
@@ -128,7 +128,7 @@ contains no invalid x86 instruction. Its own header says *"AArch64, 4 KB granule
 4-level page tables"*, and it manipulates AArch64 descriptors throughout, with
 191 arch-specific tokens in one file. A crate that builds can still be wrong.
 
-**Building is necessary, not sufficient.** The audit table in `amd64/README.md`
+**Building is necessary, not sufficient.** The audit table in `crates/akuma-kernel-amd64/README.md`
 therefore records three distinct reasons a crate is unused — blocked on a known
 proposal item, cannot build, or not reached yet — rather than one boolean.
 
@@ -153,6 +153,6 @@ first paragraph would have settled the question.
 ---
 
 **Background:** `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.21 is the stage
-these were written during; `amd64/README.md` carries the standing audit table.
+these were written during; `crates/akuma-kernel-amd64/README.md` carries the standing audit table.
 `docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §1 is the open item that blocks
 `akuma-mmap` and `akuma-elf`.

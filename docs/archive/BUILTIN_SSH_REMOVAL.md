@@ -59,7 +59,7 @@ saving decomposes cleanly as **213 KB image + 96 KB thread stack**, and the
 image shrink converts to free RAM 1:1 because the kernel image occupies PMM
 pages (`Code+Stack` loses exactly the 53 pages `User pages` gains).
 
-At `MEMORY=4608K` (the `acceptance/05_meow_tcc_extreme_4mb.md` profile),
+At `MEMORY=4608K` (the `acceptance/archive/05_meow_tcc_extreme_4mb.md` profile),
 `SNAPSHOT=1`, idle:
 
 | config | free |
@@ -217,7 +217,7 @@ until grep -aqE "sshd started|Started sshd" boot.log 2>/dev/null; do sleep 2; do
 `-a` is required — QEMU/HVF emits a control byte that makes plain `grep` treat
 the log as binary and silently match nothing.
 
-Updated to the pattern above: `acceptance/05_meow_tcc_extreme_4mb.md`,
+Updated to the pattern above: `acceptance/archive/05_meow_tcc_extreme_4mb.md`,
 `acceptance/08_meow_clone_compile_run.md`, `docs/runbooks/boot-and-connect.md`,
 `docs/runbooks/debug-boot-hang.md`, `scripts/test_memory_split.py`.
 
@@ -272,5 +272,5 @@ Two other consequences of the same removal, for anyone grepping logs:
 - `userspace/sshd/docs/PROTOCOL_UNDER_LOAD.md` — the same bug class in the
   userspace server, fixed.
 - `docs/reference/build-profiles.md` — per-profile SSH ownership.
-- `acceptance/05_meow_tcc_extreme_4mb.md` — the 4.5 MB profile these numbers
+- `acceptance/archive/05_meow_tcc_extreme_4mb.md` — the 4.5 MB profile these numbers
   were measured against.

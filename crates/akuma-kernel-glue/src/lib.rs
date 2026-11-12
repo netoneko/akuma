@@ -30,14 +30,15 @@
 //! `src/` extraction `akuma-kernel-core` started. `src/main.rs` keeps only
 //! what has to live in the actual bin crate: the `#![no_std]`/`#![no_main]`
 //! attributes, `#[global_allocator]`, `#[alloc_error_handler]`,
-//! `#[panic_handler]`, and the `rust_start` entry stub the boot assembly
-//! `bl`s — plus the boot self-test suite, which stays in `src/` per the
-//! original request.
+//! `#[panic_handler]`, and `akuma_kernel::entry!`, which defines the
+//! `rust_start` symbol the boot assembly `bl`s and calls [`start`]. The boot
+//! self-test suite is `akuma-kernel-tests-aarch64` (moved out of `src/`
+//! 2026-11-11).
 //!
-//! Every module below is re-exported back into `src/main.rs`'s crate root
+//! Every module below is re-exported at `akuma-kernel-tests-aarch64`'s root
 //! (`pub use akuma_kernel_glue::x;`), the same trick `akuma-kernel-core` uses,
 //! so the ~thousands of `crate::x::y` call sites in the test files — which
-//! are descendants of the BIN crate's root, not this one — resolve unchanged.
+//! are descendants of THAT crate's root, not this one — resolve unchanged.
 //! `kernel_main`, `halt`, and the memory-layout helpers
 //! (`compute_heap_size`/`compute_memory_layout`/`reserve_calc_ram`/
 //! `compute_thread_limit`/`MemoryLayout`) were `pub(crate)` or private in
@@ -87,11 +88,10 @@ pub use akuma_kernel_core::timer;
 #[cfg(target_os = "none")]
 pub use akuma_kernel_core::timer::GLOBAL_POLL_STEP;
 
-// akuma-virtio re-exports. `block`/`rng`/`audio` are ALSO re-exported
-// separately at the bin crate's own root (`src/main.rs`) because
-// `process_tests.rs` reaches them via `crate::block`/`crate::rng`/
-// `crate::audio` as a descendant of the bin crate, not this one — two
-// independent bindings to the same upstream crate, not a conflict.
+// akuma-virtio re-exports. `rng`/`audio` are ALSO re-exported separately at
+// `akuma-kernel-tests-aarch64`'s root, because `process_tests.rs` reaches them
+// as `crate::rng`/`crate::audio` from that crate — two independent bindings to
+// the same upstream crate, not a conflict.
 pub use akuma_virtio::{audio, block, rng};
 
 // `boot`/`smp_shared` carry `global_asm!` blocks using GNU-as/ELF section
@@ -112,12 +112,23 @@ pub use akuma_kernel_core::console;
 pub use akuma_kernel_core::platform;
 #[cfg(all(target_os = "none", feature = "rump"))]
 pub mod rump_proxy;
-#[cfg(all(target_os = "none", kernel_smp_shared))]
+#[cfg(target_os = "none")]
 pub use akuma_entry::smp_shared;
 #[cfg(target_os = "none")]
 pub mod syscall;
 #[cfg(target_os = "none")]
 pub mod vfs;
+#[cfg(target_os = "none")]
+pub mod hooked;
+
+// Every core of this kernel runs under `akuma-bkl`, whose entry points are empty
+// bodies unless it is built with `bkl-smp`. The root manifest turns that on through
+// this crate; a build that somehow lost it would boot SMP=N with no lock at all.
+#[cfg(target_os = "none")]
+const _: () = assert!(
+    akuma_bkl::ACTIVE,
+    "the AArch64 kernel needs `akuma-bkl` built with `bkl-smp`"
+);
 
 #[cfg(target_os = "none")]
 use akuma_exec::{mmu, process, threading};
@@ -131,66 +142,48 @@ pub fn halt() -> ! {
         akuma_cpu::park::wfi();
     }
 }
+
+/// RAM base and size, from the machine's `Facts` (multiarch M2: both kernels read
+/// memory from the neutral description, not from their protocol's parser).
+///
+/// `facts` is `None` when there is no DTB, or one `akuma_firecracker::describe_fdt`
+/// cannot describe (no memory node with a size, no GIC node); both fall back to
+/// QEMU virt's defaults, as a missing DTB always did. The first RAM region is the
+/// one used — the same region the FDT's own `memory` node lists first.
 #[cfg(target_os = "none")]
-fn detect_memory(fdt: Option<&akuma_fdt::Fdt<'_>>) -> (usize, usize) {
+fn detect_memory(facts: Option<&akuma_machine_facts::Facts>, have_fdt: bool) -> (usize, usize) {
     const DEFAULT_RAM_BASE: usize = 0x4000_0000; // QEMU virt: 1 GB
 
     const DEFAULT_RAM_SIZE: usize = 256 * 1024 * 1024;
     const DTB_RESERVE: usize = 2 * 1024 * 1024; // 2 MB
 
-    let Some(fdt) = fdt else {
-        console::print("[Memory] No DTB found, using default 256MB\n");
+    let Some(region) = facts.and_then(|f| f.ram().first().copied()) else {
+        if have_fdt {
+            console::print("[Memory] DTB does not describe this machine, using defaults\n");
+        } else {
+            console::print("[Memory] No DTB found, using default 256MB\n");
+        }
         return (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE);
     };
-
-    // Get memory regions from DTB
-    let memory = fdt.memory();
-    if let Some(region) = memory.regions().next() {
-        let base = region.starting_address as usize;
-        let ram_size = region.size.unwrap_or(DEFAULT_RAM_SIZE);
-        
-        console::print("[Memory] Detected from DTB: base=0x");
-        console::print_hex(base as u64);
-        console::print(", size=");
-        console::print_dec(ram_size / 1024 / 1024);
-        console::print(" MB\n");
-        (base, ram_size)
-    } else {
-        console::print("[Memory] No memory region in DTB, using defaults\n");
-        (DEFAULT_RAM_BASE, DEFAULT_RAM_SIZE - DTB_RESERVE)
-    }
+    let base = region.base as usize;
+    let ram_size = region.size as usize;
+    console::print("[Memory] Detected from DTB: base=0x");
+    console::print_hex(base as u64);
+    console::print(", size=");
+    console::print_dec(ram_size / 1024 / 1024);
+    console::print(" MB\n");
+    (base, ram_size)
 }
 
-/// Decide the kernel heap size (bytes) for a given RAM size and code+stack reserve.
-///
-/// Pure function so it can be unit-tested without booting (see
-/// `tests::test_compute_heap_size`).
-///
-/// - `config::KERNEL_HEAP_SIZE_MB != 0` → use that fixed value (manual override).
-/// - **RAM ≥ 256 MB** → the historical generous heap: `1/8 of RAM, clamped to
-///   [64 MB, 256 MB]`. Unchanged so the common 256 MB+ configs and memory-hungry
-///   workloads (go build, bun, rustc metadata) behave exactly as before.
-/// - **RAM < 256 MB** → scale down: target `1/8 of RAM` with an 8 MB floor (the
-///   kernel boots using only ~2 MB of heap), but **never more than half of the
-///   memory left after code+stack**, so user pages always survive. The old code
-///   used a flat 64 MB floor here, which left 0 user pages below ~72 MB (no boot)
-///   and starved user RAM at 128 MB.
-///   Kernel physical-RAM layout: three contiguous regions starting at `ram_base`
-///   — `[.. heap_start)` code+boot-stack, `[heap_start ..)` heap, then user pages.
-pub struct MemoryLayout {
-    pub code_and_stack: usize,
-    pub heap_start: usize,
-    pub heap_size: usize,
-    pub user_pages_start: usize,
-    pub user_pages_size: usize,
-}
+/// Kernel physical-RAM layout. Re-exported from `akuma-mem-policy` (config flag sweep,
+/// 2026-11-11): see that crate for the type itself.
+pub use akuma_mem_policy::MemoryLayout;
 
 /// Compute the kernel memory layout for a detected RAM region.
 ///
-/// All profile-specific policy lives in `config` (`MIN_CODE_AND_STACK_BYTES`,
-/// `STACK_GUARD_BYTES`, `MEM_CALC_CLAMP_MB`) rather than inline `#[cfg]` in the
-/// boot path, so the layout is one pure, unit-testable function
-/// (`tests::test_compute_memory_layout`).
+/// Thin wrapper over `akuma_mem_policy::compute_memory_layout`, supplying this kernel's own
+/// `config::` constants as arguments — the policy itself (and its unit tests) now lives in that
+/// crate, shared with amd64.
 ///
 /// CRITICAL: `code_and_stack` must cover the *boot stack* (`boot_stack_top` =
 /// the STACK_TOP linker symbol, absolute VA of the initial SP), or the heap is
@@ -198,113 +191,45 @@ pub struct MemoryLayout {
 /// pages under pressure — kernel-corrupts-kernel (the EC=0x21/0x22 crash; see
 /// docs/STACK_CORRUPTION_ANALYSIS.md). The boot layout sanity guard in
 /// `kernel_main` re-verifies the result before any allocation.
-///
-/// `calc_ram` (see `reserve_calc_ram`) sizes only the kernel's OWN reserves;
-/// `user_pages_size` is always carved from the REAL `ram_size`.
 #[must_use]
-pub fn compute_memory_layout(
-    ram_base: usize,
-    ram_size: usize,
-    boot_stack_top: usize,
-) -> MemoryLayout {
-    let stack_cover = (boot_stack_top - ram_base) + config::STACK_GUARD_BYTES;
-    let calc_ram = reserve_calc_ram(ram_size, config::MEM_CALC_CLAMP_MB);
-    let code_and_stack = core::cmp::max(
-        core::cmp::max(calc_ram / 16, config::MIN_CODE_AND_STACK_BYTES),
-        stack_cover,
-    );
-    let heap_start = ram_base + code_and_stack;
-    let heap_size = compute_heap_size(calc_ram, code_and_stack);
-    let user_pages_start = heap_start + heap_size;
-    let user_pages_size = ram_size.saturating_sub(code_and_stack + heap_size);
-    MemoryLayout {
-        code_and_stack,
-        heap_start,
-        heap_size,
-        user_pages_start,
-        user_pages_size,
-    }
+pub fn compute_memory_layout(ram_base: usize, ram_size: usize, boot_stack_top: usize) -> MemoryLayout {
+    akuma_mem_policy::compute_memory_layout(
+        ram_base,
+        ram_size,
+        boot_stack_top,
+        config::MIN_CODE_AND_STACK_BYTES,
+        config::STACK_GUARD_BYTES,
+        config::MEM_CALC_CLAMP_MB,
+        config::KERNEL_HEAP_SIZE_MB,
+    )
 }
 
-/// RAM size used to compute the kernel's own reserves (code+stack, heap).
-///
-/// `clamp_mb == 0` → return the real `ram_size` (historical behaviour, used on
-/// release/size). Otherwise cap at `clamp_mb` MiB, so on a big box the kernel's
-/// reserve math stays pinned to the small-machine numbers it was tuned for and
-/// the surplus RAM flows to the user-page pool. See `config::MEM_CALC_CLAMP_MB`.
-/// Pure so it can be unit-tested (see `tests::test_reserve_calc_ram`).
+/// RAM size used to compute the kernel's own reserves (code+stack, heap). See
+/// `akuma_mem_policy::reserve_calc_ram`.
 #[must_use]
 pub fn reserve_calc_ram(ram_size: usize, clamp_mb: usize) -> usize {
-    if clamp_mb != 0 {
-        core::cmp::min(ram_size, clamp_mb * 1024 * 1024)
-    } else {
-        ram_size
-    }
+    akuma_mem_policy::reserve_calc_ram(ram_size, clamp_mb)
 }
 
+/// Decide the kernel heap size (bytes) for a given RAM size and code+stack reserve. See
+/// `akuma_mem_policy::compute_heap_size`.
 #[must_use]
 pub fn compute_heap_size(ram_size: usize, code_and_stack: usize) -> usize {
-    const MB: usize = 1024 * 1024;
-    if config::KERNEL_HEAP_SIZE_MB != 0 {
-        return config::KERNEL_HEAP_SIZE_MB * MB;
-    }
-    if ram_size >= 256 * MB {
-        (ram_size / 8).clamp(64 * MB, 256 * MB)
-    } else {
-        // Small RAM. The kernel boots on ~2.2 MB of heap. Thread stacks are NOT
-        // in the heap (they come from PMM), so the heap doesn't have to cover
-        // them — keeping it small leaves more user pages for the thread pool +
-        // processes.
-        //
-        // On the `size` profile (small-RAM target) we drop the floor to 4 MB:
-        // that frees 4 MB that would otherwise be wasted on heap that the kernel
-        // doesn't use, and on a 24 MB box nearly doubles the user-page pool
-        // (5 MB → 9 MB), which is the difference between tcc's ELF load
-        // failing and fitting.  On release we keep the 8 MB floor for headroom.
-        //
-        // For RAM >= 128 MB, ram/8 dominates the floor (16 MB+), so this only
-        // shrinks the heap below 128 MB.
-        // On the size profile, seed the heap with only 512 KB — the PmmOomHandler
-        // grows it on demand from PMM.  On release keep 4 MB (was 8 MB) for headroom.
-        #[cfg(kernel_profile_extreme)]
-        const SMALL_FLOOR: usize = 512 * 1024;
-        #[cfg(not(kernel_profile_extreme))]
-        const SMALL_FLOOR: usize = 4 * MB;
-        const MIN_USER: usize = 4 * MB;
-        let cap = ram_size
-            .saturating_sub(code_and_stack)
-            .saturating_sub(MIN_USER);
-        core::cmp::min(
-            core::cmp::max(ram_size / 8, SMALL_FLOOR),
-            core::cmp::max(cap, MB),
-        )
-    }
+    akuma_mem_policy::compute_heap_size(ram_size, code_and_stack, config::KERNEL_HEAP_SIZE_MB)
 }
 
 /// Decide how many thread slots get a stack allocated (`thread_limit`, capped at `MAX_THREADS`).
-///
-/// Thread stacks come from PMM (the user-pages pool), so on a small machine
-/// the full 64-thread pool (~9 MB) is the real boot floor. Give the pool at
-/// most ~half of user pages (leaving the rest for processes), keeping the
-/// `reserved` system threads plus at least a couple of user threads. See
-/// docs/LOW_MEMORY_ENVIRONMENT.md.
+/// See `akuma_mem_policy::compute_thread_limit`.
 #[must_use]
 pub fn compute_thread_limit(user_pages_size: usize) -> usize {
-    if config::THREAD_LIMIT_OVERRIDE != 0 {
-        return config::THREAD_LIMIT_OVERRIDE;
-    }
-    let reserved = config::RESERVED_THREADS;
-    let sys_total = reserved.saturating_sub(1) * config::SYSTEM_THREAD_STACK_SIZE;
-    // The pool gets at most 1/4 of user pages — processes (their ELF images,
-    // heaps, page tables) need the rest, and one process ELF load OOMs if the
-    // pool is too greedy (observed at MEMORY=32M when the pool took half).
-    let stack_budget = user_pages_size / 4;
-    let user_budget = stack_budget.saturating_sub(sys_total);
-    let n_user = user_budget / config::USER_THREAD_STACK_SIZE;
-    // Floor: reserved + 6 so a minimal session (shell + SSH thread + tcc +
-    // a couple of sub-processes) can coexist without hitting "no free user
-    // thread slots".  Cost at 64 KB/slot: 4 × 64 KB = 256 KB extra pool.
-    (reserved + n_user).clamp(reserved + 6, config::MAX_THREADS)
+    akuma_mem_policy::compute_thread_limit(
+        user_pages_size,
+        config::RESERVED_THREADS,
+        config::SYSTEM_THREAD_STACK_SIZE,
+        config::USER_THREAD_STACK_SIZE,
+        config::MAX_THREADS,
+        config::THREAD_LIMIT_OVERRIDE,
+    )
 }
 
 /// Build the `akuma-exec` runtime callbacks + config from the kernel's functions and
@@ -328,25 +253,15 @@ pub(crate) fn build_exec_runtime(
         enable_irqs: irq::enable_irqs,
         end_of_interrupt: akuma_gic::end_of_interrupt,
         // Real shared-kernel SMP: voluntary reschedules (yield_now / schedule_blocking)
-        // must ring THIS core's scheduler SGI, not the hardcoded PE0 that `trigger_sgi`
-        // targets — otherwise a secondary's yield/block pokes the BSP and never
-        // reschedules itself. On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent.
-        #[cfg(kernel_smp_shared)]
+        // must ring THIS core's scheduler SGI, not PE0 — otherwise a secondary's
+        // yield/block pokes the BSP and never reschedules itself.
         trigger_sgi: akuma_gic::trigger_sgi_self,
-        #[cfg(not(kernel_smp_shared))]
-        trigger_sgi: akuma_gic::trigger_sgi,
         // Cross-core wakeup (M4): nudge an idle peer to run a just-woken thread. No-op
         // off shared-SMP.
-        #[cfg(kernel_smp_shared)]
         wake_remote_idle: smp_shared::wake_remote_idle,
-        #[cfg(not(kernel_smp_shared))]
-        wake_remote_idle: || false,
         // Direct a scheduler SGI at the woken thread's last-known core so its
         // scheduler picks up the READY thread promptly. No-op off shared-SMP.
-        #[cfg(kernel_smp_shared)]
         wake_core: smp_shared::wake_core,
-        #[cfg(not(kernel_smp_shared))]
-        wake_core: |_| {},
         heap_stats: || {
             let s = allocator::stats();
             (s.heap_size, s.allocated)
@@ -354,10 +269,7 @@ pub(crate) fn build_exec_runtime(
         is_memory_low: allocator::is_memory_low,
         // Whether the execve/ELF-load BKL-drop is enabled (M5c hold-shortening). Lets the
         // ELF loader drop the BKL around the dynamic-interpreter read. No-op off shared-SMP.
-        #[cfg(kernel_smp_shared)]
         exec_bkl_drop_enabled: smp_shared::exec_bkl_drop_enabled,
-        #[cfg(not(kernel_smp_shared))]
-        exec_bkl_drop_enabled: || false,
         read_file: |path| crate::fs::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| crate::vfs::read_at(path, off, buf).map_err(|_| -1),
         resolve_file_id: |path| crate::vfs::resolve_file_id(path).ok_or(-1),
@@ -369,8 +281,8 @@ pub(crate) fn build_exec_runtime(
         // `[0,0,0,0]` metadata ICE in the self-host build. See
         // `akuma_pmm::DP_PREFAULT_FILL_SHORT` and
         // `docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`.
-        read_at_by_inode: |path, inode, off, buf| {
-            crate::vfs::read_at_by_inode(path, inode, off, buf).map_err(|_| -1)
+        read_at_by_inode: |mount_id, inode, off, buf| {
+            akuma_vfs_glue::read_at_by_mount_inode(mount_id, inode, off, buf).map_err(|_| -1)
         },
         on_process_exit: |_pid| {},
         remove_socket: akuma_net::socket::remove_socket,
@@ -431,7 +343,9 @@ pub(crate) fn build_exec_runtime(
         // so the AArch64 kernel's behaviour here is unchanged by the seam;
         // see `akuma_exec::ExecRuntime::enter_user` for what the other arm
         // has to be instead.
-        enter_user: akuma_exec::process::enter_user_mode_checked,
+        // Under `hooked-sched` the crossing is the kit's, which also points the thread's
+        // later EL0 traps at the top of its own kernel stack (`hooked::enter_user`).
+        enter_user: hooked::enter_user,
         // The AArch64 fork memory pass, which is `fork_process`'s own step 4 —
         // registered rather than called directly so the amd64 kernel can
         // substitute a walk that speaks x86 page tables. See the field's doc.
@@ -455,8 +369,8 @@ pub(crate) fn build_exec_runtime(
         // Derive the boot-stack size from the linker symbols (the single
         // source of truth — BOOT_STACK_SIZE via --defsym, profile-dependent)
         // rather than config::KERNEL_STACK_SIZE, so slot-0's StackInfo bounds
-        // and canary placement always match the actual reservation even when
-        // the extreme profile shrinks it. See linker.ld / build.rs.
+        // and canary placement always match the actual reservation. See
+        // linker.ld / build.rs.
         kernel_stack_size: boot_stack_top - boot_stack_base,
         // Real boot-stack bounds, read from the linker-derived STACK_BOTTOM /
         // STACK_TOP symbols above. The threading crate must NOT hardcode these
@@ -472,8 +386,6 @@ pub(crate) fn build_exec_runtime(
         enable_stack_canaries,
         stack_canary: config::STACK_CANARY,
         canary_words: config::CANARY_WORDS,
-        network_thread_ratio: config::NETWORK_THREAD_RATIO,
-        prioritize_never_scheduled: config::PRIORITIZE_NEVER_SCHEDULED,
         deferred_thread_cleanup: config::DEFERRED_THREAD_CLEANUP,
         thread_cleanup_cooldown_us: config::THREAD_CLEANUP_COOLDOWN_US,
         process_reclaim_cooldown_us: config::PROCESS_RECLAIM_COOLDOWN_US,
@@ -482,21 +394,27 @@ pub(crate) fn build_exec_runtime(
         enable_sgi_debug_prints: config::ENABLE_SGI_DEBUG_PRINTS,
         proc_stdin_max_size: config::PROC_STDIN_MAX_SIZE,
         proc_stdout_max_size: config::PROC_STDOUT_MAX_SIZE,
-        cow_fork_enabled: config::COW_FORK_ENABLED,
-        vfork_fastpath_enabled: config::VFORK_FASTPATH_ENABLED,
+        // CoW fork, the vfork fast-path and the shared file-page cache were each a
+        // `config::X_ENABLED` kill-switch, born with its feature and never flipped
+        // since (2026-03-28, 2026-05-31, 2026-08-05 respectively) — removed
+        // 2026-11-11 (config flag sweep). amd64 and both tokio kernels set these
+        // `RuntimeConfig` fields independently (currently all `false` there), so the
+        // field stays; only the AArch64 root kernel's global on/off const is gone.
+        cow_fork_enabled: true,
+        vfork_fastpath_enabled: true,
         pthread_kill_eintr_enabled: config::PTHREAD_KILL_EINTR_ENABLED,
-        shared_file_pages_enabled: config::SHARED_FILE_PAGES_ENABLED,
+        shared_file_pages_enabled: true,
     };
     (rt, cfg)
 }
 
-/// Boot self-test suite entry points, registered once from `src/main.rs`'s
-/// `rust_start` before it calls [`kernel_main`].
+/// Boot self-test suite entry points, registered once by
+/// `akuma_kernel_tests_aarch64::register`, the `before_main` the root bin hands
+/// `akuma_kernel::entry!`, before [`kernel_main`] runs.
 ///
-/// The test files (`tests.rs`, `daif_tests.rs`, ...) stay in `src/` per the
-/// original request — they are the ONE thing this crate cannot depend on,
-/// since `src/` is the bin crate and depends on THIS crate, not the other way
-/// around. `kernel_main`/`run_async_main` used to call them by bare module
+/// The test files (`tests.rs`, `daif_tests.rs`, ...) are
+/// `akuma-kernel-tests-aarch64`, the ONE thing this crate cannot depend on: it
+/// depends on THIS crate, not the other way around. `kernel_main`/`run_async_main` used to call them by bare module
 /// name when they were crate-root siblings in `main.rs`; now they go through
 /// this hook, the same `OnceCopy`-backed boot-registered-function pattern
 /// `akuma_primitives::console::set_print_hook` already uses for `console::print`.
@@ -543,27 +461,17 @@ fn boot_test_hooks() -> BootTestHooks {
     BOOT_TEST_HOOKS.require()
 }
 
-/// The rump regression-guard suite (`src/rump_tests.rs`) is gated
-/// independently of `kernel_tests` — it can run on a `no-tests` build when
-/// `rump-tests` is explicitly on — so it gets its own hook rather than a
+/// The rump regression-guard suite (`crates/akuma-kernel-tests-aarch64/src/rump_tests.rs`) is gated
+/// independently of `kernel_tests` — every `rump` build runs it, `no-tests` or
+/// not — so it gets its own hook rather than a
 /// field on [`BootTestHooks`].
-#[cfg(all(
-    target_os = "none",
-    not(kernel_profile_extreme),
-    feature = "rump",
-    any(not(feature = "no-tests"), feature = "rump-tests"),
-))]
+#[cfg(all(target_os = "none", feature = "rump"))]
 static RUMP_TESTS_HOOK: akuma_primitives::Registered<fn()> = akuma_primitives::Registered::new(
     "akuma-kernel-glue: rump tests hook not registered — \
      call akuma_kernel_glue::set_rump_tests_hook() from rust_start first",
 );
 
-#[cfg(all(
-    target_os = "none",
-    not(kernel_profile_extreme),
-    feature = "rump",
-    any(not(feature = "no-tests"), feature = "rump-tests"),
-))]
+#[cfg(all(target_os = "none", feature = "rump"))]
 pub fn set_rump_tests_hook(f: fn()) {
     RUMP_TESTS_HOOK.register(f);
 }
@@ -588,6 +496,61 @@ fn thread_nr_for_alloc_hook() -> u64 {
     let tid = akuma_exec::threading::current_thread_id();
     let nr = akuma_exec::threading::thread_current_syscall(tid);
     if nr == u64::MAX { 511 } else { nr }
+}
+
+/// The body of the `rust_start` symbol `akuma_kernel::entry!` defines: what runs between the
+/// boot assembly and [`kernel_main`].
+///
+/// `before_main` runs after the console hook is installed and before `kernel_main`; the root
+/// kernel registers its boot self-tests there ([`set_boot_test_hooks`]), because the suite
+/// (`akuma-kernel-tests-aarch64`) depends on this crate and this crate cannot depend back on it.
+#[cfg(target_os = "none")]
+pub fn start(dtb_ptr: usize, before_main: fn()) -> ! {
+    // FIRST statement in the kernel's Rust entry, before any output at all: point
+    // the shared `safe_print!` at the PL011.
+    //
+    // Why here and not in `akuma_exec::init` (which also registers it, from the
+    // same `ExecRuntime::print_str = console::print`): that call is late in
+    // `kernel_main`, and everything before it — DTB scan, memory detection, the MMU
+    // and heap bring-up, the layout assertions — prints. Registering there would
+    // have silently swallowed all of it, because the shared macro discards when
+    // unregistered. `console::print` needs no initialisation (a const MMIO base and
+    // a volatile store), so there is nothing to order this after. `OnceCopy::set`
+    // ignores the later duplicate.
+    akuma_primitives::console::set_print_hook(console::print);
+
+    console::print("DTB ptr from boot (x0 arg): 0x");
+    console::print_hex(dtb_ptr as u64);
+    console::print("\n");
+    console::print("x0 at _boot entry: 0x");
+    console::print_hex(boot::x0_at_entry());
+    console::print("\n");
+
+    before_main();
+    kernel_main(dtb_ptr)
+}
+
+/// Keep `/chosen/bootargs` as the boot command line (`akuma_params::capture`), once, while the
+/// DTB is still mapped: the blob is not valid past heap init. No DTB, no `/chosen` or no
+/// `bootargs` is an empty line, which every reader takes as "nothing set".
+#[cfg(target_os = "none")]
+fn capture_bootargs(fdt: Option<&akuma_fdt::Fdt<'_>>) {
+    let bootargs = fdt
+        .and_then(|f| f.find_node("/chosen"))
+        .and_then(|n| n.property("bootargs")?.as_str())
+        .unwrap_or("");
+    let r = akuma_params::capture(|buf| {
+        if bootargs.len() > buf.len() {
+            return Err(akuma_params::Failure::TooLong);
+        }
+        buf[..bootargs.len()].copy_from_slice(bootargs.as_bytes());
+        Ok(bootargs.len())
+    });
+    match r {
+        Ok(line) if !line.is_empty() => safe_print!(160, "[Boot] command line: {}\n", line),
+        Ok(_) => {}
+        Err(e) => safe_print!(96, "[Boot] command line not kept ({:?}): defaults apply\n", e),
+    }
 }
 
 /// Main kernel initialization - all safe code
@@ -735,6 +698,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
             safe_print!(64, "[DTB] none at 0x{:x}\n", akuma_fdt::resolve(dtb_ptr));
         }
         let fdt = dtb.and_then(akuma_fdt::Dtb::parse);
+        capture_bootargs(fdt.as_ref());
 
         let outcome = platform::install_fdt_device_map(fdt.as_ref());
         match outcome {
@@ -751,19 +715,35 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
             }
         }
 
-        let ram = detect_memory(fdt.as_ref());
+        let facts = platform::fdt_facts(fdt.as_ref());
+        if let Some(f) = facts.as_ref() {
+            safe_print!(160, "[Platform] facts: {}, {} MiB in {} region(s), cpus {}, virtio {}, irq {}  [{}]\n",
+                f.provenance.name(),
+                f.ram_bytes() / (1024 * 1024),
+                f.ram().len(),
+                f.cpus.unwrap_or(0),
+                f.virtio().len(),
+                match f.irq {
+                    akuma_machine_facts::IrqController::Gicv2 { .. } => "gicv2",
+                    akuma_machine_facts::IrqController::Gicv3 { .. } => "gicv3",
+                    akuma_machine_facts::IrqController::IoApic { .. } => "ioapic",
+                    akuma_machine_facts::IrqController::Unknown => "unknown",
+                },
+                if f.validate().is_ok() { "ok" } else { "INVALID" });
+        }
+
+        let ram = detect_memory(facts.as_ref(), fdt.is_some());
 
         // Real (shared-kernel) SMP: snapshot CPU/PSCI info from the DTB NOW, before the
         // heap allocator (which can be placed exactly at the DTB's address on
         // large-RAM configs) overwrites it. No-op without the `smp-shared` feature.
-        #[cfg(kernel_smp_shared)]
         smp_shared::probe_dtb(fdt.as_ref());
 
         ram
     });
 
-    // Memory layout. All the policy (boot-stack cover, code+stack floor, the
-    // extreme reserve-RAM clamp) lives in `compute_memory_layout` + `config`, so
+    // Memory layout. All the policy (boot-stack cover, code+stack floor)
+    // lives in `compute_memory_layout` + `config`, so
     // the boot path here is just "compute, then verify". The sanity guard below
     // re-checks the result before any allocation — a wrong reserve constant must
     // refuse to boot rather than silently corrupt kernel memory under load.
@@ -791,9 +771,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     let heap_end = heap_start + heap_size;
     let user_end = user_pages_start + user_pages_size;
     // The actual boot-stack bottom is the STACK_BOTTOM linker symbol, not a
-    // hardcoded `top - 1 MB` — the extreme profile shrinks BOOT_STACK_SIZE, so
-    // assuming 1 MB here would compute a bogus bottom (below the kernel image)
-    // and the overlap guard below would be checking the wrong region.
+    // hardcoded `top - 1 MB` — BOOT_STACK_SIZE is set by build.rs, and a
+    // hardcoded size that drifted from it would compute a bogus bottom and the
+    // overlap guard below would be checking the wrong region.
     let boot_stack_bottom = stack_bottom;
     let layout_ok =
         kernel_end <= heap_start &&                // kernel binary fits in code+stack
@@ -972,7 +952,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // scheduler. No-op with a single QEMU CPU. (docs/archive/SMP_SHARED.md)
     //
     // Bringup TIMING depends on the image, because the secondary immediately calls
-    // `adopt_current_as_core_idle` to claim a thread-pool slot:
+    // `adopt_core_idle` to claim a thread-pool slot:
     //
     //  * Boot SELF-TEST image (tests compiled in): bring up HERE, before `threading::init`,
     //    so the M0–M4 `test_smp_shared_*` self-tests find the secondaries already online.
@@ -989,8 +969,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     //    stalls the boot. So the runtime image brings secondaries up AFTER `threading::init`
     //    (below), where the slot allocator is live and hands out distinct slots. See
     //    docs/archive/SMP_SHARED.md M4 "open item".
-    #[cfg(all(kernel_smp_shared, not(feature = "no-tests")))]
-    smp_shared::bringup_secondaries();
 
     // Exception-path hooks: the dispatcher + the EL0-trap diagnostic the IRQ
     // and SVC entry points call out to. Registered BEFORE `exceptions::init()`
@@ -1013,7 +991,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         debug_sigsegv_syscall_stub_elir_max: config::DEBUG_SIGSEGV_SYSCALL_STUB_ELIR_MAX,
         debug_pattern2_trap_trace: config::DEBUG_PATTERN2_TRAP_TRACE,
     });
-    #[cfg(kernel_smp_shared)]
     exceptions::register_hooks(exceptions::ExceptionHooks {
         dispatch_irq: irq::dispatch_irq,
         record_el0_trap: smp_shared::record_el0_trap,
@@ -1032,27 +1009,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         read_profile_span_new: syscall::utils::read_profile::exception_span_start,
         read_profile_span_end: syscall::utils::read_profile::exception_span_end,
     });
-    #[cfg(not(kernel_smp_shared))]
-    exceptions::register_hooks(exceptions::ExceptionHooks {
-        dispatch_irq: irq::dispatch_irq,
-        report_poison_value: akuma_exec::process::reclaim::report_poison_value,
-        dp_counters_line: pmm::dp_counters_line,
-        handle_syscall: syscall::handle_syscall,
-        current_syscall_nr: syscall::current_syscall_nr,
-        inc_pagefault: syscall::syscall_counters::inc_pagefault,
-        inc_qemu_dc_zva_ec15: syscall::syscall_counters::inc_qemu_dc_zva_ec15,
-        inc_qemu_stp_xzr_ec15: syscall::syscall_counters::inc_qemu_stp_xzr_ec15,
-        sys_exit_group: syscall::proc::sys_exit_group_pub,
-        notify_child_channel_exited: syscall::proc::notify_child_channel_exited_pub,
-        vfork_complete: syscall::proc::vfork_complete,
-        signal_is_fatal_default: syscall::signal::signal_is_fatal_default,
-        syscall_log_formatted: syscall::log::get_formatted,
-        read_profile_span_new: syscall::utils::read_profile::exception_span_start,
-        read_profile_span_end: syscall::utils::read_profile::exception_span_end,
-    });
 
     // Set up exception vectors and enable IRQs
-    akuma_entry::exceptions::init();
+    akuma_entry::hooked::init();
     console::print("IRQ handling enabled\n");
 
     // Initialize timer
@@ -1061,7 +1020,6 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
 
     // Secondaries brought up earlier (self-test image) are parked before their GIC/IRQ
     // setup until here: hooks registered, vectors installed, tick period published.
-    #[cfg(kernel_smp_shared)]
     smp_shared::open_secondary_irq_gate();
 
     // =========================================================================
@@ -1070,6 +1028,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     match rng::init() {
         Ok(()) => {
             console::print("[RNG] Hardware RNG initialized\n");
+            // The shared hook: `AT_RANDOM` on every exec
+            // (`akuma_elf::attach_stack`) and `getrandom`. Unset, both fall back.
+            akuma_primitives::rng::set_rng_hook(|buf| rng::fill_bytes(buf).is_ok());
         }
         Err(_e) => {
             console::print("[RNG] Hardware RNG not available\n");
@@ -1136,6 +1097,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // died while parked is inherited by the slot's next occupant and silently absorbs that
     // address's next wake.
     threading::set_slot_purge_callback(syscall::futex_purge_tid);
+    // The hooked scheduler's machine half and core 0's idle thread (M6): after the slot
+    // table exists, before anything but the boot thread runs.
+    hooked::init();
     process::init_box_registry(); // Init Box 0
     console::print("Threading system initialized\n");
 
@@ -1167,13 +1131,15 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     allocator::enable_preemption_safe_alloc();
 
     // RUNTIME image (`no-tests`): bring secondaries up HERE — after the thread pool and
-    // preemptive scheduler are live — so each secondary's `adopt_current_as_core_idle`
+    // preemptive scheduler are live — so each secondary's `adopt_core_idle`
     // claims a distinct slot from the initialized allocator and never collides with the
     // async-main thread spawned below. (The self-test image brought them up earlier, before
     // `threading::init`; see the note there.) Combined with the network path's cross-core
     // lock discipline (`PreemptGuard` in akuma-net), this lets the devbox boot to userspace
     // sshd under SMP>=2. See docs/archive/SMP_SHARED.md M4 "open item".
-    #[cfg(all(kernel_smp_shared, feature = "no-tests"))]
+    // `hooked-sched` (M6): here in both images. A secondary's idle thread is adopted through
+    // `hooked::init`'s registration, so the cores cannot start before it — the SGI self-test
+    // image's earlier start (see the note before `exceptions::init`) is not available here.
     smp_shared::bringup_secondaries();
 
     // The boot self-test suite spawns many concurrent threads/processes. On a
@@ -1231,7 +1197,11 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // Filesystem initialization
     // =========================================================================
-    if !config::SKIP_FILESYSTEM_INIT {
+    // `SKIP_FILESYSTEM_INIT` (config flag sweep, 2026-11-11): an unconditional
+    // debug escape hatch, never flipped since it was added, removed along with
+    // the kill-switches above. This block (kept as a bare scope, no behavior
+    // change) always runs now.
+    {
         console::print("\n--- Filesystem Initialization ---\n");
 
         // Initialize block device first
@@ -1318,12 +1288,20 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         }
 
         console::print("--- Filesystem Initialization Done ---\n\n");
-    } else {
-        console::print("[FS] Filesystem SKIPPED via config::SKIP_FILESYSTEM_INIT\n");
     }
 
     run_async_main_preemptive();
 }
+
+/// The longest the hooked netpoll loop parks between laps with no packet: the resolution
+/// of its housekeeping (reclaim, herd output, heartbeats) and of smoltcp's own timers.
+#[cfg(all(feature = "smoltcp", target_os = "none"))]
+const NETPOLL_PARK_US: u64 = 10_000;
+
+/// How long the boot thread's housekeeping loop sleeps between laps under the hooked
+/// scheduler: its cleanup runs every 10 laps, so every 100 ms.
+#[cfg(target_os = "none")]
+const BOOT_THREAD_PERIOD_US: u64 = 10_000;
 
 #[cfg(target_os = "none")]
 fn run_async_main_preemptive() -> ! {
@@ -1415,19 +1393,10 @@ fn run_async_main_preemptive() -> ! {
                     }
                 }
 
-                threading::yield_now();
-
-                // Genuinely halt until the next interrupt (timer tick ~10 ms, or a
-                // device IRQ). Without this the boot/idle thread is a pure
-                // `loop { yield_now() }` busy-spin: yield_now() only fires a self-SGI
-                // and returns immediately, so when no other thread is runnable this
-                // thread and the network poller ping-pong SGIs at microsecond
-                // granularity and pin the host vCPU at 100% even at idle. idle_halt
-                // (not raw wfi) also keeps CPU-time accounting honest so the halt
-                // isn't billed as busy time. The secondary cores already WFI in their
-                // idle loops (smp.rs); this is the BSP equivalent.
-                // See docs/KNOWN_ISSUES.md issue #11.
-                threading::idle_halt();
+                // Hooked scheduler: this is housekeeping, not an idle loop — park it for a
+                // fixed period and let the core's idle thread halt, tickless. A `wfi` here
+                // held a core on its 1 ms tick for nothing (`docs/archive/HOOKED_IDLE_TICK.md`).
+                threading::sleep_us(BOOT_THREAD_PERIOD_US);
             }
 
             console::print("[AsyncMain] Preemtive main thread terminated\n");
@@ -1489,7 +1458,6 @@ fn netpoll_drain_step() {
     {
         // Profiler only: isolate the burst-drain itself from the maintenance work
         // above it (BKL_VFS_CARVE_OUT.md §19 sub-tag split).
-        #[cfg(kernel_smp_shared)]
         akuma_exec::sync::set_holder_tag(
             akuma_exec::bkl::current_core_id(),
             akuma_exec::sync::HOLD_TAG_NETPOLL_DRAIN,
@@ -1498,12 +1466,10 @@ fn netpoll_drain_step() {
         // transitively `SOCKET_TABLE` via the post-drop wake pass) is already behind
         // its own `PreemptGuard`-protected lock, so the drain doesn't need the BKL for
         // exclusivity — same precedent as `NetBklGuard` (src/syscall/net.rs), whose
-        // mechanism this reuses directly. Gated on `kernel_no_bkl_network`
-        // specifically, not just `kernel_smp_shared`: that is what makes
-        // `PreemptGuard::new()` mask IRQs for the inner `NETWORK` hold, which is what
+        // mechanism this reuses directly. Safe because under `kernel_bkl_smp`
+        // `PreemptGuard::new()` also masks IRQs for the inner `NETWORK` hold, which is what
         // keeps a nested IRQ from ever observing this core "holding NETWORK, wanting
         // the BKL" — the AB-BA shape the `PreemptGuard` doc warns about.
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_open();
         // Re-arm the netpoll doorbell BEFORE draining, not after.
         //
@@ -1529,7 +1495,6 @@ fn netpoll_drain_step() {
         // (`NIC_WAKE_PENDING`); renamed when a loopback frame push
         // (`akuma_net::runtime::NetRuntime::wake_netpoll`) became a second ringer
         // — see `ring_netpoll_doorbell` and `docs/archive/LOOPBACK_RING_CONVERSION.md`.
-        #[cfg(kernel_smp_shared)]
         NETPOLL_WAKE_PENDING.store(false, core::sync::atomic::Ordering::Relaxed);
         let mut polls = 0u32;
         while akuma_net::smoltcp_net::poll() {
@@ -1538,7 +1503,6 @@ fn netpoll_drain_step() {
                 break; // Safety cap to avoid starving other threads
             }
         }
-        #[cfg(all(kernel_smp_shared, kernel_no_bkl_network))]
         akuma_exec::bkl::dropped_window_close();
     }
 }
@@ -1557,37 +1521,18 @@ fn run_async_main() -> ! {
     use core::pin::pin;
     use core::task::{Context, Waker};
 
-    // Register this thread as the network poller so the scheduler boost targets it.
-    //
-    // Under `rump-default` (devbox), this thread drives the (compiled-but-unused)
-    // smoltcp stack and does no real work — so it must NOT claim the boost slot.
-    // `rump_proxy::start_default_stack` claims it instead, registering
-    // `rump_server`'s own main OS thread (the fiber scheduler that services every
-    // proxied socket syscall) — NOT the `attach_server` handshake kthread, which
-    // parks after `Client::connect` and does no per-call work. See
-    // `overlays/devbox/README.md` "Rump net thread starve under CPU-bound load"
-    // and `docs/runbooks/debug-devbox.md`.
+    // Name this thread "network" in thread dumps. Under `rump-default` the name belongs to
+    // `rump_server`'s main thread instead (`rump_proxy::start_default_stack`), because this
+    // thread then drives a smoltcp stack nothing uses.
     #[cfg(not(feature = "rump-default"))]
     threading::set_network_thread_id(threading::current_thread_id());
-
-    // =========================================================================
-    // Skip async network if disabled (for debugging)
-    // =========================================================================
-    if config::SKIP_ASYNC_NETWORK {
-        console::print("[AsyncMain] Network SKIPPED via config::SKIP_ASYNC_NETWORK\n");
-        console::print("[Idle] Entering minimal idle loop...\n");
-        
-        // Enable IRQs so timer can fire
-        akuma_primitives::irq::unmask_irqs();
-        
-        loop {
-            threading::yield_now();
-        }
-    }
+    threading::register_netpoll_parker();
 
     // =========================================================================
     // Network initialization and main loop
     // =========================================================================
+    // `SKIP_ASYNC_NETWORK` (config flag sweep, 2026-11-11): removed with the
+    // other unconditional debug kill-switches. Network init always runs now.
     console::print("\n--- Network Initialization ---\n");
 
     // Initialize the akuma-net networking stack. The MMIO slot table lives in
@@ -1724,12 +1669,8 @@ fn run_async_main() -> ! {
 
     // Rump sysproxy / scheduling regression guards. Compile under `rump` (so
     // they also run on default-smoltcp builds that opt a herd box into rump),
-    // not gated on `rump-default`. See `src/rump_tests.rs`.
-    #[cfg(all(
-        not(kernel_profile_extreme),
-        feature = "rump",
-        any(not(feature = "no-tests"), feature = "rump-tests"),
-    ))]
+    // not gated on `rump-default`. See `crates/akuma-kernel-tests-aarch64/src/rump_tests.rs`.
+    #[cfg(feature = "rump")]
     // `require`, not `get`: this static and `rust_start`'s registration carry the
     // identical cfg, so an absent hook here means the two drifted apart — and the
     // old `if let Some` spelling turned that into a regression suite silently not
@@ -1760,46 +1701,36 @@ fn run_async_main() -> ! {
     // Enable IRQs for the main loop
     akuma_primitives::irq::unmask_irqs();
 
-    // Auto-start herd process supervisor
-    let (_herd_tid, mut herd_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
-        const HERD_PATH: &str = "/bin/herd";
-        const HERD_ARGS: &[&str] = &["daemon"];
-        if fs::exists(HERD_PATH) {
-            crate::safe_print!(64, "[Main] Starting herd supervisor...\n");
-            match process::spawn_process_with_channel(HERD_PATH, Some(HERD_ARGS), None) {
-                Ok((tid, channel, _pid)) => {
-                    crate::safe_print!(64, "[Main] Herd started (tid={})\n", tid);
+    // Init: what `init=`/`initargs=` on the boot line name (`akuma_params::init`, the reader
+    // amd64 uses too), and `herd daemon` when it names nothing, which is what this kernel has
+    // always started. `config::AUTO_START_HERD` still switches init off altogether. Its stdout
+    // is a channel of its own, which the loop below copies to the UART; nothing reads the UART
+    // for it (this kernel has no interactive console). `docs/reference/subsystems/boot.md` § Init.
+    let (_init_tid, mut init_channel) = if config::AUTO_START_HERD && fs::is_initialized() {
+        let init = akuma_params::init::Init::from_line_or(
+            akuma_params::line(),
+            akuma_params::init::Init::new("/bin/herd", "daemon"),
+        );
+        if fs::exists(init.path) {
+            let args: alloc::vec::Vec<&str> = init.args().collect();
+            crate::safe_print!(160, "[Main] Starting init: {} {}\n", init.path, init.args);
+            match process::spawn_process_with_channel(init.path, Some(&args), None) {
+                Ok((tid, channel, pid)) => {
+                    crate::safe_print!(64, "[Main] init started (pid={}, tid={})\n", pid, tid);
                     (tid, Some(channel))
                 }
                 Err(e) => {
-                    crate::safe_print!(64, "[Main] ERROR: Failed to start herd: {}\n", e);
+                    crate::safe_print!(160, "[Main] ERROR: failed to start init {}: {}\n", init.path, e);
                     (0, None)
                 }
             }
         } else {
-            crate::safe_print!(64, "[Main] WARNING: /bin/herd not found, supervisor disabled\n");
+            crate::safe_print!(160, "[Main] WARNING: init {} not found, nothing started\n", init.path);
             (0, None)
         }
     } else {
         (0, None)
     };
-
-    // No supervisor: start the userspace sshd ourselves, or the box has no way in.
-    // Port 22 (the QEMU hostfwd target) with /bin/sh as the login shell — the same
-    // command line herd's sshd.conf would hand it, minus the core pinning.
-    if config::AUTO_START_SSHD && _herd_tid == 0 && fs::is_initialized() {
-        const SSHD_PATH: &str = "/bin/sshd";
-        let sshd_args: [&str; 4] = ["--port", "22", "--shell", config::USERSPACE_SSHD_SHELL];
-        if fs::exists(SSHD_PATH) {
-            crate::safe_print!(64, "[Main] Starting userspace sshd (no supervisor)...\n");
-            match process::spawn_process(SSHD_PATH, Some(&sshd_args), None) {
-                Ok(tid) => crate::safe_print!(64, "[Main] sshd started (tid={})\n", tid),
-                Err(e) => crate::safe_print!(64, "[Main] ERROR: Failed to start sshd: {}\n", e),
-            }
-        } else {
-            crate::safe_print!(64, "[Main] WARNING: /bin/sshd not found, no SSH available\n");
-        }
-    }
 
     // Loop iteration counter for debugging hangs
     use core::sync::atomic::{AtomicU64, Ordering};
@@ -1835,7 +1766,7 @@ fn run_async_main() -> ! {
         // the smoltcp drain and herd polling below it, so a `netpoll` measurement
         // decomposes instead of crediting the whole iteration to one bucket
         // (BKL_VFS_CARVE_OUT.md §19).
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        #[cfg(feature = "smoltcp")]
         akuma_exec::sync::set_holder_tag(
             akuma_exec::bkl::current_core_id(),
             akuma_exec::sync::HOLD_TAG_NETPOLL_MAINT,
@@ -1948,9 +1879,8 @@ fn run_async_main() -> ! {
             // that readable without cross-referencing three separate lines and a
             // `[PSTATS]` for the free count.
             //
-            // `stackpg` is the kernel thread-stack pool, which on every profile but
-            // `extreme` is eagerly allocated for ALL slots at boot and never
-            // reclaimed — so unlike the two caches it is a floor, not a cache.
+            // `stackpg` is the kernel thread-stack pool, which is eagerly
+            // allocated for ALL slots at boot and never reclaimed — so unlike the two caches it is a floor, not a cache.
             #[cfg(feature = "pmm-instr")]
             {
                 let (low, user_oom) = akuma_pmm::pressure_stats();
@@ -2015,7 +1945,7 @@ fn run_async_main() -> ! {
             // Shared read-only file pages, same cadence. `hits` is the number of
             // private frame allocations + `read_at` sweeps this cache avoided, which
             // is the direct measure of the `-j4` amplification it exists to remove.
-            if crate::config::SHARED_FILE_PAGES_ENABLED {
+            {
                 let mut w = console::StackWriter::<192>::new();
                 crate::file_page_cache::stats_line(&mut w);
                 w.flush();
@@ -2186,7 +2116,7 @@ fn run_async_main() -> ! {
         if config::MEM_MONITOR_ENABLED {
             // Profiler only: attribute the (normally disabled) mem-monitor poll
             // separately from the drain (BKL_VFS_CARVE_OUT.md §19).
-            #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+            #[cfg(feature = "smoltcp")]
             akuma_exec::sync::set_holder_tag(
                 akuma_exec::bkl::current_core_id(),
                 akuma_exec::sync::HOLD_TAG_NETPOLL_MEMMON,
@@ -2203,13 +2133,13 @@ fn run_async_main() -> ! {
         // to 100 ms was tried 2026-08-20 and measured NEUTRAL-TO-WORSE (req/s
         // 1,040 -> 1,002, p90 2,453 -> 2,727 us on the same machine state). Do not
         // "fix" it again without re-measuring: see AKUMA_NET_ISSUES.md §10.
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
+        #[cfg(feature = "smoltcp")]
         akuma_exec::sync::set_holder_tag(
             akuma_exec::bkl::current_core_id(),
             akuma_exec::sync::HOLD_TAG_NETPOLL_HERD,
         );
-        // Poll herd output
-        if let Some(ref channel) = herd_channel {
+        // Poll init's output
+        if let Some(ref channel) = init_channel {
             if let Some(output) = channel.try_read() {
                 for &byte in &output {
                     console::print_char(byte as char);
@@ -2217,8 +2147,8 @@ fn run_async_main() -> ! {
             }
             if channel.has_exited() {
                 let exit_code = channel.exit_code();
-                crate::safe_print!(64, "[Herd] Process exited with code {}\n", exit_code);
-                herd_channel = None;
+                crate::safe_print!(64, "[Main] init exited with code {}\n", exit_code);
+                init_channel = None;
             }
         }
         
@@ -2239,23 +2169,17 @@ fn run_async_main() -> ! {
         // idle loop in smp_shared.rs). A pending RX/timer/SGI IRQ makes WFI return at
         // once, so burst draining is unaffected, while the peer core gets a BKL window
         // every iteration.
-        #[cfg(all(kernel_smp_shared, feature = "smoltcp"))]
-        {
-            akuma_exec::bkl::leave_kernel();
-            // IRQs are enabled; the timer/RX/SGI IRQ wakes us and its handler
-            // re-takes the BKL (our enter_kernel below is then idempotent).
-            akuma_cpu::park::wfi();
-            akuma_exec::bkl::enter_kernel();
-            // Profiler only: names the sliver between re-acquiring the BKL post-WFI and
-            // the top-of-loop HOLD_TAG_NETPOLL_MAINT call above — negligible, but must
-            // be something other than whatever HOLD_TAG_NETPOLL_HERD left behind
-            // (BKL_VFS_CARVE_OUT.md §18, §19).
-            akuma_exec::sync::set_holder_tag(
-                akuma_exec::bkl::current_core_id(),
-                akuma_exec::sync::HOLD_TAG_NETPOLL,
-            );
-        }
-        #[cfg(not(all(kernel_smp_shared, feature = "smoltcp")))]
+        // The hooked scheduler takes the same halt without `smp-shared` too (the rump devbox):
+        // its `yield_now` returns at once when nothing else can run, so a bare yield loop
+        // spun the only core at 100 %. The BKL calls are no-ops without `smp-shared`. A
+        // READY peer still gets the core: the tick preempts this thread mid-`wfi`, on both
+        // scheduler paths (`docs/archive/HOOKED_EL1_PREEMPTION.md`).
+        // Hooked scheduler: park instead, woken by the doorbell (`wake_netpoll_parker`) or the
+        // period, so the core's idle thread can halt with its tick stopped. A `wfi` here kept
+        // the core on its 1 ms tick (`docs/archive/HOOKED_IDLE_TICK.md`).
+        #[cfg(feature = "smoltcp")]
+        threading::schedule_blocking(timer::uptime_us().saturating_add(NETPOLL_PARK_US));
+        #[cfg(not(feature = "smoltcp"))]
         threading::yield_now();
 
         // In a rump-only / devbox build there is no smoltcp interface to poll
@@ -2306,15 +2230,15 @@ const VIRTIO_MMIO_SPI_BASE: u32 = platform::machine::VIRTIO_INTID_BASE;
 /// `docs/archive/LOOPBACK_RING_CONVERSION.md`.
 ///
 /// Only exists where it is used: the doorbell is about waking *peer* cores, so a
-/// single-core build (`extreme-size` drops `smp-shared`) has nobody to poke.
-#[cfg(all(feature = "smoltcp", kernel_smp_shared))]
+/// build without `smp-shared` has nobody to poke.
+#[cfg(feature = "smoltcp")]
 #[cfg(target_os = "none")]
 static NETPOLL_WAKE_PENDING: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
 /// Ring the cross-core netpoll doorbell: broadcast the scheduler SGI to every
 /// core, coalesced through [`NETPOLL_WAKE_PENDING`] so a burst costs one SGI
-/// per drain cycle rather than one per frame. No-op off `kernel_smp_shared`
+/// per drain cycle rather than one per frame. No-op off `kernel_bkl_smp`
 /// (see that static's doc comment).
 ///
 /// Two callers want exactly the same effect — end every core's
@@ -2336,7 +2260,9 @@ fn ring_netpoll_doorbell() {}
 #[cfg(feature = "smoltcp")]
 #[cfg(target_os = "none")]
 fn ring_netpoll_doorbell() {
-    #[cfg(kernel_smp_shared)]
+    // The hooked netpoll loop parks between laps rather than halting, so an interrupt alone
+    // does not resume it: wake it.
+    threading::wake_netpoll_parker();
     if !NETPOLL_WAKE_PENDING.swap(true, core::sync::atomic::Ordering::AcqRel) {
         // Wake EVERY core, not just the ones with a parked socket waiter.
         //
@@ -2503,137 +2429,11 @@ async fn memory_monitor() -> ! {
         buf.flush();
 
         // Stack high-water (no-op unless the probe const is on): right-sizing data
-        // for the extreme kernel stacks. Printed on its own line to keep [Mem] short.
+        // for the kernel stacks. Printed on its own line to keep [Mem] short.
         akuma_exec::threading::report_stack_high_water();
 
 
         // Report every 10 seconds (or period from config)
         Timer::after(Duration::from_secs(config::MEM_MONITOR_PERIOD_SECONDS)).await;
-    }
-}
-
-// ============================================================================
-// Source-shape invariants (host tests)
-// ============================================================================
-
-/// Two invariants that are **compile-time** properties of this crate's own
-/// source, so nothing at runtime can observe them: under `rump-default` the call
-/// T1 guards is *compiled out*, and T2's effect is only visible as a throughput
-/// difference under load. They are asserted by reading the source text.
-///
-/// They used to live in `src/rump_tests.rs` as boot-suite tests, which embedded
-/// `include_str!` of this file (126 KB) plus `rump_proxy.rs` (78 KB) into the
-/// **kernel image** — ~200 KB of `.rodata` in every build that compiled the boot
-/// suite. Moved here 2026-09-03: `#[cfg(test)]` means the embedding now happens
-/// only in the host test binary, and `cargo test --target $(host)` runs them.
-///
-/// The move also fixed a coverage hole. The old module was gated
-/// `any(not(feature = "no-tests"), feature = "rump-tests")`, so the **devbox
-/// builds — the only ones that actually run `rump-default` — never executed
-/// these checks at all.** They ran solely in an image that does not use the
-/// feature they guard. Here they run on every `cargo test`, for every profile.
-///
-/// `include_str!` rather than `std::fs`: this crate is `#![no_std]`, and a path
-/// relative to this file cannot go stale the way a `CARGO_MANIFEST_DIR` join can.
-#[cfg(test)]
-mod source_shape {
-    /// T1: under `rump-default`, `run_async_main` must NOT register itself as
-    /// the network thread — `start_default_stack` owns that slot (T2 registers
-    /// rump_server's TID). If anyone removes the
-    /// `#[cfg(not(feature = "rump-default"))]` gate we would silently regress
-    /// the devbox "starve under CPU-bound load" fix
-    /// (`overlays/devbox/README.md:297-307`).
-    #[test]
-    fn run_async_main_skips_network_thread_id_under_rump_default() {
-        const MAIN_SRC: &str = include_str!("lib.rs");
-
-        let fn_start = MAIN_SRC
-            .find("fn run_async_main(")
-            .expect("akuma-kernel-glue must define run_async_main");
-        let fn_body_end = MAIN_SRC[fn_start..]
-            .find("\nfn ")
-            .map_or(MAIN_SRC.len(), |off| fn_start + off);
-        let body = &MAIN_SRC[fn_start..fn_body_end];
-
-        let call_idx = body
-            .find("set_network_thread_id(")
-            .expect("run_async_main must register the network thread (gated)");
-
-        // Walk backwards from the call over non-comment, non-blank lines until the
-        // nearest attribute. Trim the partial last line (the `    threading::`
-        // prefix on the call's own line) so scanning starts one line above it.
-        let before = body[..call_idx].rsplit_once('\n').map_or("", |(rest, _)| rest);
-        let mut found_cfg = false;
-        for raw_line in before.lines().rev() {
-            let line = raw_line.trim_start();
-            if line.is_empty() || line.starts_with("//") {
-                continue;
-            }
-            if line.starts_with("#[cfg(") {
-                found_cfg = line.contains("not(feature = \"rump-default\")");
-            }
-            break;
-        }
-        assert!(
-            found_cfg,
-            "run_async_main's set_network_thread_id call must be gated by \
-             #[cfg(not(feature = \"rump-default\"))] so start_default_stack owns \
-             the boost slot under devbox"
-        );
-    }
-
-    /// T2: under `rump-default`, `start_default_stack` must register
-    /// rump_server's main thread (the fiber-scheduler OS thread) as the network
-    /// thread — NOT the proxy handshake kthread, which parks after
-    /// `Client::connect` and does zero per-call work.
-    #[test]
-    fn start_default_stack_registers_rump_server_tid() {
-        const PROXY_SRC: &str = include_str!("rump_proxy.rs");
-
-        let fn_start = PROXY_SRC
-            .find("pub fn start_default_stack")
-            .expect("rump_proxy.rs must define start_default_stack");
-        let fn_body_end = PROXY_SRC[fn_start..]
-            .find("\npub fn ")
-            .or_else(|| PROXY_SRC[fn_start..].find("\nfn "))
-            .map_or(PROXY_SRC.len(), |off| fn_start + off);
-        let body = &PROXY_SRC[fn_start..fn_body_end];
-
-        // The spawn must capture the TID (not discard it as `_tid`).
-        assert!(
-            !body.contains("Ok((_tid,") || body.contains("Ok((tid,"),
-            "start_default_stack must capture rump_server's TID from \
-             spawn_process_with_channel, not discard it as _tid"
-        );
-
-        // The registration must use the captured server TID, not
-        // `current_thread_id` (which would be the kthread).
-        assert!(
-            body.contains("set_network_thread_id(server_tid)"),
-            "start_default_stack must call set_network_thread_id(server_tid) — \
-             registering rump_server's main thread as the network thread, not the \
-             calling kthread. The proxy kthread parks after handshake and does no \
-             per-call work."
-        );
-
-        // The kthread body in attach_server must NOT contain its own registration.
-        let attach_start = PROXY_SRC
-            .find("pub fn attach_server")
-            .expect("rump_proxy.rs must define attach_server");
-        let attach_body = &PROXY_SRC[attach_start..];
-        let spawn_idx = attach_body
-            .find("threading::spawn_fn")
-            .expect("attach_server must spawn the handshake kthread");
-        let kthread_body = &attach_body[spawn_idx..];
-        let kthread_end = kthread_body
-            .find("\n    });\n")
-            .map_or(attach_body.len(), |off| spawn_idx + off);
-        let kthread_section = &attach_body[spawn_idx..kthread_end];
-        assert!(
-            !kthread_section.contains("set_network_thread_id(current_thread_id())"),
-            "attach_server's kthread must NOT register itself as the network \
-             thread — it parks after the handshake. The registration belongs in \
-             start_default_stack."
-        );
     }
 }

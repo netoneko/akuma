@@ -26,8 +26,8 @@ Akuma isolates processes into **boxes**, each with its own:
 - A process spawns into or `join_box`s into another box for isolation.
 
 **A kernel without containers has one box.** `akuma-isolation`'s `containers` feature
-(forwarded by every kernel's `sc-containers`; off in Taoxichuan and AArch64
-`extreme-size`) compiles the box half: `overlay_fs`, `subdir_fs` and the live
+(forwarded by every kernel's `sc-containers`; off in Taoxichuan and in any
+`--no-default-features` build that does not re-add it) compiles the box half: `overlay_fs`, `subdir_fs` and the live
 `box_registry` with its `hierarchy`/`access` walks. Without it, `box_registry` is
 `host_only`: the same functions, answered for box 0 by construction (no table, no
 lock; nothing is a box's primary, a kill cascade is the box itself, box 0 reaches
@@ -55,7 +55,7 @@ the box's recorded `creator_pid`.
 | Syscall | Rule | Denied with |
 |---|---|---|
 | `REGISTER_BOX` | `can_register_box`: re-registering a live box needs `can_access_box`; a **new** box becomes a child of the caller's box and its `root_dir` must lie inside the caller's own root (`validate_nested_root`, component-boundary match). `root_dir` is canonicalized first. Box 0 cannot be created | `EPERM` |
-| `KILL_BOX` | `can_kill_box`. The namespace is dropped only after the kill succeeds | `EPERM` |
+| `KILL_BOX` | `can_kill_box`. The namespace and the box's SysV message queues are dropped only after the kill succeeds | `EPERM` |
 | `SPAWN_EXT` (`box_id != 0`) | `can_access_box` — the child inherits that box's `box_id` **and** its mount namespace. `box_id == 0` means "inherit the caller's box" and is unchecked | `EPERM` |
 | `SET_BOX_STACK` | `can_access_box` | `EPERM` |
 | `MOUNT_IN_NS` | caller must be box 0. With fstype `overlay` at `/`, the target box must additionally have **no processes** and a still-pristine root | `EPERM` |
@@ -123,7 +123,11 @@ clean exit or `restart = false` → `Exited` (stays down); else respawn after
 `restart_delay_ms`, up to `max_retries`, then `Failed`. A **failed spawn** (the
 process never ran) is treated the same way when `restart = true` — retried,
 not parked in `Failed`; with `restart = false` or `oneshot` it is `Failed`
-(`herd::exit::classify_spawn_failure`, host-tested). `herd status` lists the
+(`herd::exit::classify_spawn_failure`, host-tested). With `backoff = true`
+(default off) the delay stretches: each failure within 30 s of the start doubles
+`restart_delay_ms`, up to 60 s, and a longer run resets it
+(`herd::exit::restart_delay_ms`, host-tested). It is off by default because a
+service that must come back promptly, such as wifi, cannot wait a minute. `herd status` lists the
 enabled services (not their runtime state).
 
 **Control:** `herd start <svc>` / `herd stop <svc>` talk to the daemon over
@@ -404,17 +408,17 @@ boxed service.
 
 The box syscalls are the same shared code on both kernels; amd64 dispatches the
 private numbers (315-318, 324, 325) to `akuma-syscalls-glue` from
-`amd64/src/usermode.rs`. What differs, and must stay true:
+`crates/akuma-kernel-amd64/src/usermode.rs`. What differs, and must stay true:
 
 - **Namespaces**: `exec_runtime.rs` forwards `get_box_namespace` /
   `set_spawn_namespace` / `clear_spawn_namespace` to `akuma-vfs-glue`, and
   `resolve_symlinks` to its resolver. Stubbing any of them silently un-jails
   `spawn_ext` children.
 - **Loading**: `spawn_ext` loads by path (large binaries) *eagerly*
-  (`set_eager_path_loads`) — amd64's `#PF` handler does not serve `LazyRegionMap`.
+  (`set_eager_path_loads`) — amd64's `#PF` handler does not serve AArch64's lazy regions.
 - **Threads**: a `spawn_ext` thread is created through
   `spawn_user_closure_initializing` so it gets a trap stack. A new way to create
-  a user thread on x86_64 must call `X86ArchHooks::prepare_task_slot`.
+  a user thread on x86_64 must call `ArchHooks::prepare_task_slot`.
 - **Stacks**: kernel stacks are 32 KiB with no guard page. Do not hold `Process`
   by value more than necessary; its big arrays live on the heap.
 - **Signals/kill**: `kill_box` kills members through `set_box_member_killer`

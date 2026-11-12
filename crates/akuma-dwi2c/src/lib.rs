@@ -3,7 +3,7 @@
 //! the register map, the master `IC_CON` value, SCL timing arithmetic,
 //! FIFO-depth and component-type decode, and the `TX_ABRT_SOURCE` → error
 //! mapping. The MMIO transaction loop itself lives kernel-side
-//! (`amd64/src/i2c.rs`, proposed); everything here is the part worth
+//! (`crates/akuma-kernel-amd64/src/i2c.rs`, proposed); everything here is the part worth
 //! testing on the host.
 //!
 //! Behavioural reference: Linux `drivers/i2c/busses/i2c-designware-*.c`

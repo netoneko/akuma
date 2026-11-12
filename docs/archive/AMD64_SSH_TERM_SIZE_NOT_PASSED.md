@@ -315,9 +315,9 @@ and keeps its pipe, byte for byte, when it did not.
 - `userspace/libakuma/src/lib.rs` — `spawn_full` and the four wrappers over it.
 - `crates/akuma-syscalls-glue/src/term.rs` — the `TIOCSWINSZ` arm and its
   `ChildStdout` reasoning, unchanged.
-- `amd64/src/fd.rs` — `console_ioctl` (break 5), `child_pipe_set_winsize`
+- `crates/akuma-kernel-amd64/src/fd.rs` — `console_ioctl` (break 5), `child_pipe_set_winsize`
   (break 4).
-- `amd64/src/usermode.rs` — `Spawn::stdout_pipe`, `child_of_stdout_pipe`,
+- `crates/akuma-kernel-amd64/src/usermode.rs` — `Spawn::stdout_pipe`, `child_of_stdout_pipe`,
   `register_exec_process`'s terminal argument (break 9), `sys_spawn`'s `envp`
   (break 8), `winsize_to_child_test`.
 - `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH4B.md` § 2.1 — why the amd64 `ioctl`

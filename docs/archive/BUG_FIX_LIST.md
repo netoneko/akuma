@@ -13,33 +13,34 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1514
-- **Docs contributing at least one fix:** 435
+- **Total distinct fixes counted:** 1592
+- **Docs contributing at least one fix:** 474
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 247 | 16.3% | 36 |
-| Memory & Virtual Memory | 182 | 12.0% | 62 |
-| Scheduler & Process Management | 141 | 9.3% | 44 |
-| SMP & Locking | 136 | 9.0% | 56 |
-| Networking | 96 | 6.3% | 37 |
-| Userspace Apps & Libraries | 40 | 2.6% | 21 |
-| Rump Kernel & Syscall Proxy | 26 | 1.7% | 6 |
-| Toolchain & Self-Hosting | 94 | 6.2% | 14 |
-| SSH | 40 | 2.6% | 19 |
-| VFS & Filesystem | 145 | 9.6% | 47 |
-| Boot & Drivers | 142 | 9.4% | 23 |
-| Signals & Exceptions | 46 | 3.0% | 17 |
-| Misc / Cross-cutting | 64 | 4.2% | 23 |
-| Console & Terminal | 59 | 3.9% | 19 |
-| Containers | 56 | 3.7% | 11 |
-| **Total** | **1514** | **100.0%** | **435** |
+| Syscall / ABI Compatibility Audits | 256 | 16.1% | 38 |
+| Memory & Virtual Memory | 201 | 12.6% | 72 |
+| Scheduler & Process Management | 154 | 9.7% | 50 |
+| SMP & Locking | 141 | 8.9% | 60 |
+| Networking | 104 | 6.5% | 38 |
+| Userspace Apps & Libraries | 42 | 2.6% | 23 |
+| Rump Kernel & Syscall Proxy | 26 | 1.6% | 6 |
+| Toolchain & Self-Hosting | 94 | 5.9% | 14 |
+| SSH | 42 | 2.6% | 21 |
+| VFS & Filesystem | 149 | 9.4% | 48 |
+| Boot & Drivers | 144 | 9.0% | 25 |
+| Signals & Exceptions | 50 | 3.1% | 20 |
+| Misc / Cross-cutting | 69 | 4.3% | 25 |
+| Console & Terminal | 63 | 4.0% | 22 |
+| Containers | 57 | 3.6% | 12 |
+| **Total** | **1592** | **100.0%** | **474** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
 - 44 — `docs/archive/GOLANG_MISSING_SYSCALLS.md`
 - 35 — `docs/archive/AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`
+- 29 — `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` (split across ten categories)
 - 21 — `docs/archive/AKUMA_FIRECRACKER_AMD64.md`
 - 21 — `docs/archive/GO_FORK_EXEC_FIXES.md`
 - 20 — `docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md`
@@ -54,7 +55,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (247 fixes, 36 docs)
+## Syscall / ABI Compatibility Audits (256 fixes, 38 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -285,7 +286,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `/proc/<pid>/oom_score_adj`, `oom_adj` and `oom_score` did not exist (`Failed to adjust OOM score of renderer`, `ENOENT`); served as constant `0` files with writes discarded (the log line itself turned out to name already-dead zygote children)
 - `mprotect` skipped every page a `PROT_NONE` had made `user = false`, so a recommit never took and PartitionAlloc's pool pages stayed inaccessible (every renderer died at its third document load); an inaccessible leaf is skipped only for a `PROT_NONE` request
 - `madvise(DONTNEED)` skipped present pages of a `PROT_NONE` region, leaving old bytes behind a recommit where the allocator expects zeros; a present page in a NONE region is zeroed like any other
-- `amd64/src/fd.rs::MAX_FDS` was 256 while `prlimit64` answers `RLIMIT_NOFILE` 1024, so Chromium's network service took 200+ `EMFILE` from `socket(2)` in 15 s of tumblr.com; the bound is 1024
+- `crates/akuma-kernel-amd64/src/fd.rs::MAX_FDS` was 256 while `prlimit64` answers `RLIMIT_NOFILE` 1024, so Chromium's network service took 200+ `EMFILE` from `socket(2)` in 15 s of tumblr.com; the bound is 1024
 - `CLOCK_MONOTONIC` subtracted the BSP's `TSC_START` from whichever core's `rdtsc` ran, and the metal's cores differ by ~1 s, so the network service's `TimeTicks` `CHECK(start <= end)` tripped ~4 s into every start; each AP's TSC offset is measured by a ping-pong at bring-up and subtracted
 - `execve` cleared `Process::sigaltstack_*` but not the calling slot's per-thread altstack, so an exec'd helper's signal frames aimed at the parent image's VA (`sig 5 declined: frame write failed`); `install_image` clears the slot's altstack too
 - timed futex waits overshot by a whole tick (an `hlt` ran before the deadline test on every pass, and a halted core waited for its next periodic tick); the pre-deadline halt is gone, `lapic::arm_deadline` programs a one-shot for the earliest waiter, and `ThreadWaker::wake` kicks a halted core with an IPI (futex 1 ms: 10.0 -> 1.013 ms)
@@ -338,7 +339,20 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `faccessat2` (439) was `ENOSYS` on amd64; the table gained the row and it routes to glue
 - `close_range` (436) was `ENOSYS`, so Bun's fd sweep fell back to 9111 `fcntl` `EBADF` calls; now implemented, with the fb/tun/wifi fd releases run for closed fds
 
-## Memory & Virtual Memory (182 fixes, 62 docs)
+### docs/archive/OPENAT_NULL_AND_EMPTY_PATH.md
+- `copy_from_user_str` refused page 0 only with validation on, so under the boot tests' bypass a NULL path read as `""`; page 0 is refused always
+- `openat("")` opened the current directory on both kernels; it is `ENOENT`
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- AArch64's `AT_RANDOM` was sixteen zero bytes (no RNG hook registered), weakening musl's and glibc's stack protector and pointer guard
+- The initial user SP was 8 bytes off when `argc + envc` was odd: the parity padding was pushed before the strings and discarded by the re-alignment
+- An argv/envp larger than the eager stack hit `write_at`'s `assert!` and panicked the kernel; it is `E2BIG`
+- AArch64 `execve` wrote back shared mappings before the load, so a failed `execve` lost its `MAP_SHARED` writable mappings
+- AArch64 `comm` was the full path instead of the basename
+- AArch64 ran a script with `$0` as the symlink-resolved path instead of the cwd-resolved one
+- AArch64's close-on-exec sweep skipped releasing `flock`s and `/dev/dsp`
+
+## Memory & Virtual Memory (201 fixes, 72 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -560,7 +574,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `STACK_WORDS_MAX` budgeted 12 auxv words while the new code wrote 14 — an index-out-of-bounds panic in the kernel for a program with a full argv; both derive from one `AUXV_WORDS` constant with an assertion now
 
 ### docs/archive/AKUMA_AMD64_MMAP_REGIONS.md
-- `amd64/src/mm.rs` was an eager bump allocator with no region table, and every limit that came with it was a wall `rustc` hits — `MAX_MAPPING`, "never lazy", the global `NEXT_VA` bump and the `MAP_FIXED`/`mprotect` refusals are all gone now that `akuma-mmap` holds the regions and the `#PF` handler demand-pages out of them
+- `crates/akuma-kernel-amd64/src/mm.rs` was an eager bump allocator with no region table, and every limit that came with it was a wall `rustc` hits — `MAX_MAPPING`, "never lazy", the global `NEXT_VA` bump and the `MAP_FIXED`/`mprotect` refusals are all gone now that `akuma-mmap` holds the regions and the `#PF` handler demand-pages out of them
 - a `fork` child leaked **every page it `mmap`ed after forking**: those frames were in neither the ledger nor the bump-window walk, and a shell is exactly that shape (fork, then let musl's allocator `mmap` an arena)
 - `sys_munmap` called `cow_ref_dec` + `free_page` on any frame it unmapped, including one the ledger still held, which `Process::free` then released a second time
 - `MAP_SHARED | MAP_ANONYMOUS` was recorded on the region and ignored by `fork`, so a shared anonymous mapping was CoW-copied and the child's writes were invisible to the parent
@@ -602,7 +616,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/AKUMA_USER_ACCESS_X86_FIXUP.md
 - a non-canonical user pointer is `#GP`, not `#PF` — the CPU rejects it before translation — and `#GP` was fatal on this target; `USER_VA_LIMIT` is the canonical half on x86_64 now and vector 13 goes through the same fixup stub as 14
-- 31 raw `read_volatile`/`write_volatile` dereferences of user pointers across `usermode.rs`, `fd.rs` and `sock.rs` went through no validation or fault recovery at all; they all go through `amd64/src/uaccess.rs` now, whose `read_cstr` reads to the end of the current page at a time so a string ending just before an unmapped page is not failed by a speculative over-read
+- 31 raw `read_volatile`/`write_volatile` dereferences of user pointers across `usermode.rs`, `fd.rs` and `sock.rs` went through no validation or fault recovery at all; they all go through `crates/akuma-kernel-amd64/src/uaccess.rs` now, whose `read_cstr` reads to the end of the current page at a time so a string ending just before an unmapped page is not failed by a speculative over-read
 
 ### docs/archive/POST_EXIT_PMM_RECLAIM.md
 - the 2026-09-03 "terminated thread must not drain" gate turned **all three** exit-path reclaim sites into no-ops by construction — each calls `drain_retired` immediately after marking its own thread terminated — so `retired_reclaim_ab` had been a standing failure on `main`, measuring `0p` on both arms with a slot stuck `RETIRED`; the gate's hazard is real, so the fix pins the reaper (preemption disabled + a reaper pin) instead of skipping the sweep
@@ -624,7 +638,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `guest-setup.sh`'s "socat already forwarding" check (`pgrep -f 'socat.*4444'`) matched its own `sh -c`, so the SSH forward was never started on a fresh VM; anchored to `^socat TCP-LISTEN:`
 
 ### docs/archive/AKUMA_AMD64_SHARED_WRITABLE_PAGES.md
-- writable `MAP_SHARED` file mappings were per-process copies with write-back on `munmap`/`msync`, so SQLite's WAL index (`-shm`) diverged between processes and goose's `sessions.db` came back malformed; new `akuma-fpcache-rw` + `amd64/src/shmpages.rs` give every mapper one frame per `(mount, inode, page)`, and `write(2)`/`ftruncate`/`fallocate` reach mapped frames through `MappedFileHooks`
+- writable `MAP_SHARED` file mappings were per-process copies with write-back on `munmap`/`msync`, so SQLite's WAL index (`-shm`) diverged between processes and goose's `sessions.db` came back malformed; new `akuma-fpcache-rw` + `crates/akuma-kernel-amd64/src/shmpages.rs` give every mapper one frame per `(mount, inode, page)`, and `write(2)`/`ftruncate`/`fallocate` reach mapped frames through `MappedFileHooks`
 - exit and `execve` freed a shared-writable mapping's frames with no flush (the address space's `Drop`), so a process killed with a live mapping lost its writes; `release_shared_write_mappings` gives them `munmap`'s treatment
 - `fork` from a non-leader thread read that thread's own, empty region list, so the parent's `MAP_SHARED` pages were CoW-split and the private `-shm` copy's write-back overwrote every other process's index; it reads the owner's list (`share_parent_memory_into`)
 
@@ -648,7 +662,46 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/COW_FRESHFRAME_STAGING.md
 - The EL0 write-fault arm allocated its CoW destination before `as_lock` and, when `stale_write_fault_absorbed` made the break unnecessary, returned without freeing it: one 4 KiB frame leaked per absorbed fault; the frame is a `FreshFrame` now, freed by `Drop` on that exit
 
-## Scheduler & Process Management (141 fixes, 44 docs)
+### docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md
+- `MAP_FIXED` over an eager mapping cleared only the PTEs: the old frames stayed in the address space's ledger until exit (32 MB over 2000 rounds of `mapfixed`) and the old region stayed under the new one; the replaced range now goes through `munmap`'s `unmap_range`
+
+### docs/archive/AKUMA_MPROTECT_CONVERGENCE.md
+- AArch64 `mprotect(RW)` wrote the protection into every present PTE, so a forked child's write to a CoW-demoted page (or a shared `akuma-fpcache` page mapped private) changed the parent's copy; one `mprotect` in glue keeps CoW-marked pages read-only
+
+### docs/archive/AKUMA_THREAD_ASID_SHARE.md
+- Every thread allocated its own ASID and held it through two 10 ms cooldowns after exit, so a create/join loop exhausted the 256 ASIDs (`pthread_create` `EAGAIN`, `sys_spawn` failing); threads now share their group's ASID
+- `register_process` panicked the kernel when the 256-row process table filled with exited threads' rows; it now reclaims and refuses
+
+### docs/archive/AKUMA_ONE_SHARED_WRITABLE_TABLE.md
+- The shared writable page table skipped executable mappings, and `PROT_READ` is executable on AArch64, so a read-only map never saw a writer's bytes
+- A page straddling EOF got no table key, so writers and readers of a file's last partial page did not share it
+- Glue's `flush_shared_write` wrote a buffered snapshot back over the shared page, undoing peers' stores (`shmwrite` lost 10-25 % of increments); it writes from the frame
+
+### docs/archive/AKUMA_ONE_BRK.md
+- AArch64 `brk` growth over another mapping aliased it; it is refused
+- AArch64 `brk` growth that ran out of memory left holes and reported success; it is undone and refused
+- AArch64 `brk` shrink-then-regrow returned the old bytes instead of zeros
+
+### docs/archive/AKUMA_ONE_MMAP.md
+- AArch64 `MAP_FIXED_NOREPLACE` mapped over an existing mapping instead of `EEXIST`
+- AArch64 `MAP_FIXED` at address 0 was treated as a hint instead of `EINVAL`
+- AArch64 `MAP_FIXED` past the user half walked the page table instead of `EINVAL`
+
+### docs/archive/AKUMA_ONE_MREMAP_MADVISE.md
+- AArch64 `mremap` ignored `MREMAP_FIXED` and chose an address; it is `EINVAL`
+- AArch64 `mremap` of a file mapping turned it anonymous, so unfaulted pages came back as zeros
+- `MADV_DONTNEED` on an ELF image page (in no region) zeroed it
+
+### docs/archive/PROC_MAPS_WALK_FREED_TABLES.md
+- `/proc/<tid>/maps` for a `CLONE_VM` thread walked the leader's page tables under the thread's own lock, so a concurrent teardown freed them under the walk (ring-0 `#PF` on the metal); it resolves and locks the address-space owner
+
+### docs/archive/HOOKED_EL1_PREEMPTION.md
+- The hooked scheduler's switch never published its TTBR0 to the freed-page-table gate's registry, so a table could be freed while a core still ran on it
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- The amd64 heap request was a flat 512 MiB below its threshold with no floor tied to RAM, so a 512 MiB machine failed boot (`heap ends ... but the region holding it ends ...`); `akuma-mem-policy` sizes it, for all four kernels
+
+## Scheduler & Process Management (154 fixes, 50 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -838,7 +891,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/AKUMA_AMD64_THREAD_LIFECYCLE.md
 - `thread::drain`'s `wake_group` made siblings *runnable*, which only a futex waiter can act on: a thread parked in a pipe `read`, `poll` or the console re-checked its own condition, parked again, and never reached the syscall entry where the group-exit flag is tested — so `drain` spun out 100 000 rounds, printed `DRAIN INCOMPLETE`, and the process was never reaped and its parent waited forever (a `cargo` build stopping dead at a random crate with nothing in its own log). `wake_group` arms `request_thread_kill` alongside the wake, which is what `exit_group` is on Linux
-- `amd64/src/fs.rs` passed **seconds** to `Ext2Filesystem::new`'s `utc_time_us` parameter, so every inode this kernel wrote was stamped `epoch/1e6` = **1789** (1970-01-01T00:29:49Z) and constant for eleven and a half days at a stretch — which is total for `cargo`, whose fingerprinting is mtime-based: no output was ever newer than its input and nothing was ever up to date
+- `crates/akuma-kernel-amd64/src/fs.rs` passed **seconds** to `Ext2Filesystem::new`'s `utc_time_us` parameter, so every inode this kernel wrote was stamped `epoch/1e6` = **1789** (1970-01-01T00:29:49Z) and constant for eleven and a half days at a stretch — which is total for `cargo`, whose fingerprinting is mtime-based: no output was ever newer than its input and nothing was ever up to date
 - `Process table full (256 slots, 246 reclaimable RETIRED)` panicked a kernel that could have collected 96% of the table: every `pthread_create` on this target registers a `Process` row and all five drain sites are on *process* exit paths, so a thread-churning workload retires rows nobody collects; `sys_clone_thread` drains at syscall entry, before it claims anything
 - `pthread_kill_eintr_enabled: false` was true when written and expired when signal delivery landed the day before, so a signal could not reach a thread parked in a blocking syscall at all — **`kill -9` on a process parked in a blocking read did nothing**, its parent waited forever, and the orphan held its `Process` row and thread slots for the life of the boot
 - `GROUP_EXIT` is indexed by process slot and only the `execve`/`spawn` path cleared it, so a plain `fork` child bound to a recycled slot was born into a group that "was exiting": the child ran fine, and every thread it created answered `EINTR` at its first syscall and tore down before running an instruction
@@ -882,7 +935,32 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `register_child_channel` recorded the **forking thread's** pid as the child's parent, so once Bun's idle pool thread exited `wait4` answered `ECHILD` for a live child of the caller while its pidfd stayed readable (a hot epoll loop, Claude Code's input stall); the child now belongs to the thread group
 - `waitid(2)` (including `P_PIDFD`) was `ENOSYS` on amd64 though glue implements it; `Syscall::Waitid` now routes to glue
 
-## SMP & Locking (136 fixes, 56 docs)
+### docs/archive/AARCH64_SPAWN_RECLAIM_SKIPPED.md
+- AArch64 `fork`/`clone` matched the reclaim-and-retry on `"No free user thread slots"` while the shared spawn returned amd64's `"No free x86 task slots"`, so an exhausted pool failed instead of reclaiming
+- `spawn_user_thread_fn_internal` returned the first claim's result with its reclaim/retry body unreachable below the `return`, so `spawn_process` threads never reclaimed
+
+### docs/archive/HOOKED_IDLE_CPU_BURN.md
+- `idle_halt` yielded instead of parking on the hooked path, so an idle guest burned a host core
+- The netpoll loop's hooked branch never halted without `smp-shared`
+- The hooked idle loop did not credit its halt, so `/proc/stat` counted idle time as `user`
+
+### docs/archive/HOOKED_IDLE_TICK.md
+- sshd polled its listener every millisecond; it blocks in `poll` with a 1 s timeout
+- Every core took a 1 kHz tick while idle; the hooked idle thread arms its timer for the earliest deadline (tickless idle)
+- The hooked path sent itself an SGI on every tick; the timer interrupt is the reschedule point
+
+### docs/archive/HOOKED_TPIDR_EL0_SWITCH.md
+- The hooked scheduler's switch did not save and restore `TPIDR_EL0`, so a thread returning from a blocking syscall copied another thread's TLS pointer into its frame (`SIGSEGV` in `epoll_wake_latency`)
+
+### docs/archive/SPAWN_TID0_CHANNEL_PLACEHOLDER.md
+- The shared spawn registered each child's channel under placeholder tid 0, amd64's boot task, then removed it, deleting the boot task's own channel (`TIOCGWINSZ` boot checks failed)
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- The hooked `spawn_user_closure_initializing` ran `prepare_task_slot` under `POOL`, and its first `spawn_fn` deadlocked on the non-reentrant lock
+- A recycled slot on the hooked path skipped the collector's cleanup and inherited a dead process's tid -> pid row, so a futex waiter keyed on a finished process's tgid
+- A socket wait that halts relied on a tick to displace it, which the hooked path does not have, so httpd's `accept` held the only core at SMP=1
+
+## SMP & Locking (141 fixes, 60 docs)
 
 ### docs/archive/AKUMA_EXEC_AUDIT.md
 (The `akuma-exec` -> `#![forbid(unsafe_code)]` campaign is a refactor and is not counted — see `AKUMA_EXEC_FORBID_UNSAFE.md`; these are the soundness defects it surfaced and fixed. §5b's triplicated `FrameSource` enum + converters is a duplication cleanup with no bug and is not counted; §6.E group 3 turned out to be non-problems and is not counted.)
@@ -1079,7 +1157,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_AMD64_SMP_SHARED_UNBLOCK.md
 - `akuma-cpu`'s x86 `daif` arm did not exist, so every `IrqGuard` and `akuma_primitives::irq::*` on this target was a silent no-op; they are real `cli`/`sti`/`pushfq`-`popfq` masks now, with the polarity divergence documented rather than normalised
 - `akuma_primitives::cpu::current_core_id` read `mpidr_el1`, whose x86 stub returns 0, and `preempt::current_tid` was a stated 0 — so the `smp-shared` flip would have compiled clean and put **four cores on core 0**, sharing one `PREEMPTION_DISABLED` counter and one BKL dropped-window ledger
-- the flip would have run `akuma_bkl`'s `KernelLock` alongside `amd64/src/smp.rs`'s private ticket lock — two locks answering one question, with `idle_halt` and every ring-3 boundary taking different ones; the private lock is deleted and `smp-shared` is a required amd64 feature enforced by a const assert
+- the flip would have run `akuma_bkl`'s `KernelLock` alongside `crates/akuma-kernel-amd64/src/smp.rs`'s private ticket lock — two locks answering one question, with `idle_halt` and every ring-3 boundary taking different ones; the private lock is deleted and `smp-shared` is a required amd64 feature enforced by a const assert
 - `akuma_primitives::park`'s x86 `wfi` arm was a bare `hlt`, which with `IF=0` sleeps until an NMI where AArch64's `wfi` wakes on a *pending* masked interrupt — so the first `blocking_relax_net` → `idle_halt` park under the feature slept forever
 
 ### docs/archive/AKUMA_AMD64_SSH_WEDGE_CONTEXT_SWITCH_PF.md
@@ -1142,7 +1220,20 @@ aren't recorded anywhere else.)
 - `/proc/stat` reported cpu0 100 % busy with an idle guest: `allow_tick` halted inside the calling task without crediting the halted time (`idle_loop` already did), so a core whose only task halts that way read fully busy; TSC measurement showed 12-13 % and `allow_tick` now credits its halt.
 - A task spinning on the hypervisor's device lock while holding the BKL deadlocked against a holder that needed the BKL back (found with on-demand cores, `smp::ensure_started`); `lock_dev` now drops the BKL between attempts.
 
-## Networking (96 fixes, 37 docs)
+### docs/archive/AMD64_YIELD_POLLER_SHOOTDOWN_DEAF.md
+- A kernel thread polling by yielding with the BKL held never serviced its shootdown mailbox (ring 0 runs with `IF` clear), so a TLB shootdown stuck; `yield_now` services it first
+
+### docs/archive/UNREGISTER_PRINT_BKL_HOLDS.md
+- A temporary diagnostic print in `unregister` ran once per thread exit under the BKL and produced most `[BKL] stuck` lines under thread churn; it is rate-limited, and the hooked path tags its holds
+
+### docs/archive/M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md
+- A kernel thread held the BKL across a cooperative wait loop while a peer needed it to un-strand a BKL-free-stolen child: a cross-core circular deadlock; waits drop the BKL (`idle_halt`)
+- The residual livelock came from the unfair test-and-set BKL; `KernelLock` became a FIFO ticket lock
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- A kernel thread that yields kept the BKL across the switch on the hooked path, so two yielding waiters on one core wedged the other; `x86_yield_now` hands the lock off
+
+## Networking (104 fixes, 38 docs)
 
 ### docs/archive/KVM_RELAY_SYN_STALL.md
 - The KVM host relay wedged on the ryzen under overlapping sessions: a forward slot reused one source port for every connection and the gateway's TCP sent its SYN once (no retransmit), so a guest holding the previous connection on that tuple never answered, the slot stayed `connecting`, the listen backlog filled and the port refused. Fixed with a rotating source-port generation per slot and a SYN retry (4 s) that gives up by resetting the client (`Gateway::fwd_reopen`, `relay.rs`); the SYNs a first 1.5 s retry chased were slow, not lost
@@ -1287,7 +1378,7 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md
 - `accept4` (x86_64 288) had no ABI row; added, applying `SOCK_NONBLOCK`/`SOCK_CLOEXEC` to the accepted fd and `EINVAL` for unknown bits
-- amd64's own `sendto`/`recvfrom`/`sendmsg`/`recvmsg` (`amd64/src/sock.rs`) never re-armed `EPOLLET` the way glue's paths do, so every tokio program — Rust `std` reads with `recv` and writes with `send` — got one edge per connection and a `kot` node went deaf within minutes; re-armed on drain/`EAGAIN` and on a short write, plus the listener on an `accept4` `EAGAIN`
+- amd64's own `sendto`/`recvfrom`/`sendmsg`/`recvmsg` (`crates/akuma-kernel-amd64/src/sock.rs`) never re-armed `EPOLLET` the way glue's paths do, so every tokio program — Rust `std` reads with `recv` and writes with `send` — got one edge per connection and a `kot` node went deaf within minutes; re-armed on drain/`EAGAIN` and on a short write, plus the listener on an `accept4` `EAGAIN`
 
 ### docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md
 - `bind()` kept only the port (`KernelSocket` had no field for the address) and every listener was a smoltcp `addr: None` endpoint, so a socket bound to `127.0.0.1` accepted connections to the NIC's address — herd's unauthenticated control socket on `:7117` answered from the LAN on all three boxes; `KernelSocket` carries `bind_ip` through every listen and UDP bind, `EADDRINUSE` compares addresses, and an address the interface does not own is `EADDRNOTAVAIL`
@@ -1307,7 +1398,7 @@ aren't recorded anywhere else.)
 - the PVH `no-tests` boot ran `late_init` and went straight to `init` with no `settle_for_dhcp`, `sync_via_sntp` or `spawn_netpoll`, so no SNTP retry, no memory watchdog and no netpoll RX pump; the PVH entry runs the same three calls the multiboot2 entry has had since 2026-09-05
 
 ### docs/archive/POST_AMD64_CODE_AUDIT.md
-- smoltcp's DNS socket failed on the first `NXDOMAIN` with one configured server (QEMU slirp `NXDOMAIN`s `example.com` while `1.1.1.1` answers) while the hand-rolled `amd64/src/dns.rs` walked resolvers; one shared, host-tested `akuma-dns` client walks the resolver list on a timeout or an answer without a record, and `dns.rs` and smoltcp's DNS socket are deleted
+- smoltcp's DNS socket failed on the first `NXDOMAIN` with one configured server (QEMU slirp `NXDOMAIN`s `example.com` while `1.1.1.1` answers) while the hand-rolled `crates/akuma-kernel-amd64/src/dns.rs` walked resolvers; one shared, host-tested `akuma-dns` client walks the resolver list on a timeout or an answer without a record, and `dns.rs` and smoltcp's DNS socket are deleted
 
 ### docs/archive/AKUMA_VIRTIO_IN_TREE.md
 - the in-tree `NetRaw::send` sent the Ethernet frame verbatim where `virtio-drivers`' `send` had chained a zeroed `virtio_net_hdr` in front, so QEMU read the frame's first 12 bytes as the header: DHCP was never answered and ssh never connected while the disk on the same ring code worked; `send` now chains a static zero header descriptor ahead of the frame
@@ -1315,7 +1406,17 @@ aren't recorded anywhere else.)
 ### docs/archive/UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS.md
 - `read`/`write` on an AF_UNIX socket moved raw bytes through the endpoint's pipe and skipped the record queue `recv`/`send` use, so Rust std's exec-failure report over a `SOCK_SEQPACKET` pair was invisible: cargo read EOF as "exec succeeded" (and never took its `@argfile` retry), or the parent's `recv` spun with the BKL held and wedged the guest; both arms delegate to `unix_send`/`unix_recv` when the fd has a table entry
 
-## Userspace Apps & Libraries (40 fixes, 21 docs)
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- `socket`/`accept4` argument checks diverged between the kernels (unknown type and flag bits accepted, `EAFNOSUPPORT`/`EBADF` where Linux says `EINVAL`/`ENOTSOCK`); one copy in glue answers as Linux
+- AArch64 `accept`/`accept4` never wrote `*addrlen`
+- AArch64 `accept`'s `EAGAIN` did not re-arm the listener's `EPOLLET` edge
+- `listen(fd, 0)` gave the listener zero handles on AArch64, so it never accepted; the backlog is clamped to 1
+- `accept` leaked a dequeued connection when there was no process
+- AF_INET `sendmsg` sent and `recvmsg` filled only the first iovec
+- `msg_iovlen` was unbounded into an infallible `vec!` (up to 64 GiB); over `UIO_MAXIOV` is `EMSGSIZE`
+- UDP blocking `recv` ignored `SO_RCVTIMEO` (a fixed 10 s), and socket timeouts expired as `ETIMEDOUT` instead of `EAGAIN`
+
+## Userspace Apps & Libraries (42 fixes, 23 docs)
 
 ### docs/archive/DOOM.md
 - SIGSEGV in `R_Init` — `strncpy` stub off-by-one corrupted an adjacent struct field
@@ -1398,6 +1499,12 @@ aren't recorded anywhere else.)
 - meow's peer probe ran inline on the hub's serve thread with a real request's 5 s I/O budget, so two litters listing each other starved each other's serve loops permanently; probes get 500 ms plus doubling backoff on a silent peer
 - meow discarded `start_raft_thread`'s result and printed `raft thread up` unconditionally; the child now sets `RAFT_ALIVE` as its first act and the parent waits for it
 - meow's raft thread logged with `format!` through the herd-captured stdout; it writes to its own file through a fixed stack buffer now (`libakuma::FixedBuf` with `safe_write!`)
+
+### docs/archive/LINUX_ABI_SPAWN_FD_LEAK.md
+- libakuma's `linux-abi` spawn (sshd's) passed the spawner's open descriptors to every child; the child calls `close_range(3, ~0U, 0)` after its `dup3`s
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- herd restarted a service that failed at once every `restart_delay` forever (69 times a minute on `server`); `backoff = true` doubles the delay up to 60 s
 
 ## Rump Kernel & Syscall Proxy (26 fixes, 6 docs)
 
@@ -1566,7 +1673,7 @@ aren't recorded anywhere else.)
 - A cargo-cached ELF is uplifted without relinking, so the wrapper never runs and the gate's aarch64 control kernel booted the middleware `.bin`; `mw_gate.sh` runs `mkbin.sh` on the ELF after every build
 - `shanghai/build.rs` was amd64-only (no `BOOT_STACK_SIZE` branch), so Shanghai did not build for aarch64
 
-## SSH (40 fixes, 19 docs)
+## SSH (42 fixes, 21 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - Every SSH session ran as one future inside a single `sshd` process, so `panic = "abort"` — which is process-wide, not future- or thread-scoped — meant *any* panic on *any* connection dropped every other live session with it. `PROTOCOL_UNDER_LOAD.md` fixed the one known trigger (a malformed pre-KEX packet) while explicitly noting the blast radius itself remained; this closes that. Each accepted connection is now served by its own `fork()`ed child, which inherits the socket through the fd-table copy (`FdTable::clone_deep_for_fork` → `socket_clone_ref`, refcounted on close by `remove_socket` — machinery that already existed and was already correct for this case). Zero kernel changes were needed: `docs/MISSING_SOCKET_MACHINERY.md` had concluded the handoff was unbuildable, having surveyed `sys_spawn`, `SCM_RIGHTS` and procfs but not `fork()`, where the fd is never handed over at all. Verified by SIGKILLing one live session under load — exactly one peer ended, three ran to completion, the server kept serving. Bounded by a new `max_sessions` (default 24) against the global `MAX_PROCESSES = 64`, since a fully-occupied session now costs two process slots. On by default (`fork-sessions`); `SSHD_FORK_SESSIONS=0` reverts to the cooperative executor for memory-constrained images
@@ -1648,7 +1755,13 @@ aren't recorded anywhere else.)
 ### docs/archive/SSHD_SESSION_WITHOUT_PATH.md
 - `session_env` stopped being empty when `HOME` was added (2026-10-17), so the kernel's `DEFAULT_ENV` and its `PATH` no longer applied and exec sessions ran with no `PATH` at all: gcc's `make_relative_prefix` fell back to `../` and `posix_spawnp("cc1")` failed with `ENOENT`; the session always gets Alpine's `PATH`
 
-## VFS & Filesystem (145 fixes, 47 docs)
+### docs/archive/SSH_SESSIONS_HAD_NO_PTY.md
+- The `linux-abi` spawn ignored `SPAWN_FLAG_PTY`, so `pty-req` sessions got pipes: `^C` did nothing and `tty` said `not a tty`; it makes a real pseudo-terminal
+
+### docs/archive/SSHD_DEAD_CLIENT_TEARDOWN.md
+- A client that vanished mid-command left its server-side shell running for about two minutes
+
+## VFS & Filesystem (149 fixes, 48 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -1767,7 +1880,7 @@ aren't recorded anywhere else.)
 - `amd64_ring3_check.py`'s kernel-heap witness had been dead since 2c: it read `/proc/meminfo`'s `Cached:`, which the mounted procfs defines as the file-page cache amd64 has none of, so it scored `0 -> 0 kB, drift +0` — the heap is rendered under `Slab:` now and the check fails when the row is absent
 
 ### docs/archive/AKUMA_AMD64_4B_FOLD_BATCH3A.md
-- the untimed-park backstop lived in `amd64/src/sched.rs` while `akuma-syscalls-glue` parks `schedule_blocking(u64::MAX)` in 22 places, so folding `read`/`write` onto the pipe arms would have turned a 1 Hz degradation into a silent unrecoverable hang — `park_indefinitely` + `set_untimed_park_backstop_us` moved into `akuma-threading`
+- the untimed-park backstop lived in `crates/akuma-kernel-amd64/src/sched.rs` while `akuma-syscalls-glue` parks `schedule_blocking(u64::MAX)` in 22 places, so folding `read`/`write` onto the pipe arms would have turned a 1 Hz degradation into a silent unrecoverable hang — `park_indefinitely` + `set_untimed_park_backstop_us` moved into `akuma-threading`
 - amd64 never registered a prefault hook, so every shared arm's fail-closed `validate_user_ptr` answered `EFAULT` for a page ring 3 had not touched — `apk` reported `v2 database format error` for a file the kernel had refused to read; `mm::prefault_user_range` is registered now
 - the boot suite's `usermode` block had no process identity, so `spawn`/`busybox`/`execve`/`fork`/`redirect` all went `EBADF` the moment `read`/`write` resolved `current_process_shared()` first
 - `rewinddir` never worked: a seek to 0 reset the entry index and left the first `dir_cache` snapshot in place for the life of the descriptor
@@ -1891,7 +2004,13 @@ aren't recorded anywhere else.)
 ### docs/archive/PROC_SELF_FD_PATH_PREFIX.md
 - Bun's `mkdir('/proc/self/fd/N/<name>')` was sent to procfs, which answered `EIO` (Claude Code's Bash tool failed with `EIO: mkdir /tmp/claude-0/-root`); `/proc/self/fd/N/` and `/proc/<own pid>/fd/N/` prefixes are now expanded to the fd's path in path resolution, `mkdirat` and `unlinkat`
 
-## Boot & Drivers (142 fixes, 23 docs)
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- AArch64 `openat` ignored `O_EXCL` on a present file, `O_DIRECTORY` on a file, `O_CREAT` on a directory and `O_NOFOLLOW` on a symlink; it refuses as Linux does
+- Writes through an `O_RDONLY` fd and reads through an `O_WRONLY` fd succeeded (`write`/`pwrite`/`read`/`pread` on AArch64, `pwrite`/`read`/`pread` on amd64); they are `EBADF`
+- `pread`/`pwrite` on a pipe or socketpair answered `EBADF` instead of `ESPIPE`
+- amd64 `lseek` on `/dev/null`, `/dev/zero` and `/dev/urandom` returned the offset asked for; Linux returns 0
+
+## Boot & Drivers (144 fixes, 25 docs)
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -2083,7 +2202,13 @@ aren't recorded anywhere else.)
 ### docs/archive/HVF_BOOT_TEST_STAGE2_FAULT.md
 - `test_safe_user_access_fault` copied across `kernel_va_end()` into a stretch the boot map covers with no RAM behind it, so under HVF the stage-2 fault (`ISV=0`) aborted QEMU and the boot suite never finished; the test builds its own stage-1 cliff now (166 PASS)
 
-## Signals & Exceptions (46 fixes, 17 docs)
+### docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md
+- `start_timer` wrote the periodic LVT before the new count, leaving a periodic timer with count 1 that livelocked QEMU's main loop (every amd64 TCG guest stopped answering after 30-600 s); the count is zeroed first
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- The multiboot2 path applied the `idlesleep` policy only inside `start_secondaries`' closure, which the full-suite boot never runs; both entries apply the command-line policies
+
+## Signals & Exceptions (50 fixes, 20 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -2119,7 +2244,7 @@ aren't recorded anywhere else.)
 - `enter_user_mode`'s `asm!` ran the whole EL0-return sequence with IRQs enabled — `leave_kernel()` restores the caller's DAIF immediately above it — so an IRQ between `msr elr_el1` and the `eret` replaced the user PC in `ELR_EL1` with the kernel PC it interrupted, and the later `msr spsr_el1` then repaired SPSR but not ELR; the `eret` dropped to EL0 at a kernel text address, presenting as an intermittent `rustc` SIGSEGV with `FAR == ELR` and every corruption tripwire clean. Fixed with `msr daifset, #2` as the block's first instruction (the sibling SVC epilogue always had it); the wider window instead `eret`s to **EL1** with DAIF masked, an uninterruptible loop in the register-restore tail
 
 ### docs/archive/AKUMA_AMD64_SIGNAL_DELIVERY.md
-- no amd64 code ever looked at the pending set: `kill(2)` was not dispatched, `rt_sigaction` was a literal `=> 0`, and `deliver_signal` returns `true` whether or not it reached a thread — so `kill` would have reported success and done nothing; `amd64/src/signal.rs` is the x86_64 counterpart to `try_deliver_signal`, with one return path serving both entering a handler and `rt_sigreturn`
+- no amd64 code ever looked at the pending set: `kill(2)` was not dispatched, `rt_sigaction` was a literal `=> 0`, and `deliver_signal` returns `true` whether or not it reached a thread — so `kill` would have reported success and done nothing; `crates/akuma-kernel-amd64/src/signal.rs` is the x86_64 counterpart to `try_deliver_signal`, with one return path serving both entering a handler and `rt_sigreturn`
 - `set_tid_address` answered a literal `1`, and musl seeds `pthread_self()->tid` from it, so **every self-signal in every program** addressed thread slot 1
 - `gettid` answered the *pid* for a main thread, putting `gettid()` and the tid `clone` hands a child in two different namespaces on one target
 - `Process::thread_id` was `None` for everything `register_exec_process` built — `init`, everything `sshd` spawns and every `execve`d image — and `deliver_signal` collects its targets from exactly that field, so nothing was pended for precisely the half that could not be signalled
@@ -2166,7 +2291,17 @@ aren't recorded anywhere else.)
 ### docs/archive/BUN_GC_FUTEX_HANG_2026_11_10.md
 - amd64 `FUTEX_WAIT` restarted after a signal whose handler had `SA_RESTART`, so JSC's GC thread-suspend signal never ran its handler and Bun hung ~10 s in; a deliverable pending signal now ends the wait with `EINTR`
 
-## Misc / Cross-cutting (64 fixes, 23 docs)
+### docs/archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md
+- `suspend_until_signal` (`pause`, `rt_sigsuspend`) never read the deferred kill request a group exit posts, so a sleeper outlived its group in a freed address space; it returns `EINTR`
+
+### docs/archive/HOOKED_IRQ_SIGNAL_DELIVERY.md
+- AArch64 delivered pending signals only on syscall return, so a thread in a compute loop never ran a handler or died of `SIGTERM`; the hooked IRQ return delivers
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- Every group `SIGKILL` cost 2 s on AArch64: each thread's `kill_thread_group` grace-waited for siblings in their own grace waits; `claim_group_exit` makes the first caller do the teardown
+- amd64 `kill` could return `EINTR` without sending (glue's dispatch prologue), orphaning a child; signal senders are exempt from the gate
+
+## Misc / Cross-cutting (69 fixes, 25 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2300,7 +2435,16 @@ aren't recorded anywhere else.)
 (Akuma's half only; the plan's Taoxichuan fixes are counted in `TAOXICHUAN_BUG_FIX_LIST.md`.)
 - `akuma-amd64`'s self-test build (without `no-tests`) had not compiled since the stage-1 boot-kit extraction (`43edbffc`): the physmap self-test named constants that moved to `akuma-boot-amd64`, and four imports and two functions (`kvm::api::check_shared_memory`, `Vcpu::get_regs`) were dead; fixed with the analysis-row trims (`a4cd34b2`)
 
-## Console & Terminal (59 fixes, 19 docs)
+### docs/archive/AKUMA_SAFE_GUEST_ENTRY.md
+- The rehearsal guests' nested page tables gave a 2 MiB leaf around each 4 KiB guest page, mapping 511 pages of host memory into the guest
+- The rehearsal permission maps passed nearly every port and MSR through, and their `run` did no `VMLOAD`/`VMSAVE`, so a guest `wrmsr LSTAR` or `swapgs` would have written the host's live registers
+- Guest ASIDs were not unique (`ASID + i`, `id + 1`), so two VMs on one core could use each other's TLB entries
+- The `/dev/kvm` nested page table's lifetime rested on a convention; the table owns its frames and guests hold it through an `Arc`
+
+### docs/archive/AKUMA_FEATURE_AUDIT.md
+- amd64 mounted the shared `/proc` without `sc-sysv-ipc` forwarded to `akuma-vfs-glue`, so it had the SysV queue syscalls but no `/proc/sysvipc/msg`
+
+## Console & Terminal (63 fixes, 22 docs)
 
 ### docs/archive/VEC_AUDIT.md
 - `crates/akuma-terminal`'s canonical-mode `canon_buffer` grew one byte per keystroke with no cap and was drained only by a line terminator, so a peer writing to a tty in canonical mode and never sending `\n` grew kernel heap without limit. Capped at `MAX_CANON = 4095` (Linux N_TTY's own ceiling), dropping — and deliberately not echoing — input beyond it, while the `\n`/VEOF paths stay uncapped so a full line can always still be terminated
@@ -2401,7 +2545,17 @@ aren't recorded anywhere else.)
 ### docs/archive/FBCON_DOUBLE_BUFFER.md
 - The amd64 framebuffer console drew straight into scanout and ignored `CSI ? 2026` synchronized output, so Claude Code's TUI flickered (and a dim step flashed the whole screen); a RAM back buffer is now presented per flush and `?2026` frames are honored
 
-## Containers (56 fixes, 11 docs)
+### docs/archive/CLOSED_STDIN_NEVER_POLLED_READABLE.md
+- A closed, empty stdin polled as not readable, though `read` returns 0, so a shell on the `server` image waited forever
+- `close_stdin` set the flag without waking pollers
+
+### docs/archive/AMD64_FB_BACK_BUFFER_DEADLOCK.md
+- `fb_enable_double_buffer` allocated the 34 MB back buffer under `CONSOLE.lock()`, and the allocator's first `[HEAP]` print took the same lock: the trashcan's 4K boot deadlocked; it allocates outside the lock
+
+### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
+- amd64 `setpgid` outside a pty session was a no-op, so `^C` on the serial console reached an empty foreground group; the shared spawn gives each child a group and amd64 uses glue's `setpgid`/`getpgid`
+
+## Containers (57 fixes, 12 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -2481,9 +2635,14 @@ aren't recorded anywhere else.)
 - `paths::sanitize_name` dropped any registry host containing a `.`, so every tag for a registry shared the store directory of the image it was made from and `box rmi` of the registry-qualified tag deleted `app:1`; only Docker Hub's spellings collapse now
 
 ### docs/archive/AMD64_BOX_SPAWN_EXT_REGRESSION.md
-- every amd64 `box run` answered `failed to spawn /bin/busybox` (12 box-suite checks): gating glue's `execve`/`SPAWN`/`SPAWN_EXT` behind a new `exec` feature turned it on only for AArch64, on the premise that both x86 kernels load with their own loaders, but amd64's box spawns still go through glue's; `amd64/Cargo.toml` enables `exec`
+- every amd64 `box run` answered `failed to spawn /bin/busybox` (12 box-suite checks): gating glue's `execve`/`SPAWN`/`SPAWN_EXT` behind a new `exec` feature turned it on only for AArch64, on the premise that both x86 kernels load with their own loaders, but amd64's box spawns still go through glue's; `crates/akuma-kernel-amd64/Cargo.toml` enables `exec`
+
+### docs/archive/MSGQUEUE_BOX_TEARDOWN.md
+- `cleanup_box_queues` had no caller, so SysV message queues outlived their box and a same-named restart inherited them; `sys_kill_box` calls it
 
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
+
+Also scanned 2026-11-13 (closing `akuma-multiarch-attempt-0`: one kernel package for both architectures, the shared mm/fd/exec/signal paths, the hooked scheduler, safe guest entry and the amd64 `unsafe` cleanup; 165 archive docs added or edited). AKUMA_MULTIARCH_ATTEMPT_0 is the branch's running log; its inline fixes are counted under ten categories and every fix with its own archive doc is counted there instead. No counted fix: AKUMA_ONE_MUNMAP and AKUMA_ONE_VA_PLACER (convergence steps whose divergences are placement policy, pinned); AMD64_RING0_PREEMPTION and HOOKED_EL1_PREEMPTION's preemption itself (capabilities; the latter's TTBR0 publication is counted); FPCACHE_UNDERSIZED_AT_LOW_RAM (open by its own header); SGI_SCHEDULER_RESIDUE (dead-code removal, behaviours measured and accepted); AMD64_KERNEL_UNSAFE_AUDIT (`unsafe` reduction; the `deliver_pending` `&mut UserCtx` alias it removed was not UB in practice, and the `sysretq` canonical-`rip` refusal is hardening); the archived proposals B12_AARCH64_SLOT_TABLE, B15_TOKIO_KERNEL_KIT, B21_TOKIO_KERNEL_AARCH64, INSTALL_SCRIPT, INSTALL_SCRIPT_QWEN_EXPERIMENT, LIBAKUMA_LINUX_COMPAT and LINUX_COMPAT_PUSH. Not counted, open by the log's own text: an amd64 `ssh host cmd` session prints nothing on stderr, and `altstackexec`'s two AArch64 rungs. The three test-harness bugs behind the amd64 RAM-floor measurement (`a4f3051e`) and W5a's thread-probe flake are test fixes, uncounted.
 
 Also scanned 2026-11-10 (the Claude Code on Akuma work, `claude-fixes`). Counted above: CHILD_OF_EXITED_THREAD_UNREAPABLE, BUN_GC_FUTEX_HANG_2026_11_10, MKDIR_UNDER_REGULAR_FILE, PROC_SELF_FD_PATH_PREFIX (split under VFS and Syscall) and FBCON_DOUBLE_BUFFER. No counted fix: CLAUDE_COMPATIBILITY_ISSUES is the litter-side report whose items are counted under MKDIR_UNDER_REGULAR_FILE and PROC_SELF_FD_PATH_PREFIX; AMD64_CLAUDE_LOGIN_INPUT_STUCK now points at its root cause, counted under CHILD_OF_EXITED_THREAD_UNREAPABLE; AKUMA_ARCH_CONVERGENCE_RESEARCH is research; TAOXICHUAN_JVM_ATTEMPT_2026_11_09 is an experiment whose third blocker is undiagnosed and landed nothing. Fix commit with no doc to cite, not counted: `1e2fbdf0` (the duplicate `shootdown_entry` that broke the amd64 link).
 
@@ -2497,7 +2656,7 @@ Also scanned 2026-09-24 (55 commits, 19 archive docs touched — the litter on t
 
 Also scanned 2026-09-19 (the `amd64-cleanup-and-improvements` branch — the bare-metal self-host and the workstation work, 63 commits, 15 archive docs touched — ahead of merging it). Two of those docs carry no counted fix. AKUMA_AMD64_NO_SLOT_RECYCLER is **Status: open, not started** by its own header: an audit of the four gaps that follow from amd64 claiming TERMINATED thread slots directly (no `TERMINATED → FREE` transition, so no recycler runs), written because the `[SWITCH FREED-CR3]` fix worked *around* it — that fix's own carve-out is counted under AKUMA_AMD64_SWITCH_FREED_CR3_UAF above, and this doc's appendix (nothing reaps an orphaned zombie when pid 1 is `sshd`) proposes two candidate fixes and lands neither. AKUMA_AMD64_BKL_NETWORKING is a read of the call path answering "does networking take the BKL?" (yes, unconditionally, and more than AArch64 does — this target has no per-syscall opt-out bitmap); its §4 numbering hazard is explicitly "currently latent, not live" and the A/B it prescribes is left unrun. Two already-listed docs were re-checked for content added here: CTRL_C_SIGINT_DELIVERY gained a 2026-09-18 section, but it is a pointer — the session-terminal-state defect it describes is counted under AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS §16, where the traces, the A/B and the fix are, and the `[ISIG-MISS]` tripwire it adds here is an instrument rather than a fix; AKUMA_SELF_HOSTING_AMD64 gained ~240 lines of walk-so-far timeline covering 09-18/09-19, every entry of which cross-references a fix counted under one of the eleven new subsections above, so its own count is unchanged. **Two of the parked docs above are no longer zero-fix:** AKUMA_AMD64_NO_SLOT_RECYCLER closed three of its four gaps on 2026-09-20 (three bullets under Scheduler & Process Management) and AKUMA_AMD64_BKL_NETWORKING landed three fixes the same day (under SMP & Locking); the text above is kept as the record of what they were when this paragraph was written.
 
-Also scanned 2026-09-13 (the `i-am-about-to-regret-this-joke-down-the-line` branch — the amd64 port, 284 commits, 92 archive docs — ahead of closing it). Thirteen of those docs carry no counted fix. Seven are port records with no defect attached: AKUMA_MMU_TLB_TARGET_VOCABULARY (a `TlbTarget`/`TlbFlush` vocabulary that changes no behaviour on the day it lands), AKUMA_MMU_X86_ADDRESS_SPACE, AKUMA_THREADING_X86_SWITCH and AKUMA_USER_ACCESS_X86_FIXUP's own half (new x86_64 arms for types that had none — the two real defects that pass surfaced there are counted above under Memory & Virtual Memory), AKUMA_USER_SPACE_LEDGER (a frame-ledger extraction with 14 host tests, no defect), AKUMA_AMD64_TEST_GATING (a `no-tests` feature so `cloc` stops reporting `amd64/src` as 0.0% test — no behaviour changed) and AMD64_CRATE_REUSE_AUDIT (by its own header, "process, not a defect. Nothing shipped broken"). Four are folds whose substance is a deletion: AKUMA_AMD64_EXECVE_RETURNS (a second `sysret` path so `execve` returns into the new image; `run_process` becomes one entry and one exit), AKUMA_AMD64_PIPE_TABLE_UNIFICATION (two instances of one `PipeTable` become one — the duplicate id space was a *scheduled* defect, live only once `close` folded, and it never did), AKUMA_AMD64_SPAWN_ROW_STDIO (`Spawn::stdout_pipe` deleted as a second copy of a fact the fd table already held) and AKUMA_AMD64_RING3_SEAM_SLICE4 (the fork memory pass gets an architecture hook; the AArch64 lift is byte-for-byte behaviour-preserving). Two are 5b slices that moved a structure without fixing one: AKUMA_AMD64_STEP5B_SLICE2_LIFECYCLE and AKUMA_AMD64_STEP5B_SLICE3_PROCFS (both record what *nearly* broke — a blank `ps`, a deleted `init_entry()` — caught before landing). FIRECRACKER_PORT moved from `proposals/` to `docs/archive/` on this branch and is the design record for a port carried out elsewhere; its one bug, the `GICD_IROUTER` aliasing, is counted under GICD_IROUTER_ALIASING. Five already-listed docs were re-checked for content added here: AKUMA_EXTRACT_MMAP gained only a supersession note (its PTE-permission vocabulary moved back down to `akuma_mmu::types`, counted under REDUCING_PLATFORM_DEPENDENCY above), AKUMA_FIRECRACKER_KVM, AKUMA_FIRECRACKER_TERRAFORM and GICD_IROUTER_ALIASING gained only path updates for that move, and DEVBOX_ISSUES gained **Issues 28 and 29** (`box grab` reportedly broken again; `dmesg` readable from inside a box) which are both **Status: OPEN**, so its count is unchanged.
+Also scanned 2026-09-13 (the `i-am-about-to-regret-this-joke-down-the-line` branch — the amd64 port, 284 commits, 92 archive docs — ahead of closing it). Thirteen of those docs carry no counted fix. Seven are port records with no defect attached: AKUMA_MMU_TLB_TARGET_VOCABULARY (a `TlbTarget`/`TlbFlush` vocabulary that changes no behaviour on the day it lands), AKUMA_MMU_X86_ADDRESS_SPACE, AKUMA_THREADING_X86_SWITCH and AKUMA_USER_ACCESS_X86_FIXUP's own half (new x86_64 arms for types that had none — the two real defects that pass surfaced there are counted above under Memory & Virtual Memory), AKUMA_USER_SPACE_LEDGER (a frame-ledger extraction with 14 host tests, no defect), AKUMA_AMD64_TEST_GATING (a `no-tests` feature so `cloc` stops reporting `crates/akuma-kernel-amd64/src` as 0.0% test — no behaviour changed) and AMD64_CRATE_REUSE_AUDIT (by its own header, "process, not a defect. Nothing shipped broken"). Four are folds whose substance is a deletion: AKUMA_AMD64_EXECVE_RETURNS (a second `sysret` path so `execve` returns into the new image; `run_process` becomes one entry and one exit), AKUMA_AMD64_PIPE_TABLE_UNIFICATION (two instances of one `PipeTable` become one — the duplicate id space was a *scheduled* defect, live only once `close` folded, and it never did), AKUMA_AMD64_SPAWN_ROW_STDIO (`Spawn::stdout_pipe` deleted as a second copy of a fact the fd table already held) and AKUMA_AMD64_RING3_SEAM_SLICE4 (the fork memory pass gets an architecture hook; the AArch64 lift is byte-for-byte behaviour-preserving). Two are 5b slices that moved a structure without fixing one: AKUMA_AMD64_STEP5B_SLICE2_LIFECYCLE and AKUMA_AMD64_STEP5B_SLICE3_PROCFS (both record what *nearly* broke — a blank `ps`, a deleted `init_entry()` — caught before landing). FIRECRACKER_PORT moved from `proposals/` to `docs/archive/` on this branch and is the design record for a port carried out elsewhere; its one bug, the `GICD_IROUTER` aliasing, is counted under GICD_IROUTER_ALIASING. Five already-listed docs were re-checked for content added here: AKUMA_EXTRACT_MMAP gained only a supersession note (its PTE-permission vocabulary moved back down to `akuma_mmu::types`, counted under REDUCING_PLATFORM_DEPENDENCY above), AKUMA_FIRECRACKER_KVM, AKUMA_FIRECRACKER_TERRAFORM and GICD_IROUTER_ALIASING gained only path updates for that move, and DEVBOX_ISSUES gained **Issues 28 and 29** (`box grab` reportedly broken again; `dmesg` readable from inside a box) which are both **Status: OPEN**, so its count is unchanged.
 
 Also scanned 2026-09-02 (the `oof-part-2` branch — `akuma-exec` -> `#![forbid(unsafe_code)]`, ahead of merging it). AKUMA_EXEC_FORBID_UNSAFE is the campaign's completion write-up — narrative pointing at fixes counted elsewhere, no bullet of its own. AKUMA_EXEC_USER_ACCESS_EXTRACTION and AKUMA_SLOT_TABLE_EXTRACTION are pure crate-extraction records ("a file move plus a fail-closed hook: behaviour-preserving" / a generic `SlotTable<T, N>` primitive with the identity cache's representation collapsed but semantics preserved) — no defect attached, counted nowhere. AKUMA_KERNEL_HOOKS is an inventory of the tree's 21 boot-registered hook cells; its one landed change — the `RUMP_TESTS_HOOK`/`BOOT_TEST_HOOKS` conversions to `Registered::require()` — is already counted under AKUMA_ENTRY_EXTRACTION (the extraction that prompted the audit), and its `transmute`-hooks finding is "recorded, not done in this pass". The two docs on this branch that *did* surface defects have their own subsections under SMP & Locking above: AKUMA_EXEC_AUDIT (five soundness fixes — a `transmute` round-trip, four `&self -> &mut` / plain-field-written-cross-core sites made atomic or moved inside their lock) and AKUMA_EXEC_ADDRESS_SPACE_MERGE (the last two casts, plus a `CowRemap` self-deadlock the merge exposed). ASID_EXHAUSTION_TIGHT_THREAD_LOOP is **Status: OPEN** — `pthread_create` fails at ~251 serial iterations because ASIDs leak from address spaces whose `Drop` never ran, against `MAX_ASID = 256` — counted nowhere. SELFHOST_KERNEL_HEAP_LEAK was **since fixed on 2026-09-03** and now has its own subsection under Memory & Virtual Memory above.
 

@@ -104,14 +104,13 @@ dump: a per-park average near the tick interval is the same symptom.
 Full investigation and the measured before/after:
 [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md).
 
-## Latency: do NOT reach for `net-noalloc` to fix it
+## Latency: static NIC rings are not the fix
 
-`net-noalloc` (static RX/TX rings + async transmit,
-`crates/akuma-net/src/virtio_rings.rs`) looks like the obvious next latency
-lever and **is off for a reason**. Measured 2026-08-19 on `devbox-smoltcp`, same
-`httpd` binary both arms:
+Static RX/TX rings with asynchronous transmit (the `net-noalloc` feature) look like
+the obvious latency lever. They were built, measured and removed on 2026-11-11.
+Measured 2026-08-19 on `devbox-smoltcp`, same `httpd` binary both arms:
 
-| | single buffer | `net-noalloc` |
+| | single buffer | rings |
 |---|---:|---:|
 | poll time held per 5 s window | 472 ms | **211 ms** |
 | tx blocking wait | 27.8 us/pkt | **9.2 us/pkt** |
@@ -119,33 +118,29 @@ lever and **is off for a reason**. Measured 2026-08-19 on `devbox-smoltcp`, same
 | HTTP p90 | **1,172 us** | 3,433 us |
 | HTTP req/s | **1,071** | 855 |
 
-It halves the time the stack holds `NETWORK` and still loses, because the cost
+They halved the time the stack holds `NETWORK` and still lost, because the cost
 moved into the wake: httpd's `accept` phase went from 66-77 % of the request to
-81-88 %. Turn it on to work *that* problem, or to measure a pipelined /
-long-lived-connection workload where the lock-hold win should dominate and the
-per-connection wake should not — it has not been measured against redis yet.
-Reasoning and the untested hypothesis:
+81-88 %. The redis A/B, the workload predicted to suit them, measured −14.6 %
+(`../archive/REDIS_ROUND_TRIP_CEILING.md`, the list after §11). Work the wake instead. Reasoning:
 [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §7.
 
-When it is on, `[NICSTAT]` gains two cumulative counters, both of which must
-stay at zero:
-
-```
-[NICSTAT] w=7 nic_irq=169 orphan=0 tx_stall=0
-```
+`[NICSTAT]` still prints `orphan=0 tx_stall=0`. They were the rings' health
+counters and are now always 0, kept so the line's columns do not move.
 
 `tx_stall` counts frames that found every TX slot in flight — the ring is too
 shallow and those frames took a spin or were dropped. `orphan` counts device
 completions whose token no slot claims, which should be impossible and means
 the token map has desynchronised from the used ring.
 
-## Latency: `net-waker-park` is off for the same kind of reason
+## Latency: targeted socket parking lost for the same kind of reason
 
 The other tempting lever. Blocking socket ops (`accept`/`recv`/`send`/`connect`)
 park in `blocking_relax` — yield + WFI — which leaves the thread READY, so
 nothing can target it and the socket's `wake_all()` walks an empty waker list.
 Every other blocking path in the kernel (pipes, fs, msgqueue, epoll) registers
-and parks properly. Fixing that outlier **measured worse**:
+and parks properly. Fixing that outlier **measured worse**. The two attempts,
+`net-waker-park` and `net-direct-waker` (a waker on the smoltcp socket instead,
+which A/B'd null), were removed 2026-11-11:
 
 | | default | `net-waker-park` |
 |---|---:|---:|
@@ -157,8 +152,8 @@ per 5 s window — so the imprecise wake is plentiful, while the directed one is
 lossy (`wake_all` drains the list, so a waiter must re-register every lap).
 Full reasoning: [`../archive/AKUMA_NET_ISSUES.md`](../archive/AKUMA_NET_ISSUES.md) §8.
 
-**Diagnostic that stays useful either way:** `KernelSocket::waker_count()` reads
-zero for any blocking socket waiter on the default build. If you are debugging a
+**Diagnostic:** `KernelSocket::waker_count()` reads zero for any blocking socket
+waiter. If you are debugging a
 socket that never wakes, that zero is expected, not the bug.
 
 ## The doorbell must be re-armed BEFORE the drain
@@ -214,8 +209,7 @@ tick means a `NETWORK` holder is sleeping while holding it.
 | Knob | Default | Effect |
 |---|---|---|
 | `SYSCALL_DEBUG_NET_ENABLED` (`src/config.rs:526`) | false | Per-call tracing in recv/sendto/epoll/socket. **Best first toggle** for "is the syscall reaching the kernel?" |
-| `NETWORK_THREAD_RATIO` (`src/config.rs:222`) | 4 | Network thread boosted every N ticks. 2=50% (aggressive), 8=12.5%. Boost targets the **registered** network thread (`set_network_thread_id`), not slot 0. |
-| `MAX_SOCKETS` (`smoltcp_net.rs:30`) | 256 (32 on `small-sockets`/`size`) | TCP buffers 16 KB RX + 16 KB TX each |
+| `MAX_SOCKETS` (`smoltcp_net.rs:30`) | 256 | TCP buffers 16 KB RX + 16 KB TX each |
 | `ENABLE_PREEMPTION_WATCHDOG` | true | Catches preemption-stall hangs |
 | Live counters | — | `is_ready()`, `is_dhcp_configured()`, `poll_count()`, `tx_drop_count()` — check first for "is the stack alive?" |
 

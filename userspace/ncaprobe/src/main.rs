@@ -128,7 +128,7 @@ fn probe_epoll(late: bool) {
         let n = unsafe { libc::epoll_wait(epfd, evs.as_mut_ptr(), 8, 0) };
         println!("[{}] --zero: pre-scan epoll_wait(timeout=0) -> {n}", el(&t0));
         for e in evs.iter().take(n.max(0) as usize) {
-            println!("[{}]         data={} events={}", el(&t0), e.u64, ev_name(e.events));
+            println!("[{}]         data={} events={}", el(&t0), { e.u64 }, ev_name(e.events));
         }
         println!("[{}] --zero: now doing the real blocking wait, WITHOUT reading anything first", el(&t0));
     }
@@ -240,7 +240,7 @@ fn probe_cross() {
                 continue;
             }
             for e in evs.iter().take(n as usize) {
-                println!("[{}] waiter round {round}: READY data={} events={}", el(&t1), e.u64, ev_name(e.events));
+                println!("[{}] waiter round {round}: READY data={} events={}", el(&t1), { e.u64 }, ev_name(e.events));
             }
             return true;
         }

@@ -1,5 +1,5 @@
 //! x86_64 4-level page tables **for the kernel's own mappings**: map, unmap,
-//! translate — the machine half of `amd64/src/paging.rs`, extracted so a
+//! translate — the machine half of `crates/akuma-kernel-amd64/src/paging.rs`, extracted so a
 //! composed kernel can make kernel mappings without inheriting the module.
 //!
 //! `boot.s` (in this crate) leaves the machine on a fixed identity map of the

@@ -5,7 +5,7 @@ extends the rung-0 guest from "two vmmcalls, hlt" to a guest that exercises
 **both permission maps**, and turns SVM on across all cores:
 
 - **MSRPM** (§15.11) and **IOPM** (§15.10.1) as `.bss` statics in
-  `amd64/src/kvm.rs`, 4-KiB-aligned and *physically contiguous* (that is the
+  `crates/akuma-kernel-amd64/src/kvm.rs`, 4-KiB-aligned and *physically contiguous* (that is the
   property §15.11/§15.10.1 demand and two frames do not have — the linker
   guarantees it of image objects; PA = VA − KERNEL_VMA). Two bits armed at
   compile time: EFER read, port `0x80`. The const builders and their
@@ -20,7 +20,7 @@ extends the rung-0 guest from "two vmmcalls, hlt" to a guest that exercises
 - **SVM on the APs**: the BSP reserves all 16 host save areas up front
   (`reserve_hsaves`, deliberately leaked — no allocation during AP bring-up),
   and every AP enables through `kvm::ap_hook` called from `ap_entry64`
-  (`amd64/src/smp.rs`). `EFER.SVME` is per-core MSR state.
+  (`crates/akuma-kernel-amd64/src/smp.rs`). `EFER.SVME` is per-core MSR state.
 
 Full record: `docs/archive/AKUMA_KVM.md` §2.7 + the `[10-21]` timeline block.
 

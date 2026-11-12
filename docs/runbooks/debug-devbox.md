@@ -11,7 +11,7 @@ symptom on the left. For build/verify steps, see
   a control byte that makes plain `grep` treat the log as binary — use
   `grep -a`.
 - **rump_server log** (in-VM): `/var/log/box/0/rump_server.log`.
-- **Boot self-tests** (`src/process_tests.rs`, `src/pthread_tests.rs`) halt on
+- **Boot self-tests** (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/pthread_tests.rs`) halt on
   regression.
 
 ## Symptom → cause → fix
@@ -24,7 +24,6 @@ symptom on the left. For build/verify steps, see
 | box 0 rump stack not up yet | No `box=0 proxy ready` line | Wait ~5-10s (DHCP + handshake). herd sshd has `start_delay_ms=10000` + `restart=true` |
 | Wrong SSH port | `ssh -p 22` | Use `-p 2223` (or `RUMP_SSH_PORT`) |
 | Host key changed after rebuild | `REMOTE HOST IDENTIFICATION HAS CHANGED` | `ssh-keygen -R "[localhost]:2223"` |
-| Built-in SSH started instead of userspace | Log lacks `[Main] Built-in SSH server disabled` | Confirm `userspace-sshd` feature is on (`devbox` feature implies it) |
 | Port 2223 busy on host | `ssh` connects then drops | `pkill -9 qemu-system-aarch64` or set `RUMP_SSH_PORT` |
 
 ### SSH slow / first-connection lag
@@ -69,7 +68,7 @@ unidentified. See `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 3e/3f.
 | Symptom | Cause | Fix |
 |---|---|---|
 | Idle VM at ~100% CPU, responsive | **FIXED (2026-07-06/07).** (1) tap-poll busy-spin in `rumpcomp_tap.c` RX fiber; (2) BSP idle threads busy-yielding instead of `WFI`. | If it recurs, check `rumpcomp_tap.c` and `idle_halt()` in `src/main.rs`. See `archive/KNOWN_ISSUES.md` §10-11. |
-| CPU-bound load (rustc codegen) starves SSH → banner timeout | Single core; rump_server waited many scheduler quanta for a timeslice. | **FIXED (2026-07-18).** `start_default_stack` registers rump_server's actual TID (not a parked kthread) for the `NETWORK_THREAD_RATIO` boost. See `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 2a. If it recurs, check `threading::set_network_thread_id` is still called with the right TID. |
+| CPU-bound load (rustc codegen) starves SSH → banner timeout | Single core; rump_server waited many scheduler quanta for a timeslice. | **FIXED 2026-07-18 by a scheduler boost that no longer exists** (it went with the SGI scheduler, `archive/SGI_SCHEDULER_RESIDUE.md`). Not re-measured on the rump devbox; if it recurs, the fix belongs in `pick_next` (`proposals/WAKEUP_LATENCY_UNDER_LOAD.md`). See `archive/RUMP_SYSPROXY_LATENCY_FIX.md` Phase 2a. |
 | Shell pipeline `cmd \| head -N` wedges VM at ~99%, `[signal] tkill(tid=X, sig=13)` | SIGPIPE delivery to the writer spins instead of terminating the write syscall. | **Open.** Workaround: redirect to a file instead of piping through `head`/`tail`. |
 
 ### Network doesn't work

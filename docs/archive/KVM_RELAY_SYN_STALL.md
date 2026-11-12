@@ -88,4 +88,4 @@ hypervisor does not do.
 ## Background
 
 `docs/archive/AKUMA_KVM_AKUMA_GUEST.md` § ssh into the guest, `scripts/kvm/relay_stress.py`,
-`crates/akuma-svm-amd64/src/gateway.rs`, `amd64/src/kvm/relay.rs`.
+`crates/akuma-svm-amd64/src/gateway.rs`, `crates/akuma-kernel-amd64/src/kvm/relay.rs`.

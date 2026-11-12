@@ -30,7 +30,7 @@
 //!
 //! This is a plumbing seam. Whether the registered source is cryptographically
 //! sound is the registrant's problem and is stated at the registration site —
-//! `amd64/src/net.rs`'s `rng_fill` degrades to a counter-based `weak_fill` on a
+//! `crates/akuma-kernel-amd64/src/net.rs`'s `rng_fill` degrades to a counter-based `weak_fill` on a
 //! CPU without `RDRAND` and says so.
 
 use crate::OnceCopy;
@@ -72,7 +72,7 @@ pub fn fill_bytes(buf: &mut [u8]) -> Option<bool> {
 
 // ── the pure halves both x86 kernels used to copy ───────────────────────────
 //
-// `crates/akuma-tokio-kernel-amd64/src/net.rs` and `amd64/src/net.rs` each carried the same SplitMix64
+// `crates/akuma-tokio-kernel-amd64/src/net.rs` and `crates/akuma-kernel-amd64/src/net.rs` each carried the same SplitMix64
 // byte mixer and the same "fill eight bytes at a time from a hardware word
 // source" loop. The hardware read (`rdrand` is `unsafe` asm) and the policy for
 // a failed read stay with each kernel; the algebra is here, where it can be

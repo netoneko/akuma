@@ -12,7 +12,7 @@ second implementation that didn't:
 
 1. **`accept4` (x86_64 288) had no ABI row** (lead 1). Added:
    `Syscall::Accept4 => 288, nr::ACCEPT4`, routed to a new
-   `amd64/src/sock.rs::sys_accept4` that applies `SOCK_NONBLOCK`/`SOCK_CLOEXEC`
+   `crates/akuma-kernel-amd64/src/sock.rs::sys_accept4` that applies `SOCK_NONBLOCK`/`SOCK_CLOEXEC`
    to the *accepted* fd and refuses other bits with `EINVAL`. Necessary, not
    sufficient: with only this, the QEMU soak below still failed.
 2. **The real wedge: amd64's own `recvfrom`/`recvmsg`/`sendto`/`sendmsg` never
@@ -156,7 +156,7 @@ next to the `(Syscall::Fadvise64, 221, 223)` table entry.
 
 ### 2. The `[wp>]` per-write console trace, printed while holding the BKL
 
-`amd64/src/usermode.rs` has a **temporary** trace from 2026-09-20 (commit
+`crates/akuma-kernel-amd64/src/usermode.rs` has a **temporary** trace from 2026-09-20 (commit
 `91532c68`, the never-runs thread hunt): `[wp0>]`/`[wp1>]` in the syscall
 entry path, and `[wp>] thread write task=… fd=… len=…` / `returned …` in
 `sys_write`. It prints for **every `write(2)` from any non-leader thread**,

@@ -14,8 +14,8 @@ macro-generated `unsafe` counts.
 | | before (`c1fe3655`) | after (`5e263f32`) |
 |---|---|---|
 | tree, production `unsafe` sites | 708 | **600** |
-| `amd64/src` | 240 | **118** |
-| `amd64/src/idt.rs` | 38 | **4** |
+| `crates/akuma-kernel-amd64/src` | 240 | **118** |
+| `crates/akuma-kernel-amd64/src/idt.rs` | 38 | **4** |
 | `usermode.rs` / `smp.rs` / `multiboot2.rs` | 31 / 17 / 19 | 6 / 10 / 6 |
 | `futex.rs` / `thread.rs` / `sched.rs` / `lapic.rs` | 12 / 7 / 13 / 13 | 0 / 0 / 6 / 4 |
 | new crates | — | `akuma-trap-amd64` 2, `akuma-idt-amd64` 1 |
@@ -183,7 +183,7 @@ restore skips a non-canonical stored value instead of faulting the switch.
 
 ## Round 3 (2026-10-19): items from "Not done" that are now done
 
-446 -> 434 production `unsafe` sites (`amd64/src` 81 -> 71).
+446 -> 434 production `unsafe` sites (`crates/akuma-kernel-amd64/src` 81 -> 71).
 
 * **Raw-pointer drivers.** The list was stale: `i2c.rs`, `nvme.rs`, `watchdog.rs` and
   `rtw89.rs` were already on `MmioWindow`; what was left was `net.rs`

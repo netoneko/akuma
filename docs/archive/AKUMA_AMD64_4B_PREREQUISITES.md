@@ -7,7 +7,7 @@
 **Parent:** `docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, the C1 box's `4b` row.
 **Predecessor:** `docs/archive/AKUMA_AMD64_C2_SLICES_6_AND_7.md`.
 
-4b is the fold that retires `amd64/src/fd.rs` — 22 syscall arms in the
+4b is the fold that retires `crates/akuma-kernel-amd64/src/fd.rs` — 22 syscall arms in the
 dispatcher still go to it rather than to `akuma-syscalls-glue`'s `fs.rs`. This
 document is what has to be true *before* an arm moves, found the way C1 step 1's
 was: by reading what a folded arm would actually touch.
@@ -38,7 +38,7 @@ libc in the guest passes:
 `O_TRUNC`, `O_APPEND`, `O_NONBLOCK`, `O_DSYNC`, `O_ASYNC`, `O_NOATIME`,
 `O_CLOEXEC`, `O_PATH`, `__O_TMPFILE`. That is what makes it dangerous: a reader
 who spot-checks `O_CREAT` and `O_CLOEXEC` concludes the encodings agree, and
-`amd64/src/fd.rs` said exactly that in a comment —
+`crates/akuma-kernel-amd64/src/fd.rs` said exactly that in a comment —
 
 > Spelled out locally rather than pulled from `akuma_syscalls_linux` because
 > those are the AArch64/`asm-generic` values; on x86_64 they **happen to share
@@ -101,7 +101,7 @@ depends on it.
   silently would let a future bit that is *not* self-inverse break one direction
   with nothing to say which.
 
-`amd64/src/fd.rs`'s `sys_openat` re-encodes the word **once, at its own
+`crates/akuma-kernel-amd64/src/fd.rs`'s `sys_openat` re-encodes the word **once, at its own
 boundary**. Everything below — the file, `KernelFile::flags`, and whatever glue
 arm folds next — then speaks one encoding. The local `open_flags` module is
 `pub use akuma_syscalls_linux::flags::open`, and the three `_X86` constants are
@@ -169,7 +169,7 @@ The only thing that caught this was reading *why* the red arm was red.
 
 **AArch64 cannot be affected, by construction rather than by measurement:** the
 diff is `amd64/` plus `akuma-syscalls-abi`, which the root kernel does not
-depend on — the workspace lists it as a member and only `amd64/Cargo.toml` links
+depend on — the workspace lists it as a member and only `crates/akuma-kernel-amd64/Cargo.toml` links
 it.
 
 Ring-3 witnesses on QEMU: `find /etc -type f`, `ls -R /etc`, `>` truncating a

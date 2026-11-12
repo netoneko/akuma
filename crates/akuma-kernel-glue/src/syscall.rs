@@ -33,15 +33,8 @@ pub fn register() {
     });
 }
 
-#[cfg(kernel_smp_shared)]
 fn probed_core_count() -> usize {
     crate::smp_shared::probed_core_count()
-}
-
-/// Without real SMP there is one core.
-#[cfg(not(kernel_smp_shared))]
-fn probed_core_count() -> usize {
-    1
 }
 
 /// The rump sysproxy five. `src/rump_proxy.rs` only exists under the `rump`

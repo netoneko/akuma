@@ -6,7 +6,7 @@
 **Predecessor:** `AKUMA_AMD64_4B_FOLD_BATCH3B.md` (the `stat` family), whose §7
 lists this batch as *"mechanical"*.
 
-Seven arms. `amd64/src/fd.rs`: **+83 / −448**, 3 448 → 3 083 lines. The batch is
+Seven arms. `crates/akuma-kernel-amd64/src/fd.rs`: **+83 / −448**, 3 448 → 3 083 lines. The batch is
 mostly deletion — the arms it folds carried no vocabulary of their own, so what
 came out is bodies, two local helper tables (`clone_refs`/`release_desc`,
 `fs_err_errno`), the `resolve_at` dirfd ladder, and four now-unreferenced errno

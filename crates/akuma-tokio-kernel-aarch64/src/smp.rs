@@ -88,7 +88,7 @@ pub fn park_halt() {
     let me = cpu_index();
     unlocked(|| {
         HALTED[me].store(true, Ordering::SeqCst);
-        if !akuma_threading::x86_runnable_exists() {
+        if !akuma_threading::runnable_exists() {
             akuma_cpu::park::wfi();
         }
         HALTED[me].store(false, Ordering::SeqCst);

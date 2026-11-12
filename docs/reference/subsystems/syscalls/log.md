@@ -22,9 +22,7 @@ oldest dropped on overflow) plus an `exited_at_us` marker used for retention.
 
 - `record()` (`log.rs:23`) — called from `handle_syscall` (`mod.rs:992`)
   after every syscall, but only when both `need_timing` is set and
-  `config::PROC_SYSCALL_LOG_ENABLED` is true (forced off on
-  `kernel_profile_extreme`, which also skips the per-syscall timing read
-  entirely).
+  `config::PROC_SYSCALL_LOG_ENABLED` is true (on in every build).
 - `mark_exited()` (`log.rs:37`) — called from `sys_exit`/`sys_exit_group`
   (`proc.rs:214,300`) to start the retention window instead of deleting the
   entry immediately.

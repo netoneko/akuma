@@ -1,6 +1,6 @@
 # B21: Taoxichuan on aarch64 - progress (from 2026-11-04)
 
-The record of [`proposals/B21_TOKIO_KERNEL_AARCH64.md`](../../proposals/B21_TOKIO_KERNEL_AARCH64.md): one `main.rs`
+The record of [`docs/archive/B21_TOKIO_KERNEL_AARCH64.md`](B21_TOKIO_KERNEL_AARCH64.md): one `main.rs`
 for both architectures, and a smaller audit surface. One row per step, newest last; each row says what moved,
 what it cost, and which gates it passed.
 
@@ -143,7 +143,7 @@ pinned down. Boot fresh before every battery.
 
 ## Background
 
-[`B15_TOKIO_KERNEL_KIT.md`](../../proposals/B15_TOKIO_KERNEL_KIT.md),
-[`B12_AARCH64_SLOT_TABLE.md`](../../proposals/B12_AARCH64_SLOT_TABLE.md),
+[`B15_TOKIO_KERNEL_KIT.md`](B15_TOKIO_KERNEL_KIT.md),
+[`B12_AARCH64_SLOT_TABLE.md`](B12_AARCH64_SLOT_TABLE.md),
 [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md),
 [`AUDIT_SURFACE_METHODOLOGY.md`](AUDIT_SURFACE_METHODOLOGY.md).

@@ -5,7 +5,7 @@
 //! handler from `oldact`; std's child-side `signal(SIGPIPE, SIG_DFL)` fails the
 //! whole spawn when that reads back as `SIG_ERR`), and `rt_sigprocmask` only has
 //! to keep a word. Both of those are in here, host-tested, so the amd64 kernel's
-//! delivery code (`amd64/src/signal.rs`) can adopt the same decode arms.
+//! delivery code (`crates/akuma-kernel-amd64/src/signal.rs`) can adopt the same decode arms.
 //!
 //! What stays with the kernel: the user-memory copies (`act`, `oldact`, `set`,
 //! `oldset`), the errno table, per-task storage, and anything that *acts* on a
@@ -233,50 +233,57 @@ pub enum TkillAction {
     /// target's next return to user mode.
     Pend,
     /// Pend, and interrupt the target out of any park so it acts promptly (a
-    /// fatal default it cannot block).
+    /// fatal default it cannot block). The target dies at its own next return to
+    /// user mode, through its kernel's delivery path.
     PendInterrupt,
-    /// The caller's own group dies now: the target is in it and the default
-    /// action kills.
-    ExitOwnGroup,
 }
 
-/// `tkill`'s decision.
+/// `tkill`'s decision, for both kernels.
 ///
-/// `target` is `None` when the thread has no owning process: a kernel thread,
-/// or a process already gone. Otherwise it is the target's disposition for
-/// `sig` and whether the target is in the caller's thread group. `mask` is the
-/// *target thread's* blocked set.
+/// `target` is `None` when the thread has no owning process (a kernel thread,
+/// or a process already gone), else the target's disposition for `sig`. `mask`
+/// is the *target thread's* blocked set.
 ///
 /// The rules (and why):
 /// - **No owning process: drop.** There is no disposition to run. Reading that
 ///   as `Default` and acting on it is what made a `SIGUSR1` storm kill `rustc`
 ///   (`docs/archive/SIGNAL_FATAL_DEFAULT_LINUX.md`).
-/// - `SIGKILL` cannot be blocked or handled: the caller's group exits if it is
-///   the target's, else the target is pended and interrupted.
-/// - A handler always pends (delivered at the next return to user mode).
-/// - `Default`: not fatal, nothing; fatal and blocked, pend; fatal and
-///   unblocked, the group exits (own) or the target is pended and interrupted.
-/// - `Ignore`: nothing.
+/// - `SIGKILL` cannot be blocked, ignored or handled: pend and interrupt.
+/// - **Blocked: pend, whatever the disposition.** Linux never discards a blocked
+///   signal ("the handler may change by the time it is unblocked"), so a program
+///   that blocks `SIGCHLD` and `sigtimedwait`s for it sees it. And never
+///   interrupt for one: a blocked signal that ended a wait with `EINTR` made
+///   musl's retry loops spin.
+/// - A handler pends (delivered at the next return to user mode).
+/// - `Default`, unblocked: a fatal one pends and interrupts; one whose default is
+///   to ignore (or stop/continue, no-ops here) is dropped. `Ignore`: dropped.
+///
+/// **No fatal default acts inside `tkill`** (2026-11-11). Until then a fatal
+/// default aimed at the caller's own group was `ExitOwnGroup`: `sys_exit_group`
+/// called from inside the `tkill`. That is the AArch64 exit and the wrong one on
+/// amd64, which left ring 3 through glue's epilogue instead of `run_process`'s;
+/// pending it lets each kernel's delivery run the exit the way that kernel leaves
+/// user mode, and for `tkill(gettid(), …)` that is the return this call is about
+/// to make (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 3: signals").
 #[must_use]
-pub const fn tkill_action(sig: u64, target: Option<(Disposition, bool)>, mask: u64) -> TkillAction {
-    let Some((disposition, same_group)) = target else {
+pub const fn tkill_action(sig: u64, target: Option<Disposition>, mask: u64) -> TkillAction {
+    let Some(disposition) = target else {
         return TkillAction::Drop;
     };
     if sig == SIGKILL {
-        return if same_group { TkillAction::ExitOwnGroup } else { TkillAction::PendInterrupt };
+        return TkillAction::PendInterrupt;
+    }
+    if mask & bit(sig) != 0 {
+        return TkillAction::Pend;
     }
     match disposition {
         Disposition::Ignore => TkillAction::Drop,
         Disposition::Handler => TkillAction::Pend,
         Disposition::Default => {
-            if !fatal_by_default(sig) {
-                TkillAction::Drop
-            } else if mask & bit(sig) != 0 {
-                TkillAction::Pend
-            } else if same_group {
-                TkillAction::ExitOwnGroup
-            } else {
+            if fatal_by_default(sig) {
                 TkillAction::PendInterrupt
+            } else {
+                TkillAction::Drop
             }
         }
     }

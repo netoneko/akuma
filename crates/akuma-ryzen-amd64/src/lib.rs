@@ -65,7 +65,7 @@
 // Zero `unsafe`, and it can stay that way. Every dangerous operation this crate
 // would otherwise need — dereferencing a VMM-supplied physical address — is on
 // the far side of [`mem::PhysMem`], which the *caller* implements. The kernel's
-// impl is three lines with one bounds check (`amd64/src/machine.rs`); the tests'
+// impl is three lines with one bounds check (`crates/akuma-kernel-amd64/src/machine.rs`); the tests'
 // impl is a list of byte spans. That split is what makes a parser of hostile,
 // attacker-adjacent input host-testable and provably memory-safe at the same
 // time. `forbid`, not `deny`, so no module can opt back in.
@@ -184,6 +184,29 @@ impl MachineDescription {
     #[must_use]
     pub fn ioapic_addr(&self) -> Option<u32> {
         self.madt.as_ref()?.ioapics().first().map(|io| io.addr)
+    }
+
+    /// The neutral view of this machine ([`akuma_machine_facts::Facts`]) under `provenance`
+    /// (`Pvh` or `Multiboot2` — the caller knows which protocol it parsed).
+    ///
+    /// Only type-1 (usable) memory becomes RAM; reserved, ACPI and NVS regions are real parts of
+    /// the E820 map but not something a frame allocator may hand out. virtio-MMIO windows keep the
+    /// command line's order, which is the slot order the drivers probe.
+    #[must_use]
+    pub fn facts(&self, provenance: akuma_machine_facts::Provenance) -> akuma_machine_facts::Facts {
+        use akuma_machine_facts::{Facts, IrqController, Range, VirtioMmio};
+        let mut f = Facts::new(provenance);
+        for r in self.regions().iter().filter(|r| r.is_ram()) {
+            let _ = f.push_ram(Range::new(r.addr, r.size));
+        }
+        for d in self.virtio.as_slice() {
+            let _ = f.push_virtio(VirtioMmio { window: Range::new(d.base, d.len), irq: d.irq });
+        }
+        f.cpus = self.cpu_count();
+        if let Some(base) = self.ioapic_addr() {
+            f.irq = IrqController::IoApic { base: u64::from(base) };
+        }
+        f
     }
 }
 

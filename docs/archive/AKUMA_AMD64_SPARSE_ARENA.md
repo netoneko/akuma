@@ -171,6 +171,6 @@ by name), and a copy straddling a region's edge is refused whole.
   predecessor: `PHYSMAP_LIMIT` 4 GiB → 64 GiB, the 16 GiB machine that saw 15%
   of itself, and the closing section that specifies this change including the
   `contains` obligation.
-- `amd64/src/mem.rs` — `init_reserving`, the `Fate` labels, `LOW_RAM_FLOOR`.
+- `crates/akuma-kernel-amd64/src/mem.rs` — `init_reserving`, the `Fate` labels, `LOW_RAM_FLOOR`.
 - `crates/akuma-pmm/src/lib.rs` — `init_sparse`, `add_ram`, `reserve_range`,
   `MAX_RAM_REGIONS`, `range_within_any`.

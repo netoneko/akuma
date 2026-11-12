@@ -17,7 +17,7 @@
 //! SCSI CDB set ([`cdb`]) the driver needs to size, read and write the disk, and
 //! the response parsers ([`InquiryData`], [`ReadCapacity10`], [`RequestSense`]).
 //! The three bulk transfers, the tag bookkeeping, and STALL recovery are the
-//! caller's — `amd64/src/usb_storage.rs` over `akuma-xhci`.
+//! caller's — `crates/akuma-kernel-amd64/src/usb_storage.rs` over `akuma-xhci`.
 
 pub mod cdb;
 

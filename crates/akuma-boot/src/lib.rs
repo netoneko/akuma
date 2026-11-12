@@ -79,7 +79,7 @@ pub fn decode(magic1: u32, magic2: u32, cmd: u32) -> Result<Option<Action>, BadM
 /// Whole-machine PSCI `SYSTEM_RESET`.
 ///
 /// Only built with the `psci` feature (the default) — an AArch64 concept.
-/// `amd64/src/reboot.rs` is the x86 counterpart.
+/// `crates/akuma-kernel-amd64/src/reboot.rs` is the x86 counterpart.
 ///
 /// Akuma has no in-kernel park/quiesce dance before this, and needs none: QEMU
 /// and firmware tear every core and device back down to the same clean reset

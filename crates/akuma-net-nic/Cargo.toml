@@ -5,18 +5,11 @@ edition = "2024"
 
 [features]
 default = []
-# Static RX/TX frame rings + a non-blocking transmit path. Forwarded from the
-# kernel feature of the same name; OFF by default — it measured worse on
-# latency. See docs/archive/AKUMA_NET_ISSUES.md §7.
-net-noalloc = []
 # Per-packet RX/TX/poll timing. MEASUREMENT BUILDS ONLY.
 net-profile = []
-# Raise the socket budget on size-constrained profiles.
-many-sessions = []
 # The raw L2 path for NIC1 (`/dev/net/tap0`). A NIC driver, so it lives here
 # with the others — the device-independent half is `akuma-rump`.
 rump = ["dep:akuma-rump"]
-small-sockets = []
 # The Realtek RTL8169/8168 as an `ExternalDevice` variant — amd64 bare metal.
 # Off by default; the driver logic is `akuma-net-rtl8169`, this feature adds the
 # MMIO/DMA glue and the `smoltcp::phy::Device` shim.

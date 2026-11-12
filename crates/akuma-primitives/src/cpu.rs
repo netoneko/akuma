@@ -12,17 +12,17 @@
 /// callers (the scheduler's per-core idle, the BKL's owner field, the MMU's
 /// per-core TTBR gate) can use it unconditionally.
 ///
-/// **The `cfg` is deliberately `kernel_smp_shared`, not `target_os = "none"`.**
+/// **The `cfg` is deliberately `kernel_bkl_smp`, not `target_os = "none"`.**
 /// A bare-metal single-core build would read aff0 = 0 anyway, so reading for real
 /// looks equivalent — but the multikernel build (`smp`, one whole kernel per core)
-/// runs on cores with *non-zero* aff0 while `kernel_smp_shared` is off, and there
+/// runs on cores with *non-zero* aff0 while `kernel_bkl_smp` is off, and there
 /// every caller expects the `0` this shim returns. Widening the gate would
 /// silently repoint that build's per-core tables.
 ///
 /// Moved here from `akuma_bkl::bkl` on 2026-08-30: it was the crate's last
 /// `unsafe` site, and removing it let the BKL protocol carry
 /// `#![forbid(unsafe_code)]` (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §7.9).
-#[cfg(all(kernel_smp_shared, target_os = "none", target_arch = "aarch64"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none", target_arch = "aarch64"))]
 #[inline]
 #[must_use]
 pub fn current_core_id() -> u32 {
@@ -37,7 +37,7 @@ pub fn current_core_id() -> u32 {
 /// header). Before `install_percpu` a `gs:`-relative load would fault; the one
 /// early path that could ask (`ap_entry64` → `paging::activate_unpublished`)
 /// takes the core as an argument instead of calling this, which is exactly why.
-#[cfg(all(kernel_smp_shared, target_os = "none", target_arch = "x86_64"))]
+#[cfg(all(kernel_bkl_smp, target_os = "none", target_arch = "x86_64"))]
 #[inline]
 #[must_use]
 pub fn current_core_id() -> u32 {
@@ -46,9 +46,9 @@ pub fn current_core_id() -> u32 {
 
 /// Non-SMP / host shim: a single-core build is always core 0.
 #[cfg(all(
-    not(all(kernel_smp_shared, target_os = "none")),
-    not(all(kernel_smp_shared, target_os = "none", target_arch = "aarch64")),
-    not(all(kernel_smp_shared, target_os = "none", target_arch = "x86_64"))
+    not(all(kernel_bkl_smp, target_os = "none")),
+    not(all(kernel_bkl_smp, target_os = "none", target_arch = "aarch64")),
+    not(all(kernel_bkl_smp, target_os = "none", target_arch = "x86_64"))
 ))]
 #[inline(always)]
 #[must_use]

@@ -28,8 +28,8 @@ device dead while config reads still work. The only feature the driver asks for 
 `block::init()` registers **every** virtio-blk the machine exposes, in slot order,
 as `vda`, `vdb`, … up to `MAX_BLOCK_DEVICES` (4); `vda` is the boot disk, the others
 are mounted at runtime with `mount(2)`. Each device has a `Spinlock` in
-`BLOCK_DEVICES`; that lock is held across a whole request (see the `no-bkl-vfs`
-note on the static).
+`BLOCK_DEVICES`; that lock is held across a whole request (see the BKL-free
+VFS note on the static).
 
 ## A request
 

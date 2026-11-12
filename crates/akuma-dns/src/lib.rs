@@ -16,7 +16,7 @@
 //!
 //! # Why it is a crate
 //!
-//! It began as `amd64/src/dns.rs`, written 2026-09-05 to route around
+//! It began as `crates/akuma-kernel-amd64/src/dns.rs`, written 2026-09-05 to route around
 //! `smoltcp_net::dns_query`, which had hung on its first amd64 caller. That
 //! left two resolvers: smoltcp's DNS socket (AArch64, and every kernel-side
 //! caller) and this one (amd64), with different behaviour where it matters —

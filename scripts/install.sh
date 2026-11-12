@@ -1,7 +1,7 @@
 #!/bin/sh
 # install.sh — from a URL to an ssh prompt on Akuma (amd64, Taoxichuan).
 #
-# Written to proposals/INSTALL_SCRIPT.md. POSIX sh, no bashisms, no python, no
+# Written to docs/archive/INSTALL_SCRIPT.md. POSIX sh, no bashisms, no python, no
 # sudo, no package installs, no Docker. The reader is an agent: one line per
 # stage, fixed exit codes, machine-readable AKUMA_* closing lines.
 #

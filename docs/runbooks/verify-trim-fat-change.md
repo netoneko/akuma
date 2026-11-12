@@ -99,8 +99,8 @@ HOST=$(rustc -vV | grep '^host:' | cut -d' ' -f2)
 
 cargo clippy --release
 cargo clippy --profile extreme-size --no-default-features \
-      --features no-tests,smoltcp,extreme,userspace-sshd
-cargo clippy --release --features devbox-smoltcp,no-tests
+      --features no-tests,smoltcp
+cargo clippy --release --features no-tests
 cargo clippy --release --no-default-features --features \
       "$(grep -oE 'DEVBOX_FEATURES="[^"]*"' scripts/build_devbox.sh | head -1 | sed 's/.*="//;s/"//')"
 
@@ -169,7 +169,7 @@ cargo test --target "$HOST" 2>&1 \
 
 ### Can this be a host test rather than a boot test?
 
-Ask before reaching for `src/process_tests.rs`. The bar is lower than it looks:
+Ask before reaching for `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`. The bar is lower than it looks:
 `akuma-exec` already runs 210 host tests, `with_irqs_disabled` is a no-op off
 `target_os = "none"`, `current_thread_id` is `akuma_primitives::preempt::current_tid`,
 and the wake path is atomic-array bookkeeping — **registering and signalling a
@@ -277,7 +277,7 @@ idle loops (`idle_halt`, netpoll WFI), poll intervals, or the timer crate.
 | `[Exception] Sync from EL1: EC=0x25` ×2 | Pre-existing; present in every archived baseline in `logs/` |
 | A `grep -c SIGSEGV` hit | The boot banner **prints an OOM-signature help block containing the literal text** `[Fault] Process N (name) SIGSEGV after Xs`. Match `^\[.*\] \[Fault\]`, not bare `SIGSEGV` |
 | `[BKL] stuck tag=511` | Load-driven. A real storm is thousands of lines, not tens |
-| The suite stops mid-run: the boot log **stops growing**, QEMU pegs one core, and the remaining exercises report TIMEOUT | **Known intermittent wedge — an EL1 sync-fault loop in `sgi_scheduler_handler_with_sp`, still open** (`COW_PILE_AUDIT.md` §10, and [`scripts/f8_wedge_repro.py`](../../scripts/f8_wedge_repro.py) to catch it under lldb). ~1 in 7 SMP=1 suite runs. It hits at the transition *between* exercises, where sshd forks the next one, and a wedged run can have **zero** time-jump lines on a completely idle host — so it is a spin with IRQs masked, not host load. Reproduced 2026-08-14 across two different trees, which is how it was cleared of being either F1 or F2. **Consequence for verification: a single SMP=1 exercise run proves nothing.** Re-run, and treat 1-of-1 results as noise — this flake was mis-attributed to a code change twice in one session before it was A/B'd properly |
+| The suite stops mid-run: the boot log **stops growing**, QEMU pegs one core, and the remaining exercises report TIMEOUT | **Known intermittent wedge, recorded as an EL1 sync-fault loop in the SGI scheduler's `sgi_scheduler_handler_with_sp`** (that scheduler was deleted 2026-11-11, `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`; not re-measured on the hooked scheduler) (`COW_PILE_AUDIT.md` §10, and [`scripts/f8_wedge_repro.py`](../../scripts/f8_wedge_repro.py) to catch it under lldb). ~1 in 7 SMP=1 suite runs. It hits at the transition *between* exercises, where sshd forks the next one, and a wedged run can have **zero** time-jump lines on a completely idle host — so it is a spin with IRQs masked, not host load. Reproduced 2026-08-14 across two different trees, which is how it was cleared of being either F1 or F2. **Consequence for verification: a single SMP=1 exercise run proves nothing.** Re-run, and treat 1-of-1 results as noise — this flake was mis-attributed to a code change twice in one session before it was A/B'd properly |
 | `[WATCHDOG] Time jump detected: ~100ms (host sleep/wake)`, repeated | Lost guest time. The parenthetical is the kernel's *guess*, not a measurement, and both causes are real: **(a)** the host descheduling QEMU — a background `cargo`/rust-analyzer rebuild during the boot is enough, and the gate's own Tier 1 immediately before Tier 2 does it; **(b)** the guest itself losing time. Treat a high count as "this run's timing is untrustworthy", not as a diagnosis, and note the wedge above can occur with a count of **zero**. Measured 2026-08-13: a run with 2866 of these had `cowstale` TIMEOUT at SMP=1 and UNEXPECTED at SMP=4 on a tree where both pass, and the same tree re-run quiet scored `ok` at both — but a clean tree also scored 741 and passed everything, so the count bounds trust, it does not explain a failure. Count them (`grep -ac 'Time jump detected'`) before believing any exercise result, and re-run rather than debug |
 | `passed_marker` differs by exactly 1 at SMP=4 while `[PASS]` is unchanged | Usually `thread_slot_reclaim_on_spawn_initializing`, which has a **third self-reported outcome** besides PASSED/SKIPPED: `INCONCLUSIVE: N slots already free at spawn, nothing forced a reclaim`. It needs the slot pool actually exhausted, and at SMP=4 that is a race (measured 2026-08-13: PASSED in one run, INCONCLUSIVE in another on the same tree, 276 vs 275). Confirm by name before treating a ±1 `passed_marker` move as a deleted test: `diff` the `[Test] <name> (PASSED\|SKIPPED)` sets between the two logs |
 | `[SGI-S FATAL] new_sp=0x0 invalid!` mid-suite, boot never reaches sshd | **Fixed 2026-08-14** for its dominant source: `test_unregister_skips_recycled_thread_slot` seeded bare claimed slots (zeroed context, `sp=0`) as `READY` across several UART prints — dispatchable by a timer tick (any SMP) or a peer core (SMP>1); it fired 3 times in 9 boots on a loaded host that day. The test now seeds `WAITING` with no deadline, which nothing dispatches or wakes. If this line still appears, the remaining fabricated-slot suspect is `test_kill_thread_group_reaps_futex_blocked_sibling` (WAITING seed + futex wake); the gate reports `smpN.halt` and `smpN.pass_marker` even when `booted: False`, so you can see how far the suite got |

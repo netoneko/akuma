@@ -43,10 +43,10 @@ host tests (which always called `add_acpi`) missed it.
 
 ## Fix
 
-- `amd64/src/kvm/linux/machine.rs`: the handoff pages, and Linux's ACPI page, sit under the top of the
+- `crates/akuma-kernel-amd64/src/kvm/linux/machine.rs`: the handoff pages, and Linux's ACPI page, sit under the top of the
   **low** extent whatever the RAM size (`top = m.low.bytes`). The low RAM entry stops short of them, and
   the high extent is reported whole.
-- `amd64/src/kvm/linux.rs`: the kernel loader's segment limit is the low extent less the handoff pages
+- `crates/akuma-kernel-amd64/src/kvm/linux.rs`: the kernel loader's segment limit is the low extent less the handoff pages
   in both shapes. The `Ram::bytes` field, which only the old limit read, is gone (`map.bytes` has it).
 - `crates/akuma-svm-amd64` (`pvh`): `write_start` sets `memmap_entries` from the layout (`ram_entries`:
   2 when the RAM crossed the device window, else 1). `plan`'s doc states the 32-bit constraint.
@@ -74,5 +74,5 @@ host tests (which always called `add_acpi`) missed it.
 
 - More than 4 GiB: `rammap::MAX_BYTES`/`MAX_DIRS` and `akuma-vm-spec::MAX_RAM_MIB` cap a guest at 4 GiB, and
   entry 29's `kvmmem=4096` is in `grubx64.efi`, which only Pop can rewrite.
-- The `/dev/kvm` API path (`amd64/src/kvm/api.rs`) leaves handoff placement to the userspace VMM, which must
+- The `/dev/kvm` API path (`crates/akuma-kernel-amd64/src/kvm/api.rs`) leaves handoff placement to the userspace VMM, which must
   keep `start_info` below 4 GiB too.

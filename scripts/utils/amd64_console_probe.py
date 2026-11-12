@@ -63,7 +63,7 @@ def usb_command(repo, mon_path, fbtrace):
     on the lower root-hub port: `find_and_reset_port` takes the first connected
     port, and a keyboard there would be tried as the disk.
     """
-    subprocess.run(["cargo", "build", "-p", "akuma-amd64", "--target", "x86_64-unknown-none", "--release"],
+    subprocess.run(["cargo", "build", "-p", "akuma", "--target", "x86_64-unknown-none", "--release"],
                    cwd=repo, check=True)
     ext2 = os.path.join(repo, "target/x86_64-unknown-none/release/amd64-root.img")
     subprocess.run(["sh", "amd64/mkdisk.sh", ext2, "128"], cwd=repo, check=True, stdout=subprocess.DEVNULL)
@@ -79,7 +79,7 @@ def usb_command(repo, mon_path, fbtrace):
         f.write(mbr)
         f.write(b"\0" * (2048 * 512 - 512))
         f.write(body)
-    kernel = os.path.join(repo, "target/x86_64-unknown-none/release/akuma-amd64")
+    kernel = os.path.join(repo, "target/x86_64-unknown-none/release/akuma")
     return [
         "qemu-system-x86_64", "-M", "q35,i8042=off", "-cpu", "max", "-m", "2048", "-smp", "1",
         "-kernel", kernel, "-append", "init=/bin/herd pci usbroot fbtrace",

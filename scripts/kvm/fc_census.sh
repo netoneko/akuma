@@ -5,7 +5,7 @@ set -eu
 cd "$(dirname "$0")/../.."
 D=${CENSUS_DIR:?set CENSUS_DIR to the dir holding fc/ gcc/ musl/ (extracted apks)}
 LOG=${1:-$D/census.log}
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests 2>&1 | grep -E "^error|^  -->" || true
+cargo build -p akuma --target x86_64-unknown-none --release --features no-tests 2>&1 | grep -E "^error|^  -->" || true
 rm -f "$LOG"
 P0="echo P0-BEGIN
 for i in ${REPEATS:-1}; do /usr/bin/firecracker ${FCARGS:---no-api --no-seccomp --config-file /vm.json}; echo \"run \$i rc=\$?\"; done

@@ -2,7 +2,7 @@
 
 The composition root of the minimal-self-hosting experiment's metal track: a
 kernel built by **pulling crates, one line per stage**, with as few crates as
-will serve — and where the logic was still stuck in `amd64/src/`, extracting it
+will serve — and where the logic was still stuck in `crates/akuma-kernel-amd64/src/`, extracting it
 into a crate first and pulling that (`akuma-boot-amd64`, `akuma-comconsole`,
 `akuma-ring3-amd64` are the extractions this kernel exists over). A piece that
 exists in a crate is pulled, never copied; what is written new here is only

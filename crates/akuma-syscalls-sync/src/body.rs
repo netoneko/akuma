@@ -1,6 +1,8 @@
 //! The `futex(2)` syscall body, shared by the two bare-metal kernels.
 //!
-//! `amd64/src/futex.rs` and `taoxichuan/src/futex.rs` each carried a copy of the
+//! `crates/akuma-kernel-amd64/src/futex.rs` (folded into `akuma-syscalls-glue::sync` 2026-11-11, so the
+//! amd64 kernel no longer uses this file) and `taoxichuan/src/futex.rs` each
+//! carried a copy of the
 //! same dispatch and the same three non-blocking operations (`wake`, `requeue`,
 //! `wake_op`), differing only in how they read user memory, how they name the
 //! caller's thread group and what "wake a thread" means. That difference is the

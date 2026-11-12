@@ -9,13 +9,13 @@ Steps 3-7 of the audit (PhysSlice, SVM, AP bring-up, ring3, per-CPU GDT, LAPIC, 
 
 | step | old site | now |
 |---|---|---|
-| 1 | `tokio-kernel-amd64` `trap_top_for`; `amd64/src/gdt.rs` `TRAP_STACK` end | no `unsafe`: address arithmetic on a static (`wrapping_add`), no dereference |
-| 2 | `amd64/src/smp.rs` `enable_sse`; `tokio-kernel-amd64` `enable_cpu_features` | `akuma_cpu::ctlreg::enable_fpu()` (CR0.EM=0, CR0.MP=1, CR4.OSFXSR, CR4.OSXMMEXCPT) |
+| 1 | `tokio-kernel-amd64` `trap_top_for`; `crates/akuma-kernel-amd64/src/gdt.rs` `TRAP_STACK` end | no `unsafe`: address arithmetic on a static (`wrapping_add`), no dereference |
+| 2 | `crates/akuma-kernel-amd64/src/smp.rs` `enable_sse`; `tokio-kernel-amd64` `enable_cpu_features` | `akuma_cpu::ctlreg::enable_fpu()` (CR0.EM=0, CR0.MP=1, CR4.OSFXSR, CR4.OSXMMEXCPT) |
 | 2 | `smp.rs` `enable_xsave` | `ctlreg::enable_xsave(xcr0)` (CR4.OSXSAVE, then `xsetbv`; the CPUID facts are the caller's, stated in the doc) |
 | 2 | `uaccess.rs` `init_smap`; `tokio-kernel-amd64`'s two CR0.WP writes | `ctlreg::enable_smep_smap(smep, smap)` and `ctlreg::set_cr0_wp()` |
 | 2 | `sti`/`cli` in `lapic.rs`, `boot.rs`, `clock.rs`, `sched.rs` (selftests) | `interrupts::{on, off}` |
 | 2 | `main.rs` and `tokio-kernel-amd64` halt loops | `park::halt() -> !` (`cli; hlt` per iteration, so an NMI wake re-halts) |
-| 2 | byte-identical `rdrand` loops in `amd64/src/net.rs` and `tokio-kernel-amd64/src/net.rs` | `rng::rdrand() -> Option<u64>` (ten retries; the CPUID gate stays the caller's) |
+| 2 | byte-identical `rdrand` loops in `crates/akuma-kernel-amd64/src/net.rs` and `tokio-kernel-amd64/src/net.rs` | `rng::rdrand() -> Option<u64>` (ten retries; the CPUID gate stays the caller's) |
 | 2 | `multiboot2.rs` PAT write | `msr::set_pat_entry_wc(index)` (one entry becomes WC, the other seven written back as read) |
 
 There is no raw `write_crN` anywhere in the public surface: each writer read-modify-writes exactly its own bits, the closed-set
@@ -37,7 +37,7 @@ live mapping selecting the edited entry changes memory type: a coherency hazard)
 
 ## Evidence
 
-* `unsafe` sites (`scripts/check_unsafe_budget.py`, production): `amd64/src` 80 -> 69, `akuma-tokio-kernel-amd64` 29 -> 24,
+* `unsafe` sites (`scripts/check_unsafe_budget.py`, production): `crates/akuma-kernel-amd64/src` 80 -> 69, `akuma-tokio-kernel-amd64` 29 -> 24,
   `akuma-cpu` 65 -> 73 (the named functions). `docs/reference/unsafe-budget.json` carries the new numbers; the ratchet moved down
   by 16 in the kernels for 8 added inside the one crate whose job is to hold them.
 * Builds: `akuma-amd64`, `akuma-tokio-kernel-amd64` (with and without `middleware`), `akuma` and
@@ -69,7 +69,7 @@ live mapping selecting the edited entry changes memory type: a coherency hazard)
 `FrameHandle` was *not* used for the saved-frame reads: it names the frame the vector just pushed for the running handler, and
 the IRQ-frame offsets (240/248) are not the `UserTrapFrame` layout, so the contract does not fit another thread's frame.
 
-Production `unsafe` sites: kernels 93 -> 69 after the sweep + stack/frame/forensics work (`amd64/src` 69 -> 59, `tokio-kernel-amd64`
+Production `unsafe` sites: kernels 93 -> 69 after the sweep + stack/frame/forensics work (`crates/akuma-kernel-amd64/src` 69 -> 59, `tokio-kernel-amd64`
 24 -> 18, `akuma-threading` 69 -> 59, `akuma-exceptions` 29 -> 27); new leaves `akuma-stack` 5, `akuma-exceptions-forensics` 2,
 `akuma-boot-amd64` 2 -> 9, `akuma-cpu` 73 -> 75. Whole tree 492 (audit start) -> 472.
 

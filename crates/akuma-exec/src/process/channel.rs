@@ -218,9 +218,13 @@ impl ProcessChannel {
         self.is_terminal.load(Ordering::Acquire)
     }
 
-    /// Mark stdin as closed (no more data will be arriving)
+    /// Mark stdin as closed (no more data will be arriving), and wake every
+    /// thread parked in `poll` on it: a closed stdin is readable (`read` returns
+    /// 0), and a poller registered before the close would otherwise sleep until
+    /// its timeout, or forever without one.
     pub fn close_stdin(&self) {
         self.stdin_closed.store(true, Ordering::Release);
+        self.wake_pollers();
     }
 
     /// Check if stdin is closed
@@ -638,7 +642,7 @@ pub fn remove_terminal_state(thread_id: usize) -> Option<Arc<Spinlock<terminal::
 ///
 /// What is therefore **not** covered here, and needs the boot suite: that a
 /// woken thread actually runs. `test_process_channel_write_bounded_backpressure`
-/// in `src/process_tests.rs` is the in-VM half.
+/// in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs` is the in-VM half.
 #[cfg(test)]
 mod tests {
     use super::*;

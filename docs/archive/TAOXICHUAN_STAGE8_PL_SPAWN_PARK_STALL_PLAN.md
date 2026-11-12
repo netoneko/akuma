@@ -137,7 +137,7 @@ kernels' paths before spending more.
 
 ## 5. Composition rule accounting
 
-To be filled per piece as it lands: what was looked for where (`grep -rn <name> crates/ amd64/src/`),
+To be filled per piece as it lands: what was looked for where (`grep -rn <name> crates/ crates/akuma-kernel-amd64/src/`),
 pulled / extracted / written-new, amd64 build gate (`cargo check -p akuma-amd64 --target
 x86_64-unknown-none --features no-tests`), aarch64 green, `wc -l taoxichuan/src/*.rs` start 8085.
 

@@ -2,7 +2,7 @@
 name = "akuma-lapic-amd64"
 version = "0.1.0"
 edition = "2024"
-description = "The LAPIC's timer face (xAPIC window, EOI, tick counter, periodic arm, 8254 PIT calibration, TSC rate/uptime), extracted from amd64/src/lapic.rs per the composition rule so the amd64 kernel and taoxichuan share one implementation. forbid(unsafe_code): every hardware access rides akuma-primitives' MmioWindow, akuma-port's PIT and akuma-cpu's rdtsc. x86_64-only, like the LAPIC itself"
+description = "The LAPIC's timer face (xAPIC window, EOI, tick counter, periodic arm, 8254 PIT calibration, TSC rate/uptime), extracted from crates/akuma-kernel-amd64/src/lapic.rs per the composition rule so the amd64 kernel and taoxichuan share one implementation. forbid(unsafe_code): every hardware access rides akuma-primitives' MmioWindow, akuma-port's PIT and akuma-cpu's rdtsc. x86_64-only, like the LAPIC itself"
 
 [lints]
 workspace = true

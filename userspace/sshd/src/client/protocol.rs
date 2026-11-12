@@ -98,8 +98,7 @@ const HANDSHAKE_IDLE_TIMEOUT_MS: u64 = 30_000;
 /// error instead of a hung terminal. Tunable at runtime via `SSH_ALIVE_INTERVAL`
 /// (seconds, 0 = off) and `SSH_ALIVE_COUNT_MAX` — same names/units as
 /// OpenSSH's `ServerAliveInterval` / `ServerAliveCountMax`.
-const DEFAULT_ALIVE_INTERVAL_MS: u64 = 15_000;
-const DEFAULT_ALIVE_COUNT_MAX: u32 = 3;
+use sshd::client_resilience::{DEFAULT_ALIVE_COUNT_MAX, DEFAULT_ALIVE_INTERVAL_MS};
 
 /// How many times `connect()` is attempted before giving up. A single failed
 /// connect on a flaky link is indistinguishable from "the wifi glitched for

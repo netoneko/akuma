@@ -196,10 +196,10 @@ spin:
 
 | build | `StateHoldGuard` | effect while a state guard is held |
 |---|---|---|
-| default (`cargo build --release` → `smp-shared` → `no-bkl-vfs`) | `akuma_primitives::PreemptGuard` | **preemption disabled + local IRQs masked** |
-| without `no-bkl-vfs` | `NoStateHold` (ZST) | nothing (the Big Kernel Lock covers it) |
+| default (`cargo build --release` → `smp-shared`) | `akuma_primitives::PreemptGuard` | **preemption disabled + local IRQs masked** |
+| without `smp-shared` | `NoStateHold` (ZST) | nothing (the Big Kernel Lock covers it) |
 
-Under `no-bkl-vfs` a core can be inside an ext2 critical section *without*
+Under `smp-shared` a core can be inside an ext2 critical section *without*
 holding the BKL. The IRQ mask is what stops a nested IRQ on that core from
 running `enter_kernel()` and hard-spinning for the BKL while this core holds the
 inner lock — the AB-BA wedge that `no-bkl-network` closed the same way
@@ -603,7 +603,7 @@ itself — deleting a source checkout is (files × ~8-10) synchronous device wri
 
 Every heap allocation in `src/ext2.rs` outside `#[cfg(test)]`, and whether it is
 justifiable. **Context that raises the bar:** under the kernel `default`
-(`no-bkl-vfs`), all of this runs with **local IRQs masked and preemption
+(`smp-shared`), all of this runs with **local IRQs masked and preemption
 disabled** for the whole `Ext2State` guard hold (see
 [above](#locking-and-the-irq-masked-hold)). An allocation here can therefore:
 take the kernel heap lock (spins with IRQs masked if another core holds it),
@@ -652,11 +652,11 @@ proportionally to file/directory size while holding the IRQ-masked guard.
 |---|---|---|
 | *(none)* | — | 64-slot `BlockRingCache`; `StateHoldGuard = NoStateHold` |
 | `fs-cache` | `ext2_fs_cache` | RAM-sized `ClockBlockCache`; GDT/inode reads routed through it |
-| `no-bkl-vfs` | (via `akuma-primitives/no-bkl-vfs`) | `StateHoldGuard = PreemptGuard` — preemption off **+ IRQs masked** for every state-lock hold |
+| `smp-shared` | (via `akuma-primitives/smp-shared`) | `StateHoldGuard = PreemptGuard` — preemption off **+ IRQs masked** for every state-lock hold |
 | `extreme` | `kernel_profile_extreme` (also from `OPT_LEVEL=z`) | **no block cache at all**; `read_block` always hits the device |
 
-The kernel `default` set includes `fs-cache` and (through `smp-shared`)
-`no-bkl-vfs`. `cargo build --release` is real SMP.
+The kernel `default` set includes `fs-cache` and `smp-shared` (whose
+`akuma-ext2` half was the `no-bkl-vfs` feature until 2026-11-11). `cargo build --release` is real SMP.
 
 ---
 

@@ -38,7 +38,7 @@ indistinguishable from BKL contention.
 
 ```bash
 ( cd scripts/bkl_rustc_bench && python3 -m http.server 8899 --bind 127.0.0.1 & )
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests
+cargo build --profile release-smp-shared --features no-tests
 SNAPSHOT=1 DISK=devbox.img MEMORY=4096 SMP=4 scripts/cargo_runner.sh \
     target/aarch64-unknown-none/release-smp-shared/akuma > boot.log 2>&1 &
 until LC_ALL=C awk '/Starting service: sshd/{f=1} END{exit !f}' boot.log; do sleep 5; done

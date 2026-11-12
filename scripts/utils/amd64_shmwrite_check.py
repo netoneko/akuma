@@ -2,7 +2,7 @@
 """Writable `MAP_SHARED` coherence on amd64, on local QEMU, over ssh.
 
 The gate for the shared writable page table (`crates/akuma-fpcache-rw`,
-`amd64/src/shmpages.rs`, 2026-10-03): the two coherence probes plus the
+`crates/akuma-kernel-amd64/src/shmpages.rs`, 2026-10-03): the two coherence probes plus the
 regression probes the change could plausibly break, each run as its own ssh
 command so one hang names itself instead of eating the rest.
 

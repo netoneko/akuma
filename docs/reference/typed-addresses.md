@@ -41,8 +41,10 @@ function, the type has no job there (the "net-zero conversion" case in the MMIO 
 | `akuma-phys` | **typed**: `phys_ptr(PhysAddr)`, `Frame::from_pa(PhysAddr)`, `Frame::pa()` and `FreshFrame::pa()` return `PhysAddr`, `copy_from_frame(PhysAddr)` |
 | `akuma-pmm` | next: its API (alloc/free/CoW refcount/`init`/`add_ram`/`reserve_range`) is `usize` with 53 untyped parameters and ~880 references outside the crate; convert behind a typed twin per function |
 | `akuma-pagetable`, `akuma-pte-*`, `akuma-mmap` | then; `akuma_mmap::PhysFrame` stays the `Copy` address vocabulary for crates that cannot call the PMM |
+| `akuma-frame-raw`, `akuma-mmu-raw`, `akuma-switch`, `akuma-entry` | the raw leaves the `unsafe` sweep isolated: each takes a raw address behind one stated contract, so their untyped parameters (25) arrived with the `unsafe` and are budgeted, not converted. Type them with the wave that types their callers (`akuma-pmm`/`akuma-pagetable` below them, `akuma-threading` above) |
+| `akuma-machine-facts` | budgeted (3): `Range`/`contains`/`ram_containing` are the discovery vocabulary for spans read out of VMM tables; typing it is a fold into `PhysAddr` at the kernel-core merge, with its adapters |
 | `akuma-mmu` (130 params) | its own sweep, full verify-trim gate |
-| `akuma-exec`, `akuma-exceptions`, `akuma-tokio-kernel-*`, `amd64/src/mm.rs` | consumers, last |
+| `akuma-exec`, `akuma-exceptions`, `akuma-tokio-kernel-*`, `crates/akuma-kernel-amd64/src/mm.rs` | consumers, last |
 
 Order is bottom-up so each wave's callers can pass typed values from the wave below. Not every hit of the gate below is an address
 confusion (a user `addr` in a socket call, a device bus `base`): those want a different type or none, and are triaged out of the list as the sweeps reach them.
