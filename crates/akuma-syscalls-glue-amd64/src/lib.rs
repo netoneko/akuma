@@ -6,12 +6,13 @@
 //! and the rest that the AArch64 kernel runs. An x86_64 caller differs from an
 //! asm-generic one in exactly the places this crate handles:
 //!
-//! - **Numbers.** Eleven fd calls exist only on x86_64 (`open` 2, `stat` 4, `lstat` 6,
-//!   `poll` 7, `access` 21, `pipe` 22, `select` 23, `dup2` 33, `creat` 85,
-//!   `epoll_create` 213, `epoll_wait` 232); each is its `*at`/`p*` successor
-//!   with fixed arguments. Two time calls do too (`gettimeofday` 96, `time` 201),
-//!   served here from the wall clock glue's `clock_gettime` reads. The path-only legacy calls are
-//!   `akuma_syscalls_abi::legacy::fold`'s, applied by the caller first.
+//! - **Numbers.** The x86-only spellings that are a modern call with fixed
+//!   arguments (`open`, `creat`, `stat`, `lstat`, `access`, `pipe`, the
+//!   `epoll` pair and the path calls) are `akuma_syscalls_abi::legacy::fold`'s,
+//!   applied by the caller first. The ones that are not a fixed rewrite are
+//!   here: `poll` 7, `select` 23, `dup2` 33, and two time calls
+//!   (`gettimeofday` 96, `time` 201) served from the wall clock glue's
+//!   `clock_gettime` reads.
 //! - **Open flags.** Four `open(2)` bits are permuted between the ABIs
 //!   (`akuma_syscalls_abi::open_flags`); handing glue the x86_64 bits opens a
 //!   directory as `O_DIRECT` and so on.
@@ -43,8 +44,6 @@ const EFAULT: u64 = (-14i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
 const ENOENT: u64 = (-2i64) as u64;
 
-const AT_FDCWD: u64 = (-100i64) as u64;
-const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
 /// The most one glue `read`/`pread64` call moves.
@@ -70,20 +69,11 @@ const fn is_err(r: u64) -> bool {
 pub fn dispatch(nr: u64, a: [u64; 6]) -> Option<u64> {
     // The legacy x86-only numbers first: none has a `Syscall` row.
     let legacy = match nr {
-        2 => Some(openat(AT_FDCWD, a[0], a[1], a[2])),
-        4 => Some(newfstatat(AT_FDCWD, a[0], a[1], 0)),
-        6 => Some(newfstatat(AT_FDCWD, a[0], a[1], AT_SYMLINK_NOFOLLOW)),
         7 => Some(poll(a[0], a[1], a[2])),
-        21 => Some(to_glue(Syscall::Faccessat, [AT_FDCWD, a[0], a[1], 0, 0, 0])),
-        22 => Some(glue::pipe::sys_pipe2(a[0], 0)),
         23 => Some(select(a[0], a[1], a[2], a[3], a[4])),
         33 => Some(dup2(a[0], a[1])),
-        // creat(path, mode) = open(path, O_CREAT | O_WRONLY | O_TRUNC, mode), x86_64 bits.
-        85 => Some(openat(AT_FDCWD, a[0], 0o100 | 0o1 | 0o1000, a[1])),
         96 => Some(gettimeofday(a[0])),
         201 => Some(time(a[0])),
-        213 => Some(to_glue(Syscall::EpollCreate1, [0; 6])),
-        232 => Some(to_glue(Syscall::EpollPwait, [a[0], a[1], a[2], a[3], 0, 0])),
         _ => None,
     };
     if legacy.is_some() {
@@ -430,8 +420,10 @@ mod tests {
     #[test]
     fn legacy_numbers_are_not_in_the_asm_generic_table() {
         // dispatch()'s first match owns these; none may also have a Syscall row,
-        // or the order of the two matches would decide which arm serves it.
-        for nr in [2u64, 4, 6, 7, 21, 22, 23, 33, 85, 96, 201, 213, 232] {
+        // or the order of the two matches would decide which arm serves it, and
+        // none may be one the caller's `legacy::fold` already rewrote.
+        for nr in [7u64, 23, 33, 96, 201] {
+            assert!(akuma_syscalls_abi::legacy::fold(nr, [0; 6]).is_none(), "x86_64 {nr} is folded");
             assert!(Syscall::from_x86_64(nr).is_none(), "x86_64 {nr} has a Syscall row");
         }
     }

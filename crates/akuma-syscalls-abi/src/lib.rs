@@ -97,9 +97,10 @@
 //!    `unlink`(87), `symlink`(88), `readlink`(89), `gettimeofday`(96),
 //!    `getpgrp`(111), `arch_prctl`(158), `settimeofday`(164), `time`(201),
 //!    `epoll_create`(213), `epoll_wait`(232) —
-//!    have **no** asm-generic number and must not get invented ones. They stay
-//!    where they belong: `AT_FDCWD` shims in `amd64/src/usermode.rs`, each
-//!    forwarding to the `*at` call this table does name.
+//!    have **no** asm-generic number and must not get invented ones. Those that
+//!    are a modern call with fixed arguments are [`legacy::fold`], which both
+//!    x86_64 kernels apply before dispatching; the rest are arms in each
+//!    kernel's dispatcher.
 //! 3. **A row means the two numbers *differ*.** Every syscall Linux added
 //!    since roughly 5.1 (`rseq`, `pidfd_send_signal`(424), `pidfd_open`(434),
 //!    `clone3`, `openat2`, `epoll_pwait2`, …) was given the **same** number on
@@ -680,15 +681,24 @@ syscall_table! {
     Getrandom  => GETRANDOM  = 318, nr::GETRANDOM;
 }
 
-/// The x86-only **legacy path spellings** as `*at` calls: `rename`, `mkdir`,
-/// `rmdir`, `link`, `unlink`, `symlink`, `readlink`, `chmod`, `chown`, `lchown`.
+/// The x86-only **legacy spellings** that are a modern call with fixed arguments.
+///
+/// The path calls `rename`, `mkdir`, `rmdir`, `link`, `unlink`, `symlink`,
+/// `readlink`, `chmod`, `chown`, `lchown`, and the fd and process calls `open`,
+/// `creat`, `stat`, `lstat`, `access`, `pipe`, `getpgrp`, `epoll_create`,
+/// `epoll_wait`.
 ///
 /// Each exists on x86_64, has no asm-generic twin (so [`Syscall`] cannot name
-/// it - rule 2 above), and means exactly "the `*at` call with `AT_FDCWD` in the
-/// directory slots". The fold lived as ten inline `match` arms in
-/// `amd64/src/usermode.rs`; Taoxichuan needed the same ten and a copy would
-/// drift, so it is here once and both kernels call it. Pure: no state, no
-/// user memory.
+/// it - rule 2 above), and means exactly its modern call with `AT_FDCWD` in the
+/// directory slots or a zero in the flag slot. Both x86_64 kernels (amd64 and
+/// Taoxichuan) apply the fold first and then dispatch the modern call through
+/// the same arm as its own spelling, so a legacy number cannot reach a
+/// different body. Pure: no state, no user memory.
+///
+/// Not here, because they are not a fixed rewrite: `poll`, `select` (a
+/// millisecond or `timeval` timeout, and `select` writes the time left back),
+/// `dup2` (`dup3` refuses `old == new`), `fork`/`vfork`, the three clock calls,
+/// and `arch_prctl`, which has no modern call at all.
 ///
 /// Divergences the fold carries from the amd64 record
 /// (`docs/archive/AKUMA_AMD64_4B_FOLD_BATCH1.md`): `symlink` (88) is
@@ -707,15 +717,30 @@ pub mod legacy {
     /// `fchownat` flag that makes it `lchown`.
     pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 
+    /// `open(2)`'s `O_CREAT | O_WRONLY | O_TRUNC`, which `creat` means. These
+    /// three bits are the same on both ABIs (`open_flags` permutes four others).
+    pub const CREAT_FLAGS: u64 = 0o100 | 0o1 | 0o1000;
+
     /// Every x86_64 number [`fold`] answers for.
-    pub const NUMBERS: [u64; 10] = [82, 83, 84, 86, 87, 88, 89, 90, 92, 94];
+    pub const NUMBERS: [u64; 19] =
+        [2, 4, 6, 21, 22, 85, 111, 213, 232, 82, 83, 84, 86, 87, 88, 89, 90, 92, 94];
 
     /// The `*at` call and arguments a legacy path syscall means, or `None`
     /// when `nr` is not one of [`NUMBERS`].
     #[must_use]
     pub const fn fold(nr: u64, a: [u64; 6]) -> Option<(Syscall, [u64; 6])> {
-        let [a1, a2, a3, ..] = a;
+        let [a1, a2, a3, a4, ..] = a;
         Some(match nr {
+            2 => (Syscall::Openat, [AT_FDCWD, a1, a2, a3, 0, 0]),
+            4 => (Syscall::Newfstatat, [AT_FDCWD, a1, a2, 0, 0, 0]),
+            6 => (Syscall::Newfstatat, [AT_FDCWD, a1, a2, AT_SYMLINK_NOFOLLOW, 0, 0]),
+            21 => (Syscall::Faccessat, [AT_FDCWD, a1, a2, 0, 0, 0]),
+            22 => (Syscall::Pipe2, [a1, 0, 0, 0, 0, 0]),
+            85 => (Syscall::Openat, [AT_FDCWD, a1, CREAT_FLAGS, a2, 0, 0]),
+            111 => (Syscall::Getpgid, [0; 6]),
+            213 => (Syscall::EpollCreate1, [0; 6]),
+            // `epoll_wait` is `epoll_pwait` with no signal mask.
+            232 => (Syscall::EpollPwait, [a1, a2, a3, a4, 0, 0]),
             82 => (Syscall::Renameat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
             83 => (Syscall::Mkdirat, [AT_FDCWD, a1, a2, 0, 0, 0]),
             84 => (Syscall::Unlinkat, [AT_FDCWD, a1, AT_REMOVEDIR, 0, 0, 0]),
@@ -740,7 +765,18 @@ pub mod legacy {
                 assert!(Syscall::from_x86_64(n).is_none(), "{n} is also in the table");
                 assert!(fold(n, [0; 6]).is_some(), "{n} has no fold");
             }
-            assert!(fold(2, [0; 6]).is_none());
+            assert!(fold(257, [0; 6]).is_none());
+        }
+
+        #[test]
+        fn fd_spellings() {
+            assert_eq!(fold(2, [5, 6, 7, 0, 0, 0]), Some((Syscall::Openat, [AT_FDCWD, 5, 6, 7, 0, 0])));
+            assert_eq!(fold(85, [5, 7, 0, 0, 0, 0]).unwrap().1[..4], [AT_FDCWD, 5, CREAT_FLAGS, 7]);
+            assert_eq!(fold(4, [5, 6, 9, 0, 0, 0]).unwrap().1[3], 0);
+            assert_eq!(fold(6, [5, 6, 9, 0, 0, 0]).unwrap().1[3], AT_SYMLINK_NOFOLLOW);
+            assert_eq!(fold(22, [5, 9, 0, 0, 0, 0]).unwrap().1[..2], [5, 0]);
+            // The sigmask and its size are dropped, whatever the registers held.
+            assert_eq!(fold(232, [1, 2, 3, 4, 5, 6]).unwrap().1, [1, 2, 3, 4, 0, 0]);
         }
 
         #[test]

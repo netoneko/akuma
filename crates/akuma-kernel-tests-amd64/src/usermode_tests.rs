@@ -1459,11 +1459,11 @@ pub fn fork_test(t: &mut Suite) {
 /// arguments returns 0 and creates nothing, so only reading the link back tells
 /// the two apart — which is exactly why it went unnoticed.
 pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
-    // Every number the legacy `match nr` above claims to own. Each must be
+    // Every number the legacy fold and `match nr` claim to own. Each must be
     // x86-only; a number that also decodes through `Syscall` is handled twice.
-    const X86_ONLY: [u64; 25] = [
-        2, 4, 6, 7, 21, 22, 23, 33, 34, 37, 57, 58, 82, 83, 84, 87, 88, 89, 96, 111, 158, 164,
-        201, 213, 232,
+    const X86_ONLY: [u64; 26] = [
+        2, 4, 6, 7, 21, 22, 23, 33, 34, 37, 57, 58, 82, 83, 84, 85, 87, 88, 89, 96, 111, 158,
+        164, 201, 213, 232,
     ];
     let mut overlap = 0u64;
     for n in X86_ONLY {
@@ -1887,6 +1887,22 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
     let n = syscall_dispatch(89, link.as_ptr() as u64, buf.as_mut_ptr() as u64, buf.len() as u64, 0, 0, 0);
     t.check_eq("dispatch: the link reads back its target length", n, 10);
     t.check("dispatch: and the target itself", &buf[..10] == b"/probe.txt");
+    // `stat` (4) is `akuma_syscalls_abi::legacy::fold`'s `newfstatat(AT_FDCWD,
+    // ..)` and reaches the same family arm as 262: the two answers are one
+    // body's, byte for byte.
+    let (mut legacy_st, mut at_st) = ([0u8; 144], [0u8; 144]);
+    let legacy_rc = syscall_dispatch(4, target.as_ptr() as u64, legacy_st.as_mut_ptr() as u64, 0, 0, 0, 0);
+    let at_rc = syscall_dispatch(
+        262,
+        (-100i64) as u64,
+        target.as_ptr() as u64,
+        at_st.as_mut_ptr() as u64,
+        0,
+        0,
+        0,
+    );
+    t.check_eq("dispatch: stat (4) answers as newfstatat (262)", legacy_rc, at_rc);
+    t.check("dispatch: and fills the same struct stat", legacy_st == at_st);
     // Cleanup through the real arm: x86_64 87 is unlink(2), unlinkat's shim.
     let unlink_rc = syscall_dispatch(87, link.as_ptr() as u64, 0, 0, 0, 0, 0);
     t.check_eq("dispatch: unlink removes the link", unlink_rc, 0);

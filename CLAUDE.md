@@ -205,7 +205,9 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   *host* under `cargo test`, so it would silently retarget every host test), and
   **never invent an asm-generic number for an x86-only legacy spelling** —
   `open`, `stat`, `poll`, `select`, `fork`, `mkdir`, `symlink`, `arch_prctl`,
-  `time` and 12 more have none, and stay as `AT_FDCWD` shims in `amd64/`. The
+  `time` and 12 more have none. The fixed rewrites (`open` -> `openat(AT_FDCWD, ..)` and
+  18 more) are `akuma_syscalls_abi::legacy::fold`, applied by both x86_64 kernels before
+  dispatch so a legacy spelling reaches its modern spelling's arm; the rest stay arms in `amd64/`. The
   first pass over that list found x86_64 88 (`symlink`) dispatching to
   `sys_utimensat`, which returns 0 — so `ln -s` reported success and created
   nothing for months.

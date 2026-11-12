@@ -2342,6 +2342,33 @@ Gates:
   check comes first.
 - `pread` on a `BlockDev` is `EBADF`.
 
+**Step 4 (2026-11-12): the fd legacy spellings are folds, and fold into the shared arm.** On amd64
+`open` (2), `stat` (4), `lstat` (6) and `pipe` (22) called `crate::fd` directly, a second entry into
+the fd layer beside the `Openat`/`Newfstatat`/`Pipe2` arm, so moving that arm to glue would have
+needed the legacy arm moved too, in step. Taoxichuan's glue-amd64 had a third set of the same rewrites.
+`akuma_syscalls_abi::legacy::fold` now carries every legacy spelling that is a modern call with
+fixed arguments: the ten path calls plus `open`, `creat` (85), `stat`, `lstat`, `access`, `pipe`,
+`getpgrp`, `epoll_create` and `epoll_wait`. amd64 sends the result through the same family `match`
+as a decoded call (`families`), instead of straight to glue, and Taoxichuan already rewrote its
+frame and dispatched the modern number. So each legacy spelling reaches exactly its modern
+spelling's arm on both kernels, and the fd step that moves an arm moves both spellings.
+
+- **Gained:** `creat` on amd64, which had no arm (`ENOSYS`); Taoxichuan had it.
+- **Left as code:** `poll`, `select` (a millisecond or `timeval` timeout, and `select` writes the
+  time left back), `dup2` (`dup3` refuses `old == new`), `fork`/`vfork`, `gettimeofday`,
+  `settimeofday`, `time`, `alarm`, `pause` and `arch_prctl`. `poll`/`select` fold once glue's wait
+  core takes a kernel-side timeout, as part of moving the fd layer.
+- Boot test: `stat` (4) and `newfstatat` (262) on one file, through the real dispatcher, answer
+  the same and fill the same bytes.
+
+Gates: host tests (`akuma-syscalls-abi`, glue-amd64); clippy for amd64, Taoxichuan and the amd64
+tests crate; amd64 TCG boot suite 823/833/833 at SMP 1/2/4, 0 failed (the two new checks are the
+difference); on an amd64 guest (SMP=2) a static musl probe issuing the raw legacy numbers (`creat`
+writes and truncates, `stat` matches `newfstatat`, `lstat` sees a link, `open`, `access`, `pipe`,
+`getpgrp`, `epoll_create`/`epoll_wait`) passes all ten checks, and a shell smoke (`>`, `|`, `stat`,
+`mkdir`, `rm -r`) is clean. Taoxichuan is checked by clippy only: its arms for these numbers were
+the same rewrites, now applied by the fold it already ran; `getpgrp` is new there.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral
@@ -2589,8 +2616,8 @@ it is in the image, so **feature-gating removes lines and linker-dropped dead co
    rather than line count.
 6. **Dispatch.** Glue's `match syscall_num` is on asm-generic numbers, so an amd64 kernel goes x86_64 number ->
    enum -> asm-generic number -> match. Matching on the arch-neutral enum drops the round trip and makes the
-   match exhaustive at compile time. `akuma_syscalls_abi::legacy::fold` already carries the x86 path spellings
-   for both kernels, so that part is done. The cut is a few hundred lines (amd64 `usermode/dispatch.rs` is 1,434,
+   match exhaustive at compile time. `akuma_syscalls_abi::legacy::fold` already carries every x86 spelling that
+   is a fixed rewrite for both kernels (slice 4 step 4), so that part is done. The cut is a few hundred lines (amd64 `usermode/dispatch.rs` is 1,434,
    an unverified 30-40% of it fold and adapter code); the larger cut is Taoxichuan's duplicated `mm`/`proc`/
    `lazy`/`cow` against glue's `mem`/`proc`, which `mm step 5a-5e` is already converging.
 

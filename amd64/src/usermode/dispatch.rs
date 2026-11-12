@@ -37,13 +37,6 @@
 use super::*;
 use crate::fd::errno;
 
-/// `AT_FDCWD` — "relative to the current directory". Every process here
-/// starts at `/` and only `chdir` moves it, so for most of the process's
-/// life this is the root; the resolution against `Process::cwd` happens in
-/// `akuma_syscalls_glue::fs::resolve_path_at`, not here. What every legacy,
-/// non-`at` path syscall below passes to its `*at` implementation.
-const AT_FDCWD: u64 = (-100i64) as u64;
-
 /// How long a `resolve_host` may take before it gives up. Generous: a
 /// cold cache on this target means a real UDP round trip to whatever
 /// `/etc/resolv.conf`'s first reachable server is, and the alternative to
@@ -83,39 +76,21 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
     // `akuma_syscalls_abi`'s table first; if the call has an asm-generic number,
     // it belongs in the `match call` below, where the AArch64 kernel's
     // implementation can eventually serve it.
-    // The ten legacy path spellings (82/83/84/86/87/88/89/90/92/94) are
-    // `AT_FDCWD` folds owned by `akuma_syscalls_abi::legacy` - one table for
-    // this kernel and Taoxichuan; the symlink/utimensat history is its doc.
+    // The fixed rewrites (`open`, `creat`, `stat`, `lstat`, `access`, `pipe`,
+    // `getpgrp`, `epoll_create`, `epoll_wait` and the ten path calls) are
+    // `akuma_syscalls_abi::legacy::fold`, one table for this kernel and
+    // Taoxichuan. The modern call then goes through the **same family arm**
+    // as its own spelling, so `open` and `openat` cannot reach different
+    // bodies; the symlink/utimensat history is the fold's doc. What is left
+    // in the `match` below is not a fixed rewrite.
     if let Some((call, args)) = akuma_syscalls_abi::legacy::fold(nr, [a1, a2, a3, a4, a5, a6]) {
-        return to_glue(call, args);
+        return families(nr, call, args);
     }
     match nr {
         // x86_64 158: the TLS-base primitive. No aarch64 number, and no
         // equivalent either — `arch_prctl(ARCH_SET_FS)` is what `set_tpidr_el0`
         // is on the other side, and that one is Akuma-private.
         158 => return sys_arch_prctl(a1, a2),
-        // Path-based `struct stat`. `stat` (4) and `lstat` (6) are x86-only —
-        // `asm-generic` dropped them — and both narrow to `newfstatat`, which
-        // is in the neutral table. `stat` follows a final symlink, `lstat` does
-        // not (`AT_SYMLINK_NOFOLLOW` == 0x100); on this target that changes
-        // nothing (see `fd::sys_newfstatat`). `AT_FDCWD` is -100. busybox `sh`
-        // stats every PATH entry before it will run an applet — without this it
-        // saw `ENOSYS` and reported "Function not implemented" for a working
-        // builtin.
-        4 => return crate::fd::sys_newfstatat(AT_FDCWD, a1, a2, 0),
-        6 => return crate::fd::sys_newfstatat(AT_FDCWD, a1, a2, 0x100),
-        // `open(path, flags, mode)` — x86_64 2. x86_64 musl issues this directly
-        // (it only falls back to `openat` on architectures without `open`, like
-        // aarch64), so `busybox cat` hit `ENOSYS` here until now. `openat`
-        // resolves the relative path against `Process::cwd` (the root until a
-        // `chdir` moves it), which is what `AT_FDCWD` means.
-        2 => return crate::fd::sys_openat(AT_FDCWD, a1, a2, a3),
-        // `access(path, mode)` — existence only. This target has one user (root)
-        // and no per-file exec tracking worth trusting, so "the path resolves"
-        // is the honest answer; a real permission check would be a guess. The
-        // `faccessat` spelling is in the neutral table and answers identically.
-        // `access(path, mode)` is `faccessat(AT_FDCWD, path, mode)` — glue's arm.
-        21 => return to_glue(Syscall::Faccessat, [AT_FDCWD, a1, a2, 0, 0, 0]),
         // `poll(fds, nfds, timeout_ms)` — x86_64 7, narrowing to the same core
         // `ppoll` uses. An interactive `busybox sh` polls its stdin on every
         // keystroke; `ENOSYS` here was a forever-loop of "sh: poll: Function
@@ -126,13 +101,11 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         // writability through this syscall; `ENOSYS` here wedged its TLS fetch
         // mid-handshake (see `fd::sys_select`).
         23 => return crate::fd::sys_select(a1, a2, a3, a4, a5),
-        // `pipe` (22) and `dup2` (33) — the legacy halves of the four calls that
-        // make a shell a shell (`pipe2`/`dup3` are the neutral pair below).
-        // Every one of them was `ENOSYS` until 2026-09-06, which is why
+        // `dup2` (33) — with `pipe` (22, in the fold) the legacy halves of the
+        // four calls that make a shell a shell (`pipe2`/`dup3` are the neutral
+        // pair). Every one of them was `ENOSYS` until 2026-09-06, which is why
         // `cmd | cmd` reported *can't create pipe* and `echo x > file` left a
-        // zero-length file: a shell builds both out of `pipe` plus `dup2`, and
-        // neither existed.
-        22 => return crate::fd::sys_pipe2(a1, 0),
+        // zero-length file. Not a fold: `dup3` refuses `old == new`.
         33 => return crate::fd::sys_dup2(a1, a2),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
@@ -140,10 +113,6 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         // with `CLONE_VM` clear is the only spelling there, and it is in the
         // neutral table below.
         57 | 58 => return sys_fork(),
-        // `getpgrp()` — x86_64 111, x86-only; asm-generic callers use
-        // `getpgid(0)`, and so does this: 1 outside a pty session, the real
-        // group inside one (see the `Getpgid` arm).
-        111 => return akuma_syscalls_glue::pty::sys_getpgid_gated(0),
         // The x86-only halves of the clock. `clock_settime` (227) and
         // `adjtimex` (159) are in the neutral table; these two are not, and
         // `busybox ntpd -q` reaches for whichever musl offers.
@@ -209,20 +178,6 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
             }
             return secs as u64;
         }
-        // `epoll_create(size)` — x86_64 213, x86-only (`epoll_create1` is the
-        // asm-generic spelling and the one in the neutral table). `size` has
-        // been advisory since Linux 2.6.8 and every kernel including this one
-        // ignores it; musl's own `epoll_create` narrows to `epoll_create1(0)`
-        // the same way, so this arm exists for a caller that issues 213 by
-        // hand rather than for anything musl emits.
-        213 => return to_glue(Syscall::EpollCreate1, [0, 0, 0, 0, 0, 0]),
-        // `epoll_wait(epfd, events, maxevents, timeout)` — x86_64 232,
-        // x86-only (asm-generic only ever had `epoll_pwait`). Narrows to it
-        // with a null sigmask/sigsetsize, which is exactly what
-        // `epoll_wait(2)` already means — glue's `sys_epoll_pwait` never reads
-        // those two arguments regardless, so there is no signal-mask feature
-        // silently lost by treating the two spellings alike.
-        232 => return to_glue(Syscall::EpollPwait, [a1, a2, a3, a4, 0, 0]),
         _ => {}
     }
 
@@ -267,7 +222,12 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         return errno::ENOSYS;
     };
 
-    let a = [a1, a2, a3, a4, a5, a6];
+    families(nr, call, [a1, a2, a3, a4, a5, a6])
+}
+
+/// Offer `call` to each family in turn. `nr` is the number ring 3 used, for the
+/// "no arm" line only: a legacy spelling arrives here already folded.
+fn families(nr: u64, call: Syscall, a: [u64; 6]) -> u64 {
     if let Some(r) = fs(call, a) {
         return r;
     }
