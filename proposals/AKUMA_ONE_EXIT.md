@@ -6,7 +6,49 @@ one execve, one spawn, one waitpid and one mm ([`AKUMA_MM_CONVERGENCE.md`](AKUMA
 
 ## Status
 
-Proposal. No step has started.
+Step 1 done (2026-11-12): `akuma_syscalls_glue::exit::finish_process`, called by glue's
+`sys_exit_group` and amd64's `run_process`. Steps 2-4 not started.
+
+### What step 1 found
+
+- **The reap reads the channel, confirmed.** glue's `wait4`/`waitpid`/`waitid` reap on
+  `ProcessChannel::has_exited` only (`reap_exited` behind `get_child_channel`/`find_exited_child`).
+  `Process::exited` is read by `/proc`, `ps`, the load counters, `cleanup_process_fds`'s sharer
+  count and the AArch64 EL0 syscall return. So the order of the `exited` store does not decide
+  when a reap may run. The publish does, and it is last in `finish_process`.
+- **The sequence is** close fds -> `exited`/`exit_code`/`Zombie` -> reparent every group
+  member's children to init -> `publish_child_exit` (and the leader's channel when a non-leader
+  exits the group) -> `vfork_complete`. Two changes against what each kernel did:
+  - AArch64 reparented *after* the publish; it now reparents before, as Linux's `exit_notify`
+    does, so a woken parent never races the reparent.
+  - AArch64 collected the group's pids *after* `kill_thread_group`; it now collects before, the
+    way amd64 always did before `drain` (a retired row is invisible to the table walk).
+- **Kept per kernel, on purpose.** `release_shared_write_mappings` stays at each call site:
+  AArch64 releases before `kill_thread_group` (which tears the space down), amd64 after `drain`
+  (so no sibling faults a page back in). Sibling teardown and how the thread leaves the CPU stay
+  per kernel. amd64 keeps `fbdev::release`.
+- **Pinned difference.** AArch64 still also marks the caller exited before `kill_thread_group`;
+  the siblings' `cleanup_process_fds` has always counted on that. `finish_process` stores the
+  same values again.
+- **amd64 now marks every process it ends**, including the boot suite's and init (slots below
+  `SPAWN_SLOT_BASE`), which `spawn_record_exit` skipped. Their publish is a no-op (no child
+  channel). The stale-row diagnostic went with `spawn_record_exit`: the exit now names the
+  exiting process, not whatever pid a row held, so that bug class cannot reach the publish.
+- **Open on amd64, found by step 1's gate and older than it:** a child forked by a worker thread
+  that exits before its process keeps the dead thread's pid as its parent
+  (`userspace/forktest/c_stress/orphanthr.c`; AArch64 and Linux pass). `finish_process`
+  reparents for every member *still in the table*, and an exited worker's row is already gone.
+  The fix belongs in thread exit (reparent to a live group member, as Linux does), which is
+  step 3's territory. `lifeprobe`'s "orphan of a SIGKILLed parent was reaped" fails on amd64
+  for the same parentage reason, before and after step 1; it passes on AArch64.
+- **Gates (step 1):** boot suites amd64 831/841/841, AArch64 312/320/318 (SMP 1/2/4), both
+  equal to the previous commit. At SMP=2 on both kernels: `segvgroup`, `thrprobe`,
+  `cloneflags`, `futextest`, `groupexit_thread` 0/1/2, `grandfork` and `killtree` pass; ssh
+  exit status 10/10 sessions, `exit 1..5`, 143 and 7. amd64's results equal the previous
+  commit's probe for probe. Self-host builds not yet run.
+- **Not folded:** `return_to_kernel` (fault and OOM kills on AArch64) lives in `akuma-exec`,
+  below glue, and keeps its own `cleanup_process_fds` + `publish_child_exit`. Nor glue's
+  `sys_exit` leader path, which is a thread exit, not a process one.
 
 ## Goal
 

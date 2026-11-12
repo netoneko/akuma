@@ -306,7 +306,7 @@ pub struct ExecRuntime {
     ///   path has no `Process` to read a root from, and the first switch into
     ///   an unbound child would run ring-3 code against the kernel's tables.
     /// * its `SPAWN` row and the `UserCtx::proc_slot` naming it. That index is
-    ///   what `run_process` uses for `thread::drain` and `spawn_record_exit`,
+    ///   what `run_process` uses for `thread::drain`,
     ///   i.e. how the target tears a process down at all.
     ///
     /// **Fallible, and the row table is why**: `SPAWN` is a fixed array and a

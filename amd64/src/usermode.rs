@@ -2309,34 +2309,18 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // Reissued at `sched::finish` below, as it used to be, the tid named the
     // zombie and its successor at once, and a `kill` of the zombie could reach
     // the successor (2026-10-16, ryzen). First thing out of ring 3, while the
-    // slot is still running and before `spawn_record_exit` lets the parent reap
+    // slot is still running and before `finish_process` lets the parent reap
     // — a hold set after a reap would never be released.
     if let Some(p) = current_process() {
         akuma_exec::process::hold_exited_thread_slot(p.pid, crate::sched::current_task());
     }
-    // Real Linux closes every fd a process still holds at exit. Since step 4b
-    // the registered table is the only descriptor authority and every entry in
-    // it owns a real pipe/socket reference, so the sweep is the table's own
-    // `close_all()` — the same walk its `Drop` would run later — captured
-    // **before** `thread::drain`, which may retire the identity the lookup
-    // below resolves through. Done before `spawn_record_exit` so a parent's
-    // `waitpid` never observes the child as reaped while its fds are still
-    // charged against the shared table.
-    let exit_fds = current_process().map(|p| p.fds.clone());
     // Every pid in this thread group, captured **before** `thread::drain` can
     // retire the threads' rows. Each thread has a pid of its own here, and a
-    // child records the *spawning thread's* pid as its parent — so a
-    // multi-threaded process's children are mostly its workers' children
-    // (kot's tokio workers running `sh -c`), and `spawn_record_exit`'s
-    // `reparent_children_to(dying, 1)` covers only the leader's. Without this
-    // every such child outlived its process as an orphan nobody could `wait`
-    // for: a zombie with `PPid` of a dead thread for the life of the boot
-    // (2026-09-24, `docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6
-    // item 6). Glue's `sys_exit_group` walks the group the same way.
-    let group_members: Vec<u32> = current_process().map_or_else(Vec::new, |p| {
-        let tgid = p.tgid;
-        akuma_exec::process::collect_pids(|q| q.tgid == tgid)
-    });
+    // child records the *spawning thread's* pid as its parent, so a
+    // multi-threaded process's children are mostly its workers' children (kot's
+    // tokio workers running `sh -c`). `finish_process` reparents all of them
+    // (2026-09-24, `docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 6).
+    let group_members = current_process().map_or_else(Vec::new, akuma_syscalls_glue::exit::group_members);
     // Every thread of this process, gone, before anything downstream can reap.
     // `sys_waitpid` retires the `Process` — and with it the page tables, which
     // the reclaim then frees — once this task is `Finished`, so a sibling still
@@ -2347,22 +2331,19 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // Writable `MAP_SHARED` file mappings get `munmap`'s treatment before the
     // address space is dropped: written back, and released from the shared
     // writable page table. After the drain, so no sibling can fault a page
-    // back in behind it.
+    // back in behind it. (AArch64 releases before its `kill_thread_group`,
+    // which tears the space down; the release is the caller's for that reason.)
     if let Some(p) = current_mm_process() {
         akuma_syscalls_glue::mem::release_shared_write_mappings(p);
     }
-    // A process that owned `/dev/fb0` hands the screen back as it exits.
     if let Some(p) = current_process() {
+        // A process that owned `/dev/fb0` hands the screen back as it exits.
         crate::fbdev::release(p.tgid);
-    }
-    if let Some(fds) = exit_fds {
-        fds.close_all();
-    }
-    if idx >= SPAWN_SLOT_BASE {
-        spawn_record_exit(idx, status as i32);
-    }
-    for member in group_members {
-        let _ = akuma_exec::process::reparent_children_to(member, 1);
+        // The rest of the exit is both kernels' one sequence: close the fds,
+        // mark the process a zombie, reparent the group's children to init,
+        // publish the exit to the parent, complete a vfork. The publish is last,
+        // so a parent's `wait4` never reaps a process still in `close_all`.
+        akuma_syscalls_glue::exit::finish_process(p, &group_members, status as i32);
     }
     // Drop this task's entry in the **per-thread** channel registry, the way
     // the AArch64 exit epilogue does (`process/mod.rs`'s `remove_channel(tid)`
@@ -2372,14 +2353,13 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // resolve through, which nothing should reach for a task that has left ring
     // 3 for good.
     //
-    // **After `spawn_record_exit`, and the order is load-bearing.** That call
+    // **After `finish_process`, and the order is load-bearing.** That call
     // publishes the exit through `publish_child_exit`, which raises SIGCHLD
     // only when *it* is the call that marked the channel exited. Setting the
     // exit code here first — which is what the AArch64 site does, on the same
     // `Arc`, as a deliberate redundant re-set — would make the publish a no-op
-    // and the parent would never get the signal. Unconditional, unlike the
-    // publish: a boot self-test process is registered (and therefore has a
-    // channel) but owns no `SPAWN` row.
+    // and the parent would never get the signal. A boot self-test process has a
+    // task channel but no child channel, so its publish is a no-op.
     let ch = akuma_exec::process::channel::remove_channel(crate::sched::current_task());
     if let Some(ch) = ch {
         ch.set_exited(status as i32);
@@ -2450,7 +2430,7 @@ extern "C" fn proc_entry() -> ! {
         serial::puts("  [proc] entry with no slot\n");
         crate::sched::finish();
     }
-    // The teardown below the entry reports an exit — `spawn_record_exit`
+    // The teardown below the entry reports an exit — `finish_process`
     // publishes a status a parent's `wait4` will believe — so a task that
     // never ran a program must not reach it. Unreachable by construction since
     // 5b slice 4 (every process task is registered before it is published) and
@@ -3489,7 +3469,7 @@ fn sys_spawn_clone(child_stack: u64) -> u64 {
 ///   tables.
 /// * **the `SPAWN` row** — this target's per-process exit record.
 /// * **`UserCtx::proc_slot`** — the index naming that row, which
-///   [`run_process`] reads back for `thread::drain` and `spawn_record_exit`.
+///   [`run_process`] reads back for `thread::drain`.
 ///   [`proc_entry`] reads it too, and refuses to enter ring 3 without it.
 ///
 /// The row is swept for reaped predecessors first, for the reason `sys_fork`
@@ -3515,7 +3495,7 @@ pub fn bind_child_task(
 
     // A `clone` child is not a process and must not get a `SPAWN` row: that row
     // is the target's per-*process* exit record, and one written for a thread
-    // would make `spawn_record_exit` publish an exit status — a `wait4` in the
+    // would make the exit path publish an exit status — a `wait4` in the
     // parent would reap a process that is still running. What a thread needs
     // instead is a `THREADS` row and a `UserCtx::thread_slot`; see
     // `crate::thread::bind_clone_child` for the four questions that answers.
@@ -3730,92 +3710,7 @@ pub fn sys_spawn(
 // It is `ProcessChannel`'s poller list now, which does carry one: a waiter
 // registers on the channel of the child (or children) it is actually waiting
 // for, and `publish_child_exit` wakes exactly those. The wake path did not move
-// so much as become answerable — see [`spawn_record_exit`] and the `Wait4` arm.
-
-/// Called from `run_process` when a spawned child leaves ring 3.
-pub fn spawn_record_exit(proc_slot: usize, status: i32) {
-    // SAFETY: raw-pointer access; single core.
-    //
-    // The row is read only for the pid that names the process. It used to
-    // also carry the child's stdout write end, closed here by hand so the
-    // parent's reader saw EOF — **C2 slice 6 deleted that**, because the
-    // child's stdio is bound descriptors now: `close_all` (which runs
-    // earlier in `run_process`'s exit path) already released the child's
-    // ends, and the refcounts did the EOF. A manual `close_write` here would
-    // be a *second* decrement of a ref the child no longer holds — it would
-    // close a live parent-side end.
-    let dying = SPAWN.get(proc_slot - SPAWN_SLOT_BASE).map_or(0, |s| s.pid);
-    // **Is the row's pid the process that is actually exiting?** Everything
-    // below marks `dying` exited and raises SIGCHLD on its parent. A row left
-    // behind by an earlier occupant of this slot would publish the death of a
-    // process that is still running — its parent's `wait4` reaps it, and an
-    // interactive shell then returns to its prompt and starts reading the
-    // terminal out from under its still-running foreground job. That is the
-    // shape of Claude Code's `/login` input loss (2026-10-17: ash back in its
-    // prompt loop while `claude` ran on); this line says whether it is this.
-    if dying != 0 {
-        let own = akuma_exec::process::read_current_pid().unwrap_or(0);
-        let tgid = current_pid();
-        if dying != own && dying != tgid {
-            akuma_primitives::safe_print!(160,
-                "[exit] slot {} row names pid {} but the exiting task is pid {} (tgid {}): stale SPAWN row\n",
-                proc_slot, dying, own, tgid);
-        }
-    }
-
-    // Reparent this process's children onto init, the way Linux does at exit.
-    //
-    // This is the other half of `sys_waitpid`'s `ppid` filter and it landed
-    // with it: once a wait only considers *your own* children, a child whose
-    // parent died has nobody left who may reap it, and its row and its pipes
-    // sit in the table until the slots run out. Before the filter the global
-    // scan let anyone reap anything, so orphans were collected by accident.
-    //
-    // Init is pid 1 and is not itself a table row (`current_pid()` answers 1
-    // for anything below `SPAWN_SLOT_BASE`), so a reparented child is reapable
-    // by whatever runs as init — which on this target is the console shell or
-    // `sshd`, both of which do reap.
-    if dying != 0 {
-        // 5b slice 2: the exit status becomes visible on the **registered**
-        // process, which is what `sys_waitpid` now reads. Set before the wake
-        // for the same reason the row's was: a parent woken by `wait4_wake_all`
-        // re-runs `sys_waitpid` immediately and must find this already true.
-        akuma_exec::process::with_process(dying, |p| {
-            p.exit_code.store(status, core::sync::atomic::Ordering::Release);
-            p.exited.store(true, core::sync::atomic::Ordering::Release);
-            // And the *reported* state. Nothing on this target read
-            // `Process::state` to decide anything, so it was never set here,
-            // and `/proc/<pid>/status` said `R (running)` for every exited,
-            // unreaped process: a zombie whose parent never waited looked
-            // exactly like "a shell hung in its own exit" (2026-10-05,
-            // `userspace/forktest/c_stress/lifeprobe.c`). Only `/proc`, `ps`
-            // and the load counters read it.
-            p.state.store(akuma_exec::process::ProcessState::Zombie(status));
-        });
-        // Reparent this process's children onto init, the way Linux does at
-        // exit — in BOTH views of parenthood. This used to rewrite only the
-        // table row's `parent_pid`, while `wait4(-1)` / `has_children` /
-        // `is_child_of_group` read the child-channel registry, which kept the
-        // dead parent: init's `wait4(-1, WNOHANG)` answered `ECHILD`, and every
-        // orphan on this target was a zombie until reboot (2026-09-23,
-        // `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`).
-        let _ = akuma_exec::process::reparent_children_to(dying, 1);
-    }
-    // Outside the `unsafe` block and after the status is recorded, both
-    // deliberately: a woken parent re-runs its wait immediately, and it must
-    // find `exited` already set or it parks again for nothing.
-    //
-    // `publish_child_exit` is the shared publisher, and it does in one call
-    // what this function's own wake could not do at all: mark the child's
-    // channel exited (waking the pollers registered on *that* child, not every
-    // parked task) and **then** raise SIGCHLD on the parent, in that order,
-    // because a shell's SIGCHLD handler re-polls with `WNOHANG` immediately and
-    // must find the zombie. It publishes at most once per death, so a child
-    // that exits and is then torn down does not raise two.
-    if dying != 0 {
-        akuma_exec::process::publish_child_exit(dying, status);
-    }
-}
+// so much as become answerable — see `akuma_syscalls_glue::exit::finish_process`.
 
 // **C2 slice 6 deleted `spawn_stdio`, `current_stdin_pipe` and
 // `current_stdout_pipe`.** They answered "which pipe serves this task's fd

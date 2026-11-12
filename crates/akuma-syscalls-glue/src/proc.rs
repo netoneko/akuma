@@ -523,6 +523,11 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         let tgid = proc.tgid;
         let proc_tid = proc.thread_id;
         let l0_phys = proc.address_space.l0_phys();
+        // Marked exited here as well as in `finish_process` (the same values, so
+        // the second store changes nothing): from this point the siblings that
+        // `kill_thread_group` ends count this table as having no live leader in
+        // `cleanup_process_fds`, as they always have. A pinned difference from
+        // amd64, which marks only in `finish_process` (`proposals/AKUMA_ONE_EXIT.md`).
         akuma_exec::process::with_current_process(|p| {
             p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
             p.exit_code.store(code, core::sync::atomic::Ordering::Relaxed);
@@ -536,6 +541,10 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if let Some(p) = akuma_exec::process::lookup_process_shared(tgid) {
             super::mem::release_shared_write_mappings(p);
         }
+        // Every pid of the group, before `kill_thread_group` retires the siblings'
+        // rows: a child records the *forking thread's* pid as its parent, so each
+        // member is a possible parent `finish_process` must reparent for.
+        let members = crate::exit::group_members(proc);
         // Reap sibling threads BEFORE notifying the parent.
         //
         // ORDERING IS LOAD-BEARING: notify_child_channel_exited() wakes the parent's
@@ -548,49 +557,22 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         // (docs §7g). Killing the thread group first guarantees every sibling is
         // terminated + woken regardless of when the parent runs.
         akuma_exec::process::kill_thread_group(pid, l0_phys, code);
-        // Close all fds immediately so pipe write-ends are decremented and
-        // epoll pollers (e.g. Go's parent waiting for compile stdout EOF) are
-        // woken now. close_all() is idempotent — cleanup_process_fds() later
-        // will find an empty table and skip any double-close.
+        // The rest is both kernels' one sequence (`exit::finish_process`): close
+        // the fds, mark the zombie, reparent the group's children to init, publish
+        // the exit (the leader's channel too when `tgid != pid`), complete a vfork.
         //
         // ORDERING IS LOAD-BEARING, for the same reason as kill_thread_group above:
-        // this MUST happen before notify_child_channel_exited(). That notify wakes the
-        // parent's wait4, which can immediately reap this process on the peer core;
-        // `unregister_process` then calls `mark_thread_terminated` on *this* thread, so
-        // a reap that lands mid-syscall stops us dead before we release our own fds.
-        //
-        // That race was survivable only by accident until Phase 7e: the reap used to
-        // free the `Process` synchronously, and `SharedFdTable`'s Drop closes the fd
-        // table, so the reaper released them on our behalf. Phase 7e defers that drop
-        // to `reclaim_retired_processes`, which during the boot self-test suite never
-        // runs at all (it is wired into `netpoll_maint`) — so losing the race meant the
-        // fds were held indefinitely. Concretely, in `yes | head -n 1`: `head`'s pipe
-        // read end was never released, `yes` never saw read_count reach 0, never got
-        // EPIPE/SIGPIPE, and slept forever on a full pipe
-        // (`test_sigpipe_terminate_no_deadlock`). Closing first makes releasing our own
-        // fds independent of who wins the reap race.
-        proc.fds.close_all();
-        notify_child_channel_exited(pid, code);
-        // If a goroutine thread (tgid != pid) is calling exit_group, the parent's
-        // wait4 waits on CHILD_CHANNELS[tgid], not CHILD_CHANNELS[pid].  Notify
-        // the tgid leader's channel too so the parent doesn't hang.
-        if tgid != pid {
-            notify_child_channel_exited(tgid, code);
-        }
-        // Children outliving the group go to init — in BOTH views of parenthood
-        // (`reparent_children_to`: the child-channel registry that `wait4(-1)`
-        // reads, and the table row). `fork` records the *forking thread's* pid
-        // as the parent, so every member of the group is a possible parent.
-        // Until 2026-09-23 nothing on this route reparented at all: an orphan
-        // kept its dead parent, init's `wait4(-1)` answered `ECHILD`, and it
-        // was a zombie for the life of the boot. It lives here and not in
-        // `return_to_kernel` because that function's own teardown never runs
-        // for this route — `current_process_shared()` is already gone by then.
-        // `docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`.
-        for member in akuma_exec::process::collect_pids(|p| p.tgid == tgid) {
-            let _ = akuma_exec::process::reparent_children_to(member, 1);
-        }
-        vfork_complete(pid);
+        // the fds close before the publish. The publish wakes the parent's wait4,
+        // which can reap this process on the peer core at once; `unregister_process`
+        // then calls `mark_thread_terminated` on *this* thread, so a reap that lands
+        // mid-syscall would stop us before we released our own fds — in
+        // `yes | head -n 1`, `head`'s pipe read end held forever and `yes` never got
+        // EPIPE (`test_sigpipe_terminate_no_deadlock`). Orphans are reparented in
+        // both views of parenthood; until 2026-09-23 nothing on this route did,
+        // and an orphan stayed a zombie for the life of the boot
+        // (`docs/archive/AKUMA_AMD64_TRAP_ENTRY_DIRECTION_FLAG.md`). This route never
+        // reaches `return_to_kernel`'s teardown, so it has to happen here.
+        crate::exit::finish_process(proc, &members, code);
 
         // Terminate the calling thread — exit_group() must never return to EL0.
         // Only do this if the calling thread IS the process's own thread;
