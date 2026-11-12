@@ -209,20 +209,23 @@ fn flush_shared_write(proc: &akuma_exec::process::Process, w: &WriteBack, lo: us
     }
     let by_path = akuma_vfs_glue::resolve_file_id(&rec.path) == Some((rec.mount_id, rec.inode));
     let hi = hi.min(w.end_va).min(w.start_va.saturating_add(size - rec.offset));
-    let mut page = alloc::vec![0u8; 4096];
     let mut failed = 0usize;
     let mut va = lo.max(w.start_va) & !0xFFF;
     while va < hi {
         if let Some(pa) = proc.with_address_space(|a| a.translate(va)) {
             let off = rec.offset + (va - w.start_va);
-            let bytes = &mut page[..(size - off).min(4096)];
-            let ok = akuma_exec::mmu::copy_from_phys(pa & !0xFFF, bytes)
-                && if by_path {
+            // Written from the frame itself, never a copy: the write's
+            // `shm::wrote` then sees its source is the frame and skips copying
+            // it back. A snapshot copied back would undo every store a peer
+            // made since it was taken (`shmwrite` rung 10 lost increments).
+            let ok = akuma_exec::mmu::with_phys_bytes_mut(pa & !0xFFF, 0, (size - off).min(4096), |bytes| {
+                if by_path {
                     akuma_vfs_glue::write_at(&rec.path, off, bytes).is_ok()
                 } else {
                     akuma_vfs_glue::fs::write_at_open_file(rec.mount_id, rec.inode, off, bytes).is_ok()
-                };
-            failed += usize::from(!ok);
+                }
+            });
+            failed += usize::from(ok != Some(true));
         }
         va += 4096;
     }

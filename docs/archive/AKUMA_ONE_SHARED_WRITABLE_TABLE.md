@@ -79,6 +79,18 @@ Both were caught by the AArch64 `shmregionprobe` run; a temporary trace in the f
   EXIT=0, 127 crates. Console: one benign `[MM] fault race`, 8 `[BKL] stuck` lines, no panics or
   tripwires.
 
+## Correction, 2026-11-12 (same day): write-back undid peers' stores
+
+`shmwrite` rung 10 (4 processes x 50,000 atomic increments) lost 10-25 % of them in 3 of 5
+runs on the next kernel built; the step-6 kernel above passed it 6 of 6, by timing. Glue's
+`flush_shared_write` copied each page into a buffer and wrote the buffer. The write reaches
+`shm::wrote`, which copies a file write into the table's frame unless the write's source *is*
+that frame. A buffer never is. So an exiting child's flush stored its snapshot back over the
+shared page, undoing every increment its peers had made since. amd64's own flush, before this
+step, wrote from the frame's kernel mapping; the move to glue lost that. The flush now writes
+straight from the frame (`with_phys_bytes_mut`), so `wrote` skips it. Rung 10: 6 of 6 after
+the fix, AArch64 devbox. It is the same code on amd64.
+
 ## Open
 
 - A table entry left by a read-only mapper that never shares the frame with a writer again stays
