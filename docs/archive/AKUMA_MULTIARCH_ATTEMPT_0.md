@@ -2741,7 +2741,8 @@ Open, found on the way and not changed here:
   within 30 s of the start, a failed spawn included, doubles `restart_delay` up to 60 s, and a
   longer run resets it (`herd::exit::{next_streak, restart_delay_ms}`, host-tested). On `server`
   with herd as init, 150 s gave 8 tries at 1, 2, 4, 8, 16, 32, 60 and 60 s; sshd started
-  normally.
+  normally. *Made opt-in the same day* (`backoff = true`, default off): it delayed wifi's
+  recovery. Without it a refused service is still retried every `restart_delay`.
 - **No job control on the amd64 serial console** (fixed in "Job control on the amd64 console" below). amd64 dispatches `setpgid`/`getpgid`/`getsid`
   to `pty::*_gated`, which are real only inside a pty session and the old accepted no-ops
   elsewhere. A busybox shell as init runs `sleep 30` "in" group 71 (its `TIOCSPGRP` sets the

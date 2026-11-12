@@ -215,6 +215,10 @@ struct ServiceConfig {
     /// services whose restart needs special handling (e.g. a rump_server, whose
     /// kernel sysproxy channel must be re-established on restart — TBD).
     restart: bool,
+    /// Stretch `restart_delay_ms` for a service that keeps failing quickly
+    /// (`herd::exit::restart_delay_ms`). Default **false**: a service that must
+    /// come back promptly (wifi) would otherwise wait up to a minute between tries.
+    backoff: bool,
     /// If set, spawn this service INTO an existing box (by name) instead of
     /// registering a new one. The target box must already exist and be marked
     /// stack=rump by its owner service (e.g. sshd `join_box = rumpnet` so its
@@ -302,6 +306,7 @@ impl Default for ServiceConfig {
             env: Vec::new(),
             stack: String::new(),
             restart: true,
+            backoff: false,
             join_box: String::new(),
             mount_fs: Vec::new(),
             start_delay_ms: 0,
@@ -684,6 +689,7 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 }
                 "stack" => config.stack = String::from(value),
                 "restart" => config.restart = value != "false" && value != "0" && value != "no",
+                "backoff" => config.backoff = value == "true" || value == "1" || value == "yes",
                 "join_box" => {
                     config.join_box = String::from(value);
                     config.boxed = true; // a joined service always runs in a box
@@ -1456,10 +1462,14 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
     }
 }
 
-/// Put `svc` in line for a restart after its backoff delay
-/// (`herd::exit::restart_delay_ms` of its `restart_delay_ms` and failure streak).
+/// Put `svc` in line for a restart after `restart_delay_ms`, or, with `backoff = true`,
+/// after that delay stretched by its failure streak (`herd::exit::restart_delay_ms`).
 fn schedule_restart(svc: &mut SupervisedProcess, name: &str, now_ms: u64) {
-    let delay = restart_delay_ms(svc.config.restart_delay_ms, svc.fail_streak);
+    let delay = if svc.config.backoff {
+        restart_delay_ms(svc.config.restart_delay_ms, svc.fail_streak)
+    } else {
+        svc.config.restart_delay_ms
+    };
     svc.restart_at_ms = Some(now_ms + delay);
     print("[herd] Scheduling restart for ");
     print(name);
