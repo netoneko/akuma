@@ -418,6 +418,27 @@ pub fn init_reserving(
 /// null pointer everywhere it is passed.
 const LOW_RAM_FLOOR: u64 = 0x10_0000;
 
+/// Physical address of the EGA text buffer (80x25 cells of character + attribute).
+const EGA_TEXT_BASE: u64 = 0xB_8000;
+/// Its length in bytes.
+const EGA_TEXT_LEN: usize = 80 * 25 * 2;
+const _: () = assert!(EGA_TEXT_BASE + EGA_TEXT_LEN as u64 <= LOW_RAM_FLOOR);
+
+/// The EGA text buffer as a byte window, for the earliest boot output there is.
+///
+/// Under UEFI in a graphics mode the range is plain low memory and the writes go
+/// nowhere visible; with a CSM, or firmware that left text mode live, they are
+/// text. Either way the range is below [`LOW_RAM_FLOOR`], which the page
+/// allocator never hands out (checked at compile time above), and inside the
+/// physmap `boot.s` maps, so a write through the window reaches no memory any
+/// Rust value owns.
+#[must_use]
+pub fn ega_text_window() -> akuma_primitives::mmio::MmioWindow {
+    // SAFETY: the range is mapped through the physmap for the kernel's life and
+    // belongs to no allocator (above); byte accesses need no alignment.
+    unsafe { akuma_primitives::mmio::MmioWindow::new(phys_to_virt(EGA_TEXT_BASE) as usize, EGA_TEXT_LEN) }
+}
+
 /// One RAM region as the kernel can actually use it, or `None` if nothing of it
 /// is left once the physmap, the low floor and whatever already occupies it are
 /// taken off.

@@ -1130,7 +1130,6 @@ extern "C" fn syscall_handler(
     // runs with the user `rsp` loaded, and the epilogue's `leave` decision is per core.
     #[cfg(feature = "ring0-preempt")]
     akuma_cpu::interrupts::off();
-    let uctx = crate::smp::current_uctx();
     // **The signal epilogue.** Before the `leave` read below, because a fatal
     // default action sets that flag — and after the trace lines, so a syscall's
     // result is reported as the syscall computed it rather than as a signal
@@ -1138,7 +1137,7 @@ extern "C" fn syscall_handler(
     //
     // Costs one relaxed load of this thread's pending word when nothing is
     // pending, which is every syscall but a handful per boot.
-    let r = crate::signal::deliver_pending(uctx, r);
+    let r = crate::signal::deliver_pending(r);
     let leaving = crate::sched::read_current_uctx(|u| u.leave != 0).unwrap_or(false);
     if !leaving {
         crate::smp::bkl_leave();

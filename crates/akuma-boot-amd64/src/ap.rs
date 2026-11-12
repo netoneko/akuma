@@ -75,7 +75,7 @@ pub fn ap_boot_root(kernel_root: u64) -> u64 {
 ///
 /// # Safety
 /// The page at [`AP_TRAMPOLINE_PA`] must be ordinary RAM that belongs to no one: the caller has checked that the
-/// machine's map and the loader's own structures leave it free (`akuma-amd64`'s `trampoline_page_available`, or
+/// machine's map and the loader's own structures leave it free ([`TrampolinePage::claim`], or
 /// the fixed layouts of the two VMMs named at [`AP_TRAMPOLINE_PA`]). This overwrites up to 3.75 KiB of it.
 pub unsafe fn install_trampoline() -> bool {
     // Two linker-visible symbols bracketing a `.rodata` blob in the kernel image; the difference is its length.
@@ -91,6 +91,42 @@ pub unsafe fn install_trampoline() -> bool {
     // blob is `len` bytes of kernel image that fit below the mailbox.
     unsafe { core::ptr::copy_nonoverlapping(src, phys_ptr::<u8>(AP_TRAMPOLINE_PA), len) };
     true
+}
+
+/// The trampoline page, proven free: made only by [`TrampolinePage::claim`], so holding one means the check
+/// that makes [`install_trampoline`] sound has passed.
+#[derive(Clone, Copy, Debug)]
+pub struct TrampolinePage(());
+
+impl TrampolinePage {
+    /// The page at [`AP_TRAMPOLINE_PA`], if it is ordinary RAM and clear of everything the boot loader placed.
+    ///
+    /// [`AP_TRAMPOLINE_PA`] is a claim about two VMMs' layouts. A firmware boot is a different machine: UEFI's
+    /// map fragments low memory, and GRUB puts its information block wherever it likes. Copying the trampoline
+    /// over either would corrupt something the kernel is still reading - so the caller names what it placed
+    /// (`keep_out`, as `[start, end)` byte ranges) and this refuses unless the page is inside a RAM region and
+    /// outside all of them. The page is below the 1 MiB floor the page allocator starts at, so nothing
+    /// allocates it later. A refusal means "stay single-core", which is a configuration, not a failure.
+    #[must_use]
+    pub fn claim(facts: &akuma_machine_facts::Facts, keep_out: &[(u64, u64)]) -> Option<Self> {
+        use akuma_machine_facts::Range;
+        // The decision is the neutral one (`Facts::is_clear_ram`); this only names the page and converts the
+        // caller's `[start, end)` pairs.
+        facts
+            .is_clear_ram(
+                Range::new(AP_TRAMPOLINE_PA, 4096),
+                keep_out.iter().map(|&(s, e)| Range::new(s, e.saturating_sub(s))),
+            )
+            .then_some(Self(()))
+    }
+
+    /// Copy the trampoline to the page. `false` if it does not fit below the mailbox. Bring-up is serial
+    /// (one core at a time through one mailbox), so no AP is executing the blob while it is rewritten.
+    #[must_use]
+    pub fn install(self) -> bool {
+        // SAFETY: `claim` proved the page is RAM no one else owns (its contract above).
+        unsafe { install_trampoline() }
+    }
 }
 
 /// Copy the trampoline to its page, **once**, for the two VMM layouts named at [`AP_TRAMPOLINE_PA`].

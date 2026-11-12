@@ -4,22 +4,37 @@
 
 ## Status (2026-11-12, late)
 
-37 -> 18. Done: the CR3 chain (9, checked `activate`), the scheduler self-test counters (2,
+37 -> 18 -> 7.
+
+First pass (37 -> 18): the CR3 chain (9, checked `activate`), the scheduler self-test counters (2,
 atomics), the no-op waker (`Waker::noop`), `machine.rs` and the crash dump's memory peek
 (`peek_ram`), `blk.rs` and `power.rs` (`MmioWindow` from `map_device_window`), the wake IPI stub
 (`akuma_trap_amd64::Kind::Wake`), the reboot triple fault (`akuma_idt_amd64::reset_by_triple_fault`),
 the RAM disk (`akuma_phys::RamSpan`, one claim at the module reservation in `multiboot2.rs`).
-Verified: amd64 boot suite (default features, SMP=2) 836/836, clippy clean for default and
-`headless`. Not yet booted: the multiboot2 RAM-disk root (the suite boots PVH on virtio).
 
-Left (18): `gdt.rs` 2 (the TSS slot is indexed by a core id only the per-CPU block knows: needs a
-per-core claim, or `akuma-percpu-gdt-amd64`), `usermode.rs` 4 (ring-3 entry, unwind, LSTAR: a
-`akuma-usermode-amd64` crate), `uaccess.rs` 4 (`copy_from_user_with` would add `akuma_mmu`'s mapped
-walk on amd64, which relies on fault recovery: a behaviour change to measure first; `read_val` needs
-`UserPod`), `signal.rs:492` (the `&mut UserCtx` is held across `exit_current_*`, so it cannot become
-`with_current_uctx` without restructuring), `multiboot2.rs` 3 (EGA window, framebuffer window, info
-block), `smp.rs` 2 (`GsBase`, the trampoline copy), `idt.rs:151` (the crash dump's stack word),
-`ramdisk` claim 1.
+Second pass (18 -> 7):
+- `gdt.rs` 2: the GDT and TSS are `akuma-percpu-gdt-amd64`'s (`init_cpu` claims the slot once,
+  `set_rsp0` finds its core through `gs:[24]`).
+- `idt.rs` stack word: `peek_ram` below the physmap check.
+- `signal.rs` `deliver_pending`: scoped `read_current_uctx`/`with_current_uctx` borrows instead of a
+  raw `&mut UserCtx` that aliased `mark_leave`'s borrow.
+- `uaccess.rs` 4: `akuma_user_access::copy_{from,to}_user_upper_half` (range check + fault recovery,
+  no page walk: the amd64 kernel lives in the upper half, so no user address aliases it), and
+  `read_val<T: Copy + Default>` through `as_user_bytes_mut`.
+- `multiboot2.rs` 2: the info block is copied out through `peek_ram` into a 64 KiB static; the EGA
+  window is `akuma_boot_amd64::mem::ega_text_window` (below the PMM's 1 MiB floor).
+- `smp.rs` trampoline: `akuma_boot_amd64::ap::TrampolinePage`, claimed in `boot.rs`, consumed by
+  `install`.
+
+Verified: amd64 boot suite (default features, SMP=2) 836/836, clippy `-D warnings` for default,
+`headless` and `headless,no-tests`, host tests of the touched crates. Not yet booted: the multiboot2
+paths (the suite boots PVH on virtio).
+
+Left (7): `usermode.rs` 4 (ring-3 entry, unwind, LSTAR: the `akuma-usermode-amd64` crate),
+`multiboot2.rs` 2 (framebuffer window, `RamSpan` claim), `smp.rs` `GsBase`. Still open from the
+soundness list: `read_val`'s `T: Copy + Default` still admits `bool` and `char`, which have invalid
+bit patterns; every caller passes an integer or an ABI struct, and a `UserPod` trait is the real
+fix.
 
 ## Soundness first
 1. uaccess::read_val<T: Copy> (uaccess.rs:310-322) builds a T from user bytes; T: Copy admits bool/char/enums/&'static T; exported to forbid(unsafe) drivers (drivers.rs:825). Same in akuma_user_access::read_user_into / as_user_bytes_mut. Fix: `unsafe trait UserPod` for ABI structs.

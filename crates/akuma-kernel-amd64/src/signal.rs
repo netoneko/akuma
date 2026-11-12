@@ -483,17 +483,17 @@ fn user_rip_ok(va: u64) -> bool {
 ///
 /// Returns early, and the early returns are the cheap path: one relaxed load of
 /// this thread's pending word for the overwhelmingly common "nothing pending".
-pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
-    if uctx.is_null() {
-        return syscall_result;
-    }
-    // SAFETY: the running task's own `UserCtx`; only this task writes it, and
-    // it is inside its own syscall.
-    let uctx = unsafe { &mut *uctx };
-
+pub fn deliver_pending(syscall_result: u64) -> u64 {
+    // The running task's own `UserCtx` is reached only through short
+    // `read_current_uctx`/`with_current_uctx` borrows, never held across the
+    // exit calls below: those set `leave` through the same cell.
+    //
     // A task on its way out of ring 3 for good has no register file worth
     // redirecting, and `execve` has just installed one that must not be.
-    if uctx.leave != 0 || uctx.exec_pending != 0 {
+    let Some((leave, exec_pending)) = crate::sched::read_current_uctx(|u| (u.leave, u.exec_pending)) else {
+        return syscall_result;
+    };
+    if leave != 0 || exec_pending != 0 {
         return syscall_result;
     }
 
@@ -544,8 +544,13 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
     // file this return will use; its `sig_rax` is the interrupted `rax`, not the
     // syscall's result. Nested delivery builds the next frame on top of that
     // restored context, which is what Linux does too.
-    let restored = uctx.sig_return != 0;
-    let cur = Regs::load(uctx, if restored { uctx.sig_rax } else { syscall_result }, restored);
+    let Some((restored, cur)) = crate::sched::read_current_uctx(|u| {
+        let restored = u.sig_return != 0;
+        (restored, Regs::load(u, if restored { u.sig_rax } else { syscall_result }, restored))
+    }) else {
+        unsuspend();
+        return syscall_result;
+    };
 
     let Some(proc) = current_process_shared() else {
         unsuspend();
@@ -560,10 +565,11 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
         Next::Nothing => {
             if restored { cur.rax } else { syscall_result }
         }
-        Next::Handler(next) => {
-            next.store(uctx);
-            uctx.sig_rax
-        }
+        Next::Handler(next) => crate::sched::with_current_uctx(|u| {
+            next.store(u);
+            u.sig_rax
+        })
+        .unwrap_or(syscall_result),
         // **This target's own exit**, not glue's `sys_exit_group`: setting
         // `leave` returns the task into `crate::usermode::run_process`, whose
         // epilogue drains sibling threads, closes the fd table, stamps the

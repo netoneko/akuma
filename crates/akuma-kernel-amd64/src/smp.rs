@@ -446,7 +446,7 @@ pub fn set_bsp_lapic_id(id: u32) {
     PERCPU[0].lapic_id.store(id, Ordering::Relaxed);
 }
 
-use akuma_boot_amd64::ap::{self, AP_MB_CR3, AP_MB_ENTRY, AP_MB_INDEX, AP_MB_STACK, AP_STARTUP_VECTOR, AP_TRAMPOLINE_PA, mailbox_write};
+use akuma_boot_amd64::ap::{self, AP_MB_CR3, AP_MB_ENTRY, AP_MB_INDEX, AP_MB_STACK, AP_STARTUP_VECTOR, mailbox_write};
 
 /// Kernel stack for an AP's idle task, and therefore for every interrupt it
 /// takes while idle. Same size as a scheduler task's.
@@ -461,41 +461,13 @@ const AP_INIT_DELAY: u32 = 1_000_000;
 /// Spins to wait for an AP to report in before the STARTUP is repeated.
 const AP_ONLINE_BUDGET: u64 = 200_000_000;
 
-/// Is the trampoline page ordinary RAM, and clear of everything the boot
-/// loader placed?
-///
-/// [`AP_TRAMPOLINE_PA`] is a claim about two VMMs' layouts. A firmware boot is
-/// a different machine: UEFI's map fragments low memory, and GRUB puts its
-/// information block wherever it likes. Copying the trampoline over either
-/// would corrupt something the kernel is still reading — so the caller names
-/// what it placed (`keep_out`, as `[start, end)` byte ranges) and this refuses
-/// unless the page is inside a RAM region and outside all of them. A refusal
-/// means "stay single-core", which is a configuration, not a failure.
-#[must_use]
-pub fn trampoline_page_available(facts: &akuma_machine_facts::Facts, keep_out: &[(u64, u64)]) -> bool {
-    use akuma_machine_facts::Range;
-    // The decision is the neutral one (`Facts::is_clear_ram`); this function only names the page
-    // and converts the caller's `[start, end)` pairs.
-    facts.is_clear_ram(
-        Range::new(AP_TRAMPOLINE_PA, 4096),
-        keep_out.iter().map(|&(s, e)| Range::new(s, e.saturating_sub(s))),
-    )
-}
-
-/// Copy the trampoline to its page (`akuma_boot_amd64::ap`). Returns false if it does not fit below the mailbox.
-fn install_trampoline() -> bool {
-    // SAFETY: both call sites run after `trampoline_page_available` (or the fixed VMM layouts named at
-    // `AP_TRAMPOLINE_PA`) cleared the page, and bring-up owns it from here.
-    unsafe { ap::install_trampoline() }
-}
-
 /// Start every AP the MADT lists. Returns how many came online.
 ///
 /// Serial, one core at a time through one mailbox: simpler than an atomic
 /// stack-claiming protocol, and bring-up is not a hot path. The BSP's timer
 /// must be stopped on entry (the INIT delay borrows it) and every AP's timer is
 /// running on exit.
-pub fn start_secondaries(madt: Option<&Madt>) -> usize {
+pub fn start_secondaries(madt: Option<&Madt>, page: ap::TrampolinePage) -> usize {
     let cap = CPU_CAP.load(Ordering::Relaxed);
     let Some(madt) = madt else {
         serial::puts("  smp:  no MADT — single core\n");
@@ -522,12 +494,12 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
         serial::puts("  smp:  [FAIL] AP boot root is above 4 GiB; CR3 is 32-bit here\n");
         return 0;
     }
-    if !install_trampoline() {
+    if !page.install() {
         serial::puts("  smp:  [FAIL] trampoline does not fit its page\n");
         return 0;
     }
 
-    TRAMP_OK.store(true, Ordering::Release);
+    *TRAMP.lock() = Some(page);
     let mut started = 0usize;
     let mut idx = 0usize;
     for &id in madt.cpus() {
@@ -614,8 +586,8 @@ pub fn start_secondaries(madt: Option<&Madt>) -> usize {
 
 /// Per core index: the LAPIC id + 1 of an AP the MADT lists and `smp=` left unstarted; 0 for none.
 static DEFERRED_ID: [core::sync::atomic::AtomicU32; MAX_CPUS] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
-/// The trampoline page was checked and is usable (set by [`start_secondaries`]).
-static TRAMP_OK: AtomicBool = AtomicBool::new(false);
+/// The trampoline page, once [`start_secondaries`] has claimed and used it.
+static TRAMP: spinning_top::Spinlock<Option<ap::TrampolinePage>> = spinning_top::Spinlock::new(None);
 /// One late start at a time: they share the trampoline's mailbox and the TSC-sync words.
 static LATE_START: spinning_top::Spinlock<()> = spinning_top::Spinlock::new(());
 
@@ -644,7 +616,7 @@ pub fn ensure_started(idx: usize) -> bool {
     if idx < ONLINE.load(Ordering::Acquire) {
         return true;
     }
-    if idx >= MAX_CPUS || !TRAMP_OK.load(Ordering::Acquire) {
+    if idx >= MAX_CPUS || TRAMP.lock().is_none() {
         return false;
     }
     let _guard = LATE_START.lock();
@@ -663,7 +635,8 @@ pub fn ensure_started(idx: usize) -> bool {
 /// is on, with delays on the TSC.
 fn start_late(idx: usize, id: u32) -> bool {
     let ap_root = ap::ap_boot_root(sched::kernel_root());
-    if ap_root >= (4 << 30) || !install_trampoline() {
+    let Some(page) = *TRAMP.lock() else { return false };
+    if ap_root >= (4 << 30) || !page.install() {
         return false;
     }
     let cpu = &PERCPU[idx];

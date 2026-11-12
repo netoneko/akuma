@@ -48,9 +48,8 @@ use crate::serial;
 /// Where the boot page tables mirror all of physical memory.
 const PHYSMAP_BASE: u64 = 0xFFFF_8000_0000_0000;
 
-/// The legacy colour-text buffer.
-const EGA_TEXT_BASE: u64 = 0xB_8000;
-/// Bright white on blue, the attribute byte for [`EGA_TEXT_BASE`].
+/// Bright white on blue, the attribute byte for the EGA text buffer
+/// (`akuma_boot_amd64::mem::ega_text_window`).
 const EGA_ATTR: u8 = 0x1F;
 
 /// Roughly how long a colour stays up in [`cycle_forever`]. Not calibrated —
@@ -65,11 +64,7 @@ const CYCLE_SPINS: u64 = 400_000_000;
 /// output there is. Either way it happens before any parsing, so it survives
 /// every failure below it.
 pub fn ega_text(row: usize, s: &str) {
-    // SAFETY: the identity/physmap window covers the first megabyte, so this
-    // range (80x25 cells of two bytes) is mapped. Writing it is either visible
-    // text or a store to unused low RAM; neither can fault, and nothing else
-    // claims that range this early in boot.
-    let win = unsafe { MmioWindow::new((PHYSMAP_BASE + EGA_TEXT_BASE) as usize, 80 * 25 * 2) };
+    let win = akuma_boot_amd64::mem::ega_text_window();
     for (i, b) in s.bytes().take(80).enumerate() {
         let off = (row * 80 + i) * 2;
         // A row past the screen is dropped, not wrapped into whatever follows.
@@ -146,6 +141,12 @@ pub fn fb_trace_byte(byte: u8) {
     }
 }
 
+/// Largest multiboot2 information block this kernel reads (the clamp on its
+/// self-declared size).
+const MB2_INFO_MAX: usize = 64 * 1024;
+/// The information block's copy (see `kmain_mb2`).
+static MB2_INFO: spinning_top::Spinlock<[u8; MB2_INFO_MAX]> = spinning_top::Spinlock::new([0; MB2_INFO_MAX]);
+
 /// The GRUB/multiboot2 boot, from long mode on; the bin's `kmain_mb2` symbol calls it.
 ///
 /// Deliberately parallel to [`crate::kmain`], and in the same order, because
@@ -153,9 +154,6 @@ pub fn fb_trace_byte(byte: u8) {
 /// the facts come from: a multiboot2 information block instead of a PVH handoff
 /// block, an ext2 image the loader left in RAM instead of a virtio disk, and a
 /// framebuffer instead of a serial port.
-// The information block's size field is a `u32` at an 8-byte-aligned address
-// (the multiboot2 ABI); the byte pointer is how the physmap hands it over.
-#[allow(clippy::cast_ptr_alignment)]
 pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> ! {
     // The bin's hook (`akuma_kernel::entry!`'s argument): it registers the boot suite, which
     // lives in `akuma-kernel-tests-amd64` because this crate cannot depend on it. It only
@@ -174,17 +172,23 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
     // this path the sink it wants is serial's framebuffer mirror.
     akuma_primitives::console::set_print_hook(serial::puts);
 
-    // SAFETY: GRUB guarantees %ebx points at an information block whose first
-    // u32 is its own total size, and boot.s has mapped all of low physical
-    // memory through the physmap -- which survives `drop_identity_map` below,
-    // so this slice stays valid for the whole function. The length is clamped
-    // so a corrupt size field cannot produce a slice running off the end of
-    // what is mapped.
-    let bytes: &[u8] = unsafe {
-        let p = (PHYSMAP_BASE + info_phys) as *const u8;
-        let total = p.cast::<u32>().read_volatile() as usize;
-        core::slice::from_raw_parts(p, total.clamp(8, 64 * 1024))
-    };
+    // GRUB's information block, copied out of the physmap once: its first u32
+    // is its own total size, clamped so a corrupt size field cannot make the
+    // copy run past the buffer. The copy outlives `drop_identity_map` and any
+    // later reuse of the low memory GRUB left it in; the guard is held for the
+    // rest of this function, which does not return.
+    let mut size = [0u8; 4];
+    if !akuma_phys::peek_ram(info, &mut size) {
+        ega_text(1, "FAIL: information block outside the physmap");
+        crate::halt();
+    }
+    let total = (u32::from_le_bytes(size) as usize).clamp(8, MB2_INFO_MAX);
+    let mut copy = MB2_INFO.lock();
+    if !akuma_phys::peek_ram(info, &mut copy[..total]) {
+        ega_text(1, "FAIL: information block runs past the physmap");
+        crate::halt();
+    }
+    let bytes: &[u8] = &copy[..total];
 
     let Some(info) = BootInfo::new(bytes) else {
         ega_text(1, "FAIL: information block too short");

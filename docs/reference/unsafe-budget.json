@@ -109,7 +109,7 @@
   "unsafe_sites": {
     "crates/akuma-alloc": 24,
     "crates/akuma-boot-aarch64": 6,
-    "crates/akuma-boot-amd64": 12,
+    "crates/akuma-boot-amd64": 14,
     "crates/akuma-cpu": 75,
     "crates/akuma-dma": 17,
     "crates/akuma-el0-entry": 4,
@@ -119,7 +119,7 @@
     "crates/akuma-frame-raw": 3,
     "crates/akuma-gic": 4,
     "crates/akuma-idt-amd64": 2,
-    "crates/akuma-kernel-amd64": 18,
+    "crates/akuma-kernel-amd64": 7,
     "crates/akuma-locks-rw-cell": 8,
     "crates/akuma-mmu-raw": 15,
     "crates/akuma-net-nic": 9,
@@ -140,7 +140,7 @@
     "crates/akuma-trap-aarch64": 21,
     "crates/akuma-trap-amd64": 2,
     "crates/akuma-uart": 1,
-    "crates/akuma-user-access": 20,
+    "crates/akuma-user-access": 22,
     "crates/akuma-vectors-aarch64": 4,
     "crates/akuma-virtio": 15
   }

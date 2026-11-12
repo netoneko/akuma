@@ -47,9 +47,7 @@
 //! per core is simpler than one table with a TSS slot per core, and costs
 //! `7 * 8 * MAX_CPUS` bytes.
 
-use akuma_gdt::{GDT_LIMIT, SLOTS, TSS_SELECTOR, Tss};
-
-use crate::smp::{self, MAX_CPUS};
+use crate::smp::MAX_CPUS;
 
 pub use akuma_gdt::{USER_CS, USER_SS};
 
@@ -66,14 +64,8 @@ const KERNEL_TRAP_STACK_SIZE: usize = 16 * 1024;
 struct TrapStack(#[allow(dead_code)] [u8; KERNEL_TRAP_STACK_SIZE]);
 
 static mut TRAP_STACK: TrapStack = TrapStack([0; KERNEL_TRAP_STACK_SIZE]);
-static mut TSS: [Tss; MAX_CPUS] = [const { Tss::new() }; MAX_CPUS];
-static mut GDT: [[u64; SLOTS]; MAX_CPUS] = [[0; SLOTS]; MAX_CPUS];
 
-#[repr(C, packed)]
-struct Gdtr {
-    limit: u16,
-    base: u64,
-}
+const _: () = assert!(MAX_CPUS <= akuma_percpu_gdt_amd64::MAX_CPUS, "the GDT/TSS table holds fewer cores than smp");
 
 /// Point this core's TSS at the stack a ring-3 trap should switch to.
 ///
@@ -83,15 +75,10 @@ struct Gdtr {
 /// one `rsp0` would have the second's interrupt overwrite the first's saved
 /// state, and the first would resume into a frame describing the second.
 ///
-/// Sharing was safe until Stage J only because nothing switched tasks from
-/// inside an interrupt handler.
+/// The core is found through `gs:` by `akuma-percpu-gdt-amd64`, so only this
+/// core's own slot can be written.
 pub fn set_kernel_stack(rsp0: u64) {
-    // SAFETY: this core's own TSS, reached only through a raw pointer; the CPU
-    // reads `rsp0` on this core's next ring-3 trap rather than concurrently, and
-    // no other core touches this slot.
-    unsafe {
-        (*(&raw mut TSS).cast::<Tss>().add(smp::cpu_index())).set_rsp0(rsp0);
-    }
+    akuma_percpu_gdt_amd64::set_rsp0(rsp0);
 }
 
 /// Build the BSP's GDT and TSS, load both.
@@ -107,33 +94,12 @@ pub fn init() {
 }
 
 /// Build core `idx`'s GDT and TSS, with `rsp0` as its initial trap stack, and
-/// load both on the calling core.
+/// load both on the calling core (`akuma_percpu_gdt_amd64::init_cpu`: each slot
+/// is claimed once, so a second init of a core panics rather than racing it).
 ///
 /// The BSP calls this as core 0 before `smp::init_bsp`, so it must not read
 /// `gs:` — it takes the index as an argument for that reason.
 pub fn init_cpu(idx: usize, rsp0: u64) {
     assert!(idx < MAX_CPUS, "cpu index out of range for the GDT table");
-    // SAFETY: interrupts masked on this core, and only this core ever touches
-    // its own slot of the two tables. The statics are reached only through raw
-    // pointers, never references.
-    unsafe {
-        let tss = (&raw mut TSS).cast::<Tss>().add(idx);
-        (*tss).set_rsp0(rsp0);
-
-        let gdt = (&raw mut GDT).cast::<[u64; SLOTS]>().add(idx);
-        *gdt = akuma_gdt::table(tss as u64);
-
-        let gdtr = Gdtr { limit: GDT_LIMIT, base: gdt as u64 };
-
-        // No far return to reload CS: entries 1 and 2 are byte-identical to the
-        // ones `boot.s` (and the AP trampoline) installed, so the selectors
-        // already loaded stay valid.
-        core::arch::asm!(
-            "lgdt [{gdtr}]",
-            "ltr {tr:x}",
-            gdtr = in(reg) &raw const gdtr,
-            tr = in(reg) TSS_SELECTOR,
-            options(readonly, nostack, preserves_flags)
-        );
-    }
+    akuma_percpu_gdt_amd64::init_cpu(idx, rsp0);
 }

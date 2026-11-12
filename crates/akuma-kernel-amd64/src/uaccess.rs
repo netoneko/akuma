@@ -69,7 +69,6 @@
 //! module cannot check that for you.
 
 use alloc::vec::Vec;
-use core::mem::MaybeUninit;
 use core::sync::atomic::Ordering;
 
 #[cfg(not(feature = "no-tests"))]
@@ -240,7 +239,8 @@ fn ac_set() -> bool {
     akuma_cpu::daif::read() & RFLAGS_AC != 0
 }
 
-use akuma_user_access::{copy_from_user_safe, copy_to_user_safe};
+#[cfg(not(feature = "no-tests"))]
+use akuma_user_access::copy_from_user_safe;
 
 /// First address the user half cannot reach: the x86_64 canonical boundary.
 pub const USER_END: u64 = 0x0000_8000_0000_0000;
@@ -281,11 +281,9 @@ pub fn read_bytes(ptr: u64, dst: &mut [u8]) -> bool {
     if !range_ok_or_bypassed(ptr, dst.len() as u64) {
         return false;
     }
-    // SAFETY: `dst` is a live kernel slice of the stated length; the source is
-    // a range-checked user address, and a fault in the copy is recovered by the
-    // page-fault handler into an `Err` rather than a halt. The copy brackets
-    // itself with `stac`/`clac`.
-    unsafe { copy_from_user_safe(dst.as_mut_ptr(), ptr as *const u8, dst.len()) }.is_ok()
+    // The range check again (the shared crate's own, so its copy cannot be
+    // reached without one), then the copy; a fault is recovered into `Err`.
+    akuma_user_access::copy_from_user_upper_half(dst, ptr).is_ok()
 }
 
 /// Copy `src` out to user address `ptr`. `false` on a bad range or a fault; the
@@ -298,27 +296,20 @@ pub fn write_bytes(ptr: u64, src: &[u8]) -> bool {
     if !range_ok_or_bypassed(ptr, src.len() as u64) {
         return false;
     }
-    // SAFETY: as `read_bytes`, with the roles swapped.
-    unsafe { copy_to_user_safe(ptr as *mut u8, src.as_ptr(), src.len()) }.is_ok()
+    akuma_user_access::copy_to_user_upper_half(ptr, src).is_ok()
 }
 
 /// Read one plain-ABI value from user memory.
 ///
 /// `T` must be integers or arrays of integers — see the module note. Alignment
-/// is not required of `ptr`: the copy is byte-granular.
+/// is not required of `ptr`: the copy is byte-granular. The value starts as
+/// `T::default()` and the copy overwrites its bytes in place
+/// (`akuma_user_access::as_user_bytes_mut`, which carries the "any byte pattern
+/// is a `T`" obligation for every caller in the tree).
 #[must_use]
-pub fn read_val<T: Copy>(ptr: u64) -> Option<T> {
-    let mut slot = MaybeUninit::<T>::uninit();
-    // SAFETY: `size_of::<T>()` writable bytes at the slot's address.
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut(slot.as_mut_ptr().cast::<u8>(), core::mem::size_of::<T>())
-    };
-    if !read_bytes(ptr, bytes) {
-        return None;
-    }
-    // SAFETY: every byte was written by the copy, and the caller's `T` is plain
-    // ABI data for which any byte pattern is a value.
-    Some(unsafe { slot.assume_init() })
+pub fn read_val<T: Copy + Default>(ptr: u64) -> Option<T> {
+    let mut v = T::default();
+    read_bytes(ptr, akuma_user_access::as_user_bytes_mut(core::slice::from_mut(&mut v))).then_some(v)
 }
 
 /// Write one plain-ABI value to user memory. Same `T` requirement as

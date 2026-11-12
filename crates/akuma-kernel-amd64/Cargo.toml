@@ -217,6 +217,8 @@ akuma-port = { path = "../akuma-port" }
 # The GDT/TSS as data: descriptors, the TSS descriptor packing, and the
 # syscall/sysret selector arithmetic (compile-time asserted).
 akuma-gdt = { path = "../akuma-gdt" }
+# The per-core GDT/TSS storage and `lgdt`/`ltr`, behind a once-per-slot claim.
+akuma-percpu-gdt-amd64 = { path = "../akuma-percpu-gdt-amd64" }
 # Linux `reboot(2)` ABI decode, shared with the aarch64 kernel's `sc-reboot`.
 # `src/pci.rs`'s sibling `src/reboot.rs` adds the x86 reset that `akuma-boot`'s
 # own `system_reset` (a PSCI `smc`) cannot do here.

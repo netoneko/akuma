@@ -673,6 +673,48 @@ pub fn copy_from_user_with(dst: &mut [u8], src_user: u64, prefault: Prefault) ->
     unsafe { copy_from_user_safe(dst.as_mut_ptr(), src_user as *const u8, dst.len()) }
 }
 
+/// The upper-half-kernel range check: [`user_range_ok`], or a boot self-test's
+/// `BYPASS_VALIDATION` window (which still refuses a wrapping range).
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+fn upper_half_range_ok(ptr: u64, len: usize) -> bool {
+    user_range_ok(ptr, len)
+        || (BYPASS_VALIDATION.load(Ordering::Acquire) && ptr.checked_add(len as u64).is_some())
+}
+
+/// Copy from user memory at `src_user` into `dst` with **no page-table walk**: the range check, then the
+/// copy, whose fault recovery turns an unmapped page into `Err(EFAULT)`; a lazy page is demand-paged by the
+/// kernel's own ring-0 `#PF` path during the copy.
+///
+/// x86_64 only, because that is where the range check alone is enough: the kernel lives in the upper half,
+/// so a range below [`USER_VA_LIMIT`] cannot name kernel memory. (On AArch64 the kernel is identity-mapped
+/// low, which is why [`validate_user_range`] also walks the tables.)
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn copy_from_user_upper_half(dst: &mut [u8], src_user: u64) -> Result<(), u64> {
+    if dst.is_empty() {
+        return Ok(());
+    }
+    if !upper_half_range_ok(src_user, dst.len()) {
+        return Err(EFAULT);
+    }
+    // SAFETY: `dst` is a live exclusive slice; the source is a range in the user half (checked above, so
+    // it names no kernel memory), and a fault on it lands in the recovery trampoline.
+    unsafe { copy_from_user_safe(dst.as_mut_ptr(), src_user as *const u8, dst.len()) }
+}
+
+/// [`copy_from_user_upper_half`] in the other direction.
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
+pub fn copy_to_user_upper_half(dst_user: u64, src: &[u8]) -> Result<(), u64> {
+    if src.is_empty() {
+        return Ok(());
+    }
+    if !upper_half_range_ok(dst_user, src.len()) {
+        return Err(EFAULT);
+    }
+    // SAFETY: as `copy_from_user_upper_half`, with the roles swapped: the destination is in the user half,
+    // so the write cannot reach kernel memory.
+    unsafe { copy_to_user_safe(dst_user as *mut u8, src.as_ptr(), src.len()) }
+}
+
 /// Read a single byte from user memory, without validating a range first.
 ///
 /// The one folded-API entry point that deliberately skips `validate_user_range`,

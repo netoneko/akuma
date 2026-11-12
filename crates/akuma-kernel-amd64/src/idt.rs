@@ -141,14 +141,17 @@ pub fn fatal_in_progress() -> bool {
 /// The qword `idx` words from `rsp` (negative is below it), for the crash dump.
 ///
 /// Callers have checked `rsp >= PHYSMAP_BASE`, so the address is in the kernel
-/// window; a kernel stack is at least a page, so the 64 words either side of a live
-/// stack pointer are the same stack. Volatile so nothing reorders the read into
-/// the prints. This is the dump's one dereference: it runs on a dying core and
-/// must not itself be able to do more than fault.
+/// window (the physmap or the image). It is translated and read through the
+/// bounds-checked physmap peek, so a word that is not RAM — past the physmap,
+/// in the device window, below it — reads as 0 rather than faulting a dying core.
 fn stack_word(rsp: u64, idx: isize) -> u64 {
     let addr = (rsp as usize).wrapping_add_signed(idx * 8);
-    // SAFETY: as above.
-    unsafe { (addr as *const u64).read_volatile() }
+    if (addr as u64) < crate::phys::PHYSMAP_BASE {
+        return 0;
+    }
+    let mut b = [0u8; 8];
+    let pa = akuma_primitives::addr::virt_to_phys(addr) as u64;
+    if akuma_phys::peek_ram(akuma_phys::PhysAddr::new(pa), &mut b) { u64::from_le_bytes(b) } else { 0 }
 }
 
 fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> ! {

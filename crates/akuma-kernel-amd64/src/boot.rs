@@ -366,8 +366,8 @@ pub fn bring_up_secondaries(
     if cmdline.split_ascii_whitespace().any(|t| t == "nosmp") {
         crate::serial::puts("  smp:  nosmp on the command line — single core\n");
         0
-    } else if smp::trampoline_page_available(facts, keep_out) {
-        smp::start_secondaries(madt)
+    } else if let Some(page) = akuma_boot_amd64::ap::TrampolinePage::claim(facts, keep_out) {
+        smp::start_secondaries(madt, page)
     } else {
         crate::serial::puts("  smp:  trampoline page is not free RAM — single core\n");
         0
