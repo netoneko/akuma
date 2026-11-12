@@ -20,51 +20,23 @@
 
 use akuma_ext2::BlockDevice;
 
-use crate::phys::phys_to_virt;
 
 /// A contiguous span of physical memory, read and written as a block device.
+///
+/// The span is an [`akuma_phys::RamSpan`]: whoever made it stated, once, that
+/// the memory is this disk's alone (`multiboot2`'s module reservation). The lock
+/// gives writes the `&mut` the span requires; `BlockDevice` takes `&self`.
 pub struct RamDisk {
-    base: u64,
+    span: spinning_top::Spinlock<akuma_phys::RamSpan>,
     len: usize,
 }
 
 impl RamDisk {
-    /// Wrap the physical range `[base, base + len)`.
-    ///
-    /// Returns `None` for an empty range, or one reaching past what the physmap
-    /// covers — a span the kernel cannot address is not a device it can read,
-    /// and finding that out through `phys_to_virt`'s assertion during a
-    /// filesystem read is a much worse way to learn it.
+    /// Wrap `span`.
     #[must_use]
-    pub fn new(base: u64, len: usize) -> Option<Self> {
-        if len == 0 {
-            return None;
-        }
-        let end = base.checked_add(len as u64)?;
-        if end > crate::phys::PHYSMAP_LIMIT {
-            return None;
-        }
-        Some(Self { base, len })
-    }
-
-    /// The bytes, as a slice.
-    fn bytes(&self) -> &[u8] {
-        // SAFETY: `new` established that the whole span lies inside the
-        // physmap, so `phys_to_virt` maps every byte of it, and the boot page
-        // tables describe that window as ordinary writable memory. The frames
-        // are reserved from the PMM by `mem::init_reserving`, so nothing else in
-        // the kernel holds a reference to them.
-        unsafe { core::slice::from_raw_parts(phys_to_virt(self.base) as *const u8, self.len) }
-    }
-
-    /// The bytes, mutably.
-    #[allow(clippy::mut_from_ref)] // the SAFETY note below is the argument
-    fn bytes_mut(&self) -> &mut [u8] {
-        // SAFETY: as `bytes`. Taking `&self` rather than `&mut self` because
-        // `BlockDevice::write_bytes` does, and the aliasing that permits is the
-        // same aliasing a real disk's write path has: the filesystem above
-        // serialises its own access.
-        unsafe { core::slice::from_raw_parts_mut(phys_to_virt(self.base) as *mut u8, self.len) }
+    pub fn new(span: akuma_phys::RamSpan) -> Self {
+        let len = span.len();
+        Self { span: spinning_top::Spinlock::new(span), len }
     }
 }
 
@@ -75,8 +47,7 @@ impl BlockDevice for RamDisk {
         if end > self.len {
             return Err(());
         }
-        buf.copy_from_slice(&self.bytes()[start..end]);
-        Ok(())
+        if self.span.lock().read(start, buf) { Ok(()) } else { Err(()) }
     }
 
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
@@ -85,7 +56,6 @@ impl BlockDevice for RamDisk {
         if end > self.len {
             return Err(());
         }
-        self.bytes_mut()[start..end].copy_from_slice(data);
-        Ok(())
+        if self.span.lock().write(start, data) { Ok(()) } else { Err(()) }
     }
 }

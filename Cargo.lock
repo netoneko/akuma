@@ -498,6 +498,7 @@ dependencies = [
  "akuma-pagetable",
  "akuma-params",
  "akuma-pci",
+ "akuma-phys",
  "akuma-pipe",
  "akuma-pipes",
  "akuma-pmm",

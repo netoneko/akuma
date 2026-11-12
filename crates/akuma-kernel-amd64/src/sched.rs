@@ -161,8 +161,7 @@ impl akuma_sched_amd64::Platform for Amd64 {
         // does not name). Every root this kernel passes comes from `AddressSpace::root`, which aliases
         // the kernel half by construction.
         assert!(root != 0 && root.trailing_zeros() >= 12 && root >> 52 == 0, "activate: bad root {root:#x}");
-        // SAFETY: a page-aligned PML4 from this kernel's address-space table (see above).
-        unsafe { paging::activate(root) };
+        paging::activate(root);
     }
     fn set_kernel_stack(top: u64) {
         crate::gdt::set_kernel_stack(top);
@@ -1259,12 +1258,10 @@ pub fn set_current_space_root(space_root: u64) {
         space_root
     };
     if want != paging::active_root() {
-        // SAFETY: `want` is either a live `UserAddressSpace` root (from `execve`'s
+        // `want` is either a live `UserAddressSpace` root (from `execve`'s
         // freshly-loaded image) or the kernel's own; both share the upper-half
-        // mappings, so the kernel stack and code stay mapped across the write.
-        unsafe {
-            paging::activate(want);
-        }
+        // mappings, which is what `activate`'s check confirms.
+        paging::activate(want);
     }
 }
 
@@ -1899,8 +1896,8 @@ pub fn finish() -> ! {
     note_yield(4);
     // Under the BKL.
     MACHINE[current()].space_root.store(0, Ordering::Relaxed);
-    // SAFETY: the kernel root maps this stack and everything below.
-    unsafe { paging::activate(KERNEL_ROOT.load(Ordering::Relaxed)) };
+    // The kernel root maps this stack and everything below.
+    paging::activate(KERNEL_ROOT.load(Ordering::Relaxed));
     threading::finish_current()
 }
 
@@ -2180,9 +2177,9 @@ const ROUNDS: u64 = 4;
 const WORKERS: usize = 3;
 
 /// Per-worker round counters.
-static mut COUNTERS: [u64; WORKERS] = [0; WORKERS];
+static COUNTERS: [AtomicU64; WORKERS] = [const { AtomicU64::new(0) }; WORKERS];
 /// Per-worker checksums, accumulated in a *local* across yields.
-static mut CHECKSUMS: [u64; WORKERS] = [0; WORKERS];
+static CHECKSUMS: [AtomicU64; WORKERS] = [const { AtomicU64::new(0) }; WORKERS];
 
 /// Body shared by the three workers.
 ///
@@ -2204,17 +2201,11 @@ fn worker_body(id: usize) -> ! {
     for round in 0..ROUNDS {
         acc = acc.wrapping_mul(31).wrapping_add(round + id as u64);
 
-        // SAFETY: under the BKL, one writer per index.
-        unsafe {
-            (*(&raw mut COUNTERS).cast::<[u64; WORKERS]>())[id] += 1;
-        }
+        COUNTERS[id].fetch_add(1, Ordering::Relaxed);
 
         yield_now();
     }
-    // SAFETY: as above.
-    unsafe {
-        (*(&raw mut CHECKSUMS).cast::<[u64; WORKERS]>())[id] = acc;
-    }
+    CHECKSUMS[id].store(acc, Ordering::Relaxed);
     finish();
 }
 
@@ -2271,13 +2262,9 @@ pub fn smoke_test(t: &mut Suite) {
     // Masking interrupts is always the conservative direction.
     akuma_cpu::interrupts::off();
 
-    // SAFETY: workers have finished; nothing else writes these.
-    let (counters, checksums) = unsafe {
-        (
-            *(&raw const COUNTERS).cast::<[u64; WORKERS]>(),
-            *(&raw const CHECKSUMS).cast::<[u64; WORKERS]>(),
-        )
-    };
+    // The workers have finished; the BKL hand-offs order their stores before these loads.
+    let counters: [u64; WORKERS] = core::array::from_fn(|i| COUNTERS[i].load(Ordering::Relaxed));
+    let checksums: [u64; WORKERS] = core::array::from_fn(|i| CHECKSUMS[i].load(Ordering::Relaxed));
 
     t.check(
         "sched: every worker ran every round",

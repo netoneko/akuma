@@ -995,13 +995,14 @@ fn dump_user_qwords(space: &akuma_mmu::UserAddressSpace, name: &str, val: u64) {
         let page = va & !0xfff;
         match space.translate(page) {
             Some(pa) => {
-                // SAFETY: `pa` is a live frame of this address space reached
-                // through the physmap, and exactly eight aligned bytes inside
-                // the page `translate` resolved are read.
-                let q = unsafe {
-                    crate::phys::phys_ptr::<u64>(((pa & !0xfff) as u64) + (va & 0xfff) as u64)
-                        .read_volatile()
-                };
+                // Eight bytes inside the page `translate` resolved, read through the
+                // bounds-checked physmap peek (a frame past the physmap reads as 0).
+                let mut b = [0u8; 8];
+                let _ = akuma_phys::peek_ram(
+                    akuma_phys::PhysAddr::new(((pa & !0xfff) as u64) + (va & 0xfff) as u64),
+                    &mut b,
+                );
+                let q = u64::from_le_bytes(b);
                 let _ = write!(w, " {q:016x}");
                 any = true;
             }

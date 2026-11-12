@@ -22,7 +22,7 @@
 //! bytes out of the window into a stack array and renders into the caller's
 //! buffer. Nothing here can fail under memory pressure.
 
-use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 
 use akuma_power::aml::{self, MAX_DECL_LEN};
 use akuma_power::ctl::{parse, Ctl, Parsed};
@@ -34,11 +34,9 @@ use akuma_ryzen_amd64::{MachineDescription, PhysMem};
 use spinning_top::Spinlock;
 
 use crate::machine::Physmap;
-use crate::paging::{self, MemAttr, PteProt};
-use crate::phys::DEVMAP_BASE;
+use crate::paging;
 use crate::serial;
 
-const PAGE: u64 = 4096;
 /// The region name the Ryzen laptop's DSDT gives the EC's memory mirror.
 const REGION: &[u8; 4] = b"ERAM";
 /// Bytes of table read per call while scanning.
@@ -48,8 +46,10 @@ const MODE_NONE: u8 = 0;
 const MODE_EC: u8 = 1;
 const MODE_SIM: u8 = 2;
 static MODE: AtomicU8 = AtomicU8::new(MODE_NONE);
-/// Kernel-virtual address of the window's first byte, when `MODE_EC`.
-static EC_VA: AtomicU64 = AtomicU64::new(0);
+/// The EC mirror as a device window, set once by [`map_window`] before `MODE_EC`
+/// is published. Read under the lock with interrupts off: the lock is held only
+/// to copy the two-word window out.
+static EC_WIN: Spinlock<Option<akuma_primitives::mmio::MmioWindow>> = Spinlock::new(None);
 
 /// The running energy total, integrated between `/proc/power` reads. The
 /// renderer is the sampler: nothing reads the EC or ticks a timer when nobody
@@ -129,29 +129,22 @@ fn scan_table(addr: u64, length: u32) -> Option<u64> {
 
 /// Map the pages covering the window into the device window, uncached.
 fn map_window(pa: u64) -> bool {
-    let first = pa & !(PAGE - 1);
-    let last = (pa + BLOCK_LEN as u64).div_ceil(PAGE) * PAGE;
-    let mut p = first;
-    while p < last {
-        if !paging::map_page((DEVMAP_BASE + p) as usize, p, PteProt::KERNEL_RW, MemAttr::Device) {
-            return false;
-        }
-        p += PAGE;
-    }
-    EC_VA.store(DEVMAP_BASE + pa, Ordering::Release);
+    let Some(w) = paging::map_device_window(pa, BLOCK_LEN as u64) else {
+        return false;
+    };
+    akuma_primitives::irq::with_irqs_disabled(|| *EC_WIN.lock() = Some(w));
     true
 }
 
 /// Copy the window out a byte at a time. Byte-wide because the mirror is EC
 /// memory: a wider access is allowed to tear, a byte is not.
 fn read_window() -> [u8; BLOCK_LEN] {
-    let va = EC_VA.load(Ordering::Acquire) as *const u8;
     let mut b = [0u8; BLOCK_LEN];
+    let Some(w) = akuma_primitives::irq::with_irqs_disabled(|| *EC_WIN.lock()) else {
+        return b;
+    };
     for (i, slot) in b.iter_mut().enumerate() {
-        // SAFETY: `map_window` mapped every page of `[va, va + BLOCK_LEN)` as
-        // device memory before `MODE_EC` was published, and `EC_VA` is only
-        // non-zero then.
-        *slot = unsafe { va.add(i).read_volatile() };
+        *slot = w.try_read::<u8>(i).unwrap_or(0);
     }
     b
 }

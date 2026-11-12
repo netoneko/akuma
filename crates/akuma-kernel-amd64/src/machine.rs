@@ -12,7 +12,7 @@
 
 use akuma_ryzen_amd64::{MachineDescription, PhysMem};
 
-use crate::phys::{PHYSMAP_LIMIT, phys_ptr};
+use crate::phys::PHYSMAP_LIMIT;
 use crate::serial;
 
 /// Physical memory as the kernel sees it: the physmap, and nothing outside it.
@@ -32,12 +32,7 @@ impl PhysMem for Physmap {
         if end > PHYSMAP_LIMIT {
             return false;
         }
-        for (i, slot) in buf.iter_mut().enumerate() {
-            // SAFETY: the whole range was just proved to be inside the physmap,
-            // which `boot.s` maps before `kmain` runs.
-            *slot = unsafe { phys_ptr::<u8>(pa + i as u64).read_volatile() };
-        }
-        true
+        akuma_phys::peek_ram(akuma_phys::PhysAddr::new(pa), buf)
     }
 }
 

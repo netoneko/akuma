@@ -183,6 +183,42 @@ impl Default for Idt {
     }
 }
 
+/// Reset the machine by triple fault.
+///
+/// Loads an empty IDT and raises `#BP`, which the CPU can neither deliver nor
+/// escalate past a double fault, so it shuts down and the chipset resets. The
+/// last resort after the port resets
+/// (`akuma_port::RESET_CONTROL`, the i8042 pulse) did not take.
+///
+/// Safe for the same reason those are: it ends the machine, it does not corrupt
+/// it. Nothing runs after it. Off x86_64 bare metal it spins.
+pub fn reset_by_triple_fault() -> ! {
+    #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+    {
+        #[repr(C, packed)]
+        struct Idtr {
+            limit: u16,
+            base: u64,
+        }
+        static EMPTY: Idtr = Idtr { limit: 0, base: 0 };
+        // SAFETY: a terminal operation. The empty table is a `static` (the operand
+        // stays valid), and the `int3` that follows cannot be delivered through
+        // it: the core shuts down. No Rust state is observed afterwards.
+        unsafe {
+            core::arch::asm!(
+                "lidt [{idtr}]",
+                "int3",
+                idtr = in(reg) &raw const EMPTY,
+                options(noreturn, nostack),
+            );
+        }
+    }
+    #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -381,7 +381,11 @@ pub fn kmain_mb2(info: akuma_primitives::addr::PhysAddr, before_main: fn()) -> !
         want_usb_root || info.cmdline().split_ascii_whitespace().any(|t| t == "usb");
     let mount_ram = || {
         module
-            .and_then(|m| crate::ramdisk::RamDisk::new(u64::from(m.start), m.len()))
+            // SAFETY: the module's pages were reserved from the PMM above, so no
+            // allocator hands them out, and this closure is the only thing that
+            // names them; `claim` checks they lie inside the physmap.
+            .and_then(|m| unsafe { akuma_phys::RamSpan::claim(akuma_phys::PhysAddr::new(u64::from(m.start)), m.len()) })
+            .map(crate::ramdisk::RamDisk::new)
             .is_some_and(|rd| {
                 crate::fs::mount_root_on(crate::fs::RootDevice::Ram(rd), "module")
             })

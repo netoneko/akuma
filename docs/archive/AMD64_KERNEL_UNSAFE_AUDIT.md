@@ -2,6 +2,25 @@
 
 37 production `unsafe` sites in `crates/akuma-kernel-amd64` at 5b596c57 (matches `docs/reference/unsafe-budget.json`). Paths are relative to `crates/akuma-kernel-amd64/src/` unless they name another crate. Not yet checked against the code: a plan, not findings.
 
+## Status (2026-11-12, late)
+
+37 -> 18. Done: the CR3 chain (9, checked `activate`), the scheduler self-test counters (2,
+atomics), the no-op waker (`Waker::noop`), `machine.rs` and the crash dump's memory peek
+(`peek_ram`), `blk.rs` and `power.rs` (`MmioWindow` from `map_device_window`), the wake IPI stub
+(`akuma_trap_amd64::Kind::Wake`), the reboot triple fault (`akuma_idt_amd64::reset_by_triple_fault`),
+the RAM disk (`akuma_phys::RamSpan`, one claim at the module reservation in `multiboot2.rs`).
+Verified: amd64 boot suite (default features, SMP=2) 836/836, clippy clean for default and
+`headless`. Not yet booted: the multiboot2 RAM-disk root (the suite boots PVH on virtio).
+
+Left (18): `gdt.rs` 2 (the TSS slot is indexed by a core id only the per-CPU block knows: needs a
+per-core claim, or `akuma-percpu-gdt-amd64`), `usermode.rs` 4 (ring-3 entry, unwind, LSTAR: a
+`akuma-usermode-amd64` crate), `uaccess.rs` 4 (`copy_from_user_with` would add `akuma_mmu`'s mapped
+walk on amd64, which relies on fault recovery: a behaviour change to measure first; `read_val` needs
+`UserPod`), `signal.rs:492` (the `&mut UserCtx` is held across `exit_current_*`, so it cannot become
+`with_current_uctx` without restructuring), `multiboot2.rs` 3 (EGA window, framebuffer window, info
+block), `smp.rs` 2 (`GsBase`, the trampoline copy), `idt.rs:151` (the crash dump's stack word),
+`ramdisk` claim 1.
+
 ## Soundness first
 1. uaccess::read_val<T: Copy> (uaccess.rs:310-322) builds a T from user bytes; T: Copy admits bool/char/enums/&'static T; exported to forbid(unsafe) drivers (drivers.rs:825). Same in akuma_user_access::read_user_into / as_user_bytes_mut. Fix: `unsafe trait UserPod` for ABI structs.
 2. paging::map_device_window(pa,len) (akuma-boot-amd64/src/paging.rs:77) safe, exported (drivers.rs:819): MmioWindow over any PA incl. kernel RAM. pci::map_bar_window same (Bar::Memory constructible by anyone); paging::map_page same internally. Need claim types (Bar only from enumeration).

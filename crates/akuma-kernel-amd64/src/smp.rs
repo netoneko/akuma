@@ -796,49 +796,13 @@ pub fn kick_core(cpu: usize) {
 /// Install [`WAKE_VECTOR`] in the shared IDT. Called from `lapic::init`, next
 /// to the shootdown vector, on both boot protocols.
 pub fn install_wake_vector() {
-    #[allow(function_casts_as_integer)]
-    idt::set_handler(WAKE_VECTOR, wake_ipi_entry as usize);
+    akuma_trap_amd64::register(akuma_trap_amd64::Kind::Wake, wake_trap);
+    idt::set_handler(WAKE_VECTOR, akuma_trap_amd64::entry(akuma_trap_amd64::Kind::Wake));
 }
 
-#[unsafe(no_mangle)]
-extern "C" fn wake_ipi_dispatch() {
+/// The wake IPI's whole job is to end a `hlt`: acknowledge it and return.
+fn wake_trap(_: &mut akuma_trap_amd64::Trap<'_>) {
     lapic::eoi();
-}
-
-// The handler touches no per-CPU state, so there is no `swapgs`; the nine
-// caller-saved pushes put `rsp` 16-aligned at the `call` (the CPU aligned it
-// before pushing its 40-byte frame).
-core::arch::global_asm!(
-    r#"
-    .section .text
-.global wake_ipi_entry
-wake_ipi_entry:
-    push rax
-    push rcx
-    push rdx
-    push rsi
-    push rdi
-    push r8
-    push r9
-    push r10
-    push r11
-    cld
-    call wake_ipi_dispatch
-    pop r11
-    pop r10
-    pop r9
-    pop r8
-    pop rdi
-    pop rsi
-    pop rdx
-    pop rcx
-    pop rax
-    iretq
-"#
-);
-
-unsafe extern "C" {
-    fn wake_ipi_entry();
 }
 
 /// Make SSE legal, exactly as `boot.s` does for the BSP — `CR0.EM=0`,
@@ -901,9 +865,9 @@ extern "C" fn ap_entry64(index: u64) -> ! {
     // First, off the boot tables: the identity map in slot 0 is the lower half
     // and belongs to userspace. The kernel root maps everything this function
     // touches — the image, the physmap this stack is in, the device window.
-    // SAFETY: the kernel root shares the upper half with the boot tables, so
-    // the instruction after the write is mapped.
-    unsafe { paging::activate_unpublished(sched::kernel_root()) };
+    // The kernel root shares the upper half with the boot tables, so the
+    // instruction after the write is mapped (and `activate_unpublished` checks it).
+    paging::activate_unpublished(sched::kernel_root());
     enable_sse();
     let _ = enable_xsave();
     // This core's own PAT, so the write-combining framebuffer is WC here too.

@@ -247,6 +247,8 @@ akuma-params = { path = "../akuma-params" }
 akuma-fdtable = { path = "../akuma-fdtable" }
 # Page tables in memory + the amd64 walker; and the entry format it walks.
 akuma-pagetable = { path = "../akuma-pagetable" }
+# Bounds-checked physmap reads (`peek_ram`) and the RAM-disk span (`RamSpan`).
+akuma-phys = { path = "../akuma-phys" }
 akuma-pte-amd64 = { path = "../akuma-pte-amd64" }
 akuma-idt-amd64 = { path = "../akuma-idt-amd64" }
 akuma-trap-amd64 = { path = "../akuma-trap-amd64" }

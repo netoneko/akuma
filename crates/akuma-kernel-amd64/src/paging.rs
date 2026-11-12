@@ -27,13 +27,13 @@ pub use akuma_boot_amd64::paging::{
 /// Switch the active address space, publishing the transition to
 /// `akuma-mmu`'s per-core live-L0 registry.
 ///
-/// # Safety
-/// `root` must be a PML4 that maps every page this kernel is currently
-/// executing from and every page it will touch before switching back — the
-/// kernel image, its stacks, the heap, the PMM pool and the LAPIC window. An
-/// address space missing any of those faults on the instruction after
-/// `mov cr3`, with no way to report it.
-pub unsafe fn activate(root: u64) {
+/// Safe: the CR3 write is `akuma_pagetable::amd64::activate`'s, which refuses
+/// (panics on) a root that does not share the live root's kernel slots for the
+/// code, the stack and the physmap it is about to touch — a triple fault with
+/// nothing printed becomes a named stop. Every root this kernel switches to is
+/// an `AddressSpace::root` (kernel half aliased by construction) or the kernel
+/// root itself, so the check is a few table reads that always pass.
+pub fn activate(root: u64) {
     // Published on every call, not only when the root changes — which is where
     // the AArch64 caller puts its `if new_ttbr0 != current_ttbr0`. Deliberate,
     // and matching this function's existing "write CR3 unconditionally" rule:
@@ -41,9 +41,9 @@ pub unsafe fn activate(root: u64) {
     // which three uncontended `xchg` is a small constant.
     let flags = akuma_cpu::daif::save_and_mask_irq();
     let core = akuma_mmu::publish_l0_begin(root, smp::cpu_index());
-    // SAFETY: caller's obligation, stated above. Writing CR3 also flushes the
-    // non-global TLB, which is what makes the switch take effect.
-    unsafe { akuma_pagetable::amd64::load_cr3(root) };
+    // Writing CR3 also flushes the non-global TLB, which is what makes the
+    // switch take effect.
+    akuma_pagetable::amd64::activate::<akuma_boot_amd64::paging::Physmap>(root);
     akuma_mmu::publish_l0_end(core);
     // Restores exactly the interrupt-enable state observed above (`popfq`).
     akuma_cpu::daif::restore(flags);
@@ -55,25 +55,20 @@ pub unsafe fn activate(root: u64) {
 /// `smp::ap_entry64`'s very first act — before `install_percpu`, before even
 /// `idt::load()` — is to get off the boot tables. `cpu_index()` reads `gs:[0]`
 /// and `IA32_GS_BASE` is still 0 there, so publishing would dereference address
-/// 0 on a core with no IDT.
-///
-/// # Safety
-/// As [`activate`], plus: the caller must be on a path where per-CPU state does
-/// not yet exist.
-pub unsafe fn activate_unpublished(root: u64) {
-    // SAFETY: caller's obligation, stated above.
-    unsafe { akuma_pagetable::amd64::load_cr3(root) };
+/// 0 on a core with no IDT. The check needs no per-CPU state: it reads CR3 and
+/// table frames through the physmap, which the boot tables map.
+pub fn activate_unpublished(root: u64) {
+    akuma_pagetable::amd64::activate::<akuma_boot_amd64::paging::Physmap>(root);
 }
 
 /// Retire the trampoline's identity map: clear PML4 slot 0 and reload CR3
 /// through [`activate`], so the registry sees the flush and the lower half is
-/// free for userspace.
+/// free for userspace. The caller is running from the kernel window on a
+/// physmap stack (`boot.s`'s `high_entry` arranges that before `kmain`), which
+/// is what lets the checked reload accept the live root.
 pub fn drop_identity_map() {
     akuma_boot_amd64::paging::clear_identity_slot();
-    // SAFETY: the caller must already be running from the kernel window with a
-    // physmap stack — which `boot.s`'s `high_entry` arranges before it calls
-    // `kmain`. Reloading CR3 flushes the now-stale identity translations.
-    unsafe { activate(active_root()) };
+    activate(active_root());
 }
 
 /// Map, write, read back and unmap one page through this walker.

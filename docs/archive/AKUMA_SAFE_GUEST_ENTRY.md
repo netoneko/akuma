@@ -102,8 +102,17 @@ The wiring changes:
 - The first rehearsal found one bug in the conversion. The ASID was written only at entry, so the
   host-side `validate_guest_state` saw ASID 0 and refused every guest. `Guest` now writes the
   confinement fields when it is made and when its table is set.
-- Still to run: the consistency ladder, nested SVM on Pop, and the ryzen metal with the `/dev/kvm`
-  API path (Taoxichuan) and the VM services.
+- Nested SVM on Pop (ryzen's Ryzen CPU, QEMU `-accel kvm`, the ryzen-built `no-tests` kernel): the
+  four rehearsal guests pass, all 12 ladder probes enter, and the Akuma guest passes with a clean
+  disk.
+- Firecracker: AArch64 under Lima 303 passed / 0 failed; amd64 on Pop (the ryzen-built test kernel)
+  798 passed / 0 failed.
+- ryzen metal, entry "KVM herd" (`kvmctl kvmmem=4096`), kernel `5b596c5`: a Taoxichuan guest
+  (`akuma-install-2322`) came up as a herd VM service and answered ssh; the same kernel ran as an
+  Akuma guest under itself (`herd vm-run`, 4 vCPUs on cores 4-7, `uname -v` `5b596c5`); the Infinity
+  guest (Taoxichuan, 4 GiB, 4 vCPUs) booted `init=/bin/herd` and answered ssh on 2225. Claude Code
+  2.1.301 ran a one-shot prompt on the host. The kernel was then installed as p3's
+  `/boot/akuma-amd64`.
 
 ## Still open
 

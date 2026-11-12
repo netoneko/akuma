@@ -174,11 +174,14 @@ pub enum Kind {
     SimdFp,
     /// The LAPIC timer. Its vector is chosen by `lapic::init`, not fixed here.
     Timer,
+    /// The cross-core wake IPI (its handler only acknowledges the LAPIC). Its
+    /// vector is the kernel's choice, like the timer's.
+    Wake,
 }
 
 impl Kind {
     /// Every kind, in declaration order.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::DivideError,
         Self::Debug,
         Self::Breakpoint,
@@ -191,13 +194,14 @@ impl Kind {
         Self::AlignmentCheck,
         Self::SimdFp,
         Self::Timer,
+        Self::Wake,
     ];
 
     /// Number of kinds: the size of the handler table.
     pub const COUNT: usize = Self::ALL.len();
 
     /// The IDT vector this kind is architecturally bound to, or `None` for the
-    /// timer, whose vector is a software choice.
+    /// timer and the wake IPI, whose vectors are a software choice.
     #[must_use]
     pub const fn vector(self) -> Option<u8> {
         Some(match self {
@@ -212,7 +216,7 @@ impl Kind {
             Self::X87Fp => 16,
             Self::AlignmentCheck => 17,
             Self::SimdFp => 19,
-            Self::Timer => return None,
+            Self::Timer | Self::Wake => return None,
         })
     }
 
@@ -467,6 +471,7 @@ mod stubs {
     plain!(Kind::X87Fp, x87_fp_entry, x87_fp_thunk);
     plain!(Kind::SimdFp, simd_fp_entry, simd_fp_thunk);
     plain!(Kind::Timer, timer_entry, timer_thunk);
+    plain!(Kind::Wake, wake_entry, wake_thunk);
 
     coded!(Kind::SegmentNotPresent, segment_not_present_entry, segment_not_present_thunk);
     coded!(Kind::StackSegment, stack_segment_entry, stack_segment_thunk);
@@ -490,6 +495,7 @@ mod stubs {
             Kind::AlignmentCheck => alignment_check_entry as usize,
             Kind::SimdFp => simd_fp_entry as usize,
             Kind::Timer => timer_entry as usize,
+            Kind::Wake => wake_entry as usize,
         }
     }
 }
@@ -545,7 +551,7 @@ mod tests {
     }
 
     #[test]
-    fn vectors_are_distinct_and_only_the_timer_is_unbound() {
+    fn vectors_are_distinct_and_only_the_software_vectors_are_unbound() {
         let mut seen = [false; 256];
         for k in Kind::ALL {
             match k.vector() {
@@ -553,7 +559,7 @@ mod tests {
                     assert!(!seen[usize::from(v)], "{k:?} shares vector {v}");
                     seen[usize::from(v)] = true;
                 }
-                None => assert_eq!(k, Kind::Timer),
+                None => assert!(matches!(k, Kind::Timer | Kind::Wake), "{k:?} has no vector"),
             }
         }
         assert_eq!(Kind::ALL.iter().filter(|k| k.user_callable()).count(), 1);

@@ -118,17 +118,7 @@ fn park_until(deadline_us: u64) {
 /// stack that calls `wake()` on a waiter that is already spinning is behaving
 /// correctly, and should not take the kernel down for it.
 fn noop_waker() -> core::task::Waker {
-    use core::task::{RawWaker, RawWakerVTable, Waker};
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |_| RawWaker::new(core::ptr::null(), &VTABLE),
-        |_| {},
-        |_| {},
-        |_| {},
-    );
-    // SAFETY: the vtable's four functions are all no-ops that ignore the data
-    // pointer, so a null pointer is never dereferenced. This is the standard
-    // no-op waker construction.
-    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+    core::task::Waker::noop().clone()
 }
 
 /// Does this CPU implement `RDRAND`?

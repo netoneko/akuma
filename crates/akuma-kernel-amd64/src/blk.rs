@@ -42,33 +42,22 @@
 #[cfg(not(feature = "no-tests"))]
 use akuma_selftest::Suite;
 
-use crate::paging::{self, MemAttr, PteProt};
+use crate::paging;
 use crate::phys::DEVMAP_BASE;
 use crate::serial;
 
-const PAGE_SIZE: u64 = 4096;
+
+/// The lowest-addressed transport's register window (slot 0), kept for the
+/// boot self-test's raw probe.
+static SLOT0: spinning_top::Spinlock<Option<akuma_primitives::mmio::MmioWindow>> = spinning_top::Spinlock::new(None);
 
 /// Map one device's register file into the device window, uncached.
 ///
 /// The window is direct — `DEVMAP_BASE + pa` — so a physical address has one
 /// device-window address and `akuma_primitives::addr::mmio_phys_to_virt` agrees
 /// with what is mapped here by construction rather than by convention.
-fn map_device(base: u64, len: u64) -> bool {
-    let first = base & !(PAGE_SIZE - 1);
-    let last = (base + len).div_ceil(PAGE_SIZE) * PAGE_SIZE;
-    let mut pa = first;
-    while pa < last {
-        if !paging::map_page(
-            (DEVMAP_BASE + pa) as usize,
-            pa,
-            PteProt::KERNEL_RW,
-            MemAttr::Device,
-        ) {
-            return false;
-        }
-        pa += PAGE_SIZE;
-    }
-    true
+fn map_device(base: u64, len: u64) -> Option<akuma_primitives::mmio::MmioWindow> {
+    paging::map_device_window(base, len)
 }
 
 /// Map the machine's virtio transports and hand their geometry to the drivers.
@@ -86,12 +75,17 @@ pub fn init(facts: &akuma_machine_facts::Facts) -> bool {
         return false;
     };
 
+    let mut lowest: Option<(u64, akuma_primitives::mmio::MmioWindow)> = None;
     for d in devs {
-        if !map_device(d.window.base, d.window.size) {
+        let Some(w) = map_device(d.window.base, d.window.size) else {
             serial::puts("  [blk] could not map a virtio transport\n");
             return false;
+        };
+        if lowest.is_none_or(|(b, _)| d.window.base < b) {
+            lowest = Some((d.window.base, w));
         }
     }
+    *SLOT0.lock() = lowest.map(|(_, w)| w);
 
     // Slot geometry: `base + i * stride`. The evenly-spaced check is
     // `akuma_machine_facts::virtio_geometry`, host-tested — believing a stride
@@ -132,12 +126,9 @@ mod reg {
     pub const VENDOR_ID: usize = 0x00c;
 }
 
-/// Read one 32-bit transport register through the device window.
-fn read_reg(slot_va: usize, off: usize) -> u32 {
-    // SAFETY: `slot_va` is a device-window address `init` mapped, and every
-    // offset here is inside the 0x100-byte virtio-MMIO header, which is inside
-    // the smallest register file either machine reports (0x200).
-    unsafe { ((slot_va + off) as *const u32).read_volatile() }
+/// Read one 32-bit transport register of slot 0 (0 if nothing was mapped).
+fn read_reg(off: usize) -> u32 {
+    SLOT0.lock().and_then(|w| w.try_read::<u32>(off)).unwrap_or(0)
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -155,14 +146,13 @@ pub fn smoke_test(t: &mut Suite, expect_disk: bool) {
         return;
     }
 
-    let slot = akuma_primitives::addr::virtio_slot_va(0);
-    t.check_eq("blk: transport magic is \"virt\"", u64::from(read_reg(slot, reg::MAGIC)), 0x7472_6976);
+    t.check_eq("blk: transport magic is \"virt\"", u64::from(read_reg(reg::MAGIC)), 0x7472_6976);
     // Version 2 is the non-legacy interface. Both machines present it; a 1 here
     // would mean the legacy layout, which `virtio-drivers` handles differently
     // and this kernel has never seen.
-    t.check_eq("blk: transport version is 2 (modern)", u64::from(read_reg(slot, reg::VERSION)), 2);
-    t.check_eq("blk: device id is 2 (block)", u64::from(read_reg(slot, reg::DEVICE_ID)), 2);
-    t.note("blk: vendor id", u64::from(read_reg(slot, reg::VENDOR_ID)));
+    t.check_eq("blk: transport version is 2 (modern)", u64::from(read_reg(reg::VERSION)), 2);
+    t.check_eq("blk: device id is 2 (block)", u64::from(read_reg(reg::DEVICE_ID)), 2);
+    t.note("blk: vendor id", u64::from(read_reg(reg::VENDOR_ID)));
 
     if !t.check("blk: driver registered a device", akuma_virtio::block::is_initialized()) {
         return;

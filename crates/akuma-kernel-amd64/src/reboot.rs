@@ -27,14 +27,6 @@ use akuma_selftest::Suite;
 use crate::fd::errno;
 use crate::serial;
 
-/// A 10-byte `IDTR` operand describing an empty interrupt descriptor table.
-#[repr(C, packed)]
-struct Idtr {
-    limit: u16,
-    base: u64,
-}
-
-static EMPTY_IDT: Idtr = Idtr { limit: 0, base: 0 };
 
 /// Reset the machine. Never returns.
 pub fn perform_reset() -> ! {
@@ -89,17 +81,7 @@ pub fn perform_reset() -> ! {
 
     // 3. Triple fault.
     serial::puts("[reboot] port resets did not take; triple-faulting\n");
-    // SAFETY: intentionally loading an empty IDT and raising a breakpoint so
-    //   the CPU cannot deliver or escalate the exception and resets. This is a
-    //   terminal operation; nothing runs after it.
-    unsafe {
-        core::arch::asm!(
-            "lidt [{idtr}]",
-            "int3",
-            idtr = in(reg) &raw const EMPTY_IDT,
-            options(noreturn, nostack),
-        );
-    }
+    akuma_idt_amd64::reset_by_triple_fault()
 }
 
 fn spin(iterations: u32) {
