@@ -2498,3 +2498,102 @@ usage simply never exercises, or an artifact specific to the no-NIC/non-sshd boo
 open. Left here rather than chased further; the next step is reproducing against the actual
 documented dev-loop setup (real NIC, `init=/bin/sshd`) before concluding anything about Taoxichuan's
 RAM floor.
+
+## Future work: Taoxichuan's RAM floor and the auditable line count (2026-11-12)
+
+Nothing here is done. It is a survey from one session: what was measured, what is an estimate, and
+what to do first. Measured numbers are marked; everything else is a guess to be replaced by a boot.
+
+### Taoxichuan's RAM floor (amd64)
+
+**Measured**, `cargo build -p taoxichuan --target x86_64-unknown-none --release --features no-tests`
+(default `shell`): 2.46 MB ELF; loaded image about 4.0 MiB (`.text` 1384 KiB, `.rodata` 161, `.data` 395,
+`.bss` 1538, `.bootbss` 532). By crate, the function symbols are `alloc` 328 KiB (generic
+instantiations), `akuma_syscalls_glue` 282, `akuma_exec` 96, `core` 90, `akuma_vfs_glue` 78,
+`akuma_ext2` 73. `akuma-cow` is under 4 KiB; it is not why the image grew.
+The 28 Oct `taoxichuan-fc.bin` (936 KiB loaded) is the AArch64 Firecracker image from before the tokio
+kernel kit, glue and SMP; it is not a like-for-like baseline.
+
+**Where the static bytes are** (`.bss`/`.data` objects, all sized for the maximum rather than for the RAM):
+
+| item | size | source |
+|---|---:|---|
+| `TRAP_STACKS` | 784 KiB | `NSLOTS + 1` = 49 slots x 16 KiB (`akuma-tokio-kernel-amd64/src/lib.rs`) |
+| `TRAP_STACK` | 256 KiB | `smp::MAX_CPUS` = 16 x 16 KiB |
+| boot stack + `PHYSMAP_PDS` | 256 + 256 KiB | `.bootbss`, `boot.s`; **do not shrink the stack**, no guard page, an overflow rewrites the page directories |
+| PMM ledgers (`FREE_LEDGER_*`, `COW_LEDGER_*`) + `QUAR_PRESENT` | ~208 KiB | `akuma-pmm`, unconditional statics; `mem::init` takes `pmm-forensics` as a runtime flag |
+| `RX_ARENA`, `LOOPBACK_ARENA` | 64 KiB each | `akuma-net-nic` |
+| `TASKS`, `SOCKET_STORAGE`, `MACHINE` | 128 / 116 / 72 KiB | `.data` |
+
+Not the 1 MiB `BOOT_STACK_SIZE` defsym in `taoxichuan/build.rs`: nothing in the amd64 link reads it.
+
+**Heap**: the amd64 half already scales. `mem::init` asks `heap_size_for(ram)` first, and when that does not
+fit falls back to `akuma-mem-policy::compute_heap_size` (1/8 of RAM, 4 MiB floor below 256 MiB). The flat
+`HEAP_BYTES = 16 << 20` is the **AArch64** tokio kernel's (`akuma-tokio-kernel-aarch64/src/lib.rs`), where
+it is a real 12 MiB saving. `compute_user_stack_size` is wired into both.
+
+**The 2 MiB**: RAM below the image is not the PMM's. 0-1 MiB is the legacy area and boot structures
+(`hvm_start_info` at `0x6000`, memory map `0x7000`, command line `0x20000`, AP trampoline `0x8000`);
+1-2 MiB is excluded by choice, `mem::init_reserving` taking `(LOW_RAM_FLOOR, kernel_end)` although the image
+loads at 2 MiB, because loader structures and the AP trampoline "have lived in that MiB on some boots".
+That MiB is a candidate to give back if nothing still lands there.
+
+**Estimate (not measured)**: 2 MiB low RAM + ~4 MiB image + 4 MiB heap + 2-3 MiB user (tcc about 1.1 MB
+measured on AArch64 at 4 MB RAM, plus init and busybox) is **~12-13 MiB**; trimming the trap stacks to the boot
+CPU count and a smaller slot count (~700 KiB) and gating the ledgers (~190 KiB) gives ~11-12 MiB. The full amd64
+kernel's sum is ~14 MiB against a measured 24 MiB (`forktest_parent`), so allow the real answer to be up to
+1.5x higher: **12-20 MiB**. The historical 4 MB AArch64 floor (`LOW_MEMORY_ENVIRONMENT.md`, `TCC_LOW_MEMORY.md`)
+came from a trimmed `extreme-size` kernel, 1 MB `text_offset` and a ~2.2 MiB heap; Taoxichuan's glue, ext2 and
+tokio layer will not reach it.
+
+**Order of work**
+1. Reproduce the spawn failure above against the documented dev-loop setup, then run the sweep (32, 24, 20, 16
+   MiB, `tcc -static -B /usr/lib/tcc hello.c`) for a measured baseline. Without it every number above is a guess.
+2. Size `TRAP_STACKS`/`TRAP_STACK` from the boot CPU count and a slot count (they are consts today).
+3. Move the PMM ledgers behind the forensics build, or out of the image.
+4. Decide whether 1-2 MiB can be handed back to the PMM.
+5. AArch64 half: replace the flat 16 MiB `HEAP_BYTES` with `compute_heap_size`.
+
+### The auditable line count
+
+`scripts/cloc_akuma.py --audit` at this tree (`no-tests`): `akuma-amd64` 137,107 audit lines (kernel 11,679,
+workspace 91,709, third-party 33,719; 2,295 `unsafe` lines, 1,330 of them third-party), Taoxichuan 80,581
+(amd64) / 79,133 (aarch64), union of its two tracks 86,296, Taoxichuan + `akuma-amd64` 143,158. Taoxichuan adds
+only ~6k on top of the host kernel; the lines to cut are in `akuma-amd64`. The audit counts a crate whole once
+it is in the image, so **feature-gating removes lines and linker-dropped dead code does not**.
+
+1. **A headless audit target.** `AUDIT_KERNELS` has no headless row, so `akuma-amd64` is audited with every
+   driver. `akuma-fbcon` (2,487), `vte` -> `memchr` (4,676) and `unicode-width` (1,787) enter only through it
+   (`cargo tree -i`); none is in the `headless` graph. About 9k lines before any code changes. This changes what
+   is counted, not what is built, and should be reported as that.
+2. **Gate glue by family.** `akuma_syscalls_glue` is 12,143 lines, the largest workspace crate. The families no
+   census program or busybox calls are listed in `B21_TOKIO_KERNEL_AARCH64.md` (R6).
+3. **Scope the hypervisor.** `akuma_kvm_amd64` (6,702) + `akuma_svm_amd64` (4,559) are out of an image that
+   does not host guests.
+4. **Replace the `elf` crate with a generated parser (3,585 lines).** Only `akuma-elf` depends on it, in
+   `load.rs`, `interp.rs`, `source.rs`; the audit counts it whole although the loader uses a sliver.
+   - The hand-rolled parser deleted on 2026-08-13 was removed for being **two copies** (one per exec path) that
+     read fields at literal offsets without checks, so a truncated program-header table parsed "whatever came
+     next" (`truncated_program_header_table_is_rejected` pins it). The replacement was verified on 2,387 binaries
+     with 280 hostile mutations before the deletion.
+   - What the kernel needs is five fixed-layout ELF64 little-endian structures: header, program header, **section
+     header**, `Rela` and `Sym` (only `st_value`), because `apply_relocations` walks `SHT_DYNSYM`/`SHT_RELA`. Not
+     notes, hash tables or versioning. Estimate 250-400 lines.
+   - Generate it from one field/offset/width table (as `syscall_table!` does for syscalls) so every read is
+     bounds-checked by construction, one parser for both source paths, layout assertions emitted with it.
+   - Keep `elf` 0.7 as a **dev-dependency oracle**: rerun the equivalence and mutation test on the host, so the
+     third-party scrutiny stays in verification and leaves the image. Saves ~3.2-3.4k audit lines. Do it after
+     1-3 and not without the fuzz target.
+5. **Third-party overlap.** `heapless` (3,872; via `smoltcp` only) and `arrayvec` (1,116) overlap; `smoltcp`
+   (11,030) is the stack and stays. The crates' `unsafe` is most of the image's: look here first for review cost
+   rather than line count.
+6. **Dispatch.** Glue's `match syscall_num` is on asm-generic numbers, so an amd64 kernel goes x86_64 number ->
+   enum -> asm-generic number -> match. Matching on the arch-neutral enum drops the round trip and makes the
+   match exhaustive at compile time. `akuma_syscalls_abi::legacy::fold` already carries the x86 path spellings
+   for both kernels, so that part is done. The cut is a few hundred lines (amd64 `usermode/dispatch.rs` is 1,434,
+   an unverified 30-40% of it fold and adapter code); the larger cut is Taoxichuan's duplicated `mm`/`proc`/
+   `lazy`/`cow` against glue's `mem`/`proc`, which `mm step 5a-5e` is already converging.
+
+Lines are not effort: an `unsafe` line or a page-table walker costs more to read than a decoder arm
+(`AUDIT_SURFACE_METHODOLOGY.md`). Moving code into a dependency, or generating it where it is not counted,
+lowers the number without lowering the review.
