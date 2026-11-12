@@ -190,6 +190,9 @@ pub fn install_shared_sinks() {
     });
     // This kernel's character devices, behind glue's fd arms (`crate::chardev`).
     crate::chardev::register();
+    // Resizing the console's terminal resizes the framebuffer view
+    // (`console::resize_view`); every other terminal takes glue's answer.
+    akuma_syscalls_glue::term::set_winsize_hook(crate::console::resize_view);
     // The wake effect for the **one** pipe table (4b batch 2b). This target
     // shares `akuma-syscalls-glue`'s table rather than keeping a second
     // instance of `akuma_pipes::PipeTable` — two instances meant two id

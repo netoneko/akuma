@@ -164,9 +164,6 @@ pub mod errno {
     pub const EFAULT: u64 = (-14i64) as u64;
     pub const EINVAL: u64 = (-22i64) as u64;
     pub const EMFILE: u64 = (-24i64) as u64;
-    /// The machine, not this process, is out of open file descriptions.
-    /// Distinct from `EMFILE` on purpose — see `install`.
-    pub const ENFILE: u64 = (-23i64) as u64;
     pub const ENOTTY: u64 = (-25i64) as u64;
     pub const ENODEV: u64 = (-19i64) as u64;
     pub const EIO: u64 = (-5i64) as u64;
@@ -265,7 +262,11 @@ pub const FIRST_FILE_FD: usize = 3;
 /// behind it is a `BTreeMap`, so the only cost is the descriptors a process
 /// actually holds. The two numbers must stay equal: a limit the kernel
 /// reports and does not honour is a lie the program cannot detect.
-pub const MAX_FDS: usize = 1024;
+///
+/// Since 2026-11-12 the two are one constant
+/// (`akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT`), enforced by glue on
+/// both kernels. Here it is only the lookup bound of this file's table helpers.
+pub const MAX_FDS: usize = akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT as usize;
 
 
 /// The descriptor table the boot task (the self-tests, and anything that runs
@@ -404,9 +405,8 @@ pub fn console_end(fd: u64) -> Option<ConsoleEnd> {
 /// process* out of descriptor numbers (checked against [`MAX_FDS`]); the old
 /// `ENFILE` — the machine out of open file descriptions — is gone with
 /// `FILES`, whose fixed 512 slots were what it counted. A `BTreeMap` is
-/// unbounded; the machine-wide ceilings that remain are real resources
-/// (`pipe::alloc`'s `MAX_PIPES`, which still answers `ENFILE` at its own
-/// call site).
+/// unbounded; the machine-wide ceiling that remains is a real resource
+/// (glue's `pipe::MAX_PIPES`, which answers `ENFILE` in `sys_pipe2`).
 fn install(desc: FileDescriptor) -> u64 {
     let t = cur_table();
     if t.table.lock().len() >= MAX_FDS {
@@ -604,129 +604,20 @@ pub fn trace_user_cstr(ptr: u64) {
 // reads `Process::cwd` where this one hard-coded root.
 
 
-/// `openat(dirfd, path, flags, mode)` — **glue's arm, behind a preamble**
-/// (4b batch 2d).
+/// `openat(dirfd, path, flags, mode)`: glue-amd64's arm, which re-encodes the
+/// x86_64 flag word (four bits are permuted against asm-generic) and hands the
+/// call to glue's `openat_path`.
 ///
-/// The ~280 lines that used to be here are
-/// `akuma_syscalls_glue::fs::openat_path`: the `AT_FDCWD` ladder, symlink
-/// resolution, the `/dev` nodes, the existence and parent-directory probes,
-/// `O_CREAT`/`O_TRUNC` through `write_file`, the inode pin, and the descriptor
-/// allocation. What is left is four things that are **this target's**, and each
-/// is here because it cannot be anywhere else.
-///
-/// **1. The flag word arrives in the x86_64 encoding and is re-encoded here,
-/// once** — the same hop `Syscall::from_x86_64` makes for the syscall number,
-/// one argument along. aarch64 Linux keeps the 32-bit ARM fcntl values, so four
-/// bits are *permuted* between the two architectures (`O_DIRECTORY`↔`O_DIRECT`,
-/// `O_NOFOLLOW`↔`O_LARGEFILE`); every other `O_*` bit is identical, which is
-/// exactly why this file used to say the two encodings "happen to share the
-/// same numeric encoding" and carry three separate `_X86` constants for the
-/// ones that do not. Everything below this line — and everything glue reads out
-/// of `KernelFile::flags` — is asm-generic, the one encoding every shared crate
-/// in this tree speaks. See `akuma_syscalls_abi::open_flags`, whose tests pin
-/// the trap: an untranslated x86_64 `O_TMPFILE` slips straight through glue's
-/// refusal.
-///
-/// **2. `/proc/<pid>/fd/0` was the last path this kernel answered for itself,
-/// and no longer is** (2026-09-11). It returned the **write end of the child's
-/// stdin pipe**, which is not what the name means anywhere else: on Linux, and
-/// in the shared `ProcFilesystem`, writing to a process's fd 0 delivers into
-/// *its* stdin. The note here said closing it meant "teaching the shared stdin
-/// sink to find the target's real stdin (its own `get_fd(0)`)", and that is
-/// exactly what happened — `akuma_exec::process::write_to_process_stdin` now
-/// routes to a `PipeRead` at the target's fd 0 through the `pipe_write` runtime
-/// hook, *after* its ISIG filtering. So `sshd`'s bridge opens the real procfs
-/// symlink through glue like everything else under `/proc`, and an `ssh`
-/// session's `^C` becomes a `SIGINT` instead of a `0x03` byte.
-///
-/// **3. The flag refusals** (`O_DIRECTORY`, `O_EXCL`, `O_NOFOLLOW`, `O_CREAT`
-/// on a directory) are glue's `openat_path`'s, for both kernels, since
-/// 2026-11-11 (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 4: fd").
-///
-/// **4. A block node is `ENODEV`, not a raw descriptor.** Glue serves
-/// `/dev/vdX` as a `BlockDev` descriptor (`docs/archive/RAW_BLOCK_DEVICE_FD.md`);
-/// nothing on this target reads one, so a folded `open("/dev/vda")` would hand
-/// back a descriptor whose first `read` answers `EBADF` — a failure at the
-/// wrong syscall, which is the `O_TMPFILE` lesson exactly. Refused here, at
-/// `open`, which is the answer this target has always given.
-///
-/// The `dirfd` case is not a nicety: `apk` loads every signing key with
-/// `openat(keys_dirfd, name)` after listing that directory, and while `dirfd`
-/// was ignored each such open landed on a root-relative name that does not
-/// exist — zero keys loaded, and every fetched index reported `UNTRUSTED
-/// signature` no matter how correct the fetch and the keys were. It is
-/// `akuma_syscalls_glue::fs::resolve_path_at` that answers it now, for both
-/// kernels, and `resolve_at` — this module's own ladder, once used by the
-/// arms that have not folded — is no longer in the `open` path at all. Two
-/// differences come with that swap and both are gains: a bogus negative
-/// `dirfd` is `EBADF` rather than `ENOTDIR`, and `AT_FDCWD` resolves against
-/// the process's `cwd` rather than against `/` — `/` for every process until a
-/// `chdir` moves it, which the target has served since 2026-09-12.
+/// Everything this arm used to add is glue's on both kernels now: the flag
+/// refusals (2026-11-11), the `RLIMIT_NOFILE` `EMFILE`, and the block nodes
+/// (2026-11-12). Glue serves `/dev/vdX` as a raw `BlockDev`, read-only while it
+/// is mounted (`EBUSY` on a write-open), and answers `ENODEV` for a node with
+/// no virtio device behind it (the NVMe root on the metal).
+/// `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "fd: the policies are glue's".
 pub fn sys_openat(dirfd: u64, path: u64, flags_: u64, mode: u64) -> u64 {
-    let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_ as u32);
-
-    // 1024, matching glue's own `copy_from_user_str` bound, so the preamble
-    // cannot refuse a path the arm behind it would have accepted.
-    let Some(raw) = crate::uaccess::read_cstr(path, 1024)
-        .and_then(|b| alloc::string::String::from_utf8(b).ok())
-    else {
-        return errno::EFAULT;
-    };
-
-    // Resolved with **glue's** ladder, not this module's, so the refusals below
-    // are asked of exactly the path `openat_path` will open. Handing the
-    // resolved path back to it costs a `canonicalize` and no second lookup:
-    // it is absolute, so glue's `dirfd_base` returns before it touches the
-    // table.
-    let Ok(resolved) = akuma_syscalls_glue::fs::resolve_path_at(dirfd as i32, &raw) else {
-        return errno::EBADF;
-    };
-
-    // This kernel's own devices (fb, wifi, power, kvm, tun, mouse) are
-    // `crate::chardev`'s, reached from glue's `openat_path`.
-
-    // A **block** node is refused rather than served — see the header. A
-    // table lookup, no I/O, so it is asked unconditionally.
-    if let Some(node) = akuma_vfs_glue::dev_node(&resolved)
-        && node.is_block
-    {
-        return errno::ENODEV;
-    }
-
-    // **The row's descriptor ceiling.** Glue's `alloc_fd` has none — a
-    // `BTreeMap` grows — and here that is not merely a policy difference:
-    // [`MAX_FDS`] is also this module's *lookup* bound ([`table_get_in`],
-    // [`is_bound`] and [`is_nonblocking`] all refuse a number at or above it),
-    // so a descriptor glue handed out past the ceiling would be a successful
-    // `open` that every later syscall answers `EBADF` for.
-    if cur_table().table.lock().len() >= MAX_FDS {
-        return errno::EMFILE;
-    }
-
-    // Glue's arm, refusals and this kernel's devices included. The path is
-    // absolute, so glue does not resolve it a second time.
-    akuma_syscalls_glue::flat(akuma_syscalls_glue::fs::openat_path(dirfd as i32, &resolved, flags, mode as u32))
+    akuma_syscalls_glue_amd64::openat(dirfd, path, flags_, mode)
 }
 
-/// The `open(2)` flag bits, **asm-generic encoding** — the tree's own table,
-/// not a local copy.
-///
-/// This used to be five constants declared here, under a comment reasoning that
-/// pulling them from `akuma_syscalls_linux` would be wrong because "those are
-/// the AArch64/`asm-generic` values" and "on x86_64 they happen to share the
-/// same numeric encoding". The first half was right and the second was **false
-/// for four bits** — aarch64 keeps the 32-bit ARM fcntl values, so
-/// `O_DIRECTORY`, `O_NOFOLLOW`, `O_DIRECT` and `O_LARGEFILE` are a permutation
-/// between the two architectures rather than a shared encoding. The file knew
-/// it in three places, as `O_NOFOLLOW_X86`, `O_TMPFILE_X86` and `O_EXCL_X86`
-/// declared inline where they were needed, which is how a coincidence survives
-/// as a stated fact: each of those sites was correct on its own and none of
-/// them contradicted the comment out loud.
-///
-/// [`sys_openat`] now re-encodes the whole word once at its own boundary
-/// (`akuma_syscalls_abi::open_flags::x86_64_to_aarch64`), so every reader below
-/// it — this module, `KernelFile::flags`, and whatever
-/// `akuma-syscalls-glue` arm folds next — speaks one encoding.
 pub use akuma_syscalls_linux::flags::open as open_flags;
 
 /// `dup(fd)` — x86_64 32. **Glue's arm** (4b batch 3c).
@@ -743,32 +634,18 @@ pub fn sys_dup(fd: u64) -> u64 {
 }
 
 /// `dup2(oldfd, newfd)` — x86_64 33, the legacy spelling asm-generic dropped.
-/// A preamble over glue's `sys_dup3`.
-///
-/// Two things glue's `dup3` arm does not do that `dup2` must:
-/// - **`oldfd == newfd` returns `newfd` unchanged, without closing it**, and
-///   is not an error — where `dup3` answers `EINVAL`. This is the whole
-///   behavioural difference between the two calls.
-/// - **`newfd` past [`MAX_FDS`] is `EBADF`.** Glue's table is a `BTreeMap` with
-///   no ceiling; this target's [`table_get_in`] refuses a number at or above
-///   `MAX_FDS`, so a descriptor glue placed there would be a successful `dup2`
-///   that every later syscall answered `EBADF` for — the trap batch 2d found
-///   for `openat`.
+/// glue-amd64's `dup2`: `oldfd == newfd` returns `newfd` unchanged (where
+/// `dup3` answers `EINVAL`), and `newfd >= RLIMIT_NOFILE` is `EBADF`, checked
+/// first. The ceiling is glue's for both kernels since 2026-11-12.
 pub fn sys_dup2(oldfd: u64, newfd: u64) -> u64 {
-    if newfd >= MAX_FDS as u64 {
-        return errno::EBADF;
-    }
     akuma_syscalls_glue_amd64::dup2(oldfd, newfd)
 }
 
-/// `dup3(oldfd, newfd, flags)` — x86_64 292. **Glue's arm** (4b batch 3c)
-/// behind the `MAX_FDS` ceiling `sys_dup2` explains. `O_CLOEXEC` in `flags` is
+/// `dup3(oldfd, newfd, flags)` — x86_64 292. **Glue's arm** (4b batch 3c),
+/// which refuses `newfd >= RLIMIT_NOFILE` with `EBADF`. `O_CLOEXEC` in `flags` is
 /// honoured by glue; the bit is not one of the four `open(2)` flags that
 /// permute, so `flags` passes through raw.
 pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
-    if newfd >= MAX_FDS as u64 {
-        return errno::EBADF;
-    }
     akuma_syscalls_glue::fs::sys_dup3(oldfd as u32, newfd as u32, flags as u32)
 }
 
@@ -781,25 +658,14 @@ pub fn sys_dup3(oldfd: u64, newfd: u64, flags: u64) -> u64 {
 /// are a shell pipeline.
 ///
 /// The pipe is freed when its **last** end closes — `close_read` and
-/// `close_write` each drop one of the two reference counts `pipe::alloc` starts
+/// `close_write` each drop one of the two reference counts glue's `pipe2` starts
 /// it with, and the second of them destroys it. A shell closes the ends in
 /// whichever order its bookkeeping reaches them, so getting that rule wrong
 /// frees the buffer under a live writer; it used to be a hand-rolled `ends`
 /// counter here and is now `akuma-pipes`' own.
+/// The machine-wide `ENFILE` ceiling is glue's `pipe::MAX_PIPES`, on both kernels.
 pub fn sys_pipe2(fds: u64, flags: u64) -> u64 {
-    // **The `MAX_PIPES` preamble.** Glue's `pipe_create` is a `BTreeMap` with
-    // no ceiling; this target keeps one so a runaway cannot take the kernel
-    // heap a pipe at a time. What that costs and what a real workload needs is
-    // measured on `crate::pipe::MAX_PIPES` — do not restate the per-pipe cost
-    // here, the version of this comment that did was wrong about it. The
-    // `sys_spawn` path gates through `crate::pipe::alloc`; this is the same
-    // gate for the `pipe2(2)` path.
-    if crate::pipe::at_capacity() {
-        return errno::ENFILE;
-    }
-    let r = akuma_syscalls_glue::pipe::sys_pipe2(fds, flags as u32);
-    crate::pipe::note_created();
-    r
+    akuma_syscalls_glue::pipe::sys_pipe2(fds, flags as u32)
 }
 
 /// `close(fd)`. Closing a console descriptor succeeds and does nothing — a
@@ -1514,28 +1380,32 @@ pub fn sys_access(path: u64) -> u64 {
 ///   suite already uses for it (4b batch 2b).
 #[must_use]
 pub fn sys_ioctl(fd: u64, req: u64, arg: u64) -> u64 {
-    // This kernel's own devices are `crate::chardev`'s, reached from glue's `term::sys_ioctl`.
-    // The by-number/by-descriptor console, plus a `/dev/tty` fd. See the header:
-    // the `fd < FIRST_FILE_FD` term is the fake tty and is the reason this
-    // preamble exists at all.
-    let is_console = console_end(fd).is_some() || dev_node_of(fd) == Some("tty");
-    if is_console
+    // A process's terminal ioctls are glue's, on both kernels (2026-11-12):
+    // `ENOTTY` when fd 0/1/2 are a pipe-backed channel, the real foreground
+    // process group, `TCSETSF`'s flush, `Termios::to_wire`'s 36-byte image, and
+    // the console's framebuffer resize through `console::resize_view`. This
+    // kernel's own devices are `crate::chardev`'s, reached from the same arm.
+    // What stays here is a task with **no process** (the boot suite's), which
+    // glue cannot serve: it has no `TerminalState` and no channel of its own.
+    if crate::usermode::current_process().is_none()
+        && (console_end(fd).is_some() || dev_node_of(fd) == Some("tty"))
         && let Some(r) = console_ioctl(req, arg)
     {
         return r;
     }
-    // `TIOCSWINSZ` on a spawned child's stdout needed a shim here while the
-    // parent held that stdout as a plain `PipeRead`: glue's arm reads the child
-    // pid straight out of a `FileDescriptor::ChildStdout(pid)`, which this
-    // target had none of, so the size landed in `sshd`'s own `TerminalState`
-    // and nothing ever read it (`AMD64_SSH_TERM_SIZE_NOT_PASSED.md` break 4).
-    // `sys_spawn` hands back a real `ChildStdout` now, so glue's arm answers it.
-    // Everything else — including any request on a console fd that the terminal
-    // subset above does not claim, which glue also answers `ENOTTY`.
     akuma_syscalls_glue::term::sys_ioctl(fd as u32, req as u32, arg)
 }
 
-/// The terminal subset this target answers itself, for a console fd.
+/// The terminal subset answered for a **process-less** task's console fds.
+///
+/// Every process goes to glue's `term::sys_ioctl` since 2026-11-12. This used
+/// to answer for every console descriptor, which made amd64 diverge: `isatty`
+/// was true on a pipe-backed session, `TIOCSPGRP` did nothing and `TIOCGPGRP`
+/// always said 1, and `TCGETS` wrote 44 bytes into a 36-byte `struct termios`.
+/// It stayed because glue once wrote `c_cc` one byte early; glue uses
+/// `Termios::to_wire` now, which is right.
+///
+/// The older notes below describe it as it was when it served processes.
 ///
 /// `None` means "not one of mine" and sends the caller on to glue's arm.
 ///
@@ -2297,9 +2167,11 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             t.check("fd: and every byte of it is zero", buf[..32].iter().all(|&b| b == 0));
             let _ = sys_close(zfd);
         }
-        // A **block** node is refused rather than falling through — `ENODEV`,
-        // not the `ENOENT` an absent file would get, because it is present and
-        // this target will not serve it.
+        // A **block** node is glue's raw `/dev/vdX` descriptor, as on AArch64:
+        // readable (the ext2 superblock is at byte 1024, magic `0xef53` at 56),
+        // and refused `EBUSY` for writing while it backs a mount. This target
+        // answered `ENODEV` for any open of it until the fd layer moved to glue
+        // (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "fd: the policies are glue's").
         //
         // Asked only when the node is actually there. `/dev/vda` exists when
         // `dev_probe` finds a virtio-blk device, which is QEMU and Firecracker
@@ -2308,11 +2180,19 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         // that matters most.
         if akuma_vfs_glue::dev_node("/dev/vda").is_some() {
             let devvda = b"/dev/vda\0";
-            t.check_eq(
-                "fd: open /dev/vda is ENODEV, not a fall-through",
-                sys_openat(0, devvda.as_ptr() as u64, 0, 0),
-                errno::ENODEV,
-            );
+            let bfd = sys_openat(0, devvda.as_ptr() as u64, 0, 0);
+            if t.check("fd: /dev/vda opens read-only", !errno::is_err(bfd)) {
+                let mut sb = [0u8; 64];
+                t.check_eq("fd: and seeks to the superblock", sys_lseek(bfd, 1024, 0), 1024);
+                t.check_eq("fd: which reads", sys_read(bfd, sb.as_mut_ptr() as u64, 64), 64);
+                t.check_eq("fd: and carries the ext2 magic",
+                           u64::from(u16::from_le_bytes([sb[56], sb[57]])), 0xef53);
+                t.check_eq("fd: close /dev/vda", sys_close(bfd), 0);
+            }
+            if akuma_vfs_glue::device_is_mounted("vda") {
+                t.check_eq("fd: a write-open of the mounted /dev/vda is EBUSY",
+                           sys_openat(0, devvda.as_ptr() as u64, 2, 0), errno::EBUSY);
+            }
         }
     }
 
@@ -2815,6 +2695,10 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     t.check_eq("fd: opening a missing file is ENOENT",
                sys_openat(0, missing.as_ptr() as u64, 0, 0), errno::ENOENT);
     t.check_eq("fd: a null path is EFAULT", sys_openat(0, 0, 0, 0), errno::EFAULT);
+    // ...and an empty one is `ENOENT`, not the cwd: glue's string reader once
+    // read the null page as `""` under the self-tests' validation bypass.
+    let empty = b"\0";
+    t.check_eq("fd: an empty path is ENOENT", sys_openat(0, empty.as_ptr() as u64, 0, 0), errno::ENOENT);
 
     // Write round-trip (2026-09-04): create a file, write to it, close (the
     // one point this target ever persists a write — see `fs`'s module

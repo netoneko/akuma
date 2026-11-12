@@ -2,6 +2,26 @@ use super::*;
 #[cfg(feature = "akuma-native")]
 use akuma_tty::mode_flags;
 
+/// A kernel's say in a window-size change: given the terminal being resized and
+/// the requested `(rows, cols)`, the size it actually takes.
+///
+/// amd64 registers one so that resizing **the console's** terminal resizes the
+/// framebuffer view, which can clamp the request to what fits on the screen.
+/// Every other terminal (a pty, an ssh session) takes the request as given. A
+/// kernel that registers nothing (AArch64, Taoxichuan) changes nothing.
+pub type WinsizeHook = fn(
+    ts: &alloc::sync::Arc<spinning_top::Spinlock<akuma_tty::TerminalState>>,
+    rows: u16,
+    cols: u16,
+) -> (u16, u16);
+
+static WINSIZE_HOOK: akuma_primitives::OnceCopy<WinsizeHook> = akuma_primitives::OnceCopy::new();
+
+/// Register [`WinsizeHook`]. Boot-time, once.
+pub fn set_winsize_hook(hook: WinsizeHook) {
+    WINSIZE_HOOK.set(hook);
+}
+
 pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TCGETS: u32 = 0x5401;
     const TCSETS: u32 = 0x5402;
@@ -11,6 +31,7 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const TIOCSWINSZ: u32 = 0x5414;
     const TIOCGPGRP: u32 = 0x540f;
     const TIOCSPGRP: u32 = 0x5410;
+    const TIOCSCTTY: u32 = 0x540e;
     const FIONBIO: u32 = 0x5421;
     const FIONREAD: u32 = 0x541B;
     const FIOCLEX: u32 = 0x5451;
@@ -161,6 +182,10 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             };
             match ts {
                 Some(state) => {
+                    let (height, width) = match WINSIZE_HOOK.get() {
+                        Some(hook) if height != 0 && width != 0 => hook(&state, height, width),
+                        _ => (height, width),
+                    };
                     let mut s = state.lock();
                     s.term_width = width;
                     s.term_height = height;
@@ -357,6 +382,11 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
             ts.foreground_pgid = pgid;
             0
         }
+        // Making this the controlling terminal: there is one session terminal
+        // per process tree here already, so there is nothing to attach. Linux
+        // succeeds for a session leader, and a shell that asks (`setsid -c`,
+        // an `init` that adopts the console) must not see `ENOTTY`.
+        TIOCSCTTY => 0,
         _ => ENOTTY,
     };
 

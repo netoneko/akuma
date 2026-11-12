@@ -8,8 +8,8 @@ characterization test.
 dependencies** and nothing in it locks. The kernel keeps the acting half:
 `akuma-exec`'s `SharedFdTable` (the three spinlocks and the reference
 effects), `akuma-syscalls-glue/src/fs.rs` (the dup/fcntl/close_range syscall
-bodies, user copies, kernel-object release), `amd64/src/fd.rs` (the `MAX_FDS`
-ceiling, the boot task's `KERNEL_TABLE`).
+bodies, user copies, kernel-object release), `amd64/src/fd.rs` (the boot
+task's `KERNEL_TABLE`).
 
 | item | what | who calls it |
 |---|---|---|
@@ -61,8 +61,10 @@ nonblock"):
   computes a lowest-free fd, sweeps cloexec, or copies a table for fork; the
   read-side `Deref` borrows (`get`/`contains_key`/`range`/`keys`) are the only
   sanctioned direct pokes, always under a lock held by the caller.
-- **The ceiling is policy.** `FdTable` is ceiling-free; `MAX_FDS = 1024` is
-  enforced at `amd64/src/fd.rs` (`install`, `sys_dup2`) and mirrored by
+- **The ceiling is policy.** `FdTable` is ceiling-free; `RLIMIT_NOFILE`
+  (`akuma_syscalls_linux::rlimit::NOFILE_LIMIT`, 1024) is enforced by glue for
+  both kernels (`openat`, `dup`, `dup3`, `F_DUPFD`; glue-amd64's `dup2`), see
+  [`syscalls/fs.md`](syscalls/fs.md), and mirrored by
   `free_below(min, ceiling)` for callers that want the bounded question
   answered where the crate can see it.
 - **Allocation:** three collection nodes per occupied fd, `const`-constructible

@@ -500,8 +500,12 @@ pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
 
 pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
     let limit = user_va_limit();
-    if !BYPASS_VALIDATION.load(Ordering::Acquire)
-        && (ptr < 0x1000 || ptr >= limit) { return Err(EFAULT); }
+    // The null page is refused even under `BYPASS_VALIDATION`: the bypass lets the
+    // boot self-tests pass *kernel* buffers, and no kernel buffer lives in page 0.
+    // On amd64 page 0 reads as zeros in ring 0, so a waived check turned
+    // `openat(AT_FDCWD, NULL)` into `openat(AT_FDCWD, "")` and opened the cwd.
+    if ptr < 0x1000 { return Err(EFAULT); }
+    if !BYPASS_VALIDATION.load(Ordering::Acquire) && ptr >= limit { return Err(EFAULT); }
     let mut bytes = Vec::new();
     let mut len = 0;
     while len < max_len {

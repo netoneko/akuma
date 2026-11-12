@@ -157,6 +157,13 @@ pub mod rlimit {
     pub const RLIMIT_NOFILE: u32 = 7;
     pub const RLIMIT_AS: u32 = 9;
     pub const RLIM_INFINITY: u64 = u64::MAX;
+    /// The `RLIMIT_NOFILE` both kernels report (soft = hard) and enforce.
+    ///
+    /// An open or a `dup` past it is `EMFILE`, a `dup2`/`dup3` target at or
+    /// past it `EBADF`, an `F_DUPFD` floor at or past it `EINVAL` (Linux's
+    /// answers). One constant, so the number `getrlimit` reports is the number
+    /// the fd table refuses at.
+    pub const NOFILE_LIMIT: u64 = 1024;
 }
 
 const _: () = assert!(core::mem::size_of::<CloneArgs>() == 64);

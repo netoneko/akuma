@@ -66,6 +66,18 @@ pub fn is_console_terminal(ts: &Arc<Spinlock<TerminalState>>) -> bool {
     TERM.lock().as_ref().is_some_and(|t| Arc::ptr_eq(t, ts))
 }
 
+/// glue's `TIOCSWINSZ` hook (`akuma_syscalls_glue::term::set_winsize_hook`):
+/// resizing **the console's** terminal resizes the framebuffer view, which may
+/// clamp the request to what fits on the screen. Any other terminal (a pty, an
+/// ssh session) takes the request as given.
+pub fn resize_view(ts: &Arc<Spinlock<TerminalState>>, rows: u16, cols: u16) -> (u16, u16) {
+    if is_console_terminal(ts) {
+        crate::drivers::fb_set_view(cols, rows).unwrap_or((rows, cols))
+    } else {
+        (rows, cols)
+    }
+}
+
 /// The console channel, or `None` before [`init`].: keyboard bytes in `stdin_buffer`, the line
 /// discipline's echo in `buffer`.
 ///

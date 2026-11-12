@@ -233,6 +233,8 @@ pub mod syscall {
         /// has no handler for at all.
         pub const EXECVE: u64 = 221;
         pub const DUP3: u64 = 24;
+        /// `close_range(2)`: 436 in both tables.
+        pub const CLOSE_RANGE: u64 = 436;
         /// asm-generic `reboot(2)`. See [`super::super::reboot`].
         pub const REBOOT: u64 = 142;
     }
@@ -332,6 +334,8 @@ pub mod syscall {
         /// `--features linux-net` a build error on this target.
         pub const EXECVE: u64 = 59;
         pub const DUP3: u64 = 292;
+        /// `close_range(2)`: 436, the same as asm-generic.
+        pub const CLOSE_RANGE: u64 = 436;
         /// Real x86_64 `reboot(2)` — **169**, not the asm-generic 142 (which is
         /// `s390_pci_mmio_write`-adjacent territory on this arch, not reboot).
         /// `amd64/src/usermode.rs` dispatches `Syscall::Reboot` straight to
@@ -2293,6 +2297,13 @@ fn spawn_full(
             close(out_read);
             close(in_read);
             close(in_write);
+            // And everything else the spawner holds: the child is a fresh
+            // program, as 301's is, not an heir to the spawner's descriptors.
+            // sshd's listening and connection sockets are not close-on-exec,
+            // and every session shell held both until 2026-11-12 (1019 free
+            // descriptors where Linux gives 1021). A kernel without it says
+            // `ENOSYS` and the child inherits them, as before.
+            syscall(syscall::CLOSE_RANGE, 3, u64::from(u32::MAX), 0, 0, 0, 0);
             syscall(
                 syscall::EXECVE,
                 path_terminated.as_ptr() as u64,

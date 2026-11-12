@@ -105,6 +105,18 @@ exists, and what `stat` reports — comes from one table (`akuma_vfs::dev`, via
 `open()` on `/dev/vda`..`vdd` now returns (write-open refused `EBUSY` on a
 mounted device) and why a box sees no synthetic `/dev`.
 
+Before any of that, in Linux's order: a NULL or unreadable path is `EFAULT`
+(page 0 is refused even under the boot tests' `BYPASS_VALIDATION`); an empty path
+is `ENOENT`, never the dirfd itself; `O_TMPFILE` is `EINVAL`; and a table holding
+`RLIMIT_NOFILE` descriptors is `EMFILE` whatever the path.
+
+**`RLIMIT_NOFILE` is 1024 and is enforced** (`akuma_syscalls_linux::rlimit::NOFILE_LIMIT`,
+which `prlimit64` also reports): `openat` and `dup`/`F_DUPFD` on a full table are
+`EMFILE`, `dup2`/`dup3` to `fd >= 1024` are `EBADF`, `F_DUPFD` from `>= 1024` is
+`EINVAL`. These are glue's on both kernels; a kernel keeps no descriptor ceiling of
+its own. Oracle: `userspace/forktest/c_stress/fdlimit.c`, identical to Linux at
+`ulimit -n 1024` ([`../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md), "fd: the policies are glue's").
+
 For a real path:
 - File doesn't exist and `O_CREAT` not set → `ENOENT`.
 - File doesn't exist, `O_CREAT` set, but the **parent directory** doesn't

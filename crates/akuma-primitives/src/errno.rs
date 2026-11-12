@@ -102,6 +102,7 @@ errno_table! {
     ENOTDIR = 20;
     EISDIR = 21;
     EINVAL = 22;
+    ENFILE = 23;
     EMFILE = 24;
     ENOTTY = 25;
     ETXTBSY = 26;
@@ -229,6 +230,7 @@ mod tests {
             ("EEXIST", EEXIST, 17),
             ("EXDEV", EXDEV, 18),
             ("EINVAL", EINVAL, 22),
+            ("ENFILE", ENFILE, 23),
             ("EMFILE", EMFILE, 24),
             ("ETXTBSY", ETXTBSY, 26),
             ("EADDRINUSE", EADDRINUSE, 98),

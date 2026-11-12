@@ -2565,6 +2565,52 @@ Gates: AArch64 HVF suite 312/320/318 with ssh ready on every SMP; 10 ssh session
 returned its own exit status and output through sshd's `waitpid_status`; clippy AArch64, amd64
 `headless`, Taoxichuan, host glue.
 
+### fd: the policies are glue's (2026-11-12)
+
+Slice 4's step 3: the policies amd64 enforced alone move into glue, so both kernels apply them.
+amd64's `fd.rs` keeps only what is its own.
+
+| policy | was | now |
+|---|---|---|
+| `RLIMIT_NOFILE` | amd64 only (`MAX_FDS`); AArch64 reported 1024 through `getrlimit` and never applied it | glue, both kernels: `openat`/`dup`/`F_DUPFD` on a full table `EMFILE`; `dup2`/`dup3` to `>= 1024` `EBADF`; `F_DUPFD` from `>= 1024` `EINVAL`. One constant, `akuma_syscalls_linux::rlimit::NOFILE_LIMIT`, also behind `prlimit64` |
+| live pipes | amd64's `pipe::MAX_PIPES` (2048, `ENFILE`) | glue's `pipe::MAX_PIPES`, both kernels; `pipe_stats()` feeds amd64's `[PIPE]` line |
+| `openat` | amd64 preamble (block node `ENODEV`, `MAX_FDS`), then glue-amd64 | glue-amd64's `openat`, so amd64 gains the raw `/dev/vdX` descriptor: readable, `EBUSY` for writing while mounted |
+| terminal ioctls | amd64's `console_ioctl` for every console fd | glue's `term::sys_ioctl` for every process; `console_ioctl` serves only a task with no process |
+
+What amd64's `console_ioctl` got wrong, now that glue answers: `isatty` was true on a pipe-backed
+session, `TIOCSPGRP` did nothing and `TIOCGPGRP` always said 1, and `TCGETS` wrote 44 bytes into
+a 36-byte `struct termios`. The framebuffer resize it did on `TIOCSWINSZ` is a glue hook now,
+`term::set_winsize_hook` (amd64 registers `console::resize_view`). Glue gained `TIOCSCTTY` as a
+no-op success, which amd64 had.
+
+Found on the way, each with its own archive doc:
+
+- `openat(NULL)` read as `""` under the boot tests' validation bypass, and `openat("")` opened
+  the cwd on both kernels ([`OPENAT_NULL_AND_EMPTY_PATH.md`](OPENAT_NULL_AND_EMPTY_PATH.md)).
+- The shared spawn parked each child's channel under tid 0, which is amd64's boot task, and then
+  deleted it ([`SPAWN_TID0_CHANNEL_PLACEHOLDER.md`](SPAWN_TID0_CHANNEL_PLACEHOLDER.md)).
+- libakuma's `linux-abi` spawn (sshd's) passed sshd's sockets to every session shell
+  ([`LINUX_ABI_SPAWN_FD_LEAK.md`](LINUX_ABI_SPAWN_FD_LEAK.md)).
+
+The oracle is `userspace/forktest/c_stress/fdlimit.c`. On Linux 7.0 (`ulimit -n 1024`), the
+AArch64 kernel and amd64 its limit and path rows are identical: `getrlimit 1024/1024`,
+`open_null -14`, `open_empty -2`, `dup2`/`dup3` to the limit `-9`, `F_DUPFD` from it `-22`, 1021
+opens ending at fd 1023, `EMFILE` for `open`/`dup`/`F_DUPFD`, the next open after `close(500)`
+is 500. The `vda_*` rows (Akuma only) agree across the two kernels: read-only open, superblock
+read, ext2 magic `0xef53`, write-open `EBUSY`. `fdrefuse` is unchanged and identical.
+
+**Still pinned:** `pread` on a raw block descriptor is `EBADF` (the probe uses `lseek`+`read`).
+
+Gates: amd64 TCG boot suite 829/839/839 at SMP 1/2/4, 0 failed (+6 checks: the `/dev/vda` read
+path, the write-open `EBUSY`, the empty path); AArch64 HVF suite 312/320/318 with the 3 known
+`SPAWN FAILED` lines; ring-3 harness OK; `fdlimit`/`fdrefuse` and a shell smoke (`>`, `>>`,
+`noclobber`, `cp`/`cmp` of 1.2 MB, `exec 9<`) on both kernels at SMP=2. Terminal: on the amd64
+serial console `stty size` reads 24 80, `stty rows 40 cols 100` is what `stty size` and `stty -a`
+then report, a child of the shell sees a tty and a piped stdin does not; on an AArch64 ssh pty
+session the same. An amd64 ssh session has no pty at all, before and after this change: sshd's
+`linux-abi` spawn ignores the pty flag (open). Clippy: AArch64, amd64 `headless` and
+`headless,no-tests`, the amd64 tests crate, Taoxichuan, host glue/abi crates, sshd.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

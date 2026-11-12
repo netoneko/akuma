@@ -303,6 +303,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 /// is open (where `dup3` answers `EINVAL`); otherwise glue's `dup3` with no flags.
 #[must_use]
 pub fn dup2(old: u64, new: u64) -> u64 {
+    // Linux checks the target against `RLIMIT_NOFILE` first, `old == new` included.
+    if new >= akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT {
+        return EBADF;
+    }
     if old == new {
         let open = akuma_exec::process::current_process_shared().and_then(|p| p.with_fd(old as u32, |_| ()));
         return if open.is_some() { new } else { EBADF };

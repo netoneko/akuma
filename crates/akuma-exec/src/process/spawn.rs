@@ -10,7 +10,7 @@ use alloc::format;
 
 use crate::runtime::{runtime, config};
 use crate::process::types::{Pid, DEFAULT_ENV};
-use crate::process::channel::{ProcessChannel, register_channel, remove_channel};
+use crate::process::channel::{ProcessChannel, register_channel};
 use crate::process::children::{lookup_process_shared, current_terminal_state};
 use crate::process::lifecycle::LifecycleGuard;
 
@@ -592,9 +592,11 @@ pub fn spawn_process_named(
     // allowing reattach() to succeed without races.
     super::table::register_reserved(pid, boxed_process, slot);
 
-    // Register the channel for the thread ID placeholder (0 for now, will be updated)
-    // Actually, current_channel() now uses the field in Process struct, so this is mostly for legacy.
-    register_channel(0, channel.clone());
+    // No per-tid channel is registered until the child's thread exists (below).
+    // This used to park the channel under a placeholder tid 0 and remove it from
+    // there — but tid 0 is a real thread, amd64's boot task, whose console
+    // channel each spawn replaced and then deleted. Nothing read the placeholder:
+    // `current_channel()` consults the `Process` field first.
 
     // The channel THIS spawn created, captured now rather than re-read from the
     // process below. `p.channel` is the process's *I/O* channel and can be
@@ -662,8 +664,6 @@ pub fn spawn_process_named(
                 // the per-thread identity cache (same critical section).
                 crate::process::table::thread_pid_map_insert(tid, pid);
 
-                // Move the channel registration to the correct TID
-                remove_channel(0);
                 register_channel(tid, spawn_channel);
 
                 // Execute the process (already in the table)

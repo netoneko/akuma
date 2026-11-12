@@ -38,8 +38,9 @@ close-on-exec), `TIOCSWINSZ` (see below), the OSS `/dev/dsp` ioctls
 otherwise).
 
 **Real terminal ioctls** (`TCGETS`/`TCSETS*`/`TIOCGWINSZ`/`TIOCGPGRP`/
-`TIOCSPGRP`): gated to `fd <= 2` (`ENOTTY` above that) **and** to a channel
-where `is_terminal()` is true. A spawned child's stdin/stdout is a pipe
+`TIOCSPGRP`; `TIOCSCTTY` is a no-op success): gated to an fd whose **table
+entry** is `Stdin`/`Stdout`/`Stderr`/`DevTty` (`ENOTTY` for a pipe, file or
+socket dup'd over 0/1/2) **and** to a channel where `is_terminal()` is true. A spawned child's stdin/stdout is a pipe
 (`ProcessChannel`), not a real terminal — reporting `ENOTTY` there is
 deliberate so `isatty()` (which probes `TCGETS`) reports false and shells
 run non-interactively over the SSH-into-box bridge instead of launching a
@@ -51,6 +52,15 @@ child its own fresh `TerminalState` Arc (deliberately not sharing sshd's,
 so concurrent sessions don't alias one `input_waker` slot) — see
 [`../ssh.md`](../ssh.md) "PTY / winsize" for why sshd must therefore target
 the child's state rather than its own.
+
+**One implementation for both kernels.** amd64's `fd::sys_ioctl` sends every
+process here and keeps only a kernel task with no process (which has no
+`TerminalState` or channel for glue to read); a kernel must not
+answer a process's terminal ioctl itself. A kernel whose terminal has a size of
+its own registers `term::set_winsize_hook`, which `TIOCSWINSZ` calls with the
+state and the requested size and which returns the size actually applied
+(amd64's framebuffer console clamps to what fits). The 36-byte `TCGETS` image is
+`Termios::to_wire` ([`../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md), "fd: the policies are glue's").
 
 ## Rich terminal syscalls (307–313)
 

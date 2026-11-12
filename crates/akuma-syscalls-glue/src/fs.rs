@@ -1817,12 +1817,26 @@ pub fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> SysResult {
     }
 }
 
+/// `RLIMIT_NOFILE`, as both kernels report and enforce it.
+const NOFILE: u64 = akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT;
+
+/// Is `proc`'s table full, so a fresh descriptor would land at or past
+/// [`NOFILE`]? A count, not "is the lowest free number `>= NOFILE`": the two
+/// agree while no descriptor sits at or past the limit, and nothing here can
+/// put one there (every `dup` target and `F_DUPFD` floor is bounded below).
+fn fd_table_full(proc: &akuma_exec::process::Process) -> bool {
+    proc.fds.table.lock().len() as u64 >= NOFILE
+}
+
 pub fn sys_dup(oldfd: u32) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
         None => return EBADF,
     };
+    if fd_table_full(proc) {
+        return EMFILE;
+    }
     // One list, in `akuma_exec::process::clone_fd_refs`. This was a local
     // four-arm copy that had drifted: `EventFd` and `RumpSocket` are
     // refcounted but were handled only on the fork path, so a dup of
@@ -1846,6 +1860,7 @@ pub fn sys_dup(oldfd: u32) -> u64 {
 
 pub fn sys_dup3(oldfd: u32, newfd: u32, flags: u32) -> u64 {
     if oldfd == newfd { return EINVAL; }
+    if u64::from(newfd) >= NOFILE { return EBADF; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
     let entry = match proc.get_fd(oldfd) {
         Some(e) => e,
@@ -2019,6 +2034,24 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             akuma_primitives::safe_print!(128, "[syscall] openat({:?}): O_TMPFILE unsupported -> EINVAL\n", raw_path);
         }
         return Err(EINVAL);
+    }
+
+    // An empty path names nothing (`openat` has no `AT_EMPTY_PATH`). Resolved,
+    // `""` is the dirfd itself, so `open("")` used to open the cwd. Linux
+    // checks this when it copies the name in: after the flag checks above,
+    // before the descriptor is allocated.
+    if raw_path.is_empty() {
+        return Err(ENOENT);
+    }
+
+    // `RLIMIT_NOFILE`: Linux allocates the descriptor before it looks the path
+    // up, so a full table is `EMFILE` whatever the path. amd64 enforced this
+    // alone (`MAX_FDS`) until 2026-11-12; the AArch64 kernel reported the limit
+    // through `getrlimit` and never applied it.
+    if let Some(proc) = akuma_exec::process::current_process_shared()
+        && fd_table_full(proc)
+    {
+        return Err(EMFILE);
     }
 
     // Was an eighth copy of the `AT_FDCWD` ladder, and one of the two that
@@ -3422,6 +3455,12 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     match cmd {
         F_DUPFD | F_DUPFD_CLOEXEC => {
             let entry = match proc.get_fd(fd) { Some(e) => e, None => return EBADF };
+            if arg >= NOFILE {
+                return EINVAL;
+            }
+            if fd_table_full(proc) {
+                return EMFILE;
+            }
             // Bump refcounts before inserting the duplicate entry. One list, in
             // `akuma_exec::process::clone_fd_refs`. This was a local four-arm
             // copy that had drifted: `EventFd` and `RumpSocket` are refcounted

@@ -1396,7 +1396,10 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
                 let stack_size = akuma_exec::runtime::config().user_stack_size as u64;
                 (stack_size, stack_size)
             },
-            7 => (1024, 1024),
+            7 => (
+                akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT,
+                akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT,
+            ),
             _ => (RLIM_INFINITY, RLIM_INFINITY),
         };
         let rlim = Rlimit { rlim_cur: cur, rlim_max: max };
