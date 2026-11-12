@@ -1107,28 +1107,19 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // (real on this target — `exec_runtime.rs`), `RLIMIT_NOFILE` 1024,
         // everything else `RLIM_INFINITY`.
         Syscall::Prlimit64 => to_glue(call, [a1, a2, a3, a4, a5, a6]),
-        // Process-group / session ids. One process, so it is its own group and
-        // session leader; `setpgid`/`setsid` accept and report id 1.
-        // `getpgid`/`getsid` still answer `1` — **deliberately, and the reason is
-        // the console**. `TerminalState::foreground_pgid` defaults to 1 and
-        // `kill_foreground_group` excludes the group leader, which is what makes
-        // `^C` reach `init`'s children and not `init` (`crate::console`). A shell
-        // that read a real `getpgid` and then `TIOCSPGRP`'d it would move that
-        // target, and nothing here has been tested against job control. Fold
-        // them when something needs them, with the Ctrl-C gate in hand.
-        //
-        // **Something needed them: a pty session** (2026-10-05). A shell on a
-        // pseudo-terminal does job control against *that* terminal's foreground
-        // group — busybox `ash` loops `killpg(0, SIGTTIN)` until
-        // `tcgetpgrp() == getpgrp()` — so for a process whose session a pty
-        // controls the answers are real, and for everything else (the console
-        // world this comment is about) they are exactly what they were.
-        // `setsid` is real everywhere: it is how a pty child gets a group of
-        // its own before `TIOCSCTTY`, and it detaches from any terminal, which
-        // touches nothing the console reads. `akuma_syscalls_glue::pty`.
-        Syscall::Getpgid => akuma_syscalls_glue::pty::sys_getpgid_gated(a1 as u32),
+        // Process-group / session ids. `setpgid`/`getpgid` are glue's real ones, as on
+        // the AArch64 kernel (2026-11-12): the shared spawn gives every child a group
+        // of its own and points its terminal's foreground group at it (init's is the
+        // console's), so a job-control shell's `tcgetpgrp() == getpgrp()` holds, and its
+        // `setpgid(job, job)` + `TIOCSPGRP(job)` lets `^C` reach the job. Until then they
+        // were real only inside a pty session and accepted no-ops elsewhere, and on the
+        // serial console `^C` went to an empty group (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`,
+        // "Job control on the amd64 console"). `getsid` stays the pty-gated answer: glue has
+        // no session model beyond a pty's, and the AArch64 kernel does not serve it at all.
+        // `setsid` is real everywhere: it is how a pty child gets a group of its own
+        // before `TIOCSCTTY`. `akuma_syscalls_glue::pty`.
+        Syscall::Getpgid | Syscall::Setpgid => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         Syscall::Getsid => akuma_syscalls_glue::pty::sys_getsid_gated(a1 as u32),
-        Syscall::Setpgid => akuma_syscalls_glue::pty::sys_setpgid_gated(a1 as u32, a2 as u32),
         Syscall::Setsid => akuma_syscalls_glue::pty::sys_setsid(),
         Syscall::Getrusage => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `waitid(idtype, id, infop, options, rusage)` — x86_64 247, glue's (`sys_waitid`: `P_PID`/`P_ALL`/

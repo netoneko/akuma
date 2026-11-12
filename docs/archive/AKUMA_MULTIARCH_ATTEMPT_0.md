@@ -2737,7 +2737,7 @@ Open, found on the way and not changed here:
 - **herd retries a refused service forever.** On `server` its `console = true` service fails with
   `ENODEV` and is restarted every `restart_delay`: 69 times in a minute. herd should give up, or
   back off, after repeated start failures.
-- **No job control on the amd64 serial console.** amd64 dispatches `setpgid`/`getpgid`/`getsid`
+- **No job control on the amd64 serial console** (fixed in "Job control on the amd64 console" below). amd64 dispatches `setpgid`/`getpgid`/`getsid`
   to `pty::*_gated`, which are real only inside a pty session and the old accepted no-ops
   elsewhere. A busybox shell as init runs `sleep 30` "in" group 71 (its `TIOCSPGRP` sets the
   terminal's foreground group), but the `setpgid` was a no-op, so `^C` reaches
@@ -2765,6 +2765,28 @@ INITARGS=--port,22,--no-banner` boots with sshd as init (no herd) and serves ssh
 `init=/bin/busybox initargs=uname,-a` runs one applet and reaches `-- init exited --`;
 `init=/bin/sshd` serves 10 ssh sessions; `akuma-params` host tests; clippy on AArch64 and the three
 amd64 images.
+
+### Job control on the amd64 console (2026-11-12)
+
+amd64 answered `setpgid`/`getpgid` through `pty::*_gated`: real inside a pty session, and outside one
+`setpgid` accepted and did nothing while `getpgid` said 1. The reason was the console: its terminal's
+foreground group defaulted to 1, and a shell reading a real group and `TIOCSPGRP`-ing it would have
+moved the `^C` target, untested. What that cost: a busybox shell as init put `sleep 30` "in" group 70
+(`TIOCSPGRP` is real) while its `setpgid` was a no-op, so `^C` reached
+`[ISIG] ... fg_pgid=70 members=0` and nothing died.
+
+The shared spawn now gives every child its own group and points its terminal's foreground group at it
+(init's terminal is the console's, through `Attach`). So amd64 dispatches `setpgid`/`getpgid` to glue's
+real implementations, as the AArch64 kernel always has. `getsid` stays the pty-gated answer: glue has
+no session model beyond a pty's, and AArch64 does not serve `getsid` at all.
+
+Checked: busybox as init on the serial console, `sleep 30` then `^C`, gives `members=1` and
+`pid=70 killed by signal 2`, then `sleep 2 &`, `jobs`, `wait` behave; herd's console shell the same
+(`members=1`); 10 ssh sessions plain and with `-tt`; amd64 suite 831/841/841, ring-3 OK.
+
+Not fixed by this: `^C` in an **interactive ssh** session on amd64 (`ssh -tt` with a typed `sleep 30`)
+does nothing, the same with or without this change, because sshd's sessions have no terminal at all
+there (next section).
 
 ### Slice 5: mm (deferred, 2026-11-11)
 
