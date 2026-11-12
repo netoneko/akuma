@@ -411,7 +411,7 @@ private numbers (315-318, 324, 325) to `akuma-syscalls-glue` from
   `resolve_symlinks` to its resolver. Stubbing any of them silently un-jails
   `spawn_ext` children.
 - **Loading**: `spawn_ext` loads by path (large binaries) *eagerly*
-  (`set_eager_path_loads`) — amd64's `#PF` handler does not serve `LazyRegionMap`.
+  (`set_eager_path_loads`) — amd64's `#PF` handler does not serve AArch64's lazy regions.
 - **Threads**: a `spawn_ext` thread is created through
   `spawn_user_closure_initializing` so it gets a trap stack. A new way to create
   a user thread on x86_64 must call `ArchHooks::prepare_task_slot`.

@@ -999,24 +999,33 @@ pub fn alloc_mmap(size: usize) -> usize {
 }
 
 // ==========================================================================
-// LazyRegionMap — the per-process lazy-region bookkeeping.
+// Lazy (demand-paged) regions.
 //
-// This is the pure data-structure layer, lifted out of the former global
-// `LAZY_REGION_TABLE` so it can live as a field on `Process` (`lazy_regions:
-// Spinlock<LazyRegionMap>`). Owning the map per-process is what closes the
-// rule-2 hang class for this subsystem: a `BTreeMap::insert` that OOMs under
-// the lock routes through `alloc_error_handler` → `return_to_kernel`, whose
-// teardown used to re-enter the *global* `LAZY_REGION_TABLE` (`clear_lazy_regions`)
-// and spin forever (the abandoned `SpinlockGuard` is never dropped — no
-// unwinding). With the map owned by the dying `Process`, the field drops inside
-// `Process::drop` on the existing reclaim path and teardown no longer
-// re-acquires it. See docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md.
+// A lazy region is an `MmapRegion` with `lazy` set, in the same sorted
+// `Process::mmap_regions` list as the eager ones (step 4b of
+// `proposals/AKUMA_MM_CONVERGENCE.md`). It used to be a `LazyRegion` in a
+// per-process `BTreeMap` of its own (`LazyRegionMap`), which is the list the
+// amd64 kernel never had; one list is what lets the two kernels' fault paths
+// read the same record.
 //
-// Keeping the logic in a standalone newtype also means it is unit-testable
-// without a registered `Process` (the host regression tests construct one
-// directly), preserving the coverage the old global-table tests gave us.
+// The pid-keyed API below (`lazy_region_lookup*`, `push_lazy_region*`,
+// `munmap_lazy_regions_in_range`, ...) kept its names and shapes: a lookup
+// still hands back `(flags word, LazySource, start, size)`, the `LazySource`
+// rebuilt from the region's `FileBacking` (`lazy_source_of`). The pure layer
+// under it (`lazy_mmap_region`, `insert_lazy_region`, `lazy_lookup`,
+// `detach_lazy`) takes a `&mut Vec<MmapRegion>` and is host-tested without a
+// process.
+//
+// What keeps a mapped file alive is the address space's `MappingPins`
+// (`akuma-user-space`), taken on push and released when no region names the
+// inode any more. A `LazySource` handed out by a lookup carries a pin of its
+// own, held only while the caller reads the file.
+//
+// The rule-2 hang that moved the old global table onto `Process`
+// (docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md) still does not
+// apply: the list drops with the `Process`, and no teardown path takes
+// `mmap_regions`' lock on a dying process.
 // ==========================================================================
-
 /// The protection an AArch64 `user_flags` word records: `0` is "none recorded",
 /// anything else its [`Prot`](akuma_mmap::Prot). Exact for every word this tree
 /// stores (the six [`to_pte`](crate::mmu::user_flags::to_pte) encodings), which
@@ -1032,239 +1041,177 @@ fn region_word(prot: Option<akuma_mmap::Prot>) -> u64 {
     prot.map_or(0, crate::mmu::user_flags::to_pte)
 }
 
-/// A process's set of demand-paged lazy regions, keyed by `start_va`.
-pub struct LazyRegionMap {
-    regions: BTreeMap<usize, LazyRegion>,
+/// The `MmapRegion` that records a lazy region of `size` bytes at `start_va`
+/// reading from `source`.
+///
+/// A file source becomes a [`FileBacking`](akuma_mmap::FileBacking) whose
+/// `lead` is the distance from the region's first page to the segment's first
+/// byte; [`lazy_source_of`] reads it back. A source whose `segment_va` lies
+/// below `start_va` (a piece of a clipped region) is advanced to `start_va`
+/// first, the same arithmetic `FileBacking::advance` applies to a clip.
+#[must_use]
+pub fn lazy_mmap_region(start_va: usize, size: usize, flags: u64, source: &LazySource) -> MmapRegion {
+    debug_assert!(start_va % crate::mmu::PAGE_SIZE == 0 && size % crate::mmu::PAGE_SIZE == 0,
+        "a lazy region is whole pages");
+    let region = MmapRegion::demand_paged(start_va, size.div_ceil(crate::mmu::PAGE_SIZE), region_prot(flags));
+    match *source {
+        LazySource::File { inode, mount_id, file_offset, filesz, segment_va, .. } => {
+            let file = if segment_va >= start_va {
+                akuma_mmap::FileBacking { mount_id, inode, offset: file_offset, filesz, lead: segment_va - start_va }
+            } else {
+                let skip = start_va - segment_va;
+                akuma_mmap::FileBacking {
+                    mount_id,
+                    inode,
+                    offset: file_offset.saturating_add(skip),
+                    filesz: filesz.saturating_sub(skip),
+                    lead: 0,
+                }
+            };
+            region.file_backed(file)
+        }
+        LazySource::Zero => region,
+    }
 }
 
-impl LazyRegionMap {
-    pub const fn new() -> Self {
-        Self { regions: BTreeMap::new() }
+/// The [`LazySource`] a lazy region reads from: [`lazy_mmap_region`] read
+/// backwards. Takes a pin on a file's inode, which the caller holds while it
+/// reads the file and drops after.
+#[must_use]
+pub fn lazy_source_of(region: &MmapRegion) -> LazySource {
+    match region.file {
+        Some(f) => LazySource::file(f.mount_id, f.inode, f.offset, f.filesz, region.start_va + f.lead),
+        None => LazySource::Zero,
     }
+}
 
-    pub fn len(&self) -> usize {
-        self.regions.len()
-    }
+/// `(flags word, source, start_va, size)` for a lazy region: the shape every
+/// lookup has always returned. The word is `0` when the region records no
+/// protection ([`region_word`]).
+fn lazy_view(region: &MmapRegion) -> (u64, LazySource, usize, usize) {
+    (region_word(region.recorded_prot()), lazy_source_of(region), region.start_va, region.len_bytes())
+}
 
-    pub fn is_empty(&self) -> bool {
-        self.regions.is_empty()
-    }
+/// Set once a lazy region was pushed over an eager one. The list is then no
+/// longer free of overlaps, which [`region_index_containing`]'s binary search
+/// relies on, so [`lazy_lookup`] falls back to a scan.
+static LAZY_OVER_EAGER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-    /// O(log n) lookup of the region covering `va`, if any. The `LazySource` is
-    /// cloned out so the caller can drop the lock before doing I/O.
-    pub fn lookup(&self, va: usize) -> Option<(u64, LazySource, usize, usize)> {
-        let (_key, r) = self.regions.range(..=va).next_back()?;
-        (va < r.start_va + r.size)
-            .then(|| (region_word(r.prot), r.source.clone(), r.start_va, r.size))
-    }
-
-    /// Insert/replace a region. Returns the new region count.
-    pub fn push(&mut self, start_va: usize, size: usize, flags: u64, source: LazySource) -> usize {
-        self.regions.insert(
-            start_va,
-            LazyRegion { start_va, size, prot: region_prot(flags), source },
-        );
-        self.regions.len()
-    }
-
-    pub fn remove(&mut self, start_va: usize) -> Option<LazyRegion> {
-        self.regions.remove(&start_va)
-    }
-
-    pub fn clear(&mut self) -> usize {
-        let n = self.regions.len();
-        self.regions.clear();
-        n
-    }
-
-    /// Deep-clone of the whole map (fork propagation snapshots).
-    pub fn clone_all(&self) -> BTreeMap<usize, LazyRegion> {
-        self.regions.clone()
-    }
-
-    /// Snapshot every `LazySource::File` region's `(start_va, size)` onto a
-    /// stack buffer for `reclaim_clean_file_pages` (which cannot allocate — it
-    /// runs on the OOM path). `out` is filled up to `N` entries; returns the
-    /// count written.
-    pub fn snapshot_file_regions<const N: usize>(
-        &self,
-        out: &mut [(usize, usize); N],
-    ) -> usize {
-        let mut n = 0usize;
-        for r in self.regions.values() {
-            if matches!(r.source, LazySource::File { .. }) && n < N {
-                out[n] = (r.start_va, r.size);
-                n += 1;
-            }
+/// The lazy region containing `va`, as [`lazy_view`] describes it.
+#[must_use]
+pub fn lazy_lookup(regions: &[MmapRegion], va: usize) -> Option<(u64, LazySource, usize, usize)> {
+    if let Some(i) = region_index_containing(regions, va) {
+        if regions[i].lazy {
+            return Some(lazy_view(&regions[i]));
         }
-        n
     }
+    if LAZY_OVER_EAGER.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    regions.iter().rev().find(|r| r.lazy && r.contains(va)).map(lazy_view)
+}
 
-    /// Merge every region in `src` into `self`, replacing any existing entry at
-    /// the same `start_va` and leaving entries at other VAs alone (fork's
-    /// `propagate_lazy_regions_to_child`). Returns the number of entries in
-    /// `self` after the merge.
-    pub fn extend_from_slice(&mut self, src: &[LazyRegion]) -> usize {
-        for r in src {
-            self.regions.insert(r.start_va, r.clone());
+/// Whether any region of the list reads from `inode`.
+#[must_use]
+pub fn regions_name_inode(regions: &[MmapRegion], inode: u32) -> bool {
+    regions.iter().any(|r| r.file.is_some_and(|f| f.inode == inode))
+}
+
+/// The inodes a removal may have stopped mapping, collected under the region
+/// lock without allocating. Holds up to four; an inode past that keeps its
+/// address-space pin, which costs disk space until exit and never correctness.
+#[derive(Default)]
+pub struct OrphanedInodes {
+    inodes: [u32; 4],
+    n: usize,
+}
+
+impl OrphanedInodes {
+    fn note(&mut self, regions: &[MmapRegion], inode: u32) {
+        if inode == 0 || self.inodes[..self.n].contains(&inode) || regions_name_inode(regions, inode) {
+            return;
         }
-        self.regions.len()
-    }
-
-    /// Replace `self`'s contents with a deep clone of `src` (fork's
-    /// `clone_lazy_regions`).
-    pub fn replace_with_clone(&mut self, src: &BTreeMap<usize, LazyRegion>) {
-        self.regions = src.clone();
-    }
-
-    /// Update flags on all regions overlapping `[range_start, range_end)`,
-    /// splitting partially-overlapping regions as needed.
-    pub fn update_flags(&mut self, range_start: usize, range_size: usize, new_flags: u64) {
-        let new_prot = region_prot(new_flags);
-        let range_end = range_start + range_size;
-        // Collect keys of regions that overlap [range_start, range_end).
-        let keys: alloc::vec::Vec<usize> = self
-            .regions
-            .range(..range_end)
-            .filter(|x| *x.0 + x.1.size > range_start)
-            .map(|x| *x.0)
-            .collect();
-
-        for key in keys {
-            let r_start = key;
-            let r_size = self.regions[&key].size;
-            let r_end = r_start + r_size;
-            let r_prot = self.regions[&key].prot;
-            let r_source = self.regions[&key].source.clone();
-
-            let clip_start = r_start.max(range_start);
-            let clip_end = r_end.min(range_end);
-
-            if clip_start == r_start && clip_end == r_end {
-                // Fully contained: update in place.
-                self.regions.get_mut(&key).unwrap().prot = new_prot;
-            } else {
-                // Partially overlapping: remove and re-insert up to 3 pieces.
-                self.regions.remove(&key);
-                if clip_start > r_start {
-                    self.regions.insert(r_start, LazyRegion {
-                        start_va: r_start,
-                        size: clip_start - r_start,
-                        prot: r_prot,
-                        source: r_source.clone(),
-                    });
-                }
-                self.regions.insert(clip_start, LazyRegion {
-                    start_va: clip_start,
-                    size: clip_end - clip_start,
-                    prot: new_prot,
-                    source: r_source.clone(),
-                });
-                if clip_end < r_end {
-                    self.regions.insert(clip_end, LazyRegion {
-                        start_va: clip_end,
-                        size: r_end - clip_end,
-                        prot: r_prot,
-                        source: r_source,
-                    });
-                }
-            }
+        if self.n < self.inodes.len() {
+            self.inodes[self.n] = inode;
+            self.n += 1;
         }
     }
 
-    /// Clip/remove the first region overlapping `[range_start, range_end)` for
-    /// munmap. Returns `Some((op, freed_start_va, freed_pages))` if a region was
-    /// touched, so the caller can loop for further overlaps. `op` is the clip
-    /// shape — `F`ull / `P`refix / `S`uffix / `M`iddle-split — carried out for the
-    /// caller's `[LR*]` debug line; region splitting is where this code has gone
-    /// wrong before, and the shape is the first thing you want in the log.
-    ///
-    /// The second value is the inode of a file region removed **whole** (0
-    /// otherwise): a clip leaves a piece naming the same file, a full removal
-    /// may have taken the last mapping of it ([`Self::names_inode`]).
-    pub fn munmap_one_overlap(
-        &mut self,
-        range_start: usize,
-        range_end: usize,
-    ) -> Option<((char, usize, usize), u32)> {
-        let key = self
-            .regions
-            .range(..range_end)
-            .filter(|x| *x.0 + x.1.size > range_start)
-            .map(|x| *x.0)
-            .next()?;
+    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        self.inodes[..self.n].iter().copied()
+    }
 
-        let reg_start = key;
-        let reg_size = self.regions[&key].size;
-        let reg_end = reg_start + reg_size;
-        let reg_prot = self.regions[&key].prot;
-        let reg_source = self.regions[&key].source.clone();
-
-        let clip_start = range_start.max(reg_start);
-        let clip_end = range_end.min(reg_end);
-
-        if clip_start == reg_start && clip_end == reg_end {
-            self.regions.remove(&key);
-            Some((('F', reg_start, reg_size / 4096), reg_source.pinned_inode()))
-        } else if clip_start == reg_start {
-            // Trim prefix: remove old entry, insert remainder at new start_va.
-            self.regions.remove(&key);
-            self.regions.insert(clip_end, LazyRegion {
-                start_va: clip_end,
-                size: reg_end - clip_end,
-                prot: reg_prot,
-                source: reg_source,
-            });
-            Some((('P', clip_start, (clip_end - clip_start) / 4096), 0))
-        } else if clip_end == reg_end {
-            // Trim suffix: shorten the existing entry in place (key unchanged).
-            self.regions.get_mut(&key).unwrap().size = clip_start - reg_start;
-            Some((('S', clip_start, (reg_end - clip_start) / 4096), 0))
-        } else {
-            // Middle split: shorten left piece, insert right piece.
-            self.regions.get_mut(&key).unwrap().size = clip_start - reg_start;
-            self.regions.insert(clip_end, LazyRegion {
-                start_va: clip_end,
-                size: reg_end - clip_end,
-                prot: reg_prot,
-                source: reg_source,
-            });
-            Some((('M', clip_start, (clip_end - clip_start) / 4096), 0))
+    /// Release the address space's pin on each.
+    fn unpin(&self, proc: &Process) {
+        if self.n > 0 {
+            proc.with_address_space(|a| self.iter().for_each(|i| a.unpin_mapped_inode(i)));
         }
     }
+}
 
-    /// Whether any region still reads from `inode`. Linear in the region
-    /// count, and run only after a file region is removed whole.
-    #[must_use]
-    pub fn names_inode(&self, inode: u32) -> bool {
-        self.regions.values().any(|r| r.source.pinned_inode() == inode)
-    }
+/// What [`insert_lazy_region`] displaced.
+#[derive(Default)]
+pub struct LazyInsert {
+    /// Files no region maps after the insert.
+    pub orphaned: OrphanedInodes,
+    /// The new region overlaps an eager one (see [`LAZY_OVER_EAGER`]).
+    pub over_eager: bool,
+}
 
-    /// Debug iterator (first 8 regions) for `lazy_region_debug`.
-    pub fn for_each_debug<F: FnMut(usize, usize)>(&self, mut f: F) {
-        for r in self.regions.values().take(8) {
-            f(r.start_va, r.size);
+/// Insert a lazy region, first removing whatever part of an existing lazy
+/// region it covers: the later push wins, as it did when the map was keyed by
+/// `start_va`. That case is real, not defensive: the ELF loader registers
+/// adjacent segments that share a boundary page, and the later segment is the
+/// one that serves it.
+pub fn insert_lazy_region(regions: &mut Vec<MmapRegion>, region: MmapRegion) -> LazyInsert {
+    debug_assert!(region.lazy);
+    let (start, end) = (region.start_va, region.start_va + region.len_bytes());
+    let new_inode = region.file.map_or(0, |f| f.inode);
+    let removed = akuma_mmap::detach_lazy_regions_in_range(regions, start, end);
+    let over_eager = akuma_mmap::regions_overlapping(regions, start, end)
+        .iter()
+        .any(|r| !r.lazy && r.start_va < end && start < r.start_va + r.len_bytes());
+    insert_region_sorted(regions, region);
+    let mut out = LazyInsert { over_eager, ..LazyInsert::default() };
+    for piece in &removed {
+        if let Some(f) = piece.file && f.inode != new_inode {
+            out.orphaned.note(regions, f.inode);
         }
     }
+    out
+}
+
+/// Remove the lazy regions' share of `[start, end)`, clipping at both ends.
+/// Returns each removed piece as `(start_va, pages)`, and the files no region
+/// maps afterwards.
+pub fn detach_lazy(regions: &mut Vec<MmapRegion>, start: usize, end: usize) -> (Vec<(usize, usize)>, OrphanedInodes) {
+    let removed = akuma_mmap::detach_lazy_regions_in_range(regions, start, end);
+    let mut orphaned = OrphanedInodes::default();
+    for piece in &removed {
+        if let Some(f) = piece.file {
+            orphaned.note(regions, f.inode);
+        }
+    }
+    (removed.iter().map(|p| (p.start_va, p.pages)).collect(), orphaned)
 }
 
 /// Check if a virtual address falls within any lazy region of the current process.
 /// Returns `(flags, source, region_start, region_size)` if found.
-/// The source is cloned so the caller can release the lock before performing I/O.
+/// The source is built under the region lock and owned, so the caller can
+/// release the lock before performing I/O.
 pub fn lazy_region_lookup(va: usize) -> Option<(u64, LazySource, usize, usize)> {
     let pid = address_space_owner_pid_for_fault()?;
-    lookup_process_shared(pid).and_then(|p| with_irqs_disabled(|| p.lazy_regions.lock().lookup(va)))
+    lazy_region_lookup_for_pid(pid, va)
 }
 
 /// Number of lazy regions registered for `pid` (0 if the pid isn't registered).
 pub fn lazy_region_count_for_pid(pid: Pid) -> usize {
-    lookup_process_shared(pid).map_or(0, |p| with_irqs_disabled(|| p.lazy_regions.lock().len()))
+    lookup_process_shared(pid).map_or(0, |p| p.vm_with_regions(|r| r.iter().filter(|x| x.lazy).count()))
 }
 
 pub fn lazy_region_lookup_for_pid(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
-    lookup_process_shared(pid).and_then(|p| with_irqs_disabled(|| p.lazy_regions.lock().lookup(va)))
+    lookup_process_shared(pid).and_then(|p| p.vm_with_regions(|r| lazy_lookup(r, va)))
 }
-
 /// Rotating sweep cursor (VA) for [`reclaim_clean_file_pages`], so successive
 /// reclaims page out across the whole file region (clock-like) instead of always
 /// hitting the same low addresses.
@@ -1300,7 +1247,17 @@ pub fn reclaim_clean_file_pages(want: usize) -> usize {
     // we are already under memory pressure and a Vec growth could recurse into
     // the allocator's OOM handler. 64 regions is ample (llama uses ~37 total).
     let mut regions: [(usize, usize); 64] = [(0, 0); 64];
-    let n = with_irqs_disabled(|| proc.lazy_regions.lock().snapshot_file_regions(&mut regions));
+    let n = proc.vm_with_regions(|r| {
+        let mut n = 0usize;
+        for reg in r.iter().filter(|reg| reg.lazy && reg.file.is_some()) {
+            if n == regions.len() {
+                break;
+            }
+            regions[n] = (reg.start_va, reg.len_bytes());
+            n += 1;
+        }
+        n
+    });
     if n == 0 { return 0; }
 
     // Cap pages scanned per call so a sparse (mostly-unmapped) region set can't
@@ -1380,9 +1337,8 @@ pub fn address_space_owner_of(pid: Pid) -> Option<(Pid, usize)> {
 }
 
 /// Thread group leader PID for page-fault / CoW paths: all `CLONE_VM` threads in a group must
-/// share one [`Process::fault_mutex`] and resolve to the leader's [`Process::lazy_regions`]
-/// (see `clone_lazy_regions`,
-/// forktest / GO_FORKTEST_DEBUG).
+/// share one [`Process::fault_mutex`] and resolve to the leader's [`Process::mmap_regions`]
+/// (forktest / GO_FORKTEST_DEBUG).
 ///
 /// Uses TTBR0-derived lookup as the primary mechanism: the current TTBR0_EL1 unambiguously
 /// identifies the running address space regardless of THREAD_PID_MAP state.  Stale
@@ -1410,13 +1366,17 @@ pub fn address_space_owner_pid_for_fault() -> Option<Pid> {
 ///
 /// Ordering matters when only the leader's `Process` holds the regions but the caller
 /// passes another thread id (clone snapshot keys, or stale ProcessInfo).
+///
+/// The fallback resolves `pid`'s own address-space owner, since a `CLONE_VM`
+/// member's list is empty: its group's regions are on the leader's.
 pub fn lazy_region_lookup_for_page_fault(pid: Pid, va: usize) -> Option<(u64, LazySource, usize, usize)> {
     if let Some(owner) = address_space_owner_pid_for_fault() {
         if let Some(r) = lazy_region_lookup_for_pid(owner, va) {
             return Some(r);
         }
     }
-    lazy_region_lookup_for_pid(pid, va)
+    let owner = address_space_owner_of(pid).map_or(pid, |(owner, _)| owner);
+    lazy_region_lookup_for_pid(owner, va)
 }
 
 // `LazyDebugWriter` was a third copy of the stack writer; `lazy_region_debug`
@@ -1429,17 +1389,14 @@ pub fn lazy_region_debug(va: usize) {
         crate::safe_print!(128, "[DP] lazy miss: pid={} va={:#x} no process entry\n", pid, va);
         return;
     };
-    with_irqs_disabled(|| {
-        let g = proc.lazy_regions.lock();
-        let count = g.len();
+    proc.vm_with_regions(|r| {
+        let count = r.iter().filter(|x| x.lazy).count();
         let mut w = akuma_primitives::console::StackWriter::<256>::new();
         let _ = write!(w, "[DP] lazy miss: pid={} va={:#x} regions={} [", pid, va, count);
-        let mut i = 0;
-        g.for_each_debug(|sv, sz| {
+        for (i, reg) in r.iter().filter(|x| x.lazy).take(8).enumerate() {
             if i > 0 { let _ = w.write_str(","); }
-            let _ = write!(w, "{:#x}+{:#x}", sv, sz);
-            i += 1;
-        });
+            let _ = write!(w, "{:#x}+{:#x}", reg.start_va, reg.len_bytes());
+        }
         let _ = w.write_str("]\n");
         w.flush();
     });
@@ -1449,59 +1406,42 @@ pub fn push_lazy_region(pid: Pid, start_va: usize, size: usize, page_flags: u64)
     push_lazy_region_with_source(pid, start_va, size, page_flags, LazySource::Zero)
 }
 
+/// Register a lazy region on `pid`'s list. Returns the list's length after.
 pub fn push_lazy_region_with_source(pid: Pid, start_va: usize, size: usize, page_flags: u64, source: LazySource) -> usize {
     let Some(proc) = lookup_process_shared(pid) else { return 0 };
     let inode = source.pinned_inode();
-    let count = with_irqs_disabled(|| proc.lazy_regions.lock().push(start_va, size, page_flags, source));
-    // The address space's pin, beside the one inside `source`. `pid` is the
-    // thread-group id, so this is the owner's address space, not a thread's
-    // view. Taken after the region lock is released: the two never nest.
+    let region = lazy_mmap_region(start_va, size, page_flags, &source);
+    let (inserted, count) = proc.vm_with_regions(|r| {
+        let ins = insert_lazy_region(r, region);
+        (ins, r.len())
+    });
+    note_lazy_over_eager(pid, start_va, size, inserted.over_eager);
+    // The address space's pin. `pid` is the thread-group id, so this is the
+    // owner's address space, not a thread's view. Taken after the region lock
+    // is released: the two never nest.
     if inode != 0 {
         proc.with_address_space(|a| a.pin_mapped_inode(inode));
     }
+    inserted.orphaned.unpin(proc);
     count
 }
 
-/// Copy every lazy-region descriptor in `parent_regions` into `child`.
-///
-/// `child` is taken by reference rather than by pid deliberately: `fork_process`
-/// builds the child as a local `Box<Process>` and only calls `register_process`
-/// at the very end, so a pid-keyed variant would silently find nothing to write
-/// to and drop the propagation on the floor (which is exactly the SIGSEGV this
-/// function exists to prevent). Both fork call sites already hold a
-/// `Vec<LazyRegion>` snapshot of the parent, so the parent is read once.
-///
-
-/// `fork_process`'s CoW-sharing (`cow_share_range`) only shares pages that are
-/// *currently resident* in the parent — a lazy region the parent registered but
-/// hasn't fully touched yet (a `.data`/`.bss` page nobody wrote to since exec, a
-/// stack page deeper than the parent's current usage, ...) has nothing resident
-/// to share. Without also copying the region *descriptors* themselves, the child
-/// has no lazy-region entry for that VA either: not resident (nothing was shared)
-/// and not lazy (no entry to demand-page from) — an unconditional SIGSEGV on first
-/// touch. A single fork off a long-lived, fully-warmed-up process rarely hits this;
-/// forking off a process that was itself freshly forked (a shell subshell
-/// backgrounding a real command) hits it far more often, since the intermediate
-/// process hasn't had time to fault every lazy page in yet.
-/// See docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md.
-///
-/// Returns the child's total region count after the merge (0 if the parent had
-/// none — the child is left untouched in that case).
-pub fn propagate_lazy_regions_to_child(parent_regions: &[LazyRegion], child: &Process) -> usize {
-    if parent_regions.is_empty() {
-        return 0;
+/// Report a lazy region pushed over an eager one, and switch [`lazy_lookup`]
+/// to the scan that still finds it.
+pub fn note_lazy_over_eager(pid: Pid, start_va: usize, size: usize, over: bool) {
+    if !over {
+        return;
     }
-    // Only the child's lock is taken, and the parent snapshot was produced
-    // before this call — the two maps' locks never nest.
-    let count = with_irqs_disabled(|| child.lazy_regions.lock().extend_from_slice(parent_regions));
-    // The child's address space pins what its inherited file regions name,
-    // after the region lock is released.
-    child.with_address_space(|a| {
-        for r in parent_regions {
-            a.pin_mapped_inode(r.source.pinned_inode());
-        }
-    });
-    count
+    let seen = LAZY_OVER_EAGER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if seen < 8 {
+        crate::safe_print!(128, "[LR-OVERLAP] pid={} lazy {:#x}+{:#x} overlaps an eager region\n",
+            pid, start_va, size);
+    }
+}
+
+/// How many lazy regions were pushed over an eager one since boot.
+pub fn lazy_over_eager_count() -> usize {
+    LAZY_OVER_EAGER.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Derive a CoW-forked child's `mmap_regions` from its parent's, and `munmap`'s
@@ -1533,7 +1473,9 @@ pub use akuma_mmap::{
 pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
     let lookup = |p: Pid| -> Option<u64> {
         let proc = lookup_process_shared(p)?;
-        proc.vm_with_regions(|r| r.iter().find(|reg| reg.contains(va)).map(|reg| crate::mmu::user_flags::to_pte(reg.prot)))
+        proc.vm_with_regions(|r| {
+            r.iter().find(|reg| !reg.lazy && reg.contains(va)).map(|reg| crate::mmu::user_flags::to_pte(reg.prot))
+        })
     };
     if let Some(owner) = address_space_owner_pid_for_fault()
         && let Some(f) = lookup(owner)
@@ -1557,7 +1499,10 @@ pub fn eager_region_recorded_prot_for_page_fault(pid: Pid, va: usize) -> Option<
     let lookup = |p: Pid| -> Option<u64> {
         let proc = lookup_process_shared(p)?;
         proc.vm_with_regions(|r| {
-            r.iter().find(|reg| reg.contains(va)).and_then(MmapRegion::recorded_prot).map(crate::mmu::user_flags::to_pte)
+            r.iter()
+                .find(|reg| !reg.lazy && reg.contains(va))
+                .and_then(MmapRegion::recorded_prot)
+                .map(crate::mmu::user_flags::to_pte)
         })
     };
     if let Some(owner) = address_space_owner_pid_for_fault()
@@ -1583,7 +1528,7 @@ pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, 
         lookup_process_shared(p).map_or_else(alloc::vec::Vec::new, |proc| {
             proc.vm_with_regions(|r| {
                 r.iter()
-                    .filter(|reg| reg.contains(va))
+                    .filter(|reg| !reg.lazy && reg.contains(va))
                     .map(|reg| (reg.start_va, reg.pages, crate::mmu::user_flags::to_pte(reg.prot)))
                     .collect()
             })
@@ -1593,25 +1538,13 @@ pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, 
     if owned.is_empty() && owner != pid { collect(pid) } else { owned }
 }
 
-/// Update flags on all **eager** mmap regions overlapping
-/// `[range_start, range_start+range_size)`.
+/// Record `new_prot` on exactly `[range_start, range_start+range_size)`:
+/// `mprotect`'s region half. Covers every region in the list, lazy ones
+/// included (the name predates their move into it), splitting any region the
+/// range only partly covers.
 ///
-/// `mprotect`'s eager counterpart to [`update_lazy_region_flags`]. Unlike the lazy
-/// map this does not split regions: `MmapRegion` keys its frame list to `start_va`,
-/// and splitting one would have to split `frames` in step. A sub-range `mprotect`
-/// therefore records the *new* protection for the whole region, which is
-/// deliberately conservative in the safe direction — the fault handler only ever
-/// uses these flags to grant a write, so widening the recorded range of a
-/// downgrade can never turn a legitimate SIGSEGV into a silent success. Recording
-/// nothing at all, which is what happened before, is what could.
-/// `mprotect`'s eager-region half.
-///
-/// Takes the neutral [`akuma_mmap::Prot`] rather than a raw PTE since
-/// 2026-09-06: a region *records* a protection and the encoding lives with the
-/// walker, so handing this an `AP_*` word would put the arch back in the record.
-/// Its lazy sibling (`update_lazy_region_flags`) still takes a `u64` — a
-/// `LazyRegion`'s flags go straight to `map_page` on the fault path and have not
-/// moved.
+/// Takes the neutral [`akuma_mmap::Prot`] rather than a raw PTE: a region
+/// *records* a protection and the encoding lives with the walker.
 pub fn update_eager_region_flags(
     pid: Pid,
     range_start: usize,
@@ -1647,89 +1580,62 @@ pub fn update_eager_region_flags(
 pub static EAGER_FLAG_WIDENED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
-/// Update flags on all lazy regions that overlap [range_start, range_start+range_size).
-pub fn update_lazy_region_flags(pid: Pid, range_start: usize, range_size: usize, new_flags: u64) {
-    let Some(proc) = lookup_process_shared(pid) else { return };
-    with_irqs_disabled(|| proc.lazy_regions.lock().update_flags(range_start, range_size, new_flags));
-}
-
 /// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
+/// Returns each removed piece as `(start_va, pages)`.
 pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usize) -> Vec<(usize, usize)> {
-    let unmap_end = unmap_addr + unmap_len;
-    let mut results = Vec::new();
-
-    loop {
-        if let Some(result) = munmap_lazy_region_overlapping(pid, unmap_addr, unmap_end) {
-            results.push(result);
-        } else {
-            break;
-        }
+    let Some(proc) = lookup_process_shared(pid) else { return Vec::new() };
+    let unmap_end = unmap_addr.saturating_add(unmap_len);
+    // A piece removed may have been the last to name its file. The check and
+    // the removal share one hold, so the answer is about the list the removal
+    // left.
+    let (pieces, orphaned) = proc.vm_with_regions(|r| detach_lazy(r, unmap_addr, unmap_end));
+    orphaned.unpin(proc);
+    for &(start, pages) in &pieces {
+        log::debug!("[LR] pid={} munmap {:#x}+{:#x} ({} pages)", pid, start, pages * 4096, pages);
     }
-    results
+    pieces
 }
 
-fn munmap_lazy_region_overlapping(pid: Pid, range_start: usize, range_end: usize) -> Option<(usize, usize)> {
-    let proc = lookup_process_shared(pid)?;
-    // A region removed whole may have been the last to name its file. The
-    // check and the removal share one hold, so the answer is about the map
-    // the removal left.
-    let ((op, freed_start, freed_pages), orphaned) = with_irqs_disabled(|| {
-        let mut map = proc.lazy_regions.lock();
-        let (removed, inode) = map.munmap_one_overlap(range_start, range_end)?;
-        let orphaned = if inode != 0 && !map.names_inode(inode) { inode } else { 0 };
-        Some((removed, orphaned))
-    })?;
-    if orphaned != 0 {
-        proc.with_address_space(|a| a.unpin_mapped_inode(orphaned));
-    }
-    log::debug!("[LR{}] pid={} munmap {:#x}+{:#x} ({} pages)",
-        op, pid, freed_start, freed_pages * 4096, freed_pages);
-    Some((freed_start, freed_pages))
-}
-
-/// Clear every lazy region registered for `pid`. No-op if `pid` isn't a registered
-/// process. Note: the per-process teardown paths (`return_to_kernel*`,
-/// `teardown_forked_process_thread_group`) deliberately do NOT call this — the
-/// field drops inside `Process::drop` on the reclaim path, so calling it from the
-/// exit/OOM-kill path would re-enter the very lock an OOM'd mutator frame is
-/// still holding (the rule-2 hang in
-/// docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md). It is kept for the
-/// zombie-reap paths (`sys_wait4`/`sys_waitid` in `syscall/proc.rs`), which release
-/// a *child's* map early from the reaping parent's syscall context — a context that
-/// holds no lazy-region lock, so there is nothing to re-enter. Purely an
-/// optimization there: the map would drop with the `Process` anyway.
-///
-/// The execve image-replacement path does not come through here — `replace_image`
-/// owns `&mut self` and clears `self.lazy_regions` directly.
+/// Drop every lazy region registered for `pid`. No-op if `pid` isn't a
+/// registered process. The per-process teardown paths (`return_to_kernel*`,
+/// `teardown_forked_process_thread_group`) deliberately do NOT call this: the
+/// list drops inside `Process::drop` on the reclaim path, and the exit/OOM-kill
+/// path must not take a lock an OOM'd mutator frame may still hold
+/// (docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md). It is kept for the
+/// zombie-reap paths (`sys_wait4`/`sys_waitid`), which release a *child's*
+/// regions early from the reaping parent's syscall context. Purely an
+/// optimization there: the list would drop with the `Process` anyway.
 pub fn clear_lazy_regions(pid: Pid) {
     let Some(proc) = lookup_process_shared(pid) else { return };
-    let count = with_irqs_disabled(|| proc.lazy_regions.lock().clear());
+    let count = proc.vm_with_regions(|r| {
+        let before = r.len();
+        r.retain(|x| !x.lazy);
+        before - r.len()
+    });
     if count > 0 {
         log::debug!("[LR!] clear pid={} ({} regions)", pid, count);
     }
 }
 
-pub fn clone_lazy_regions(from_pid: Pid, to_pid: Pid) {
-    let (Some(from), Some(to)) = (lookup_process_shared(from_pid), lookup_process_shared(to_pid)) else {
-        return;
-    };
-    // Snapshot under the parent's lock, clone under the child's — never nested.
-    let snapshot = with_irqs_disabled(|| from.lazy_regions.lock().clone_all());
-    if snapshot.is_empty() {
-        return;
-    }
-    let len = snapshot.len();
-    with_irqs_disabled(|| to.lazy_regions.lock().replace_with_clone(&snapshot));
-    log::debug!("[LR] clone pid={}->{} ({} regions)", from_pid, to_pid, len);
-}
-
-/// Owned snapshot of a pid's lazy regions (`None` if the pid isn't registered).
-/// Diagnostic/test replacement for the former direct
-/// `LAZY_REGION_TABLE.lock().get(&pid)` inspection (that global is gone) — allocates
-/// (clones the map),
-/// so call only from non-pressure contexts.
+/// Owned snapshot of a pid's lazy regions as [`LazyRegion`] views (`None` if
+/// the pid isn't registered). Diagnostics and tests only: it allocates, so
+/// call it from non-pressure contexts.
 pub fn lazy_regions_snapshot(pid: Pid) -> Option<BTreeMap<usize, LazyRegion>> {
-    lookup_process_shared(pid).map(|p| with_irqs_disabled(|| p.lazy_regions.lock().clone_all()))
+    let proc = lookup_process_shared(pid)?;
+    let regions: Vec<MmapRegion> = proc.vm_with_regions(|r| r.iter().filter(|x| x.lazy).cloned().collect());
+    Some(
+        regions
+            .iter()
+            .map(|r| {
+                (r.start_va, LazyRegion {
+                    start_va: r.start_va,
+                    size: r.len_bytes(),
+                    prot: r.recorded_prot(),
+                    source: lazy_source_of(r),
+                })
+            })
+            .collect(),
+    )
 }
 
 
@@ -1967,261 +1873,190 @@ mod child_channel_drain_tests {
 }
 
 #[cfg(test)]
-mod lazy_region_propagation_tests {
-    //! Regression tests for `propagate_lazy_regions_to_child`
-    //! (docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md): `fork_process`'s
-    //! `cow_share_range` only shares pages already resident in the parent, so the
-    //! child also needs the parent's lazy-region *descriptors* copied over —
-    //! otherwise a page the parent registered but hadn't touched yet is neither
-    //! resident (nothing to share) nor lazy (no entry to demand-page from) for the
-    //! child, and the first touch is an unconditional SIGSEGV.
-    //!
-    //! These exercise [`LazyRegionMap`] rather than the pid-keyed wrapper: since
-    //! the per-process move (docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md)
-    //! `propagate_lazy_regions_to_child` is a null-check plus one
-    //! `extend_from_slice` call, and building a real `Process` on the host needs a
-    //! page allocator the stub test runtime doesn't have.
+mod lazy_region_list_tests {
+    //! The lazy half of `Process::mmap_regions`: a lazy region is an
+    //! `MmapRegion` with `lazy` set, and these pin down the conversions and the
+    //! list edits the pid-keyed API is built from.
     use super::*;
-
-    /// The parent-side snapshot both fork arms take before propagating.
-    fn snapshot(map: &LazyRegionMap) -> alloc::vec::Vec<LazyRegion> {
-        map.clone_all().into_values().collect()
-    }
-
-    /// Mount id 1 throughout: these tests are about region propagation across
-    /// fork, not about which filesystem the inode came from.
-    fn file_source(_path: &str, inode: u32) -> LazySource {
-        LazySource::file(1, inode, 0, 0x2000, 0x2000_0000)
-    }
-
-    #[test]
-    fn copies_all_parent_regions_to_child() {
-        let mut parent = LazyRegionMap::new();
-        let mut child = LazyRegionMap::new();
-
-        parent.push(0x1000_0000, 0x1000, crate::mmu::user_flags::RX, LazySource::Zero);
-        parent.push(0x2000_0000, 0x2000, crate::mmu::user_flags::RW_NO_EXEC, file_source("/bin/busybox", 42));
-
-        let total = child.extend_from_slice(&snapshot(&parent));
-        assert_eq!(total, 2);
-
-        let child_regions = child.clone_all();
-        assert_eq!(child_regions.len(), 2);
-
-        let r1 = &child_regions[&0x1000_0000];
-        assert_eq!(r1.size, 0x1000);
-        assert_eq!(r1.prot, Some(akuma_mmap::Prot::RX));
-        assert!(matches!(r1.source, LazySource::Zero));
-
-        let r2 = &child_regions[&0x2000_0000];
-        assert_eq!(r2.size, 0x2000);
-        assert_eq!(r2.prot, Some(akuma_mmap::Prot::RW_NO_EXEC));
-        match &r2.source {
-            LazySource::File { inode, mount_id, .. } => {
-                assert_eq!((*mount_id, *inode), (1, 42));
-            }
-            _ => panic!("expected a File-backed lazy source to survive propagation"),
-        }
-
-        // The parent keeps its own regions — propagation is a copy, not a move.
-        assert_eq!(parent.len(), 2);
-    }
-
-    // ── Inode pins follow region lifetime ───────────────────────────
-    //
-    // A `LazySource::File` region holds an `InodePin` that stops the filesystem
-    // freeing its inode underneath it (`SELFHOST_ZERO_PAGE_HUNT.md` §14). Nothing
-    // reads that field, so nothing would notice it going wrong — these tests are
-    // the check that every mutation on this map leaves the count balanced.
-    //
-    // Each test uses its own inode number: the pin table is a process-wide
-    // static, so shared numbers would make peers interfere.
-
+    use crate::mmu::user_flags;
     use akuma_primitives::inode_pin::pin_count;
 
-    #[test]
-    fn a_file_region_pins_its_inode_until_it_is_removed() {
-        let ino = 50_001;
-        let mut map = LazyRegionMap::new();
-        assert_eq!(pin_count(ino), 0);
+    /// Mount id 1 throughout.
+    fn file_source(inode: u32, file_offset: usize, filesz: usize, segment_va: usize) -> LazySource {
+        LazySource::file(1, inode, file_offset, filesz, segment_va)
+    }
 
-        map.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
-        assert_eq!(pin_count(ino), 1, "a live region must pin its inode");
-
-        map.remove(0x1000_0000);
-        assert_eq!(pin_count(ino), 0, "removing the region must release it");
+    fn push(list: &mut Vec<MmapRegion>, start: usize, size: usize, flags: u64, source: &LazySource) -> LazyInsert {
+        insert_lazy_region(list, lazy_mmap_region(start, size, flags, source))
     }
 
     #[test]
-    fn dropping_the_whole_map_releases_every_pin() {
-        // The `Process::drop` path: a dying process must not leave its inodes
-        // pinned forever, or their disk space is never reclaimed.
-        let ino = 50_002;
-        {
-            let mut map = LazyRegionMap::new();
-            map.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
-            map.push(0x2000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
-            assert_eq!(pin_count(ino), 2);
+    fn a_lookup_reads_back_what_was_pushed() {
+        let mut list = Vec::new();
+        push(&mut list, 0x1000_0000, 0x1000, user_flags::RX, &LazySource::Zero);
+        // An ELF segment starting 0x234 into its first page.
+        push(&mut list, 0x2000_0000, 0x3000, user_flags::RW_NO_EXEC, &file_source(60_001, 0x5234, 0x1800, 0x2000_0234));
+
+        let (flags, source, start, size) = lazy_lookup(&list, 0x1000_0800).unwrap();
+        assert_eq!((flags, start, size), (user_flags::RX, 0x1000_0000, 0x1000));
+        assert!(matches!(source, LazySource::Zero));
+
+        let (flags, source, start, size) = lazy_lookup(&list, 0x2000_2fff).unwrap();
+        assert_eq!((flags, start, size), (user_flags::RW_NO_EXEC, 0x2000_0000, 0x3000));
+        match source {
+            LazySource::File { inode, mount_id, file_offset, filesz, segment_va, .. } => {
+                assert_eq!((mount_id, inode, file_offset, filesz, segment_va), (1, 60_001, 0x5234, 0x1800, 0x2000_0234));
+            }
+            LazySource::Zero => panic!("file source lost"),
         }
-        assert_eq!(pin_count(ino), 0, "map drop must release all of them");
+        assert!(lazy_lookup(&list, 0x2000_3000).is_none());
+        assert!(lazy_lookup(&list, 0x0fff_f000).is_none());
     }
 
     #[test]
-    fn clear_releases_every_pin() {
-        // `exec` replacing the image: same requirement as drop.
-        let ino = 50_003;
-        let mut map = LazyRegionMap::new();
-        map.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
+    fn an_unrecorded_protection_reads_back_as_zero() {
+        let mut list = Vec::new();
+        push(&mut list, 0x1000_0000, 0x1000, 0, &LazySource::Zero);
+        assert_eq!(lazy_lookup(&list, 0x1000_0000).unwrap().0, 0);
+        push(&mut list, 0x2000_0000, 0x1000, user_flags::NONE, &LazySource::Zero);
+        assert_eq!(lazy_lookup(&list, 0x2000_0000).unwrap().0, user_flags::NONE);
+    }
+
+    #[test]
+    fn eager_regions_are_not_lazy_hits() {
+        let mut list = alloc::vec![MmapRegion::inherited_with_prot(0x3000_0000, 2, akuma_mmap::Prot::RW)];
+        push(&mut list, 0x1000_0000, 0x1000, user_flags::RW, &LazySource::Zero);
+        assert!(lazy_lookup(&list, 0x3000_0000).is_none());
+        assert!(lazy_lookup(&list, 0x1000_0000).is_some());
+        assert_eq!(list.iter().map(|r| r.start_va).collect::<Vec<_>>(), [0x1000_0000, 0x3000_0000]);
+    }
+
+    #[test]
+    fn a_later_segment_takes_the_boundary_page() {
+        // Two ELF segments share the page at 0x2000_1000. The map keyed by
+        // `start_va` served it from the later one; the list must too.
+        let mut list = Vec::new();
+        push(&mut list, 0x2000_0000, 0x2000, user_flags::RX, &file_source(60_002, 0, 0x1800, 0x2000_0000));
+        push(&mut list, 0x2000_1000, 0x2000, user_flags::RW, &file_source(60_002, 0x1900, 0x400, 0x2000_1900));
+        assert_eq!(list.len(), 2);
+        let (flags, _, start, size) = lazy_lookup(&list, 0x2000_1abc).unwrap();
+        assert_eq!((flags, start, size), (user_flags::RW, 0x2000_1000, 0x2000));
+        let (flags, _, start, size) = lazy_lookup(&list, 0x2000_0abc).unwrap();
+        assert_eq!((flags, start, size), (user_flags::RX, 0x2000_0000, 0x1000));
+    }
+
+    #[test]
+    fn a_clipped_file_region_reads_the_same_bytes() {
+        // Clip the head off a segment with a lead; the remaining piece must map
+        // each page to the same file offset as before.
+        let mut list = Vec::new();
+        let src = file_source(60_003, 0x8100, 0x3000, 0x4000_0100);
+        push(&mut list, 0x4000_0000, 0x4000, user_flags::RO, &src);
+        let off_before = |src: &LazySource, va: usize| match *src {
+            LazySource::File { file_offset, segment_va, .. } => file_offset as isize + (va as isize - segment_va as isize),
+            LazySource::Zero => unreachable!(),
+        };
+        let want = off_before(&src, 0x4000_2000);
+        let (pieces, _) = detach_lazy(&mut list, 0x4000_0000, 0x4000_1000);
+        assert_eq!(pieces, [(0x4000_0000, 1)]);
+        let (_, after, start, _) = lazy_lookup(&list, 0x4000_2000).unwrap();
+        assert_eq!(start, 0x4000_1000);
+        assert_eq!(off_before(&after, 0x4000_2000), want);
+        match after {
+            LazySource::File { filesz, segment_va, .. } => {
+                // The 0xf00 bytes of data in the first page are gone with it.
+                assert_eq!((segment_va, filesz), (0x4000_1000, 0x3000 - 0xf00));
+            }
+            LazySource::Zero => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn a_source_below_its_region_is_advanced() {
+        let r = lazy_mmap_region(0x5000_1000, 0x1000, 0, &file_source(60_004, 0x100, 0x2000, 0x5000_0800));
+        let f = r.file.unwrap();
+        assert_eq!((f.lead, f.offset, f.filesz), (0, 0x900, 0x1800));
+    }
+
+    #[test]
+    fn detach_reports_a_file_once_nothing_maps_it() {
+        let ino = 60_005;
+        let mut list = Vec::new();
+        push(&mut list, 0x1000_0000, 0x4000, user_flags::RO, &file_source(ino, 0, 0x4000, 0x1000_0000));
+        push(&mut list, 0x2000_0000, 0x1000, user_flags::RO, &file_source(ino, 0, 0x1000, 0x2000_0000));
+        push(&mut list, 0x3000_0000, 0x1000, user_flags::RW, &LazySource::Zero);
+
+        let (pieces, orphaned) = detach_lazy(&mut list, 0x1000_1000, 0x1000_2000); // middle split
+        assert_eq!(pieces, [(0x1000_1000, 1)]);
+        assert_eq!(orphaned.iter().count(), 0);
+        assert_eq!(list.len(), 4);
+
+        let (_, orphaned) = detach_lazy(&mut list, 0x1000_0000, 0x1000_4000);
+        assert_eq!(orphaned.iter().count(), 0, "the mapping at 0x2000_0000 still names it");
+
+        let (pieces, orphaned) = detach_lazy(&mut list, 0x2000_0000, 0x3000_1000);
+        assert_eq!(pieces, [(0x2000_0000, 1), (0x3000_0000, 1)]);
+        assert_eq!(orphaned.iter().collect::<Vec<_>>(), [ino]);
+        assert!(list.is_empty());
+    }
+
+    #[test]
+    fn detach_leaves_eager_regions_alone() {
+        let mut list = alloc::vec![MmapRegion::inherited_with_prot(0x1000_1000, 1, akuma_mmap::Prot::RW)];
+        push(&mut list, 0x1000_0000, 0x1000, user_flags::RW, &LazySource::Zero);
+        let (pieces, _) = detach_lazy(&mut list, 0x1000_0000, 0x1000_2000);
+        assert_eq!(pieces, [(0x1000_0000, 1)]);
+        assert_eq!(list.len(), 1);
+        assert!(!list[0].lazy);
+    }
+
+    #[test]
+    fn replacing_a_mapping_orphans_the_old_file() {
+        let (old, new) = (60_006, 60_007);
+        let mut list = Vec::new();
+        push(&mut list, 0x1000_0000, 0x1000, 0, &file_source(old, 0, 0x1000, 0x1000_0000));
+        let ins = push(&mut list, 0x1000_0000, 0x1000, 0, &file_source(new, 0, 0x1000, 0x1000_0000));
+        assert_eq!(ins.orphaned.iter().collect::<Vec<_>>(), [old]);
+        assert!(!ins.over_eager);
+        assert_eq!(list.len(), 1);
+        // Re-pushing the same file orphans nothing.
+        let ins = push(&mut list, 0x1000_0000, 0x1000, 0, &file_source(new, 0, 0x1000, 0x1000_0000));
+        assert_eq!(ins.orphaned.iter().count(), 0);
+    }
+
+    #[test]
+    fn a_push_over_an_eager_region_is_reported() {
+        let mut list = alloc::vec![MmapRegion::inherited_with_prot(0x1000_1000, 1, akuma_mmap::Prot::RW)];
+        let ins = push(&mut list, 0x1000_0000, 0x2000, 0, &LazySource::Zero);
+        assert!(ins.over_eager);
+        let ins = push(&mut list, 0x2000_0000, 0x1000, 0, &LazySource::Zero);
+        assert!(!ins.over_eager);
+    }
+
+    #[test]
+    fn regions_hold_no_pins_and_a_lookup_holds_one_while_alive() {
+        // The address space pins mapped files now (`MappingPins`); a region
+        // record holds none, and a looked-up source holds one for its reader.
+        let ino = 60_008;
+        let mut list = Vec::new();
+        push(&mut list, 0x1000_0000, 0x1000, 0, &file_source(ino, 0, 0x1000, 0x1000_0000));
+        assert_eq!(pin_count(ino), 0);
+        let hit = lazy_lookup(&list, 0x1000_0000).unwrap();
         assert_eq!(pin_count(ino), 1);
-
-        map.clear();
+        drop(hit);
         assert_eq!(pin_count(ino), 0);
     }
 
     #[test]
-    fn fork_propagation_takes_a_reference_of_its_own() {
-        // The child maps the same file, so the inode must stay pinned until
-        // *both* are gone — a child outliving its parent is the ordinary case.
-        let ino = 50_004;
-        let mut parent = LazyRegionMap::new();
-        parent.push(0x1000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
-
-        let mut child = LazyRegionMap::new();
-        child.extend_from_slice(&snapshot(&parent));
-        assert_eq!(pin_count(ino), 2, "parent and child hold one each");
-
-        parent.clear();
-        assert_eq!(pin_count(ino), 1, "the child's mapping still needs the file");
-
-        child.clear();
-        assert_eq!(pin_count(ino), 0);
-    }
-
-    #[test]
-    fn replacing_a_region_at_the_same_va_swaps_the_pin() {
-        // `push` over an existing key drops the old region — its pin must go
-        // with it, or a re-mmap'd VA leaks a pin on the previous file.
-        let old = 50_005;
-        let new = 50_006;
-        let mut map = LazyRegionMap::new();
-        map.push(0x1000_0000, 0x1000, 0x1, file_source("/old.so", old));
-        map.push(0x1000_0000, 0x1000, 0x1, file_source("/new.so", new));
-
-        assert_eq!(pin_count(old), 0, "the replaced region must release its pin");
-        assert_eq!(pin_count(new), 1);
-        map.clear();
-        assert_eq!(pin_count(new), 0);
-    }
-
-    #[test]
-    fn munmap_clip_shapes_keep_the_count_matching_the_pieces() {
-        // Every clip shape rebuilds regions by remove-then-insert, which is
-        // exactly where a hand-maintained count would drift.
-        let ino = 50_007;
-        let mut map = LazyRegionMap::new();
-        map.push(0x1000_0000, 0x4000, 0x1, file_source("/lib.so", ino));
-        assert_eq!(pin_count(ino), 1);
-
-        // Middle split: one region becomes two, so two pins.
-        map.munmap_one_overlap(0x1000_1000, 0x1000_2000);
-        assert_eq!(pin_count(ino), 2, "a middle split leaves two live regions");
-
-        // Full unmap of everything that is left.
-        while map.munmap_one_overlap(0x1000_0000, 0x1000_4000).is_some() {}
-        assert_eq!(pin_count(ino), 0, "unmapping it all must release every pin");
-    }
-
-    #[test]
-    fn only_a_whole_removal_reports_the_inode_and_names_inode_sees_the_rest() {
-        // munmap releases the address space's pin when a whole removal reports
-        // an inode that `names_inode` no longer finds; a clip must report none.
-        let ino = 50_011;
-        let mut map = LazyRegionMap::new();
-        map.push(0x1000_0000, 0x4000, 0x1, file_source("/lib.so", ino));
-        map.push(0x2000_0000, 0x1000, 0x1, file_source("/lib.so", ino));
-
-        let (_, reported) = map.munmap_one_overlap(0x1000_0000, 0x1000_1000).unwrap(); // prefix
-        assert_eq!(reported, 0);
-        let ((op, _, _), reported) = map.munmap_one_overlap(0x1000_1000, 0x1000_4000).unwrap();
-        assert_eq!((op, reported), ('F', ino));
-        assert!(map.names_inode(ino), "the second mapping still names it");
-
-        let (_, reported) = map.munmap_one_overlap(0x2000_0000, 0x2000_1000).unwrap();
-        assert_eq!(reported, ino);
-        assert!(!map.names_inode(ino));
-
-        map.push(0x3000_0000, 0x1000, 0x1, LazySource::Zero);
-        let (_, reported) = map.munmap_one_overlap(0x3000_0000, 0x3000_1000).unwrap();
-        assert_eq!(reported, 0, "an anonymous region pins nothing");
-    }
-
-    #[test]
-    fn mprotect_splitting_a_region_keeps_the_pin() {
-        // `update_flags` also removes and re-inserts up to three pieces.
-        let ino = 50_008;
-        let mut map = LazyRegionMap::new();
-        map.push(0x1000_0000, 0x4000, 0x1, file_source("/lib.so", ino));
-
-        map.update_flags(0x1000_1000, 0x1000, 0x7);
-        assert_eq!(pin_count(ino), 3, "split into three pieces, three pins");
-
-        map.clear();
-        assert_eq!(pin_count(ino), 0);
-    }
-
-    #[test]
-    fn anonymous_regions_pin_nothing() {
-        // `LazySource::Zero` has no file behind it; it must not touch the table.
-        let mut map = LazyRegionMap::new();
-        map.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
-        // (A file region always has an inode now: `LazySource::file` asserts it.)
-        assert_eq!(pin_count(0), 0);
-        map.clear();
-    }
-
-    #[test]
-    fn parent_with_no_regions_copies_nothing() {
-        let parent = LazyRegionMap::new();
-        let mut child = LazyRegionMap::new();
-
-        assert_eq!(child.extend_from_slice(&snapshot(&parent)), 0);
-        assert!(child.is_empty());
-    }
-
-    #[test]
-    fn does_not_clobber_childs_existing_regions_at_other_vas() {
-        let mut parent = LazyRegionMap::new();
-        let mut child = LazyRegionMap::new();
-
-        // Child already has its own region (e.g. from an earlier setup step) at a
-        // VA the parent doesn't use; propagation must not wipe it out.
-        child.push(0x3000_0000, 0x1000, 0x1, LazySource::Zero);
-        parent.push(0x1000_0000, 0x1000, 0x1, LazySource::Zero);
-
-        assert_eq!(child.extend_from_slice(&snapshot(&parent)), 2);
-
-        let child_regions = child.clone_all();
-        assert!(child_regions.contains_key(&0x1000_0000));
-        assert!(child_regions.contains_key(&0x3000_0000));
-    }
-
-    #[test]
-    fn parent_region_replaces_a_child_region_at_the_same_va() {
-        // Same `start_va` on both sides: the parent's descriptor wins, so a child
-        // forked off a parent that re-mmap'd a VA inherits the *current* mapping
-        // rather than a stale one.
-        let mut parent = LazyRegionMap::new();
-        let mut child = LazyRegionMap::new();
-
-        child.push(0x1000_0000, 0x1000, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
-        parent.push(0x1000_0000, 0x8000, crate::mmu::user_flags::RX, file_source("/bin/dash", 7));
-
-        assert_eq!(child.extend_from_slice(&snapshot(&parent)), 1);
-
-        let (flags, source, start_va, size) =
-            child.lookup(0x1000_4000).expect("the parent's larger region now covers this VA");
-        assert_eq!((start_va, size, flags), (0x1000_0000, 0x8000, crate::mmu::user_flags::RX));
-        assert!(matches!(source, LazySource::File { inode: 7, .. }));
+    fn cow_inheritance_carries_lazy_regions_and_their_files() {
+        let mut parent = Vec::new();
+        push(&mut parent, 0x1000_0000, 0x2000, user_flags::RX, &file_source(60_009, 0x40, 0x1000, 0x1000_0040));
+        push(&mut parent, 0x2000_0000, 0x1000, user_flags::RW, &LazySource::Zero);
+        let child = inherit_mmap_regions_for_cow_child(&parent);
+        let (flags, src, start, size) = lazy_lookup(&child, 0x1000_1000).unwrap();
+        assert_eq!((flags, start, size), (user_flags::RX, 0x1000_0000, 0x2000));
+        assert!(matches!(src, LazySource::File { inode: 60_009, segment_va: 0x1000_0040, .. }));
+        assert!(lazy_lookup(&child, 0x2000_0000).is_some());
     }
 }
 

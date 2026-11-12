@@ -5187,16 +5187,15 @@ fn test_map_fixed_replaces_eager_mapping() {
 /// mm convergence step 3) follows the lazy file regions that name the inode.
 ///
 /// A file region pushed for a process pins its inode in that process's address
-/// space as well as in the region's own `LazySource`. Removing one of two
+/// space; the region record itself holds no pin (step 4b). Removing one of two
 /// regions naming the file keeps the pin; removing the last releases it. A fork
-/// child's address space pins what its inherited regions name. Step 4 deletes
-/// the `LazySource` pin, and this is what keeps those files alive then.
+/// child's address space pins what its inherited regions name.
 ///
 /// The inode is synthetic: the pin table counts numbers and needs no file.
 fn test_lazy_file_regions_pin_in_address_space() {
     use akuma_exec::process::{
         register_process, unregister_process, with_process, push_lazy_region_with_source,
-        munmap_lazy_regions_in_range, propagate_lazy_regions_to_child, lazy_regions_snapshot,
+        munmap_lazy_regions_in_range, inherit_mmap_regions_for_cow_child, pin_region_files,
         LazySource,
     };
     use akuma_primitives::inode_pin::pin_count;
@@ -5220,18 +5219,20 @@ fn test_lazy_file_regions_pin_in_address_space() {
     let _ = push_lazy_region_with_source(pid, A, 0x2000, 0, src());
     let _ = push_lazy_region_with_source(pid, B, 0x1000, 0, src());
     check(as_pins(), "push did not pin in the address space");
-    // Two region pins and one address-space pin, not one per region.
-    check(pin_count(INO) == 3, "want 3 pins after two pushes");
+    // One address-space pin, not one per region; a region record holds none.
+    check(pin_count(INO) == 1, "want 1 pin after two pushes");
 
     // Fork: the child's address space pins what it inherits.
     let child_pid: u32 = 7722;
-    let child = make_test_process(child_pid);
-    let snapshot: alloc::vec::Vec<_> = lazy_regions_snapshot(pid).map_or_else(alloc::vec::Vec::new, |m| m.into_values().collect());
-    let _ = propagate_lazy_regions_to_child(&snapshot, &child);
-    drop(snapshot);
+    let mut child = make_test_process(child_pid);
+    let inherited = with_process(pid, |p| inherit_mmap_regions_for_cow_child(&p.mmap_regions.lock()))
+        .unwrap_or_default();
+    pin_region_files(child.address_space.get_mut(), &inherited);
+    *child.mmap_regions.lock() = inherited;
     check(child.with_address_space(|a| a.pins_mapped_inode(INO)), "fork child's address space did not pin");
+    check(pin_count(INO) == 2, "want the child's pin beside the parent's");
     drop(child);
-    check(pin_count(INO) == 3, "dropping the child did not release its pins");
+    check(pin_count(INO) == 1, "dropping the child did not release its pins");
 
     let _ = munmap_lazy_regions_in_range(pid, A, 0x1000); // clip: A's tail still names it
     check(as_pins(), "a clip released the pin");
@@ -14089,12 +14090,13 @@ fn test_kill_thread_group_preserves_lazy_regions() {
     }
 }
 
-/// forktest / GO_FORKTEST_DEBUG: `lazy_region_lookup_for_page_fault` must find regions
-/// cloned to sibling PIDs (same as `lazy_region_lookup_for_pid` after `clone_lazy_regions`).
+/// forktest / GO_FORKTEST_DEBUG: `lazy_region_lookup_for_page_fault` called with a
+/// `CLONE_VM` sibling's pid must find the regions on the leader, whose address space the
+/// sibling shares. A sibling's own list is empty: nothing copies regions to it.
 fn test_lazy_region_lookup_for_page_fault_clone() {
     use akuma_exec::process::{
         lookup_process_shared, register_process, unregister_process, push_lazy_region, clear_lazy_regions,
-        clone_lazy_regions, lazy_region_lookup_for_page_fault,
+        lazy_region_lookup_for_page_fault,
     };
     use akuma_exec::mmu::user_flags;
 
@@ -14113,7 +14115,6 @@ fn test_lazy_region_lookup_for_page_fault_clone() {
     register_process(sibling_pid, sib_proc);
 
     push_lazy_region(owner_pid, va, size, user_flags::RW);
-    clone_lazy_regions(owner_pid, sibling_pid);
 
     let hit = lazy_region_lookup_for_page_fault(sibling_pid, va + 0x2000).is_some();
 
@@ -14130,7 +14131,7 @@ fn test_lazy_region_lookup_for_page_fault_clone() {
 }
 
 /// Lazy regions are keyed by TGID (see `sys_mmap` / `proc.tgid`, which pushes them onto the
-/// *leader's* `Process::lazy_regions`). Demand paging must
+/// *leader's* `Process::mmap_regions`). Demand paging must
 /// resolve lazy metadata via the thread-group leader even when the fault path passes a
 /// worker PID or an unrelated id, as long as [`current_process`] maps to a CLONE_VM sibling.
 fn test_lazy_region_lookup_resolves_tgid_for_demand_paging() {

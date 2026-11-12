@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 
 use spinning_top::Spinlock;
 
-use super::{Creds, LazyRegionMap, Pid, Process, ProcessMemory, SharedFdTable};
+use super::{Creds, Pid, Process, ProcessMemory, SharedFdTable};
 
 impl Process {
     /// A process over the root `root_pa`, which its kernel's task record owns.
@@ -40,7 +40,6 @@ impl Process {
             memory: ProcessMemory::new(0, 0, 0, 0),
             process_info_phys: 0,
             mmap_regions: Vec::new(),
-            lazy_regions: LazyRegionMap::new(),
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: Some(tid),
             terminal_state: Arc::new(Spinlock::new(akuma_tty::TerminalState::default())),

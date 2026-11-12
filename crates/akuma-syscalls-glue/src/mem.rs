@@ -9,7 +9,7 @@ use akuma_exec::process::MmapRegion;
 /// `sys_mremap`/`sys_mmap` mutate already carrying its own fine-grained lock —
 /// `Process::as_lock` (page-table PTE edits, via `Process::with_address_space`),
 /// `Process::vm_lock` (`mmap_regions` AND the mmap free-list, via
-/// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`), `Process::lazy_regions`, PMM/
+/// `vm_with_regions`/`vm_alloc_mmap`/`vm_free_mmap`; lazy regions are in `mmap_regions` too), PMM/
 /// `FRAME_TRACKER` (never held across a yield), and `SHARED_FILE_MAPPINGS` — so
 /// the BKL is redundant for them. Two gaps this phase's audit found (a plain
 /// unguarded `ProcessMemory::free_regions`, and `sys_mmap`'s OOM/reclaim sweep
@@ -17,7 +17,7 @@ use akuma_exec::process::MmapRegion;
 /// prerequisite; see `Process::vm_alloc_mmap`/`vm_free_mmap` and
 /// `reclaim_clean_file_pages`'s per-page `proc.address_space.lock()`.
 ///
-/// Unlike the VFS/net carve-outs, none of `as_lock`/`vm_lock`/`lazy_regions`/
+/// Unlike the VFS/net carve-outs, none of `as_lock`/`vm_lock`/
 /// PMM need to know a BKL-free window is calling them — their IRQ-masking is
 /// already unconditional (not gated on being reachable from a dropped-BKL window
 /// the way `PreemptGuard` is, see BKL_VFS_CARVE_OUT.md §19.3), so there is no
@@ -890,7 +890,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         // `rustc`: `[WPF] … eager=0x60000000000080 cow_ref=1` with no `mprotect`
         // anywhere in the log. See mem.md § "A `mprotect` bug this gate found".
         let old_prot = proc.vm_with_regions(|r| {
-            r.iter().find(|reg| reg.start_va == old_addr).and_then(MmapRegion::recorded_prot)
+            r.iter().find(|reg| !reg.lazy && reg.start_va == old_addr).and_then(MmapRegion::recorded_prot)
         });
         let region = match old_prot {
             Some(p) => MmapRegion::owned_with_prot(new_addr, new_frames, p),
@@ -905,7 +905,7 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         // Remove the old region under the lock, then unmap/free its frames after
         // releasing it (unmap/free must not run while vm_lock is held).
         let old_region_opt = proc.vm_with_regions(|r| {
-            r.iter().position(|reg| reg.start_va == old_addr).map(|idx| r.remove(idx))
+            r.iter().position(|reg| !reg.lazy && reg.start_va == old_addr).map(|idx| r.remove(idx))
         });
         if let Some(old_region) = old_region_opt {
             // Size from `pages`, not the owned frame count: a CoW-inherited region
@@ -1124,7 +1124,7 @@ fn madvise_dontneed_range(
     //
     // This was `lazy_region_lookup_for_pid(proc.tgid, va)` per page, and that
     // helper does `lookup_process_shared(pid)` + `with_irqs_disabled` +
-    // `lazy_regions.lock()` + the lookup — so a 64-page `MADV_DONTNEED` performed
+    // the region lock + the lookup — so a 64-page `MADV_DONTNEED` performed
     // 64 process-table walks, 64 IRQ mask/unmask pairs and 64 spinlock
     // round-trips, to consult one map that never changed and to re-find a
     // `Process` the caller already holds as `proc`. Measured 2026-08-29:
@@ -1135,14 +1135,12 @@ fn madvise_dontneed_range(
     // re-entrancy hazard `CLAUDE.md` § "Kernel conventions" is about. Reserving
     // `pages` is the exact worst case, so no push inside can grow it.
     let mut file_vas: alloc::vec::Vec<usize> = alloc::vec::Vec::with_capacity(pages);
-    akuma_primitives::irq::with_irqs_disabled(|| {
-        let lr = proc.lazy_regions.lock();
+    proc.vm_with_regions(|r| {
         for i in 0..pages {
             let va = aligned_addr + i * 4096;
-            if matches!(
-                lr.lookup(va),
-                Some((_, akuma_exec::process::LazySource::File { .. }, _, _))
-            ) {
+            if akuma_exec::process::region_index_containing(r, va)
+                .is_some_and(|at| r[at].lazy && r[at].file.is_some())
+            {
                 file_vas.push(va);
             }
         }
@@ -1378,9 +1376,9 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     }
     if let Some(proc) = akuma_exec::process::lookup_process_shared(owner_pid) {
         let _mm_window = MmBklGuard::new();
-        akuma_exec::process::update_lazy_region_flags(proc.tgid, addr, pages * 4096, new_flags);
-        // Eager regions need the same bookkeeping: they are the ones whose PTEs the
-        // fault handler can only repair if it knows the intended protection.
+        // One list, lazy regions included: the split records the new protection
+        // on exactly the range, for the fault handler to map lazy pages with and
+        // to repair eager PTEs against.
         akuma_exec::process::update_eager_region_flags(proc.tgid, addr, pages * 4096, new_prot);
 
         // Update all page table entries with no_flush, then issue a single

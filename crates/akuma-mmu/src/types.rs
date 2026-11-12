@@ -90,8 +90,8 @@ pub mod user_flags {
     ///
     /// Because the `u64` is the currency `akuma-exec` still speaks. Its
     /// `UserAddressSpace` calls — `map_page`, `alloc_and_map`, `map_and_track`,
-    /// `map_user_page_tracked` — take a PTE flag word, and `LazyRegionMap`'s
-    /// callers still pass one (it stores a `Prot` since step 1 of
+    /// `map_user_page_tracked` — take a PTE flag word, and the lazy-region API's
+    /// callers still pass one (the region stores a `Prot` since step 1 of
     /// `proposals/AKUMA_MM_CONVERGENCE.md`); that is AArch64 machinery living in a crate both kernels
     /// compile. The x86 walker cannot consume those bits (the two permission
     /// masks share exactly zero, and AArch64's `AP_MASK` lands on x86's Dirty

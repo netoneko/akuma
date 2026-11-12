@@ -276,8 +276,10 @@ LazyRegion>>>` in `process/table.rs`. A `BTreeMap::insert` that OOM'd inside
 abandoned frame still held, and (since there is no unwinding) wedging that lock
 for the rest of the boot. That was the `-j4` self-host freeze of 2026-08-02.
 
-It now lives on the process: `Process::lazy_regions: Spinlock<LazyRegionMap>`
-(fix direction (3), "structural (durable)", in the archive doc). Consequences:
+It now lives on the process: lazy regions are records in `Process::mmap_regions`
+(fix direction (3), "structural (durable)", in the archive doc; a per-process
+`lazy_regions` map until mm convergence step 4 folded it into the one list).
+Consequences:
 
 - The lock is reachable only through a `Process`, and each process has its own,
   so a hang would need the dying thread's *own* map — and the teardown paths no
@@ -286,9 +288,10 @@ It now lives on the process: `Process::lazy_regions: Spinlock<LazyRegionMap>`
   calls; the field is released by `Process::drop` on the existing reclaim path.
 - `clear_lazy_regions` survives only for the `sys_wait4`/`sys_waitid` zombie
   reap, which runs in the *parent's* syscall context holding no lazy-region lock.
-- `LazyRegionMap` (in `process/children.rs`) is the pure data structure and is
-  unit-tested on the host; the pid-keyed free functions are thin wrappers that
-  resolve `pid` → `Process` first.
+- The list edits (`insert_lazy_region`, `detach_lazy`, `lazy_lookup` in
+  `process/children.rs`, over `akuma-mmap`'s region algebra) are unit-tested on
+  the host; the pid-keyed free functions are thin wrappers that resolve
+  `pid` → `Process` first.
 
 Full audit, the deadlock chain, and why the tactical `try_lock`-and-skip fix
 would *not* have been sufficient:
@@ -356,8 +359,8 @@ inside `with_irqs_disabled` process-table scans
 (`process/mod.rs:1077,1226,1251,1302`). Any of these failing under heap pressure
 becomes rule-2 hang fuel.
 
-The lazy-region writers (`push_lazy_region*`, `update_lazy_region_flags`,
-`munmap_lazy_region_overlapping`, `clone_lazy_regions`) used to belong on this
+The lazy-region writers (`push_lazy_region*`, `update_eager_region_flags`,
+`munmap_lazy_regions_in_range`) used to belong on this
 list and no longer do — see §5.1b for why owning the map per-process took them
 out of rule-2's reach. That is the template for retiring the rest: give the
 state an owner whose drop is already on the teardown path, rather than a global

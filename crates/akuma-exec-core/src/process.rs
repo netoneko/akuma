@@ -404,6 +404,11 @@ impl KernelFile {
 pub use akuma_syscalls_linux::flags::open as open_flags;
 
 /// Source of data for a lazy region page.
+///
+/// The region itself is an `MmapRegion` with `lazy` set, its file in a
+/// `FileBacking`. A `LazySource` is the view a lookup hands the fault path
+/// (`akuma_exec::process::lazy_source_of`) and the argument `push_lazy_region`
+/// takes; it is not stored.
 #[derive(Clone)]
 pub enum LazySource {
     Zero,
@@ -424,20 +429,20 @@ pub enum LazySource {
         file_offset: usize,
         filesz: usize,
         segment_va: usize,
-        /// Keeps `inode`'s data alive for as long as this region exists.
+        /// Keeps `inode`'s data alive while the holder reads it.
         ///
-        /// `inode` is a raw number with no lifetime tie to the file, so without
-        /// this the filesystem was free to truncate it and reissue the number
+        /// `inode` is a raw number with no lifetime tie to the file, so without a
+        /// pin the filesystem was free to truncate it and reissue the number
         /// under a live mapping — the fill then read `Ok(0)` (zero page) or, after
         /// reuse, another file's bytes. That is root cause #2 of the self-host
         /// `rustc` ICE (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
         ///
-        /// Nothing reads this field. It is load-bearing purely through
-        /// [`InodePin`]'s `Clone`/`Drop`, which is what makes every region path —
-        /// fork's propagate/clone, `mprotect`'s split, `munmap`'s four clip
-        /// shapes, `exec`'s clear, `Process::drop` — balanced without any of them
-        /// knowing the pin exists. Construct with [`LazySource::file`] rather
-        /// than by hand so the pin can never be forgotten.
+        /// The mapping's own claim on the file is the address space's
+        /// (`UserAddressSpace::pin_mapped_inode`), held for as long as a region
+        /// names the inode. This one covers a fill whose region is unmapped
+        /// under it. Nothing reads the field; it works through [`InodePin`]'s
+        /// `Clone`/`Drop`. Construct with [`LazySource::file`] so it is never
+        /// forgotten.
         pin: akuma_primitives::InodePin,
     },
 }
@@ -475,7 +480,9 @@ impl LazySource {
     }
 }
 
-/// A lazily-backed virtual memory region.
+/// A lazy region as a diagnostic snapshot describes it
+/// (`akuma_exec::process::lazy_regions_snapshot`). The live record is an
+/// `MmapRegion` with `lazy` set.
 #[derive(Clone)]
 pub struct LazyRegion {
     pub start_va: usize,
@@ -487,7 +494,7 @@ pub struct LazyRegion {
     /// It was the AArch64 PTE word itself (`flags: u64`, with `0` meaning
     /// "unrecorded") until step 1 of `proposals/AKUMA_MM_CONVERGENCE.md`, which
     /// is what kept a lazy region from being something the amd64 kernel could
-    /// read. The word survives at `LazyRegionMap`'s edges only, as an exact
+    /// read. The word survives at the lazy API's edges only, as an exact
     /// conversion.
     pub prot: Option<akuma_mmap::Prot>,
     pub source: LazySource,

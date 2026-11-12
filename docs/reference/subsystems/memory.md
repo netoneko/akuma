@@ -415,6 +415,21 @@ with IRQs masked, so there is no verdict to print.
 - **Demand paging:** "lazy regions" (`push_lazy_region` →
   `ensure_user_page_mapped`) for heap, large mmap, stack, large ELF segments
   (`DeferredLazySegment` via `from_elf_path`).
+- **One region list.** A lazy region is an `MmapRegion` with `lazy` set, in the same sorted,
+  non-overlapping `Process::mmap_regions` as the eager ones, on the thread-group leader. Its file
+  is a `FileBacking` whose `lead` is the distance from the region's first page to the segment's
+  first byte. The `*lazy_region*` functions in `akuma-exec`'s `process/children.rs` are names over
+  that list, and a lookup still returns a `LazySource` view built under the lock. Rules:
+  - **Readers of eager state skip `lazy`** (`eager_region_flags_for_page_fault`,
+    `eager_region_recorded_prot_for_page_fault`, `detach_eager_regions_in_range`, `mremap`'s
+    exact-start match). Lazy regions own no frames.
+  - **A lazy push removes the lazy part it covers**; the later push wins, which is what serves an
+    ELF boundary page shared by two segments. A push over an *eager* region breaks the
+    no-overlap invariant; it is reported once as `[LR-OVERLAP]` and lookups fall back to a scan.
+  - **`mprotect` splits lazy and eager regions alike** (`mprotect_eager_regions_in_range`).
+  - **fork reads the leader's list**, whichever thread forks; the CoW child inherits it with
+    `inherit_mmap_regions_for_cow_child`, lazy records included. A `CLONE_VM` thread's own list
+    is empty and its faults resolve through the owner of the address space.
 - **mmap:** bump from `0x10000000`, first-fit into `free_regions` on munmap;
   jumps over `kernel_va_end()`; MAP_FIXED may shatter a 2 MB block into L3.
 - **Lazy anonymous mmap:** `MAP_PRIVATE` > `MMAP_EAGER_MAX_PAGES`=16 → lazy
@@ -434,15 +449,14 @@ with IRQs masked, so there is no verdict to print.
   - **One pin per distinct inode**, not per mapping. The pin table is global and bounded, and a
     saturated table stalls ext2's deferred frees.
   - **Released when the last mapping naming the inode goes**, not when the address space drops.
-    AArch64 checks after `munmap` removes a file region whole (`LazyRegionMap::names_inode`);
+    AArch64 checks after a `munmap` or a replacing push (`regions_name_inode` over the list);
     amd64 calls `retain_mapped_inode_pins` over its surviving regions.
   - **On the owner's address space**, never a thread's view, which drops with its thread.
   - **Fork inherits; exec and exit drop.** A fork child pins what its inherited regions name.
     `exec` pins the new image's file-backed segments in the new address space.
 
-  On AArch64 each `LazySource::File` also holds its own `InodePin` until mm convergence step 4
-  removes it (`proposals/AKUMA_MM_CONVERGENCE.md`). Boot test
-  `test_lazy_file_regions_pin_in_address_space`.
+  A region record holds no pin. A `LazySource` handed out by a lookup holds one for as long as
+  the fill reads the file. Boot test `test_lazy_file_regions_pin_in_address_space`.
 
 ### The mmu map/demote surface is safe — its obligations are not optional
 

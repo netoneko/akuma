@@ -22,9 +22,9 @@ pub struct DeferredLazySegment {
 }
 use crate::mmu;
 use crate::runtime::{runtime, config, track_frame, FrameSource, PhysFrame};
-use crate::process::types::{ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
+use crate::process::types::{MmapRegion, ProcessMemory, LazySource, SignalHandler, SignalAction, PROCESS_INFO_ADDR, ProcessInfo, Pid};
 use crate::process::lifecycle::LifecycleGuard;
-use super::{LazyRegionMap, NEXT_PID, Process, SharedFdTable};
+use super::{NEXT_PID, Process, SharedFdTable};
 
 #[cfg(feature = "elf-loader")]
 /// True if some OTHER process shares `tgid` — a live CLONE_THREAD sibling of `pid`.
@@ -68,7 +68,7 @@ pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usiz
     core::cmp::max(core::cmp::min(phys_cap, va_cap), MIN_HEAP)
 }
 
-/// Set by a kernel whose page-fault handler does not serve [`LazyRegionMap`]
+/// Set by a kernel whose page-fault handler does not serve lazy regions
 /// (amd64): a path load then maps every segment up front instead of deferring.
 /// Without it the first instruction fetch of any binary over `HEAP_SLURP_MAX`
 /// is a not-present fault nothing resolves, and `box run` of a 1 MiB busybox
@@ -127,10 +127,10 @@ impl ImageSource<'_> {
 /// deferred_segments` is a property of the mapping strategy, not of the caller),
 /// so this is a no-op on that path rather than a branch either caller has to make.
 #[cfg(not(feature = "elf-loader"))]
-const fn push_deferred_regions(_lazy: &mut LazyRegionMap, _segments: &[DeferredLazySegment]) {}
+const fn push_deferred_regions(_regions: &mut Vec<MmapRegion>, _segments: &[DeferredLazySegment]) {}
 
 #[cfg(feature = "elf-loader")]
-fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegment]) {
+fn push_deferred_regions(regions: &mut Vec<MmapRegion>, segments: &[DeferredLazySegment]) {
     for seg in segments {
         let source = match &seg.file_source {
             Some(fs) => LazySource::file(
@@ -142,8 +142,15 @@ fn push_deferred_regions(lazy: &mut LazyRegionMap, segments: &[DeferredLazySegme
             ),
             None => LazySource::Zero,
         };
-        lazy.push(seg.start_va, seg.size, seg.page_flags, source);
+        push_image_region(regions, seg.start_va, seg.size, seg.page_flags, &source);
     }
+}
+
+/// Add one lazy region to an image's starting list. Every inode it names is
+/// pinned in the image's address space by [`pin_deferred_inodes`]; a region a
+/// later one replaces names the same file.
+fn push_image_region(regions: &mut Vec<MmapRegion>, start_va: usize, size: usize, flags: u64, source: &LazySource) {
+    let _ = super::insert_lazy_region(regions, super::lazy_mmap_region(start_va, size, flags, source));
 }
 
 /// Pin, in the image's own address space, the inode of every file-backed
@@ -188,8 +195,8 @@ pub struct ImageInstall<'a> {
     pub mmap_floor: usize,
     /// The new `argv`, for `/proc/<pid>/cmdline`.
     pub args: &'a [String],
-    /// Segments the loader chose not to map, to be demand-paged from
-    /// `lazy_regions`. Empty for a kernel that maps eagerly.
+    /// Segments the loader chose not to map, to be demand-paged from lazy
+    /// regions in `mmap_regions`. Empty for a kernel that maps eagerly.
     pub deferred_segments: &'a [DeferredLazySegment],
 }
 
@@ -212,7 +219,7 @@ impl Process {
     /// `&self`, not `&mut self` (`AKUMA_EXEC_AUDIT.md` §6.E group 2b): the
     /// mutated fields are now atomics (`entry_point`, `initial_brk`, `brk`,
     /// `process_info_phys`, `clear_child_tid`, `sigaltstack_*`), interior-locked
-    /// (`memory`, `mmap_regions`, `lazy_regions`, `address_space`,
+    /// (`memory`, `mmap_regions`, `address_space`,
     /// `signal_actions`), or behind [`Process::image`] (`args`, `context`). The
     /// `LifecycleGuard` + the caller's BKL are what keep a peer from observing
     /// the half-swapped state, exactly as before — this change only removes the
@@ -302,8 +309,6 @@ impl Process {
         self.brk.store(inst.brk, Ordering::Relaxed);
         self.initial_brk.store(inst.brk, Ordering::Relaxed);
         self.memory.reset(inst.brk, inst.stack_bottom, inst.stack_top, inst.mmap_floor);
-        self.mmap_regions.lock().clear();
-        self.lazy_regions.lock().clear();
         // `dynamic_page_tables` is always empty in this tree (nothing pushes to
         // it), so there is nothing to clear — and `&self` could not anyway.
         self.clear_child_tid.store(0, Ordering::Relaxed);
@@ -314,12 +319,15 @@ impl Process {
         let heap_lazy_size = compute_heap_lazy_size(inst.brk, &self.memory);
         let lazy_stack_start = inst.stack_top.saturating_sub(LAZY_STACK_MAX);
         {
-            let mut lazy = self.lazy_regions.lock();
-            // Demand-paged segments first, then heap and stack — the order the
-            // on-demand path has always used.
-            push_deferred_regions(&mut lazy, inst.deferred_segments);
-            lazy.push(inst.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
-            lazy.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+            // Built aside and swapped in: the old list drops after the lock is
+            // released. Demand-paged segments first, then heap and stack — the
+            // order the on-demand path has always used.
+            let mut regions = Vec::new();
+            push_deferred_regions(&mut regions, inst.deferred_segments);
+            push_image_region(&mut regions, inst.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
+            push_image_region(&mut regions, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
+            let old = core::mem::replace(&mut *self.mmap_regions.lock(), regions);
+            drop(old);
         }
 
         if config().syscall_debug_info_enabled {
@@ -431,8 +439,8 @@ impl Process {
         // process table, and this `Process` does not exist yet — let alone is
         // registered — so every region would be silently dropped and the first
         // heap or deep-stack touch would SIGSEGV.
-        let mut lazy_regions = LazyRegionMap::new();
-        push_deferred_regions(&mut lazy_regions, &loaded.deferred_segments);
+        let mut mmap_regions = Vec::new();
+        push_deferred_regions(&mut mmap_regions, &loaded.deferred_segments);
         pin_deferred_inodes(&mut loaded.address_space, &loaded.deferred_segments);
 
         let process_info_frame = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new).ok_or(ElfError::OutOfMemory)?;
@@ -454,9 +462,9 @@ impl Process {
             pid, loaded.brk, loaded.stack_bottom, loaded.stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit.load(Ordering::Relaxed));
 
         let heap_lazy_size = compute_heap_lazy_size(loaded.brk, &memory);
-        lazy_regions.push(loaded.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        push_image_region(&mut mmap_regions, loaded.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
         let lazy_stack_start = loaded.stack_top.saturating_sub(LAZY_STACK_MAX);
-        lazy_regions.push(lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, LazySource::Zero);
+        push_image_region(&mut mmap_regions, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
 
         Ok(Self::fresh(crate::process::FreshProcess {
             pid,
@@ -469,8 +477,7 @@ impl Process {
             brk: loaded.brk,
             memory,
             process_info_phys: process_info_frame.addr,
-            mmap_regions: Vec::new(),
-            lazy_regions,
+            mmap_regions,
             fds: Arc::new(SharedFdTable::with_stdio()),
             thread_id: None,
             terminal_state: Arc::new(Spinlock::new(terminal::TerminalState::default())),

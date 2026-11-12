@@ -2810,8 +2810,6 @@ pub fn current_pid() -> u32 {
 // * `image.context: UserContext::new(0, 0)` — amd64 keeps ring-3 registers in
 //   its own `UserCtx` and `enter_user` is its own entry path; this context is
 //   never `eret`n from.
-// * `lazy_regions` empty — demand paging here comes from `mmap_regions`
-//   (`akuma-mmap`), not a lazy-region map.
 // * `memory: ProcessMemory::new(end_va, stack_bottom, ELF_STACK_TOP,
 //   mm::MMAP_BASE)` — the same constants `loader.rs`/`mm.rs` place with, so
 //   the registered view and the real one cannot disagree about where the heap,
@@ -2946,7 +2944,7 @@ pub fn register_exec_process(
     use alloc::sync::Arc;
 
     use akuma_exec::process::{
-        FreshProcess, LazyRegionMap, Process, ProcessChannel, ProcessMemory, SharedFdTable, register_channel,
+        FreshProcess, Process, ProcessChannel, ProcessMemory, SharedFdTable, register_channel,
         register_child_channel, register_reserved, thread_pid_map_insert,
     };
 
@@ -3050,7 +3048,6 @@ pub fn register_exec_process(
         // from the loader. Empty for everything but a `fork` child, which
         // arrives carrying the parent's extents.
         mmap_regions: image.regions,
-        lazy_regions: LazyRegionMap::new(),
         // **`with_stdio()` since 4b batch 2a** — it was `new()`, and the
         // comment here recorded why: a table holding `Stdin`/`Stdout`/`Stderr`
         // made `is_bound(1)` true and routed the write into `sys_write_file`,

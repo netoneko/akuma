@@ -12,7 +12,10 @@ deferred there because it cannot be done one call at a time.*
 | — | **`MAP_FIXED` leak fixed first** (2026-11-12): glue's `MAP_FIXED` kept every replaced eager frame until exit and left an overlapping record in the list. It now goes through `unmap_range`, `munmap`'s body. A prerequisite for step 5, since this `mem.rs` becomes amd64's mm too ([`AKUMA_MAP_FIXED_EAGER_LEAK.md`](../docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md)) |
 | 2 | folded into step 4 (below) |
 | 3. pin set in the shared `UserAddressSpace` | **done** (2026-11-12): `akuma_user_space::MappingPins` held by both structs, methods shared. AArch64 pins on `push_lazy_region_with_source`, fork's `propagate_lazy_regions_to_child`, exec and spawn (deferred segments), and releases when `munmap` removes the last region naming the inode. Thread views (`clone_lazy_regions`) pin nothing. Boot test `test_lazy_file_regions_pin_in_address_space`; `ext2probe` `SPACE OK`; `mem_suite` 12/12 |
-| 4–6 | open |
+| 4a. `MmapRegion` can describe a demand-paged ELF segment | **done** (2026-11-12): `lazy` marker, `FileBacking::lead`, `page_span` |
+| 4b-i. a lazy file region is named by `(mount, inode)` | **done** (2026-11-12): no path in `LazySource`; inode-less files map eagerly |
+| 4b-ii. lazy regions join `mmap_regions` | **done** (2026-11-12): `LazyRegionMap`, `Process::lazy_regions`, `clone_lazy_regions`, `update_lazy_region_flags` and `propagate_lazy_regions_to_child` deleted; the `*lazy_region*` names are views over the one list. fork reads the leader's list (a worker's fork used to read its own, empty one); a thread's faults resolve through the address-space owner. A replacing push now releases the old file's pin. Gates: AArch64 HVF boot suite 318/326/324 (SMP 1/2/4, unchanged), `mem_suite` 12/12, `dynspawn` 0 divergences, `ext2probe` SPACE OK (100 % returned, pinned and unpinned), forktest stress, `futextest`/`thrchurn`/`sigprobe`, clean `-j4` self-host kernel build in the devbox VM (EXIT=0, 1m12s, tripwires 0) |
+| 5–6 | open |
 
 ## Goal
 
@@ -137,10 +140,8 @@ Reading the code for step 2 changed four parts of the plan above.
 - **Pins are released with the last region that names the inode.** Both kernels already had that
   lifetime: AArch64 through each region's `InodePin`, amd64 through `retain_mapped_inode_pins`. The
   set lives in the shared `UserAddressSpace` (step 3, done). `munmap`, `MAP_FIXED` and `mremap`
-  release a pin through the regions they detach. One gap is left for step 4: a `push` that
-  replaces a region at the same start address drops the old region's `InodePin` but not the
-  address space's pin, which then lasts until exit. Nothing pushes over a live region today,
-  since `MAP_FIXED` unmaps first.
+  release a pin through the regions they detach, and since step 4b-ii so does a push that
+  replaces part of a lazy region.
 - **`MmapRegion` needs a `lazy` marker.** Three AArch64 readers of the eager list assume
   every record in it is backed by present pages:
   - `eager_region_flags_for_page_fault`;

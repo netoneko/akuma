@@ -25,7 +25,7 @@ use akuma_mmap::MmapRegion;
 use spinning_top::Spinlock;
 
 use super::{
-    AssistedSpinlock, AtomicProcessState, Creds, LazyRegionMap, Pid, ProcAddressSpace, Process, ProcessChannel,
+    AssistedSpinlock, AtomicProcessState, Creds, Pid, ProcAddressSpace, Process, ProcessChannel,
     ProcessImage, ProcessMemory, ProcessState, ProcessSyscallStats, SharedCreds, SharedFdTable, SharedSignalTable,
     StdioBuffer, UserContext,
 };
@@ -49,8 +49,8 @@ pub struct FreshProcess {
     /// Physical address of the read-only process-info page, or 0 when the
     /// kernel maps none (amd64, the tokio kernels).
     pub process_info_phys: usize,
+    /// Every region the image starts with, lazy ones included, sorted.
     pub mmap_regions: Vec<MmapRegion>,
-    pub lazy_regions: LazyRegionMap,
     pub fds: Arc<SharedFdTable>,
     /// The scheduler slot that runs it, when one is already known.
     pub thread_id: Option<usize>,
@@ -78,7 +78,6 @@ impl Process {
             memory,
             process_info_phys,
             mmap_regions,
-            lazy_regions,
             fds,
             thread_id,
             terminal_state,
@@ -112,7 +111,6 @@ impl Process {
             exit_code: AtomicI32::new(0),
             dynamic_page_tables: Vec::new(),
             mmap_regions: AssistedSpinlock::new(mmap_regions),
-            lazy_regions: Spinlock::new(lazy_regions),
             fds,
             thread_id,
             // Set when spawned by another process.

@@ -726,6 +726,49 @@ pub fn detach_eager_regions_in_range(
     range_start: usize,
     range_end: usize,
 ) -> alloc::vec::Vec<(usize, usize, alloc::vec::Vec<PhysFrame>)> {
+    detach_regions_in_range_where(regions, range_start, range_end, |r| !r.lazy)
+        .into_iter()
+        .map(|p| (p.start_va, p.pages, p.frames))
+        .collect()
+}
+
+/// [`detach_eager_regions_in_range`] for the **demand-paged** regions.
+///
+/// Clips at both ends. A piece names its file backing (already advanced to the piece's start), so
+/// the caller can tell which files the removal may have stopped mapping.
+#[must_use]
+pub fn detach_lazy_regions_in_range(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    range_start: usize,
+    range_end: usize,
+) -> alloc::vec::Vec<DetachedPiece> {
+    detach_regions_in_range_where(regions, range_start, range_end, |r| r.lazy)
+}
+
+/// One piece cut out of a region by [`detach_regions_in_range_where`].
+#[derive(Debug)]
+pub struct DetachedPiece {
+    pub start_va: usize,
+    pub pages: usize,
+    /// The frames the region owned in this piece (none for a lazy region or a
+    /// CoW-inherited one).
+    pub frames: alloc::vec::Vec<PhysFrame>,
+    /// The piece's file backing, advanced to `start_va`.
+    pub file: Option<FileBacking>,
+    pub lazy: bool,
+}
+
+/// Detach the regions `select` picks that overlap `[range_start, range_end)`.
+///
+/// Partial ones are clipped at both ends; regions it does not pick are left
+/// alone. The clipping, ordering and survivor rules are
+/// [`detach_eager_regions_in_range`]'s.
+pub fn detach_regions_in_range_where(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    range_start: usize,
+    range_end: usize,
+    select: impl Fn(&MmapRegion) -> bool,
+) -> alloc::vec::Vec<DetachedPiece> {
     let mut pieces = alloc::vec::Vec::new();
     if range_end <= range_start {
         return pieces;
@@ -769,7 +812,7 @@ pub fn detach_eager_regions_in_range(
         if reg_start >= range_end {
             break;
         }
-        if reg_end <= range_start {
+        if reg_end <= range_start || !select(&regions[i]) {
             i += 1;
             continue;
         }
@@ -851,7 +894,13 @@ pub fn detach_eager_regions_in_range(
             regions.remove(i);
         }
         if clip_pages > 0 {
-            pieces.push((clip_start, clip_pages, mid));
+            pieces.push(DetachedPiece {
+                start_va: clip_start,
+                pages: clip_pages,
+                frames: mid,
+                file: file.map(|f| f.advance(head_pages)),
+                lazy,
+            });
         }
         // Step over the survivors. They lie outside [range_start, range_end) by
         // construction, so re-examining them could only waste overlap tests —
@@ -1717,5 +1766,35 @@ mod lead_tests {
         assert!(list.iter().all(|r| r.lazy));
         let child = super::inherit_mmap_regions_for_cow_child(&list);
         assert!(child.iter().all(|r| r.lazy));
+    }
+
+    #[test]
+    fn eager_and_lazy_detach_each_leave_the_other_kind_alone() {
+        let base = 0x20_0000;
+        let file = FileBacking { mount_id: 1, inode: 9, offset: 0x3000, filesz: 0x10_000, lead: 0x800 };
+        let mut list = alloc::vec![
+            MmapRegion::inherited_with_prot(base, 2, Prot::RW),
+            MmapRegion::demand_paged(base + 0x2000, 4, Some(Prot::RO)).file_backed(file),
+        ];
+        // The eager detach over everything takes only the eager region.
+        let eager = super::detach_eager_regions_in_range(&mut list, base, base + 0x6000);
+        assert_eq!(eager.len(), 1);
+        assert_eq!((eager[0].0, eager[0].1), (base, 2));
+        assert_eq!(list.len(), 1);
+        assert!(list[0].lazy);
+        // The lazy detach clips: pages 1..3 of the lazy region go, head and tail stay.
+        let lazy = super::detach_lazy_regions_in_range(&mut list, base + 0x3000, base + 0x5000);
+        assert_eq!(lazy.len(), 1);
+        let p = &lazy[0];
+        assert!(p.lazy && p.frames.is_empty());
+        assert_eq!((p.start_va, p.pages), (base + 0x3000, 2));
+        // One page in: the 0x800 lead is consumed, then 0x800 of file data.
+        let f = p.file.expect("piece keeps its file");
+        assert_eq!((f.lead, f.offset, f.inode), (0, 0x3800, 9));
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].start_va, list[0].pages), (base + 0x2000, 1));
+        assert_eq!((list[1].start_va, list[1].pages), (base + 0x5000, 1));
+        assert!(list.iter().all(|r| r.lazy));
+        assert_eq!(list[0].file.unwrap().lead, 0x800);
     }
 }

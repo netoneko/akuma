@@ -796,20 +796,16 @@ pub struct Process {
     /// `replace_image` must reset it (it takes `&self` now, so it would need a
     /// lock or to move into [`Process::image`]).
     pub dynamic_page_tables: Vec<PhysFrame>,
-    /// mmap region bookkeeping.
+    /// mmap region bookkeeping: every mapping the process made, eager and
+    /// demand-paged (`MmapRegion::lazy`), sorted by `start_va` and never
+    /// overlapping. A thread's own list is empty; its group's mappings are on
+    /// the leader's.
     ///
     /// Inside the lock, not beside a `Spinlock<()>` — see
     /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis. `vm_with_regions` used to reach
     /// around the old `vm_lock` with `&mut *(addr_of!(..) as *mut Vec<_>)`
     /// because there is no way to get `&mut` out of a lock that guards nothing.
     pub mmap_regions: AssistedSpinlock<Vec<MmapRegion>>,
-    /// Per-process demand-paged lazy regions, keyed by `start_va`. Owned here
-    /// (not in a global table) so a `BTreeMap::insert` that OOMs under the lock
-    /// cannot self-deadlock on teardown — the field drops inside `Process::drop`
-    /// on the reclaim path, and `return_to_kernel*` no longer re-acquires it. See
-    /// docs/archive/LAZY_REGION_TABLE_ALLOC_UNDER_LOCK_HANG.md and
-    /// [`LazyRegionMap`].
-    pub lazy_regions: Spinlock<LazyRegionMap>,
     pub fds: Arc<SharedFdTable>,
     pub thread_id: Option<usize>,
     pub spawner_pid: Option<Pid>,
@@ -1052,12 +1048,8 @@ impl Process {
             dynamic_page_tables: Vec::new(),
             // `fork` replaces this with `inherit_mmap_regions_for_cow_child`;
             // `vfork`/`clone_thread` leave it empty and see the parent's mappings
-            // through the shared L0.
+            // through the shared L0, and their faults resolve the leader's list.
             mmap_regions: AssistedSpinlock::new(Vec::new()),
-            // Per-process, dropped in `Process::drop`. `fork` propagates the
-            // parent thread-group leader's descriptors into it before
-            // registration; `clone_thread` calls `clone_lazy_regions` after.
-            lazy_regions: Spinlock::new(LazyRegionMap::new()),
             thread_id: None,
             delegate_pid: None,
             grabbed_by: None,
@@ -2666,21 +2658,36 @@ pub fn fork_alloc_process_info(
 /// `parent_pid`/`parent_tgid` are read off `parent` rather than passed: they
 /// were locals of `fork_process` and a caller that disagreed with the `Process`
 /// it just handed over is a class of bug worth not having.
+/// Pin, in a fork child's address space, every file its inherited regions read.
+/// Takes `&mut`: the child is not published yet, so nothing else can hold it.
+pub fn pin_region_files(aspace: &mut UserAddressSpace, regions: &[MmapRegion]) {
+    for f in regions.iter().filter_map(|r| r.file) {
+        aspace.pin_mapped_inode(f.inode);
+    }
+}
+
 pub fn fork_share_parent_memory(
     parent: &Process,
     new_proc: &mut Process,
 ) -> Result<(), &'static str> {
     let parent_pid = parent.pid;
-    // Lazy mmap regions are keyed by *thread-group id* (see `mmap` →
-    // `push_lazy_region(proc.tgid, …)`): every thread sharing this address space
-    // registers its anonymous mappings (including each pthread's stack) under
-    // the one tgid. fork must enumerate lazy regions by tgid, NOT by the forking
-    // thread's pid — otherwise a worker-thread fork (pid != tgid) drops every
-    // *sibling* thread's stack from the child, and the child's libc `fork()`
-    // thread-list fixup faults dereferencing a sibling pthread node that was
-    // never replicated (docs/RUST_TOOLCHAIN.md §4). For a single-threaded
-    // process pid == tgid, so this is a no-op there.
+    // Every mapping — eager and lazy, including each pthread's stack — is
+    // recorded on the *thread-group leader* (`sys_mmap` resolves `proc.tgid`).
+    // fork must read the leader's list, NOT the forking thread's — otherwise a
+    // worker-thread fork (pid != tgid) drops every sibling's mapping from the
+    // child, and the child's libc `fork()` thread-list fixup faults
+    // dereferencing a sibling pthread node that was never replicated
+    // (docs/RUST_TOOLCHAIN.md §4). For a single-threaded process pid == tgid.
     let parent_tgid = parent.tgid;
+    // The process whose `mmap_regions` describes this address space: the
+    // thread-group leader, where `sys_mmap` records every mapping (`proc.tgid`).
+    // A worker thread's own list is empty, so a worker's fork read nothing from
+    // it until the region records were taken from here.
+    let regions_owner: &Process = if parent.pid == parent_tgid {
+        parent
+    } else {
+        lookup_process_shared(parent_tgid).unwrap_or(parent)
+    };
     // 4. Perform memory copy
     let stack_top = parent.memory.stack_top.load(Ordering::Relaxed);
     let stack_size = config().user_stack_size; 
@@ -2838,7 +2845,7 @@ pub fn fork_share_parent_memory(
         let sibling_ranges: alloc::vec::Vec<(usize, usize)> = {
             let mut needed: usize = 0;
             table::for_each_process(|p| {
-                if p.tgid == parent_tgid && p.pid != parent_pid {
+                if p.tgid == parent_tgid && p.pid != parent_pid && p.pid != regions_owner.pid {
                     needed += p.mmap_regions.lock().iter().filter(|r| r.pages > 0).count();
                 }
             });
@@ -2846,7 +2853,7 @@ pub fn fork_share_parent_memory(
             let mut ranges: alloc::vec::Vec<(usize, usize)> = alloc::vec::Vec::with_capacity(needed);
             let mut overflow = false;
             table::for_each_process(|p| {
-                if p.tgid == parent_tgid && p.pid != parent_pid {
+                if p.tgid == parent_tgid && p.pid != parent_pid && p.pid != regions_owner.pid {
                     for region in p.mmap_regions.lock().iter() {
                         if region.pages > 0 {
                             if ranges.len() < ranges.capacity() {
@@ -2864,25 +2871,32 @@ pub fn fork_share_parent_memory(
             ranges
         };
 
-        // Lazy regions, likewise snapshotted BKL-held. We share the pages the parent
-        // has *resident* in each lazy range, AND propagate the parent's lazy-region
-        // *descriptors* to the child's own tgid — see `propagate_lazy_regions_to_child`'s
-        // doc comment for why: `cow_share_and_demote_range` only shares resident pages, so a lazy
-        // region the parent registered but hasn't fully touched yet would otherwise
-        // vanish for the child (not resident, not registered). Note: this closes a real
-        // correctness gap, but is NOT a fix for the specific fork-then-exec SIGSEGV in
-        // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md — that crash's faulting VA
-        // was confirmed unregistered in the parent too. That bug remains open.
-        //
-        // One snapshot serves the share, the demote AND the descriptor
-        // propagation — `propagate_lazy_regions_to_child` writes straight into
-        // `new_proc`, which is not registered in the process table until the very
-        // end of this function, so it must be reached by reference here.
-        let parent_lazy_regions: alloc::vec::Vec<crate::process::types::LazyRegion> =
-            lazy_regions_snapshot(parent_tgid)
-                .map(|m| m.into_values().collect())
-                .unwrap_or_default();
-        propagate_lazy_regions_to_child(&parent_lazy_regions, new_proc);
+        // The leader's regions, eager and lazy, likewise snapshotted BKL-held, as
+        // `(start, len, shared_anon)`: the share below takes `as_lock` per chunk,
+        // which must not nest inside `mmap_regions`' lock. A lazy region's resident
+        // pages are shared like any other; its record reaches the child through
+        // `inherit_mmap_regions_for_cow_child` below, which is what keeps a page the
+        // parent never touched demand-pageable in the child
+        // (docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md). Counted first and
+        // filled within capacity, so the hold allocates nothing; the margin covers
+        // a sibling's concurrent `mmap`, and a region past it is reported.
+        let region_ranges: alloc::vec::Vec<(usize, usize, bool)> = {
+            let needed = regions_owner.vm_with_regions(|r| r.len());
+            let mut ranges = alloc::vec::Vec::with_capacity(needed + 16);
+            let overflow = regions_owner.vm_with_regions(|r| {
+                for region in r.iter().filter(|region| region.pages > 0) {
+                    if ranges.len() == ranges.capacity() {
+                        return true;
+                    }
+                    ranges.push((region.start_va, region.len_bytes(), region.shared_anon));
+                }
+                false
+            });
+            if overflow {
+                lifecycle_trace("[FORK-COW] WARNING: region list truncated (grew between count and collect)\n");
+            }
+            ranges
+        };
 
         // Per-chunk PTE snapshot buffer, reserved ONCE here so no `as_lock` hold below
         // ever has to grow it (see `FORK_AS_CHUNK_PAGES`).
@@ -2913,9 +2927,9 @@ pub fn fork_share_parent_memory(
                     new_proc.address_space.get_mut(), &mut chunk_scratch, "interp")?;
             }
 
-            // Share mmap regions.
+            // Share mmap regions, eager and lazy.
             //
-            // Size the share from `region.pages`, NOT `region.frames.len()`: when the
+            // Sized from `region.pages`, NOT `region.frames.len()`: when the
             // parent is itself a CoW-forked child its regions are `inherited` (extent
             // known, no owned frames), and using the frame count would compute a
             // zero-length range and silently skip the region — leaving this child with
@@ -2924,31 +2938,21 @@ pub fn fork_share_parent_memory(
             // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md: a grandchild of the
             // process that ran `mmap` (`( cmd; cmd ) &` — shell forks a subshell,
             // subshell forks to exec) faulted on musl's first malloc arena.
-            for region in parent.mmap_regions.lock().iter() {
-                if region.pages == 0 {
-                    continue;
-                }
+            for &(start_va, len, shared_anon) in &region_ranges {
                 // `MAP_SHARED|MAP_ANONYMOUS` must survive fork as ONE object. CoW-sharing
                 // it would give parent and child separate pages on the first write,
                 // silently ignoring the flag — see `share_rw_range`.
-                total_shared += if region.shared_anon {
-                    share_rw_range(parent_as, region.start_va,
-                        region.len_bytes(), new_proc.address_space.get_mut(), &mut chunk_scratch)?
+                total_shared += if shared_anon {
+                    share_rw_range(parent_as, start_va, len, new_proc.address_space.get_mut(), &mut chunk_scratch)?
                 } else {
-                    cow_share_and_demote_range(parent_as, region.start_va,
-                        region.len_bytes(), new_proc.address_space.get_mut(), &mut chunk_scratch,
-                        "mmap")?
+                    cow_share_and_demote_range(parent_as, start_va, len,
+                        new_proc.address_space.get_mut(), &mut chunk_scratch, "mmap")?
                 };
             }
 
             for (va_start, len) in &sibling_ranges {
                 total_shared += cow_share_and_demote_range(parent_as, *va_start, *len,
                     new_proc.address_space.get_mut(), &mut chunk_scratch, "sibling-mmap")?;
-            }
-
-            for region in &parent_lazy_regions {
-                total_shared += cow_share_and_demote_range(parent_as, region.start_va, region.size,
-                    new_proc.address_space.get_mut(), &mut chunk_scratch, "lazy")?;
             }
 
             // Belt-and-braces global invalidate on top of the per-chunk range flushes.
@@ -2968,13 +2972,9 @@ pub fn fork_share_parent_memory(
         // not owned.  On write fault, new frames are allocated and tracked in
         // user_frames.  We keep each region's VA *and page count* so munmap can
         // size it and so this child's own forks can share it (see `MmapRegion`).
-        *new_proc.mmap_regions.lock() = inherit_mmap_regions_for_cow_child(&parent.mmap_regions.lock());
-        // NOTE: `new_proc.lazy_regions` is deliberately NOT cleared here — the
-        // parent's descriptors were propagated into it above, and wiping them
-        // reinstates the first-touch SIGSEGV of
-        // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md. (Pre-`LazyRegionMap`
-        // this line reset a vestigial `Vec` field that nothing read, while the real
-        // state lived in the global table.)
+        let child_regions = inherit_mmap_regions_for_cow_child(&regions_owner.mmap_regions.lock());
+        pin_region_files(new_proc.address_space.get_mut(), &child_regions);
+        *new_proc.mmap_regions.lock() = child_regions;
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
 
         let cow_elapsed_us = (runtime().uptime_us)() - cow_start_us;
@@ -3037,14 +3037,14 @@ pub fn fork_share_parent_memory(
         lifecycle_trace("[FORK-DBG] step4: interp done\n");
 
         const MAX_FORK_MMAP_PAGES: usize = 2048;
-        let mmap_snapshot: Vec<MmapRegion> = parent.mmap_regions.lock().clone();
+        let mmap_snapshot: Vec<MmapRegion> = regions_owner.mmap_regions.lock().clone();
         // RAII so a `?` early-return (OOM mid-copy) can't strand the flag set for the
         // rest of the boot, as the bare store/store pair did.
         let _forking = ForkInProgressGuard::new();
         let mut total_copied_pages: usize = 0;
         let mut child_mmap_regions: Vec<MmapRegion> = Vec::new();
 
-        for (region_idx, region) in mmap_snapshot.iter().enumerate() {
+        for (region_idx, region) in mmap_snapshot.iter().enumerate().filter(|(_, r)| !r.lazy) {
             let va_start = &region.start_va;
             let parent_frames = &region.frames;
             if lifecycle_trace_on() {
@@ -3117,33 +3117,29 @@ pub fn fork_share_parent_memory(
             }
         }
 
+        // The lazy regions' records go to the child whole; their resident pages
+        // are copied just below. Without the records a page the parent never
+        // touched would be neither copied nor demand-pageable in the child
+        // (docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md).
+        let parent_lazy: Vec<MmapRegion> = mmap_snapshot.into_iter().filter(|r| r.lazy).collect();
+        child_mmap_regions.extend(parent_lazy.iter().cloned());
+        child_mmap_regions.sort_by_key(|r| r.start_va);
+        pin_region_files(new_proc.address_space.get_mut(), &child_mmap_regions);
         *new_proc.mmap_regions.lock() = child_mmap_regions;
-        // `new_proc.lazy_regions` starts empty and is filled by the propagation
-        // just below; clearing it here would undo that (see the CoW arm's note).
         new_proc.memory.next_mmap.store(parent.memory.next_mmap.load(Ordering::Relaxed), Ordering::Relaxed);
         lifecycle_trace("[FORK-DBG] step4: mmap done\n");
 
         {
             const MAX_FORK_LAZY_PAGES: usize = 4096;
             let lazy_start_us = (runtime().uptime_us)();
-            // Clone the full LazyRegion descriptors, not just (va, size) — see
-            // `propagate_lazy_regions_to_child`'s doc comment (same propagation gap:
-            // eagerly copying whatever's *resident* in the parent's lazy ranges is
-            // not enough; the child needs its own lazy-region registration too, for
-            // whatever wasn't resident yet in the parent at fork time).
-            let parent_regions: alloc::vec::Vec<crate::process::types::LazyRegion> =
-                lazy_regions_snapshot(parent_tgid)
-                    .map(|m| m.into_values().collect())
-                    .unwrap_or_default();
-            propagate_lazy_regions_to_child(&parent_regions, new_proc);
-            let num_regions = parent_regions.len();
+            let num_regions = parent_lazy.len();
             let mut lazy_pages_copied = 0usize;
             let mut lazy_pages_scanned = 0usize;
             if lifecycle_trace_on() {
                 crate::safe_print!(64, "[FORK-DBG] lazy: {} regions\n", num_regions);
             }
-            'lazy_copy: for (region_idx, region) in parent_regions.into_iter().enumerate() {
-                let (va, size) = (region.start_va, region.size);
+            'lazy_copy: for (region_idx, region) in parent_lazy.iter().enumerate() {
+                let (va, size) = (region.start_va, region.len_bytes());
                 let pages = match fork_page_count_for_len(size) {
                     Some(p) => p,
                     None => continue,
@@ -3180,11 +3176,11 @@ pub fn fork_share_parent_memory(
 /// Fork the current process (deep copy)
 /// Returns the new PID to the parent.
 ///
-/// **Locks:** `clone_deep_for_fork` and the lazy-region snapshot take
-/// `SharedFdTable` / the parent's `Process::lazy_regions` only inside short
-/// `with_irqs_disabled` windows. The long eager copies do **not** hold those locks,
+/// **Locks:** `clone_deep_for_fork` and the region snapshot take
+/// `SharedFdTable` / the leader's `Process::mmap_regions` only inside short
+/// `with_irqs_disabled` windows. The long copies do **not** hold those locks,
 /// so fork is not expected to deadlock the fd table or either process's
-/// lazy-region map. A pathological
+/// region list. A pathological
 /// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
 pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
     // Serialize lifecycle against preemption under shared-kernel SMP. See
@@ -3206,7 +3202,7 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
         crate::safe_print!(128, "[FORK-DBG] parent_pid={} child_pid={} brk=0x{:x} code_end=0x{:x} mmap_regions={} lazy_regs={}\n",
             parent_pid, child_pid, parent.brk.load(Ordering::Relaxed), parent.memory.code_end.load(Ordering::Relaxed),
             parent.mmap_regions.lock().len(),
-            parent.lazy_regions.lock().len());
+            lazy_region_count_for_pid(parent.tgid));
     }
 
     // 1. Create new address space
@@ -3300,12 +3296,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
     child_ctx.set_address_space_root(new_proc.address_space.ttbr0());
 
     // 7./8. Spawn the child thread, publish the process, make it runnable — the
-    // shared tail. No `clone_lazy_regions(parent_pid, child_pid)` in `before_ready`:
-    // both fork arms above already propagated the parent *thread-group leader*'s
-    // descriptors into `new_proc` before registration. Re-cloning from `parent_pid`
-    // would replace that with the forking thread's own (per-thread, possibly stale)
-    // map — lazy regions are tgid-keyed (`sys_mmap` uses `proc.tgid`), so the
-    // leader's map is the authoritative one.
+    // shared tail. Both fork arms above already gave `new_proc` the thread-group
+    // leader's region list (lazy regions included) before registration.
     lifecycle_trace("[FORK-DBG] step7: spawning child thread\n");
     spawn_child_thread_and_publish(
         new_proc,
@@ -3639,8 +3631,6 @@ pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u6
             // address space — the thread-spawn SIGSEGV diagnostic; see
             // `record_clone_snapshot` and docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md.
             record_clone_snapshot(tid, stack, parent_pid, parent_tid, shared_ttbr0);
-
-            clone_lazy_regions(parent_pid, child_pid);
 
             // Publish the child's TID — but ONLY where the caller asked for it.
             //
@@ -4136,7 +4126,6 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
         exited: AtomicBool::new(false), exit_code: AtomicI32::new(0),
         dynamic_page_tables: Vec::new(), mmap_regions: AssistedSpinlock::new(Vec::new()),
-        lazy_regions: Spinlock::new(LazyRegionMap::new()),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
         thread_id: None, spawner_pid: None, ctty: AtomicU32::new(0),

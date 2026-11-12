@@ -96,7 +96,7 @@ pub fn run_memory_tests() -> bool {
     run_test!(test_lazy_region_munmap_suffix, "lazy_region_munmap_suffix");
     run_test!(test_lazy_region_munmap_middle, "lazy_region_munmap_middle");
     run_test!(test_lazy_region_munmap_multi, "lazy_region_munmap_multi");
-    run_test!(test_lazy_region_clone, "lazy_region_clone");
+    run_test!(test_lazy_and_eager_regions_share_one_list, "lazy_and_eager_share_one_list");
     run_test!(test_lazy_region_lookup_pid_isolation, "lazy_region_lookup_pid_isolation");
     run_test!(test_map_user_page_roundtrip, "map_user_page_roundtrip");
     run_test!(test_eager_mmap_pages_survive_subrange_munmap, "eager_mmap_subrange_munmap");
@@ -3250,48 +3250,49 @@ fn test_lazy_region_munmap_multi() -> bool {
     ok
 }
 
-/// Test clone_lazy_regions copies all regions from parent to child PID
-fn test_lazy_region_clone() -> bool {
-    console::print("\n[TEST] lazy_region: clone_lazy_regions\n");
+/// Lazy and eager regions live in one `mmap_regions` list: a lazy lookup
+/// never answers for an eager region, the eager readers never answer for a lazy
+/// one, and removing the lazy regions leaves the eager one in place.
+fn test_lazy_and_eager_regions_share_one_list() -> bool {
+    console::print("\n[TEST] lazy_region: lazy and eager share one list\n");
 
-    const PARENT_PID: u32 = 0xDEAD;
-    const CHILD_PID: u32 = 0xBEEF;
-
-    let _parent = LazyTestProcess::new(PARENT_PID);
-    let _child = LazyTestProcess::new(CHILD_PID);
-
-    // Create regions in parent
-    // Three distinct protections, so a clone that mixed them up would show.
+    const PID: u32 = 0xDEAD;
+    let _proc = LazyTestProcess::new(PID);
     const A: u64 = akuma_exec::mmu::user_flags::RW_NO_EXEC;
     const B: u64 = akuma_exec::mmu::user_flags::RX;
-    const C: u64 = akuma_exec::mmu::user_flags::RO_NO_EXEC;
-    akuma_exec::process::push_lazy_region(PARENT_PID, 0x1000_0000, 0x100_0000, A);
-    akuma_exec::process::push_lazy_region(PARENT_PID, 0x2000_0000, 0x200_0000, B);
-    akuma_exec::process::push_lazy_region(PARENT_PID, 0x5000_0000, 0x50_0000, C);
+    akuma_exec::process::push_lazy_region(PID, 0x1000_0000, 0x10_0000, A);
+    akuma_exec::process::push_lazy_region(PID, 0x3000_0000, 0x10_0000, B);
+    let eager = akuma_exec::process::MmapRegion::inherited_with_prot(0x2000_0000, 4, akuma_exec::mmu::Prot::RO);
+    let inserted = akuma_exec::process::with_process(PID, |p| {
+        p.vm_with_regions(|r| akuma_exec::process::insert_region_sorted(r, eager));
+    })
+    .is_some();
 
-    // Clone to child
-    akuma_exec::process::clone_lazy_regions(PARENT_PID, CHILD_PID);
+    let lazy_hit = akuma_exec::process::lazy_region_lookup_for_pid(PID, 0x3000_1000).map(|(f, _, s, _)| (f, s));
+    let lazy_miss_on_eager = akuma_exec::process::lazy_region_lookup_for_pid(PID, 0x2000_1000).is_none();
+    let eager_hit = akuma_exec::process::eager_region_flags_for_page_fault(PID, 0x2000_1000);
+    let eager_miss_on_lazy = akuma_exec::process::eager_region_flags_for_page_fault(PID, 0x1000_1000).is_none();
+    let counted = akuma_exec::process::lazy_region_count_for_pid(PID);
 
-    // Verify child has all regions
-    let child_regions = lazy_regions_of(CHILD_PID);
+    akuma_exec::process::clear_lazy_regions(PID);
+    let after_clear = (
+        akuma_exec::process::lazy_region_count_for_pid(PID),
+        akuma_exec::process::eager_region_flags_for_page_fault(PID, 0x2000_1000).is_some(),
+    );
 
-    let ok = child_regions.len() == 3
-        && child_regions.iter().any(|&(s, sz, f)| s == 0x1000_0000 && sz == 0x100_0000 && f == A)
-        && child_regions.iter().any(|&(s, sz, f)| s == 0x2000_0000 && sz == 0x200_0000 && f == B)
-        && child_regions.iter().any(|&(s, sz, f)| s == 0x5000_0000 && sz == 0x50_0000 && f == C);
-
-    // Verify parent still has its regions (clone should not remove them)
-    let parent_regions = lazy_regions_of(PARENT_PID);
-    let parent_ok = parent_regions.len() == 3;
-
-    if !ok || !parent_ok {
-        crate::safe_print!(192, "  child_regions={:?} parent_count={}\n",
-            child_regions, parent_regions.len());
+    let ok = inserted
+        && lazy_hit == Some((B, 0x3000_0000))
+        && lazy_miss_on_eager
+        && eager_hit == Some(akuma_exec::mmu::user_flags::RO)
+        && eager_miss_on_lazy
+        && counted == 2
+        && after_clear == (0, true);
+    if !ok {
+        crate::safe_print!(256, "  lazy_hit={:?} miss_on_eager={} eager_hit={:?} miss_on_lazy={} count={} after_clear={:?}\n",
+            lazy_hit, lazy_miss_on_eager, eager_hit, eager_miss_on_lazy, counted, after_clear);
     }
-
-    let result = ok && parent_ok;
-    crate::safe_print!(64, "  Result: {}\n", if result { "PASS" } else { "FAIL" });
-    result
+    crate::safe_print!(64, "  Result: {}\n", if ok { "PASS" } else { "FAIL" });
+    ok
 }
 
 /// Test that lazy_region_lookup_for_pid finds regions only for the correct PID
@@ -3608,7 +3609,6 @@ fn make_test_process(
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: core::sync::atomic::AtomicBool::new(false), exit_code: core::sync::atomic::AtomicI32::new(0),
         dynamic_page_tables: Vec::new(), mmap_regions: akuma_exec::process::AssistedSpinlock::new(Vec::new()),
-        lazy_regions: Spinlock::new(akuma_exec::process::LazyRegionMap::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeMap::new()),
         thread_id: None, spawner_pid: None, ctty: core::sync::atomic::AtomicU32::new(0),
@@ -4569,8 +4569,9 @@ fn test_munmap_fallback_clears_stale_ptes() -> bool {
 
 /// Bug 12: mprotect must update lazy region flags for demand paging.
 ///
-/// Verifies that update_lazy_region_flags changes the stored flags on
-/// overlapping lazy regions.
+/// Verifies that `update_eager_region_flags` — `mprotect`'s record edit, over
+/// the one list that holds lazy regions too — changes the stored flags on an
+/// overlapping lazy region.
 fn test_mprotect_updates_lazy_flags() -> bool {
     console::print("\n[TEST] Bug 12: mprotect updates lazy region flags\n");
 
@@ -4589,7 +4590,7 @@ fn test_mprotect_updates_lazy_flags() -> bool {
 
     // mprotect updates flags to RW_NO_EXEC
     let new_flags = akuma_exec::mmu::user_flags::RW_NO_EXEC;
-    akuma_exec::process::update_lazy_region_flags(test_pid, va_start, region_size, new_flags);
+    akuma_exec::process::update_eager_region_flags(test_pid, va_start, region_size, akuma_exec::mmu::Prot::RW_NO_EXEC);
 
     // Verify flags are updated
     let updated_flags = akuma_exec::process::lazy_region_lookup_for_pid(test_pid, va_start)

@@ -608,7 +608,7 @@ dropped-window ledger.
 
 | site | guard scope | inner lock(s) held while BKL dropped |
 |---|---|---|
-| `fork_process` CoW share/demote pass | the copy loop only — after the `for_each_process` sibling scan, the `LAZY_REGION_TABLE` snapshot, and `propagate_lazy_regions_to_child` (all hoisted BKL-held ahead of it); before steps 5–8 | thread-group **leader's** `Process::as_lock` in 64-page chunks (`FORK_AS_CHUNK_PAGES`, IRQ-masked via `AsLockHold`), plus `COW_REFCOUNTS` `Spinlock` and the PMM/allocator locks |
+| `fork_process` CoW share/demote pass | the copy loop only — after the `for_each_process` sibling scan and the leader's `mmap_regions` snapshot (both hoisted BKL-held ahead of it); before steps 5–8 | thread-group **leader's** `Process::as_lock` in 64-page chunks (`FORK_AS_CHUNK_PAGES`, IRQ-masked via `AsLockHold`), plus `COW_REFCOUNTS` `Spinlock` and the PMM/allocator locks |
 
 Two things about this one differ from the fs/net pattern and are easy to get
 wrong:
