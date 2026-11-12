@@ -1962,6 +1962,17 @@ pub fn sys_close_child_stdin(pid: u32) -> u64 {
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
+    // **Only the parent's thread group may reap**, the rule `wait4` and
+    // `waitid` already enforce through the same check. Without it any process
+    // could take another's child's status and unregister it. A caller with no
+    // process (a kernel thread) is tgid 0, which is what `spawn_request`
+    // records as the spawner of a child it starts. `ECHILD` reads as
+    // "not running" to libakuma's `waitpid_status`, as the old `0` did.
+    let waiter_tgid = akuma_exec::process::current_process_shared().map_or(0, |p| p.tgid);
+    if !akuma_exec::process::is_child_of_group(pid, waiter_tgid) {
+        return ECHILD;
+    }
+
     if let Some(ch) = akuma_exec::process::get_child_channel(pid)
         && ch.has_exited() {
             if status_ptr != 0 {

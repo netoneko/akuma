@@ -287,6 +287,13 @@ version starved the 32-slot thread pool under Go's 50-worker goroutine pools).
   child's `set_exited()` wakes the parent immediately (no 10 ms poll).
 - `EINTR` on `is_current_interrupted()`.
 
+Akuma's own `waitpid` (303) is **non-blocking** (sshd's bridge and herd poll
+it) and answers only the caller's own children: `ECHILD` unless
+`is_child_of_group(pid, caller tgid)`, the check `wait4`/`waitid` use. A
+caller with no process is tgid 0, the spawner `spawn_request` records for a
+kernel-started child. amd64 still answers 303 with its own `sys_waitpid`
+(parent filter, `-1`/`0` = any child, `SPAWN`-row reap).
+
 `wait4`/`waitid`/`waitpid` **reap** the zombie: `clear_lazy_regions(pid) +
 unregister_process(pid)` (the only paths that remove a zombie from the
 table). Linux wait-status encoding (`encode_wait_status`): normal exit

@@ -2544,6 +2544,27 @@ now services the mailbox: [`AMD64_YIELD_POLLER_SHOOTDOWN_DEAF`](AMD64_YIELD_POLL
 amd64's `SPAWN` rows stay: `bind_child_task` writes them for every process, and `waitpid` (303)
 and the console path read them.
 
+### `waitpid` (303): glue's answers only the parent (2026-11-12)
+
+Glue's 303 (the AArch64 kernel's) reaped any pid whose child channel had exited, with no
+check that the caller was its parent: any process could take another's child's status and
+unregister it. It now refuses with `ECHILD` unless `is_child_of_group(pid, caller tgid)`, the
+check `wait4`/`waitid` already make. The callers (`sshd`, `herd`, via libakuma's
+`waitpid_status`) wait only on children they spawned, and `ECHILD` reads as "not running" there,
+as the old `0` did.
+
+**Why 303 is not one copy yet.** amd64's `sys_waitpid` decides "exited" from
+`Process::exited`. Glue's exit path sets that *before* `close_all`, and amd64 sets it again in
+`spawn_record_exit`. Glue's decides from the child channel, marked after `close_all`. The reap
+differs too (amd64 clears a `SPAWN` row and runs a reclaim drain; AArch64 clears lazy regions).
+One copy needs one "done" signal, chosen so a reap can never run while the child is still
+inside its exit path, plus a per-arch reap hook. amd64's semantics (`-1`/`0` = any child) are
+the ones to keep.
+
+Gates: AArch64 HVF suite 312/320/318 with ssh ready on every SMP; 10 ssh sessions at SMP=2 each
+returned its own exit status and output through sshd's `waitpid_status`; clippy AArch64, amd64
+`headless`, Taoxichuan, host glue.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral
