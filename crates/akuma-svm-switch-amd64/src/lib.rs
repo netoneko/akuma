@@ -17,12 +17,16 @@
 //!   `EFER.SVME` where SVM is absent or firmware-locked `#GP`s.
 //! - **[`HostState::save`]** is `VMSAVE` into a page the value owns alone.
 //!
-//! What does not, and is therefore `unsafe`: **[`run`] and [`run_with_regs`]**. `VMRUN` hands
-//! the core to a guest whose reach is whatever its VMCB says — nested paging on or off, the
-//! nested page table's leaves, the I/O and MSR permission maps. Only the caller knows that the
-//! nested page table maps nothing but memory the guest owns, and the wiring's guest RAM is
-//! physical ranges carved from a reserve and tracked by offset, not by an owning type. Until
-//! it is, that is the caller's obligation, stated once at [`run`].
+//! - **[`Guest::run`]** is `VMRUN`. The guest's reach is whatever its VMCB says, so a
+//!   [`Guest`] owns everything that decides it — its VMCB page, its [`Asid`], its [`Npt`] (which
+//!   owns the [`GuestRam`] and pages it maps, and maps nothing else) — and rewrites every
+//!   confinement field from those values on each entry (`guest.rs` lists them). Nothing a caller
+//!   writes into the VMCB can widen what the guest reaches; a caller can only make it fault.
+//!
+//! The `unsafe` left here is the instructions themselves, each behind the type that discharges
+//! its obligation: the two MSR writes in [`enable`], `VMSAVE` in [`HostState::save`], `CLGI`,
+//! and the one `VMLOAD`/`VMRUN`/`VMSAVE` block in `enter`, reachable only from [`Guest::run`].
+//! The wiring (`akuma-kvm-amd64`) forbids `unsafe`.
 //!
 //! Memory safety, not harmlessness (the `akuma-port` rule): `VMSAVE` or `VMRUN` on a core
 //! whose `EFER.SVME` is clear raises `#UD`, which faults the kernel in the open; it is not a
@@ -35,6 +39,18 @@
 // `deny`, not `forbid`: the instructions are `unsafe` by nature and each block below carries
 // its own `allow` and SAFETY argument.
 #![deny(unsafe_code)]
+
+extern crate alloc;
+
+mod asid;
+mod guest;
+mod npt;
+mod ram;
+
+pub use asid::Asid;
+pub use guest::{Guest, Refused};
+pub use npt::{MapError, Npt, RamId};
+pub use ram::{reserve, GuestRam};
 
 use akuma_cpu::msr::{self, Msr};
 use akuma_phys::FreshFrame;
@@ -124,22 +140,25 @@ pub fn enable(area: HostSaveArea) -> Result<(), Unavailable> {
 
 /// The host's own FS/GS/TR/LDTR/`KernelGsBase`/`STAR`/`LSTAR`/`CSTAR`/`SFMASK`/
 /// `SYSENTER_*` state, in a VMCB-format page: what `VMRUN` itself does not save and
-/// [`run_with_regs`] `VMLOAD`s back after every exit.
+/// [`Guest::run`] `VMLOAD`s back after every exit.
 pub struct HostState {
     frame: FreshFrame,
 }
 
 impl HostState {
-    /// A zeroed page for it. Call [`HostState::save`] before the first entry.
+    /// A zeroed page for it. [`Guest::run`] saves into it on every entry.
     #[must_use]
     pub fn alloc() -> Option<Self> {
         FreshFrame::alloc_zeroed().map(|frame| Self { frame })
     }
 
-    /// `VMSAVE` this core's current state into the page. Before every entry when other host
-    /// tasks share the core: one of them may have moved `KernelGsBase` or `FS_BASE`, and a
-    /// stale save would put the old value back on exit.
-    pub fn save(&mut self) {
+    /// `VMSAVE` this core's current state into the page. [`Guest::run`] does it on every
+    /// entry, with GIF clear: another host task may have moved `KernelGsBase` or `FS_BASE`
+    /// since the last one, or the task may be on a different core, and a stale save would put
+    /// the wrong value back on exit.
+    // `&mut`: VMSAVE writes the page, and no other borrow may observe it mid-write.
+    #[allow(clippy::needless_pass_by_ref_mut)]
+    pub(crate) fn save(&mut self) {
         let pa = self.frame.pa().get();
         #[allow(unsafe_code)]
         // SAFETY: `pa` is a 4-KiB-aligned PMM frame this value owns alone (`&mut self`, and no
@@ -152,7 +171,7 @@ impl HostState {
 }
 
 /// The guest general registers `VMRUN` does not carry (RAX, RSP, RIP and RFLAGS live in the
-/// VMCB). Field order is [`run_with_regs`]'s offsets; the layout is pinned below.
+/// VMCB). Field order is `enter`'s offsets; the layout is pinned below.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Debug)]
 pub struct GuestRegs {
@@ -179,72 +198,29 @@ const _: () = {
     assert!(core::mem::offset_of!(GuestRegs, r15) == 0x68);
 };
 
-/// `VMRUN` once (APM Vol 2 §15.4), passing the guest only RCX, RDX and RBX.
-///
-/// RCX and RDX are handed back: the shape of the phase-0 rehearsal guests. RSP, RAX, RIP and RFLAGS are
-/// the host's again at `#VMEXIT` (the host save area); every other GPR is shared with the
-/// guest (Table B-2), so the asm declares them all clobbered. Returns with GIF set (`stgi`):
-/// `#VMEXIT` leaves it clear, and with GIF clear no interrupt, NMI or SMI reaches the host.
-///
-/// # Safety
-/// The guest the VMCB describes gets this core, and its reach is the VMCB's to state:
-/// - `vmcb` is the 4-KiB-aligned physical address of a fully initialized VMCB page the caller
-///   keeps alive and does not touch for the duration of the call;
-/// - that VMCB confines the guest to memory it owns: nested paging is on and the nested page
-///   table maps nothing but the guest's own RAM and pages it may read; and nothing the guest
-///   can execute reaches host memory or firmware state through a port or MSR the I/O and MSR
-///   permission maps leave it (a fixed rehearsal program may be given ports an arbitrary
-///   guest may not);
-/// - [`enable`] succeeded on this core.
-#[allow(unsafe_code)]
-#[inline(never)]
-#[must_use = "RCX and RDX are what the guest left in them"]
-pub unsafe fn run(vmcb: PhysAddr, guest_rcx: u64, guest_rdx: u64, guest_rbx: u64) -> (u64, u64) {
-    let (rcx, rdx);
-    // SAFETY: per the contract above. RBX and RBP cannot be operands (LLVM reserves RBX; RBP
-    // is the frame pointer), so they are saved by hand around VMRUN, which does not restore
-    // them; RBX rides in through r15 because the PVH handoff wants the guest entered with it.
+/// Clear GIF (APM Vol 2 §15.17): no interrupt, NMI or SMI is taken until [`enter`]'s `STGI`.
+fn clgi() {
+    #[allow(unsafe_code)]
+    // SAFETY: CLGI touches no memory and only holds interrupts pending; `Guest::run` calls it
+    // only on its way into `enter`, which ends with STGI on every path.
     unsafe {
-        core::arch::asm!(
-            "push rbp",
-            "push rbx",
-            "mov rbx, r15",
-            "vmrun rax",
-            "pop rbx",
-            "pop rbp",
-            "stgi",
-            inlateout("rax") vmcb.get() => _,
-            inlateout("rcx") guest_rcx => rcx,
-            inlateout("rdx") guest_rdx => rdx,
-            inlateout("r15") guest_rbx => _,
-            lateout("rsi") _,
-            lateout("rdi") _,
-            lateout("r8") _,
-            lateout("r9") _,
-            lateout("r10") _,
-            lateout("r11") _,
-            lateout("r12") _,
-            lateout("r13") _,
-            lateout("r14") _,
-            options()
-        );
+        core::arch::asm!("clgi", options(nomem, nostack, preserves_flags));
     }
-    (rcx, rdx)
 }
 
-/// Enter the guest once with its whole register file.
-///
 /// Load `regs`, `VMLOAD` the guest's FS/GS/TR/LDTR and syscall MSRs, `VMRUN`, and on the way
 /// out store its registers back into `regs`, `VMSAVE` its state into its VMCB and `VMLOAD`
-/// `host`'s. Returns with GIF set.
-///
-/// # Safety
-/// [`run`]'s contract, for `vmcb`. `host` must have been [`HostState::save`]d on this core
-/// (it is `VMLOAD`ed after every exit — a zero page points the kernel's `%gs` at nothing).
-#[allow(unsafe_code)]
+/// `host`'s. Returns with GIF set. Called with GIF clear, only by [`Guest::run`].
 #[inline(never)]
-pub unsafe fn run_with_regs(vmcb: PhysAddr, host: &HostState, regs: &mut GuestRegs) {
-    // SAFETY: per the contract above. The stack pushes are balanced (so no `nostack`); RBX and
+fn enter(vmcb: PhysAddr, host: &HostState, regs: &mut GuestRegs) {
+    #[allow(unsafe_code)]
+    // SAFETY: `vmcb` is the VMCB page of the `Guest` whose `run` is the only caller, which owns
+    // it and has just rewritten its confinement fields from owned values (`guest.rs`): nested
+    // paging over that guest's own `Npt`, every port and MSR intercepted, VMLOAD/VMSAVE/VMRUN/
+    // STGI/CLGI/SKINIT/XSETBV intercepted, its own ASID flushed on a first entry per core. So
+    // the guest reaches nothing but memory it owns. `host` was VMSAVEd on this core just
+    // before, with GIF already clear, so the VMLOAD after the exit restores this core's state.
+    // The stack pushes are balanced (so no `nostack`); RBX and
     // RBP cannot be operands and are saved by hand; every other GPR is declared clobbered,
     // which is the shared-register contract; RSP is the host's again at #VMEXIT, so
     // `[rsp]` (`regs`) and `[rsp+8]` (`host`'s page) are intact. `host`'s page is only read
@@ -269,7 +245,6 @@ pub unsafe fn run_with_regs(vmcb: PhysAddr, host: &HostState, regs: &mut GuestRe
             "mov r14, [rdi + 0x60]",
             "mov r15, [rdi + 0x68]",
             "mov rdi, [rdi + 0x20]",
-            "clgi",
             "vmload rax",
             "vmrun rax",
             "vmsave rax",

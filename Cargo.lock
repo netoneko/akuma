@@ -1013,8 +1013,13 @@ name = "akuma-svm-switch-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-cpu",
+ "akuma-mmu-raw",
  "akuma-phys",
+ "akuma-pmm",
  "akuma-primitives",
+ "akuma-svm-amd64",
+ "akuma-vm-spec",
+ "spinning_top",
 ]
 
 [[package]]

@@ -19,7 +19,8 @@ use spinning_top::Spinlock;
 use super::platform::{Offer, Platform, Source};
 use akuma_kernel_amd64::drivers::services::errno;
 use crate::linux::{Guest, GuestRegs, INTR0_BASE, get_reg, init_vmcb, set_reg};
-use akuma_svm_switch_amd64::{self as switch, HostState};
+use akuma_svm_switch_amd64::{Asid, Guest as SvmGuest, HostState, Npt};
+use alloc::sync::Arc;
 use crate::{enable_on_core, next_rip};
 use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_kernel_amd64::drivers::services::sched::FxArea;
@@ -98,7 +99,8 @@ enum Pending {
 
 pub(super) struct Vcpu {
     id: usize,
-    vmcb: FreshFrame,
+    /// The VMCB, the ASID and (from the first `RUN`) the VM's nested page table.
+    vmcb: SvmGuest,
     host: HostState,
     /// The run mapping's frames (the VMM maps them; the kernel writes exits through the physmap).
     pub(super) run: [FreshFrame; RUN_PAGES],
@@ -123,10 +125,10 @@ fn heap_array<T: Clone, const N: usize>(v: T) -> Option<Box<[T; N]>> {
 
 impl Vcpu {
     pub(super) fn new(id: usize) -> Option<Self> {
-        let mut vmcb = FreshFrame::alloc_zeroed()?;
+        let mut vmcb = SvmGuest::new(Asid::alloc()?)?;
         let host = HostState::alloc()?;
         let run = [FreshFrame::alloc_zeroed()?, FreshFrame::alloc_zeroed()?];
-        init_vmcb(vmcb.bytes_mut(), Guest::Akuma, 0, id as u32 + 1);
+        init_vmcb(vmcb.page_mut(), Guest::Akuma);
         Some(Self {
             id,
             vmcb,
@@ -142,7 +144,7 @@ impl Vcpu {
     }
 
     fn vmcb(&mut self) -> Vmcb<'_> {
-        Vmcb::new(self.vmcb.bytes_mut())
+        self.vmcb.vmcb()
     }
 
     /// Copy the VM's eventfd registrations in (before a `RUN`).
@@ -361,9 +363,9 @@ fn signal_pending() -> bool {
 const QUANTUM_US: u64 = 5_000;
 
 /// `KVM_RUN`. 0 when the VMM has something to do (the run page says what), `EINTR` for a signal.
-pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64) -> u64 {
+pub(super) fn run(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt: &Arc<Npt>) -> u64 {
     let Some(ev) = vc.events.take() else { return errno::EBUSY };
-    let r = run_pinned(vc, plat, slots, npt_pa, &ev[0]);
+    let r = run_pinned(vc, plat, slots, npt, &ev[0]);
     vc.events = Some(ev);
     r
 }
@@ -385,7 +387,7 @@ fn placed_core(id: usize) -> Option<usize> {
     Some(usize::from(*placed.get(id.min(akuma_vm_spec::cores::MAX_PLACED - 1))?))
 }
 
-fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events) -> u64 {
+fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt: &Arc<Npt>, ev: &Events) -> u64 {
     // The core must have SVM on and the thread must stay on it.
     let mut me = placed_core(vc.id).unwrap_or_else(akuma_kernel_amd64::drivers::services::smp::cpu_index);
     if PLACED_TRACED.fetch_or(1 << (vc.id & 31), core::sync::atomic::Ordering::Relaxed) & (1 << (vc.id & 31)) == 0 {
@@ -416,7 +418,7 @@ fn run_pinned(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, n
     }
     let saved_flags = akuma_cpu::daif::read();
     akuma_cpu::daif::unmask_irq();
-    let r = run_inner(vc, plat, slots, npt_pa, ev, me);
+    let r = run_inner(vc, plat, slots, npt, ev, me);
     akuma_cpu::daif::restore(saved_flags);
     r
 }
@@ -425,12 +427,13 @@ fn io_ticks() -> u64 {
     svm::pit::ticks_from_us(akuma_kernel_amd64::drivers::services::net::uptime_us())
 }
 
-fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt_pa: u64, ev: &Events, _core: usize) -> u64 {
+fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, npt: &Arc<Npt>, ev: &Events, _core: usize) -> u64 {
     let mem = SlotMem(slots);
     let id = vc.id;
     let nrips = true;
-    let vmcb_pa = vc.vmcb.pa();
-    let mut first = true;
+    if !vc.vmcb.npt().is_some_and(|n| Arc::ptr_eq(n, npt)) {
+        vc.vmcb.set_npt(Arc::clone(npt));
+    }
 
     // Finish what the previous exit left the VMM to do.
     complete_pending(vc);
@@ -453,7 +456,6 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         let (offered, due) = with_plat(plat, |p| (p.offer(id, now), p.next_event_us(id)));
         {
             let mut v = vc.vmcb();
-            v.set_n_cr3(npt_pa);
             v.set_intr0(INTR0_BASE);
             v.set_v_intr(match offered {
                 Some(o) => ctrl::v_intr_extint(o.vector),
@@ -465,12 +467,8 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
                 offered.map_or(0x100, |o| u64::from(o.vector)) | v.v_intr() << 16,
                 due.map_or(0, |d| d.saturating_sub(now)),
             );
-            if first {
-                v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
-                first = false;
-            } else {
-                v.set_tlb_control(ctrl::TLB_DO_NOTHING);
-            }
+            // The switch flushes this vCPU's ASID on its first entry on a core.
+            v.set_tlb_control(ctrl::TLB_DO_NOTHING);
         }
         // A host interrupt at the guest's next deadline (or this quantum's end) ends the entry.
         let wake = due.unwrap_or(u64::MAX).min(now + QUANTUM_US);
@@ -478,22 +476,20 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         let _ = akuma_kernel_amd64::drivers::services::lapic::arm_oneshot_in_us(wake.saturating_sub(akuma_kernel_amd64::drivers::services::net::uptime_us()));
         akuma_cpu::daif::unmask_irq();
 
-        vc.host.save();
         akuma_kernel_amd64::drivers::services::sched::fpu_save_live(&mut host_fpu);
         akuma_kernel_amd64::drivers::services::sched::fpu_restore_live(&vc.fpu[0]);
-        // SAFETY: the VMCB is live and owned by `vc`, for a guest built by `init_vmcb`: nested paging over
-        // the memslot table `build_npt` made, whose leaves are the VM's own memslots, with the I/O and MSR
-        // permission maps `init_vmcb` installs. `vc.host` was saved just above, on this core, where
-        // `enable_on_core` succeeded and to which the thread is pinned.
+        // `enable_on_core` succeeded on this core, to which the thread is pinned.
         let unlocked = Unlocked::new();
-        #[allow(unsafe_code)]
-        unsafe { switch::run_with_regs(vmcb_pa, &vc.host, &mut vc.regs) };
+        let entered = vc.vmcb.run(&mut vc.host, &mut vc.regs);
         drop(unlocked);
         akuma_kernel_amd64::drivers::services::sched::fpu_save_live(&mut vc.fpu[0]);
         host_fpu.sanitize();
         akuma_kernel_amd64::drivers::services::sched::fpu_restore_live(&host_fpu);
+        if entered.is_err() {
+            return errno::ENODEV;
+        }
 
-        let mut v = Vmcb::new(vc.vmcb.bytes_mut());
+        let mut v = vc.vmcb.vmcb();
         trace_exit(v.exitcode(), v.rip(), v.exitinfo1(), v.exitinfo2());
         evring::push(evring::EXIT, v.rip(), v.exitcode() << 32 | (v.exitinfo1() & 0xffff_ffff), v.exitinfo2());
         // The INTA cycle: V_IRQ comes back cleared once the guest has dispatched the vector.
@@ -508,7 +504,7 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
             ExitCode::Cpuid => {
                 let (leaf, sub) = (v.rax() as u32, vc.regs.rcx as u32);
                 let [eax, ebx, ecx, edx] = vc.cpuid_lookup(leaf, sub);
-                let mut v = Vmcb::new(vc.vmcb.bytes_mut());
+                let mut v = vc.vmcb.vmcb();
                 v.set_rax(u64::from(eax));
                 vc.regs.rbx = u64::from(ebx);
                 vc.regs.rcx = u64::from(ecx);

@@ -1,7 +1,14 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-11 (late night) with `python3 scripts/cloc_akuma.py src crates`:
-**103 of 141 crates** forbid `unsafe`. 110738 of 111901 production lines (99.0%) sit outside any
+**Grade: A** — regenerated 2026-11-12 with `python3 scripts/cloc_akuma.py src crates`:
+**105 of 143 crates** forbid `unsafe`. 125777 of 127016 production lines (99.0%) sit outside any
+`unsafe` block; 391 production sites across `crates/` (490 with tests), 0 inside enforced crates.
+`akuma-kvm-amd64` took the ban: entering a guest is safe
+([`AKUMA_SAFE_GUEST_ENTRY.md`](../archive/AKUMA_SAFE_GUEST_ENTRY.md)), because
+`akuma-svm-switch-amd64` now owns guest RAM, the nested page table, ASIDs and the permission maps
+and confines the VMCB on every entry. kvm went 7 -> 0 sites, the switch 6 -> 4.
+
+The run before, 2026-11-11 (late night): **103 of 141 crates** forbid `unsafe`. 110738 of 111901 production lines (99.0%) sit outside any
 `unsafe` block; 363 production sites across `crates/` (442 with tests), 0 inside enforced crates.
 `akuma-drivers-amd64` took the ban: the hypervisor moved out into `akuma-kvm-amd64`, which keeps the
 seven guest entries (its only `unsafe`, each with its own `allow`), so the sites moved and none was

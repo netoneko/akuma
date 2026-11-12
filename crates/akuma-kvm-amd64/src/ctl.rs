@@ -34,7 +34,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use akuma_dmesg::Ring;
-use akuma_vm_spec::{arena::Arena, spec::MAX_WIRE, Spec};
+use akuma_vm_spec::{spec::MAX_WIRE, Spec};
 use spinning_top::Spinlock;
 
 use akuma_kernel_amd64::drivers::services::errno;
@@ -433,80 +433,24 @@ pub(super) fn should_stop() -> bool {
 // Reserved guest RAM
 // ---------------------------------------------------------------------------
 
-/// The block is the kernel's for good (never returned to the page allocator), so only its
-/// aligned base and the arena over it are kept.
-struct Reserve {
-    /// Host-physical, 2 MiB-aligned.
-    base: u64,
-    arena: Arena,
-}
-
-static RESERVE: Spinlock<Option<Reserve>> = Spinlock::new(None);
-
-/// Take `mib` MiB of contiguous memory for guests (`kvmmem=`), while memory is unfragmented.
+/// Take `mib` MiB of contiguous memory for guests (`kvmmem=`), while memory is unfragmented. The
+/// reserve and the slices carved from it are `akuma_svm_switch_amd64::reserve`'s: guest RAM is
+/// an owned value there, which is what lets entering a guest be safe.
 pub(super) fn reserve_init(mib: u64) {
-    let bytes = mib << 20;
-    let alloc_pages = ((bytes + SLICE_ALIGN) / 4096) as usize;
-    let Some(alloc_pa) = akuma_pmm::alloc_pages_contiguous_zeroed(alloc_pages) else {
-        super::p("[KVM] kvmmem: no contiguous block of that size; guests use the page allocator\n");
-        return;
-    };
-    let base = (alloc_pa as u64 + SLICE_ALIGN - 1) & !(SLICE_ALIGN - 1);
-    irq_off(|| *RESERVE.lock() = Some(Reserve { base, arena: Arena::new(bytes) }));
-    super::p("[KVM] kvmmem: reserved ");
-    super::dec(mib);
-    super::p(" MiB for guests\n");
-}
-
-/// Where a slice of guest memory came from.
-#[derive(Clone, Copy)]
-pub(super) enum Carve {
-    /// A slice of the reserve at host-physical `pa`; `off` is its handle for [`uncarve`].
-    Reserved { pa: u64, off: u64 },
-    /// No reserve was configured: the caller uses the page allocator.
-    Pmm,
-    /// A reserve exists and has no room: **refuse** (no silent fallback).
-    Refused { free: u64 },
-}
-
-/// Slice `bytes` (a multiple of 4 KiB) out of the reserve, zeroed.
-pub(super) fn carve(bytes: u64) -> Carve {
-    let got = irq_off(|| {
-        let mut g = RESERVE.lock();
-        let r = g.as_mut()?;
-        Some(match r.arena.alloc(bytes, SLICE_ALIGN) {
-            Some(off) => Ok((r.base + off, off)),
-            None => Err(r.arena.total() - r.arena.used()),
-        })
-    });
-    match got {
-        None => Carve::Pmm,
-        Some(Err(free)) => Carve::Refused { free },
-        Some(Ok((pa, off))) => {
-            zero_phys(pa, bytes);
-            Carve::Reserved { pa, off }
+    match akuma_svm_switch_amd64::reserve::init(mib << 20, SLICE_ALIGN) {
+        akuma_svm_switch_amd64::reserve::Init::Reserved => {
+            super::p("[KVM] kvmmem: reserved ");
+            super::dec(mib);
+            super::p(" MiB for guests\n");
+        }
+        akuma_svm_switch_amd64::reserve::Init::AlreadyReserved => super::p("[KVM] kvmmem: already reserved\n"),
+        akuma_svm_switch_amd64::reserve::Init::NoMemory => {
+            super::p("[KVM] kvmmem: no contiguous block of that size; guests use the page allocator\n");
         }
     }
-}
-
-pub(super) fn uncarve(off: u64) {
-    irq_off(|| {
-        if let Some(r) = RESERVE.lock().as_mut() {
-            r.arena.free(off);
-        }
-    });
 }
 
 /// Reserve bytes in use and in total, for `status`.
-pub(super) fn reserve_usage() -> Option<(u64, u64)> {
-    irq_off(|| RESERVE.lock().as_ref().map(|r| (r.arena.used(), r.arena.total())))
-}
-
-fn zero_phys(pa: u64, bytes: u64) {
-    let z = [0u8; 4096];
-    let mut off = 0;
-    while off < bytes {
-        let _ = akuma_mmu::copy_to_phys((pa + off) as usize, &z);
-        off += 4096;
-    }
+fn reserve_usage() -> Option<(u64, u64)> {
+    akuma_svm_switch_amd64::reserve::usage()
 }

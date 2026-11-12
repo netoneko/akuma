@@ -33,7 +33,9 @@
 //! stops the run at `HLT` — which is a finding, not a failure of the loader.
 //! The phase's pass is the kernel's banner arriving on the emulated COM1.
 
-use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, image_pa, next_rip, p, Iopm, Msrpm};
+use super::{crumb, dec, dump_exit, dump_state, enable_on_core, hx, next_rip, p};
+use alloc::sync::Arc;
+use akuma_svm_switch_amd64::{reserve, GuestRam, Npt};
 use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::devices::{MsrStore, Uart};
@@ -289,13 +291,15 @@ impl Vm {
 
     /// The disk to give the guest, if the machine has one. A spec's explicit `disk` is that
     /// file (or its RAM copy); an empty one is the machine's second virtio-blk device.
-    fn pick_disk(&self) -> Option<HostDisk> {
-        let Some(s) = &self.spec else { return HostDisk::pick(self.guest.disk_path()) };
+    ///
+    /// A RAM copy comes with the memory that holds it, which the caller keeps for the run.
+    fn pick_disk(&self) -> (Option<HostDisk>, Option<GuestRam>) {
+        let Some(s) = &self.spec else { return (HostDisk::pick(self.guest.disk_path()), None) };
         match s.disk_source() {
-            DiskSource::None => HostDisk::second_virtio(),
-            DiskSource::File(f) if s.disk_ram => HostDisk::load_into_ram(f),
-            DiskSource::File(f) => HostDisk::file(f),
-            DiskSource::NvmePartition(n) => HostDisk::nvme_partition(n),
+            DiskSource::None => (HostDisk::second_virtio(), None),
+            DiskSource::File(f) if s.disk_ram => HostDisk::load_into_ram(f).map_or((None, None), |(d, m)| (Some(d), Some(m))),
+            DiskSource::File(f) => (HostDisk::file(f), None),
+            DiskSource::NvmePartition(n) => (HostDisk::nvme_partition(n), None),
         }
     }
 }
@@ -357,10 +361,6 @@ const LOG_FIRST: u32 = 40;
 /// nobody emulates must not hold the boot — least of all on metal.
 const RUN_BUDGET_US: u64 = 120_000_000;
 const QUIET_BUDGET_US: u64 = 20_000_000;
-/// ASID: unique among the phases (ladder 1-13, two-level 14, pvh 15 under
-/// QEMU's 16); the first entry flushes, so it cannot see a previous phase's
-/// stale translations.
-const ASID: u32 = 1;
 
 pub const MSR_EFER: u32 = 0xC000_0080;
 pub const MSR_STAR: u32 = 0xC000_0081;
@@ -380,42 +380,49 @@ pub const MSR_APIC_BASE: u32 = 0x1B;
 pub use akuma_svm_switch_amd64::GuestRegs;
 
 
-/// Where a guest's RAM came from, so it goes back there.
-enum RamSrc {
-    /// A slice of the reserve (`kvmmem=`); `off` is its handle.
-    Reserved { off: u64 },
-    Pmm { alloc_pa: usize, alloc_pages: usize },
-}
-
 /// Guest RAM: one contiguous run of host frames, 2-MiB-aligned. Its guest-physical map
 /// is `svm::rammap::plan(bytes)` (flat to 3 GiB, then the PC shape around the device
 /// window), so guest-physical `g` is host-physical `map.host(base, g)`.
+///
+/// The frames are a [`GuestRam`] owned by the nested page table, which maps exactly the
+/// map's two ranges and nothing else; holding the table here is what keeps every host copy
+/// below inside memory the guest still owns.
 struct Ram {
     base: u64,
     map: svm::rammap::Map,
-    src: RamSrc,
+    npt: Arc<Npt>,
 }
 
 impl Ram {
     /// From the reserve when there is one (**refused**, not retried elsewhere, when it has no
-    /// room); from the page allocator when there is none.
+    /// room); from the page allocator when there is none. Mapped into a fresh nested page
+    /// table with 2 MiB leaves.
     fn alloc(bytes: u64) -> Option<Self> {
         let map = svm::rammap::plan(bytes)?;
-        match super::ctl::carve(bytes) {
-            super::ctl::Carve::Reserved { pa, off } => Some(Self { base: pa, map, src: RamSrc::Reserved { off } }),
-            super::ctl::Carve::Refused { free } => {
+        let ram = match reserve::carve(bytes) {
+            reserve::Carve::Ram(r) => r,
+            reserve::Carve::Refused { free } => {
                 p("[KVM] linux: refused: guest RAM does not fit the kvmmem= reserve (");
                 dec(free >> 20);
                 p(" MiB free)\n");
-                None
+                return None;
             }
-            super::ctl::Carve::Pmm => {
-                let alloc_pages = ((bytes + RAM_ALIGN) / 4096) as usize;
-                let alloc_pa = akuma_pmm::alloc_pages_contiguous_zeroed(alloc_pages)?;
-                let base = (alloc_pa as u64 + RAM_ALIGN - 1) & !(RAM_ALIGN - 1);
-                Some(Self { base, map, src: RamSrc::Pmm { alloc_pa, alloc_pages } })
-            }
+            reserve::Carve::NoReserve => GuestRam::alloc(bytes, RAM_ALIGN)?,
+        };
+        let base = ram.pa();
+        let Some(mut npt) = Npt::new() else {
+            p("[KVM] linux: no frames for the NPT\n");
+            return None;
+        };
+        let id = npt.adopt_ram(ram).ok()?;
+        let mapped = npt.map_ram(id, 0, map.low.bytes, map.low.gpa).and_then(|()| {
+            if map.high.bytes == 0 { Ok(()) } else { npt.map_ram(id, map.low.bytes, map.high.bytes, map.high.gpa) }
+        });
+        if mapped.is_err() {
+            p("[KVM] linux: the NPT refused guest RAM\n");
+            return None;
         }
+        Some(Self { base, map, npt: Arc::new(npt) })
     }
 
     /// The host-physical address of guest-physical `gpa`: `None` in the device window
@@ -468,31 +475,24 @@ enum HostDisk {
     /// A file on the host's filesystem, preallocated.
     File(Text<{ akuma_vm_spec::spec::MAX_PATH }>),
     /// A copy of an image file held in contiguous host frames from `base`, `bytes` long: a
-    /// slice of the reserve (`off` is its handle) or page-allocator frames. Returned by
-    /// [`MemLease`] when the run ends, so a restarting guest does not leak its image.
-    Mem { base: u64, bytes: u64, off: Option<u64> },
+    /// [`GuestRam`] (a slice of the reserve, or page-allocator frames) that [`DiskLease`] holds
+    /// for the run and gives back when it ends, so a restarting guest does not leak its image.
+    Mem { base: u64, bytes: u64 },
     /// A GPT partition of the NVMe disk, used **in place** through the driver's second window
     /// ([`akuma_kernel_amd64::drivers::services::nvme::open_guest_partition`]): the guest's writes are the partition's.
     Nvme { bytes: u64 },
 }
 
 /// Gives a RAM-copy disk (or a lent partition) back when the run ends, on every path out of it.
-struct DiskLease(Option<HostDisk>);
+/// The second field is a RAM copy's memory, held (never read) so it is given back exactly when
+/// the lease drops.
+struct DiskLease(Option<HostDisk>, #[allow(dead_code)] Option<GuestRam>);
 
 impl Drop for DiskLease {
     fn drop(&mut self) {
-        match self.0 {
-            Some(HostDisk::Mem { base, bytes, off }) => release_mem(base, bytes, off),
-            Some(HostDisk::Nvme { .. }) => akuma_kernel_amd64::drivers::services::nvme::close_guest_partition(),
-            _ => {}
+        if let Some(HostDisk::Nvme { .. }) = self.0 {
+            akuma_kernel_amd64::drivers::services::nvme::close_guest_partition();
         }
-    }
-}
-
-fn release_mem(base: u64, bytes: u64, off: Option<u64>) {
-    match off {
-        Some(o) => super::ctl::uncarve(o),
-        None => akuma_pmm::free_pages_contiguous(base as usize, bytes.div_ceil(4096) as usize),
     }
 }
 
@@ -515,11 +515,11 @@ impl HostDisk {
 
     /// Copy the whole of `file` into a slice of the reserve (refused if it has no room) or, with
     /// no reserve, contiguous frames from the page allocator, 1 MiB at a time.
-    fn load_into_ram(file: &str) -> Option<Self> {
+    fn load_into_ram(file: &str) -> Option<(Self, GuestRam)> {
         let bytes = akuma_vfs_glue::file_size(file).ok().filter(|&n| n >= virtio::SECTOR)? as u64;
-        let (base, off) = match super::ctl::carve(bytes.div_ceil(4096) * 4096) {
-            super::ctl::Carve::Reserved { pa, off } => (pa, Some(off)),
-            super::ctl::Carve::Refused { free } => {
+        let mem = match reserve::carve(bytes.div_ceil(4096) * 4096) {
+            reserve::Carve::Ram(r) => r,
+            reserve::Carve::Refused { free } => {
                 p("[KVM] linux: refused: the RAM copy of ");
                 p(file);
                 p(" does not fit the kvmmem= reserve (");
@@ -527,19 +527,19 @@ impl HostDisk {
                 p(" MiB free)\n");
                 return None;
             }
-            super::ctl::Carve::Pmm => {
-                let Some(base) = akuma_pmm::alloc_pages_contiguous_zeroed(bytes.div_ceil(4096) as usize) else {
+            reserve::Carve::NoReserve => {
+                let Some(r) = GuestRam::alloc(bytes.div_ceil(4096) * 4096, 4096) else {
                     p("[KVM] linux: no contiguous frames for the RAM copy of ");
                     p(file);
                     p("\n");
                     return None;
                 };
-                (base as u64, None)
+                r
             }
         };
+        let base = mem.pa();
         let mut buf = alloc::vec::Vec::new();
         if buf.try_reserve_exact(CHUNK_COPY).is_err() {
-            release_mem(base, bytes, off);
             return None;
         }
         buf.resize(CHUNK_COPY, 0u8);
@@ -555,12 +555,11 @@ impl HostDisk {
                 && akuma_mmu::copy_to_phys((base + at) as usize, &buf[..n]);
             if !ok {
                 p("[KVM] linux: reading the image failed\n");
-                release_mem(base, bytes, off);
                 return None;
             }
             at += n as u64;
         }
-        Some(Self::Mem { base, bytes, off })
+        Some((Self::Mem { base, bytes }, mem))
     }
 
     /// GPT partition `number` of the NVMe disk, lent to the guest (refused if it is the host's).
@@ -685,44 +684,6 @@ pub fn set_reg(v: &mut Vmcb<'_>, r: &mut GuestRegs, n: u8, val: u64) {
         14 => r.r14 = val,
         _ => r.r15 = val,
     }
-}
-
-impl Drop for Ram {
-    fn drop(&mut self) {
-        match self.src {
-            RamSrc::Reserved { off } => super::ctl::uncarve(off),
-            RamSrc::Pmm { alloc_pa, alloc_pages } => akuma_pmm::free_pages_contiguous(alloc_pa, alloc_pages),
-        }
-    }
-}
-
-/// The nested page table: PML4 -> PDPT -> directories of 2 MiB leaves, covering exactly
-/// guest RAM as `svm::rammap` lays it out — three GiBs below the device window and, past
-/// 3 GiB of RAM, the GiB above it. Everything else (the device window with the local APIC
-/// and virtio-mmio pages, ROMs, the framebuffer) is absent — a guest that touches it
-/// takes a nested page fault and the run stops there, naming the address. The window's
-/// GiB gets no directory at all, so at most four are ever allocated.
-struct Npt {
-    pml4: FreshFrame,
-    _pdpt: FreshFrame,
-    _dirs: [Option<FreshFrame>; svm::rammap::MAX_DIRS],
-}
-
-fn build_npt(ram: &Ram) -> Option<Npt> {
-    let mut pml4 = FreshFrame::alloc_zeroed()?;
-    let mut pdpt = FreshFrame::alloc_zeroed()?;
-    let mut dirs = [const { None }; svm::rammap::MAX_DIRS];
-    svm::wr64(pml4.bytes_mut(), 0, svm::npt::pointer(pdpt.pa().get()));
-    for (d, dir) in dirs.iter_mut().enumerate() {
-        if !ram.map.covers((d as u64) << 30) {
-            continue;
-        }
-        let mut page = FreshFrame::alloc_zeroed()?;
-        svm::rammap::fill_directory(page.bytes_mut(), ram.map, ram.base, d);
-        svm::wr64(pdpt.bytes_mut(), d * 8, svm::npt::pointer(page.pa().get()));
-        *dir = Some(page);
-    }
-    Some(Npt { pml4, _pdpt: pdpt, _dirs: dirs })
 }
 
 /// What the loader found.
@@ -1491,8 +1452,8 @@ enum CpuState {
 }
 
 /// Processor `cpu`'s VMCB.
-fn vmcb_of(frames: &mut [Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> Vmcb<'_> {
-    Vmcb::new(frames[cpu].as_mut().expect("a VMCB is allocated for every virtual processor").bytes_mut())
+fn vmcb_of(guests: &mut [Option<akuma_svm_switch_amd64::Guest>; MAX_VCPUS], cpu: usize) -> Vmcb<'_> {
+    guests[cpu].as_mut().expect("a VMCB is allocated for every virtual processor").vmcb()
 }
 
 /// What every processor intercepts: CPUID, every port, every MSR, HLT, the host's own
@@ -1504,7 +1465,10 @@ pub const INTR0_BASE: u32 =
 /// The controls every virtual processor shares: everything the guest can ask the
 /// hypervisor about is intercepted, nested paging is on, and the host's `IF` — not
 /// the guest's — decides whether a physical interrupt is taken while the guest runs.
-pub fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) {
+///
+/// What bounds the guest's reach (nested paging, its table, the permission maps, its ASID) is
+/// not set here: `akuma_svm_switch_amd64::Guest::run` writes it on every entry.
+pub fn init_vmcb(page: &mut [u8; 4096], guest: Guest) {
     let mut v = Vmcb::new(page);
     v.set_intr0(INTR0_BASE);
     v.set_intr1(intr1::VMRUN | intr1::VMMCALL | intr1::XSETBV);
@@ -1517,13 +1481,8 @@ pub fn init_vmcb(page: &mut [u8; 4096], guest: Guest, npt_root: u64, asid: u32) 
         Guest::Linux | Guest::LinuxApic => excp::UD | excp::GP | excp::PF | excp::DF,
         Guest::Akuma | Guest::AkumaHello | Guest::AkumaSmp | Guest::AkumaNet | Guest::AkumaSpec => excp::UD | excp::GP | excp::DF,
     });
-    v.set_iopm_base(image_pa(static_iopm()));
-    v.set_msrpm_base(image_pa(static_msrpm()));
-    v.set_asid(asid);
     v.set_tlb_control(ctrl::TLB_FLUSH_ALL);
-    v.set_np_enable(true);
     v.set_v_intr(ctrl::V_INTR_MASKING);
-    v.set_n_cr3(npt_root);
     v.set_save64(save::DR6, 0xFFFF_0FF0);
     v.set_save64(save::DR7, 0x400);
     // The architectural reset PAT (WB, WT, UC-, UC twice): used because
@@ -1594,16 +1553,3 @@ fn set_startup_state(v: &mut Vmcb<'_>, vector: u8) {
 }
 
 
-fn static_msrpm() -> &'static Msrpm {
-    &MSRPM_ALL
-}
-
-fn static_iopm() -> &'static Iopm {
-    &IOPM_ALL
-}
-
-/// Every MSR intercepted (both bits of every pair set): a guest's `WRMSR` is
-/// the hypervisor's to answer, never the host CPU's.
-static MSRPM_ALL: Msrpm = Msrpm([0xFF; svm::msrpm::SIZE]);
-/// Every port intercepted.
-static IOPM_ALL: Iopm = Iopm(svm::iopm::all());

@@ -2,7 +2,7 @@
 name = "akuma-svm-switch-amd64"
 version = "0.1.0"
 edition = "2024"
-description = "The AMD SVM world switch: the only crate that executes VMRUN, VMSAVE, VMLOAD and the EFER.SVME / VM_HSAVE_PA writes, behind owned types (a per-core host save area, a host state page) and one stated contract for entering a guest"
+description = "The AMD SVM world switch: the only crate that executes VMRUN, VMSAVE, VMLOAD, CLGI and the EFER.SVME / VM_HSAVE_PA writes, behind owned types — a per-core host save area, a host state page, guest RAM, the nested page table, ASIDs, and a Guest whose every entry rewrites the VMCB fields that bound what it can reach — so entering a guest is safe"
 
 [lints]
 workspace = true
@@ -13,3 +13,11 @@ workspace = true
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-phys = { path = "../akuma-phys" }
 akuma-primitives = { path = "../akuma-primitives" }
+# Guest RAM: contiguous blocks (`GuestRam::alloc`, the `kvmmem=` reserve) and zeroing a reused slice.
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-mmu-raw = { path = "../akuma-mmu-raw" }
+# The VMCB layout, NPT encodings and permission-map shapes the confinement writes.
+akuma-svm-amd64 = { path = "../akuma-svm-amd64" }
+# The reserve's first-fit arena.
+akuma-vm-spec = { path = "../akuma-vm-spec" }
+spinning_top = { version = "0.3" }

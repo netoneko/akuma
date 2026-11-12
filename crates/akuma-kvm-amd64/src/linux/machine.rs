@@ -46,8 +46,7 @@ use super::*;
 use alloc::sync::Arc;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use spinning_top::Spinlock;
-use akuma_primitives::addr::PhysAddr;
-use akuma_svm_switch_amd64::{self as switch, HostState};
+use akuma_svm_switch_amd64::{Asid, Guest as SvmGuest, HostState};
 
 /// Longest the owner sleeps with nothing to do and no relayed connection: bounds the latency of
 /// a new connection (the relay's `accept` runs from this loop) and of a lease check.
@@ -86,8 +85,8 @@ struct VcpuCtl {
     poke: AtomicBool,
     /// Where the guest was when its task last stopped (the summary line).
     rip: AtomicU64,
-    /// The VMCB frame, until the processor's task takes it.
-    vmcb: Spinlock<Option<FreshFrame>>,
+    /// The processor's VMCB, ASID and table, until its task takes it.
+    vmcb: Spinlock<Option<SvmGuest>>,
 }
 
 impl VcpuCtl {
@@ -187,9 +186,9 @@ struct Shared {
     nrips: bool,
     service: bool,
     n_cpu: usize,
+    /// Also holds the nested page table (and through it the RAM) for as long as any processor
+    /// can run.
     ram: Ram,
-    /// Keeps the nested page table's frames alive for as long as any processor can run.
-    _npt: Npt,
     dev: Spinlock<Devices>,
     cpu: [VcpuCtl; MAX_VCPUS],
     /// The host core each processor runs on.
@@ -358,11 +357,7 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
         sh.request_stop("no host save area for a processor's core", true);
         return;
     }
-    // The host's FS/GS/TR/LDTR/syscall-MSR state, parked in a VMCB-format page that
-    // `switch::run_with_regs` loads back after every exit.
-    host.save();
-
-    let mut vmcbs = [const { None::<FreshFrame> }; MAX_VCPUS];
+    let mut vmcbs = [const { None::<SvmGuest> }; MAX_VCPUS];
     for j in members() {
         vmcbs[j] = sh.cpu[j].vmcb.lock().take();
     }
@@ -609,9 +604,6 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
             akuma_cpu::daif::unmask_irq();
         }
         crumb(0x57);
-        if service {
-            host.save();
-        }
         // A service guest runs with the BKL released: on a many-core host the network and wifi
         // tasks (and every syscall) wait on it, and a guest entry can last a whole quantum. The
         // window is what the netpoll daemon uses for its own long BKL-free stretches; the host
@@ -621,15 +613,15 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
             akuma_bkl::bkl::dropped_window_open();
         }
         let guest_t0 = akuma_cpu::tsc::rdtsc();
-        // SAFETY: the VMCB is a live frame this function owns, for a guest built by `init_vmcb`:
-        // nested paging over `build_npt`'s table, which maps only this machine's own RAM, with the
-        // I/O and MSR permission maps `init_vmcb` installs.
-        // `host` was saved on this core, where `enable_on_core` succeeded.
-        #[allow(unsafe_code)]
-        unsafe { switch::run_with_regs(vmcb_of_pa(&vmcbs, i), &host, &mut regs_all[i]) };
+        // `enable_on_core` succeeded on this core; the switch saves `host` on every entry.
+        let entered = vmcbs[i].as_mut().expect("a VMCB is allocated for every virtual processor").run(&mut host, &mut regs_all[i]);
         acct.guest += akuma_cpu::tsc::rdtsc().wrapping_sub(guest_t0);
         if service {
             akuma_bkl::bkl::dropped_window_close();
+        }
+        if entered.is_err() {
+            sh.request_stop("the switch refused to enter the guest", true);
+            break 'run;
         }
         crumb(0x58);
         let regs = &mut regs_all[i];
@@ -952,16 +944,11 @@ fn serve(sh: &Shared, group: u32, owner: bool) {
     }
     crumb(0x59);
     for j in members() {
-        if let Some(f) = vmcbs[j].as_mut() {
-            sh.cpu[j].rip.store(Vmcb::new(f.bytes_mut()).rip(), Ordering::Relaxed);
+        if let Some(g) = vmcbs[j].as_mut() {
+            sh.cpu[j].rip.store(g.vmcb().rip(), Ordering::Relaxed);
         }
     }
     sh.totals.lock().add(&c);
-}
-
-/// A VMCB frame's physical address.
-fn vmcb_of_pa(frames: &[Option<FreshFrame>; MAX_VCPUS], cpu: usize) -> PhysAddr {
-    frames[cpu].as_ref().expect("a VMCB is allocated for every virtual processor").pa()
 }
 
 /// The `late()`/service entry: set a guest up, run it on its placed cores and report.
@@ -980,10 +967,6 @@ pub fn run(nrips: bool, vm: &Vm) {
         return;
     };
     crumb(0x52);
-    let Some(npt) = build_npt(&ram) else {
-        p("[KVM] linux: no frames for the NPT\n");
-        return;
-    };
     let Some(mut scratch) = FreshFrame::alloc_zeroed() else {
         p("[KVM] linux: no scratch frame\n");
         return;
@@ -1010,8 +993,8 @@ pub fn run(nrips: bool, vm: &Vm) {
     // entries (one, or two around the device window) stopping short of them. With a disk,
     // one more page under the handoff pages holds
     // the ACPI tables and the memory map reports it (type 3) instead of as RAM.
-    let disk = vm.pick_disk();
-    let _disk_lease = DiskLease(disk);
+    let (disk, disk_ram) = vm.pick_disk();
+    let _disk_lease = DiskLease(disk, disk_ram);
     // A spec that names a disk does not run without it: a refused RAM copy (the reserve is too
     // small) or a missing image would otherwise boot a rootless guest that halts and is
     // restarted forever (found on the ryzen 2026-10-22, a 3 GiB image against a 3 GiB reserve).
@@ -1136,14 +1119,18 @@ pub fn run(nrips: bool, vm: &Vm) {
     };
     let ctl: [VcpuCtl; MAX_VCPUS] = [const { VcpuCtl::new() }; MAX_VCPUS];
     for (i, c) in ctl.iter().enumerate().take(n_cpu) {
-        let Some(mut f) = FreshFrame::alloc_zeroed() else {
+        let Some(asid) = Asid::alloc() else {
+            p("[KVM] linux: no free ASID\n");
+            return;
+        };
+        let Some(mut f) = SvmGuest::with_npt(asid, Arc::clone(&ram.npt)) else {
             p("[KVM] linux: no frame for a VMCB\n");
             return;
         };
-        init_vmcb(f.bytes_mut(), guest, npt.pml4.pa().get(), ASID + i as u32);
+        init_vmcb(f.page_mut(), guest);
         if i == 0 {
             // The BSP starts the way PVH says: 32-bit protected mode, paging off.
-            let mut v = Vmcb::new(f.bytes_mut());
+            let mut v = f.vmcb();
             set_pvh_state(&mut v, loaded.entry);
             if let Err(e) = svm::validate_guest_state(&v) {
                 p("[KVM] linux: guest state rejected: ");
@@ -1187,7 +1174,6 @@ pub fn run(nrips: bool, vm: &Vm) {
         service,
         n_cpu,
         ram,
-        _npt: npt,
         dev: Spinlock::new(Devices { plat, blk, net, relay, scratch, log: ExitLog { cpuid: 0, msr: 0, exc: 0 } }),
         cpu: ctl,
         place: {

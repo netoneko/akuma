@@ -11,9 +11,10 @@
 //! §15.5.1 guest-state validation, NPT encodings) lives in
 //! `akuma-svm-amd64` and is host-tested; the instructions (`VMRUN`, `VMSAVE`,
 //! `VMLOAD`, the `EFER.SVME`/`VM_HSAVE_PA` writes) are `akuma-svm-switch-amd64`'s;
-//! this module is only the wiring, and its one kind of `unsafe` is entering a
-//! guest ([`switch::run`]), whose contract — the guest reaches only what its
-//! VMCB lets it — only the wiring can discharge.
+//! this module is only the wiring, and it holds no `unsafe`: a guest is entered
+//! through `akuma_svm_switch_amd64::Guest::run`, which owns the guest's RAM,
+//! nested page table, ASID and permission maps and rewrites the VMCB fields
+//! that bound its reach on every entry.
 //!
 //! Spec-first: no Linux/KVM code was consulted (GPL); every constant traces to
 //! the APM citation recorded in the crate or the milestone doc.
@@ -42,15 +43,14 @@
 //! would otherwise corrupt the host in flight.
 
 //!
-//! A crate of its own (2026-11-11) so that `akuma-drivers-amd64` can forbid `unsafe`: entering a
-//! guest (`akuma_svm_switch_amd64::run`) is an `unsafe fn` whose contract — the guest reaches
-//! only memory it owns — no type states yet, because guest RAM is carved physical ranges rather
-//! than an owning type. Each of the seven entries carries its own `allow` and SAFETY argument;
-//! nothing else here may use `unsafe`.
+//! A crate of its own (2026-11-11) so that `akuma-drivers-amd64` could forbid `unsafe` while
+//! entering a guest was still an `unsafe fn`. Since guest RAM, the nested page table and the
+//! guest itself became owned types in `akuma-svm-switch-amd64` (2026-11-12,
+//! `docs/archive/AKUMA_SAFE_GUEST_ENTRY.md`) this crate forbids it too.
 
 #![no_std]
 #![cfg(all(target_arch = "x86_64", target_os = "none"))]
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 
@@ -58,7 +58,8 @@ use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_kernel_amd64::drivers::services::serial;
 use akuma_kernel_amd64::drivers::services::smp;
 use akuma_cpu::msr::{self, Msr};
-use akuma_svm_switch_amd64::{self as switch, HostSaveArea};
+use akuma_svm_switch_amd64::{self as switch, Asid, Guest as SvmGuest, GuestRegs, HostSaveArea, HostState, Npt};
+use alloc::sync::Arc;
 use spinning_top::Spinlock;
 use akuma_svm_amd64 as svm;
 use akuma_vm_spec::Spec;
@@ -500,73 +501,6 @@ pub fn ap_hook() {
     }
 }
 
-/// The MSR permissions map (§15.11): 8 KiB in **two contiguous physical
-/// pages** — the property two separately allocated frames do not have, so
-/// the map lives in `.bss`, whose image bytes `linker.ld` places at
-/// `VA − KERNEL_VMA`. All zero = nothing intercepted; the one armed bit
-/// (EFER read) is set at compile time, which is also what keeps a `static`
-/// free of interior mutability.
-#[repr(C, align(4096))]
-struct Msrpm([u8; svm::msrpm::SIZE]);
-static MSRPM: Msrpm = Msrpm(svm::msrpm::with_access(
-    [0; svm::msrpm::SIZE],
-    svm::msr::EFER,
-    true,
-    false,
-));
-
-/// The I/O permissions map (§15.10.1): 12 contiguous KiB, same `.bss`
-/// argument, armed for port `0x80` (POST, the one exit the seed guests
-/// exercise) **and for the whole CMOS port range `0x70`–`0x77`** — the
-/// index/data pair and the extended-bank ports every chipset decodes there.
-/// The rehearsal guests run every other port natively on purpose (that is
-/// what the map is for), but "natively" must never mean the real RTC/NVRAM
-/// chip: a guest that grows one more `out` instruction would otherwise write
-/// the machine's firmware settings from inside the rehearsal. Everything a
-/// real OS guest sees goes through `IOPM_ALL` in `kvm/linux.rs`.
-#[repr(C, align(4096))]
-struct Iopm([u8; svm::iopm::SIZE]);
-static IOPM: Iopm = Iopm(svm::iopm::with_port(
-    svm::iopm::with_port(
-        svm::iopm::with_port(
-            svm::iopm::with_port(
-                svm::iopm::with_port(
-                    svm::iopm::with_port(
-                        svm::iopm::with_port(
-                            svm::iopm::with_port(
-                                svm::iopm::with_port([0; svm::iopm::SIZE], 0x80, true),
-                                0x70,
-                                true,
-                            ),
-                            0x71,
-                            true,
-                        ),
-                        0x72,
-                        true,
-                    ),
-                    0x73,
-                    true,
-                ),
-                0x74,
-                true,
-            ),
-            0x75,
-            true,
-        ),
-        0x76,
-        true,
-    ),
-    0x77,
-    true,
-));
-
-/// The physical address of an object in the kernel image — the derivation
-/// `linker.ld` bakes into every section (`AT(ADDR(...) - KERNEL_VMA)`) and
-/// `multiboot2.rs`'s PAT init already makes.
-fn image_pa<T>(r: &T) -> u64 {
-    core::ptr::from_ref::<T>(r) as u64 - akuma_kernel_amd64::drivers::services::phys::KERNEL_VMA
-}
-
 // ---------------------------------------------------------------------------
 // The trivial guest
 // ---------------------------------------------------------------------------
@@ -592,20 +526,8 @@ const GUEST_CODE: [u8; 18] = [
 /// PMM) — nothing is published to the physmap, so no mapping code runs.
 fn trivial_guest(nrips: bool) {
     crumb(1);
-    let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+    let Some(mut vmcb_f) = Asid::claim(1).or_else(Asid::alloc).and_then(SvmGuest::new) else {
         p("[KVM] no frame for VMCB\n");
-        return;
-    };
-    let Some(mut pml4_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] no frame for NPT PML4\n");
-        return;
-    };
-    let Some(mut pdpt_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] no frame for NPT PDPT\n");
-        return;
-    };
-    let Some(mut pd_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] no frame for NPT PD\n");
         return;
     };
     let Some(mut code_f) = FreshFrame::alloc_zeroed() else {
@@ -620,30 +542,27 @@ fn trivial_guest(nrips: bool) {
     // The permission maps: 4-KiB aligned and physically contiguous by
     // construction (`.bss` statics — see their docs); the alignment is the
     // one part of that the hardware enforces, so it is checked, not trusted.
-    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
-    if msrpm_pa % 4096 != 0 || iopm_pa % 4096 != 0 {
-        p("[KVM] permission map base not 4-KiB aligned\n");
-        return;
-    }
 
-    // Nested paging, minimal: identity-map exactly the 2 MiB page holding the
+    // Nested paging, minimal: identity-map exactly the 4 KiB page holding the
     // guest code. Guest CR0.PG=0 makes guest-linear == guest-physical, so the
     // NPT walk translates `code_pa` directly. The VMCB/hsave/NPT pages are
     // host-physical and never NPT-walked — no mapping for them.
-    let pml4_pa = pml4_f.pa().get();
-    let pdpt_pa = pdpt_f.pa().get();
-    let pd_pa = pd_f.pa().get();
-    svm::wr64(pml4_f.bytes_mut(), 0, svm::npt::pointer(pdpt_pa));
-    svm::wr64(pdpt_f.bytes_mut(), 0, svm::npt::pointer(pd_pa));
-    let pd_index = ((code_pa >> 21) & 0x1FF) as usize;
-    svm::wr64(pd_f.bytes_mut(), pd_index * 8, svm::npt::leaf_2m(code_pa & !0x1F_FFFF));
+    let Some(mut npt) = Npt::new() else {
+        p("[KVM] no frame for the NPT\n");
+        return;
+    };
+    if npt.adopt_page(code_f, code_pa).is_err() {
+        p("[KVM] the NPT refused a page\n");
+        return;
+    }
+    vmcb_f.set_npt(Arc::new(npt));
 
     // VMCB. Unused bytes must stay zero (page note, Table B-1): alloc_zeroed
     // guarantees it, and the wrapper only writes the fields below.
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
     {
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         // Intercept what the seed understands: the four exceptions a bad guest
         // state raises, the external events that would hit a null guest IDTR,
         // the three instructions the protocol uses, and the two permission
@@ -653,12 +572,7 @@ fn trivial_guest(nrips: bool) {
         );
         v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
         v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
-        v.set_iopm_base(iopm_pa);
-        v.set_msrpm_base(msrpm_pa);
-        v.set_asid(1);
         v.set_tlb_control(ctrl::TLB_DO_NOTHING);
-        v.set_np_enable(true);
-        v.set_n_cr3(pml4_pa);
         // Flat segments: base 0, limit 0xFFFF_FFFF. The VMCB limit field is the
         // byte-scaled 32-bit limit, not the 20-bit pre-granularity form: 0xFFFFF
         // here is a 1 MiB limit, and the guest code sits above it (#GP on fetch).
@@ -695,7 +609,7 @@ fn trivial_guest(nrips: bool) {
     // The §15.5.1 consistency checks, host-implemented: VMEXIT_INVALID gives
     // no diagnostics, so a failing boot names its own cause here.
     {
-        let v = Vmcb::new(vmcb_f.bytes_mut());
+        let v = Vmcb::new(vmcb_f.page_mut());
         if let Err(e) = svm::validate_guest_state(&v) {
             p("[KVM] guest state rejected: ");
             p(e.name());
@@ -721,6 +635,12 @@ fn trivial_guest(nrips: bool) {
     // dozen known bytes, and the host save area restores everything VMRUN
     // took. RCX/RDX round-trip through the loop: VMRUN does not save them
     // (Table B-2), so the guest's last value is the only copy there is.
+    let Some(mut host) = HostState::alloc() else {
+        p("[KVM] no frame for the host state page
+");
+        return;
+    };
+    let mut regs = GuestRegs::default();
     akuma_cpu::daif::mask_irq();
     let mut vmmcalls = 0u64;
     let mut msr_exits = 0u64;
@@ -729,16 +649,17 @@ fn trivial_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(7);
-        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
-        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
-        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
-        // succeeded on this core.
-        #[allow(unsafe_code)]
-        let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
-        guest_rcx = rcx_out;
-        guest_rdx = rdx_out;
+        regs.rcx = guest_rcx;
+        regs.rdx = guest_rdx;
+        regs.rbx = 0;
+        if vmcb_f.run(&mut host, &mut regs).is_err() {
+            why = "the switch refused to enter the guest";
+            break;
+        }
+        guest_rcx = regs.rcx;
+        guest_rdx = regs.rdx;
         crumb(8);
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         match ExitCode::from_u64(v.exitcode()) {
             ExitCode::Msr => {
                 msr_exits += 1;
@@ -792,7 +713,7 @@ fn trivial_guest(nrips: bool) {
     akuma_cpu::daif::unmask_irq();
     crumb(9);
 
-    let final_v = Vmcb::new(vmcb_f.bytes_mut());
+    let final_v = Vmcb::new(vmcb_f.page_mut());
     let pass = halted
         && vmmcalls == 2
         && msr_exits == 1
@@ -849,20 +770,8 @@ const LONGMODE_CODE: [u8; 26] = [
 /// names which guest died.
 fn longmode_guest(nrips: bool) {
     crumb(0x11);
-    let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+    let Some(mut vmcb_f) = Asid::claim(2).or_else(Asid::alloc).and_then(SvmGuest::new) else {
         p("[KVM] long-mode: no frame for VMCB\n");
-        return;
-    };
-    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] long-mode: no frame for NPT PML4\n");
-        return;
-    };
-    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] long-mode: no frame for NPT PDPT\n");
-        return;
-    };
-    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] long-mode: no frame for NPT PD\n");
         return;
     };
     let Some(mut gpml4_f) = FreshFrame::alloc_zeroed() else {
@@ -886,54 +795,56 @@ fn longmode_guest(nrips: bool) {
     let code_pa = code_f.pa().get();
     code_f.bytes_mut()[..LONGMODE_CODE.len()].copy_from_slice(&LONGMODE_CODE);
 
-    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
-    if msrpm_pa % 4096 != 0 || iopm_pa % 4096 != 0 {
-        p("[KVM] permission map base not 4-KiB aligned\n");
-        return;
-    }
-
-    // Nested paging, identity for every guest-physical address the run
-    // touches: the code *and* the three guest page-table pages, which the
-    // guest paging walk itself reads as guest-physical memory. Two of the
-    // four PAs can share a 2 MiB page; writing that entry twice is fine.
-    let npml4_pa = npml4_f.pa().get();
-    let npdpt_pa = npdpt_f.pa().get();
-    let npd_pa = npd_f.pa().get();
-    let gpml4_pa = gpml4_f.pa().get();
-    let gpdpt_pa = gpdpt_f.pa().get();
-    let gpd_pa = gpd_f.pa().get();
-    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
-    svm::wr64(npdpt_f.bytes_mut(), 0, svm::npt::pointer(npd_pa));
-    for pa in [code_pa, gpml4_pa, gpdpt_pa, gpd_pa] {
-        let idx = ((pa >> 21) & 0x1FF) as usize;
-        svm::wr64(npd_f.bytes_mut(), idx * 8, svm::npt::leaf_2m(pa & !0x1F_FFFF));
-    }
 
     // Guest paging, identity at every level: the indices come from
     // `code_pa`, so guest VA == guest PA == host PA wherever the PMM put
     // the frames.
+    let gpml4_pa = gpml4_f.pa().get();
+    let gpdpt_pa = gpdpt_f.pa().get();
+    let gpd_pa = gpd_f.pa().get();
     svm::wr64(gpml4_f.bytes_mut(), ((code_pa >> 39) & 0x1FF) as usize * 8, svm::npt::pointer(gpdpt_pa));
     svm::wr64(gpdpt_f.bytes_mut(), ((code_pa >> 30) & 0x1FF) as usize * 8, svm::npt::pointer(gpd_pa));
     svm::wr64(gpd_f.bytes_mut(), ((code_pa >> 21) & 0x1FF) as usize * 8, svm::npt::leaf_2m(code_pa & !0x1F_FFFF));
 
+    // Nested paging, identity for exactly the four pages the run touches: the
+    // code *and* the three guest page-table pages, which the guest paging walk
+    // itself reads as guest-physical memory. The guest's 2 MiB leaf covers
+    // more, but nothing outside the code page is ever fetched.
+    let Some(mut npt) = Npt::new() else {
+        p("[KVM] long-mode: no frame for the NPT\n");
+        return;
+    };
+    if npt.adopt_page(code_f, code_pa).is_err() {
+        p("[KVM] long-mode: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(gpml4_f, gpml4_pa).is_err() {
+        p("[KVM] long-mode: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(gpdpt_f, gpdpt_pa).is_err() {
+        p("[KVM] long-mode: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(gpd_f, gpd_pa).is_err() {
+        p("[KVM] long-mode: the NPT refused a page\n");
+        return;
+    }
+    vmcb_f.set_npt(Arc::new(npt));
+
     // VMCB — the trivial guest's intercepts and maps; ASID 2, so this
     // guest's translations cannot collide with the trivial guest's in the
     // TLB the ASID tags.
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
     {
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         v.set_intr0(
             intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
         );
         v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
         v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
-        v.set_iopm_base(iopm_pa);
-        v.set_msrpm_base(msrpm_pa);
-        v.set_asid(2);
         v.set_tlb_control(ctrl::TLB_DO_NOTHING);
-        v.set_np_enable(true);
-        v.set_n_cr3(npml4_pa);
         let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
         v.set_seg(
             save::CS,
@@ -967,7 +878,7 @@ fn longmode_guest(nrips: bool) {
 
     crumb(0x13);
     {
-        let v = Vmcb::new(vmcb_f.bytes_mut());
+        let v = Vmcb::new(vmcb_f.page_mut());
         if let Err(e) = svm::validate_guest_state(&v) {
             p("[KVM] long-mode guest state rejected: ");
             p(e.name());
@@ -991,6 +902,12 @@ fn longmode_guest(nrips: bool) {
 
     // Same excursion shape as the trivial guest: IRQs masked for the whole
     // run, RCX/RDX round-tripped through the loop (Table B-2).
+    let Some(mut host) = HostState::alloc() else {
+        p("[KVM] no frame for the host state page
+");
+        return;
+    };
+    let mut regs = GuestRegs::default();
     akuma_cpu::daif::mask_irq();
     let mut vmmcalls = 0u64;
     let mut msr_exits = 0u64;
@@ -998,16 +915,17 @@ fn longmode_guest(nrips: bool) {
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x17);
-        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
-        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
-        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
-        // succeeded on this core.
-        #[allow(unsafe_code)]
-        let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
-        guest_rcx = rcx_out;
-        guest_rdx = rdx_out;
+        regs.rcx = guest_rcx;
+        regs.rdx = guest_rdx;
+        regs.rbx = 0;
+        if vmcb_f.run(&mut host, &mut regs).is_err() {
+            why = "the switch refused to enter the guest";
+            break;
+        }
+        guest_rcx = regs.rcx;
+        guest_rdx = regs.rdx;
         crumb(0x18);
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         match ExitCode::from_u64(v.exitcode()) {
             ExitCode::Msr => {
                 msr_exits += 1;
@@ -1060,7 +978,7 @@ fn longmode_guest(nrips: bool) {
     akuma_cpu::daif::unmask_irq();
     crumb(0x19);
 
-    let final_v = Vmcb::new(vmcb_f.bytes_mut());
+    let final_v = Vmcb::new(vmcb_f.page_mut());
     let pass = halted
         && vmmcalls == 2
         && msr_exits == 1
@@ -1165,20 +1083,8 @@ const TWOVL_CODE: [u8; 32] = {
 /// Breadcrumbs 0x31–0x39 mirror the other guests' runs.
 fn twolvl_guest(nrips: bool) {
     crumb(0x31);
-    let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+    let Some(mut vmcb_f) = Asid::claim(14).or_else(Asid::alloc).and_then(SvmGuest::new) else {
         p("[KVM] two-level: no frame for VMCB\n");
-        return;
-    };
-    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] two-level: no frame for NPT PML4\n");
-        return;
-    };
-    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] two-level: no frame for NPT PDPT\n");
-        return;
-    };
-    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] two-level: no frame for NPT PD\n");
         return;
     };
     let Some(mut gpml4_f) = FreshFrame::alloc_zeroed() else {
@@ -1221,31 +1127,6 @@ fn twolvl_guest(nrips: bool) {
     code_f.bytes_mut()[..TWOVL_CODE.len()].copy_from_slice(&TWOVL_CODE);
     data_f.bytes_mut()[..8].copy_from_slice(&TWOVL_DATA_MAGIC.to_le_bytes());
 
-    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
-    if msrpm_pa % 4096 != 0 || iopm_pa % 4096 != 0 {
-        p("[KVM] permission map base not 4-KiB aligned\n");
-        return;
-    }
-
-    // NPT: every synthetic 2-MiB region → the aligned window holding the
-    // frame that plays it. All six regions share PDPT index 1 (the 1–2 GiB
-    // band), so one NPT PD covers them.
-    let npml4_pa = npml4_f.pa().get();
-    let npdpt_pa = npdpt_f.pa().get();
-    let npd_pa = npd_f.pa().get();
-    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
-    svm::wr64(npdpt_f.bytes_mut(), 8, svm::npt::pointer(npd_pa));
-    for (region, frame_pa) in [
-        (TWOVL_CODE_REGION, code_f.pa().get()),
-        (TWOVL_DATA_REGION, data_f.pa().get()),
-        (TWOVL_GPT_REGION[0], gpml4_f.pa().get()),
-        (TWOVL_GPT_REGION[1], gpdpt_f.pa().get()),
-        (TWOVL_GPT_REGION[2], gpd_f.pa().get()),
-        (TWOVL_GPT_REGION[3], gpt_f.pa().get()),
-    ] {
-        let idx = ((region >> 21) & 0x1FF) as usize;
-        svm::wr64(npd_f.bytes_mut(), idx * 8, svm::npt::leaf_2m(frame_pa & !0x1F_FFFF));
-    }
 
     // Guest paging: three pointer entries and two 4-KiB leaves — the PT
     // level is real, and every entry holds a *guest-physical* address for
@@ -1258,24 +1139,52 @@ fn twolvl_guest(nrips: bool) {
     svm::wr64(gpd_f.bytes_mut(), pd_idx * 8, svm::npt::pointer(gpt_gpa[3]));
     svm::wr64(gpt_f.bytes_mut(), 0, svm::npt::leaf_4k(code_gpa));
     svm::wr64(gpt_f.bytes_mut(), 8, svm::npt::leaf_4k(data_gpa));
+    let code_pa = code_f.pa().get();
+
+    // NPT: each synthetic page → the frame that plays it, one 4 KiB leaf
+    // apiece (all in the 1–2 GiB band).
+    let Some(mut npt) = Npt::new() else {
+        p("[KVM] two-level: no frame for the NPT\n");
+        return;
+    };
+    if npt.adopt_page(code_f, code_gpa).is_err() {
+        p("[KVM] two-level: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(data_f, data_gpa).is_err() {
+        p("[KVM] two-level: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(gpml4_f, gpt_gpa[0]).is_err() {
+        p("[KVM] two-level: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(gpdpt_f, gpt_gpa[1]).is_err() {
+        p("[KVM] two-level: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(gpd_f, gpt_gpa[2]).is_err() {
+        p("[KVM] two-level: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(gpt_f, gpt_gpa[3]).is_err() {
+        p("[KVM] two-level: the NPT refused a page\n");
+        return;
+    }
+    vmcb_f.set_npt(Arc::new(npt));
 
     // VMCB — the long-mode phase's state with the synthetic CR3 and VA in
     // place of the identity ones; ASID 14 stays clear of the ladder's 1–13.
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
     {
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         v.set_intr0(
             intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
         );
         v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
         v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
-        v.set_iopm_base(iopm_pa);
-        v.set_msrpm_base(msrpm_pa);
-        v.set_asid(14);
         v.set_tlb_control(ctrl::TLB_DO_NOTHING);
-        v.set_np_enable(true);
-        v.set_n_cr3(npml4_pa);
         let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
         v.set_seg(
             save::CS,
@@ -1306,7 +1215,7 @@ fn twolvl_guest(nrips: bool) {
 
     crumb(0x33);
     {
-        let v = Vmcb::new(vmcb_f.bytes_mut());
+        let v = Vmcb::new(vmcb_f.page_mut());
         if let Err(e) = svm::validate_guest_state(&v) {
             p("[KVM] two-level guest state rejected: ");
             p(e.name());
@@ -1327,28 +1236,35 @@ fn twolvl_guest(nrips: bool) {
     p(" gpa=");
     hx(code_gpa, 16);
     p(" hpa=");
-    hx(code_f.pa().get(), 16);
+    hx(code_pa, 16);
     p(")\n");
 
     // Same excursion shape as both earlier guests: IRQs masked for the run,
     // RCX/RDX round-tripped (Table B-2; this guest writes RSI only inside
     // itself, before any exit, so the shared-GPR contract does not reach it).
+    let Some(mut host) = HostState::alloc() else {
+        p("[KVM] no frame for the host state page
+");
+        return;
+    };
+    let mut regs = GuestRegs::default();
     akuma_cpu::daif::mask_irq();
     let mut vmmcalls = 0u64;
     let (mut guest_rcx, mut guest_rdx) = (0u64, 0u64);
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x37);
-        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
-        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
-        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
-        // succeeded on this core.
-        #[allow(unsafe_code)]
-        let (rcx_out, rdx_out) = unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, 0) };
-        guest_rcx = rcx_out;
-        guest_rdx = rdx_out;
+        regs.rcx = guest_rcx;
+        regs.rdx = guest_rdx;
+        regs.rbx = 0;
+        if vmcb_f.run(&mut host, &mut regs).is_err() {
+            why = "the switch refused to enter the guest";
+            break;
+        }
+        guest_rcx = regs.rcx;
+        guest_rdx = regs.rdx;
         crumb(0x38);
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         match ExitCode::from_u64(v.exitcode()) {
             ExitCode::Vmmcall => {
                 vmmcalls += 1;
@@ -1386,7 +1302,7 @@ fn twolvl_guest(nrips: bool) {
     akuma_cpu::daif::unmask_irq();
     crumb(0x39);
 
-    let final_v = Vmcb::new(vmcb_f.bytes_mut());
+    let final_v = Vmcb::new(vmcb_f.page_mut());
     let pass = halted && vmmcalls == 2 && final_v.rax() == TWOVL_DATA_MAGIC;
     p("[KVM] two-level guest: ");
     p(if pass { "PASS" } else { "FAIL" });
@@ -1489,26 +1405,8 @@ const PVH_CODE: [u8; 0x59] = [
 /// field its I/O. Breadcrumbs 0x41–0x49.
 fn pvh_guest(nrips: bool) {
     crumb(0x41);
-    let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+    let Some(mut vmcb_f) = Asid::claim(15).or_else(Asid::alloc).and_then(SvmGuest::new) else {
         p("[KVM] pvh: no frame for VMCB\n");
-        return;
-    };
-    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] pvh: no frame for NPT PML4\n");
-        return;
-    };
-    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] pvh: no frame for NPT PDPT\n");
-        return;
-    };
-    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] pvh: no frame for NPT PD\n");
-        return;
-    };
-    // The PT level the handoff forces: three blob pages share one 2-MiB
-    // region, which no single leaf can cover.
-    let Some(mut nptpt_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] pvh: no frame for NPT PT\n");
         return;
     };
     let Some(mut code_f) = FreshFrame::alloc_zeroed() else {
@@ -1538,50 +1436,45 @@ fn pvh_guest(nrips: bool) {
         return;
     }
 
-    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
-    if msrpm_pa % 4096 != 0 || iopm_pa % 4096 != 0 {
-        p("[KVM] permission map base not 4-KiB aligned\n");
+
+    // NPT: the code page and the three handoff pages, each a 4 KiB leaf at the
+    // guest-physical address `pvh::plan` gave it.
+    let code_gpa = PVH_CODE_REGION | (code_f.pa().get() & 0x1F_FFFF);
+    let Some(mut npt) = Npt::new() else {
+        p("[KVM] pvh: no frame for the NPT\n");
+        return;
+    };
+    if npt.adopt_page(code_f, code_gpa).is_err() {
+        p("[KVM] pvh: the NPT refused a page\n");
         return;
     }
-
-    // NPT: the code page rides a 2-MiB leaf in its own region; the three
-    // handoff pages, packed in one region by `pvh::plan`, need real 4-KiB
-    // leaves — the first PT level any phase's nested tables have built.
-    let npml4_pa = npml4_f.pa().get();
-    let npdpt_pa = npdpt_f.pa().get();
-    let npd_pa = npd_f.pa().get();
-    let nptpt_pa = nptpt_f.pa().get();
-    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
-    svm::wr64(npdpt_f.bytes_mut(), 8, svm::npt::pointer(npd_pa));
-    let code_gpa = PVH_CODE_REGION | (code_f.pa().get() & 0x1F_FFFF);
-    svm::wr64(npd_f.bytes_mut(), 0, svm::npt::leaf_2m(code_f.pa().get() & !0x1F_FFFF));
-    svm::wr64(npd_f.bytes_mut(), 2 * 8, svm::npt::pointer(nptpt_pa));
-    for (gpa, frame_pa) in [
-        (l.cmdline_gpa, cmdline_f.pa().get()),
-        (l.memmap_gpa, memmap_f.pa().get()),
-        (l.start_gpa, start_f.pa().get()),
-    ] {
-        svm::wr64(nptpt_f.bytes_mut(), ((gpa >> 12) & 0x1FF) as usize * 8, svm::npt::leaf_4k(frame_pa));
+    if npt.adopt_page(cmdline_f, l.cmdline_gpa).is_err() {
+        p("[KVM] pvh: the NPT refused a page\n");
+        return;
     }
+    if npt.adopt_page(memmap_f, l.memmap_gpa).is_err() {
+        p("[KVM] pvh: the NPT refused a page\n");
+        return;
+    }
+    if npt.adopt_page(start_f, l.start_gpa).is_err() {
+        p("[KVM] pvh: the NPT refused a page\n");
+        return;
+    }
+    vmcb_f.set_npt(Arc::new(npt));
 
     // VMCB — the trivial phase's 32-bit unpaged state, ASID 15 (ladder 1–13,
     // two-level 14), and EBX = start_info's GPA delivered through the
     // extended `vmrun`, which is the entire PVH convention.
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
-    svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+    svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
     {
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         v.set_intr0(
             intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
         );
         v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
         v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
-        v.set_iopm_base(iopm_pa);
-        v.set_msrpm_base(msrpm_pa);
-        v.set_asid(15);
         v.set_tlb_control(ctrl::TLB_DO_NOTHING);
-        v.set_np_enable(true);
-        v.set_n_cr3(npml4_pa);
         let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
         v.set_seg(
             save::CS,
@@ -1613,7 +1506,7 @@ fn pvh_guest(nrips: bool) {
 
     crumb(0x43);
     {
-        let v = Vmcb::new(vmcb_f.bytes_mut());
+        let v = Vmcb::new(vmcb_f.page_mut());
         if let Err(e) = svm::validate_guest_state(&v) {
             p("[KVM] pvh guest state rejected: ");
             p(e.name());
@@ -1633,23 +1526,29 @@ fn pvh_guest(nrips: bool) {
     hx(l.start_gpa, 16);
     p(")\n");
 
+    let Some(mut host) = HostState::alloc() else {
+        p("[KVM] no frame for the host state page
+");
+        return;
+    };
+    let mut regs = GuestRegs::default();
     akuma_cpu::daif::mask_irq();
     let mut vmmcalls = 0u64;
     let (mut guest_rcx, mut guest_rdx) = (0u64, 0u64);
     let (mut halted, mut why) = (false, "loop exhausted");
     for _ in 0..8 {
         crumb(0x47);
-        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
-        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
-        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
-        // succeeded on this core.
-        #[allow(unsafe_code)]
-        let (rcx_out, rdx_out) =
-            unsafe { switch::run(vmcb_f.pa(), guest_rcx, guest_rdx, l.start_gpa) };
-        guest_rcx = rcx_out;
-        guest_rdx = rdx_out;
+        regs.rcx = guest_rcx;
+        regs.rdx = guest_rdx;
+        regs.rbx = l.start_gpa;
+        if vmcb_f.run(&mut host, &mut regs).is_err() {
+            why = "the switch refused to enter the guest";
+            break;
+        }
+        guest_rcx = regs.rcx;
+        guest_rdx = regs.rdx;
         crumb(0x48);
-        let mut v = Vmcb::new(vmcb_f.bytes_mut());
+        let mut v = Vmcb::new(vmcb_f.page_mut());
         match ExitCode::from_u64(v.exitcode()) {
             ExitCode::Vmmcall => {
                 vmmcalls += 1;
@@ -1695,7 +1594,7 @@ fn pvh_guest(nrips: bool) {
     akuma_cpu::daif::unmask_irq();
     crumb(0x49);
 
-    let final_v = Vmcb::new(vmcb_f.bytes_mut());
+    let final_v = Vmcb::new(vmcb_f.page_mut());
     let pass = halted && vmmcalls == 2 && final_v.rax() == u64::from(svm::pvh::MEMMAP_RAM);
     p("[KVM] pvh guest: ");
     p(if pass { "PASS" } else { "FAIL" });
@@ -1775,18 +1674,6 @@ fn consistency_ladder() {
         p("[KVM] ladder: no frame for probe code\n");
         return;
     };
-    let Some(mut npml4_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] ladder: no frame for NPT PML4\n");
-        return;
-    };
-    let Some(mut npdpt_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] ladder: no frame for NPT PDPT\n");
-        return;
-    };
-    let Some(mut npd_f) = FreshFrame::alloc_zeroed() else {
-        p("[KVM] ladder: no frame for NPT PD\n");
-        return;
-    };
     let Some(mut gpml4_f) = FreshFrame::alloc_zeroed() else {
         p("[KVM] ladder: no frame for guest PML4\n");
         return;
@@ -1802,25 +1689,27 @@ fn consistency_ladder() {
 
     let code_pa = code_f.pa().get();
     code_f.bytes_mut()[..PROBE_CODE.len()].copy_from_slice(&PROBE_CODE);
-    let (msrpm_pa, iopm_pa) = (image_pa(&MSRPM.0), image_pa(&IOPM.0));
 
-    // Nested and guest paging, built once for `probe_pa` exactly as the
+    // Guest and nested paging, built once for `probe_pa` exactly as the
     // long-mode phase builds them; rows that do not page simply never walk.
-    let npml4_pa = npml4_f.pa().get();
-    let npdpt_pa = npdpt_f.pa().get();
-    let npd_pa = npd_f.pa().get();
+    // Every row's guest shares the one table.
     let gpml4_pa = gpml4_f.pa().get();
     let gpdpt_pa = gpdpt_f.pa().get();
     let gpd_pa = gpd_f.pa().get();
-    svm::wr64(npml4_f.bytes_mut(), 0, svm::npt::pointer(npdpt_pa));
-    svm::wr64(npdpt_f.bytes_mut(), 0, svm::npt::pointer(npd_pa));
-    for pa in [code_pa, gpml4_pa, gpdpt_pa, gpd_pa] {
-        let idx = ((pa >> 21) & 0x1FF) as usize;
-        svm::wr64(npd_f.bytes_mut(), idx * 8, svm::npt::leaf_2m(pa & !0x1F_FFFF));
-    }
     svm::wr64(gpml4_f.bytes_mut(), ((code_pa >> 39) & 0x1FF) as usize * 8, svm::npt::pointer(gpdpt_pa));
     svm::wr64(gpdpt_f.bytes_mut(), ((code_pa >> 30) & 0x1FF) as usize * 8, svm::npt::pointer(gpd_pa));
     svm::wr64(gpd_f.bytes_mut(), ((code_pa >> 21) & 0x1FF) as usize * 8, svm::npt::leaf_2m(code_pa & !0x1F_FFFF));
+    let Some(mut npt) = Npt::new() else {
+        p("[KVM] ladder: no frame for the NPT\n");
+        return;
+    };
+    for (f, g) in [(code_f, code_pa), (gpml4_f, gpml4_pa), (gpdpt_f, gpdpt_pa), (gpd_f, gpd_pa)] {
+        if npt.adopt_page(f, g).is_err() {
+            p("[KVM] ladder: the NPT refused a page\n");
+            return;
+        }
+    }
+    let npt = Arc::new(npt);
 
     if !enable_on_core(0) {
         p("[KVM] ladder: no host save area for the BSP\n");
@@ -1833,33 +1722,35 @@ fn consistency_ladder() {
     hx(code_pa, 16);
     p("\n");
 
+    let Some(mut host) = HostState::alloc() else {
+        p("[KVM] no frame for the host state page\n");
+        return;
+    };
     akuma_cpu::daif::mask_irq();
     for (i, (name, cfg)) in LADDER.iter().enumerate() {
-        let Some(mut vmcb_f) = FreshFrame::alloc_zeroed() else {
+        let Some(mut vmcb_f) = Asid::claim(cfg.asid)
+            .or_else(Asid::alloc)
+            .and_then(|a| SvmGuest::with_npt(a, Arc::clone(&npt)))
+        else {
             p("[KVM] ladder ");
             p(name);
-            p(": no frame for VMCB\n");
+            p(": no frame or ASID for VMCB\n");
             break;
         };
         p("[KVM] ladder ");
         p(name);
         p(": ");
 
-        svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
-        svm::wr64(vmcb_f.bytes_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
+        svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR6, 0xFFFF_0FF0);
+        svm::wr64(vmcb_f.page_mut(), svm::SAVE_AREA_BASE + save::DR7, 0x400);
         {
-            let mut v = Vmcb::new(vmcb_f.bytes_mut());
+            let mut v = Vmcb::new(vmcb_f.page_mut());
             v.set_intr0(
                 intr0::INTR | intr0::NMI | intr0::CPUID | intr0::HLT | intr0::MSR_PROT | intr0::IOIO_PROT,
             );
             v.set_intr1(intr1::VMRUN | intr1::VMMCALL);
             v.set_excp(svm::excp::DB | svm::excp::UD | svm::excp::GP | svm::excp::PF);
-            v.set_iopm_base(iopm_pa);
-            v.set_msrpm_base(msrpm_pa);
-            v.set_asid(cfg.asid);
             v.set_tlb_control(ctrl::TLB_DO_NOTHING);
-            v.set_np_enable(true);
-            v.set_n_cr3(npml4_pa);
             let flat = |attr: SegAttr| Seg { selector: 0, attr, limit: 0xFFFF_FFFF, base: 0 };
             v.set_seg(
                 save::CS,
@@ -1907,7 +1798,7 @@ fn consistency_ladder() {
             v.set_rsp(0);
         }
         {
-            let v = Vmcb::new(vmcb_f.bytes_mut());
+            let v = Vmcb::new(vmcb_f.page_mut());
             if let Err(e) = svm::validate_guest_state(&v) {
                 p("illegal-self ");
                 p(e.name());
@@ -1917,13 +1808,11 @@ fn consistency_ladder() {
         }
 
         crumb(0x22 + i as u8);
-        // SAFETY: `vmcb_f` is this function's own VMCB, alive across the call. The guest is a fixed
-        // program this function wrote, run under nested paging (`set_np_enable`) whose table maps
-        // only frames allocated here; `IOPM` keeps it off the CMOS/RTC ports. `enable_on_core`
-        // succeeded on this core.
-        #[allow(unsafe_code)]
-        let _ = unsafe { switch::run(vmcb_f.pa(), 0, 0, 0) };
-        let v = Vmcb::new(vmcb_f.bytes_mut());
+        if vmcb_f.run(&mut host, &mut GuestRegs::default()).is_err() {
+            p("refused by the switch\n");
+            continue;
+        }
+        let v = Vmcb::new(vmcb_f.page_mut());
         if ExitCode::from_u64(v.exitcode()) == ExitCode::Invalid {
             p("rejected\n");
             dump_state(&v);

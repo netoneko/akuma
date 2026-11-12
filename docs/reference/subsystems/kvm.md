@@ -25,8 +25,33 @@ from the AMD APM Vol 2/3, the virtio and ACPI specifications, Xen's public
 `akuma-svm-amd64` is `#![forbid(unsafe_code)]`, `no_std`, no dependencies, and owns
 *vocabulary and decisions*. `akuma-svm-switch-amd64` executes the instructions (the
 `EFER.SVME`/`VM_HSAVE_PA` writes, `VMRUN`, `VMSAVE`/`VMLOAD`) behind owned types;
-`akuma-kvm-amd64` is the wiring and every effect, and its only `unsafe` is the seven calls
-that enter a guest, whose contract (the guest reaches only memory it owns) no type states yet.
+`akuma-kvm-amd64` is the wiring and every effect, and is `forbid(unsafe_code)`.
+
+### What a guest can reach
+
+A guest is entered only through `akuma_svm_switch_amd64::Guest::run`, which is safe because the
+switch crate owns everything that bounds the guest
+([`AKUMA_SAFE_GUEST_ENTRY.md`](../../archive/AKUMA_SAFE_GUEST_ENTRY.md)):
+
+- **RAM** is a `GuestRam`, made only from the page allocator or the `kvmmem=` reserve
+  (`reserve::{init, carve}`, one reserve per boot), and given back on drop.
+- **The nested page table** is an `Npt` that owns its table frames and every `GuestRam` and page
+  it maps. Leaves are written only into adopted memory (`map_ram`, `adopt_page`), and it is
+  append-only. Guests share it through an `Arc`, so it cannot be dropped under a running guest.
+- **The ASID** is an `Asid`, unique among live values.
+- **On every entry** `run` rewrites, from those values, the VMCB fields that bound the guest:
+  - nested paging on, `N_CR3`, and no SEV, SEV-ES or PML bits;
+  - the all-intercept I/O and MSR maps;
+  - the `IOIO_PROT`, `MSR_PROT`, `SHUTDOWN`, `VMRUN`, `VMLOAD`, `VMSAVE`, `STGI`, `CLGI`,
+    `SKINIT` and `XSETBV` intercepts;
+  - AVIC and virtual `VMLOAD`/`VMSAVE` off, `V_INTR_MASKING` on;
+  - its ASID, and a flush of that ASID on its first entry on each core;
+  - VMCB clean bits zero.
+- **The host** is `VMSAVE`d with GIF already clear on every entry.
+
+What the wiring writes into those fields is overwritten, so a guest that needs a port, an MSR or a
+memory range is emulated through its exits, never granted directly. **Never map a page into a guest
+that the `Npt` does not own, and never add a second way into `VMRUN`.**
 
 | module | what it is |
 |---|---|

@@ -25,7 +25,7 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   forwarders read "absent" when nothing registered, and reaches the kernel only through
   `drivers::services`. **Never add a driver `cfg` to the machine half**; add a class slot.
   It is `forbid(unsafe_code)`; the hypervisor is its own crate, `akuma-kvm-amd64` (the `kvm`
-  feature pulls it in), because entering a guest is the one driver operation that needs `unsafe`.
+  feature pulls it in), split out when entering a guest still needed `unsafe`; it forbids it too now.
   `akuma-fdtable` is the fd table's state machine — lowest-free allocation,
   dup/close/sweep/fork decisions, effects returned not performed, `forbid`,
   no locks; `SharedFdTable` in `akuma-exec` keeps the locks and performs the
@@ -303,11 +303,14 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `akuma-svm-switch-amd64` is the **world switch** (2026-11-11): the only crate that executes
   `VMRUN`/`VMSAVE`/`VMLOAD` or writes `EFER.SVME`/`VM_HSAVE_PA`. `enable` takes a `HostSaveArea`
   (made only by giving up a `FreshFrame`, consumed, so no page is two cores' save area) and
-  checks CPUID and `VM_CR.SVMDIS` first; `HostState::save` is `VMSAVE` into an owned page. Only
-  `run`/`run_with_regs` stay `unsafe fn`: the guest reaches whatever its VMCB's nested page table
-  and permission maps let it, and guest RAM is carved physical ranges, not an owning type. Those
-  7 call sites are all the `unsafe` in `akuma-kvm-amd64` (each with its own `allow`).
-  **Never open-code an SVM instruction in the wiring.**
+  checks CPUID and `VM_CR.SVMDIS` first; `HostState::save` is `VMSAVE` into an owned page. Since
+  2026-11-12 entering a guest is **safe** (`Guest::run`): the crate owns guest RAM (`GuestRam`,
+  from the PMM or the `kvmmem=` `reserve`), the nested page table (`Npt`, which maps only memory
+  it adopted), the `Asid` and the all-intercept permission maps, and rewrites every VMCB
+  confinement field from them on each entry; `akuma-kvm-amd64` is `forbid(unsafe_code)`
+  (`docs/archive/AKUMA_SAFE_GUEST_ENTRY.md`). **Never open-code an SVM instruction in the wiring,
+  never map a page into a guest that its `Npt` does not own, and never add a second way into
+  `VMRUN`.**
   `akuma-vm-spec` is **what a VM is, before anything runs it** (2026-10-22; `forbid(unsafe_code)`,
   no dependencies): the `Spec` (kernel, cmdline, RAM, vCPUs, disk, forwards, backend), its parser and
   `key=value` wire text, Firecracker's field names as aliases, the first-fit `arena` over the

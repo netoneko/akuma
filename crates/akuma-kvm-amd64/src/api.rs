@@ -27,9 +27,10 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use akuma_kernel_amd64::drivers::services::errno;
-use akuma_kernel_amd64::drivers::services::phys::FreshFrame;
 use akuma_kernel_amd64::drivers::services::serial;
 use alloc::boxed::Box;
+use alloc::sync::Arc;
+use akuma_svm_switch_amd64::{reserve, GuestRam, Npt};
 use platform::Platform;
 use vcpu::Vcpu;
 
@@ -77,8 +78,9 @@ static HANDLES: Spinlock<[Option<Handle>; MAX_HANDLES]> = Spinlock::new([None; M
 struct Vm {
     owner: u32,
     slots: Table,
-    /// Reserve handle ([`super::ctl::Carve`]) of each slot's slice, for `uncarve`.
-    carved: [Option<u64>; MAX_SLOTS],
+    /// Each slot's slice of the reserve, until the nested page table adopts it at the first `RUN`
+    /// (a slot set after that stays here, unmapped, until the VM is destroyed).
+    ram: [Option<GuestRam>; MAX_SLOTS],
     irqchip: bool,
     pit: bool,
     tss: u64,
@@ -88,7 +90,9 @@ struct Vm {
     created: [bool; MAX_VCPUS],
     /// Host-physical addresses of each vCPU's run frames, for `mmap`.
     run_pas: [[usize; vcpu::RUN_PAGES]; MAX_VCPUS],
-    npt: Option<Npt>,
+    /// Built at the first `RUN`; `Err` when it could not map every slot (its RAM is still held, so
+    /// the VMM's mappings of it stay the VM's).
+    npt: Option<Result<Arc<Npt>, Arc<Npt>>>,
     /// Each with the kernel id of its eventfd (a reference is held until the VM is destroyed).
     irqfds: [Option<(Irqfd, u32)>; MAX_IRQFDS],
     ioeventfds: [Option<(Ioeventfd, u32)>; MAX_IOEVENTFDS],
@@ -99,7 +103,7 @@ impl Vm {
         Self {
             owner,
             slots: Table::new(),
-            carved: [None; MAX_SLOTS],
+            ram: [const { None }; MAX_SLOTS],
             irqchip: false,
             pit: false,
             tss: 0,
@@ -117,44 +121,28 @@ static VM: Spinlock<Option<Vm>> = Spinlock::new(None);
 /// The in-kernel PIT/PIC/LAPIC, created by `CREATE_IRQCHIP`.
 static PLAT: Spinlock<Option<Platform>> = Spinlock::new(None);
 
-/// The nested page table over the memslots: PML4 -> PDPT -> directories of 2 MiB leaves,
-/// built at the first `RUN`. Slots may sit below or above the 3..4 GiB device window
-/// (`slots::check` refuses in/crossing it); a directory is allocated per GiB that holds a
-/// slot, so at most four are ever allocated — the window's GiB maps nothing.
-struct Npt {
-    pml4: FreshFrame,
-    _pdpt: FreshFrame,
-    _dirs: [Option<FreshFrame>; akuma_svm_amd64::rammap::MAX_DIRS],
-}
-
-fn build_npt(slots: &Table) -> Option<Npt> {
-    let mut pml4 = FreshFrame::alloc_zeroed()?;
-    let mut pdpt = FreshFrame::alloc_zeroed()?;
-    let mut dirs = [const { None }; akuma_svm_amd64::rammap::MAX_DIRS];
-    akuma_svm_amd64::wr64(pml4.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pdpt.pa().get()));
-    for (d, dir) in dirs.iter_mut().enumerate() {
-        let base = (d as u64) << 30;
-        // A directory only for a GiB some slot actually covers; the window's GiB (and
-        // any GiB past the top) stays pointer-free in the PDPT.
-        if !slots.iter().any(|s| s.region.gpa < base + (1 << 30) && base < s.region.gpa + s.region.size) {
+/// The nested page table over the memslots, built at the first `RUN`: each slot's slice adopted and
+/// mapped at its guest-physical address (2 MiB leaves: slots and slices are 2 MiB aligned). Slots may
+/// sit below or above the 3..4 GiB device window (`slots::check` refuses in/crossing it), which maps
+/// nothing.
+fn build_npt(slots: &Table, ram: &mut [Option<GuestRam>; MAX_SLOTS]) -> Option<Result<Arc<Npt>, Arc<Npt>>> {
+    let mut npt = Npt::new()?;
+    let mut ok = true;
+    for s in slots.iter() {
+        let Some(r) = ram.get_mut(s.region.slot as usize).and_then(Option::take) else {
+            ok = false;
             continue;
+        };
+        match npt.adopt_ram(r) {
+            Ok(id) => ok &= npt.map_ram(id, 0, s.region.size, s.region.gpa).is_ok(),
+            Err(r) => {
+                ok = false;
+                ram[s.region.slot as usize] = Some(r);
+            }
         }
-        let mut page = FreshFrame::alloc_zeroed()?;
-        for s in slots.iter() {
-            // `check` already refused a window-crossing or misaligned slot; the leaf
-            // writer's refusal is a belt-and-braces no-op here.
-            let _ = akuma_svm_amd64::rammap::fill_slot_directory(
-                page.bytes_mut(),
-                d,
-                s.region.gpa,
-                s.region.size,
-                s.slice_off,
-            );
-        }
-        akuma_svm_amd64::wr64(pdpt.bytes_mut(), d * 8, akuma_svm_amd64::npt::pointer(page.pa().get()));
-        *dir = Some(page);
     }
-    Some(Npt { pml4, _pdpt: pdpt, _dirs: dirs })
+    let npt = Arc::new(npt);
+    Some(if ok { Ok(npt) } else { Err(npt) })
 }
 
 fn irq_off<T>(f: impl FnOnce() -> T) -> T {
@@ -194,9 +182,8 @@ pub fn vm_live() -> bool {
 fn destroy_vm() {
     let taken = irq_off(|| VM.lock().take());
     if let Some(vm) = taken {
-        for off in vm.carved.into_iter().flatten() {
-            super::ctl::uncarve(off);
-        }
+        // Dropping `vm` gives its slices back to the reserve (a vCPU still out in `RUN` keeps the
+        // nested page table, and the slices it adopted, alive until it returns).
         for (_, id) in vm.irqfds.into_iter().flatten() {
             akuma_syscalls_glue::eventfd::eventfd_close(id);
         }
@@ -434,14 +421,24 @@ fn run_vcpu(id: u8) -> u64 {
         let mut g = VM.lock();
         let v = g.as_mut()?;
         if v.npt.is_none() {
-            v.npt = build_npt(&v.slots);
+            v.npt = build_npt(&v.slots, &mut v.ram);
         }
-        let npt_pa = v.npt.as_ref()?.pml4.pa().get();
+        let npt = match v.npt.as_ref()? {
+            Ok(n) => Arc::clone(n),
+            Err(_) => return Some(Err(())),
+        };
         let mut vc = v.vcpus[id as usize].take()?;
         vc[0].refresh_events(&v.ioeventfds, &v.irqfds);
-        Some((vc, v.slots, npt_pa))
+        Some(Ok((vc, v.slots, npt)))
     });
-    let Some((mut vc, slots, npt_pa)) = taken else { return errno::EBUSY };
+    let (mut vc, slots, npt) = match taken {
+        None => return errno::EBUSY,
+        Some(Err(())) => {
+            serial::puts("[kvmapi] the nested page table could not map every memslot\n");
+            return errno::ENOMEM;
+        }
+        Some(Ok(t)) => t,
+    };
     if irq_off(|| PLAT.lock().is_none()) {
         irq_off(|| {
             if let Some(v) = VM.lock().as_mut() {
@@ -450,7 +447,7 @@ fn run_vcpu(id: u8) -> u64 {
         });
         return errno::EINVAL;
     }
-    let r = vcpu::run(&mut vc[0], &PLAT, &slots, npt_pa);
+    let r = vcpu::run(&mut vc[0], &PLAT, &slots, &npt);
     irq_off(|| {
         if let Some(v) = VM.lock().as_mut() {
             v.vcpus[id as usize] = Some(vc);
@@ -494,34 +491,36 @@ fn set_memory_region(arg: u64) -> u64 {
     if checked != 0 {
         return checked;
     }
-    let (pa, off) = match super::ctl::carve(r.size) {
-        super::ctl::Carve::Reserved { pa, off } => (pa, off),
-        super::ctl::Carve::Pmm => {
+    let ram = match reserve::carve(r.size) {
+        reserve::Carve::Ram(ram) => ram,
+        reserve::Carve::NoReserve => {
             serial::puts("[kvmapi] guest RAM needs the kvmmem= reserve\n");
             return errno::ENOMEM;
         }
-        super::ctl::Carve::Refused { .. } => {
+        reserve::Carve::Refused { .. } => {
             serial::puts("[kvmapi] guest RAM does not fit the kvmmem= reserve\n");
             return errno::ENOMEM;
         }
     };
+    let pa = ram.pa();
     if !akuma_kernel_amd64::drivers::services::mm::remap_user_to_phys(r.uaddr as usize, r.size as usize, pa as usize) {
-        super::ctl::uncarve(off);
         return errno::ENOMEM;
     }
+    // The VMM's range now lives on the slice: from here on it may only be given back when the VM
+    // dies (freeing it under a live mapping would hand the VMM another guest's memory).
+    let mut ram = Some(ram);
     let set = with_vm(|v| match v.slots.set(r, pa) {
         Ok(()) => {
-            v.carved[r.slot as usize] = Some(off);
+            v.ram[r.slot as usize] = ram.take();
             0
         }
         Err(_) => errno::EINVAL,
     });
-    if set != 0 {
-        // The VMM's range now lives on the slice; keep the slice (leaking it until the VM dies is
-        // safe, freeing it under a live mapping is not).
-        return set;
+    if let Some(orphan) = ram {
+        // Refused (or the VM is gone): no table holds it, so it is leaked for good.
+        core::mem::forget(orphan);
     }
-    0
+    set
 }
 
 fn irqfd(arg: u64) -> u64 {
