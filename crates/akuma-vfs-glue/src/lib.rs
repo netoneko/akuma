@@ -1754,6 +1754,26 @@ pub fn set_mapped_file_hooks(h: MappedFileHooks) {
     MAPPED_FILE_HOOKS.set(h);
 }
 
+/// Wire `akuma_exec::shm`, the shared writable page table, to the filesystem.
+///
+/// The same on both kernels: every `write(2)`/truncate reaches the mapped frames,
+/// and ext2 freeing an inode number drops both caches' pages for it. Before any
+/// mapping can be made: ext2 reissues inode numbers, so without the hook a new
+/// file inherits the cached pages of whatever last held its number
+/// (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §15).
+pub fn init_shared_write() {
+    fn inode_freed(inode: u32) {
+        akuma_fpcache::invalidate_inode(inode);
+        akuma_exec::shm::inode_freed(inode);
+    }
+    akuma_ext2::init_inode_freed_hook(inode_freed);
+    set_mapped_file_hooks(MappedFileHooks {
+        active: akuma_exec::shm::active,
+        wrote: akuma_exec::shm::wrote,
+        zeroed: akuma_exec::shm::zeroed,
+    });
+}
+
 /// The registered observers, if any and if they have anything to observe.
 fn mapped_file_hooks() -> Option<MappedFileHooks> {
     MAPPED_FILE_HOOKS.get().filter(|h| (h.active)())

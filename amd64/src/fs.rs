@@ -381,19 +381,11 @@ pub fn init_vfs() {
         // is x86-only. See `fd::pid_map_rows`.
         pid_map_rows: crate::fd::pid_map_rows,
     });
-    // Drop cached file pages when ext2 frees an inode number, **before** any
-    // mapping can be made. The cache is keyed on `(inode, mount, offset)` and
-    // ext2 reissues inode numbers, so without this a newly created file
-    // silently inherits the cached pages of whatever last held its number —
-    // a wrong-bytes bug, not a crash (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md`
-    // §15). The AArch64 kernel registers it in `akuma_vfs_glue::fs::init`,
-    // which this target does not call: it mounts ext2 itself. The other half of
-    // invalidation — every mutating VFS entry point — is already shared code.
-    // `shmpages::inode_freed` is `akuma_fpcache::invalidate_inode` plus the
-    // shared writable page table's own leftovers, and registers the VFS
-    // observers that keep that table coherent with `write(2)`.
-    akuma_ext2::init_inode_freed_hook(crate::shmpages::inode_freed);
-    crate::shmpages::init();
+    // The caches' inode-freed hook and the shared writable table's write
+    // observers, before any mapping can be made. The AArch64 kernel gets them
+    // from `akuma_vfs_glue::fs::init`, which this target does not call: it
+    // mounts ext2 itself.
+    akuma_vfs_glue::init_shared_write();
 
     // Size the cache from the RAM the PMM actually manages.
     //

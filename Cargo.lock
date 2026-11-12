@@ -312,6 +312,7 @@ dependencies = [
  "akuma-elf",
  "akuma-exec-core",
  "akuma-fdtable",
+ "akuma-fpcache-rw",
  "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",

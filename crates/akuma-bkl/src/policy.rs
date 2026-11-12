@@ -101,8 +101,8 @@ pub fn set_vfs_bkl_drop_enabled(on: bool) {
 /// docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md) — drop the BKL for the whole
 /// duration of `sys_mprotect`/`sys_madvise`/`sys_munmap`/`sys_mremap`/`sys_mmap`,
 /// relying on `Process::as_lock` (page tables), `Process::vm_lock` (`mmap_regions`
-/// — eager and lazy regions — and the mmap free-list), PMM/`FRAME_TRACKER`, and
-/// `SHARED_FILE_MAPPINGS` for cross-core mutual exclusion instead. `MmBklGuard`
+/// — eager and lazy regions), PMM/`FRAME_TRACKER`, and
+/// the shared writable table (`akuma_exec::shm`) for cross-core mutual exclusion instead. `MmBklGuard`
 /// reads this at construct/drop time (latched, same discipline as
 /// `VFS_BKL_DROP_ENABLED`) so an `smp-shared` boot with the feature compiled in can
 /// still A/B against the BKL-held path without a rebuild.

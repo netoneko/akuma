@@ -199,20 +199,17 @@ regression test, `crash14: addr = 0xffffffffffffffea`, pins the ordering):
   (page walk capped at 256 MiB) → `EEXIST`. `MAP_FIXED_NOREPLACE` wins over
   `MAP_FIXED` when both are set, as on Linux.
 - No gap in the placement window for a non-fixed request (`vm_alloc_mmap`) → `ENOMEM`.
-- Eager frame batch alloc fails, and reclaim-and-retry also fails: a writable
-  `MAP_SHARED` file-backed mapping → `ENOMEM` (must stay eager to track pages
-  for writeback — no safe lazy fallback); everything else silently degrades
-  to a lazy region instead of failing (see `../memory.md` "Userspace memory
+- Eager frame batch alloc fails, and reclaim-and-retry also fails: the mapping
+  silently degrades to a lazy region instead of failing (a writable `MAP_SHARED`
+  file mapping is always lazy and never gets here) (see `../memory.md` "Userspace memory
   model" — lazy anonymous mmap).
 
 **A `MAP_SHARED|MAP_ANONYMOUS` mapping is never demand-paged.** Fork shares it
 by identity by walking the parent's present pages; a page not yet faulted is
-not one, and each side would fault a private frame. Writable `MAP_SHARED` file
-mappings go one of two ways, chosen by the `shared_write_backing` hook: glue's
-write-back records (AArch64) or the kernel's shared writable table, with the
-record on the region (amd64, `shmpages`) — until step 6 of
-`proposals/AKUMA_MM_CONVERGENCE.md` makes the table both kernels'
-([`AKUMA_ONE_MMAP.md`](../../../archive/AKUMA_ONE_MMAP.md)).
+not one, and each side would fault a private frame. A writable `MAP_SHARED` file
+mapping is a lazy region carrying both a `file` and a `shared_write` record, and
+its pages are the shared writable table's (§ "Writable MAP_SHARED file-backed
+mappings" below).
 
 **`mremap`** (`sys_mremap`, glue `mem.rs`; **both kernels** since 2026-11-12):
 - `MREMAP_FIXED` → `EINVAL`. The placer chooses the address, and returning a different one than
@@ -263,9 +260,9 @@ unaligned `addr` → `EINVAL`; `addr + len` past `akuma_mmu::USER_VA_END` →
 address with nothing mapped there is **not** an error (matches Linux — silently
 succeeds). The body, `unmap_range`, is one shape for every caller:
 
-1. write back shared writable file pages while still mapped (amd64's
-   `shmpages` table through the `release_shared_write` hook, then glue's own
-   records);
+1. write back the shared writable table pages in the range while still mapped,
+   unmap them and reap the entries whose frames that released
+   (`release_shared_write`);
 2. detach **every** region in the range, eager and lazy, and unpin each file
    no region names afterwards (`akuma_exec::process::detach_regions_in_range`);
 3. sweep the whole range by live PTE (`UserAddressSpace::unmap_present`) and
@@ -300,8 +297,8 @@ self-check it cannot pass without `/proc/<pid>/smaps`
 - **Never a device page.** A frame outside the PMM's RAM (`akuma_pmm::contains`, e.g. `/dev/fb0`)
   reads as absent to both passes.
 - **A lazy file-backed page is dropped**, and the next touch re-reads the file.
-- **A page of amd64's shared writable table** is written back and dropped through the
-  `release_shared_write` hook, never zeroed (that would zero it for every mapper).
+- **A page of the shared writable table** is written back and dropped by
+  `release_shared_write`, never zeroed (that would zero it for every mapper).
 - No process → `ESRCH` (`len == 0` is `0` first).
 
 Per anonymous page, the rule is `dontneed_page_action(mapped, cow_ref)`:
@@ -363,9 +360,10 @@ so would require teaching the eager path to register a region first.
 calibrated against real Linux arm64) and the boot test
 `madvise_dontneed_spares_shared_frame`.
 
-**`msync`** (`sys_msync`, `mem.rs:94`): always returns `0`, even for a range
-with no writable `MAP_SHARED` file mapping (matches Linux: a no-op on a
-clean/private range is a success, not an error).
+**`msync`** (`sys_msync`, glue `mem.rs`; both kernels): `addr` 0 or unaligned →
+`EINVAL`; `len == 0` → `0`; no process → `ESRCH`. Otherwise it writes back the
+shared writable pages present in the range and returns `0`, also for a range with
+no such mapping (as Linux: a no-op on a clean/private range is a success).
 
 **`membarrier`** (`membarrier_cmd`, `mem.rs:582`): `CMD_QUERY` returns a
 capability bitmask (`0x18` = `PRIVATE_EXPEDITED | REGISTER_PRIVATE_EXPEDITED`).
@@ -393,19 +391,25 @@ mapping goes through `unmap_range`. Gates:
 
 ## Writable MAP_SHARED file-backed mappings (writeback)
 
-This mechanism lives entirely in `mem.rs` — it is not covered in
-`../memory.md`. Akuma has no unified page cache, so a file-backed mapping and
-its backing file don't share storage automatically. When `flags & MAP_SHARED`
-and `prot & PROT_WRITE` and the mapping is file-backed, `sys_mmap` forces the
-**eager** (fully-resident) path and records `(tgid, base_va) →
-SharedFileMapping { path, file_offset, len }` in `SHARED_FILE_MAPPINGS`
-(`mem.rs:40`). Three syscall-visible flush points read that table back to the
-file: `msync`, `munmap` (before the frames are freed), and process exit
-(`flush_and_clear_shared_file_mappings`, called from the exit syscalls in
-`proc.rs`). If the eager frame batch can't be satisfied even after
-reclaiming, such a mapping fails with `ENOMEM` rather than silently
-downgrading to `MAP_PRIVATE` semantics (a downgrade some earlier `go build`
-traces logged — see Background).
+One table for both kernels, `akuma_exec::shm` over `akuma-fpcache-rw`: every process that maps
+page `p` of a file `MAP_SHARED|PROT_WRITE` maps **one frame**, writable and never CoW-marked,
+keyed `(mount, inode, p)`. The region carries `shared_write` (mount, inode, offset, path) beside
+its `file` record; fork shares its present pages by identity and copies the record.
+
+- **Fault.** Both kernels' fault paths call `shm::fault_page` (a hit maps the peer's frame; a miss
+  reads the file's current page and publishes it) for a `shared_write` region, and
+  `shm::map_existing` first for a read-only page of any other file mapping, so a reader sees a
+  writer's frame. A private writable mapping never takes the writer's frame.
+- **Write-back** (`flush_shared_write`): `msync`, `munmap`/`MAP_FIXED`/`mremap`'s source,
+  `MADV_DONTNEED`, exit and `execve` write each present page below the file's current size — by
+  path while the path still names the inode, by inode otherwise. Then those callers unmap and
+  reap only the entries whose frames the unmap released (`shm::reap_released`).
+- **`write(2)`** and truncation are copied into the mapped frames (`MappedFileHooks`, registered by
+  `akuma_vfs_glue::init_shared_write`); an inode's entries go when ext2 frees it.
+
+Design, invariants and what is not promised:
+[`../amd64-shared-write-mmap.md`](../amd64-shared-write-mmap.md);
+[`AKUMA_ONE_SHARED_WRITABLE_TABLE.md`](../../../archive/AKUMA_ONE_SHARED_WRITABLE_TABLE.md).
 
 ## Placement: one placer, over the region list
 

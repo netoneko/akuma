@@ -402,9 +402,9 @@ pub(super) fn sys_exit(code: i32) -> u64 {
         // sys_exit() for a non-leader thread must NOT close the shared FD
         // table; only sys_exit_group() (or the last thread) does that.
         if proc.tgid == proc.pid {
-            // Flush any writable MAP_SHARED file mappings to disk before teardown,
-            // so a process that exits without munmap still persists its writes.
-            super::mem::flush_and_clear_shared_file_mappings(proc.tgid);
+            // Writable MAP_SHARED file mappings get `munmap`'s treatment before
+            // teardown: written back, and released from the shared table.
+            super::mem::release_shared_write_mappings(proc);
             proc.fds.close_all();
         }
         // CLONE_CHILD_CLEARTID: write 0 to the TID address and wake any
@@ -531,9 +531,11 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         if akuma_config::PROC_SYSCALL_LOG_ENABLED {
             crate::log::mark_exited(pid);
         }
-        // Flush writable MAP_SHARED file mappings to disk while the address space
-        // is still intact (kill_thread_group below tears it down).
-        super::mem::flush_and_clear_shared_file_mappings(tgid);
+        // Writable MAP_SHARED file mappings: written back and released while the
+        // address space is still intact (kill_thread_group below tears it down).
+        if let Some(p) = akuma_exec::process::lookup_process_shared(tgid) {
+            super::mem::release_shared_write_mappings(p);
+        }
         // Reap sibling threads BEFORE notifying the parent.
         //
         // ORDERING IS LOAD-BEARING: notify_child_channel_exited() wakes the parent's
@@ -1016,6 +1018,12 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     // `with_process_exclusive`'s contract are discharged in the crate that owns
     // `Process` rather than asserted here; the no-nesting clause is why this stays
     // the one enumerated call site (Phase 7f owns converting the window itself).
+    // The old image's writable `MAP_SHARED` file mappings die with it: written
+    // back and released from the shared table now, while its address space is
+    // still the current one — `replace_image`'s teardown would do neither.
+    if let Some(p) = super::mem::current_owner() {
+        super::mem::release_shared_write_mappings(p);
+    }
     let ret = {
         akuma_exec::process::with_own_process_exclusive(move |proc| {
     let replace_result = if let Some(data) = file_data.take() {

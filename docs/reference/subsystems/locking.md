@@ -763,9 +763,9 @@ significant BKL holder).
 |---|---|---|
 | `sys_mprotect` (`mem.rs`) | after `proc` resolves | `Process::as_lock` (PTE flag edits); `LAZY_REGION_TABLE` |
 | `sys_madvise` (`mem.rs`) | after `proc` resolves, per match arm | `Process::as_lock` (prefault install / zero-mapped); `LAZY_REGION_TABLE`; PMM (`MADV_WILLNEED`'s batch alloc) |
-| `sys_munmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (region lookup/removal); `Process::as_lock` (PTE unmap); `SHARED_FILE_MAPPINGS`; `LAZY_REGION_TABLE`; PMM (frame free) |
+| `sys_munmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (region lookup/removal); `Process::as_lock` (PTE unmap); `LAZY_REGION_TABLE`; PMM (frame free); the `akuma_exec::shm` table (leaf, below the AS lock) |
 | `sys_mremap` (`mem.rs`) | after `proc` resolves once (not re-looked-up inside the window) | `Process::vm_lock`; `Process::as_lock`; `LAZY_REGION_TABLE`; PMM |
-| `sys_mmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (placement + reservation via `vm_alloc_mmap`); `Process::as_lock` (PTE install); `LAZY_REGION_TABLE`; PMM; `SHARED_FILE_MAPPINGS`; nested `VfsBklGuard` windows for on-disk fill (ledger depth-counted, safe to nest) |
+| `sys_mmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (placement + reservation via `vm_alloc_mmap`); `Process::as_lock` (PTE install); `LAZY_REGION_TABLE`; PMM; nested `VfsBklGuard` windows for on-disk fill (ledger depth-counted, safe to nest) |
 
 Two gaps closed as a prerequisite (not present before this phase, not a "nothing to
 build" finding like net/vfs/process):

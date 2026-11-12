@@ -262,16 +262,6 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
     // is asm-generic. Handing it `1` meaning `write` would find the *wrong*
     // handler rather than none — so the vocabulary hop happens once, here,
     // through a table whose two halves are round-trip tested against each other.
-    // x86_64 nr 26 is `msync` — routed **before** the shared table to this
-    // kernel's own `mm::sys_msync` rather than glue's. (asm-generic does have
-    // msync, 227: `Syscall::Msync` is a row since 2026-11-01, and a comment
-    // here said otherwise until then.) See `mm::sys_msync` for
-    // what it does and `MmapRegion::shared_write` for why it exists at all:
-    // it is the flush `memmap2::MmapMut::flush` compiles to, and without it a
-    // writable `MAP_SHARED` mapping could not be trusted at close.
-    if nr == 26 {
-        return crate::mm::sys_msync(a1, a2);
-    }
     let Some(call) = Syscall::from_x86_64(nr) else {
         report_unknown_syscall(nr);
         return errno::ENOSYS;
@@ -821,8 +811,8 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // Found 2026-10-08 by the `[sc!]` trace: 54 `brk -> -ENOSYS` lines in
         // one Chromium run.
         Syscall::Brk => current_process().map_or(0, |p| p.get_brk() as u64),
-        // `Msync` never gets here: 26 is routed above, before the decode.
-        Syscall::Msync => errno::ENOSYS,
+        // `msync` is glue's: written back from the shared writable table.
+        Syscall::Msync => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         _ => return None,
     })
 }

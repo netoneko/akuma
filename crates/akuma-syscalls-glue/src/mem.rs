@@ -10,7 +10,7 @@ use akuma_exec::process::MmapRegion;
 /// `Process::as_lock` (page-table PTE edits, via `Process::with_address_space`),
 /// `Process::vm_lock` (`mmap_regions`, which is also what VA placement reads, via
 /// `vm_with_regions`/`vm_alloc_mmap`; lazy regions are in `mmap_regions` too), PMM/
-/// `FRAME_TRACKER` (never held across a yield), and `SHARED_FILE_MAPPINGS` — so
+/// `FRAME_TRACKER` (never held across a yield), and `akuma_exec::shm`'s table — so
 /// the BKL is redundant for them. Two gaps this phase's audit found (a plain
 /// unguarded mmap free list, since removed, and `sys_mmap`'s OOM/reclaim sweep
 /// mutating page tables with no address-space-lock hold) were closed as a
@@ -154,191 +154,157 @@ pub fn dontneed_audit_line(w: &mut dyn core::fmt::Write) {
     );
 }
 
-/// Writable `MAP_SHARED` file-backed mappings whose dirty pages must be flushed
-/// back to the backing file.
+/// One writable `MAP_SHARED` file region, captured for write-back.
 ///
-/// Akuma has no unified page cache, so a file-backed mapping and the on-disk file
-/// do NOT share storage: writes through the mapping land in anonymous frames and
-/// are invisible to the file unless we copy them back explicitly. We record each
-/// such mapping by `(tgid, base_va)` and write its resident pages back to the
-/// file on `munmap`, `msync`, and process exit. `msync` is the POSIX flush point
-/// linkers like `rust-lld` use right before renaming their output buffer, so
-/// without this a freshly-linked binary lands on disk as zero bytes (the in-VM
-/// self-host `hello` link, docs/AKUMA_SELF_HOSTING.md §7d).
-///
-/// Two shapes. **Eager** (`lazy == false`): every page resident, the region's
-/// frame list complete, writeback a straight copy of `len` bytes — the
-/// original design, still what small mappings (e.g. `rust-lld`'s output
-/// buffer) get. **Lazy** (`lazy == true`, since 2026-09-22): the mapping went
-/// down the demand-paged file path because the shared `mmap::plan` now marks
-/// writable `MAP_SHARED` lazy-eligible (amd64's change for parity-db, whose
-/// table files map `len + 1 GiB` of reserve that no eager fill can back).
-/// There is no frame list to trust, so writeback walks the page tables for
-/// the pages actually present, and stops at the file's size *at flush time*
-/// — see [`writeback_present_pages`]. Before this record carried `lazy`, a
-/// lazy shared-writable mapping was never registered at all and every write
-/// through it was silently dropped on close
-/// (docs/archive/MIOT_MESH_ON_AKUMA.md, finding 1b).
-struct SharedFileMapping {
-    path: alloc::string::String,
-    file_offset: usize,
-    len: usize,
-    lazy: bool,
+/// Every mapper maps **one frame** per
+/// file page, from the shared writable table (`akuma_exec::shm`), so a store is
+/// visible to every other mapper at once. The region's `shared_write` record
+/// names the file, and its pages are written back on `munmap`, `msync`,
+/// `MADV_DONTNEED`, `execve` and exit. `msync` is the POSIX flush point linkers
+/// like `rust-lld` use right before renaming their output buffer
+/// (docs/AKUMA_SELF_HOSTING.md §7d). Both kernels since 2026-11-12
+/// (`docs/archive/AKUMA_ONE_SHARED_WRITABLE_TABLE.md`); AArch64 used to give each
+/// mapper private frames and write them back, so two mappers never saw each
+/// other's stores.
+struct WriteBack {
+    rec: akuma_mmap::SharedWriteBack,
+    start_va: usize,
+    end_va: usize,
 }
 
-static SHARED_FILE_MAPPINGS: Spinlock<BTreeMap<(u32, usize), SharedFileMapping>> =
-    Spinlock::new(BTreeMap::new());
-
-/// Does `uaddr` fall inside a writable `MAP_SHARED` file mapping owned by `tgid`?
-///
-/// This is Akuma's *entire* notion of memory genuinely shared between address
-/// spaces: `MAP_SHARED|MAP_ANONYMOUS` gets no special handling (fork copies it) and
-/// there is no shm, so any other mapping is private to one address space no matter
-/// what flags created it. `futex_key_tgid` uses this to decide whether a
-/// non-private futex may legitimately share a key namespace with another process —
-/// see its doc comment for why keying every non-private op globally was a
-/// cross-process lost wakeup.
-pub(super) fn is_shared_file_mapping(tgid: u32, uaddr: usize) -> bool {
-    let map = SHARED_FILE_MAPPINGS.lock();
-    map.range(..=(tgid, uaddr))
-        .next_back()
-        .is_some_and(|(&(t, base), m)| t == tgid && uaddr < base.saturating_add(m.len))
+/// Every writable `MAP_SHARED` file region overlapping `[start, end)`, captured
+/// under the region lock. Allocates only when there is one.
+fn snapshot_shared_write(proc: &akuma_exec::process::Process, start: usize, end: usize) -> Vec<WriteBack> {
+    proc.vm_with_regions(|r| {
+        akuma_exec::process::regions_overlapping(r, start, end)
+            .iter()
+            .filter(|x| x.start_va < end)
+            .filter_map(|x| {
+                x.shared_write.as_ref().map(|sw| WriteBack {
+                    rec: sw.clone(),
+                    start_va: x.start_va,
+                    end_va: x.start_va + x.len_bytes(),
+                })
+            })
+            .collect()
+    })
 }
 
-/// Copy `len` bytes from the resident pages at physical addresses `pas` back to
-/// `path`, starting at `file_offset`. Returns the number of bytes written.
-pub fn writeback_shared_pages(path: &str, file_offset: usize, len: usize, pas: &[usize]) -> usize {
-    let mut off = file_offset;
-    let mut written = 0usize;
-    // One page-sized staging buffer for the whole call, not one per page: the loop
-    // below runs once per 4 KB of a mapping that can be hundreds of megabytes, so a
-    // per-iteration allocation would be an allocation per page on the exit path —
-    // exactly where the allocator is least likely to be healthy.
-    let mut page = alloc::vec![0u8; 4096];
-    for (i, &pa) in pas.iter().enumerate() {
-        let chunk = core::cmp::min(4096, len.saturating_sub(i * 4096));
-        if chunk == 0 { break; }
-        // Snapshot the frame, then write the snapshot. The frame is still mapped
-        // writable in the process, so userspace may be storing into it as we read;
-        // that is inherent to writing a MAP_SHARED mapping back and is why this
-        // takes a copy rather than handing `write_at` a view of live user memory.
-        if !akuma_exec::mmu::copy_from_phys(pa, &mut page[..chunk]) {
-            break; // `pa` is not PMM-managed RAM — a corrupt mapping record
-        }
-        match akuma_vfs_glue::fs::write_at(path, off, &page[..chunk]) {
-            Ok(n) => { written += n; off += n; }
-            Err(_) => break,
-        }
+/// Write back the present pages of `w` inside `[lo, hi)`.
+///
+/// Bounded by the file's size **now**, not at `mmap`: parity-db grows a file
+/// with `ftruncate` and writes through the reserve past the old end, and a page
+/// past the current end must not extend the file. Through the recorded path when
+/// it still names this inode, else by inode — after an `unlink` (SQLite deletes
+/// its `-shm` before unmapping it) or an unlink-and-recreate, the path is gone or
+/// names another file, and the mapping's pin keeps the inode alive
+/// (`chromeprobe`'s shmvar c/d). One page is translated at a time and copied
+/// out before the write, so no page-table lock is held across I/O.
+fn flush_shared_write(proc: &akuma_exec::process::Process, w: &WriteBack, lo: usize, hi: usize) {
+    let rec = &w.rec;
+    let Ok(meta) = akuma_vfs_glue::fs::metadata_open_file(&rec.path, rec.mount_id, rec.inode) else { return };
+    let size = meta.size as usize;
+    if size <= rec.offset {
+        return;
     }
-    written
-}
-
-/// Write back the **present** pages of a lazily-filled writable `MAP_SHARED`
-/// mapping at `base` (file offset `file_offset`), restricted to the VA window
-/// `[lo, hi)`. Returns bytes written.
-///
-/// Absent pages were never touched (or only ever read and then evicted as
-/// clean — `reclaim_clean_file_pages` evicts read-only PTEs only), so the file
-/// already holds their bytes. The walk is bounded by the file's size queried
-/// *now*: parity-db grows a file with `ftruncate` and then writes through the
-/// reserve past the old end, so the size at `mmap` time would be wrong, and
-/// anything past the current end must not be written (that would extend the
-/// file by the whole 1 GiB reserve). Same rule as amd64's
-/// `mm::flush_shared_write` (docs/reference/subsystems/amd64-shared-write-mmap.md).
-///
-/// Translation takes the address-space lock per page and releases it before
-/// the copy and the ext2 write, so no page-table lock is held across I/O.
-fn writeback_present_pages(
-    proc: &akuma_exec::process::Process,
-    path: &str,
-    base: usize,
-    file_offset: usize,
-    lo: usize,
-    hi: usize,
-) -> usize {
-    let Ok(size) = akuma_vfs_glue::fs::file_size(path) else { return 0 };
-    let size = size as usize;
-    if size <= file_offset {
-        return 0;
-    }
-    let eof_va = base.saturating_add(size - file_offset);
-    let hi = hi.min(eof_va);
+    let by_path = akuma_vfs_glue::resolve_file_id(&rec.path) == Some((rec.mount_id, rec.inode));
+    let hi = hi.min(w.end_va).min(w.start_va.saturating_add(size - rec.offset));
     let mut page = alloc::vec![0u8; 4096];
-    let mut written = 0usize;
-    let mut va = lo & !0xFFF;
+    let mut failed = 0usize;
+    let mut va = lo.max(w.start_va) & !0xFFF;
     while va < hi {
-        let pa = proc.with_address_space(|aspace| aspace.translate(va));
-        if let Some(pa) = pa {
-            let off = file_offset + (va - base);
-            let chunk = core::cmp::min(4096, size - off);
-            if akuma_exec::mmu::copy_from_phys(pa & !0xFFF, &mut page[..chunk])
-                && let Ok(n) = akuma_vfs_glue::fs::write_at(path, off, &page[..chunk])
-            {
-                written += n;
-            }
+        if let Some(pa) = proc.with_address_space(|a| a.translate(va)) {
+            let off = rec.offset + (va - w.start_va);
+            let bytes = &mut page[..(size - off).min(4096)];
+            let ok = akuma_exec::mmu::copy_from_phys(pa & !0xFFF, bytes)
+                && if by_path {
+                    akuma_vfs_glue::write_at(&rec.path, off, bytes).is_ok()
+                } else {
+                    akuma_vfs_glue::fs::write_at_open_file(rec.mount_id, rec.inode, off, bytes).is_ok()
+                };
+            failed += usize::from(!ok);
         }
         va += 4096;
     }
-    written
-}
-
-/// Flush one recorded mapping over `[lo, hi)`, whichever shape it is.
-fn flush_shared_mapping(proc: &akuma_exec::process::Process, base: usize, m: &SharedFileMapping, lo: usize, hi: usize) -> usize {
-    if m.lazy {
-        return writeback_present_pages(proc, &m.path, base, m.file_offset, lo.max(base), hi.min(base + m.len));
+    if failed > 0 {
+        akuma_primitives::safe_print!(96, "[MM-WB] {} write-back page(s) FAILED\n", failed);
     }
-    let pas = proc.vm_with_regions(|r| {
-        r.iter().find(|reg| reg.start_va == base).map(|reg| reg.frames.iter().map(|f| f.addr).collect::<Vec<usize>>())
-    });
-    pas.map_or(0, |pas| writeback_shared_pages(&m.path, m.file_offset, m.len, &pas))
 }
 
-/// Flush and forget every writable MAP_SHARED file mapping owned by `tgid`.
-/// Called from the exit syscalls so a process that drops its mapping by exiting
-/// (rather than calling `munmap`) still persists its writes, and so a later
-/// process reusing the same `tgid`/`base_va` can't inherit a stale entry.
-pub(super) fn flush_and_clear_shared_file_mappings(tgid: u32) {
-    // Snapshot the entries for this tgid, then resolve+writeback outside the lock
-    // (writeback touches the fs, which takes other locks).
-    let entries: Vec<(usize, SharedFileMapping)> = {
-        let map = SHARED_FILE_MAPPINGS.lock();
-        map.iter()
-            .filter(|((t, _), _)| *t == tgid)
-            .map(|((_, base), m)| (*base, SharedFileMapping { path: m.path.clone(), ..*m }))
-            .collect()
-    };
-    if entries.is_empty() { return; }
-    if let Some(proc) = akuma_exec::process::lookup_process_shared(tgid) {
-        for (base, m) in &entries {
-            flush_shared_mapping(proc, *base, m, *base, base + m.len);
+/// Write back, then drop, this address space's writable `MAP_SHARED` file pages
+/// in `[start, end)`.
+///
+/// `munmap`'s and `MADV_DONTNEED`'s first step. Once unmapped, a page's bytes exist only in the
+/// table, so the flush comes first; then each entry whose frame this address
+/// space just gave up is reaped if nobody else maps it. The next touch (after `DONTNEED`) faults the page back in.
+pub(super) fn release_shared_write(proc: &akuma_exec::process::Process, start: usize, end: usize) {
+    let snapshot = snapshot_shared_write(proc, start, end);
+    if snapshot.is_empty() {
+        return;
+    }
+    for w in &snapshot {
+        flush_shared_write(proc, w, start, end);
+        let (lo, hi) = (w.start_va.max(start), w.end_va.min(end));
+        let mut released = Vec::new();
+        proc.with_address_space(|a| a.unmap_present(lo, hi, &mut released));
+        for &frame in &released {
+            akuma_exec::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion);
         }
+        let mut pas: Vec<usize> = released.iter().map(|f| f.addr).collect();
+        pas.sort_unstable();
+        let from = w.rec.offset + (lo - w.start_va);
+        akuma_exec::shm::reap_released(w.rec.mount_id, w.rec.inode, from, from + (hi - lo), &pas);
     }
-    let mut map = SHARED_FILE_MAPPINGS.lock();
-    map.retain(|(t, _), _| *t != tgid);
 }
 
-/// `msync(addr, len, flags)` — flush writable MAP_SHARED file mappings that
-/// overlap `[addr, addr+len)` back to their backing files. Other mappings are a
-/// no-op (return success), matching Linux for clean/private ranges.
-pub(super) fn sys_msync(addr: usize, len: usize, _flags: u32) -> u64 {
-    let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
-    let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
-    let proc = match akuma_exec::process::lookup_process_shared(owner_pid) {
-        Some(p) => p,
-        None => return ESRCH,
-    };
-    let end = addr.saturating_add(if len > 0 { (len + 4095) & !4095 } else { 4096 });
-    let entries: Vec<(usize, SharedFileMapping)> = {
-        let map = SHARED_FILE_MAPPINGS.lock();
-        map.iter()
-            .filter(|((t, base), m)| *t == proc.tgid && *base < end && base.saturating_add(m.len) > addr)
-            .map(|((_, base), m)| (*base, SharedFileMapping { path: m.path.clone(), ..*m }))
+/// Unmap every writable `MAP_SHARED` file mapping of `proc`, as `munmap` would.
+///
+/// For `execve` and exit, whose address-space teardown would neither write the
+/// pages back nor release the table's entries. Call with the other threads gone
+/// where the caller can, so nothing faults a page back in behind the walk.
+pub fn release_shared_write_mappings(proc: &akuma_exec::process::Process) {
+    let extents: Vec<(usize, usize)> = proc.vm_with_regions(|r| {
+        r.iter()
+            .filter(|x| x.shared_write.is_some())
+            .map(|x| (x.start_va, x.start_va + x.len_bytes()))
             .collect()
-    };
-    for (base, m) in &entries {
-        // An eager record flushes whole (its frame list has no per-page offsets
-        // to window by); a lazy one flushes just the msync'd window.
-        flush_shared_mapping(proc, *base, m, addr & !0xFFF, end);
+    });
+    for (start, end) in extents {
+        unmap_range(proc, start, end);
+    }
+}
+
+/// Does `uaddr` fall inside a writable `MAP_SHARED` file mapping of `tgid`?
+///
+/// The memory genuinely shared between address spaces by a file, which
+/// `futex_key_tgid` uses to decide whether a non-private futex may share a key
+/// namespace with another process — see its doc comment for why keying every
+/// non-private op globally was a cross-process lost wakeup.
+pub(super) fn is_shared_file_mapping(tgid: u32, uaddr: usize) -> bool {
+    akuma_exec::process::lookup_process_shared(tgid).is_some_and(|p| {
+        p.vm_with_regions(|r| {
+            akuma_exec::process::region_index_containing(r, uaddr).is_some_and(|i| r[i].shared_write.is_some())
+        })
+    })
+}
+
+/// `msync(addr, len, flags)`: write back the shared writable file mappings in range.
+///
+/// Synchronously and in full (no dirty
+/// tracking: I/O spent, never bytes miswritten). `flags` is accepted —
+/// `MS_ASYNC` is a no-op on Linux too, and there is no other cache to
+/// invalidate against. A range with no such mapping is `0` without I/O.
+pub(super) fn sys_msync(addr: usize, len: usize, _flags: u32) -> u64 {
+    if addr == 0 || addr & 0xFFF != 0 {
+        return EINVAL;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Some(proc) = current_owner() else { return ESRCH };
+    let end = addr.saturating_add(len);
+    for w in &snapshot_shared_write(proc, addr, end) {
+        flush_shared_write(proc, w, addr, end);
     }
     0
 }
@@ -473,18 +439,6 @@ fn mmap_eager_to_lazy_fallback(
     mmap_addr as u64
 }
 
-/// Who keeps a writable `MAP_SHARED` file mapping coherent — the
-/// `shared_write_backing` hook's answer.
-pub enum SharedWrite {
-    /// Glue's write-back records (`SHARED_FILE_MAPPINGS`).
-    Glue,
-    /// The kernel's shared writable table, which faults read through this
-    /// record on the region. The mapping must be demand-paged.
-    Table(akuma_mmap::SharedWriteBack),
-    /// Nothing to write back to (no inode identity): `EACCES`.
-    Refuse,
-}
-
 /// Can this path's bytes be mapped? Not a `/dev` node (no inode holds its
 /// bytes: a mapping would be zeros posing as the file) and not a directory.
 fn mappable_path(path: &str) -> bool {
@@ -575,14 +529,18 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     } else {
         None
     };
-    let mut shared_write = if plan.is_shared_writable && file.is_some() {
-        crate::hooks::shared_write_backing(fd, offset)
-    } else {
-        SharedWrite::Glue
+    // A writable `MAP_SHARED` file mapping is served from the shared writable
+    // table, keyed by inode: with no inode there is nothing to share or write
+    // back to, and that is a refusal rather than private pages posing as the file.
+    let mut shared_write = match &file {
+        Some((path, mount_id, inode)) if plan.is_shared_writable => {
+            if *inode == 0 {
+                return EACCES;
+            }
+            Some(akuma_mmap::SharedWriteBack { mount_id: *mount_id, inode: *inode, offset, path: path.clone() })
+        }
+        _ => None,
     };
-    if matches!(shared_write, SharedWrite::Refuse) {
-        return EACCES;
-    }
     let _mm_window = MmBklGuard::new();
 
     let reservation = || MmapRegion::demand_paged(addr, pages, Some(akuma_exec::mmu::Prot::NONE));
@@ -625,13 +583,6 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
 
     let is_file_backed = file.is_some();
 
-    // Writable MAP_SHARED on a file: writes through the mapping must reach the
-    // file. Either the kernel's shared writable table serves the pages
-    // (`SharedWrite::Table`, demand-paged only), or glue records the mapping
-    // and writes its present pages back on munmap/msync/exit
-    // (`SHARED_FILE_MAPPINGS`).
-    let is_shared_writable = plan.is_shared_writable && is_file_backed;
-
     // Anonymous private mappings above MMAP_EAGER_MAX_PAGES are demand-paged
     // (zero-fill on first touch); MAP_POPULATE suppresses that (`plan`).
     //
@@ -666,26 +617,20 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         && inode != 0 && mount_id != 0 {
             let source = akuma_exec::process::LazySource::file(mount_id, inode, offset, filesz, mmap_addr);
             let region = akuma_exec::process::lazy_mmap_region(mmap_addr, byte_len, page_flags, &source);
-            let region = if let SharedWrite::Table(rec) = core::mem::replace(&mut shared_write, SharedWrite::Glue) {
-                region.shared_writable(rec)
-            } else {
-                if is_shared_writable {
-                    SHARED_FILE_MAPPINGS.lock().insert(
-                        (proc.tgid, mmap_addr),
-                        SharedFileMapping { path: path.clone(), file_offset: offset, len, lazy: true },
-                    );
-                }
-                region
+            let shared = shared_write.is_some();
+            let region = match shared_write.take() {
+                Some(rec) => region.shared_writable(rec),
+                None => region,
             };
             let count = akuma_exec::process::push_lazy_mmap_region(proc.tgid, region);
             if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
                 akuma_primitives::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (lazy-file{}, {} regions)\n",
                     proc.pid, fd, path, offset, len, mmap_addr,
-                    if is_shared_writable { ", shared-writable" } else { "" }, count);
+                    if shared { ", shared-writable" } else { "" }, count);
             }
             return mmap_addr as u64;
         }
-    if matches!(shared_write, SharedWrite::Table(_)) {
+    if shared_write.is_some() {
         // The table keys pages by inode; without one there is nothing coherent
         // to serve.
         proc.vm_release_reservation(mmap_addr, byte_len);
@@ -705,13 +650,6 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
         if reclaimed > 0 {
             if let Some(b) = akuma_exec::pmm::alloc_pages_zeroed(pages) {
                 b
-            } else if is_shared_writable {
-                // A writable MAP_SHARED mapping must stay eager so its pages are
-                // tracked for writeback; the lazy fallback can't do that, so fail
-                // rather than silently drop writes.
-                akuma_pmm::note_user_enomem("mmap/shared-writable", len);
-                proc.vm_release_reservation(mmap_addr, pages * 4096);
-                return ENOMEM;
             } else {
                 // Still short of a contiguous eager batch: fall back to a lazy
                 // (demand-paged) region, which always succeeds as a VA
@@ -719,10 +657,6 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 // for both anonymous and file-backed mappings.
                 return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
             }
-        } else if is_shared_writable {
-            akuma_pmm::note_user_enomem("mmap/shared-writable", len);
-            proc.vm_release_reservation(mmap_addr, pages * 4096);
-            return ENOMEM;
         } else {
             return mmap_eager_to_lazy_fallback(proc, is_file_backed, fd, offset, len, mmap_addr, pages, page_flags);
         }
@@ -821,24 +755,9 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     });
     akuma_pmm::dp_count(&akuma_pmm::EAGER_MMAP_PAGES, pages);
 
-    // Record writable MAP_SHARED file mappings so their pages get written back to
-    // the file on munmap/msync/exit (Akuma has no shared page cache).
-    if is_shared_writable
-        && let Some(akuma_exec::process::FileDescriptor::File(f)) = proc.get_fd(fd as u32) {
-            SHARED_FILE_MAPPINGS.lock().insert(
-                (proc.tgid, mmap_addr),
-                SharedFileMapping { path: f.path.clone(), file_offset: offset, len, lazy: false },
-            );
-            if akuma_config::MEM_SYSCALL_TRACE_ENABLED {
-                akuma_primitives::tprint!(192, "[mmap] pid={} fd={} file={} off={} len=0x{:x} = 0x{:x} (shared-writable, writeback on)\n",
-                    proc.pid, fd, &f.path, offset, len, mmap_addr);
-            }
-        }
-
     // `MAP_SHARED|MAP_ANONYMOUS` must survive fork as one object rather than being
-    // CoW-copied — see `MmapRegion::shared_anon` and `process::share_rw_range`. File
-    // -backed `MAP_SHARED` is a different mechanism entirely (SHARED_FILE_MAPPINGS
-    // writeback), so this is the anonymous case only.
+    // CoW-copied — see `MmapRegion::shared_anon` and `process::share_rw_range`. A
+    // writable file `MAP_SHARED` is the table's and never reaches here.
     let region = MmapRegion::owned_with_prot(mmap_addr, frames, page_prot);
     let region = if plan.shared_anon { region.shared_anon() } else { region };
     // Over the reservation, in address order (`akuma_mmap::insert_region_sorted`).
@@ -907,11 +826,6 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         region
     });
     proc.vm_install_region(region);
-    // Glue's write-back record follows a mapping moved from its base.
-    let moved_record = SHARED_FILE_MAPPINGS.lock().remove(&(proc.tgid, old_addr));
-    if let Some(m) = moved_record {
-        SHARED_FILE_MAPPINGS.lock().insert((proc.tgid, new_addr), m);
-    }
 
     // Re-point each present page rather than copy it: no frames allocated, a
     // CoW page stays CoW, a shared page stays shared.
@@ -1038,12 +952,11 @@ fn madvise_dontneed_range(
     const BATCH: usize = 16;
 
     let end = aligned_addr + pages * 4096;
-    // A page of amd64's shared writable table would be zeroed for every
-    // mapper. Linux drops the mapping and keeps the page cache, and so does
-    // this: the hook writes the range back and drops this address space's
-    // claim, and the next touch faults the shared page back in. A no-op on
-    // AArch64 until its shared mappings use the same table.
-    hooks::release_shared_write(aligned_addr, end);
+    // A page of the shared writable table would be zeroed for every mapper.
+    // Linux drops the mapping and keeps the page cache, and so does this: the
+    // range is written back and this address space's claim dropped, and the
+    // next touch faults the shared page back in.
+    release_shared_write(proc, aligned_addr, end);
 
     // **Only pages inside a recorded region, or the `brk` heap, are touched.**
     // The ELF image is mapped by the loader and is in no region; zeroing its
@@ -1418,7 +1331,7 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
 
 /// The process whose address space the caller runs in: a thread's group
 /// leader, which owns the region list `CLONE_VM` siblings share.
-fn current_owner() -> Option<&'static akuma_exec::process::Process> {
+pub(super) fn current_owner() -> Option<&'static akuma_exec::process::Process> {
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
     akuma_exec::process::lookup_process_shared(owner_pid)
@@ -1460,11 +1373,10 @@ pub fn unmap_current(start: usize, end: usize) {
 /// Three steps, each in its own lock hold (regions, then address space, then
 /// the PMM; never nested the other way):
 ///
-/// 1. **Write back** shared writable file pages while they are still mapped:
-///    the kernel's own table first (the hook), then glue's lazy records.
+/// 1. **Write back** shared writable file pages while they are still mapped,
+///    and drop them from the table (`release_shared_write`).
 /// 2. **Records**: every region in the range, eager and lazy, is detached,
 ///    clipped at both ends; a file no region maps afterwards loses its pin.
-///    Eager shared records are written back from their frames.
 /// 3. **Pages**: one sweep of the whole range by live PTE. Never by the
 ///    record, which goes stale when a CoW break or `MADV_DONTNEED` replaces a
 ///    frame, and a range may hold pages no region claims (a `MAP_FIXED` over
@@ -1480,44 +1392,12 @@ fn unmap_range(proc: &akuma_exec::process::Process, addr: usize, end: usize) {
     if end <= addr {
         return;
     }
-    crate::hooks::release_shared_write(addr, end);
-
-    // A lazy writable-shared record overlapping the range: flush the overlap
-    // while its pages are still mapped, and forget the record once the whole
-    // mapping is gone. A partial unmap keeps it; the unmapped part simply has
-    // no present pages to flush next time.
-    let lazy_shared: Vec<(usize, SharedFileMapping)> = {
-        let map = SHARED_FILE_MAPPINGS.lock();
-        map.iter()
-            .filter(|((t, base), m)| *t == proc.tgid && m.lazy && *base < end && base.saturating_add(m.len) > addr)
-            .map(|((_, base), m)| (*base, SharedFileMapping { path: m.path.clone(), ..*m }))
-            .collect()
-    };
-    for (base, m) in &lazy_shared {
-        let written = flush_shared_mapping(proc, *base, m, addr, end);
-        if akuma_config::TRACE_MUNMAP {
-            akuma_primitives::tprint!(192, "[munmap] pid={} lazy shared-writeback file={} off={} {} bytes\n",
-                proc.pid, &m.path, m.file_offset, written);
-        }
-        if addr <= *base && end >= base + m.len {
-            SHARED_FILE_MAPPINGS.lock().remove(&(proc.tgid, *base));
-        }
-    }
-
+    release_shared_write(proc, addr, end);
     let pieces = akuma_exec::process::detach_regions_in_range(proc, addr, end);
-    for p in pieces.iter().filter(|p| !p.lazy) {
-        if akuma_config::TRACE_MUNMAP {
+    if akuma_config::TRACE_MUNMAP {
+        for p in pieces.iter().filter(|p| !p.lazy) {
             akuma_primitives::tprint!(128, "[munmap] pid={} addr=0x{:x} ({} pages, {} owned, base=0x{:x})\n",
                 proc.pid, addr, p.pages, p.frames.len(), p.start_va);
-        }
-        // Writable eager MAP_SHARED file mapping: flush its pages back to the
-        // file before the sweep below frees them.
-        let Some(m) = SHARED_FILE_MAPPINGS.lock().remove(&(proc.tgid, p.start_va)) else { continue };
-        let pas: Vec<usize> = p.frames.iter().map(|f| f.addr).collect();
-        let written = writeback_shared_pages(&m.path, m.file_offset, m.len.min(p.pages * 4096), &pas);
-        if akuma_config::TRACE_MUNMAP {
-            akuma_primitives::tprint!(192, "[munmap] pid={} shared-writeback file={} off={} {} bytes\n",
-                proc.pid, &m.path, m.file_offset, written);
         }
     }
     drop(pieces);

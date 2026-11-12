@@ -2890,7 +2890,9 @@ pub fn fork_share_parent_memory(
                     if ranges.len() == ranges.capacity() {
                         return true;
                     }
-                    ranges.push((region.start_va, region.len_bytes(), region.shared_anon));
+                    // A writable `MAP_SHARED` file mapping is shared by identity like an
+                    // anonymous one: its frames are the shared writable table's.
+                    ranges.push((region.start_va, region.len_bytes(), region.shared_anon || region.shared_write.is_some()));
                 }
                 false
             });
@@ -2940,11 +2942,11 @@ pub fn fork_share_parent_memory(
             // docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md: a grandchild of the
             // process that ran `mmap` (`( cmd; cmd ) &` — shell forks a subshell,
             // subshell forks to exec) faulted on musl's first malloc arena.
-            for &(start_va, len, shared_anon) in &region_ranges {
-                // `MAP_SHARED|MAP_ANONYMOUS` must survive fork as ONE object. CoW-sharing
+            for &(start_va, len, shared) in &region_ranges {
+                // `MAP_SHARED` (anonymous, or a writable file) must survive fork as ONE object. CoW-sharing
                 // it would give parent and child separate pages on the first write,
                 // silently ignoring the flag — see `share_rw_range`.
-                total_shared += if shared_anon {
+                total_shared += if shared {
                     share_rw_range(parent_as, start_va, len, new_proc.address_space.get_mut(), &mut chunk_scratch)?
                 } else {
                     cow_share_and_demote_range(parent_as, start_va, len,

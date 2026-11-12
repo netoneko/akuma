@@ -135,6 +135,9 @@ pub use akuma_elf as elf_loader;
 pub use akuma_threading as threading;
 pub mod alarms;
 pub mod process;
+/// Writable `MAP_SHARED` file pages: one frame per file page for every mapper,
+/// on both kernels (`akuma-fpcache-rw`'s kernel half).
+pub mod shm;
 /// The box (container) registry — **moved to `akuma-isolation` on 2026-08-30**
 /// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.1), where it joins the mount and
 /// network namespaces it has always sat on top of and gains that crate's

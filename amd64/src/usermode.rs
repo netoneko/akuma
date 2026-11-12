@@ -1898,19 +1898,7 @@ fn share_parent_memory_into(
         // part that has been dropped before: a grandchild whose parent's
         // regions read as zero-length shares nothing and faults on its first
         // touch (`docs/archive/FORK_EXEC_HEAP_LAZY_REGION_SIGSEGV.md`).
-        let mut inherited = akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions);
-        // The shared crate drops `shared_write` on inheritance, because a
-        // CoW child owns no frames to write back — true on AArch64, whose
-        // fork copies. Here the child maps the **same** frames as the parent
-        // (the share pass below), so it is a mapper like any other: it must
-        // write back on `munmap`/exit and release its table references, and
-        // without the record it would do neither. Index-aligned, because the
-        // inheritance maps over the parent's list in order.
-        for (child, parent) in inherited.iter_mut().zip(parent_regions.iter()) {
-            if parent.shared_write.is_some() && child.start_va == parent.start_va {
-                child.shared_write.clone_from(&parent.shared_write);
-            }
-        }
+        let inherited = akuma_mmap::inherit_mmap_regions_for_cow_child(&parent_regions);
         (inherited, shared)
     };
     *child_regions = inherited;
@@ -2177,7 +2165,7 @@ pub fn with_current_regions<R>(f: impl FnOnce(&mut Vec<MmapRegion>) -> R) -> Opt
 /// the same as asking the wrong one. amd64 reached for the own-half everywhere
 /// only because, before the fold, a thread had no `Process` of its own and the
 /// two answers coincided.
-fn current_mm_process() -> Option<&'static akuma_exec::process::Process> {
+pub fn current_mm_process() -> Option<&'static akuma_exec::process::Process> {
     akuma_exec::process::current_thread_tgid_process().map(|(_tgid, p)| p)
 }
 
@@ -2393,8 +2381,10 @@ fn run_process(idx: usize, first: &UserContext) -> ! {
     // Writable `MAP_SHARED` file mappings get `munmap`'s treatment before the
     // address space is dropped: written back, and released from the shared
     // writable page table. After the drain, so no sibling can fault a page
-    // back in behind it. See `mm::release_shared_write_mappings`.
-    crate::mm::release_shared_write_mappings();
+    // back in behind it.
+    if let Some(p) = current_mm_process() {
+        akuma_syscalls_glue::mem::release_shared_write_mappings(p);
+    }
     // A process that owned `/dev/fb0` hands the screen back as it exits.
     if let Some(p) = current_process() {
         crate::fbdev::release(p.tgid);
@@ -3645,7 +3635,9 @@ fn do_execve(
     // them back and release their shared pages now, while the old address
     // space is still the current one — its `Drop` inside `install_image` would
     // do neither. Same call the exit epilogue makes.
-    crate::mm::release_shared_write_mappings();
+    if let Some(p) = current_mm_process() {
+        akuma_syscalls_glue::mem::release_shared_write_mappings(p);
+    }
 
     // Built **before** the hold below. `with_process` runs its closure with
     // interrupts disabled and states that it must not allocate on the heap, so

@@ -30,8 +30,6 @@ pub fn register() {
         // so the hook has nothing to say.
         dev_mouse_has_events: || false,
         dev_tun_has_frame: || false,
-        release_shared_write: |_, _| {},
-        shared_write_backing: |_, _| akuma_syscalls_glue::mem::SharedWrite::Glue,
     });
 }
 

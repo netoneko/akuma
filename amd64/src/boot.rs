@@ -187,10 +187,6 @@ pub fn install_shared_sinks() {
         dev_mouse_has_events: crate::drivers::pointer_has_events,
         // The fifth: the tap node's gateway queue (`/dev/net/tun`), a relaxed flag the pump refreshes.
         dev_tun_has_frame: crate::drivers::hypervisor_tun_has_frame,
-        // `munmap`'s amd64 half: shared writable file pages live in
-        // `shmpages`, which glue's frame sweep does not know.
-        release_shared_write: crate::mm::release_shared_write,
-        shared_write_backing: crate::mm::shared_write_backing,
     });
     // This kernel's character devices, behind glue's fd arms (`crate::chardev`).
     crate::chardev::register();

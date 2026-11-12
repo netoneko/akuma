@@ -94,6 +94,7 @@ akuma-el0-entry = { path = "../akuma-el0-entry" }
 # half back into it at `init`.
 akuma-user-access = { path = "../akuma-user-access" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-fpcache-rw = { path = "../akuma-fpcache-rw" }
 spinning_top = "0.3"
 lock_api = "0.4"
 log = { version = "0.4", default-features = false }

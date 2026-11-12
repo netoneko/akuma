@@ -583,6 +583,36 @@ fn demand_page_lazy_region(
     let _fault_guard = fault_slot_hold(pid, as_owner, page_va);
 
     let file_backed = matches!(source, akuma_exec::process::LazySource::File { .. });
+
+    // A writable `MAP_SHARED` file page is the shared writable table's frame,
+    // the same one every mapper maps; and a page of a read-only mapping of that
+    // file is that frame too while a writer has it, as Linux's one page cache
+    // would give it (`shmregionprobe`). `PROT_READ` is EL0-executable here
+    // (`Prot::RO` has no `UXN`), so an executable mapping takes this path too and
+    // gets the I-cache maintenance the private path below would have given it.
+    if file_backed
+        && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner)
+        && let Some((key, shared_write)) = akuma_exec::shm::region_key(owner, page_va)
+    {
+        let mapped = if shared_write {
+            Some(akuma_exec::shm::fault_page(owner, page_va, flags, key))
+        } else if akuma_exec::mmu::user_flags::is_write(flags) {
+            // A private writable mapping must never be handed the writer's
+            // frame, or its stores would land in every mapper.
+            None
+        } else {
+            akuma_exec::shm::map_existing(owner, page_va, flags, key).filter(|ok| *ok)
+        };
+        if let Some(ok) = mapped {
+            if ok && akuma_exec::mmu::user_flags::is_exec(flags)
+                && let Some(pa) = owner.with_address_space(|a| a.translate(page_va))
+            {
+                let kva = akuma_exec::mmu::phys_to_virt(pa & !0xFFF) as usize;
+                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
+            }
+            return ok;
+        }
+    }
     let map_flags = akuma_exec::mmu::lazy_map_flags(access, flags, file_backed);
     // I-cache maintenance is a property of the *mapping* this fault installs, not of
     // the arm the fault arrived through: a page mapped non-exec cannot be fetched

@@ -101,43 +101,22 @@ pub struct MmapRegion {
     /// *which* file, not a claim on it.
     pub file: Option<FileBacking>,
 
-    /// A **writable `MAP_SHARED` file mapping**: its pages must be written
-    /// back to the file when they leave the address space (`munmap`, `msync`,
-    /// `madvise(MADV_DONTNEED)`).
-    ///
-    /// Akuma has no unified page cache — the reason this shape was `ENOSYS`
-    /// for so long — so coherence is delivered the other way: the mapping is
-    /// populated **eagerly** (`Plan::is_shared_writable` excludes it from both
-    /// lazy paths), every page stays a private frame this region owns in
-    /// [`frames`](Self::frames), and a *write-back of the whole region* is the
-    /// flush. No dirty-bit tracking: each flush rewrites every in-file page
-    /// from its frame, which is wrong only in I/O spent, never in bytes.
-    ///
-    /// This is a record, not a page cache. **On amd64 since 2026-10-03 a lazy
-    /// region with this record is served from the shared writable page table
-    /// (`akuma-fpcache-rw`)**: every mapper of a page maps one frame, so
-    /// mappers *are* coherent with each other and `write(2)` is copied into
-    /// the mapped frames; the paragraph below is the eager (no-identity) path
-    /// and the AArch64 kernel, which never sets this field (its record is
-    /// `akuma-syscalls-glue`'s `SharedFileMapping`). There, two mappers of one
-    /// file do not see each other's writes until a flush lands (and
-    /// `read(2)`/`write(2)` on the same file see a mapping's writes only after
-    /// one). What it does
-    /// guarantee is the guarantee `mmap`'s contract actually needs for the
-    /// dominant single-mapper caller (a database mapping its own files):
-    /// *writes through the mapping reach the file*, and a process that
-    /// unmaps (or `msync`s) before inspecting by other means sees its own
-    /// writes. A process **killed** with the mapping live loses writes since
-    /// its last flush — the exit path does not flush; Linux's page cache
-    /// would have.
+    /// A **writable `MAP_SHARED` file mapping**: its pages are the shared
+    /// writable table's (`akuma-fpcache-rw`, the kernel half `akuma_exec::shm`),
+    /// one frame per file page for every mapper, so mappers are coherent with
+    /// each other and `write(2)` is copied into the mapped frames. Its pages are
+    /// written back to the file when they leave an address space (`munmap`,
+    /// `msync`, `MADV_DONTNEED`, `execve`, exit). Always on a lazy region with a
+    /// [`file`](Self::file) record: a file with no inode identity is refused at
+    /// `mmap`. Both kernels since 2026-11-12; AArch64 kept private frames under
+    /// a separate record until then, so two mappers did not see each other's
+    /// stores. A process **killed** with the mapping live leaves its stores in
+    /// the table, unflushed, until another mapper flushes the page.
     ///
     /// The path is carried — unlike [`FileBacking`]'s integers-only rule —
-    /// because the write-back has no by-inode route (`read_at_by_inode`
-    /// exists; `write_at_by_inode` does not) and the flush needs *some*
-    /// name the VFS can resolve. A rename under a live shared-writable
-    /// mapping redirects its flushes to the new name, which is coherent
-    /// here only because the mapping is this process's private view; the
-    /// `InodePin` keeps the *blocks* alive across an `unlink` either way.
+    /// because the write-back prefers the name (a `/proc` file renders by
+    /// path); after an `unlink` or a rename the flush writes by inode instead,
+    /// and the `InodePin` keeps the blocks alive.
     pub shared_write: Option<SharedWriteBack>,
 
     /// **Demand-paged**: the region reserves its range and its pages are made
@@ -491,17 +470,11 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
             // A lazy parent region is lazy in the child: its absent pages are
             // still to be made on first touch, not missing.
             inherited.lazy = r.lazy;
-            // (amd64 re-attaches it for the regions it shares by identity at
-            // fork — `usermode.rs::share_parent_memory_into` — because there
-            // the child maps the parent's frames and is a real mapper.)
-            // `shared_write` is deliberately **dropped**, unlike `file`: the
-            // child owns no frames (CoW), so its flush would write nothing —
-            // and if a child write broke CoW into a private frame, flushing
-            // that frame back would be the parent-or-child divergence
-            // reaching the file. The file answers to the mapper that owns
-            // frames; a forked child of a shared-writable mapping flushes
-            // nothing, by construction.
-            inherited.shared_write = None;
+            // `shared_write` is carried too: both kernels share a writable
+            // `MAP_SHARED` file mapping's frames by identity at fork (they are
+            // the shared writable table's), so the child is a real mapper — it
+            // must write back on `munmap`/exit and release its table references.
+            inherited.shared_write.clone_from(&r.shared_write);
             if r.shared_anon { inherited.shared_anon() } else { inherited }
         })
         .collect()
@@ -1255,7 +1228,7 @@ mod mmap_region_inheritance_tests {
     }
 
     #[test]
-    fn cow_child_drops_the_writeback_record_but_keeps_the_file_record() {
+    fn fork_child_keeps_the_writeback_record_and_the_file_record() {
         let mut parent = MmapRegion::owned_with_prot(0x1000_0000, frames(2), Prot::RW);
         parent.file = Some(FileBacking {
             mount_id: 1, inode: 7, offset: 0, filesz: 2 * 4096, lead: 0,
@@ -1263,8 +1236,8 @@ mod mmap_region_inheritance_tests {
         parent.shared_write = Some(swb("/data/db", 0));
         let child = &inherit_mmap_regions_for_cow_child(&[parent.clone()])[0];
         assert!(child.file.is_some(), "fault-time fills still need the source");
-        assert!(child.shared_write.is_none(),
-            "a child owns no frames; a record here would flush nothing, or worse");
+        assert_eq!(child.shared_write, parent.shared_write,
+            "the child maps the table's frames: it writes back and releases them too");
     }
 
     /// Total pages a region list covers, for conservation assertions.
