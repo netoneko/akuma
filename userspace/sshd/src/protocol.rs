@@ -439,7 +439,7 @@ async fn run_exec_session(
                 session.term_height as u16,
             );
         }
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested && !res.terminal).await;
     }
 
     // Same emergency fallback as the interactive path, with paws's own `-c`
@@ -457,7 +457,7 @@ async fn run_exec_session(
             );
         }
         println(&format!("[SSH] Spawned emergency shell: {}", used_path));
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, session.pty_requested && !res.terminal).await;
     }
 
     // Neither could be spawned — exec itself is what is broken. Last resort:
@@ -516,7 +516,7 @@ async fn run_shell_session(
         // fresh TerminalState from the pty spawn, so its fd (ChildStdout) is
         // the handle the kernel resolves to that state.
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, true).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, !res.terminal).await;
     }
 
     // The configured shell couldn't be spawned at all — try the built-in
@@ -525,7 +525,7 @@ async fn run_shell_session(
     if let Some((res, used_path)) = try_emergency_shell(&shell_path, None, &env_refs, true) {
         set_terminal_size(res.stdout_fd as i32, session.term_width as u16, session.term_height as u16);
         println(&format!("[SSH] Spawned emergency shell: {}", used_path));
-        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, true).await;
+        return bridge_process(stream, session, res.pid, res.stdout_fd, res.stdin_fd, !res.terminal).await;
     }
 
     // Neither could be spawned — exec itself is what is broken. Last resort:
@@ -769,10 +769,11 @@ async fn send_paws_output(
     Ok(())
 }
 
-/// `\n` → `\r\n` for a client PTY, byte-identical passthrough otherwise. A PTY
-/// needs it because the shell's stdout is a pipe, not a terminal, so no line
-/// discipline cooks it for us (mirrors the in-kernel sshd's cooked-mode
-/// output). An exec channel's stdout is a raw byte stream, not terminal
+/// `\n` → `\r\n` for a client PTY whose child sits on a pipe,
+/// byte-identical passthrough otherwise. A pipe has no line discipline to cook
+/// it for us (mirrors the in-kernel sshd's cooked-mode output); a child on a
+/// real `/dev/pts/N` (`SpawnResult::terminal`) is already cooked by its
+/// pty's `ONLCR`, and cooking again sends `\r\r\n`. An exec channel's stdout is a raw byte stream, not terminal
 /// text — translating it corrupts any binary or digest-checked output. See
 /// `EXEC_CHANNEL_LARGE_OUTPUT_TRUNCATION.md` root cause B.
 fn cook_output(data: &[u8], pty: bool) -> Vec<u8> {
@@ -875,9 +876,9 @@ async fn bridge_process(
     pid: u32,
     stdout_fd: u32,
     child_stdin: Option<u32>,
-    pty: bool,
+    cook: bool,
 ) -> Result<(), NetError> {
-    match bridge_process_inner(stream, session, pid, stdout_fd, child_stdin, pty).await {
+    match bridge_process_inner(stream, session, pid, stdout_fd, child_stdin, cook).await {
         Ok(report) => report,
         Err(e) => {
             eprintln(&format!(
@@ -897,7 +898,7 @@ async fn bridge_process_inner(
     pid: u32,
     stdout_fd: u32,
     child_stdin: Option<u32>,
-    pty: bool,
+    cook: bool,
 ) -> Result<Result<(), NetError>, NetError> {
     let mut buf = [0u8; 1024];
 
@@ -984,7 +985,7 @@ async fn bridge_process_inner(
             loop {
                 let n = read_fd(stdout_fd as i32, &mut buf);
                 if n > 0 {
-                    let out = cook_output(&buf[..n as usize], pty);
+                    let out = cook_output(&buf[..n as usize], cook);
                     send_channel_data(stream, session, &out).await?;
                 } else {
                     break;
@@ -1017,7 +1018,7 @@ async fn bridge_process_inner(
         // 2. Output from process to SSH (non-blocking). See cook_output().
         let n = read_fd(stdout_fd as i32, &mut buf);
         if n > 0 {
-            let out = cook_output(&buf[..n as usize], pty);
+            let out = cook_output(&buf[..n as usize], cook);
             send_channel_data(stream, session, &out).await?;
             did_io = true;
         }

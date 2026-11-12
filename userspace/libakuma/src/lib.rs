@@ -233,6 +233,12 @@ pub mod syscall {
         /// has no handler for at all.
         pub const EXECVE: u64 = 221;
         pub const DUP3: u64 = 24;
+        /// `setsid(2)`, for the pty child: a session of its own before `TIOCSCTTY`.
+        pub const SETSID: u64 = 157;
+        /// `rt_sigaction(2)` / `rt_sigprocmask(2)`, for the pty child's reset to
+        /// default dispositions and an empty mask before `execve`.
+        pub const RT_SIGACTION: u64 = 134;
+        pub const RT_SIGPROCMASK: u64 = 135;
         /// `close_range(2)`: 436 in both tables.
         pub const CLOSE_RANGE: u64 = 436;
         /// asm-generic `reboot(2)`. See [`super::super::reboot`].
@@ -334,6 +340,11 @@ pub mod syscall {
         /// `--features linux-net` a build error on this target.
         pub const EXECVE: u64 = 59;
         pub const DUP3: u64 = 292;
+        /// `setsid(2)` — x86_64 112 (asm-generic 157 is `setregid` territory here).
+        pub const SETSID: u64 = 112;
+        /// `rt_sigaction(2)` / `rt_sigprocmask(2)` — x86_64 13 / 14.
+        pub const RT_SIGACTION: u64 = 13;
+        pub const RT_SIGPROCMASK: u64 = 14;
         /// `close_range(2)`: 436, the same as asm-generic.
         pub const CLOSE_RANGE: u64 = 436;
         /// Real x86_64 `reboot(2)` — **169**, not the asm-generic 142 (which is
@@ -2082,6 +2093,12 @@ pub struct SpawnResult {
     /// kernel owns the child's stdin channel; reach it through
     /// `/proc/<pid>/fd/0` and end it with [`close_child_stdin`].
     pub stdin_fd: Option<u32>,
+    /// The child's stdio is a real terminal (`/dev/pts/N`, made by the
+    /// `linux-abi` spawn for `SPAWN_FLAG_PTY`): its line discipline already
+    /// turns `\n` into `\r\n`, so a caller relaying `stdout_fd` to a remote
+    /// terminal must not cook it a second time. `false` for a pipe, and for
+    /// the native spawn, whose output has always been relayed raw.
+    pub terminal: bool,
 }
 
 /// Spawn a child process
@@ -2241,7 +2258,7 @@ fn spawn_full(
     // Extract PID (low 32 bits) and stdout_fd (high 32 bits)
     let pid = (result & 0xFFFF_FFFF) as u32;
     let stdout_fd = ((result >> 32) & 0xFFFF_FFFF) as u32;
-    Some(SpawnResult { pid, stdout_fd, stdin_fd: None })
+    Some(SpawnResult { pid, stdout_fd, stdin_fd: None, terminal: false })
 }
 
 /// `linux-abi` process spawn: Akuma's own `SPAWN` (301) is a single private
@@ -2254,7 +2271,8 @@ fn spawn_full(
 /// Built from the real Linux primitives instead: two `pipe2`s (the child's
 /// stdout and stdin), [`fork`] (already a genuine `CLONE` syscall — this part
 /// was never broken), `dup3` to move the pipes' ends onto the child's fds 1 and
-/// 0, then `execve`. `flags` (pty) is not wired up on this path.
+/// 0, then `execve`. With [`SPAWN_FLAG_PTY`] the child gets a pseudo-terminal
+/// instead of pipes ([`spawn_pty_linux`]), when the kernel has one.
 ///
 /// **The stdin pipe is the half that was missing until 2026-11-01.** Without it
 /// the child inherited the spawner's own fd 0, and sshd's pump — which writes
@@ -2272,14 +2290,18 @@ fn spawn_full(
     args: Option<&[&str]>,
     stdin: Option<&[u8]>,
     env: &[&str],
-    _flags: u64,
+    flags: u64,
 ) -> Option<SpawnResult> {
     let (path_terminated, _args_terminated, argv, _env_terminated, envp) = build_argv_envp(path, args, env);
     let envp_arg = if env.is_empty() { core::ptr::null() } else { envp.as_ptr() };
 
-    let Some((out_read, out_write)) = pipe_cloexec() else {
-        return None;
-    };
+    if flags & SPAWN_FLAG_PTY != 0 && stdin.is_none() {
+        if let Some(r) = spawn_pty_linux(path_terminated.as_bytes(), &argv, envp_arg) {
+            return Some(r);
+        }
+    }
+
+    let (out_read, out_write) = pipe_cloexec()?;
     let Some((in_read, in_write)) = pipe_cloexec() else {
         close(out_read);
         close(out_write);
@@ -2336,13 +2358,116 @@ fn spawn_full(
                     None
                 }
             };
-            Some(SpawnResult { pid, stdout_fd: out_read as u32, stdin_fd })
+            Some(SpawnResult { pid, stdout_fd: out_read as u32, stdin_fd, terminal: false })
         }
         Err(_) => {
             close(out_read);
             close(out_write);
             close(in_read);
             close(in_write);
+            None
+        }
+    }
+}
+
+/// The `linux-abi` pty spawn: what `openpty` + `login_tty` do, by hand.
+///
+/// `/dev/ptmx` (close-on-exec), unlock it, ask its number; then the child makes
+/// a session of its own (`setsid`), opens `/dev/pts/N`, takes it as its
+/// controlling terminal (`TIOCSCTTY`) and puts it on 0, 1 and 2 before
+/// `execve`. The caller gets the master twice: `stdout_fd` to read the
+/// terminal's output (and `TIOCSWINSZ`, which sshd sends to it) and `stdin_fd`,
+/// a duplicate, to type into it, so closing one leaves the other working.
+///
+/// `None` when the kernel has no ptys (`/dev/ptmx` does not open, as on
+/// Taoxichuan) or a step before the fork fails; the caller then falls back to
+/// pipes, which is what every pty spawn on this path was until 2026-11-12. With
+/// a pty the line discipline, echo and `^C` are the kernel's pty, the same code
+/// a Linux terminal emulator talks to (`crates/akuma-syscalls-glue/src/pty.rs`).
+#[cfg(feature = "linux-abi")]
+fn spawn_pty_linux(path_terminated: &[u8], argv: &[*const u8], envp_arg: *const *const u8) -> Option<SpawnResult> {
+    const O_RDWR: u64 = 2;
+    const O_NOCTTY: u64 = 0o400;
+    const O_CLOEXEC: u64 = 0o2_000_000;
+    const TIOCGPTN: u64 = 0x8004_5430;
+    const TIOCSPTLCK: u64 = 0x4004_5431;
+    const TIOCSCTTY: u64 = 0x540e;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+    const AT_FDCWD: u64 = -100i64 as u64;
+
+    let master = syscall(syscall::OPENAT, AT_FDCWD, c"/dev/ptmx".as_ptr() as u64, O_RDWR | O_NOCTTY | O_CLOEXEC, 0, 0, 0) as i64;
+    if master < 0 {
+        return None;
+    }
+    let master = master as i32;
+    let unlock: i32 = 0;
+    let mut n: u32 = 0;
+    if (syscall(syscall::IOCTL, master as u64, TIOCSPTLCK, core::ptr::addr_of!(unlock) as u64, 0, 0, 0) as i64) < 0
+        || (syscall(syscall::IOCTL, master as u64, TIOCGPTN, core::ptr::addr_of_mut!(n) as u64, 0, 0, 0) as i64) < 0
+    {
+        close(master);
+        return None;
+    }
+    // `/dev/pts/N\0`, built before the fork: the child allocates nothing.
+    let mut slave_path = [0u8; 24];
+    let prefix = b"/dev/pts/";
+    slave_path[..prefix.len()].copy_from_slice(prefix);
+    let mut digits = [0u8; 10];
+    let mut d = 0;
+    let mut v = n;
+    loop {
+        digits[d] = b'0' + (v % 10) as u8;
+        d += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    for i in 0..d {
+        slave_path[prefix.len() + i] = digits[d - 1 - i];
+    }
+    let input = syscall(syscall::FCNTL, master as u64, F_DUPFD_CLOEXEC, 3, 0, 0, 0) as i64;
+    if input < 0 {
+        close(master);
+        return None;
+    }
+    let input = input as i32;
+
+    match fork() {
+        Ok(ForkResult::Child) => {
+            syscall(syscall::SETSID, 0, 0, 0, 0, 0, 0);
+            let slave = syscall(syscall::OPENAT, AT_FDCWD, slave_path.as_ptr() as u64, O_RDWR, 0, 0, 0) as i64;
+            if slave < 0 {
+                exit(127);
+            }
+            syscall(syscall::IOCTL, slave as u64, TIOCSCTTY, 0, 0, 0, 0);
+            // A login session starts from default dispositions and an empty
+            // mask, whatever its spawner inherited (`posix_spawn`'s SETSIGDEF +
+            // SETSIGMASK). An ignored SIGINT survives `execve`, and ash keeps a
+            // signal ignored on entry ignored for good, so an sshd that was
+            // itself started from a script's `&` job (which ignores SIGINT)
+            // handed every session a `^C` that did nothing. A zeroed kernel
+            // `struct sigaction` is `SIG_DFL` on both architectures;
+            // SIGKILL/SIGSTOP refuse with `EINVAL`, harmlessly.
+            let dfl = [0u64; 4];
+            for signo in 1..=64u64 {
+                syscall(syscall::RT_SIGACTION, signo, dfl.as_ptr() as u64, 0, 8, 0, 0);
+            }
+            let empty: u64 = 0;
+            syscall(syscall::RT_SIGPROCMASK, 2 /* SIG_SETMASK */, core::ptr::addr_of!(empty) as u64, 0, 8, 0, 0);
+            for target in [fd::STDIN, fd::STDOUT, fd::STDERR] {
+                syscall(syscall::DUP3, slave as u64, target as u64, 0, 0, 0, 0);
+            }
+            // Everything else the spawner holds, the master pair included, as in
+            // the pipe path below.
+            syscall(syscall::CLOSE_RANGE, 3, u64::from(u32::MAX), 0, 0, 0, 0);
+            syscall(syscall::EXECVE, path_terminated.as_ptr() as u64, argv.as_ptr() as u64, envp_arg as u64, 0, 0, 0);
+            exit(127);
+        }
+        Ok(ForkResult::Parent(pid)) => Some(SpawnResult { pid, stdout_fd: master as u32, stdin_fd: Some(input as u32), terminal: true }),
+        Err(_) => {
+            close(master);
+            close(input);
             None
         }
     }
