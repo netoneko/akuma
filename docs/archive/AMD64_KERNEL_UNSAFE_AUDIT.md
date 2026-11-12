@@ -53,10 +53,16 @@ Fourth pass (3 -> 0):
   `init_reserving` kept the PMM off its pages. `kmain_mb2` halts if its argument disagrees with the
   recorded address.
 
-`akuma-kernel-amd64` has no `unsafe` site. It does not `forbid(unsafe_code)`: two entry symbols
-(`ap_entry64`, `syscall_handler`) are `#[unsafe(no_mangle)]`, which the lint covers. Registering
-them as function pointers in the crates that call them would let it take the ban. Next after that:
-merge the crossing with `akuma-ring3-amd64` (Taoxichuan's).
+`akuma-kernel-amd64` has no `unsafe` site, and since 2026-11-13 the compiler holds it there:
+`#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]`, with `deny` when the boot suite is
+linked and an `allow` on each of the six suite functions whose probes store to an unmapped page or
+read back through the physmap (20 test sites; `idt::{smoke_test, user_copy_smoke_test}`,
+`paging::smoke_test`, `uaccess::{smoke_test, write_protect_check}`, `loader::read_user`). The two
+`#[unsafe(no_mangle)]` entry symbols, which the lint covers, went first: `ap_entry64` never needed
+a name (its address reaches the AP through `mailbox_write(AP_MB_ENTRY, ..)`), and `syscall_entry`
+now does `call [rip + SYSCALL_HANDLER]`, a word `akuma_usermode_amd64::install(handler)` writes
+before it writes `LSTAR`. Verified: clippy on default, `headless` and `headless,no-tests`; amd64
+boot suite SMP=2 836/836. Next: merge the crossing with `akuma-ring3-amd64` (Taoxichuan's).
 
 Still open from the soundness list: `read_val`'s `T: Copy + Default` still admits `bool` and `char`,
 which have invalid bit patterns; every caller passes an integer or an ABI struct, and a `UserPod`

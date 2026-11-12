@@ -23,6 +23,15 @@
 // ELFs, the test-process helpers, the independent ELF re-reader). That split is
 // what makes `scripts/cloc_akuma.py` honest here rather than merely flattering.
 #![cfg_attr(feature = "no-tests", allow(dead_code, unused_imports))]
+// No `unsafe` in the machine half: every operation that needs it lives in the
+// crate that owns the fact (`akuma-usermode-amd64`, `akuma-boot-amd64::mb2`,
+// `akuma-phys`, ...). The shipped image (`no-tests`) forbids it outright. The
+// boot suite's own probes poke raw memory on purpose (a store the #PF handler
+// must map, a read-back through the physmap), so with the suite linked the lint
+// is `deny` and each such test function carries its own `allow` - nothing
+// outside `#[cfg(not(feature = "no-tests"))]` may.
+#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]
+#![cfg_attr(not(feature = "no-tests"), deny(unsafe_code))]
 
 extern crate alloc;
 

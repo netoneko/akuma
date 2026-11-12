@@ -1,17 +1,25 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-12 (night) with `python3 scripts/cloc_akuma.py src crates`:
-**105 of 144 crates** forbid `unsafe`. 126041 of 127197 production lines (99.1%) sit outside any
+**Grade: A** — regenerated 2026-11-13 with `python3 scripts/cloc_akuma.py src crates`:
+**106 of 144 crates** forbid `unsafe`. 126045 of 127201 production lines (99.1%) sit outside any
 `unsafe` block; 367 production sites across `crates/` (465 with tests), 0 inside enforced crates.
-`akuma-kernel-amd64` went 37 -> 0. The CR3 writes go through the checked
+The new one is `akuma-kernel-amd64`, the amd64 machine half, which went 37 -> 0 and now carries
+`#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]`: the shipped image forbids it, and with
+the boot suite linked the lint is `deny`, with an `allow` on each of the six suite functions whose
+probes touch raw memory on purpose (20 test sites). `cloc_akuma.py` counts that form as a ban,
+since it already scores `no-tests`-gated code as test code. The two entry symbols went with it:
+`ap_entry64`'s address reaches the AP through the mailbox, and `akuma-usermode-amd64`'s
+`syscall_entry` calls the handler `install(handler)` recorded instead of a `no_mangle` symbol.
+
+The run before, 2026-11-12 (night): 105 of 144, 367 production sites. `akuma-kernel-amd64` went 37 -> 0. The CR3 writes go through the checked
 `akuma_pagetable::amd64::activate`; the wake IPI is an `akuma-trap-amd64` kind; device reads use
 `MmioWindow`s; RAM reads `akuma_phys::peek_ram`; the reset is
 `akuma_idt_amd64::reset_by_triple_fault`; the GDT/TSS are `akuma-percpu-gdt-amd64`'s; user copies
 are `akuma_user_access::copy_{from,to}_user_upper_half`; the AP trampoline is an
 `akuma_boot_amd64::ap::TrampolinePage`; the ring-3 crossing and the per-CPU head are
 `akuma-usermode-amd64` (3 sites); and the multiboot2 framebuffer and RAM-disk claims are
-`akuma_boot_amd64::mb2`'s, made from the address `boot.s` recorded. It is not yet `forbid`: two
-entry symbols are `#[unsafe(no_mangle)]`. Detail: [`AMD64_KERNEL_UNSAFE_AUDIT.md`](../archive/AMD64_KERNEL_UNSAFE_AUDIT.md).
+`akuma_boot_amd64::mb2`'s, made from the address `boot.s` recorded. Detail:
+[`AMD64_KERNEL_UNSAFE_AUDIT.md`](../archive/AMD64_KERNEL_UNSAFE_AUDIT.md).
 
 The run before, 2026-11-12 (late): 376 production sites (474 with tests), `akuma-kernel-amd64` 18.
 

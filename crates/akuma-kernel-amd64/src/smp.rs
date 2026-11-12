@@ -797,7 +797,6 @@ pub fn enable_xsave() -> bool {
 /// The order is the BSP's, minus what is shared: GDT and TSS are per core
 /// (`ltr` needs its own), the IDT is one table loaded on each, the syscall
 /// MSRs and `CR4.SMAP/SMEP` are per core, and the LAPIC is this core's own.
-#[unsafe(no_mangle)]
 extern "C" fn ap_entry64(index: u64) -> ! {
     let idx = index as usize;
     // First, off the boot tables: the identity map in slot 0 is the lower half

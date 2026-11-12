@@ -337,6 +337,9 @@ class FileCount:
     #: has none left (2026-09-01), and if one comes back it understates the
     #: crate rather than overstating it.
     forbids_unsafe: bool = False
+    #: The ban is `#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]`: it
+    #: binds production lines only, so test sites in the crate are not a leak.
+    forbid_production_only: bool = False
     #: Production CODE lines lying inside an `unsafe { .. }` block, plus the
     #: declaration line of an `unsafe fn`/`impl`/`trait`. This is the "how much
     #: of what ships is the compiler NOT checking" number; `unsafe_sites` counts
@@ -827,7 +830,13 @@ ITEM_KEYWORDS = {
 
 #: A crate-level `#![forbid(unsafe_code)]`, at the start of a line so a mention
 #: inside a doc comment ("carries `#![forbid(unsafe_code)]`") does not match.
-FORBID_RE = re.compile(r"^\s*#!\[forbid\([^)]*\bunsafe_code\b", re.M)
+#: `#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]` counts too: this
+#: script already scores `no-tests`-gated code as test code, so a ban on the
+#: `no-tests` image is a ban on exactly the lines it calls production
+#: (`akuma-kernel-amd64`, whose boot-suite probes keep their `unsafe`).
+FORBID_RE = re.compile(
+    r'^\s*#!\[(cfg_attr\(\s*feature\s*=\s*"no-tests"\s*,\s*)?forbid\([^)]*\bunsafe_code\b', re.M
+)
 
 #: The arch named by a `#[cfg(target_arch = "...")]` attribute. Matched against
 #: the attribute's inner text, which the lexer has already cut out of comments
@@ -854,9 +863,9 @@ def count_text(text: str, relpath: str, spec: LangSpec, kernel_gate,
     fc = FileCount(path=relpath, lang=spec.name)
     fc.arches = arches
     fc.whole_file_test = (filename_tests and is_test_path(relpath)) or inner_test
-    fc.forbids_unsafe = FORBID_RE.search(text) is not None and os.path.basename(
-        relpath
-    ) in ("lib.rs", "main.rs")
+    m = FORBID_RE.search(text)
+    fc.forbids_unsafe = m is not None and os.path.basename(relpath) in ("lib.rs", "main.rs")
+    fc.forbid_production_only = fc.forbids_unsafe and m.group(1) is not None
     for ln in unsafe_lines:
         if fc.whole_file_test or ln in test:
             fc.test_unsafe_sites += 1
@@ -1077,6 +1086,8 @@ class Agg:
     #: True once this component's crate root carried `#![forbid(unsafe_code)]`.
     #: See `FileCount.forbids_unsafe` for why only the root counts.
     forbids_unsafe: bool = False
+    #: See `FileCount.forbid_production_only`.
+    forbid_production_only: bool = False
 
     def add(self, fc: FileCount):
         self.files += 1
@@ -1086,6 +1097,7 @@ class Agg:
         self.unsafe_code += fc.unsafe_code
         self.test_unsafe_code += fc.test_unsafe_code
         self.forbids_unsafe = self.forbids_unsafe or fc.forbids_unsafe
+        self.forbid_production_only = self.forbid_production_only or fc.forbid_production_only
         for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code",
                   "copy_sites", "test_copy_sites", "mut_sites", "test_mut_sites"):
             setattr(self, f, getattr(self, f) + getattr(fc, f))
@@ -1100,6 +1112,7 @@ class Agg:
         self.unsafe_code += other.unsafe_code
         self.test_unsafe_code += other.test_unsafe_code
         self.forbids_unsafe = self.forbids_unsafe or other.forbids_unsafe
+        self.forbid_production_only = self.forbid_production_only or other.forbid_production_only
         for f in ("blank", "comment", "code", "test_blank", "test_comment", "test_code",
                   "copy_sites", "test_copy_sites", "mut_sites", "test_mut_sites"):
             setattr(self, f, getattr(self, f) + getattr(other, f))
@@ -1280,7 +1293,7 @@ def print_unsafe_report(by_comp: dict, W: int) -> None:
     all_code = sum(a.total_code for a in crates.values())
     all_unsafe = sum(a.unsafe_sites for a in crates.values())
     all_test_unsafe = sum(a.test_unsafe_sites for a in crates.values())
-    leaked = sum(a.unsafe_sites + a.test_unsafe_sites for a in safe)
+    leaked = sum(a.unsafe_sites + (0 if a.forbid_production_only else a.test_unsafe_sites) for a in safe)
     prod_code = sum(a.code for a in crates.values())
     prod_unsafe_code = sum(a.unsafe_code for a in crates.values())
     prod_safe_code = prod_code - prod_unsafe_code
@@ -2598,16 +2611,20 @@ def self_test() -> int:
         files, _ = walk(["crates"], True)
         by_crate: dict = {}
         for f in files:
-            agg = by_crate.setdefault(component_of(f.path), [False, 0])
+            agg = by_crate.setdefault(component_of(f.path), [False, 0, 0, False])
             agg[0] = agg[0] or f.forbids_unsafe
-            agg[1] += f.unsafe_sites + f.test_unsafe_sites
-        contradictions = [c for c, (forbids, sites) in by_crate.items() if forbids and sites]
+            agg[1] += f.unsafe_sites
+            agg[2] += f.test_unsafe_sites
+            agg[3] = agg[3] or f.forbid_production_only
+        # A `no-tests`-only ban binds production lines; its test sites are legal.
+        contradictions = [c for c, (forbids, prod, test, prod_only) in by_crate.items()
+                          if forbids and (prod or (test and not prod_only))]
         if contradictions:
             failures += 1
             print(f"  FAIL crate(s) claim #![forbid(unsafe_code)] yet report sites: "
                   f"{sorted(contradictions)}")
         else:
-            n = sum(1 for forbids, _ in by_crate.values() if forbids)
+            n = sum(1 for forbids, *_ in by_crate.values() if forbids)
             print(f"  ok   every forbidding crate reports zero unsafe sites ({n})")
 
     # A file the walker calls a test file must charge nothing to production, and

@@ -82,7 +82,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `install_percpu` that points `GS_BASE` at one. Taoxichuan's counterpart is `akuma-ring3-amd64`; the
   two are to merge. `akuma_boot_amd64::mb2` makes the multiboot2 claims (info block, framebuffer
   window, RAM-disk module) from the address `boot.s` recorded. **`crates/akuma-kernel-amd64/` has no
-  `unsafe` site (2026-11-12); keep it at 0 — put the operation in the crate that owns the fact.**
+  `unsafe` site and forbids it in the shipped (`no-tests`) image (2026-11-13; boot-suite probes carry
+  a per-function `allow`); keep it at 0 — put the operation in the crate that owns the fact.**
   `akuma_cpu::msr` is the closed set of MSRs the kernel touches (`Msr` enum): reads
   safe, `write` unsafe (so the kernel's own `GS_BASE`, which every per-CPU read
   dereferences, stays `unsafe` at its one call site), and `set_fs_base`/`set_user_gs_base`

@@ -10,9 +10,8 @@
 //!
 //! # The contract with the kernel
 //!
-//! - **`syscall_handler`.** The stub calls a symbol of that name with the
-//!   System V signature `extern "C" fn(nr, a1, a2, a3, a4, a5, a6) -> u64`. The
-//!   kernel defines it `#[unsafe(no_mangle)]`; without it the link fails.
+//! - **The handler.** The stub calls the [`SyscallHandler`] the kernel passed
+//!   to [`install`]; no symbol is shared, so the kernel needs no `no_mangle`.
 //! - **The per-CPU block.** `gs` (after `swapgs` on entry, before it on the
 //!   way out) addresses the kernel's per-CPU block, with the running task's
 //!   `*mut UserCtx` at [`PERCPU_CURRENT_UCTX`] and one scratch word at
@@ -462,7 +461,7 @@ syscall_entry:
     mov rdx, rsi
     mov rsi, rdi
     mov rdi, rax
-    call syscall_handler            /* result in rax */
+    call qword ptr [rip + {handler}] /* the kernel's handler (`install`); result in rax */
 
     add rsp, 8
     pop r10                         /* restore what the ABI promises userspace */
@@ -733,6 +732,7 @@ akuma_usermode_unwind:
     // derives from `IA32_STAR`, taken from the GDT crate so they cannot drift.
     user_cs = const akuma_gdt::USER_CS as u64,
     user_ss = const akuma_gdt::USER_SS as u64,
+    handler = sym SYSCALL_HANDLER,
 );
 
     unsafe extern "C" {
@@ -765,7 +765,13 @@ akuma_usermode_unwind:
         unsafe { msr::write(Msr::GsBase, addr) };
     }
 
-    pub fn install() {
+    /// The kernel's syscall handler, called by `syscall_entry` through this
+    /// word. Written by `install` before it writes `LSTAR`, so no `syscall`
+    /// can reach the stub while it is 0.
+    static SYSCALL_HANDLER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    pub fn install(handler: super::SyscallHandler) {
+        SYSCALL_HANDLER.store(handler as usize, core::sync::atomic::Ordering::Release);
         let star = akuma_gdt::star();
         // SAFETY: the four architectural MSRs of the fast-syscall path. LSTAR is
         // this crate's stub, STAR is the GDT crate's row order (what `sysretq`
@@ -781,11 +787,15 @@ akuma_usermode_unwind:
     }
 }
 
-/// Enable `syscall`/`sysret` on this core: `EFER.SCE`, `STAR`, `LSTAR` (this
-/// crate's stub) and [`FMASK`].
+/// The kernel side of a `syscall`: `(nr, a1..a6) -> rax`, System V, called by
+/// `syscall_entry` on the task's kernel stack with interrupts off.
+pub type SyscallHandler = extern "C" fn(u64, u64, u64, u64, u64, u64, u64) -> u64;
+
+/// Enable `syscall`/`sysret` on this core: record `handler` for the stub, then
+/// `EFER.SCE`, `STAR`, `LSTAR` (this crate's stub) and [`FMASK`].
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
-pub fn install() {
-    switch::install();
+pub fn install(handler: SyscallHandler) {
+    switch::install(handler);
 }
 
 /// Enter ring 3 at `rip` on stack `rsp` with `rax = 0`. Returns the status the

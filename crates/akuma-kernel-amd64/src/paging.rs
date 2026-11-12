@@ -77,6 +77,7 @@ pub fn drop_identity_map() {
 /// path (allocate PDPT entry, PD, PT, leaf) is exercised and a false pass from
 /// accidentally hitting the identity map is impossible.
 #[cfg(not(feature = "no-tests"))]
+#[allow(unsafe_code)] // boot-suite probe; gated by `no-tests` (lib.rs)
 pub fn smoke_test(t: &mut Suite) {
     const TEST_VA: usize = 1 << 30;
     const PATTERN: u64 = 0x0bad_c0de_dead_beef;

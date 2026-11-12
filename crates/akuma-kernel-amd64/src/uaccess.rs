@@ -374,6 +374,7 @@ pub fn read_cstr(ptr: u64, max: usize) -> Option<Vec<u8>> {
 /// unmarked read-only page, the fault falls through to the user-copy fixup, and
 /// [`write_bytes`] reports failure. Without that half, turning `WP` on would
 /// simply move the corruption rather than fix it.
+#[allow(unsafe_code)] // boot-suite probe; gated by `no-tests` (lib.rs)
 fn write_protect_check(t: &mut Suite) {
     use crate::paging::{self, MemAttr, PteProt};
     use crate::phys::phys_ptr;
@@ -489,6 +490,7 @@ fn write_protect_check(t: &mut Suite) {
 ///    correctly, and leave `AC` clear afterwards.
 /// 4. A bracketed copy that *faults* (unmapped source) also leaves `AC` clear:
 ///    the fixup path returns through `clac`, not around it.
+#[allow(unsafe_code)] // boot-suite probe; gated by `no-tests` (lib.rs)
 pub fn smoke_test(t: &mut Suite, st: SmapStatus) {
     use crate::paging::{self, MemAttr, PteProt};
     use crate::phys::phys_ptr;

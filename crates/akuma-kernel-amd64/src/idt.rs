@@ -1486,6 +1486,7 @@ fn disarm_lazy() {
 /// than working once, and reading the values back afterwards proves the mappings
 /// survived — a handler that mapped the page and then lost it would still let
 /// the faulting store retire.
+#[allow(unsafe_code)] // boot-suite probe; gated by `no-tests` (lib.rs)
 pub fn smoke_test(t: &mut Suite) {
     const LAZY_BASE_VA: u64 = 2 << 30;
     const PAGES: u64 = 4;
@@ -1579,6 +1580,7 @@ pub fn smoke_test(t: &mut Suite) {
 ///
 /// Plus the differential sweep from the crate itself, which pins `rep movsb`
 /// against a byte loop over every alignment and tier-boundary length.
+#[allow(unsafe_code)] // boot-suite probe; gated by `no-tests` (lib.rs)
 pub fn user_copy_smoke_test(t: &mut Suite) {
     use akuma_user_access::copy_from_user_safe;
     const EFAULT: u64 = 14;

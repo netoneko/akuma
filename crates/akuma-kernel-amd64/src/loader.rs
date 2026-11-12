@@ -189,6 +189,7 @@ const fn align_up(v: u64, to: u64) -> u64 {
 /// `uaccess` with `CR3` already naming it. The self-test that checks what the
 /// stack builder actually wrote has no such luxury, since the space it is
 /// inspecting has never been entered.
+#[allow(unsafe_code)] // boot-suite probe; gated by `no-tests` (lib.rs)
 pub fn read_user(space: &UserAddressSpace, va: u64, dst: &mut [u8]) -> bool {
     let mut done = 0usize;
     while done < dst.len() {

@@ -407,7 +407,6 @@ fn enter_user(entry: u64, stack: u64, forked: bool) -> u64 {
 /// 5's point made load-bearing: the same `write` is 1 here and 64 on aarch64, so
 /// a handler written against numbers cannot be shared and a handler written
 /// against names can.
-#[unsafe(no_mangle)]
 extern "C" fn syscall_handler(
     nr: u64,
     a1: u64,
@@ -1009,7 +1008,7 @@ pub fn sys_write(fd: u64, buf: u64, len: u64) -> u64 {
 /// `STAR`, `LSTAR` and `FMASK` (the flag list and why each is masked is
 /// `akuma_usermode_amd64::FMASK`).
 pub fn init_syscall() {
-    akuma_usermode_amd64::install();
+    akuma_usermode_amd64::install(syscall_handler);
 }
 
 
