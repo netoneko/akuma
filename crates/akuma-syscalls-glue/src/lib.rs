@@ -1430,6 +1430,13 @@ pub struct SyscallHooks {
     /// kernel registers `|| false`. The one reader is the `DevTun` arm of
     /// [`poll::epoll_check_fd_readiness`].
     pub dev_tun_has_frame: fn() -> bool,
+
+    /// Write back and unmap this kernel's writable `MAP_SHARED` file pages in
+    /// `[start, end)`, before [`mem::unmap_current`] detaches their regions.
+    /// amd64 keeps those pages in its shared writable table, which the frame
+    /// sweep knows nothing about; the AArch64 kernel's live in glue's own
+    /// `SHARED_FILE_MAPPINGS` and it registers `|_, _| {}`.
+    pub release_shared_write: fn(usize, usize),
 }
 
 static HOOKS: akuma_primitives::OnceCopy<SyscallHooks> = akuma_primitives::OnceCopy::new();
@@ -1483,5 +1490,10 @@ pub(crate) mod hooks {
     }
     pub fn dev_tun_has_frame() -> bool {
         HOOKS.get().is_some_and(|h| (h.dev_tun_has_frame)())
+    }
+    pub fn release_shared_write(start: usize, end: usize) {
+        if let Some(h) = HOOKS.get() {
+            (h.release_shared_write)(start, end);
+        }
     }
 }

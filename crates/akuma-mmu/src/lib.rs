@@ -2510,6 +2510,26 @@ impl UserAddressSpace {
         changed
     }
 
+    /// `munmap`'s page half: clear every present page in `[start, end)` and
+    /// push each frame this address space held the **last** VA onto `out`
+    /// (the ledger decides, as [`unmap_and_free_page_no_flush`](Self::unmap_and_free_page_no_flush)),
+    /// then flush the range once on every core. Freeing is the caller's, after
+    /// releasing the address-space lock; the PMM's share count decides whether
+    /// another address space still holds the frame. The x86 twin has the same
+    /// contract.
+    pub fn unmap_present(&mut self, start: usize, end: usize, out: &mut Vec<PhysFrame>) {
+        let first = start & !(PAGE_SIZE - 1);
+        let mut va = first;
+        while va < end {
+            if let Some(frame) = self.unmap_and_free_page_no_flush(va) {
+                out.push(frame);
+            }
+            let Some(next) = va.checked_add(PAGE_SIZE) else { break };
+            va = next;
+        }
+        let _ = flush_tlb_range_all_asid(first, (va - first) / PAGE_SIZE, TlbTarget::AllCores);
+    }
+
     /// Raw L3 page descriptor for `va` (4KiB-aligned), if mapped at the final level.
     /// Used by kernel tests and diagnostics (e.g. verify `UXN` after `update_page_flags`).
     pub fn read_l3_page_entry(&self, va: usize) -> Option<u64> {
@@ -3881,6 +3901,19 @@ impl UserAddressSpace {
         f: impl FnMut(&FrameLedger, Leaf) -> LeafAction,
     ) -> usize {
         x86_walk_leaves(self.root as u64, &self.ledger, start, end, f)
+    }
+
+    /// `munmap`'s page half, the AArch64 twin's contract in one descent:
+    /// absent subtrees cost one read, so a sparse gigabyte is cheap. A leaf the
+    /// ledger does not track (a device window) is cleared and not handed back.
+    pub fn unmap_present(&mut self, start: usize, end: usize, out: &mut Vec<PhysFrame>) {
+        self.rewrite_leaves_in_range(start, end, |ledger, leaf| {
+            let frame = PhysFrame::new(leaf.pa);
+            if ledger.remove_user_frame(frame) {
+                out.push(frame);
+            }
+            LeafAction::Unmap
+        });
     }
 
     /// `mprotect`'s page-table half — the AArch64 twin's contract, in one

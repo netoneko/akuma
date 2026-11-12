@@ -236,9 +236,26 @@ dispatches it to glue):
   ([`AKUMA_MPROTECT_CONVERGENCE.md`](../../../archive/AKUMA_MPROTECT_CONVERGENCE.md); probe
   `cowprotect` in `scripts/mem_suite.py`).
 
-**`munmap`** (`sys_munmap`, `mem.rs:654`): owner lookup fails → `ESRCH`.
-`addr`/`len` are page-rounded; unmapping an address with nothing mapped there
-is **not** an error (matches Linux — silently succeeds).
+**`munmap`** (`sys_munmap`, both kernels): checked in Linux's order —
+unaligned `addr` → `EINVAL`; `addr + len` past `akuma_mmu::USER_VA_END` →
+`EINVAL`; owner lookup fails → `ESRCH`. `len` is page-rounded; unmapping an
+address with nothing mapped there is **not** an error (matches Linux — silently
+succeeds). The body, `unmap_range`, is one shape for every caller:
+
+1. write back shared writable file pages while still mapped (amd64's
+   `shmpages` table through the `release_shared_write` hook, then glue's own
+   records);
+2. detach **every** region in the range, eager and lazy, and unpin each file
+   no region names afterwards (`akuma_exec::process::detach_regions_in_range`);
+3. sweep the whole range by live PTE (`UserAddressSpace::unmap_present`) and
+   free, outside the address-space lock, the frames the ledger says this space
+   held last.
+
+**Never free by the region's recorded frames**: the record goes stale on every
+CoW break and `MADV_DONTNEED`. **Never sweep only the regions' pages**: a range
+may hold pages no region claims. A kernel's own callers (`MAP_FIXED`, `mremap`,
+exit's shared-mapping release) use `akuma_syscalls_glue::mem::unmap_current`
+([`AKUMA_ONE_MUNMAP.md`](../../../archive/AKUMA_ONE_MUNMAP.md)).
 
 **`madvise`** (`sys_madvise`, `mem.rs:1001`): `MADV_FREE` returns `EINVAL`
 (deliberately — see below); everything else returns `0` unconditionally, and OOM

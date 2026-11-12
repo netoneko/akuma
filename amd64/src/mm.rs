@@ -1891,141 +1891,57 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
     }
 }
 
-/// `munmap(addr, len)`.
-pub fn sys_munmap(addr: u64, len: u64) -> u64 {
-    if !addr.is_multiple_of(PAGE_SIZE) {
-        return errno::EINVAL;
-    }
-    // **Divergence 1** of `akuma-syscalls-mem`, preserved rather than fixed:
-    // `munmap(addr, 0)` unmaps one page here where Linux returns `EINVAL`.
-    let byte_len = akuma_syscalls_mem::mmap::munmap_len(len as usize);
-    let start = addr as usize;
-    let Some(end) = start.checked_add(byte_len).filter(|e| *e <= USER_VA_LIMIT) else {
-        return errno::EINVAL;
-    };
-    // Without a process there is no region list and no user address space. This
-    // check is now belt-and-braces — [`unmap_range`] resolves the address space
-    // through `with_current_address_space`, which answers `None` rather than
-    // handing back the kernel's own `CR3` the way `paging::active_root()` did —
-    // but it is kept because the **errno** is the point: a caller with no
-    // process must see `ESRCH`, not the `0` a silently-skipped unmap would give.
-    if !have_address_space() {
-        return errno::ESRCH;
-    }
-    unmap_range(start, end);
-    0
+/// Retire `[start, end)` of the current process: glue's `munmap` body
+/// (`akuma_syscalls_glue::mem::unmap_current`), which reaches back into this
+/// kernel only through [`release_shared_write`].
+fn unmap_range(start: usize, end: usize) {
+    akuma_syscalls_glue::mem::unmap_current(start, end);
 }
 
-/// Retire `[start, end)`: detach the region records it covers, then unmap and
-/// release every page that is actually present.
+/// The `release_shared_write` hook: `munmap`'s amd64 half, run before glue
+/// detaches anything. A writable `MAP_SHARED` file mapping's pages are about to
+/// lose their mapping; once they do, the bytes exist nowhere but the shared
+/// writable table (`shmpages`) or the recycler. So: flush them to the file,
+/// then unmap them here, reaping each table entry whose last mapping this was.
+/// Glue's sweep, which follows, finds those leaves already gone.
 ///
-/// The two halves are separate on purpose. The **records** are clipped by
-/// [`akuma_mmap::detach_eager_regions_in_range`], which splits a region the
-/// range only partly covers and leaves the head and tail behind — the algebra
-/// that had gone wrong before and now has host tests. The **pages** are found by
-/// walking the page table, not the returned pieces, because a range may contain
-/// mapped pages no region ever claimed (a `MAP_FIXED` landing on part of the ELF
-/// image, say) and those must still be unmapped.
-///
-/// Frames go back through the ledger, never straight to the PMM:
-/// `untrack_anon_frame` reports whether this address space held the last VA onto
-/// the frame, and only then does `cow_ref_dec` get asked whether this was the
-/// last address space. A frame the ledger does not track is left alone —
-/// `Process::free` will release it — because freeing it here would be a double
-/// free against that.
-///
-/// There is a **third** thing to release, and it was missing until 2026-09-17:
-/// the `InodePin` a file-backed mapping took to keep its file's blocks alive
-/// across an `unlink`. It lives in the address space, whose `Drop` releases it
-/// on `exec` and exit — which covers the mapping's death only when the whole
-/// address space dies with it. A `munmap` left the claim behind, and once
-/// enough distinct inodes had been mapped to saturate the 1024-slot pin table,
-/// `is_pinned` answered `true` for everything and ext2 stopped freeing blocks
-/// on `unlink` at all. See `retain_mapped_inode_pins`.
-fn unmap_range(start: usize, end: usize) {
-    if end <= start {
+/// The snapshot takes the region lock and nothing else; the flush takes the
+/// filesystem's locks and does disk I/O with **no** region lock held — the
+/// regions -> address space -> PMM order must not grow a regions -> ext2 edge.
+/// Allocates only when the range names such a mapping, which almost none does.
+pub fn release_shared_write(start: usize, end: usize) {
+    let snapshot = usermode::with_current_regions(|regions| snapshot_shared_write(regions, start, end))
+        .unwrap_or_default();
+    if snapshot.is_empty() {
         return;
     }
-    // **Flush before anything is detached or freed.** A writable
-    // `MAP_SHARED` region's frames are about to lose their last owner; once
-    // the leaf walk below runs, the bytes exist nowhere but the recycler.
-    // The snapshot takes the region lock and nothing else, the flush takes
-    // the filesystem's locks and does disk I/O with **no** region lock held —
-    // the established regions -> address-space -> PMM order must not grow a
-    // regions -> ext2 edge — and the detach + free below then proceeds
-    // exactly as it did before this existed. A page that faults in after the
-    // snapshot and before the free cannot happen: nothing runs between the
-    // snapshot and the leaf walk but this flush, on this thread.
-    let snapshot = usermode::with_current_regions(|regions| {
-        snapshot_shared_write(regions, start, end)
-    })
-    .unwrap_or_default();
     flush_shared_write(&snapshot);
-
-    // Records first, under the region lock, which is released before the page
-    // walk below takes the address-space lock and the PMM. Lock order is
-    // regions -> address space everywhere in this module.
-    let _ = usermode::with_current_regions(|regions| {
-        // Does the doomed range name a file at all? Almost no `munmap` does, and
-        // the reconciliation below costs a scan of the region list per live pin,
-        // so it is worth one overlap pass to skip it. A region that has no
-        // `file` never contributed a pin.
-        // Bounded by the sorted invariant: only the regions that can overlap are
-        // examined, not the whole list. This was a full scan per `munmap`, which
-        // is the second of the two O(regions) walks that made `munmap` cost 42 us
-        // against a 4 400-region list (the other was the clip itself).
-        let unmaps_a_file = akuma_mmap::regions_overlapping(regions, start, end).iter().any(|r| {
-            r.file.is_some() && r.start_va < end && r.start_va.saturating_add(r.len_bytes()) > start
-        });
-        let _pieces: Vec<_> = akuma_mmap::detach_eager_regions_in_range(regions, start, end);
-        region_trace(format_args!(
-            "[MMT] detach 0x{start:x}..0x{end:x} pieces={} pid={}\n",
-            _pieces.len(),
-            usermode::current_mm_pid(),
-        ));
-        if unmaps_a_file {
-            // The pins are per *inode*, so which ones to drop can only be
-            // decided against the survivors: a program that maps one shared
-            // object once per segment unmaps three regions and must keep the pin
-            // until the third goes. Inside the region hold, which is the
-            // established order (`with_current_address_space`: regions ->
-            // address space, never the other way).
-            let _ = usermode::with_current_address_space(|uas| {
-                uas.retain_mapped_inode_pins(|inode| {
-                    regions.iter().any(|r| r.file.is_some_and(|f| f.inode == inode))
-                });
+    let mut to_free: Vec<PhysFrame> = Vec::new();
+    let _ = usermode::with_current_address_space(|uas| {
+        for r in &snapshot {
+            let lo = r.start_va.max(start);
+            let hi = (r.start_va + r.pages * PAGE_SIZE as usize).min(end);
+            uas.rewrite_leaves_in_range(lo, hi, |ledger, leaf| {
+                // Ledger, then the global share count, then the table. A frame
+                // this address space does not track is left for teardown.
+                if ledger.remove_user_frame(PhysFrame::new(leaf.pa)) {
+                    if akuma_pmm::cow_ref_dec(leaf.pa) {
+                        to_free.push(PhysFrame::new(leaf.pa));
+                    } else if let Some(key) = shared_write_key(&snapshot, leaf.va) {
+                        // Still referenced, by the table at least. Safe to drop
+                        // the entry: the flush above made the file its only
+                        // copy. Under the address-space hold, `shmpages`'
+                        // documented order (address space -> table).
+                        crate::shmpages::reap(key, leaf.pa);
+                    }
+                }
+                LeafAction::Unmap
             });
         }
     });
-
-    // One descent, clearing each leaf and dropping this address space's claim on
-    // its frame in the same step. The ledger is reached through the walk's own
-    // parameter rather than `usermode::untrack_anon_frame`, which would take
-    // this very lock again and deadlock — and rather than a `Vec` of leaves,
-    // which would allocate proportionally to residency on the one syscall that
-    // runs when memory is short.
-    let _ = usermode::with_current_address_space(|uas| {
-        uas.rewrite_leaves_in_range(start, end, |ledger, leaf| {
-            // Ledger first, then the global share count, then the free. A frame
-            // this address space does not track is left alone — teardown will
-            // release it — because freeing it here would be a double free
-            // against that.
-            if ledger.remove_user_frame(PhysFrame::new(leaf.pa)) {
-                if akuma_pmm::cow_ref_dec(leaf.pa) {
-                    akuma_pmm::free_page(leaf.pa, 0);
-                } else if let Some(key) = shared_write_key(&snapshot, leaf.va) {
-                    // A page of the shared writable table, still referenced —
-                    // by the table, at least. If this was its last mapping the
-                    // entry goes now, which is safe because the flush above
-                    // already wrote it back: the file is the page's only copy
-                    // from here on. Under the address-space hold, which is
-                    // `shmpages`'s documented order (address space -> table).
-                    crate::shmpages::reap(key, leaf.pa);
-                }
-            }
-            LeafAction::Unmap
-        });
-    });
+    for f in to_free {
+        akuma_pmm::free_page(f.addr, 0);
+    }
 }
 
 /// The shared writable table's key for `va`, if a captured region maps it
@@ -2795,8 +2711,18 @@ pub fn smoke_test(t: &mut Suite) {
     );
     t.check_eq(
         "munmap: an unaligned address is EINVAL",
-        sys_munmap(0x1001, 4096),
+        crate::usermode::to_glue(akuma_syscalls_abi::Syscall::Munmap, [0x1001, 4096, 0, 0, 0, 0]),
         errno::EINVAL,
+    );
+    t.check_eq(
+        "munmap: a range into the kernel half is EINVAL",
+        crate::usermode::to_glue(akuma_syscalls_abi::Syscall::Munmap, [(USER_VA_LIMIT - 4096) as u64, 8192, 0, 0, 0, 0]),
+        errno::EINVAL,
+    );
+    t.check_eq(
+        "munmap: no process is ESRCH",
+        crate::usermode::to_glue(akuma_syscalls_abi::Syscall::Munmap, [0x1_0000_0000, 4096, 0, 0, 0, 0]),
+        errno::ESRCH,
     );
     t.check_eq(
         "mprotect: writable+executable is accepted (ESRCH here: no process, not EINVAL)",

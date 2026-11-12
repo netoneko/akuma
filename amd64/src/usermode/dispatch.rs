@@ -798,7 +798,7 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
             if r == crate::fd::errno::ENODEV { crate::mm::sys_mmap(a1, a2, a3, a4 | 0x20, u64::MAX, 0) } else { r }
         }
         Syscall::Mmap => crate::mm::sys_mmap(a1, a2, a3, a4, a5, a6),
-        Syscall::Munmap => crate::mm::sys_munmap(a1, a2),
+        Syscall::Munmap => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `madvise(addr, len, advice)`. Answered `ENOSYS` for everything until
         // 2026-09-07, which is the *wrong* way to say "not implemented": Linux
         // says `EINVAL` for unsupported advice and redis exits on anything else.

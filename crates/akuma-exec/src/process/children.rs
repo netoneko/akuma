@@ -1580,6 +1580,32 @@ pub fn update_eager_region_flags(
 pub static EAGER_FLAG_WIDENED: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 
+/// `munmap`'s record half, for both kernels: detach every region in
+/// `[start, end)`, eager and lazy, clipping at both ends, and release the
+/// address space's pin on each file no region maps afterwards. The pieces come
+/// back with their recorded frames, which a write-back may need; the pages
+/// themselves are the caller's to unmap.
+///
+/// Orphans are collected in a `Vec`, not [`OrphanedInodes`]: a `munmap` may
+/// cross any number of files, and a pin left behind is the 1024-slot pin table
+/// filling up (`retain_mapped_inode_pins`' history on amd64).
+pub fn detach_regions_in_range(proc: &Process, start: usize, end: usize) -> Vec<akuma_mmap::DetachedPiece> {
+    let (pieces, orphans) = proc.vm_with_regions(|r| {
+        let pieces = akuma_mmap::detach_regions_in_range_where(r, start, end, |_| true);
+        let mut orphans: Vec<u32> = Vec::new();
+        for f in pieces.iter().filter_map(|p| p.file) {
+            if f.inode != 0 && !orphans.contains(&f.inode) && !regions_name_inode(r, f.inode) {
+                orphans.push(f.inode);
+            }
+        }
+        (pieces, orphans)
+    });
+    if !orphans.is_empty() {
+        proc.with_address_space(|a| orphans.iter().for_each(|&i| a.unpin_mapped_inode(i)));
+    }
+    pieces
+}
+
 /// Handle munmap across all lazy regions overlapping [unmap_addr, unmap_addr+unmap_len).
 /// Returns each removed piece as `(start_va, pages)`.
 pub fn munmap_lazy_regions_in_range(pid: Pid, unmap_addr: usize, unmap_len: usize) -> Vec<(usize, usize)> {
