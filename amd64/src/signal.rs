@@ -508,25 +508,21 @@ pub fn deliver_pending(uctx: *mut UserCtx, syscall_result: u64) -> u64 {
     // and not as a pending signal because pending signals run
     // `next_delivery`'s disposition logic, which is exactly what a group
     // death bypasses.
-    let slot = crate::usermode::current_proc_slot();
-    if let Some(status) = crate::thread::group_exit_status(slot) {
+    match crate::thread::group_exit_status() {
         // A voluntary `exit_group(code)` from a sibling thread — no signal, so
         // no `exit_current_from_signal` (whose status is `-(sig)`).
-        //
-        // **The sign is tested first.** `GROUP_EXIT_CODE_FLAG` is bit 30, and
-        // every negative word has bit 30 set, so the flag test alone read a
-        // death by signal as `exit_group(sig & 0xff)`: a SIGKILLed group
-        // reported exit 247, a SIGTERMed one 241 — the number kami logged as
-        // "chromium exited: exit status: 241" — and `wait4` said `WIFEXITED`.
-        // Found by `usermode::kill_test` (`got 0xf7 want …fff7`), 2026-10-09.
-        if status.cast_signed() >= 0 && status & crate::thread::GROUP_EXIT_CODE_FLAG != 0 {
-            let code = u64::from(status & 0xff);
+        Some(akuma_exec::process::GroupExit::Code(code)) => {
             crate::usermode::exit_current_group();
-            return code;
+            return u64::from(code);
         }
-        let sig = status.cast_signed().wrapping_neg() as u32;
-        crate::usermode::exit_current_from_signal(sig);
-        return signal_status(sig);
+        // `GroupExit` is typed: the old word put the code flag at bit 30, which
+        // every negative (signal) word also has, and a reader that tested the
+        // flag first reported a SIGKILLed group as `exit 247` (2026-10-09).
+        Some(akuma_exec::process::GroupExit::Signal(sig)) => {
+            crate::usermode::exit_current_from_signal(sig);
+            return signal_status(sig);
+        }
+        None => {}
     }
 
     // `rt_sigsuspend`'s saved mask (glue's `suspend_until_signal` arms the slot): a handler entered at this
@@ -832,7 +828,7 @@ pub fn notify_group_of_thread_fatal(sig: u32) {
     // `SIGSEGV` handler (rustc does), and a handled notification is a hung
     // process, not a dead one. Then interrupt everyone (`deliver_signal`
     // pends as well; those pends are superseded by the status check below).
-    crate::thread::set_group_exit_status(crate::usermode::current_proc_slot(), signal_status(sig) as u32);
+    crate::thread::set_group_exit_status(akuma_exec::process::GroupExit::Signal(sig));
     // `pend_signal_to_group`, not `deliver_signal`: the latter's SIGKILL arm
     // is the AArch64 hard kill (`kill_thread_group`), and this was the one
     // door it was still reached through on this target after `sys_kill`
@@ -973,15 +969,10 @@ pub fn deliver_pending_on_tick(
     // `DRAIN INCOMPLETE` left after `kill(2)` stopped hard-killing. The tick
     // is the one place that reaches such a thread, and it already leaves
     // from here for a fatal signal; this is the same exit for a group exit.
-    let slot = crate::usermode::current_proc_slot();
-    if let Some(status) = crate::thread::group_exit_status(slot) {
-        // Same decode as `deliver_pending`: sign first, then the code flag.
-        let value = if status.cast_signed() >= 0 && status & crate::thread::GROUP_EXIT_CODE_FLAG != 0 {
-            u64::from(status & 0xff)
-        } else {
-            signal_status(status.cast_signed().wrapping_neg() as u32)
-        };
-        return TickOutcome::Exit(value);
+    match crate::thread::group_exit_status() {
+        Some(akuma_exec::process::GroupExit::Code(code)) => return TickOutcome::Exit(u64::from(code)),
+        Some(akuma_exec::process::GroupExit::Signal(sig)) => return TickOutcome::Exit(signal_status(sig)),
+        None => {}
     }
     if crate::thread::should_leave_now() {
         return TickOutcome::Exit(0);

@@ -52,7 +52,6 @@
 //! thread's exit path drains it to zero before it finishes, so by the time
 //! anything can reap, no task holds that `space_root`.
 
-use core::sync::atomic::{AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use crate::fd::errno;
@@ -110,113 +109,77 @@ fn thread_row(i: usize) -> Option<Thread> {
     THREADS.lock()[i]
 }
 
-/// Set when any thread of a process calls `exit_group`, so its siblings leave
-/// ring 3 at their next syscall instead of running on into a torn-down space.
-///
-/// Indexed by process slot. An `AtomicU32` bitmap would be tighter; an array of
-/// flags is what the rest of this file's tables look like.
-static GROUP_EXIT: [AtomicU32; crate::usermode::PROC_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::usermode::PROC_SLOTS];
-
-/// Has `proc_slot` been asked to exit as a whole?
-#[must_use]
-pub fn group_exiting(proc_slot: usize) -> bool {
-    GROUP_EXIT.get(proc_slot).is_some_and(|f| f.load(Ordering::Relaxed) != 0)
+/// The calling thread's group: its `SharedSignalTable`, which `clone_thread` shares across the
+/// thread group and `fork`/`spawn` make fresh. The group's exit state lives there (Linux's
+/// `signal_struct`), so it is the group's by construction rather than a process slot's.
+fn group() -> Option<&'static akuma_exec::process::SharedSignalTable> {
+    akuma_exec::process::current_process_shared().map(|p| &*p.signal_actions)
 }
 
-/// Mark `proc_slot`'s whole thread group for exit. Called by `exit_group`.
-pub fn set_group_exiting(proc_slot: usize) {
-    if let Some(f) = GROUP_EXIT.get(proc_slot) {
-        f.store(1, Ordering::Relaxed);
+/// Has the calling thread's group been asked to exit as a whole?
+#[must_use]
+pub fn group_exiting() -> bool {
+    group().is_some_and(akuma_exec::process::SharedSignalTable::group_exiting)
+}
+
+/// Mark the calling thread's whole group for exit, so its siblings leave ring 3 at their next
+/// syscall (or tick) instead of running on into a torn-down space. Called by `exit_group`.
+pub fn set_group_exiting() {
+    if let Some(g) = group() {
+        g.begin_group_exit();
     }
 }
 
-/// The exit status a **group death by signal** carries, per process slot: the
-/// bit pattern of `-(sig)`, 0 when none. Set by
-/// `crate::signal::notify_group_of_thread_fatal` when a non-main thread dies
-/// by a default-action signal.
+/// How the calling thread's group is ending, when a sibling decided it: a sibling's
+/// `exit_group(code)` ([`exit_group_from_thread`]) or its death by a default-action signal
+/// (`crate::signal::notify_group_of_thread_fatal`).
 ///
-/// Why this exists beside [`GROUP_EXIT`]: the interrupt-and-pend route
-/// (`deliver_signal`) honors dispositions, and a main thread with a `SIGSEGV`
-/// handler — every rustc, which installs one process-wide — would *handle* the
-/// pended signal and run on, hung forever behind its already-dead workers.
-/// Measured 2026-09-13: rustc's worker `#GP`ed, its eight siblings died, and
-/// the leader survived in `ps` because it handled the notification. Linux's
-/// `do_group_exit` does not consult handlers either; the group exit code is
-/// fixed at the signal that started it.
-static GROUP_EXIT_STATUS: [AtomicU32; crate::usermode::PROC_SLOTS] =
-    [const { AtomicU32::new(0) }; crate::usermode::PROC_SLOTS];
+/// Why this exists beside [`group_exiting`]: the interrupt-and-pend route (`deliver_signal`)
+/// honors dispositions, and a main thread with a `SIGSEGV` handler — every rustc, which
+/// installs one process-wide — would *handle* the pended signal and run on, hung forever
+/// behind its already-dead workers. Measured 2026-09-13: rustc's worker `#GP`ed, its eight
+/// siblings died, and the leader survived in `ps` because it handled the notification.
+/// Linux's `do_group_exit` does not consult handlers either; the group exit code is fixed at
+/// the signal that started it.
+#[must_use]
+pub fn group_exit_status() -> Option<akuma_exec::process::GroupExit> {
+    group().and_then(akuma_exec::process::SharedSignalTable::group_exit_status)
+}
 
-/// Record the group's death status for `proc_slot`.
-pub fn set_group_exit_status(proc_slot: usize, status: u32) {
-    if let Some(f) = GROUP_EXIT_STATUS.get(proc_slot) {
-        f.store(status, Ordering::Relaxed);
+/// Record how the calling thread's group ends.
+pub fn set_group_exit_status(how: akuma_exec::process::GroupExit) {
+    if let Some(g) = group() {
+        g.set_group_exit_status(how);
     }
 }
-
-/// The recorded group death status, if any.
-#[must_use]
-pub fn group_exit_status(proc_slot: usize) -> Option<u32> {
-    GROUP_EXIT_STATUS.get(proc_slot).map(|f| f.load(Ordering::Relaxed))
-        .filter(|&s| s != 0)
-}
-
-/// Bit set in a [`GROUP_EXIT_STATUS`] word when the group is ending by a
-/// **voluntary `exit_group(code)`**, the low byte then being the code. Without
-/// it the word is `-(sig)` — a death by signal — which is negative. **A reader
-/// must test the sign before the flag**: bit 30 is set in every negative word
-/// too, so the flag alone misreads a signal death as `exit_group(sig & 0xff)`
-/// (`signal::deliver_pending` did, until 2026-10-09). `code == 0` stays
-/// distinguishable from "no group exit in progress" (a zero word).
-pub const GROUP_EXIT_CODE_FLAG: u32 = 0x4000_0000;
 
 /// **`exit_group` from a thread that is not the leader.**
 ///
-/// The leader's `run_process` epilogue is the only place a group dies on this
-/// target (`drain`, the fd sweep, the `SPAWN` row, the parent's status), and
-/// the calling thread leaves through `run_thread`, which does none of that. When
-/// the caller *is* the leader that is fine; when it is not, the leader has to be
-/// told, or it sits where it was and the group never ends.
+/// The leader's `run_process` epilogue is the only place a group dies on this target
+/// (`drain`, `finish_process`), and the calling thread leaves through `run_thread`, which does
+/// none of that. When the caller *is* the leader that is fine; when it is not, the leader has
+/// to be told, or it sits where it was and the group never ends.
 ///
-/// That is not exotic: a Rust program that runs `main` on a spawned big-stack
-/// thread leaves its original thread in `pthread_join`'s untimed
-/// `FUTEX_WAIT`, and `std::process::exit` from that thread is an `exit_group`.
-/// `goose --version` printed its version and then never exited — the leader
-/// parked on the join futex for good, the parent's `wait4` with it
-/// (2026-10-03, trashcan).
+/// That is not exotic: a Rust program that runs `main` on a spawned big-stack thread leaves
+/// its original thread in `pthread_join`'s untimed `FUTEX_WAIT`, and `std::process::exit` from
+/// that thread is an `exit_group`. `goose --version` printed its version and then never exited
+/// — the leader parked on the join futex for good, the parent's `wait4` with it (2026-10-03,
+/// trashcan).
 ///
-/// The route out is the one a fatal signal in a sibling already takes
-/// ([`set_group_exit_status`] + an interrupt, read at the leader's next syscall
-/// return by `signal::deliver_pending`), minus the signal: the status word
-/// carries the exit code, and the interrupt is `request_thread_kill` + `wake`,
-/// which is what every blocking arm's `should_interrupt_blocking_syscall`
-/// already reads. The leader's slot is resolved through `thread_for_pid`, never
-/// `Process::thread_id`, because a recorded slot may have been recycled.
+/// The route out is the one a fatal signal in a sibling already takes (the group's exit status
+/// and an interrupt, read at the leader's next syscall return by `signal::deliver_pending`),
+/// minus the signal: the status carries the exit code, and the interrupt is
+/// `request_thread_kill` + `wake`, which is what every blocking arm's
+/// `should_interrupt_blocking_syscall` already reads. The leader's slot is resolved through
+/// `thread_for_pid`, never `Process::thread_id`, because a recorded slot may have been recycled.
 ///
-/// Siblings other than the leader are not touched here: once the leader is out,
-/// its epilogue's [`drain`] reaches them as it always has.
-pub fn exit_group_from_thread(proc_slot: usize, tgid: u32, code: u64) {
-    set_group_exit_status(proc_slot, GROUP_EXIT_CODE_FLAG | (code as u32 & 0xff));
+/// Siblings other than the leader are not touched here: once the leader is out, its
+/// epilogue's [`drain`] reaches them as it always has.
+pub fn exit_group_from_thread(tgid: u32, code: u64) {
+    set_group_exit_status(akuma_exec::process::GroupExit::Code(code as u8));
     if let Some(leader) = akuma_exec::process::thread_for_pid(tgid) {
         akuma_threading::request_thread_kill(leader);
         crate::sched::wake(leader);
-    }
-}
-
-/// Clear the group death status when a slot is rebound to a new process —
-/// same reasoning as [`clear_group_exiting`], which this is cleared beside.
-pub fn clear_group_exit_status(proc_slot: usize) {
-    if let Some(f) = GROUP_EXIT_STATUS.get(proc_slot) {
-        f.store(0, Ordering::Relaxed);
-    }
-}
-
-/// Clear the flag when a slot is reused — `execve` and `sys_spawn` both put a
-/// new program in an existing slot, and a stale flag would kill it on its first
-/// syscall.
-pub fn clear_group_exiting(proc_slot: usize) {
-    if let Some(f) = GROUP_EXIT.get(proc_slot) {
-        f.store(0, Ordering::Relaxed);
     }
 }
 
@@ -253,7 +216,7 @@ pub fn should_leave_now() -> bool {
     if current_is_main() {
         return false;
     }
-    group_exiting(crate::usermode::current_proc_slot())
+    group_exiting()
 }
 
 pub fn current_thread_slot() -> usize {
@@ -447,7 +410,7 @@ fn teardown(slot: usize) {
 /// the same preemption that bounds any other runaway user program, and called
 /// out in `AKUMA_AMD64_RUST_STD.md` as a known gap rather than papered over.
 pub fn drain(proc_slot: usize) {
-    set_group_exiting(proc_slot);
+    set_group_exiting();
     wake_group(proc_slot);
     // Bounded, like every other drive loop in this kernel. An unbounded wait
     // here turns any bug in the leave path into a boot that hangs with no

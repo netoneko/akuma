@@ -1183,7 +1183,7 @@ pub fn exit_current_from_signal(sig: u32) {
     // main thread, which is already that leader. See
     // `crate::signal::notify_group_of_thread_fatal`.
     crate::signal::notify_group_of_thread_fatal(sig);
-    crate::thread::set_group_exiting(current_proc_slot());
+    crate::thread::set_group_exiting();
     // The status travels in `%rax`: [`run_process`] reads `enter_user`'s
     // return value, which is why `signal::deliver_pending` returns `-(sig)`
     // rather than the interrupted syscall's result.
@@ -1194,7 +1194,7 @@ pub fn exit_current_from_signal(sig: u32) {
 /// `leave`, which the syscall return path reads. The code itself is the
 /// caller's return value, carried out in `%rax` to [`run_process`].
 pub fn exit_current_group() {
-    crate::thread::set_group_exiting(current_proc_slot());
+    crate::thread::set_group_exiting();
     mark_leave();
 }
 
@@ -2463,31 +2463,11 @@ extern "C" fn proc_entry() -> ! {
 pub fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
     let task_slot = crate::sched::spawn_in_space_unpublished(proc_entry, root)?;
     crate::sched::seed_proc_slot(task_slot, proc_slot);
-    // **A new process in this slot starts with a clean group.** Both flags are
-    // indexed by process slot, and slots are recycled: `sys_spawn` takes the
-    // lowest free SPAWN row, so the slot a dead process just vacated is the
-    // very next one handed out. Until 2026-09-24 only the `fork` path cleared
-    // them, and a spawn inherited whatever the previous occupant left:
-    //
-    // - `GROUP_EXIT_STATUS` — a multithreaded process whose worker died by a
-    //   default-action signal (`notify_group_of_thread_fatal`) stamps
-    //   `-(sig)` here. `deliver_pending` checks it before anything else, so
-    //   every later spawn into the slot exited at its first syscall return as
-    //   that signal. The captured case: `kot` (tokio, many workers) took a
-    //   `SIGTERM` from herd or a `kill <pid>`, a worker died of it, and from
-    //   then on **every** exec on the box returned 241 (`-15 & 0xff`) with no
-    //   output until a power cycle — `sshd`'s shells, herd's restarts of kot
-    //   itself.
-    // - `GROUP_EXIT` — left set by any multithreaded `exit_group`. Harmless to
-    //   a single-threaded successor (the main thread never tests it), but
-    //   every thread a threaded successor creates would leave ring 3 at its
-    //   first syscall.
-    //
-    // Cleared here rather than at each caller because this is the one claim
-    // every non-`fork` process goes through (`sys_spawn`, init, the self-tests).
-    // Regression: `spawn_stale_group_state_test`.
-    crate::thread::clear_group_exiting(proc_slot);
-    crate::thread::clear_group_exit_status(proc_slot);
+    // No group state to clear: a group's exit flag and status live on its own
+    // `SharedSignalTable`, fresh for every new process, not on this recycled
+    // slot. (Until 2026-11-12 they were slot-indexed, and a spawn inherited a
+    // dead occupant's `SIGTERM`: every exec on the box exited 241,
+    // `docs/archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`.)
     Some(task_slot)
 }
 
@@ -3328,12 +3308,13 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
         Ok(())
     }
 
-    fn enter(&self, _proc: &akuma_exec::process::Process) -> u64 {
+    fn enter(&self, proc: &akuma_exec::process::Process) -> u64 {
         let (entry, stack, root) = self.entered.get();
-        // A new program in an existing slot starts with a clean group: a stale
-        // `exit_group` flag from the image just replaced would kill its first
-        // thread at its first syscall.
-        crate::thread::clear_group_exiting(self.slot);
+        // The exec survived the siblings `stop_siblings` drained, and `drain` set
+        // the group's exit flag to make them leave. The new image is a group of
+        // one that is not exiting: left set, its first thread would leave ring 3
+        // at its first syscall.
+        proc.signal_actions.end_group_exit_for_exec();
         // `install_image` left the hardware on the boot root; `CR3` onto the new
         // space, recorded on the task slot so the next switch installs it too.
         crate::sched::set_current_space_root(root);
@@ -3507,19 +3488,11 @@ pub fn bind_child_task(
         );
     }
 
-    // **A new process in this slot must not inherit the old one's exit.**
-    // `GROUP_EXIT` outlives the process that set it — `drain` sets it and
-    // nothing cleared it on the plain `fork` path, where the child is bound to
-    // a *recycled* slot the way `execve`/`spawn` are (and only those two
-    // cleared it). A fork child landed on such a slot ran fine itself —
-    // `should_leave_now` is false for a main thread — but every thread it
-    // ever `pthread_create`d saw `group_exiting` true at its **first** syscall,
-    // answered `EINTR` and left before executing a user instruction. Measured
-    // 2026-09-12 with a fork → spawn-8-parkers child: `started=0`, and the
-    // console showed every worker's `run_thread` returning `-4` immediately —
-    // `/probes/segvgroup` failing its worker barrier from round 0. Threads
-    // must not clear this: they *join* the running group, which may genuinely
-    // be exiting.
+    // No group state to clear here either: a `fork` child's `SharedSignalTable`
+    // is `clone_for_fork`'s, which starts not exiting. (Slot-indexed until
+    // 2026-11-12, it outlived its process, and a fork child on a recycled slot
+    // had every thread it created leave at its first syscall: `segvgroup`,
+    // 2026-09-12.)
 
     // Collect any row the reaper left behind before looking for a free one.
     sweep_reaped_spawn_rows();
@@ -3542,8 +3515,6 @@ pub fn bind_child_task(
 
     // Under the BKL, and the task is unpublished.
     SPAWN.set(slot - SPAWN_SLOT_BASE, Spawn { pid: child.pid, exec_slot: task_slot });
-    crate::thread::clear_group_exiting(slot);
-    crate::thread::clear_group_exit_status(slot);
     // `seed_proc_slot` alone leaves `UserCtx::thread_slot` untouched. Every
     // OTHER caller of this task-slot claim is a `fork`/`vfork`/`clone` child
     // reached through `spawn_user_thread_initializing`'s two-phase claim,

@@ -202,7 +202,8 @@ fn run(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     crate::usermode_tests::socketpair_smoke_test(t);
     crate::usermode_tests::fdprobe_test(t);
     crate::usermode_tests::spawn_test(t);
-    crate::usermode_tests::spawn_stale_group_state_test(t);
+    // `spawn_stale_group_state_test` retired 2026-11-12: the state it poisoned is no longer
+    // per slot (`akuma_exec::process::signal`'s `group_exit_tests` pin the rule now).
     crate::usermode_tests::winsize_to_child_test(t);
     crate::usermode_tests::session_terminal_is_private_test(t);
     crate::usermode_tests::wait4_ownership_test(t);

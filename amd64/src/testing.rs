@@ -125,10 +125,7 @@ pub mod sock {
 }
 
 pub mod thread {
-    pub use crate::thread::{
-        clear_group_exit_status, clear_group_exiting, live_count, set_group_exit_status,
-        set_group_exiting,
-    };
+    pub use crate::thread::live_count;
 }
 
 pub mod uaccess {

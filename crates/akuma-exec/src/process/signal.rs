@@ -1,5 +1,5 @@
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use crate::process::types::{Pid, ProcessState, SignalAction, MAX_SIGNALS};
@@ -20,6 +20,48 @@ pub struct SharedSignalTable {
     /// `SIGNAL_GROUP_EXIT`, which lives in the same shared `signal_struct`).
     /// Only `CLONE_THREAD` shares this table, so "the table" is "the group".
     group_exit: AtomicBool,
+    /// How the group is ending, once that is decided by something other than
+    /// the leader's own exit: [`GroupExit`] encoded, 0 for none.
+    group_exit_status: AtomicU32,
+}
+
+/// How a thread group is ending, recorded on the group's [`SharedSignalTable`] so every thread
+/// of it reads the same answer.
+///
+/// Set when the decision is made by a thread that is not the one whose exit ends the group: a
+/// sibling's `exit_group(code)`, or a sibling's death by a default-action signal (Linux's
+/// `do_group_exit`, which fixes the group's status at the signal that started it and does not
+/// consult handlers). Each thread takes it at its next return to user mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupExit {
+    /// `exit_group(code)`: the low byte is the status.
+    Code(u8),
+    /// Death by this signal.
+    Signal(u32),
+}
+
+impl GroupExit {
+    /// Set on a [`GroupExit::Code`] word; a [`GroupExit::Signal`] word has bit 31 set instead,
+    /// so the two never collide and 0 stays "none".
+    const CODE: u32 = 0x4000_0000;
+    const SIGNAL: u32 = 0x8000_0000;
+
+    const fn encode(self) -> u32 {
+        match self {
+            Self::Code(code) => Self::CODE | code as u32,
+            Self::Signal(sig) => Self::SIGNAL | (sig & 0xff),
+        }
+    }
+
+    const fn decode(word: u32) -> Option<Self> {
+        if word & Self::SIGNAL != 0 {
+            Some(Self::Signal(word & 0xff))
+        } else if word & Self::CODE != 0 {
+            Some(Self::Code((word & 0xff) as u8))
+        } else {
+            None
+        }
+    }
 }
 
 impl SharedSignalTable {
@@ -27,7 +69,38 @@ impl SharedSignalTable {
         Self {
             actions: Spinlock::new([SignalAction::default(); MAX_SIGNALS]),
             group_exit: AtomicBool::new(false),
+            group_exit_status: AtomicU32::new(0),
         }
+    }
+
+    /// Begin the group's exit: every thread of it should leave user mode at its next chance.
+    /// Unlike [`Self::claim_group_exit`], any number of callers may.
+    pub fn begin_group_exit(&self) {
+        self.group_exit.store(true, Ordering::Release);
+    }
+
+    /// Has some thread of this group begun its exit?
+    #[must_use]
+    pub fn group_exiting(&self) -> bool {
+        self.group_exit.load(Ordering::Acquire)
+    }
+
+    /// `execve` survived the siblings it stopped: the group (now one thread running a new
+    /// image) is not exiting. The recorded [`GroupExit`] is kept: one set while the exec was
+    /// in flight is still the group's death.
+    pub fn end_group_exit_for_exec(&self) {
+        self.group_exit.store(false, Ordering::Release);
+    }
+
+    /// Record how the group ends. A later record replaces an earlier one.
+    pub fn set_group_exit_status(&self, how: GroupExit) {
+        self.group_exit_status.store(how.encode(), Ordering::Release);
+    }
+
+    /// How the group ends, if a sibling decided it.
+    #[must_use]
+    pub fn group_exit_status(&self) -> Option<GroupExit> {
+        GroupExit::decode(self.group_exit_status.load(Ordering::Acquire))
     }
 
     /// Claim the group's exit. `true` for exactly one caller per group: the
@@ -74,7 +147,9 @@ impl SharedSignalTable {
     pub fn clone_for_fork(&self) -> Self {
         Self {
             actions: Spinlock::new(*self.actions.lock()),
+            // A new process: a group of one, not exiting, whatever the parent's group is doing.
             group_exit: AtomicBool::new(false),
+            group_exit_status: AtomicU32::new(0),
         }
     }
 }
@@ -781,5 +856,75 @@ mod signal_can_act_tests {
         assert!(!signal_can_act(SignalHandler::Ignore, SIGWINCH));
         assert!(signal_can_act(SignalHandler::Ignore, SIGKILL));
         assert!(signal_can_act(SignalHandler::Default, SIGSTOP));
+    }
+}
+
+/// The group's exit state lives on the group's table, so a new process starts clean by
+/// construction. On amd64 it was indexed by process slot until 2026-11-12, and a slot reused
+/// by `spawn` or `fork` inherited the dead occupant's state: every spawn on the box exited 241
+/// (`-SIGTERM & 0xff`) until a power cycle (`docs/archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`).
+#[cfg(test)]
+mod group_exit_tests {
+    use super::{GroupExit, SharedSignalTable};
+    use alloc::sync::Arc;
+
+    #[test]
+    fn a_new_table_is_not_exiting() {
+        let t = SharedSignalTable::new();
+        assert!(!t.group_exiting());
+        assert_eq!(t.group_exit_status(), None);
+    }
+
+    #[test]
+    fn a_fork_child_does_not_inherit_its_parents_group_exit() {
+        let parent = SharedSignalTable::new();
+        parent.begin_group_exit();
+        parent.set_group_exit_status(GroupExit::Signal(15));
+        let child = parent.clone_for_fork();
+        assert!(!child.group_exiting());
+        assert_eq!(child.group_exit_status(), None);
+    }
+
+    #[test]
+    fn threads_share_one_answer() {
+        let leader = Arc::new(SharedSignalTable::new());
+        let thread = Arc::clone(&leader);
+        thread.set_group_exit_status(GroupExit::Code(3));
+        thread.begin_group_exit();
+        assert!(leader.group_exiting());
+        assert_eq!(leader.group_exit_status(), Some(GroupExit::Code(3)));
+    }
+
+    /// The old word was `-(sig)` beside a code flag at bit 30, and every negative word has bit
+    /// 30 set: a reader that tested the flag first read SIGKILL as `exit 247`. The typed
+    /// decode cannot confuse them.
+    #[test]
+    fn codes_and_signals_round_trip_distinctly() {
+        for code in [0u8, 1, 3, 241, 255] {
+            assert_eq!(GroupExit::decode(GroupExit::Code(code).encode()), Some(GroupExit::Code(code)));
+        }
+        for sig in [1u32, 9, 11, 15, 64] {
+            assert_eq!(GroupExit::decode(GroupExit::Signal(sig).encode()), Some(GroupExit::Signal(sig)));
+        }
+        assert_eq!(GroupExit::decode(0), None);
+    }
+
+    #[test]
+    fn exec_ends_the_exit_but_keeps_a_recorded_death() {
+        let t = SharedSignalTable::new();
+        t.begin_group_exit();
+        t.set_group_exit_status(GroupExit::Signal(9));
+        t.end_group_exit_for_exec();
+        assert!(!t.group_exiting());
+        assert_eq!(t.group_exit_status(), Some(GroupExit::Signal(9)));
+    }
+
+    #[test]
+    fn claim_is_once_but_begin_is_any_number() {
+        let t = SharedSignalTable::new();
+        t.begin_group_exit();
+        t.begin_group_exit();
+        assert!(t.group_exiting());
+        assert!(!t.claim_group_exit(), "begun already: no teardown left to claim");
     }
 }

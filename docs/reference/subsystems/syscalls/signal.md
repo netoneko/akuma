@@ -198,6 +198,16 @@ claims the group's exit (`SharedSignalTable::claim_group_exit`, Linux's
 slot `TERMINATED` and parks, as a posted deferred kill does at the EL0 boundary.
 Two teardowns in one group grace-wait on each other for the whole 2 s.
 
+**A group's exit state is the group's, on both kernels.** The flag and the status live on the
+group's `SharedSignalTable` (shared by `clone_thread`, fresh for `fork` and spawn, Linux's
+`signal_struct`): `begin_group_exit`/`group_exiting` (siblings leave at their next syscall or
+tick), `claim_group_exit` (exactly one teardown), and `GroupExit::{Code, Signal}` for a group
+whose end a sibling decided (a sibling's `exit_group`, or its default-action signal death, which
+no handler can catch). `execve` ends the exit it began to stop its siblings
+(`end_group_exit_for_exec`). Never index group state by a process or task slot: slots are
+recycled and the state outlives its process
+([`../../../archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`](../../../archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md)).
+
 Gates: `userspace/forktest/c_stress/killtree.c` (on both arches, through
 `ssh`) and the amd64 boot check `usermode::kill_test`
 (`userspace/amd64/killprobe`).

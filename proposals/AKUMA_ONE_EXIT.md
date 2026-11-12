@@ -7,7 +7,21 @@ one execve, one spawn, one waitpid and one mm ([`AKUMA_MM_CONVERGENCE.md`](AKUMA
 ## Status
 
 Step 1 done (2026-11-12): `akuma_syscalls_glue::exit::finish_process`, called by glue's
-`sys_exit_group` and amd64's `run_process`. Steps 2-4 not started.
+`sys_exit_group` and amd64's `run_process`.
+
+Step 2 done (2026-11-12): the group's exit flag and status live on its `SharedSignalTable`
+(`begin_group_exit`/`group_exiting`, `GroupExit::{Code, Signal}`, `end_group_exit_for_exec`).
+amd64's `GROUP_EXIT`/`GROUP_EXIT_STATUS` arrays and every slot clear (spawn, `bind_child_task`,
+exec) are gone; the status is typed, so the sign-before-flag decode at its two readers is gone
+too. `spawn_stale_group_state_test` (a boot test that poisoned the next spawn slot) has nothing
+left to poison and is replaced by host tests (`akuma_exec::process::signal::group_exit_tests`).
+Gates: amd64 suite 826/836/832 (the retired test's 5 checks; SMP=4's further 4 are the
+by-design spawn skip), AArch64 312/320/318; probes and ssh exit status equal to step 1 on
+amd64 and all-pass on AArch64. The 3 `DRAIN INCOMPLETE` lines after `lifeprobe`'s SIGKILL
+(a stale `THREADS` row in the dead process's slot) appear on the step-1 kernel too; step 3
+removes the table they come from.
+
+Steps 3-4 not started.
 
 ### What step 1 found
 

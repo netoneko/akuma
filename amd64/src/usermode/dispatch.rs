@@ -863,7 +863,7 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
             if !crate::thread::current_is_main()
                 && let Some(p) = akuma_exec::process::current_process_shared()
             {
-                crate::thread::exit_group_from_thread(current_proc_slot(), p.tgid, a1);
+                crate::thread::exit_group_from_thread(p.tgid, a1);
             }
             exit_current_group();
             a1
