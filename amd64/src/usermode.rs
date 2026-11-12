@@ -1751,16 +1751,28 @@ impl Image {
     }
 
     /// Give a loaded image its initial stack.
+    ///
+    /// `akuma_elf::attach_stack`, the AArch64 kernel's builder, at this target's
+    /// fixed top with `AT_HWCAP` 0. On a failure the loaded space drops inside
+    /// it, which frees every frame the load placed.
     fn with_stack(
-        (mut space, img): (UserAddressSpace, loader::LoadedImage),
+        (loaded, img): (akuma_elf::LoadedElf<UserAddressSpace>, loader::LoadedImage),
         argv: &[&[u8]],
         envp: &[&[u8]],
     ) -> Result<(Self, loader::LoadedImage), &'static str> {
-        // `space` drops here on a stack failure, which frees the frames the
-        // loader placed along with the page tables it built. That is exactly
-        // the `free_all_frames` + `space.free()` pair this arm used to run by
-        // hand, and it can no longer be forgotten on a new arm.
-        let stack = loader::build_stack(&mut space, ELF_STACK_TOP, ELF_STACK_PAGES, argv, envp, &img)?;
+        if argv.is_empty() || argv.len() > loader::MAX_ARGV || envp.len() > loader::MAX_ENVP {
+            return Err("argv must hold 1..=MAX_ARGV entries and envp at most MAX_ENVP");
+        }
+        let built = akuma_elf::attach_stack(
+            loaded,
+            argv,
+            envp,
+            Some(ELF_STACK_TOP as usize),
+            ELF_STACK_PAGES * 4096,
+            0,
+        )
+        .map_err(|e| loader::elf_err(&e))?;
+        let (space, stack) = (built.address_space, built.sp as u64);
 
         let entry = img.entry;
         let regions = alloc::vec![crate::mm::lazy_stack_region(ELF_STACK_TOP, ELF_STACK_PAGES, elf_stack_max_pages())];
@@ -3369,6 +3381,10 @@ fn exec_load_errno(e: &str) -> u64 {
     if e.contains("out of memory") {
         // The one string `elf_err` produces for `ElfError::OutOfMemory`.
         return errno::ENOMEM;
+    }
+    if e.contains("do not fit") {
+        // `akuma_elf::setup_linux_stack`: argv and envp exceed the eager stack.
+        return errno::E2BIG;
     }
     if e == "File read failed" || e == "Short read" {
         // `akuma-elf`'s path source: the file stopped reading part-way through

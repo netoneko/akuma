@@ -21,7 +21,7 @@ not ship its own libc. For the syscall ABI that makes this possible, see
 | `-errno` return on failure | `neg_errno(i32) -> u64` | `src/syscall/mod.rs` |
 | `TPIDR_EL0` = userspace TLS | saved/restored across context switch | scheduler context switch |
 | `TPIDRRO_EL0` = kernel-tracked TID | set per-thread by the kernel | — |
-| `__init_tls` runs before user code | auxv (`AT_PHDR`/`AT_RANDOM`/`AT_PAGESZ`/`AT_ENTRY`) + PT_INTERP mapping | `crates/akuma-exec/src/elf/mod.rs` |
+| `__init_tls` runs before user code | auxv (`AT_PHDR`/`AT_RANDOM`/`AT_PAGESZ`/`AT_ENTRY`) + PT_INTERP mapping | `crates/akuma-elf/src/stack.rs` (`attach_stack`) |
 | `getrandom` for stack canaries / ASLR | nr 278 | `src/syscall/proc.rs` |
 | `/dev/urandom` for crypto seed | `DevUrandom` fd | see `archive/ON_DEMAND_ELF_LOADER.md` |
 | `clock_gettime(CLOCK_REALTIME/MONOTONIC)` | nr 113, ns resolution | `crates/akuma-syscalls-time/src/lib.rs` |

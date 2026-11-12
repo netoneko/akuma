@@ -155,11 +155,19 @@ since any libc call touches the lower stack first.
 
 ### auxv
 
-Built in `crates/akuma-exec/src/elf/mod.rs` (`setup_linux_stack`). Entries:
+Built by `akuma_elf::attach_stack` (`crates/akuma-elf/src/stack.rs`) on both kernels. Entries:
 `AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_PAGESZ` (4096), `AT_ENTRY`,
-`AT_CLKTCK` (100), `AT_RANDOM` (16 random bytes), `AT_UID`/`AT_EUID`/
-`AT_GID`/`AT_EGID` (all 0 — single-user), `AT_HWCAP` (`AARCH64_HWCAP`),
-`AT_HWCAP2` (0), and `AT_BASE` when an interpreter was loaded.
+`AT_CLKTCK` (100), `AT_RANDOM` (16 bytes from the kernel RNG hook; a fixed
+`0xA5` pattern when there is none), `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`
+(all 0 — single-user), `AT_SECURE` (0), `AT_HWCAP` (`AARCH64_HWCAP` on
+AArch64, 0 on amd64), `AT_HWCAP2` (0) and `AT_BASE` (the interpreter's base,
+0 for a static image, as on Linux).
+
+The stack top is the caller's: AArch64 lets `compute_stack_top` place it above
+the image, amd64 passes `ELF_STACK_TOP` (the top of the lower half). An argv
+and envp that do not fit the eagerly mapped stack are refused with `E2BIG`
+before anything is written. Probe: `userspace/forktest/c_stress/auxvprobe.c`
+(passes on Linux); limits: `envmax.c`.
 
 ## execve
 

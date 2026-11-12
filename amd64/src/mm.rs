@@ -177,7 +177,7 @@ fn find_free_va_from(regions: &mut [MmapRegion], pages: usize, hint: usize) -> (
 }
 
 /// The demand-grown part of the main stack: `max_pages` below `top`, of which
-/// the top `eager_pages` are already mapped by `loader::build_stack`. An
+/// the top `eager_pages` are already mapped by `akuma_elf::attach_stack`. An
 /// anonymous RW region with no file, so `fault_in` zero-fills a page when the
 /// stack reaches it. Placed under the process's mmap window by
 /// `ProcessMemory`'s `mmap_limit` (`stack_bottom - 1 MiB`).

@@ -1,5 +1,8 @@
-//! Building the initial user stack: argv/envp/auxv per the Linux AArch64 ABI,
-//! and the `load_elf_with_stack*` entry points `ProcessImage` calls.
+//! Building the initial user stack: argv/envp/auxv in the Linux layout, which
+//! is the same on AArch64 and x86_64 (argc at SP, 16-byte aligned), and the
+//! `load_elf_with_stack*` entry points `ProcessImage` calls. Both kernels build
+//! their stacks here; [`attach_stack`] takes where the stack goes and the
+//! `AT_HWCAP` word, which are the two things that differ.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -81,8 +84,8 @@ impl<'a, A: UserPages> UserStack<'a, A> {
         Self { stack_bottom, stack_top, sp: stack_top, address_space }
     }
 
-    pub fn push_str(&mut self, s: &str) -> usize {
-        let bytes = s.as_bytes();
+    pub fn push_str(&mut self, s: impl AsRef<[u8]>) -> usize {
+        let bytes = s.as_ref();
         let len = bytes.len() + 1;
         self.sp -= len;
 
@@ -118,12 +121,12 @@ impl<'a, A: UserPages> UserStack<'a, A> {
     }
 }
 
-pub fn setup_linux_stack<A: UserPages>(
+pub fn setup_linux_stack<A: UserPages, S: AsRef<[u8]>>(
     stack: &mut UserStack<'_, A>,
-    args: &[String],
-    env: &[String],
+    args: &[S],
+    env: &[S],
     auxv: &[AuxEntry],
-) -> usize {
+) -> Result<usize, ElfError> {
     // Calculate total number of 8-byte words to be pushed
     // argc: 1
     // argv: args.len() + 1 (NULL)
@@ -131,12 +134,14 @@ pub fn setup_linux_stack<A: UserPages>(
     // auxv: 2 * (auxv.len() + 1) (each entry is 2 words, + NULL entry)
     let total_words = 1 + (args.len() + 1) + (env.len() + 1) + 2 * (auxv.len() + 1);
 
-    // Standard AArch64 Linux ABI requires SP to be 16-byte aligned.
-    // If total_words is ODD, we need one word of padding at the top (highest address)
-    // to ensure SP (at the lowest address) ends up 16-byte aligned.
-    stack.align_sp(16);
-    if total_words % 2 != 0 {
-        stack.push_u64(0); // Alignment padding
+    // Refuse before writing anything: the pushes below assert that each page
+    // is mapped, and an argv larger than the stack would reach below it. The
+    // strings, the two alignments (up to 15 bytes each), one padding word and
+    // the word block.
+    let strings = args.iter().chain(env).map(|a| a.as_ref().len() + 1).sum::<usize>();
+    let needed = strings + 2 * 16 + 8 + total_words * 8;
+    if needed > stack.sp - stack.stack_bottom {
+        return Err(ElfError::MappingFailed("argv and envp do not fit the initial stack"));
     }
 
     let mut envp_addrs = Vec::new();
@@ -151,7 +156,16 @@ pub fn setup_linux_stack<A: UserPages>(
     }
     argv_addrs.reverse();
 
+    // Both ABIs want SP 16-byte aligned at entry, and SP points at argc, the
+    // last of `total_words` words pushed below. So align here, after the
+    // strings, and pad one word when the count is odd. The padding used to be
+    // pushed before the strings, where this alignment discarded it: an odd
+    // count entered the program with SP 8 bytes off (`auxvprobe`'s first
+    // check, seen on amd64; AArch64's usual argv/envp counted even).
     stack.align_sp(16);
+    if total_words % 2 != 0 {
+        stack.push_u64(0);
+    }
 
     // Push Auxiliary Vector
     stack.push_u64(0); // AT_NULL a_type
@@ -176,7 +190,7 @@ pub fn setup_linux_stack<A: UserPages>(
     // Push argc
     stack.push_u64(args.len() as u64);
 
-    stack.sp
+    Ok(stack.sp)
 }
 
 /// Compute user stack top address dynamically based on binary layout.
@@ -228,7 +242,7 @@ pub fn load_elf_with_stack<A: UserPages>(
     stack_size: usize,
     interp_prefix: Option<&str>,
 ) -> Result<LoadedWithStack<A>, ElfError> {
-    attach_stack(load_elf(elf_data, interp_prefix)?, args, env, stack_size)
+    attach_stack(load_elf(elf_data, interp_prefix)?, args, env, None, stack_size, auxv::AARCH64_HWCAP)
 }
 
 pub fn load_elf_with_stack_from_path<A: UserPages>(
@@ -243,7 +257,9 @@ pub fn load_elf_with_stack_from_path<A: UserPages>(
         load_elf_from_path(path, file_size, interp_prefix)?,
         args,
         env,
+        None,
         stack_size,
+        auxv::AARCH64_HWCAP,
     )
 }
 
@@ -264,19 +280,29 @@ pub fn load_elf_with_stack_eager_from_path<A: UserPages>(
         crate::load::load_elf_eager_from_path(path, interp_prefix)?,
         args,
         env,
+        None,
         stack_size,
+        auxv::AARCH64_HWCAP,
     )
 }
 
-/// Give a loaded image its initial stack, auxv and heap pre-allocation.
-fn attach_stack<A: UserPages>(
+/// Give a loaded image its initial stack and auxv.
+///
+/// `stack_top` is where the stack ends, or `None` for [`compute_stack_top`]'s
+/// choice from the image's extent (AArch64). amd64 passes the top of the lower
+/// half, where Linux puts it, because its `mmap` window runs up to the stack
+/// and Go and Chromium hint addresses above 256 GiB. `stack_size` bytes below it
+/// are mapped now. `hwcap` is the `AT_HWCAP` word, which is per architecture.
+pub fn attach_stack<A: UserPages, S: AsRef<[u8]>>(
     mut loaded: LoadedElf<A>,
-    args: &[String],
-    env: &[String],
+    args: &[S],
+    env: &[S],
+    stack_top: Option<usize>,
     stack_size: usize,
+    hwcap: u64,
 ) -> Result<LoadedWithStack<A>, ElfError> {
     let has_interp = loaded.interp.is_some();
-    let stack_top = compute_stack_top(loaded.brk, has_interp);
+    let stack_top = stack_top.unwrap_or_else(|| compute_stack_top(loaded.brk, has_interp));
     let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
     let total_size = stack_size + PAGE_SIZE;
     let guard_page = (stack_top - total_size) & !(PAGE_SIZE - 1);
@@ -289,7 +315,14 @@ fn attach_stack<A: UserPages>(
     }
 
     let mut stack = UserStack::new(stack_bottom, stack_top, &mut loaded.address_space);
-    let random_ptr = stack.push_raw(&[0u8; 16]);
+    // `AT_RANDOM`: musl and glibc seed the stack protector and pointer guard
+    // from these bytes. A kernel with no RNG hook gives a fixed pattern rather
+    // than zeros, which `canary == 0` checks would read as "uninitialised".
+    let mut random = [0xA5u8; 16];
+    if akuma_primitives::rng::fill_bytes(&mut random) != Some(true) {
+        random = [0xA5; 16];
+    }
+    let random_ptr = stack.push_raw(&random);
 
     let actual_entry = if let Some(ref interp) = loaded.interp {
         interp.entry_point
@@ -309,13 +342,16 @@ fn attach_stack<A: UserPages>(
     auxv_vec.push(AuxEntry { a_type: auxv::AT_EUID, a_val: 0 });
     auxv_vec.push(AuxEntry { a_type: auxv::AT_GID, a_val: 0 });
     auxv_vec.push(AuxEntry { a_type: auxv::AT_EGID, a_val: 0 });
-    auxv_vec.push(AuxEntry { a_type: auxv::AT_HWCAP, a_val: auxv::AARCH64_HWCAP });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_SECURE, a_val: 0 });
+    auxv_vec.push(AuxEntry { a_type: auxv::AT_HWCAP, a_val: hwcap });
     auxv_vec.push(AuxEntry { a_type: auxv::AT_HWCAP2, a_val: 0 });
-    if let Some(ref interp) = loaded.interp {
-        auxv_vec.push(AuxEntry { a_type: auxv::AT_BASE, a_val: interp.base_addr as u64 });
-    }
+    // Linux passes `AT_BASE` always, 0 for a static image.
+    auxv_vec.push(AuxEntry {
+        a_type: auxv::AT_BASE,
+        a_val: loaded.interp.as_ref().map_or(0, |i| i.base_addr as u64),
+    });
 
-    let sp = setup_linux_stack(&mut stack, args, env, &auxv_vec);
+    let sp = setup_linux_stack(&mut stack, args, env, &auxv_vec)?;
 
     // The break starts on a page boundary with nothing mapped above it:
     // `Process::set_brk` maps the heap and refuses to grow over a mapped page.
@@ -346,4 +382,73 @@ fn attach_stack<A: UserPages>(
         mmap_floor,
         deferred_segments: loaded.deferred_segments,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    //! `setup_linux_stack` against a page map, so the layout rules are checked
+    //! without a kernel: SP alignment at every parity, the refusal of an argv
+    //! that does not fit, and argc where SP points.
+    use super::*;
+    use alloc::collections::BTreeMap;
+    use alloc::vec;
+
+    struct Pages(BTreeMap<usize, Vec<u8>>);
+
+    impl UserPages for Pages {
+        fn new_space() -> Option<Self> {
+            Some(Self(BTreeMap::new()))
+        }
+        fn alloc_and_map(&mut self, va: usize, _prot: SegProt) -> Result<usize, &'static str> {
+            self.0.insert(va, vec![0; PAGE_SIZE]);
+            Ok(va)
+        }
+        fn write_page_bytes(&mut self, page_va: usize, offset: usize, bytes: &[u8]) -> bool {
+            let Some(p) = self.0.get_mut(&page_va) else { return false };
+            p[offset..offset + bytes.len()].copy_from_slice(bytes);
+            true
+        }
+    }
+
+    const TOP: usize = 0x10_0000;
+
+    fn build(pages: usize, args: &[&[u8]], env: &[&[u8]], aux: usize) -> (Pages, Result<usize, ElfError>) {
+        let mut space = Pages(BTreeMap::new());
+        let bottom = TOP - pages * PAGE_SIZE;
+        for i in 0..pages {
+            space.alloc_and_map(bottom + i * PAGE_SIZE, SegProt::Data).unwrap();
+        }
+        let auxv: Vec<AuxEntry> = (0..aux).map(|i| AuxEntry { a_type: 100 + i as u64, a_val: 1 }).collect();
+        let mut stack = UserStack::new(bottom, TOP, &mut space);
+        // An odd start, as after `AT_RANDOM`'s 16 bytes and a string or two.
+        stack.push_raw(&[0u8; 9]);
+        let r = setup_linux_stack(&mut stack, args, env, &auxv);
+        (space, r)
+    }
+
+    fn word(space: &Pages, va: usize) -> u64 {
+        let page = va & !(PAGE_SIZE - 1);
+        let off = va - page;
+        u64::from_ne_bytes(space.0[&page][off..off + 8].try_into().unwrap())
+    }
+
+    #[test]
+    fn sp_is_16_aligned_for_odd_and_even_word_counts() {
+        // total_words = 1 + (a+1) + (e+1) + 2*(aux+1): parity follows a + e.
+        for (a, e) in [(1usize, 0usize), (1, 1), (2, 1), (3, 4), (5, 7)] {
+            let args: Vec<&[u8]> = (0..a).map(|_| b"arg".as_slice()).collect();
+            let env: Vec<&[u8]> = (0..e).map(|_| b"K=V".as_slice()).collect();
+            let (space, sp) = build(2, &args, &env, 5);
+            let sp = sp.unwrap();
+            assert_eq!(sp % 16, 0, "argc {a}, envc {e}");
+            assert_eq!(word(&space, sp), a as u64, "argc is where SP points");
+        }
+    }
+
+    #[test]
+    fn an_argv_larger_than_the_stack_is_refused_not_written() {
+        let big = vec![b'x'; 2 * PAGE_SIZE];
+        let (_, r) = build(1, &[big.as_slice()], &[], 5);
+        assert!(matches!(r, Err(ElfError::MappingFailed(m)) if m.contains("do not fit")));
+    }
 }

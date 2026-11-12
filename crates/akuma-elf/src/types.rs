@@ -48,6 +48,7 @@ pub mod auxv {
     pub const AT_EUID: u64 = 12;
     pub const AT_GID: u64 = 13;
     pub const AT_EGID: u64 = 14;
+    pub const AT_SECURE: u64 = 23;
     pub const AT_RANDOM: u64 = 25;
     pub const AT_HWCAP: u64 = 16;
     pub const AT_CLKTCK: u64 = 17;

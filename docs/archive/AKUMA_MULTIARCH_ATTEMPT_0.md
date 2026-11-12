@@ -2369,6 +2369,51 @@ writes and truncates, `stat` matches `newfstatat`, `lstat` sees a link, `open`, 
 `mkdir`, `rm -r`) is clean. Taoxichuan is checked by clippy only: its arms for these numbers were
 the same rewrites, now applied by the fold it already ran; `getpgrp` is new there.
 
+### One initial-stack builder (2026-11-12)
+
+The first piece of converging `execve`. amd64's exec already loaded through `akuma_elf::load_elf` and
+installed through `Process::install_image`. Only the initial stack (argv, envp, auxv) was its own:
+`loader::build_stack`, about 250 lines beside `akuma_elf::attach_stack`. Its doc said it stayed for
+the stack's placement: AArch64's `compute_stack_top` puts the stack at most 256 GiB up, inside amd64's
+mmap window. That is a parameter, not a second builder, so `attach_stack` is now `pub` and takes the
+stack top (`None` = computed, as AArch64 does; amd64 passes `ELF_STACK_TOP`) and the `AT_HWCAP` word.
+`build_stack`, `write_user`, `map_range`, `widen`, the auxv constants and four `LoadedImage` fields
+are deleted.
+
+Merging the two builders found three defects, two of them on AArch64:
+
+1. **AArch64's `AT_RANDOM` was sixteen zero bytes.** `attach_stack` pushed `[0u8; 16]`, and the AArch64
+   kernel never registered the shared RNG hook (`akuma_primitives::rng::set_rng_hook`), so nothing
+   could have filled it. musl and glibc seed the stack protector and the pointer guard from these
+   bytes. `attach_stack` now fills them from the hook, and the AArch64 kernel registers its virtio-rng
+   as the hook once `rng::init` succeeds. amd64 always filled them.
+2. **The initial SP was 8 bytes off when the stack's word count was odd.** `setup_linux_stack` pushed its
+   parity padding before the strings and then re-aligned after them, which discarded it. The count is
+   `argc + envc` plus a constant, so whether a program entered misaligned depended on its
+   environment. Seen on amd64 (`auxvprobe`, first check); AArch64 had the same code and its usual
+   counts happened to be even. The padding now follows the final alignment.
+3. **An argv/envp larger than the eager stack panicked the kernel** (`write_at`'s `assert!`).
+   `setup_linux_stack` now measures first and returns an error, which `execve` reports as `E2BIG` on
+   both kernels. amd64's builder refused it.
+
+The auxv is the union: amd64 gains `AT_HWCAP2`; AArch64 gains `AT_SECURE` and an `AT_BASE` of 0 for
+a static image, which Linux always passes.
+
+Probe: `userspace/forktest/c_stress/auxvprobe.c` (all seven checks pass on Linux 7.0, Lima `fc`):
+SP alignment, `AT_RANDOM` non-zero and different per exec, `AT_BASE`, `AT_PAGESZ`, `AT_SECURE`,
+`AT_PHDR`/`AT_PHNUM`/`AT_ENTRY`. Host tests in `akuma-elf`'s `stack.rs` pin the alignment at both
+parities and the refusal. `envmax.c` gives the same limits as before on both kernels (amd64 keeps its
+`MAX_ARGV`/`MAX_ENVP` and copy-in byte budget).
+
+Gates: clippy (AArch64, amd64 `headless` and `headless,no-tests`, the amd64 tests crate, Taoxichuan);
+host tests (`akuma-elf`, `akuma-exec`); boot suites unchanged, AArch64 HVF 312/320/318 and amd64 TCG
+823/833/833 at SMP 1/2/4; `auxvprobe` all seven on both kernels at odd and even environment sizes;
+`envmax` limits as before on both; AArch64 devbox self-host `-j4` EXIT=0 in 1m03s with no tripwire
+lines. Not run: an amd64 self-host.
+
+Open: AArch64 has no `MAX_ARG_STRLEN` cap on an envp string (`envmax`'s `envstr`; argv strings are
+capped), unchanged by this step.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

@@ -1004,6 +1004,9 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     match rng::init() {
         Ok(()) => {
             console::print("[RNG] Hardware RNG initialized\n");
+            // The shared hook: `AT_RANDOM` on every exec
+            // (`akuma_elf::attach_stack`) and `getrandom`. Unset, both fall back.
+            akuma_primitives::rng::set_rng_hook(|buf| rng::fill_bytes(buf).is_ok());
         }
         Err(_e) => {
             console::print("[RNG] Hardware RNG not available\n");

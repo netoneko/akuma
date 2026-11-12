@@ -1053,7 +1053,13 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
         // fork+exec child that means its O_CLOEXEC error-report pipe would
         // already be gone, so it could neither report the exec failure to the
         // parent nor leave the parent's handshake pipe in a coherent state.
-        return if e.contains("Failed to load ELF") { ENOEXEC } else { ENOMEM };
+        return if e.contains("do not fit") {
+            E2BIG
+        } else if e.contains("Failed to load ELF") {
+            ENOEXEC
+        } else {
+            ENOMEM
+        };
     }
     // `/proc/<pid>/exe` follows the new image (`ProcessImage::exe`). This
     // kernel never refreshed it, so an exec'd process kept reporting whatever
