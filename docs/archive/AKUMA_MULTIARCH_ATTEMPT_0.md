@@ -2627,6 +2627,28 @@ ssh session identical to Linux, `fdrefuse` and the shell smoke unchanged; clippy
 `headless` and `headless,no-tests`, the amd64 tests crate, Taoxichuan (which runs glue-amd64),
 host glue-amd64. The AArch64 kernel is untouched by this step.
 
+### One waitpid (2026-11-12)
+
+303 is one implementation: glue's `sys_waitpid`, which is `wait4(pid, status, WNOHANG)` with
+pid 0 and `u32::MAX` meaning any child, and tgid 0 as the waiter for a kernel task. Every reap in
+glue now goes through one helper, `reap_exited`: `wait4` carried the same twelve lines four
+times. amd64's 303 is glue's followed by `after_reap` (the `SPAWN` row sweep plus a reclaim
+drain), which its `wait4` and `waitid` arms now share.
+
+**The "done" signal is the child channel's.** amd64's own 303 read `Process::exited`; glue's
+reads the channel. On both kernels the channel is marked after the child's `close_all` (amd64:
+`publish_child_exit` inside `spawn_record_exit`), so a reap cannot run while the child is still
+inside its exit path. amd64's `is_child_of`, which existed for `spawn_ext` children
+(`parent_pid` 0, spawner set), is gone: `spawn_ext` registers the spawner as the channel's parent,
+which `is_child_of_group` already reads.
+
+Changes a caller can see on amd64: a bad `status` pointer is `EFAULT` and leaves the child
+reapable, where it used to lose the status and reap (Linux's answer is glue's).
+
+Gates: amd64 TCG suite 829/839/839, 0 failed; ring-3 harness OK; AArch64 HVF 312/320/318; on
+both kernels at SMP=2, 10 ssh sessions each returned their own exit status, and a shell saw
+`exit 1..5`, a `SIGTERM` death as 143 and a background `wait` as 7.
+
 ### Slice 5: mm (deferred, 2026-11-11)
 
 Not per call. amd64 keeps every mapping, lazy ones included, in `Process::mmap_regions` with a neutral

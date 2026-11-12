@@ -291,12 +291,17 @@ Akuma's own `waitpid` (303) is **non-blocking** (sshd's bridge and herd poll
 it) and answers only the caller's own children: `ECHILD` unless
 `is_child_of_group(pid, caller tgid)`, the check `wait4`/`waitid` use. A
 caller with no process is tgid 0, the spawner `spawn_request` records for a
-kernel-started child. amd64 still answers 303 with its own `sys_waitpid`
-(parent filter, `-1`/`0` = any child, `SPAWN`-row reap).
+kernel-started child. It is `wait4(pid, status, WNOHANG)`, with `0` and
+`-1` meaning any child, on both kernels; amd64 adds only `after_reap` (its
+`SPAWN`-row sweep and a reclaim drain), as it does after `wait4`/`waitid`.
 
-`wait4`/`waitid`/`waitpid` **reap** the zombie: `clear_lazy_regions(pid) +
-unregister_process(pid)` (the only paths that remove a zombie from the
-table). Linux wait-status encoding (`encode_wait_status`): normal exit
+`wait4`/`waitid`/`waitpid` **reap** the zombie through one helper,
+`reap_exited`: status first (a failed copy is `EFAULT` and leaves the child
+reapable), then `clear_lazy_regions(pid) + unregister_process(pid) +
+reap_child_channel(pid)` (the only paths that remove a zombie from the
+table). "Exited" is the child channel's `has_exited()`, which both kernels
+set after the child's descriptors are closed
+([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md), "One waitpid"). Linux wait-status encoding (`encode_wait_status`): normal exit
 `(code & 0xFF) << 8`; signal death `(-code) & 0x7F`.
 
 ## kill / tkill

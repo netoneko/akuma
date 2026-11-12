@@ -1058,6 +1058,33 @@ fn report_child_rusage(rusage_ptr: u64, cpu_time_us: u64) {
     }
 }
 
+/// Collect an exited child: its wait status to `status_ptr`, its rusage, and the
+/// reap (lazy regions, registration, child channel). Every reaping path in this
+/// file ends here: `wait4`'s four and `waitpid` (303).
+///
+/// **Report before reaping, and refuse to reap if the report failed.** The zombie
+/// is the only remaining copy of the exit status: reaping after a failed copy
+/// destroys it and hands the caller a pid as though it had been reported. Linux
+/// returns `EFAULT` here and leaves the child reapable, and so does this.
+///
+/// The CPU time is the child channel's, recorded when the exit was published:
+/// the thread slot it ran on may be recycled by now.
+fn reap_exited(pid: u32, ch: &akuma_exec::process::ProcessChannel, status_ptr: u64, rusage_ptr: u64) -> u64 {
+    let code = ch.exit_code();
+    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
+        let st = encode_wait_status(code);
+        akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", pid, code, st);
+    }
+    if status_ptr != 0 && write_user_val(status_ptr, &encode_wait_status(code)).is_err() {
+        return EFAULT;
+    }
+    report_child_rusage(rusage_ptr, ch.cpu_time_us());
+    akuma_exec::process::clear_lazy_regions(pid);
+    let _ = akuma_exec::process::unregister_process(pid);
+    akuma_exec::process::reap_child_channel(pid);
+    u64::from(pid)
+}
+
 pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
@@ -1091,31 +1118,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         if let Some(ch) = akuma_exec::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
-                    let code = ch.exit_code();
-                    if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                        let st = encode_wait_status(code);
-                        akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", p, code, st);
-                    }
-                    if status_ptr != 0 {
-                        let status = encode_wait_status(code);
-                        // Report BEFORE reaping, and refuse to reap if the report failed.
-                        // The zombie is the only remaining copy of this exit status: reaping
-                        // after a failed copy_to_user destroys it permanently and hands the
-                        // caller a pid as though it had been reported, with nothing left to
-                        // wait on. Linux returns EFAULT here and leaves the child reapable.
-                        if write_user_val(status_ptr, &status).is_err() {
-                            return EFAULT;
-                        }
-                    }
-                    // Reap the zombie: remove from process table + child channels.
-                    // On Linux, waitpid is the only way to reap a zombie.
-                    // The child's CPU time, recorded when its exit was published: the
-                    // thread slot it came from may be recycled by now.
-                    report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                    akuma_exec::process::clear_lazy_regions(p);
-                    let _ = akuma_exec::process::unregister_process(p);
-                    akuma_exec::process::reap_child_channel(p);
-                    return u64::from(p);
+                    return reap_exited(p, &ch, status_ptr, rusage_ptr);
                 }
 
                 if wnohang {
@@ -1125,25 +1128,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 ch.add_poller(waiter_tid);
                 // Double-check after registering to avoid missed wakeup race.
                 if ch.has_exited() {
-                    let code = ch.exit_code();
-                    if status_ptr != 0 {
-                        let status = encode_wait_status(code);
-                        // Report BEFORE reaping, and refuse to reap if the report failed.
-                        // The zombie is the only remaining copy of this exit status: reaping
-                        // after a failed copy_to_user destroys it permanently and hands the
-                        // caller a pid as though it had been reported, with nothing left to
-                        // wait on. Linux returns EFAULT here and leaves the child reapable.
-                        if write_user_val(status_ptr, &status).is_err() {
-                            return EFAULT;
-                        }
-                    }
-                    // The child's CPU time, recorded when its exit was published: the
-                    // thread slot it came from may be recycled by now.
-                    report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                    akuma_exec::process::clear_lazy_regions(p);
-                    let _ = akuma_exec::process::unregister_process(p);
-                    akuma_exec::process::reap_child_channel(p);
-                    return u64::from(p);
+                    return reap_exited(p, &ch, status_ptr, rusage_ptr);
                 }
                 // Tested *before* blocking so that on wake the loop re-runs
                 // has_exited() first: a reapable child outranks EINTR. SIGCHLD
@@ -1165,30 +1150,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
 
         loop {
             if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
-                let code = ch.exit_code();
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    let st = encode_wait_status(code);
-                    akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
-                }
-                if status_ptr != 0 {
-                    let status = encode_wait_status(code);
-                    // Report BEFORE reaping, and refuse to reap if the report failed.
-                    // The zombie is the only remaining copy of this exit status: reaping
-                    // after a failed copy_to_user destroys it permanently and hands the
-                    // caller a pid as though it had been reported, with nothing left to
-                    // wait on. Linux returns EFAULT here and leaves the child reapable.
-                    if write_user_val(status_ptr, &status).is_err() {
-                        return EFAULT;
-                    }
-                }
-                // Reap the zombie
-                // The child's CPU time, recorded when its exit was published: the
-                // thread slot it came from may be recycled by now.
-                report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                akuma_exec::process::clear_lazy_regions(child_pid);
-                let _ = akuma_exec::process::unregister_process(child_pid);
-                akuma_exec::process::reap_child_channel(child_pid);
-                return u64::from(child_pid);
+                return reap_exited(child_pid, &ch, status_ptr, rusage_ptr);
             }
 
             if wnohang {
@@ -1198,30 +1160,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             akuma_exec::process::add_poller_to_all_children(waiter_tgid, waiter_tid);
             // Double-check after registering to avoid missed-wakeup race.
             if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
-                let code = ch.exit_code();
-                if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
-                    let st = encode_wait_status(code);
-                    akuma_primitives::safe_print!(128, "[syscall] wait4: PID {} exit_code={} wait_status=0x{:08x}\n", child_pid, code, st);
-                }
-                if status_ptr != 0 {
-                    let status = encode_wait_status(code);
-                    // Report BEFORE reaping, and refuse to reap if the report failed.
-                    // The zombie is the only remaining copy of this exit status: reaping
-                    // after a failed copy_to_user destroys it permanently and hands the
-                    // caller a pid as though it had been reported, with nothing left to
-                    // wait on. Linux returns EFAULT here and leaves the child reapable.
-                    if write_user_val(status_ptr, &status).is_err() {
-                        return EFAULT;
-                    }
-                }
-                // Reap the zombie
-                // The child's CPU time, recorded when its exit was published: the
-                // thread slot it came from may be recycled by now.
-                report_child_rusage(rusage_ptr, ch.cpu_time_us());
-                akuma_exec::process::clear_lazy_regions(child_pid);
-                let _ = akuma_exec::process::unregister_process(child_pid);
-                akuma_exec::process::reap_child_channel(child_pid);
-                return u64::from(child_pid);
+                return reap_exited(child_pid, &ch, status_ptr, rusage_ptr);
             }
             // Before blocking, so a child that became reapable while we slept is
             // returned ahead of EINTR (see the pid>0 arm).
@@ -1961,36 +1900,39 @@ pub fn sys_close_child_stdin(pid: u32) -> u64 {
     }
 }
 
+/// Akuma's `waitpid` (303): `wait4(pid, status, WNOHANG)` for both kernels.
+///
+/// `pid` 0 and `u32::MAX` are any child. The answer is the reaped pid, `0` for a
+/// child that has not exited, or `ECHILD`. libakuma's `waitpid_status` (sshd,
+/// herd) polls it. The reap is `wait4`'s ([`reap_exited`]), and the "done"
+/// signal is the child channel's, which is published after the child's
+/// descriptors are closed, so a reap never runs while the child is still inside
+/// its exit path (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "One waitpid").
 #[cfg(feature = "akuma-native")]
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
     // **Only the parent's thread group may reap**, the rule `wait4` and
-    // `waitid` already enforce through the same check. Without it any process
-    // could take another's child's status and unregister it. A caller with no
-    // process (a kernel thread) is tgid 0, which is what `spawn_request`
-    // records as the spawner of a child it starts. `ECHILD` reads as
-    // "not running" to libakuma's `waitpid_status`, as the old `0` did.
+    // `waitid` enforce through the same lookups. A caller with no process (a
+    // kernel thread) is tgid 0, which is what `spawn_request` records as the
+    // spawner of a child it starts; `wait4` has no such caller.
     let waiter_tgid = akuma_exec::process::current_process_shared().map_or(0, |p| p.tgid);
+
+    // `0` and `-1` (`u32::MAX`) are any child, as `wait4(-1)`.
+    if pid == 0 || pid == u32::MAX {
+        if !akuma_exec::process::has_children(waiter_tgid) {
+            return ECHILD;
+        }
+        return akuma_exec::process::find_exited_child(waiter_tgid)
+            .map_or(0, |(child, ch)| reap_exited(child, &ch, status_ptr, 0));
+    }
     if !akuma_exec::process::is_child_of_group(pid, waiter_tgid) {
         return ECHILD;
     }
-
-    if let Some(ch) = akuma_exec::process::get_child_channel(pid)
-        && ch.has_exited() {
-            if status_ptr != 0 {
-                let status = encode_wait_status(ch.exit_code());
-                if write_user_val(status_ptr, &status).is_err() {
-                    return EFAULT;
-                }
-            }
-            // Reap the zombie
-            akuma_exec::process::clear_lazy_regions(pid);
-            let _ = akuma_exec::process::unregister_process(pid);
-            akuma_exec::process::reap_child_channel(pid);
-            return u64::from(pid);
-        }
-    0
+    match akuma_exec::process::get_child_channel(pid) {
+        Some(ch) if ch.has_exited() => reap_exited(pid, &ch, status_ptr, 0),
+        _ => 0,
+    }
 }
 
 /// prctl - process control

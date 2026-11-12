@@ -4054,142 +4054,36 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
     akuma_syscalls_glue::proc::sys_close_child_stdin(pid as u32)
 }
 
-/// Is `p` a child of `me` for `waitpid`'s purposes?
-///
-/// `parent_pid` is the link every process this target builds itself carries. A
-/// process created by `spawn_ext` — `box run`/`open`/`use`, herd's services —
-/// is built by `akuma-exec`, which records the caller as `spawner_pid` and
-/// leaves `parent_pid` at 0 (AArch64 waits through child channels and never
-/// reads it). Matching on `parent_pid` alone made every such child invisible to
-/// its spawner's `waitpid`: `ECHILD` forever, and `box use -i` / `box run`
-/// polling a finished container until the session was killed.
-fn is_child_of(p: &akuma_exec::process::Process, me: u32) -> bool {
-    p.parent_pid == me || (p.parent_pid == 0 && p.spawner_pid == Some(me))
-}
-
-/// `waitpid(pid, status_ptr, options)` — Akuma's syscall 303.
+/// `waitpid(pid, status_ptr, options)` — Akuma's syscall 303: glue's, which is
+/// `wait4(pid, status, WNOHANG)` for both kernels, then [`after_reap`].
 ///
 /// Non-blocking regardless of `options`: `sshd`'s bridge polls it every tick and
-/// must keep draining the child's stdout while it waits. Returns `pid` and
-/// writes the wait status (`encode_wait_status`: `code << 8`, or `WTERMSIG` for
-/// a signal death) once the child has exited, `0`
-/// while it is still running, `-ESRCH` for an unknown pid.
+/// must keep draining the child's stdout while it waits. This kernel kept its
+/// own until 2026-11-12, deciding "exited" from `Process::exited` (set before
+/// the child's descriptors were closed in glue's exit path) where glue's decides
+/// from the child channel (set after); one copy needed one signal, and it is the
+/// channel's (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "One waitpid").
 pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
-    use crate::fd::errno;
-    use core::sync::atomic::Ordering;
-    let want = pid as u32;
-    // `wait4(-1)` / `waitpid(0)` — any child. `-1` arrives as `u32::MAX`.
-    let any = want == u32::MAX || want == 0;
-    // **Whose** children. Answered by `akuma-exec`'s process table since 5b
-    // slice 2; it was the global spawn table, which has a row for every live
-    // process rather than for the caller's descendants — so a scan without a
-    // parent filter answered "are there any processes?" instead of "do I have
-    // any children?".
-    //
-    // That was a hang, and a bad one: a subshell (`( ls; true )`) forks `ls`,
-    // reaps it, and asks once more. Its own row was still there, so the scan
-    // said "a child exists, none has exited" — the process saw *itself* as its
-    // unexited child and the `Wait4` arm parked it forever
-    // (`docs/archive/AKUMA_AMD64_WAIT4_OWNERSHIP.md`). Moving the question onto
-    // the registered process keeps the filter and drops the second copy of the
-    // parent link: `parent_pid` is now the only place it is written.
-    let me = current_pid();
+    let r = akuma_syscalls_glue::proc::sys_waitpid(pid as u32, status_ptr);
+    after_reap();
+    r
+}
 
-    // Does any matching child exist at all? (For the `-ECHILD` vs `0` decision.)
-    let exists = akuma_exec::process::find_process(|p| {
-        (is_child_of(p, me) && (any || p.pid == want)).then_some(())
-    })
-    .is_some();
-    if !exists {
-        // ECHILD, not ESRCH: POSIX gives "you have no such child" its own errno
-        // and a shell tests for exactly it to stop reaping. ESRCH here happened
-        // to end ash's loop too, but anything that checks — `wait`, `system()`,
-        // make's jobserver — reads a wrong answer from it.
-        return errno::ECHILD;
-    }
-
-    // A matching child that has exited — reap the first one found. `exited` is
-    // published by `spawn_record_exit` before it wakes the waiters, so a parent
-    // that gets here after a wake finds it set.
-    let Some((child_pid, code)) = akuma_exec::process::find_process(|p| {
-        (is_child_of(p, me) && (any || p.pid == want) && p.exited.load(Ordering::Acquire))
-            .then(|| (p.pid, p.exit_code.load(Ordering::Acquire)))
-    }) else {
-        return 0; // matching child(ren) exist, none has exited yet
-    };
-
-    // The spawn row is now consulted for the task slot the identity map is
-    // keyed by, and for the one pipe end no descriptor names. Everything else
-    // about the child is read above — since C2 slice 6 its stdout pipe is a
-    // refcounted descriptor whose ends died with the child's own `close_all`
-    // at exit, so the reap's old "spare the stdout pipe for
-    // `sshd`'s final drain, and mind `borrowed_io`" bookkeeping is exactly what
-    // the refcounts already do.
-    let Some(slot_off) = spawn_row_of(child_pid) else {
-        // A child known to the process table with no spawn row is not a
-        // condition this target has: every registration is paired with a row.
-        // Report the reap rather than wedging the parent — losing a pipe leaks
-        // a buffer; refusing here would hang a shell.
-        reap_exec_process(child_pid, usize::MAX);
-        return u64::from(child_pid);
-    };
-    // `slot_off` came from a live row and nothing yields between.
-    let exec_slot = SPAWN.get(slot_off).unwrap().exec_slot;
-
-    // **Nothing to release here any more.** This used to drop the spawn's own
-    // writer reference on the child's stdin pipe — the one no descriptor named,
-    // so nothing else would, and a reap that skipped it leaked a pipe per spawn
-    // against a 64-pipe ceiling. A spawned child's stdio is a `ProcessChannel`
-    // now; the last `Arc` out drops it, and a reap has no bookkeeping to do.
-
-    if status_ptr != 0 {
-        // Glue's encoder, the one `wait4` uses: a negative code is a signal
-        // death (`-(sig)`) and must read back as `WIFSIGNALED`. This used to be
-        // `(code & 0xff) << 8` for everything, which reported a `SIGTERM` death
-        // as a clean `exit(241)` — to `sshd` (which then sent `exit-status 241`
-        // rather than `exit-signal TERM`) and to herd, whose `signaled()` never
-        // fired. That is what hid the stale `GROUP_EXIT_STATUS` kill
-        // (`spawn_process_task`) behind a meaningless-looking exit code.
-        let raw = akuma_syscalls_glue::proc::encode_wait_status(code).cast_signed();
-        // A bad `status` pointer loses the status, not the reap: the child is
-        // already gone and `wait4` reporting its pid is the useful half.
-        let _ = crate::uaccess::write_val::<i32>(status_ptr, raw);
-    }
-
-    // The child task is Finished — it called `sched::finish()` in `run_process`
-    // after recording its exit.
-    SPAWN.clear(slot_off);
-    // 5b slice 1: the child is gone from this target's tables, so it goes from
-    // akuma-exec's too. 5b slice 4 gave that line a second job: the registered
-    // `Process` **owns** the address space now, so retiring it is also what
-    // frees the child's frames and page tables — the `drop(p)` that used to
-    // happen here, out of `PROCS`, deferred by one reclaim sweep. This target
-    // configures `process_reclaim_cooldown_us: 0`, so the next drain site to
-    // run collects it; `run_process`'s own terminal drain, the idle loop and
-    // the PMM pressure ladder are all of them.
-    //
-    // The `THREAD_PID_MAP` entry is removed only while the recorded task slot
-    // still names this pid (`reap_exec_process`).
-    reap_exec_process(child_pid, exec_slot);
-    // **The reap is a drain site on this target**, added by 5b slice 4 because
-    // that slice is what gave the registered process something worth freeing.
-    //
-    // `process::reclaim`'s vetted list has three entries here — the exit path's
-    // terminal drain, the idle loop, and the PMM pressure ladder — and none of
-    // them covers the moment a *parent* collects a child: the child's own
-    // terminal drain ran before this retire, the idle loop does not run while a
-    // busy shell reaps, and parking one image is not pressure. The boot suite
-    // is the extreme case that shows it, and did: at `SMP=1` thread 0 is the
-    // test rather than idling, so `spawn`/`busybox`/`fork`'s "teardown leaks
-    // nothing" checks each reported a whole image outstanding.
-    //
-    // The lock context is the one the module docs require: inside a syscall,
-    // holding the BKL and nothing else — no PMM lock, no VFS lock, no address
-    // space. The reaping thread is alive rather than terminated, so the sweep
-    // is not even the pinned variant. It is the same work `drop(p)` did here
-    // before the address space moved onto the registered process.
+/// What this kernel does after any reap (`waitpid`, `wait4`, `waitid`): free the
+/// `SPAWN` rows whose process is gone ([`sweep_reaped_spawn_rows`]), and drain
+/// the retired processes.
+///
+/// **The reap is a drain site on this target.** `process::reclaim`'s vetted
+/// sites here are the exit path's terminal drain, the idle loop and the PMM
+/// pressure ladder, and none covers a *parent* collecting a child: the child's
+/// own drain ran before the retire, the idle loop does not run while a busy
+/// shell reaps, and parking one image is not pressure. The boot suite shows it:
+/// at `SMP=1` thread 0 is the test rather than idling, so the "teardown leaks
+/// nothing" checks each saw a whole image outstanding. The lock context is the
+/// one the module requires: inside a syscall, holding the BKL and nothing else.
+pub fn after_reap() {
+    sweep_reaped_spawn_rows();
     akuma_exec::process::reclaim::drain_retired_if_requested();
-    u64::from(child_pid)
 }
 
 /// The spawn-row index for `pid`, or `None`.

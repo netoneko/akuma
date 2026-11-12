@@ -1033,7 +1033,7 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // why a sweep and not a hook.
         Syscall::Wait4 => {
             let r = to_glue(Syscall::Wait4, [a1, a2, a3, a4, 0, 0]);
-            sweep_reaped_spawn_rows();
+            after_reap();
             r
         }
         // Credentials — **served by glue** (C1 step 3, second batch).
@@ -1137,7 +1137,7 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // (unless `WNOWAIT`), so the `SPAWN` row sweep follows.
         Syscall::Waitid => {
             let r = to_glue(Syscall::Waitid, [a1, a2, a3, a4, a5, 0]);
-            sweep_reaped_spawn_rows();
+            after_reap();
             r
         }
         _ => return None,
