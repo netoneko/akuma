@@ -214,7 +214,9 @@ record on the region (amd64, `shmpages`) — until step 6 of
 `proposals/AKUMA_MM_CONVERGENCE.md` makes the table both kernels'
 ([`AKUMA_ONE_MMAP.md`](../../../archive/AKUMA_ONE_MMAP.md)).
 
-**`mremap`** (`sys_mremap`, `mem.rs:400`):
+**`mremap`** (`sys_mremap`, glue `mem.rs`; **both kernels** since 2026-11-12):
+- `MREMAP_FIXED` → `EINVAL`. The placer chooses the address, and returning a different one than
+  the caller named is a confident wrong answer, so the flag is refused rather than ignored.
 - `new_size == 0` → `EINVAL`; `old_addr` misaligned → `EINVAL`.
 - `old_addr >= user_va_limit()` → `EFAULT`.
 - Shrink (`new_pages <= old_pages`) → returns `old_addr` unchanged, a no-op
@@ -224,7 +226,14 @@ record on the region (amd64, `shmpages`) — until step 6 of
   at all. This `ENOMEM`-vs-`EFAULT` split is deliberate and Linux-shaped —
   see Background: JSC's GC used to get `ENOMEM` for every unmapped probe
   address and couldn't distinguish "not my mapping" from "can't grow here".
-- `MREMAP_MAYMOVE`, new region alloc fails → `ENOMEM`.
+- `MREMAP_MAYMOVE`, no process → `ESRCH`; no room → `ENOMEM`.
+- **A move re-points pages; it never copies them.** The new region is demand-paged and carries the
+  old one's recorded protection (or its absence), `file`, `shared_write` and `shared_anon` records,
+  advanced to `old_addr`'s place. `UserAddressSpace::move_present` moves each present leaf with its
+  bits (a CoW page stays CoW, a device page keeps its cache type); a page never touched stays
+  absent and faults in from the same source. Then `unmap_range` retires the source. No frame is
+  allocated, and no copy loop exists that could stop early and look finished
+  ([`AKUMA_ONE_MREMAP_MADVISE.md`](../../../archive/AKUMA_ONE_MREMAP_MADVISE.md)).
 
 **`brk`** (`sys_brk`): no error path modeled. `new_brk == 0` is a size query
 (returns the current brk). If the owner process can't be looked up, returns
@@ -283,8 +292,19 @@ self-check it cannot pass without `/proc/<pid>/smaps`
 
 ### `MADV_DONTNEED` — breaks sharing, does not drop the mapping
 
-`madvise_dontneed_range` (`mem.rs:938`). Per page, the rule is
-`dontneed_page_action(mapped, cow_ref)`:
+`madvise_dontneed_range` (glue `mem.rs`; **both kernels** since 2026-11-12). What it touches:
+
+- **Only pages inside a recorded region, or the `brk` heap.** The ELF image is mapped by the loader
+  and is in no region; zeroing its text or data destroys the program with no way to re-read it.
+  Regions are walked a fixed batch at a time, so the walk allocates nothing.
+- **Never a device page.** A frame outside the PMM's RAM (`akuma_pmm::contains`, e.g. `/dev/fb0`)
+  reads as absent to both passes.
+- **A lazy file-backed page is dropped**, and the next touch re-reads the file.
+- **A page of amd64's shared writable table** is written back and dropped through the
+  `release_shared_write` hook, never zeroed (that would zero it for every mapper).
+- No process → `ESRCH` (`len == 0` is `0` first).
+
+Per anonymous page, the rule is `dontneed_page_action(mapped, cow_ref)`:
 
 | `cow_ref` | What it means | Action |
 |---|---|---|
@@ -297,7 +317,8 @@ self-check it cannot pass without `/proc/<pid>/smaps`
 see this frame". Breaking the share = `unmap_and_free_page(va)` — the usual
 `released_last_va` gate, so `pmm::free_page` routes through `cow_ref_dec` and
 declines to free the frame while the peer holds it — then a freshly zeroed
-private frame mapped at the same VA, `RW_NO_EXEC`.
+private frame mapped at the same VA with the **region's** recorded protection
+(`RW_NO_EXEC` when it records none), never the old PTE's bits.
 
 **Until 2026-08-14 every page in that bottom row was `memset` in place**, which
 after a `fork` wrote through the frame the peer was still reading: the peer's

@@ -2510,6 +2510,46 @@ impl UserAddressSpace {
         changed
     }
 
+    /// `mremap`'s page half: move every present user page of `[start, end)` to
+    /// the same offset from `new_base`, keeping its entry bits (protection, CoW
+    /// state). The frame is the same one at one VA before and after, so the
+    /// ledger's count is untouched. The pages are collected first (the `Vec` is
+    /// sized by residency) and the source cleared before any destination is
+    /// installed, so a frame is never mapped twice. `false` if a page table
+    /// could not be allocated partway: the pages moved so far stay moved, and
+    /// the rest of the destination demand-pages. The x86 twin has the same
+    /// contract.
+    pub fn move_present(&mut self, start: usize, end: usize, new_base: usize) -> bool {
+        let first = start & !(PAGE_SIZE - 1);
+        let mut moves: Vec<(usize, u64)> = Vec::new();
+        let mut va = first;
+        while va < end {
+            if let Some(entry) = self.read_l3_page_entry(va)
+                && entry & flags::USER != 0
+                && let Some(slot) = self.l3_slot(va)
+            {
+                slot.set(0);
+                moves.push((va, entry));
+            }
+            let Some(next) = va.checked_add(PAGE_SIZE) else { break };
+            va = next;
+        }
+        let _ = flush_tlb_range_all_asid(first, (va - first) / PAGE_SIZE, TlbTarget::AllCores);
+        let mut ok = true;
+        for &(va, entry) in &moves {
+            let pa = (entry & 0x0000_FFFF_FFFF_F000) as usize;
+            let (tables, installed) = map_user_page_inner(new_base + (va - start), pa, entry & !0x0000_FFFF_FFFF_F000, false);
+            for tf in tables {
+                self.track_page_table_frame(tf);
+            }
+            if !installed {
+                ok = false;
+                break;
+            }
+        }
+        ok
+    }
+
     /// `munmap`'s page half: clear every present page in `[start, end)` and
     /// push each frame this address space held the **last** VA onto `out`
     /// (the ledger decides, as [`unmap_and_free_page_no_flush`](Self::unmap_and_free_page_no_flush)),
@@ -3901,6 +3941,34 @@ impl UserAddressSpace {
         f: impl FnMut(&FrameLedger, Leaf) -> LeafAction,
     ) -> usize {
         x86_walk_leaves(self.root as u64, &self.ledger, start, end, f)
+    }
+
+    /// `mremap`'s page half, the AArch64 twin's contract: each present user
+    /// leaf moves to the same offset from `new_base` with its protection, CoW
+    /// marker and cache type (a moved `/dev/fb0` page stays write-combining).
+    /// The source is cleared by the walk's own `Unmap` and the destination
+    /// installed after it, because the walk holds `&mut self`.
+    pub fn move_present(&mut self, start: usize, end: usize, new_base: usize) -> bool {
+        let mut moves: Vec<(usize, usize, PteProt, bool, MemAttr)> = Vec::new();
+        self.rewrite_leaves_in_range(start, end, |_ledger, leaf| {
+            if !leaf.prot.user {
+                return LeafAction::Keep;
+            }
+            moves.push((leaf.va, leaf.pa, leaf.prot, leaf.cow, leaf.attr));
+            LeafAction::Unmap
+        });
+        for &(va, pa, prot, cow, attr) in &moves {
+            let to = new_base + (va - start);
+            let moved = if attr == MemAttr::WriteBack {
+                self.map_page_pte(to, pa, prot, cow)
+            } else {
+                self.map_device_page(to, pa, prot, attr)
+            };
+            if !moved {
+                return false;
+            }
+        }
+        true
     }
 
     /// `munmap`'s page half, the AArch64 twin's contract in one descent:

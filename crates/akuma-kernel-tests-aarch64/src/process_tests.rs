@@ -7131,7 +7131,7 @@ fn test_madvise_dontneed_spares_shared_frame() {
 
     let spares = [spare];
     let mut to_free: alloc::vec::Vec<crate::pmm::PhysFrame> = alloc::vec::Vec::new();
-    let outcome = dontneed_apply(&mut aspace, SHARED_VA, 2, &spares, &mut to_free);
+    let outcome = dontneed_apply(&mut aspace, SHARED_VA, 2, &spares, &mut to_free, crate::mmu::user_flags::RW_NO_EXEC);
 
     // The peer's frame: still fully intact. This single line is the whole defect.
     let peer_intact = all_bytes_are(shared.addr, PATTERN);

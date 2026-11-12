@@ -802,14 +802,12 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
         Syscall::Mmap if crate::fd::is_dev_fb(a5) => crate::mm::mmap_framebuffer(a1, a2, a3 as u32, a4 as u32, a6),
         Syscall::Mmap => to_glue(call, [a1, a2, a3, a4, a5, a6]),
         Syscall::Munmap => to_glue(call, [a1, a2, 0, 0, 0, 0]),
-        // `madvise(addr, len, advice)`. Answered `ENOSYS` for everything until
-        // 2026-09-07, which is the *wrong* way to say "not implemented": Linux
-        // says `EINVAL` for unsupported advice and redis exits on anything else.
-        Syscall::Madvise => crate::mm::sys_madvise(a1, a2, a3),
-        // `mremap(old, old_len, new_len, flags)`. `a5` is `MREMAP_FIXED`'s
-        // `new_address` and is deliberately not passed: this target does not
-        // support `MREMAP_FIXED`, and the decision crate does not decode it.
-        Syscall::Mremap => crate::mm::sys_mremap(a1, a2, a3, a4),
+        // `madvise(addr, len, advice)` is glue's. Unsupported advice is `EINVAL`,
+        // never `ENOSYS`: redis exits on anything else.
+        Syscall::Madvise => to_glue(call, [a1, a2, a3, 0, 0, 0]),
+        // `mremap(old, old_len, new_len, flags)` is glue's. `a5` is
+        // `MREMAP_FIXED`'s `new_address` and is not passed: glue refuses the flag.
+        Syscall::Mremap => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // `mprotect` is glue's, the one implementation both kernels run
         // (`proposals/AKUMA_MM_CONVERGENCE.md` step 5).
         Syscall::Mprotect => to_glue(call, [a1, a2, a3, 0, 0, 0]),

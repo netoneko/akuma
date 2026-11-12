@@ -7781,11 +7781,11 @@ fn test_mmap_madvise_hostile_length_is_refused() -> bool {
         NR_MADVISE, &[0x1000, !0u64, MADV_DONTNEED, 0, 0, 0]);
     let huge_madv_ok = huge_madv == EINVAL;
 
-    // A legitimate small madvise must still be accepted — the guard must not have
-    // become "reject everything".
+    // A legitimate small madvise must get past the guard — it must not have
+    // become "reject everything". `0` with a process, `ESRCH` without one.
     let ok_madv = crate::syscall::handle_syscall(
         NR_MADVISE, &[0x1000, 0x1000, MADV_DONTNEED, 0, 0, 0]);
-    let ok_madv_ok = ok_madv == 0;
+    let ok_madv_ok = ok_madv != EINVAL;
 
     let pass = huge_anon_ok && huge_fixed_ok && huge_madv_ok && ok_madv_ok;
     if !pass {
