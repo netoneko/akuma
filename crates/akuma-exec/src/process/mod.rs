@@ -1273,46 +1273,71 @@ impl Process {
         self.brk.load(Ordering::Relaxed)
     }
 
-    /// Set program break, returns new value.
-    /// Maps any new pages between old and new brk.
-    /// Returns the exact requested value (matching Linux brk ABI).
+    /// Set the program break; returns the break in effect afterwards, the old one
+    /// when the request is refused (Linux's `brk` ABI). Both kernels' `brk`.
     ///
-    /// `&self`: page installs go through [`Process::with_address_space`]
-    /// (`as_lock` + IRQs masked on smp-shared, frame allocated outside the hold,
-    /// same shape as the old inline `AsLockHold`), and the `brk` scalar store is
-    /// serialized under [`Process::vm_lock`] (pure bookkeeping, matching that
-    /// lock's discipline). Concurrent *readers* of `brk` race the store exactly
-    /// as they did against the old `&mut self` write.
+    /// - **Growth** maps zeroed pages, allocated outside `as_lock` (the PMM's OOM
+    ///   path can re-enter it). It is refused, as on Linux, when it asks for more
+    ///   than the PMM has free, or would land on
+    ///   anything else: a region, or a page no region records (amd64's
+    ///   interpreter sits 512 MiB above a PIE program). Out of memory undoes what
+    ///   this call mapped and refuses.
+    /// - **Shrinking** unmaps the pages past the new break, so a later growth gets
+    ///   zeroed ones.
+    ///
+    /// The heap's pages are in no region; `MADV_DONTNEED` and fork know the heap.
     pub fn set_brk(&self, new_brk: usize) -> usize {
-        if new_brk < self.initial_brk.load(core::sync::atomic::Ordering::Relaxed) {
-            return self.brk.load(Ordering::Relaxed);
+        let old = self.brk.load(Ordering::Relaxed);
+        let initial = self.initial_brk.load(Ordering::Relaxed);
+        if new_brk < initial {
+            return old;
         }
-        let aligned = (new_brk + 0xFFF) & !0xFFF;
-        let old_top = (self.brk.load(Ordering::Relaxed) + 0xFFF) & !0xFFF;
-        if aligned > old_top {
-            let mut page = old_top;
-            while page < aligned {
-                if !self.address_space.is_range_mapped(page, 0x1000) {
-                    // Allocate the frame OUTSIDE `as_lock` (the PMM OOM/reclaim path can
-                    // re-enter it), then install it under the hold so a concurrent
-                    // BKL-free fault on this address space excludes correctly.
-                    if let Some(frame) = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new) {
-                        track_frame(frame, FrameSource::ElfLoader);
-                        let _ = self.with_address_space(|aspace| {
-                            aspace.map_and_track(page, frame, crate::mmu::user_flags::RW_NO_EXEC)
-                        });
-                    }
-                }
-                page += 0x1000;
-            }
+        let top = (new_brk + 0xFFF) & !0xFFF;
+        let old_top = (old + 0xFFF) & !0xFFF;
+        if top < old_top {
+            self.drop_pages(top, old_top);
+        } else if top > old_top && !self.grow_heap(old_top, top) {
+            return old;
         }
-        // No lock and no IRQ masking: `brk` is an atomic, and since
-        // `mmap_regions` moved inside its own lock there is no
-        // longer any other `vm_*` bookkeeping to order against. `vm_lock` — a
-        // `Spinlock<()>` guarding nothing, which is what forced the old cast —
-        // is gone. See `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis.
         self.brk.store(new_brk, Ordering::Relaxed);
         new_brk
+    }
+
+    fn grow_heap(&self, from: usize, to: usize) -> bool {
+        // More than the PMM has free cannot succeed, and bounds the walk below.
+        if (to - from) / 0x1000 > akuma_pmm::stats().2
+            || self.vm_with_regions(|r| !crate::process::regions_overlapping(r, from, to).is_empty())
+            || self.with_address_space(|a| (from..to).step_by(0x1000).any(|va| a.is_mapped(va)))
+        {
+            return false;
+        }
+        for page in (from..to).step_by(0x1000) {
+            let Some(frame) = akuma_pmm::alloc_page_zeroed().map(PhysFrame::new) else {
+                self.drop_pages(from, page);
+                return false;
+            };
+            track_frame(frame, FrameSource::ElfLoader);
+            let mapped = self.with_address_space(|a| {
+                a.map_and_track(page, frame, crate::mmu::user_flags::RW_NO_EXEC).is_ok() || {
+                    let _ = a.remove_user_frame(frame);
+                    false
+                }
+            });
+            if !mapped {
+                crate::pmm::free_page(frame);
+                self.drop_pages(from, page);
+                return false;
+            }
+        }
+        true
+    }
+
+    fn drop_pages(&self, from: usize, to: usize) {
+        let mut freed = Vec::new();
+        self.with_address_space(|a| a.unmap_present(from, to, &mut freed));
+        for frame in freed {
+            crate::pmm::free_page_at(frame, akuma_pmm::FreeSite::MunmapRegion);
+        }
     }
 
     /// A clone of the process name. `name` is behind [`Process::image`]

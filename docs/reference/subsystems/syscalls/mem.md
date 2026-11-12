@@ -232,10 +232,18 @@ mappings" below).
   allocated, and no copy loop exists that could stop early and look finished
   ([`AKUMA_ONE_MREMAP_MADVISE.md`](../../../archive/AKUMA_ONE_MREMAP_MADVISE.md)).
 
-**`brk`** (`sys_brk`): no error path modeled. `new_brk == 0` is a size query
-(returns the current brk). If the owner process can't be looked up, returns
-`0` (not an errno) — brk's ABI has no failure return distinct from "brk
-didn't move", so there's nothing to signal.
+**`brk`** (`sys_brk` → `Process::set_brk`; **both kernels** since 2026-11-12). brk's ABI has no
+errno: a refusal answers the current break, and musl's `__expand_heap` then falls back to `mmap`.
+- `new_brk == 0` → the current break. No process → `0`. Below the initial break → refused.
+- **Growth** maps zeroed pages eagerly. It is refused when it asks for more pages than the PMM has
+  free, when a region overlaps it, or when any page in it is already mapped: amd64's interpreter
+  sits at `0x3000_0000`, 512 MiB above a PIE program, and is in no region. Nothing pre-maps the
+  heap and no region records it, on either kernel. Out of
+  memory part-way undoes this call's pages and refuses.
+- **Shrinking** unmaps the pages past the new break, so a regrowth reads zeros.
+- Heap pages are in no region. `MADV_DONTNEED` advises them anyway; fork copies them with the
+  page table. Probe: `brkgrow` in `scripts/mem_suite.py`
+  ([`AKUMA_ONE_BRK.md`](../../../archive/AKUMA_ONE_BRK.md)).
 
 **`mprotect`** (`sys_mprotect`, glue `mem.rs`; **both kernels** since 2026-11-12 — amd64
 dispatches it to glue):

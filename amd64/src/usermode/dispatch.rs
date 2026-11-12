@@ -801,16 +801,10 @@ fn mem(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // `mprotect` is glue's, the one implementation both kernels run
         // (`proposals/AKUMA_MM_CONVERGENCE.md` step 5).
         Syscall::Mprotect => to_glue(call, [a1, a2, a3, 0, 0, 0]),
-        // `brk(addr)` — x86_64 12. This target has no program break (the
-        // allocators are `mmap`-based and the arm was removed), so the row
-        // decoded and fell into the silent default below: `ENOSYS`, an answer
-        // Linux's `brk` never gives. Linux's answer for a break that cannot
-        // move is the **current break, unchanged**; musl's `__expand_heap`
-        // reads that as "no growth" and falls back to `mmap`, which is what it
-        // did here anyway — now through the documented path. Nothing is mapped.
-        // Found 2026-10-08 by the `[sc!]` trace: 54 `brk -> -ENOSYS` lines in
-        // one Chromium run.
-        Syscall::Brk => current_process().map_or(0, |p| p.get_brk() as u64),
+        // `brk(addr)` is glue's (`Process::set_brk`): growth that would land on
+        // another mapping, or does not fit, answers the current break, and musl
+        // falls back to `mmap`.
+        Syscall::Brk => to_glue(call, [a1, 0, 0, 0, 0, 0]),
         // `msync` is glue's: written back from the shared writable table.
         Syscall::Msync => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         _ => return None,

@@ -26,6 +26,7 @@ that currently work:
                         mapped, mprotect splits, fork; prints [OK]/[FAIL]
   mapfixed              MAP_FIXED over a live mapping: zero-filled, gone after
                         munmap, and no frames held per replace; prints ok/FAIL
+  brkgrow               brk grow/shrink/refusal; prints PASS/FAIL
 
 So the verdict is layered rather than one regex:
 
@@ -118,6 +119,9 @@ PROBES = {
     # mprotect after fork: a private page re-granted write stays copy-on-write,
     # a MAP_SHARED one stays shared (`docs/archive/AKUMA_MPROTECT_CONVERGENCE.md`).
     "cowprotect":           ("", 300),
+    # brk: grow, shrink-then-regrow zeroed, refused over a mapping and when huge
+    # (`docs/archive/AKUMA_ONE_BRK.md`).
+    "brkgrow":              ("", 120),
 }
 
 SSH_BASE = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",

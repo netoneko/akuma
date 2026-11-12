@@ -57,17 +57,6 @@ fn kill_exec_siblings(pid: Pid, tgid: Pid) {
 /// 32 MB is enough for even the heaviest runtimes (Bun/JSC uses ~600KB–2MB).
 pub(crate) const LAZY_STACK_MAX: usize = 32 * 1024 * 1024;
 
-pub(crate) fn compute_heap_lazy_size(brk: usize, memory: &ProcessMemory) -> usize {
-    const MIN_HEAP: usize = 16 * 1024 * 1024;
-    const RESERVE_PAGES: usize = 2048; // 8MB
-
-    let (_, _, free) = akuma_pmm::stats();
-    let phys_cap = free.saturating_sub(RESERVE_PAGES) * crate::mmu::PAGE_SIZE;
-    let va_cap = memory.next_mmap.load(core::sync::atomic::Ordering::Relaxed).saturating_sub(brk);
-
-    core::cmp::max(core::cmp::min(phys_cap, va_cap), MIN_HEAP)
-}
-
 /// Set by a kernel whose page-fault handler does not serve lazy regions
 /// (amd64): a path load then maps every segment up front instead of deferring.
 /// Without it the first instruction fetch of any binary over `HEAP_SLURP_MAX`
@@ -316,15 +305,14 @@ impl Process {
         // Written through the owned field rather than the pid-keyed
         // `push_lazy_region`: that would resolve `self.pid` back to this very
         // `Process` through a *shared* table lookup, re-entering the caller.
-        let heap_lazy_size = compute_heap_lazy_size(inst.brk, &self.memory);
         let lazy_stack_start = inst.stack_top.saturating_sub(LAZY_STACK_MAX);
         {
             // Built aside and swapped in: the old list drops after the lock is
-            // released. Demand-paged segments first, then heap and stack — the
+            // released. Demand-paged segments first, then the stack (the `brk` heap is
+            // mapped by `set_brk` and is in no region) — the
             // order the on-demand path has always used.
             let mut regions = Vec::new();
             push_deferred_regions(&mut regions, inst.deferred_segments);
-            push_image_region(&mut regions, inst.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
             push_image_region(&mut regions, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
             let old = core::mem::replace(&mut *self.mmap_regions.lock(), regions);
             drop(old);
@@ -461,8 +449,6 @@ impl Process {
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
             pid, loaded.brk, loaded.stack_bottom, loaded.stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit.load(Ordering::Relaxed));
 
-        let heap_lazy_size = compute_heap_lazy_size(loaded.brk, &memory);
-        push_image_region(&mut mmap_regions, loaded.brk, heap_lazy_size, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
         let lazy_stack_start = loaded.stack_top.saturating_sub(LAZY_STACK_MAX);
         push_image_region(&mut mmap_regions, lazy_stack_start, LAZY_STACK_MAX, crate::mmu::user_flags::RW_NO_EXEC, &LazySource::Zero);
 

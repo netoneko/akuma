@@ -1410,29 +1410,16 @@ fn madvise_check(t: &mut Suite) {
 }
 
 #[cfg(not(feature = "no-tests"))]
-/// After the boot suite has run real programs: assert the lazy path was taken.
+/// After the boot suite has run real programs: how many pages the lazy path served.
 ///
-/// # Why this check exists
-///
-/// `mm::smoke_test` used to check only *refusals*, on the reasoning that the
-/// success path is exercised for real by every allocating program. Removing the
-/// refusals — `MAX_MAPPING`, `MAP_FIXED`, "never lazy" — would have left that
-/// reasoning holding up nothing, which is the "a boot self-test that goes quiet
-/// is not a pass" trap in exact form: demand paging could regress to *never
-/// firing* and every other check in the suite would still be green, because an
-/// eagerly-populated mapping works too. It would simply be the old kernel again,
-/// silently.
-///
-/// So this runs **after** `busybox_test` / `execve_test` / `fork_test` /
-/// `redirect_test` — shells, pipelines and a `fork`+`execve` — and asserts that
-/// at least one not-present fault was serviced out of a region. musl's allocator
-/// asks for arenas well past [`EAGER_MAX_PAGES`], so zero here means the lazy
-/// arm is not being reached, whatever the reason.
+/// Noted, not checked: since `brk` grows (2026-11-12) the suite's static musl
+/// programs take their heap from it and need no lazy mapping, so zero here is
+/// not a regression. `scripts/mem_suite.py` (`mmaplazy`, `mmap_stress`) is what
+/// proves the lazy path.
 pub fn demand_paging_report(t: &mut Suite) {
     use core::sync::atomic::Ordering;
     let n = crate::idt::USER_DEMAND_FAULTS.load(Ordering::Relaxed);
     t.note("mmap: user pages demand-paged from a region", n);
-    t.check("mmap: the lazy path was actually taken", n > 0);
     // The file arm separately, because it is the one added on 2026-09-13 and the
     // one that goes quiet rather than red when it regresses. Noted, not
     // `check`ed: whether any program in the boot suite `mmap`s a **file** is a

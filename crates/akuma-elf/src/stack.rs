@@ -317,13 +317,11 @@ fn attach_stack<A: UserPages>(
 
     let sp = setup_linux_stack(&mut stack, args, env, &auxv_vec);
 
+    // The break starts on a page boundary with nothing mapped above it:
+    // `Process::set_brk` maps the heap and refuses to grow over a mapped page.
     let hs = (loaded.brk + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    for i in 0..16 {
-        let _ = loaded.address_space.alloc_and_map(hs + i * 0x1000, SegProt::Data);
-    }
 
     if DEBUG_ELF_LOADING {
-        log::debug!("[ELF] Heap pre-alloc: 0x{:x} (16 pages)", hs);
         log::debug!("[ELF] Stack: 0x{:x}-0x{:x}, SP=0x{:x}, argc={}",
             stack_bottom, stack_top, sp, args.len());
         if loaded.interp.is_some() {
