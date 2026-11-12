@@ -220,6 +220,13 @@ thread's `clear_child_tid` is its `Process`'s (set by `CLONE_CHILD_CLEARTID`, mo
 outlived its threads and made the next process drain threads it never had
 ([`../../../../proposals/AKUMA_ONE_EXIT.md`](../../../../proposals/AKUMA_ONE_EXIT.md) step 3).
 
+**Every blocking wait must leave on a deferred kill request**, not only on a pending signal:
+a group exit asks a sibling to leave with `request_thread_kill` (`PENDING_KILL`), which pends
+nothing. The common park loops read it through `should_interrupt_blocking_syscall`; a loop of
+its own (`suspend_until_signal`, behind `pause`/`rt_sigsuspend`) must test `has_pending_kill`
+itself, or a thread parked there outlives its group's drain
+([`../../../archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md`](../../../archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md)).
+
 Gates: `userspace/forktest/c_stress/killtree.c` (on both arches, through
 `ssh`) and the amd64 boot check `usermode::kill_test`
 (`userspace/amd64/killprobe`).

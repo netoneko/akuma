@@ -202,6 +202,18 @@ fn suspend_until_signal(new_mask: u64) -> u64 {
             // Leave the restore-sigmask armed for try_deliver_signal to consume.
             return EINTR;
         }
+        // A group exit (amd64 `thread::drain`, AArch64 `kill_thread_group`) asks this thread
+        // to leave with a deferred kill request, not a signal: it pends nothing, so the check
+        // above never sees it, and without this the loop re-parks forever. `drain` then gave
+        // up on a thread parked in `pause()` and the reaper freed the space it stood in
+        // (`docs/archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md`). Not consumed here: the
+        // syscall-return path that takes it is what ends the thread.
+        if akuma_exec::threading::has_pending_kill(slot) {
+            if let Some(m) = akuma_exec::threading::take_restore_sigmask() {
+                akuma_exec::threading::set_thread_signal_mask(m);
+            }
+            return EINTR;
+        }
         if akuma_exec::process::is_current_interrupted() {
             // Woken without a deliverable signal (spurious / external interrupt):
             // no frame will be built to consume the restore-mask, so undo it
