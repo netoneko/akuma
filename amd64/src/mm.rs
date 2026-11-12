@@ -202,12 +202,11 @@ pub fn register_lazy_stack(top: u64, eager_pages: usize, max_pages: usize) {
 pub static PLACEMENTS_CHECKED: core::sync::atomic::AtomicU64 =
     core::sync::atomic::AtomicU64::new(0);
 
-/// Is the caller a slotted user task with an address space of its own?
+/// Is the caller a user task with an address space of its own?
 ///
-/// The one question every effect in this module is gated on. It is asked
-/// through the region accessor rather than `current_proc_slot` so there is a
-/// single definition of "has an address space" — a slot that exists but holds
-/// no `Process` is not one, and the two spellings disagreed about that.
+/// The one question every effect in this module is gated on, asked through the
+/// region accessor so there is a single definition of "has an address space":
+/// a registered `Process`.
 fn have_address_space() -> bool {
     usermode::with_current_regions(|_| ()).is_some()
 }

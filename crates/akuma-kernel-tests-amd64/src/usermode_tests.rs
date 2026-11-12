@@ -235,14 +235,13 @@ impl TestImage for Image {
 /// The parent is pid 1: these run before `run_init`, so there is no real
 /// parent, and 1 is what `current_pid()` answers for the boot task driving them.
 fn start_test_process(
-    slot: usize,
     image: Image,
     image_top: u64,
     name: &str,
 ) -> Option<(u32, usize)> {
     let root = image.space.ttbr0();
     let table_slot = akuma_exec::process::reserve_process_slot()?;
-    let task_slot = spawn_process_task(slot, root)?;
+    let task_slot = spawn_process_task(root)?;
     let pid = alloc_pid();
     let mut cmdline = alloc::vec::Vec::with_capacity(name.len() + 1);
     cmdline.extend_from_slice(name.as_bytes());
@@ -1954,9 +1953,9 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
 ///
 /// # What the two numbers are
 ///
-/// * `slot` — [`current_proc_slot`], the per-CPU `UserCtx` field read. This is
-///   what the **old** lookup was, plus one bounds-checked array index that no
-///   measurement here could separate from noise.
+/// * `slot` — `sched::current_task`, the per-CPU read the **old** lookup began
+///   with (it read `UserCtx::proc_slot` and indexed an array; neither exists
+///   now, and one per-CPU word is the same cost).
 /// * `process` — [`current_process`], the whole new lookup: the same per-CPU
 ///   read of the task slot, then `THREAD_IDENTITY[tid]`'s cached process-table
 ///   slot and generation, then `SlotTable::ref_if_current`.
@@ -2011,7 +2010,7 @@ pub fn identity_cost_test(t: &mut Suite) {
 
     let t0 = tsc();
     for _ in 0..ITERS {
-        core::hint::black_box(current_proc_slot());
+        core::hint::black_box(k::sched::current_task());
     }
     let t1 = tsc();
     for _ in 0..ITERS {
@@ -2066,8 +2065,8 @@ pub fn smoke_test(t: &mut Suite) {
     let pa_k = k::paging::translate(USER_CODE_VA);
 
     let (Some(a), Some(b)) = (
-        start_test_process(0, a, 0, "ring3-a"),
-        start_test_process(1, b, 0, "ring3-b"),
+        start_test_process(a, 0, "ring3-a"),
+        start_test_process(b, 0, "ring3-b"),
     ) else {
         t.check("ring3: processes spawned", false);
         return;
@@ -2141,8 +2140,8 @@ pub fn preempt_test(t: &mut Suite) {
     };
 
     let (Some(c), Some(d)) = (
-        start_test_process(2, c, 0, "ring3-c"),
-        start_test_process(3, d, 0, "ring3-d"),
+        start_test_process(c, 0, "ring3-c"),
+        start_test_process(d, 0, "ring3-d"),
     ) else {
         t.check("preempt: processes spawned", false);
         return;
@@ -2216,8 +2215,8 @@ pub fn smp_parallel_test(t: &mut Suite) {
 
     // Slots 2 and 3 are free again: `preempt_test` reaped its processes.
     let (Some(c), Some(d)) = (
-        start_test_process(2, c, 0, "ring3-e"),
-        start_test_process(3, d, 0, "ring3-f"),
+        start_test_process(c, 0, "ring3-e"),
+        start_test_process(d, 0, "ring3-f"),
     ) else {
         t.check("smp ring3: processes spawned", false);
         return;
@@ -2471,7 +2470,7 @@ pub fn elf_test(t: &mut Suite) {
         proc.stack < ELF_STACK_TOP && proc.stack >= ELF_STACK_TOP - (ELF_STACK_PAGES as u64 * 4096),
     );
 
-    let Some(started) = start_test_process(4, proc, img.end_va, "hello") else {
+    let Some(started) = start_test_process(proc, img.end_va, "hello") else {
         t.check("elf: process spawned", false);
         return;
     };
@@ -2767,7 +2766,7 @@ pub fn fdprobe_test(t: &mut Suite) {
             return;
         }
     };
-    let Some(started) = start_test_process(5, proc, _img.end_va, "fdprobe") else {
+    let Some(started) = start_test_process(proc, _img.end_va, "fdprobe") else {
         t.check("fdprobe: spawned", false);
         return;
     };
@@ -2860,7 +2859,7 @@ pub fn thread_test(t: &mut Suite) {
         }
     };
     t.check("thread: probe loaded", true);
-    let Some(started) = start_test_process(5, proc, _img.end_va, "threadprobe") else {
+    let Some(started) = start_test_process(proc, _img.end_va, "threadprobe") else {
         t.check("thread: probe spawned", false);
         return;
     };
@@ -2922,7 +2921,6 @@ pub fn thread_test(t: &mut Suite) {
 /// The spinning thread is the one that proves the tick path: it makes no
 /// syscall, so only `deliver_pending_on_tick` can end it.
 pub fn kill_test(t: &mut Suite) {
-    const SLOT: usize = 6;
     /// `(-9)` as the exit path carries it: `signal::signal_status(9)`.
     const SIGKILL_STATUS: u64 = (-9i64) as u64;
     const WORKERS: usize = 3;
@@ -2938,7 +2936,7 @@ pub fn kill_test(t: &mut Suite) {
             return;
         }
     };
-    let Some((pid, task_slot)) = start_test_process(SLOT, proc, img.end_va, "killprobe") else {
+    let Some((pid, task_slot)) = start_test_process(proc, img.end_va, "killprobe") else {
         t.check("kill: probe spawned", false);
         return;
     };
@@ -3003,7 +3001,6 @@ pub fn kill_test(t: &mut Suite) {
 /// the only pass; the probe's header lists the other codes, and a mismatch
 /// writes its register mask to the console.
 pub fn sigregs_test(t: &mut Suite) {
-    const SLOT: usize = 6;
     let free_before = akuma_pmm::free_count();
     let (proc, img) = match Image::from_elf(SIGREGS_ELF) {
         Ok(p) => p,
@@ -3015,7 +3012,7 @@ pub fn sigregs_test(t: &mut Suite) {
             return;
         }
     };
-    let Some((pid, task_slot)) = start_test_process(SLOT, proc, img.end_va, "sigregs") else {
+    let Some((pid, task_slot)) = start_test_process(proc, img.end_va, "sigregs") else {
         t.check("sigregs: probe spawned", false);
         return;
     };

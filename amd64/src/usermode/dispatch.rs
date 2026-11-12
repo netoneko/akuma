@@ -1028,9 +1028,8 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         //   that passes a pointer expects to find.
         //
         // The reap moved with it: glue unregisters the process and reaps the
-        // child channel, so this target's `SPAWN` row is collected by
-        // [`sweep_reaped_spawn_rows`] rather than freed inline. See its doc for
-        // why a sweep and not a hook.
+        // child channel, and [`after_reap`] drops the reaped pid's
+        // `THREAD_PID_MAP` row and drains the retired process.
         Syscall::Wait4 => {
             let r = to_glue(Syscall::Wait4, [a1, a2, a3, a4, 0, 0]);
             after_reap();

@@ -1228,8 +1228,8 @@ pub fn idle_loop() -> ! {
 ///   `CR3` — so `run_init`'s `sysret` into ring 3 fetched sshd's entry point
 ///   unmapped. Measured 2026-09-04, intermittent by timer phase: one boot served
 ///   ssh, the next died on the first user instruction.
-/// - Every process thread now needs [`seed_proc_slot`] before it runs, because
-///   `usermode::proc_entry` reads its process index out of its own `UserCtx`.
+/// - Every process thread needs its `Process` registered before it runs,
+///   because `usermode::proc_entry` refuses to enter ring 3 without one.
 ///
 /// With a second core the window is not a tick away but zero instructions away.
 pub fn spawn_in_space_unpublished(entry: extern "C" fn() -> !, space_root: u64) -> Option<usize> {
@@ -1787,27 +1787,6 @@ pub fn task_space_root(task_slot: usize) -> u64 {
     // that already holds the slot — and out-of-range slots answer 0 rather than
     // indexing.
     MACHINE.get(task_slot).map_or(0, |m| m.space_root.load(Ordering::Relaxed))
-}
-
-/// Seed a not-yet-running task — a process's or a `clone` thread's — with the
-/// process slot it serves (a thread shares its parent's, which routes its fds).
-///
-/// This is the reason `usermode` needs only one process entry function. Until 2026-09-06
-/// a process index had nowhere to live but the `fn` pointer itself, so
-/// `usermode::proc_entry_for` baked one into each of sixteen hand-written
-/// trampolines — and since only nine of them were ever handed out, the machine
-/// could not run more than nine processes at once. `cargo -j4` is cargo plus
-/// four `rustc`s plus their children before anything interesting happens.
-///
-/// Deliberately not folded into [`write_user_context`]: a spawned process needs
-/// this and *not* a register snapshot (it starts at a fresh entry point, not at
-/// a copy of its parent's context), so one function taking both would make two
-/// unrelated requirements look like one call.
-pub fn seed_proc_slot(task_slot: usize, proc_slot: usize) {
-    // Under the BKL; the slot is unpublished, so no core can be running it.
-    if let Some(m) = MACHINE.get(task_slot) {
-        m.uctx.with_mut(|u| u.proc_slot = proc_slot);
-    }
 }
 
 /// Release a [`spawn_in_space_unpublished`] slot that will never be published.

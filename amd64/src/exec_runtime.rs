@@ -209,9 +209,8 @@ fn runtime() -> ExecRuntime {
         // mapping one would leak 4 KiB per process past the frame ledger. Step
         // 5's re-map and `ProcessInfo` write are skipped on the same `0`.
         alloc_process_info: |_space| Ok(0),
-        // The child's `CR3` root, its `SPAWN` row and the `UserCtx::proc_slot`
-        // naming that row — the three things `akuma-exec` has no concept of.
-        // See the function.
+        // The child's `CR3` root — the one thing `akuma-exec` has no concept
+        // of. See the function.
         bind_child_task: crate::usermode::bind_child_task,
         // **`stac`/`clac`, not a bare store.** SMAP is on here, so the shared
         // `mmu::write_current_user_val` the other kernel registers would fault

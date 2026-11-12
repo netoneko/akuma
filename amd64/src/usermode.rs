@@ -45,7 +45,7 @@ use akuma_mmu::{LeafAction, PteProt, UserAddressSpace};
 
 use crate::loader;
 use crate::serial;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// `nopidfd` on the kernel command line: `pidfd_open` answers `ENOSYS`, the way a
 /// kernel older than 5.3 would, so a program that probes for it takes its
@@ -129,12 +129,11 @@ pub struct UserCtx {
     pub user_rsp: u64,
     /// Non-zero when this task should leave ring 3. Offset 16.
     pub leave: u64,
-    /// The process slot this task is running, or `usize::MAX` for a task that
-    /// is not an ELF process (the boot task). Offset 24 — past everything the
-    /// assembly indexes, so it is free to be an ordinary field. `sys_read` /
-    /// `sys_write` use it to route fd 0/1/2 to a spawned child's pipes instead
-    /// of the console.
-    pub proc_slot: usize,
+    /// Unused; keeps `user_rip` at offset 32, where `syscall_entry` writes it.
+    /// It was `proc_slot`, the task's row in the `SPAWN` table that the process
+    /// table replaced (2026-11-12): a task runs a process when
+    /// `current_process()` answers.
+    pub reserved_24: usize,
     /// The user instruction pointer captured on syscall entry — the address the
     /// `syscall` will return to. Offset 32. `syscall_entry` writes it (as
     /// `[rax + 32]`) so `sys_fork` can hand a child task the exact point the
@@ -281,7 +280,7 @@ impl UserCtx {
             kernel_rsp: 0,
             user_rsp: 0,
             leave: 0,
-            proc_slot: usize::MAX,
+            reserved_24: 0,
             user_rip: 0,
             fs_base: 0,
             saved_regs: [0; 12],
@@ -1165,7 +1164,7 @@ fn mark_leave() {
 /// Deliberately the same three lines as the [`Syscall::ExitGroup`] arm rather
 /// than a call into `akuma_syscalls_glue::sys_exit_group`: this target's
 /// teardown lives in [`run_process`]'s epilogue, and the `leave` flag is how a
-/// task gets there. Glue's version stops short of the `SPAWN` row and parks the
+/// task gets there. Glue's version stops short of that epilogue and parks the
 /// thread in a `yield_now` loop, so a child killed through it would never report
 /// a status to its parent's `sys_waitpid`.
 ///
@@ -2166,31 +2165,6 @@ pub fn with_current_address_space<R>(f: impl FnOnce(&mut akuma_mmu::UserAddressS
     Some(f(&mut p.address_space.lock()))
 }
 
-/// How many process slots this target has.
-///
-/// A process slot is **not** a process any more — since 5b slice 4 the process
-/// itself is an `akuma_exec::Process` in `PROCESS_TABLE`. What is left keyed by
-/// slot is this target's own mechanism: the `SPAWN` row (stdio pipes and the
-/// scheduler task slot), `fd.rs`'s descriptor row, and `crate::thread`'s
-/// group-exit flag and thread list. `UserCtx::proc_slot` is how a running task
-/// names its own.
-///
-/// Slots 0..=6 are the self-tests and `run_init`; slots [`SPAWN_SLOT_BASE`]..
-/// are for `sys_spawn`'d children (an `sshd` session's shell).
-///
-/// **Raised 16 → 128 on 2026-09-06.** Nine concurrent spawns was "past what the
-/// cooperative `sshd` serves" only while a session stayed idle: a real one
-/// (`apk add`, then any command) exhausted it and `sshd` reported
-/// `failed to spawn '/bin/sh' for exec`. Slots *are* recycled on
-/// `waitpid`/exit, so this is headroom against leaks and bursts, not a true
-/// concurrency bound.
-pub const PROC_SLOTS: usize = 128;
-
-/// First process slot `sys_spawn` may use; everything below is the self-tests
-/// and `run_init`.
-pub const SPAWN_SLOT_BASE: usize = 7;
-
-
 /// Read and clear this task's [`UserCtx::forked`] flag — one-shot, and
 /// consumed by [`run_process`] only.
 ///
@@ -2219,19 +2193,13 @@ fn take_uctx_flag(read: impl Fn(&mut UserCtx) -> &mut u64) -> bool {
 /// exit is handled from inside the syscall path. Here `sysret` **returns**, so
 /// everything after the entry — the `execve` loop and the whole teardown — has
 /// to live on this side of the hook. `-> !` is what says so.
-///
-/// The slot comes from the running task's own `UserCtx`, seeded by
-/// [`crate::sched::seed_proc_slot`] before the task was published, for the same
-/// reason [`proc_entry`] reads it there: shared code has no process-slot
-/// concept to hand one down.
 pub fn enter_ring3(first: &UserContext) -> ! {
-    let idx = current_proc_slot();
-    if idx >= PROC_SLOTS {
-        // A task published without being seeded. `proc_entry` catches this
-        // first for the tasks it starts; the check is repeated here because
-        // this function is a registered hook and its other caller (slice 3's
-        // shared `entry_point_trampoline`) does not go through `proc_entry`.
-        serial::puts("  [proc] ring-3 entry with no slot\n");
+    if current_process().is_none() {
+        // A task published without a registered process. `proc_entry` catches
+        // this first for the tasks it starts; the check is repeated here because
+        // this function is a registered hook and its other caller (the shared
+        // `entry_point_trampoline`) does not go through `proc_entry`.
+        serial::puts("  [proc] ring-3 entry with no process\n");
         crate::sched::finish();
     }
     // **A thread is not a process, and its exit is not a process's exit.**
@@ -2387,10 +2355,9 @@ fn run_process(first: &UserContext) -> ! {
 /// refused any parent slot `>= 16` — so nine concurrent processes, which
 /// `cargo -j4` exceeds before it has finished starting.
 ///
-/// The index now lives where a thread's already did: `UserCtx::proc_slot`,
-/// written by `sched::seed_proc_slot` while the task is still unpublished and
-/// read back here. Nothing else changed — the ceiling was never about memory
-/// or scheduling, only about where one `usize` could be kept.
+/// The index then lived in `UserCtx::proc_slot`, seeded before publication.
+/// Since 2026-11-12 there is no index at all: the task's registered `Process`,
+/// which every spawn path registers before it publishes, is all this reads.
 ///
 /// # It ends in the shared `Process::run`, since the ring-3 entry seam
 ///
@@ -2418,47 +2385,28 @@ fn run_process(first: &UserContext) -> ! {
 ///   than removed, because "the scheduler already did it" is a property of
 ///   this target's spawn path and not of `run()`.
 extern "C" fn proc_entry() -> ! {
-    let slot = current_proc_slot();
-    if slot >= PROC_SLOTS {
-        // Reached only if a task was published without being seeded. Say so:
-        // `run_process` would name no process at all, and a panic here reads
-        // as a scheduler fault rather than a missing seed.
-        serial::puts("  [proc] entry with no slot\n");
-        crate::sched::finish();
-    }
     // The teardown below the entry reports an exit — `finish_process`
     // publishes a status a parent's `wait4` will believe — so a task that
     // never ran a program must not reach it. Unreachable by construction since
     // 5b slice 4 (every process task is registered before it is published) and
     // checked rather than assumed.
     let Some(proc) = current_process() else {
-        serial::puts("  [proc] slot ");
-        serial::put_dec(slot as u64);
-        serial::puts(" has no registered process; not entering ring 3\n");
+        serial::puts("  [proc] task has no registered process; not entering ring 3\n");
         crate::sched::finish();
     };
     proc.run()
 }
 
-/// Reserve and seed — but do **not** publish — a task to run process slot
-/// `proc_slot` in the address space `root`.
-///
-/// Two steps in a fixed order, which is why it is a function rather than two
-/// lines at each call site: reserve the task, then seed the slot it serves. A
-/// task published before it is seeded can be scheduled, reach [`proc_entry`],
-/// and find `usize::MAX` there.
+/// Reserve — but do **not** publish — a task to run a process in the address
+/// space `root`.
 ///
 /// **It published, until 5b slice 4.** Every caller now registers the process
 /// with `akuma-exec` before calling [`crate::sched::publish_task`], because
 /// `run_process` reads its entry point and stack *out of* that registration:
 /// a task published first could reach ring 3 before it exists as a process and
-/// find nowhere to start. Slices 1-2 tolerated that window — an unregistered
-/// child's syscalls merely fell back to the pre-slice answers — and this is
-/// what closes it, for the reason `spawn_in_space_unpublished` has no
-/// publish-immediately variant at all.
-pub fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
+/// find nowhere to start, which [`proc_entry`] refuses.
+pub fn spawn_process_task(root: u64) -> Option<usize> {
     let task_slot = crate::sched::spawn_in_space_unpublished(proc_entry, root)?;
-    crate::sched::seed_proc_slot(task_slot, proc_slot);
     // No group state to clear: a group's exit flag and status live on its own
     // `SharedSignalTable`, fresh for every new process, not on this recycled
     // slot. (Until 2026-11-12 they were slot-indexed, and a spawn inherited a
@@ -2485,104 +2433,9 @@ pub fn spawn_process_task(proc_slot: usize, root: u64) -> Option<usize> {
 // procfs `/proc/<pid>/fd/0` for that, the same call it makes on the other
 // kernel. This file answered that path itself until 2026-09-11.
 //
-// No `fork`, no per-process fd table, no real process hierarchy — one spawn per
-// `SPAWN` slot, and fd 0/1/2 are routed per task through `UserCtx::proc_slot`.
+// A spawned child is a registered `Process` like any other; its stdio is one
+// `ProcessChannel`, as on the AArch64 kernel.
 
-/// One spawned child: a pid and the scheduler task running it.
-///
-/// **All four stdio fields are gone**, and the last two went on 2026-09-11 with
-/// the pipes themselves.
-///
-/// C2 slice 6 deleted `borrowed_io`/`console_io` and rewrote what `stdout_pipe`
-/// was *for*; those three existed because a spawned child's stdio was routed *by
-/// number*: every unbound fd 0/1/2 read or write asked the spawn row which pipe
-/// (or console) served it, and the exit path closed the child's stdout end by
-/// hand. Binding real descriptors in the child's own registered table retired
-/// every one of those jobs. `stdout_pipe` outlived them by a slice because it
-/// had acquired a second one — naming the child a `TIOCSWINSZ` on the parent's
-/// stdout descriptor was meant for — and that moved to the child's registered
-/// fd 1.
-///
-/// `stdin_pipe` outlived them all, for a real reason while it lasted: its write
-/// end was reached by *path* (`sshd` opened `/proc/<pid>/fd/0`) and later by
-/// *id*, and neither is a reference, so nothing refcounted it and the reap had
-/// to drop it by hand or leak a pipe per spawn against a 64-pipe ceiling.
-///
-/// **There are no pipes.** A spawned child's stdio is one `ProcessChannel`,
-/// which is what an AArch64 spawn has always been, and an `Arc` needs no reap to
-/// notice it is finished. What the row still carries is the pair `waitpid` needs
-/// and nothing else: which pid this slot is, and which task slot to unpublish.
-#[derive(Clone, Copy)]
-struct Spawn {
-    pid: u32,
-    /// The scheduler task slot running this child, recorded at spawn so the
-    /// `waitpid` reap can remove the `THREAD_PID_MAP` entry it published
-    /// (`reap_exec_process`). A `usize` is wider than `sched::MAX_TASKS` needs,
-    /// but `usize::MAX` is not a sentinel here — every Spawn row has one.
-    exec_slot: usize,
-}
-
-const SPAWN_SLOTS: usize = PROC_SLOTS - SPAWN_SLOT_BASE;
-
-/// The spawn table: one row per spawned-process slot, as two arrays of atomics.
-///
-/// It was `static mut` reached through raw pointers, on the discipline the deleted
-/// `PROCS` had: the only writers run inside a syscall and none yield while touching
-/// it. That discipline is unchanged — the atomics do not make a *row* update
-/// atomic, only make each word's access defined — but it no longer costs an
-/// `unsafe` block per access. A row is "free" when its `pid` is 0 (no process has
-/// pid 0), so `exec_slot` is written first and `pid` last (Release), and read in
-/// the opposite order.
-pub struct SpawnTable {
-    pid: [AtomicU32; SPAWN_SLOTS],
-    exec_slot: [AtomicUsize; SPAWN_SLOTS],
-}
-
-impl SpawnTable {
-    const fn new() -> Self {
-        Self {
-            pid: [const { AtomicU32::new(0) }; SPAWN_SLOTS],
-            exec_slot: [const { AtomicUsize::new(0) }; SPAWN_SLOTS],
-        }
-    }
-
-    /// The row at `off`, or `None` when it is free or out of range.
-    fn get(&self, off: usize) -> Option<Spawn> {
-        let pid = self.pid.get(off)?.load(Ordering::Acquire);
-        (pid != 0).then(|| Spawn { pid, exec_slot: self.exec_slot[off].load(Ordering::Relaxed) })
-    }
-
-    fn is_free(&self, off: usize) -> bool {
-        self.get(off).is_none()
-    }
-
-    fn set(&self, off: usize, row: Spawn) {
-        debug_assert!(row.pid != 0, "pid 0 marks a free spawn row");
-        self.exec_slot[off].store(row.exec_slot, Ordering::Relaxed);
-        self.pid[off].store(row.pid, Ordering::Release);
-    }
-
-    fn clear(&self, off: usize) {
-        self.pid[off].store(0, Ordering::Release);
-    }
-
-    /// Rows in use.
-    fn used(&self) -> usize {
-        (0..SPAWN_SLOTS).filter(|&off| !self.is_free(off)).count()
-    }
-
-    /// The first free row's process slot (`SPAWN_SLOT_BASE + offset`).
-    pub fn first_free_slot(&self) -> Option<usize> {
-        (SPAWN_SLOT_BASE..PROC_SLOTS).find(|&s| self.is_free(s - SPAWN_SLOT_BASE))
-    }
-
-    /// The offset of the row naming `pid`.
-    fn position_of(&self, pid: u32) -> Option<usize> {
-        (0..SPAWN_SLOTS).position(|off| self.get(off).is_some_and(|row| row.pid == pid))
-    }
-}
-
-pub static SPAWN: SpawnTable = SpawnTable::new();
 
 /// The next pid.
 ///
@@ -2647,17 +2500,15 @@ pub fn current_pid() -> u32 {
     // parking.
     //
     // Unmapped means init: the self-tests run before `run_init` registers
-    // anything, and they are pid 1's work. That is the same answer the slot
-    // walk gave for `slot < SPAWN_SLOT_BASE`.
+    // anything, and they are pid 1's work.
     akuma_exec::process::current_thread_tgid_process().map_or(1, |(tgid, _)| tgid)
 }
 
 // ===========================================================================
 // 5b slice 1: akuma-exec's process table, populated (2026-09-08)
 //
-// `SPAWN` above is what is left of this target's *mechanism* — which pipes a
-// process slot reads and writes, and which scheduler task serves it. `akuma_exec`'s `PROCESS_TABLE` +
-// `THREAD_PID_MAP` are its *identity* — which pid is calling this syscall —
+// `akuma_exec`'s `PROCESS_TABLE` + `THREAD_PID_MAP` are this target's process
+// *identity* — which pid is calling this syscall —
 // and until now nothing here populated them, so every
 // `akuma_exec::process::current_process_shared()` a folded glue arm reached
 // answered `None`. Each `sys_spawn`/`sys_fork`/`run_init` below now also
@@ -3047,8 +2898,8 @@ pub fn register_exec_process(
 /// `task_slot → pid` map entry **only if the slot still names this pid**.
 ///
 /// That guard is load-bearing rather than tidy: task slots are recycled, and a
-/// zombie can sit in the `SPAWN` table long past the moment its finished task
-/// slot was handed to an unrelated process. Removing the entry unconditionally
+/// a stale row can name a task slot that has since been handed to an
+/// unrelated process. Removing the entry unconditionally
 /// would strip a live process's identity — every syscall it makes would
 /// degrade to the pre-slice fallbacks until its own insert re-stamps, which is
 /// exactly the silent-wrongness this table exists to prevent. Compare, then
@@ -3071,7 +2922,7 @@ pub fn reap_exec_process(pid: u32, task_slot: usize) {
     //
     // Inside this function rather than beside it, because it has two callers
     // and the second one is the path that is easy to forget: `sys_waitpid`'s
-    // fallback for a child the process table knows and no `SPAWN` row names.
+    // fallback for a child the process table knows and its own reap missed.
     // `reap_child_channel` declines while the channel still holds unread
     // stdout, so a parent mid-drain is not robbed of it.
     reap_child_channel(pid);
@@ -3177,10 +3028,8 @@ fn exec_load_errno(e: &str) -> u64 {
 fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     use crate::fd::errno;
 
-    let slot = current_proc_slot();
-    if slot >= PROC_SLOTS {
-        // Not a slotted user task — nothing to replace. (`current_proc_slot`
-        // answers `usize::MAX` off a user task, which this same bound catches.)
+    if current_process().is_none() {
+        // Not a user task — nothing to replace.
         return errno::ENOSYS;
     }
 
@@ -3373,9 +3222,9 @@ fn sys_fork() -> u64 {
     //   `spawn_user_closure_initializing` real x86_64 arms, so steps 6 and 7
     //   stop failing.
     //
-    // What is left here is the pid and the errno translation. The `SPAWN` row,
-    // the `CR3` root and the `UserCtx::proc_slot` — the three things shared code
-    // has no concept of — are bound through `ExecRuntime::bind_child_task`
+    // What is left here is the pid and the errno translation. The `CR3` root —
+    // the one thing shared code has no concept of — is bound through
+    // `ExecRuntime::bind_child_task`
     // below, in the one window where the child provably has not executed an
     // instruction.
     //
@@ -3402,7 +3251,7 @@ fn sys_fork() -> u64 {
         Err(e) => {
             // Named, not swallowed. Every failure inside `fork_process` is a
             // `&'static str` and `sh: can't fork: Out of memory` names the
-            // wrong resource for most of them — the `SPAWN` table filling up
+            // wrong resource for most of them — the process table filling up
             // being the one this target hits first.
             serial::puts("  [fork] ");
             serial::puts(e);
@@ -3431,84 +3280,36 @@ fn sys_spawn_clone(child_stack: u64) -> u64 {
 }
 
 /// **`ExecRuntime::bind_child_task` on this target** — give a freshly spawned
-/// `fork`/`vfork` child the three things `akuma-exec` has no concept of, in the
-/// window after its task slot exists and before it can be scheduled.
+/// child the one thing `akuma-exec` has no concept of, in the window after its
+/// task slot exists and before it can be scheduled: **`space_root`**, the
+/// page-table root the scheduler writes to `CR3` on every switch into this
+/// task. The crate's spawn leaves it `0` (kernel `CR3`) because it has no
+/// `Process` to read a root from, and the first switch into an unbound child
+/// would run ring-3 code against the kernel's tables.
 ///
-/// All three are keyed on the **task slot**, which is why this cannot happen
-/// before the spawn, and all three must be in place before publication, which
-/// is why it cannot happen after `mark_thread_ready`:
+/// Keyed on the **task slot**, which is why this cannot happen before the
+/// spawn, and needed before publication, which is why it cannot happen after
+/// `mark_thread_ready`.
 ///
-/// * **`space_root`** — the page-table root the scheduler writes to `CR3` on
-///   every switch into this task. The crate's spawn leaves it `0` (kernel
-///   `CR3`) because it has no `Process` to read a root from, and the first
-///   switch into an unbound child would run ring-3 code against the kernel's
-///   tables.
-/// * **the `SPAWN` row** — this target's per-process exit record.
-/// * **`UserCtx::proc_slot`** — the index naming that row, which
-///   [`run_process`] reads back for `thread::drain`.
-///   [`proc_entry`] reads it too, and refuses to enter ring 3 without it.
-///
-/// The row is swept for reaped predecessors first, for the reason `sys_fork`
-/// swept before it: glue's `wait4` frees the process, not the row (see
-/// [`sweep_reaped_spawn_rows`]), so without this the table fills with rows for
-/// processes that no longer exist and `fork` reports failure on a machine with
-/// gigabytes free.
-///
-/// **`stdin_pipe`/`stdout_pipe` are `None` and that is not a stub.** A `fork`
-/// child's fd 0/1/2 are *names* for the parent's descriptions, copied by
-/// `Process::inherit_from`'s `clone_deep_for_fork` and released by this child's
-/// own table at exit. It owns no pipe of its own; only `sys_spawn` creates one.
+/// It also wrote a `SPAWN` row and a `UserCtx::proc_slot` naming it until
+/// 2026-11-12. The row carried a pid and this task slot, both of which the
+/// registered `Process` and `THREAD_PID_MAP` already hold, and its sweep's one
+/// remaining job — dropping a reaped process's map row — is [`after_reap`]'s
+/// (`proposals/AKUMA_ONE_EXIT.md` step 4). A fork could fail with "no free
+/// SPAWN row" at 121 processes on a machine whose process table had room.
+// The `ExecRuntime::bind_child_task` hook's signature, which is fallible.
+#[allow(clippy::unnecessary_wraps)]
 pub fn bind_child_task(
     task_slot: usize,
     child: &akuma_exec::process::Process,
-    kind: akuma_exec::process::ChildKind,
+    _kind: akuma_exec::process::ChildKind,
 ) -> Result<(), &'static str> {
-    // The root first: **both** kinds need it, and a thread's is the parent's
-    // own — `clone_thread` builds the child a `new_shared` view of the same
-    // PML4, so `ttbr0()` answers the parent's root and the scheduler installs
-    // exactly the address space the thread is meant to share.
+    // **Both** kinds need it, and a thread's is the parent's own —
+    // `clone_thread` builds the child a `new_shared` view of the same PML4, so
+    // `ttbr0()` answers the parent's root and the scheduler installs exactly
+    // the address space the thread is meant to share. Whether the child is a
+    // thread or a process is its `Process` (`pid != tgid`), read at its entry.
     crate::sched::set_task_space_root(task_slot, child.address_space.ttbr0());
-
-    // A `clone` child is not a process and must not get a `SPAWN` row: that row
-    // is the target's per-*process* exit record, and one written for a thread
-    // would make the exit path publish an exit status — a `wait4` in the
-    // parent would reap a process that is still running. What a thread needs
-    // is only its parent's `proc_slot`, which routes its fds the same way; its
-    // identity, its group and its `clear_child_tid` are its registered
-    // `Process` (`crate::thread`'s "the process table is the thread list").
-    if kind == akuma_exec::process::ChildKind::Thread {
-        crate::sched::seed_proc_slot(task_slot, current_proc_slot());
-        return Ok(());
-    }
-
-    // No group state to clear here either: a `fork` child's `SharedSignalTable`
-    // is `clone_for_fork`'s, which starts not exiting. (Slot-indexed until
-    // 2026-11-12, it outlived its process, and a fork child on a recycled slot
-    // had every thread it created leave at its first syscall: `segvgroup`,
-    // 2026-09-12.)
-
-    // Collect any row the reaper left behind before looking for a free one.
-    sweep_reaped_spawn_rows();
-
-    let slot = SPAWN.first_free_slot();
-    let Some(slot) = slot else {
-        // A bare "out of memory" here reaches the user as `sh: can't fork: Out
-        // of memory`, which names the wrong resource: the table is full, and
-        // the machine may have gigabytes free. Say which, and how full.
-        let spawn_used = SPAWN.used();
-        serial::puts("  [fork] no free process slot: SPAWN ");
-        serial::put_dec(spawn_used as u64);
-        serial::puts("/");
-        serial::put_dec(SPAWN_SLOTS as u64);
-        serial::puts(" registered ");
-        serial::put_dec(akuma_exec::process::process_count() as u64);
-        serial::puts("\n");
-        return Err("fork: no free SPAWN row");
-    };
-
-    // Under the BKL, and the task is unpublished.
-    SPAWN.set(slot - SPAWN_SLOT_BASE, Spawn { pid: child.pid, exec_slot: task_slot });
-    crate::sched::seed_proc_slot(task_slot, slot);
     Ok(())
 }
 
@@ -3673,11 +3474,6 @@ pub fn sys_spawn(
 // a pipe fd 1 no longer had — and the descriptor said something different. Two
 // sources, one of them ignoring redirection.
 
-#[must_use]
-pub fn current_proc_slot() -> usize {
-    // Under the BKL; the running task's slot, or `usize::MAX` with none.
-    crate::sched::read_current_uctx(|u| u.proc_slot).unwrap_or(usize::MAX)
-}
 
 /// `close_child_stdin(pid)` — Akuma's syscall 326. `sshd` calls it when the
 /// client sends EOF on the channel, so the shell sees end-of-input.
@@ -3710,9 +3506,19 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
     r
 }
 
-/// What this kernel does after any reap (`waitpid`, `wait4`, `waitid`): free the
-/// `SPAWN` rows whose process is gone ([`sweep_reaped_spawn_rows`]), and drain
-/// the retired processes.
+/// What this kernel does after any reap (`waitpid`, `wait4`, `waitid`): drop the
+/// `THREAD_PID_MAP` rows the reap left naming a dead pid, and drain the retired
+/// processes.
+///
+/// **The map rows.** AArch64's slot recycler evicts a slot's row when it reuses
+/// it (`on_thread_cleanup`); this target's scheduler claims a `TERMINATED` slot
+/// directly and never asks, so a reaped process's row would name its dead pid
+/// until something re-stamped the slot. `sweep_dead_thread_identities` removes a
+/// row only when its slot is not live *and* its pid is not registered, and only
+/// if it still names that pid when it is removed — so a zombie keeps its row
+/// until its reap, and a slot reissued in between keeps its new owner. It
+/// replaced a sweep over the `SPAWN` table, which asked the same question of a
+/// second record of the same pair (`proposals/AKUMA_ONE_EXIT.md` step 4).
 ///
 /// **The reap is a drain site on this target.** `process::reclaim`'s vetted
 /// sites here are the exit path's terminal drain, the idle loop and the PMM
@@ -3723,65 +3529,8 @@ pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
 /// nothing" checks each saw a whole image outstanding. The lock context is the
 /// one the module requires: inside a syscall, holding the BKL and nothing else.
 pub fn after_reap() {
-    sweep_reaped_spawn_rows();
+    let _ = akuma_exec::process::sweep_dead_thread_identities();
     akuma_exec::process::reclaim::drain_retired_if_requested();
-}
-
-/// The spawn-row index for `pid`, or `None`.
-///
-/// The row is addressed by pid rather than by slot since 5b slice 2: the
-/// process table decides *which* child is being reaped, and this finds the
-/// stdio that goes with it.
-/// Free every `SPAWN` row whose process has been reaped, and drop the one pipe
-/// end nothing else holds.
-///
-/// # Why a sweep and not a reap hook
-///
-/// Since 2026-09-10 the reaper is `akuma-syscalls-glue`'s `wait4`: it
-/// unregisters the process and reaps the child channel, and it knows nothing
-/// about this target's `SPAWN` table — nor should it, since the two things left
-/// in a row are a scheduler task slot and a `crate::pipe` id, neither of which
-/// exists on the other kernel.
-///
-/// A hook was the obvious alternative and is the wrong shape here. The reap is
-/// not the only way a row can become stale — a reparented orphan collected by
-/// init, a `wait4` that returned `EFAULT` after unregistering, a future second
-/// waiter — and a hook has to be called from every one of them, correctly,
-/// forever. "The process this row names is no longer registered" is checkable
-/// and true in all of them, so the sweep asks the question instead of trusting
-/// a call site to answer it. It runs after each `wait4` and again when
-/// `sys_spawn` looks for a free slot, which are the only two moments the answer
-/// matters.
-///
-/// **`pipe::close_write`, not `pipe::free`**, for the reason
-/// [`Spawn::stdin_pipe`]'s doc gives: a reader reference on that pipe can
-/// It released the spawn's stdin-pipe writer reference too, until the pipes
-/// themselves went (2026-09-11). A `ProcessChannel` needs no such hand: the last
-/// `Arc` out drops it.
-pub fn sweep_reaped_spawn_rows() {
-    for off in 0..SPAWN_SLOTS {
-        // Under the BKL; nothing yields between the read and the write below.
-        let Some(Spawn { pid, exec_slot: slot }) = SPAWN.get(off) else {
-            continue;
-        };
-        if akuma_exec::process::lookup_process_shared(pid).is_some() {
-            continue;
-        }
-        // The child's task reached `sched::finish()` before its process could
-        // be unregistered, so nothing is running on `slot`.
-        SPAWN.clear(off);
-        // The identity map entry this row's spawn published, removed only if it
-        // still names this pid — task slots are recycled, and stripping a live
-        // process's identity would degrade every syscall it makes until its own
-        // insert re-stamped.
-        if akuma_exec::process::pid_for_thread(slot) == Some(pid) {
-            akuma_exec::process::thread_pid_map_remove(slot);
-        }
-    }
-}
-
-pub fn spawn_row_of(pid: u32) -> Option<usize> {
-    SPAWN.position_of(pid)
 }
 
 

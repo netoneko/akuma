@@ -17,8 +17,7 @@
 //! |---|---|
 //! | a new `UserAddressSpace` (CoW-shared) | the parent's, unchanged |
 //! | its own frame ledger (inside that address space) | none — it owns no frames |
-//! | a process slot and a `Spawn` record | the parent's, shared |
-//! | its own fd routing (`UserCtx::proc_slot`) | the parent's, shared |
+//! | its own fd table (`clone_deep_for_fork`) | the parent's, shared (`CLONE_FILES`) |
 //! | its own `%fs` base, copied from the parent | its own, **from `CLONE_SETTLS`** |
 //! | a `waitpid`-visible exit status | a `futex` wake on `clear_child_tid` |
 //!
@@ -191,9 +190,8 @@ pub fn sys_clone_thread(
     tls: u64,
 ) -> u64 {
     // A task that is not running a registered process has no thread group to
-    // join. `current_proc_slot` answering `usize::MAX` is how that shows up,
-    // and the child would have no fd routing to share.
-    if crate::usermode::current_proc_slot() >= crate::usermode::PROC_SLOTS {
+    // join. (`clone_thread` would refuse too, with a less exact errno.)
+    if crate::usermode::current_process().is_none() {
         return errno::ENOSYS;
     }
 

@@ -17,9 +17,12 @@ too. `spawn_stale_group_state_test` (a boot test that poisoned the next spawn sl
 left to poison and is replaced by host tests (`akuma_exec::process::signal::group_exit_tests`).
 Gates: amd64 suite 826/836/832 (the retired test's 5 checks; SMP=4's further 4 are the
 by-design spawn skip), AArch64 312/320/318; probes and ssh exit status equal to step 1 on
-amd64 and all-pass on AArch64. The 3 `DRAIN INCOMPLETE` lines after `lifeprobe`'s SIGKILL
-(a stale `THREADS` row in the dead process's slot) appear on the step-1 kernel too; step 3
-removes the table they come from.
+amd64 and all-pass on AArch64. The 3 `DRAIN INCOMPLETE` lines appear on the step-1 kernel
+too. *Corrected 2026-11-12:* they were blamed here on a stale `THREADS` row after `lifeprobe`'s
+SIGKILL. Step 3 deleted the table, the lines stayed, and once `drain` reported by tgid they
+named `groupexit_thread`'s group: its `pause()` sibling never saw the group exit
+([`docs/archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md`](../docs/archive/AKUMA_PAUSE_IGNORES_GROUP_EXIT.md),
+fixed in cc546fd2).
 
 Step 3 done (2026-11-12): amd64's `THREADS` table is gone. A group's live threads are the
 process table's rows with its `tgid` and a live `THREAD_PID_MAP` slot
@@ -30,7 +33,17 @@ before it counts, so no thread joins after the count reaches zero. `UserCtx::thr
 reserved word (the assembly's offsets past it are fixed). Gates: amd64 suite 826/836/832,
 AArch64 312/320/318, both equal to step 2.
 
-Step 4 not started.
+Step 4 done (2026-11-12): amd64's `SPAWN` table, `PROC_SLOTS`, `UserCtx::proc_slot` (now a
+reserved word, for the assembly's offsets) and `seed_proc_slot` are gone. "Is this a user task"
+is "does it have a registered `Process`"; `bind_child_task` only sets the `CR3` root; the
+sweep's last job moved to `after_reap` as `akuma_exec::process::sweep_dead_thread_identities`,
+which drops a `THREAD_PID_MAP` row only when its slot is not live *and* its pid is not
+registered, and only if it still names that pid. A fork no longer fails at 121 processes with
+"no free SPAWN row"; the process table is the only ceiling. Gates: amd64 suite 826/836/832,
+AArch64 312/320/318; no `DRAIN INCOMPLETE` anywhere; probes and ssh exit status equal to
+step 3. Still open on amd64: `orphanthr`'s thread-child case (a child of an already-exited
+worker keeps the dead ppid). `lifeprobe`'s orphan check fails only because that rig boots
+`sshd` as pid 1, which does not reap.
 
 ### What step 1 found
 

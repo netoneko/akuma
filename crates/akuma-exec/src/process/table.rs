@@ -813,6 +813,59 @@ pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
     })
 }
 
+/// Remove every `THREAD_PID_MAP` row whose thread slot is no longer live and whose pid is no
+/// longer registered, and return how many went.
+///
+/// For a kernel whose slot recycler does not evict map rows itself (amd64 claims a `TERMINATED`
+/// slot directly; AArch64's `on_thread_cleanup` evicts at recycle and never needs this). Run it
+/// after a reap: a reaped process's row then names a pid nothing resolves, on a slot nothing
+/// runs.
+///
+/// **Both tests, and each one is load-bearing.** "Pid not registered" alone would strip a row
+/// that `clone_thread`/`spawn` published a moment before registering the pid; "slot not live"
+/// alone would strip a zombie's row while its parent may still `kill` it. A row is removed only
+/// if it still names the same pid when the lock is retaken, so a slot reissued in between keeps
+/// its new owner.
+///
+/// Allocation-free; at most [`SWEEP_BATCH`] rows per call, and a remainder waits for the next
+/// reap.
+pub fn sweep_dead_thread_identities() -> usize {
+    let mut rows = [(0usize, 0 as Pid); SWEEP_BATCH];
+    let mut n = 0usize;
+    with_irqs_disabled(|| {
+        for (&tid, &pid) in THREAD_PID_MAP.lock().iter() {
+            if n == SWEEP_BATCH {
+                break;
+            }
+            if !crate::threading::slot_is_live(tid) {
+                rows[n] = (tid, pid);
+                n += 1;
+            }
+        }
+    });
+    let mut removed = 0usize;
+    for &(tid, pid) in &rows[..n] {
+        if active_process_ref(pid).is_some() {
+            continue;
+        }
+        let gone = with_irqs_disabled(|| {
+            let mut map = THREAD_PID_MAP.lock();
+            if map.get(&tid) == Some(&pid) {
+                map.remove(&tid);
+                identity_clear_locked(tid);
+                true
+            } else {
+                false
+            }
+        });
+        removed += usize::from(gone);
+    }
+    removed
+}
+
+/// Rows [`sweep_dead_thread_identities`] looks at per call.
+pub const SWEEP_BATCH: usize = 64;
+
 /// A process whose last thread is leaving ring 3 for good **keeps its thread
 /// slot until it is reaped**: the slot is not reissued while the process is a
 /// zombie, and [`retire_process`] gives it back.

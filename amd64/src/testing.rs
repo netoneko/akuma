@@ -135,11 +135,11 @@ pub mod uaccess {
 /// Ring 3: the process machinery the `usermode` tests drive by hand.
 pub mod usermode {
     pub use crate::usermode::{
-        alloc_pid, current_pid, current_proc_slot, current_process, reap_exec_process,
-        register_exec_process, run_init, spawn_process_task, spawn_row_of, sweep_reaped_spawn_rows,
+        alloc_pid, current_pid, current_process, reap_exec_process,
+        register_exec_process, run_init, spawn_process_task,
         syscall_dispatch, sys_spawn, sys_waitpid, sys_write, to_glue, with_current_address_space,
         with_current_regions, Image, AF_UNIX, elf_stack_max_pages, ELF_STACK_PAGES, ELF_STACK_TOP,
-        SPAWN, SPAWN_FLAG_PTY, SPAWN_SLOT_BASE, SYSCALL_TRACE, WRITE_CPU, WRITE_SEQ,
+        SPAWN_FLAG_PTY, SYSCALL_TRACE, WRITE_CPU, WRITE_SEQ,
         WRITE_SEQ_LEN,
     };
 }
