@@ -53,3 +53,16 @@ the RED phase proves the probes themselves before any pass claims anything.
   own* verdict on parser bugs (lowercase grep, eval quoting) — the stall protocol's
   "one hypothesis → one change → re-run" never needed a third; the probes were proven by being
   trusted over the parser, not the reverse.
+
+## Record
+
+- 2026-11-13 (PHASE-1-METHOD GREEN): one binary, named arms, phase-2 gates grep the names.
+- 2026-11-13 (PHASE-2-WX GREEN): the vocabulary paid off first-hand — `RWX PASS rw_to_rx=42`
+  judged the gate on the first capture, on the same image that RED'd it in phase 1. Two probe
+  debts filed for the next gate's research: (1) the `java` arm names exit-vs-signal but not the
+  *fault* — a raw `signal=11 first=""` was past-blocker-1 by the letter and opaque in fact; the
+  next gate (FAULTNAME) exists to make such deaths readable (kernel prints rip/cr2). (2) The
+  probe scripts carry no epoch stamps, so wall-clock per step is reconstructed, not measured —
+  stamp `date +%s` at each arm (probe-method.sh's H1 shape already does this; copy it).
+  Rig facts: bare `ls` is not on the guest ssh PATH (`/bin/busybox ls`); `-Xlog:all=info`
+  wedges the guest — do not use it as a diagnostic there until the wedge is understood.

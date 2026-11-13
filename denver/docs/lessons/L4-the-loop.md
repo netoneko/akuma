@@ -48,3 +48,19 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   protocol never reached two hypotheses on one question). Machine facts recorded: host clock
   slew, kernel 0.0.9's RWX baseline vs the guest stack's EACCES, no xattr syscalls (mke2fs
   needed `-E no_copy_xattrs`).
+
+## Record
+
+- 2026-11-13 (PHASE-1-METHOD GREEN): H1 measured at 0–1 s (clamped; epochs logged), whole
+  method 9 s wall clock, three gate runs total (two parser-bug verdicts, one GREEN — the stall
+  protocol never reached two hypotheses on one question). Machine facts recorded: host clock
+  slew, kernel 0.0.9's RWX baseline vs the guest stack's EACCES, no xattr syscalls (mke2fs
+  needed `-E no_copy_xattrs`).
+- 2026-11-13 (PHASE-2-WX GREEN): the kernel-change cycle, phase 2's first measurement (Do step
+  2, kept honest by naming *which* cycle): feature build 24 s cold-chain; rebuild → stage →
+  boot → RESULT PASS ≈ 4 min; WIP commit → gate capture ≈ 11 min; one gate run, GREEN first
+  capture (the phase-1 RED suite is what bought that — the probes were already proven). The
+  per-step number is reconstructed from build outputs, not stamped — L2 debt (1)/(2); the
+  diagnostics-first rule paid for itself twice in one session: the console census re-ranked the
+  curriculum for free (no rebuild needed to learn `getcpu` was unreached), and the two appended
+  boots named the movement raw-SIGSEGV/no-report before any fix could be guessed at.

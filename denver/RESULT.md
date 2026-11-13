@@ -199,3 +199,50 @@ history and the `/src/akuma-merge` main checkout.
 (G1: the W^X relaxation behind an off-by-default feature in `akuma-syscalls-mem::wx`, mapped
 1:1 through `akuma-jvm-kernel` → `denver`; gate greps `RWX PASS` from the guest and the java
 arm past the blocker-1 line).
+
+---
+
+## Gate PHASE-2-WX — session 4, 2026-11-13 20:09–21:10 UTC — GREEN (opens phase 2)
+
+**Goal:** close G1 (`denver/docs/REQUIREMENTS.md`): the W^X policy must let HotSpot's
+executable-page marking through, behind an off-by-default feature relayed 1:1 through the
+front crate (phase-1 transition line). Pass: `RWX PASS rw_to_rx=42` from the guest + the java
+arm past the blocker-1 line, captured first-hand in `denver/gates/PHASE-2-WX.log`.
+
+**Commands and outcomes** (capture: `denver/gates/PHASE-2-WX.log`; gate run first, two
+diagnostic boots appended in the same file):
+
+| step | command | outcome |
+|---|---|---|
+| research first (R1) | `denver/docs/research/PHASE-2-WX.md` (D13–D16) | precedents: `TAOXICHUAN_WX_POLICY.md`, git `0dcc33e7`, BUG_FIX_LIST Fix 18 (metal grants W|X), attempt policy note |
+| feature, pure half | `wx-relaxed` in `akuma-syscalls-mem` (checks answer `Allow`) | host tests: 46 strict / 43 relaxed, both green (`cargo test -p akuma-syscalls-mem --target x86_64-unknown-linux-musl [--features wx-relaxed]`) |
+| feature, machine half | `WX_ENFORCE` boots `!cfg!(feature)` (the `wx=0` hatch at compile time) | relay `denver`→`akuma-jvm-kernel`→`akuma-tokio-kernel`→`akuma-tokio-kernel-amd64`→`akuma-syscalls-mem`; ~45 kernel LOC |
+| R6 check | `cargo build -p denver / -p taoxichuan --target x86_64-unknown-none --release` (no features) | **PASS** 22.8 s / 22.9 s — default builds unchanged |
+| gate kernel | `cargo build -p denver --features wx-relaxed --target x86_64-unknown-none --release` → `/root/denver/w/denver-wx` + `vm-wx.spec` | **PASS** 24.2 s; phase-0/1 rig untouched (D15) |
+| gate probe | `sh denver/probe-wx.sh 2>&1 \| tee denver/gates/PHASE-2-WX.log` | **RESULT PASS first capture**; `uname` = `0.1.0-8a658723-denver` (the relaxed build's hash, in the capture) |
+| platform sanity | `/bin/tokioprobe` | **PASS** — RUNTIME/UNAME/HTTPS green under the relaxed policy |
+| G1 verdict arm | `/bin/jvmprobe rwx` | `RWX INFO mmap-RWX-allowed` + **`RWX PASS rw_to_rx=42`** (phase 1's RED on this same image: EACCES ×2) |
+| G1 movement arm | `/bin/jvmprobe java /opt/jdk/bin/java -version` | **past blocker-1** (`Failed to mark memory page…` never appears): now `JVM RED signal=11 first=""` — raw SIGSEGV, 0 bytes, no `hs_err`, no core; ×3 boots reproducible |
+| diagnostics (R8) | two appended boots: census + `hs_err` search + `-Xlog` try | `[Fault] slot 5 killed (SIGSEGV)` (kernel names the death, not the address); `getcpu(168)` never called — death precedes `os::init_2`; ENOSYS window: `setitimer(38)`, `membarrier(324)`, `sysinfo(99)`, `prlimit64(302)`, `getrlimit(97)`, uid/gid family; `/root` empty (no report file); `-Xlog:all=info` **wedged the guest** (ssh keepalive loss — the attempt's tool unusable as-is on this rig); bare `ls` not on guest PATH (`/bin/busybox`) |
+
+**Verdict.** Gate GREEN on the session's first capture: the W^X relaxation is real
+(mmap-RWX succeeds; RW→write→RX→execute returns 42), tokio is unregressed, and the workload
+moved past the blocker-1 line — exactly the phase-1 pass condition. The movement is honestly
+named: the workload now dies at an *unnamed* SIGSEGV before ever calling `getcpu`, so G2 is
+proven **not** the next init blocker; REQUIREMENTS.md re-ranked openly (G6
+`PHASE-2-FAULTNAME` inserted, reason recorded there and in LOOP_LOG D-3).
+
+**Interventions:** none. Machine facts recorded (not fought): `-Xlog:all=info` wedges the
+guest; guest ssh shell has no bare `ls` (`/bin/busybox ls`); HotSpot's report path produces
+nothing for this fault (the kernel-side line is the only namer); `[E2-EOF]` spam during the
+libjvm mapping (past-EOF page fill, non-fatal — the JVM mapped fine in phase 1 with the same
+image); `membarrier(324)` ENOSYS on the amd64 machine half although the pure decision exists
+(`akuma-syscalls-mem::membarrier`) — composition hole filed for the next sessions (R2).
+
+**Kernel-change cycle measured** (L4's phase-2 deliverable): feature build 24 s; rebuild →
+stage → boot → verdict ≈ 4 min; WIP commit → RESULT PASS capture ≈ 11 min (the probe script
+carries no epoch stamps — noted in L2 as the probe improvement the next gate's research
+owns).
+
+**Wall clock:** ~61 min (20:09–21:10 UTC). **Token spend:** not instrumented in-session; the
+driver log (`/tmp/denver-autoresearch.log`) is the ledger.

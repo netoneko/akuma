@@ -50,3 +50,16 @@ capability gap with evidence, and rank by the workload's own order, never by tas
 - 2026-11-13 (PHASE-1-METHOD GREEN): table written from first-hand lines; G1 W^X (guest-proven),
   G2 getcpu (both kernels), G3 vDSO (metal-proven, guest-unreached), G4 procfs auxv/maps
   (diagnostics), G5 time cost (deferred). Decisions: D11 (A/B both kernels). Zero interventions.
+
+## Record
+
+- 2026-11-13 (PHASE-1-METHOD GREEN): table written from first-hand lines; G1 W^X (guest-proven),
+  G2 getcpu (both kernels), G3 vDSO (metal-proven, guest-unreached), G4 procfs auxv/maps
+  (diagnostics), G5 time cost (deferred). Decisions: D11 (A/B both kernels). Zero interventions.
+- 2026-11-13 (PHASE-2-WX GREEN): the rank is *alive* — closing G1 moved the first blocker to an
+  unnamed SIGSEGV that fires before `getcpu` (console census: `nr=168` never called). The table
+  re-ranked openly with the reason recorded in the file (its own pre-authorized clause: "re-rank
+  openly if evidence changes it"); new row G6 + new order FAULTNAME → GETCPU → PROCFS → VDSO.
+  Lesson: the rank is a snapshot of the workload's init order *at a kernel policy state* — a
+  closed gap re-orders the queue, so every pass ends by re-reading the table against fresh
+  evidence, not by taking its own NEXT line forward blindly.

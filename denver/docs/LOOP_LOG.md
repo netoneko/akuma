@@ -127,3 +127,57 @@ passed, diagnostics arm) cleanly on both kernels; hypothesis-to-verdict cycle me
 clamped; whole method 9 s wall clock).
 
 NEXT GATE: PHASE-2-WX
+
+### PHASE-2-WX — 2026-11-13, session 4 (goose, glm-5.3-flash; opens phase 2)
+
+**What we did.** Took the transition line (phase-1 D-carry: zero interventions → the agent
+opens phase 2 itself). Research first (R1): `denver/docs/research/PHASE-2-WX.md`, decisions
+D13–D16, precedents cited (R9): the canonical `TAOXICHUAN_WX_POLICY.md` (the `wx=0` escape
+hatch — "restores the old behaviour (`PROT_EXEC` widens a mapping to RWX)"), git `0dcc33e7`
+(taoxichuan later made W^X unconditional — a kernel *generation* decides its default policy),
+`BUG_FIX_LIST`/`AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md` Fix 18 (the metal went the other way and
+*grants* W|X for V8 — two sibling kernels already chose opposite policies, so a per-build
+policy switch is the established shape), the attempt doc's policy note ("running any JVM here
+means giving up W^X … a policy decision, not a bug"). Then the smallest change the plan allows
+(~45 kernel LOC): the `wx-relaxed` feature — the pure checks in `akuma-syscalls-mem::wx`
+answer `Allow` (host-tested both ways: 46 strict / 43 relaxed, all green), and `WX_ENFORCE` in
+`akuma-tokio-kernel-amd64` boots `false`, which is the proven `wx=0` behavior path at compile
+time; relayed 1:1 `denver` → `akuma-jvm-kernel` → `akuma-tokio-kernel` → the machine half (the
+`console` naming rule; off by default at every level — R6, default builds unchanged, re-verified
+`-p denver` and `-p taoxichuan`). Rig: a *second* kernel binary `denver-wx` + `vm-wx.spec`
+(D15, D4's rule — the phase-0/1 rig stays byte-reproducible), `denver/probe-wx.sh` (vm-probe
+shape, D16). Gate run: **RESULT PASS first capture** in `denver/gates/PHASE-2-WX.log` —
+platform sanity (`tokioprobe` PASS under the relaxed policy), `RWX INFO mmap-RWX-allowed` +
+`RWX PASS rw_to_rx=42` (the RED phase 1 captured on this same image, closed), and the workload
+past the blocker-1 line. Diagnostics (R8, two appended boots in the same log): the movement is
+a **raw SIGSEGV, zero output, no `hs_err`, no core, 3 boots reproducible**; the kernel names
+the death but not the address (`[Fault] slot 5 killed (SIGSEGV)`); the console census proves
+`getcpu` was **never called** (death precedes `os::init_2`; last ENOSYS calls: `setitimer(38)`,
+`membarrier(324)`, `sysinfo(99)`, `prlimit64(302)`, `getrlimit(97)`, uid/gid family);
+`-Xlog:all=info` wedges the guest; bare `ls` is not on the guest ssh PATH (`/bin/busybox`).
+
+**What decision it forced.**
+1. *The relaxation is one feature flipping the default of the existing hatch* (D13/D14) — not
+   new enforcement logic and not a runtime flag: `wx=0` already flips every enforcement point,
+   so the feature is "the hatch at compile time". The pure crate's flip is its host-tested
+   policy statement (R3); the machine half rides the same feature name; no `wx=1` exists (R7).
+2. *The gate kernel is a second rig binary, not an overwrite* (D15) — the RED gate stays
+   reproducible, D4's rule applied to the kernel side.
+3. *The rank re-ranked on evidence, openly* (recorded in REQUIREMENTS.md): closing G1 moved
+   the first blocker to an unnamed SIGSEGV that fires before `getcpu`; the runbook's
+   diagnostics-before-bugs rule and the attempt doc's own next step ("the fault handler
+   printing the VMA") insert **PHASE-2-FAULTNAME** (G6: the user-SIGSEGV delivery path prints
+   rip+cr2 with the `[Fault]` line — the aarch64 sibling's `ec=`/`far=` shape is the precedent,
+   the amd64 line is the site) ahead of G2. G2 stays open (the arm still REDs; HotSpot exits
+   on it later), G4 stays ahead of G3.
+4. *`membarrier(324)` ENOSYS on the amd64 machine half* — found while reading the census: the
+   pure decision (`akuma-syscalls-mem::membarrier`) exists, the arm is not wired there. A
+   composition hole (R2), filed for the G2/PROCFS sessions' research, not fixed here.
+5. *Zero interventions again* — autonomy holds into the next pass.
+
+**Gate state:** GREEN (`RESULT PASS` + `RWX PASS rw_to_rx=42` in `denver/gates/PHASE-2-WX.log`,
+first-hand capture, gate run + diagnostic boots in one file). Kernel-change cycle measured
+(L4): build `--features wx-relaxed` 24 s, rebuild+stage+boot+verdict ≈ 4 min; the whole gate
+from WIP commit to capture ≈ 11 min.
+
+NEXT GATE: PHASE-2-FAULTNAME
