@@ -75,3 +75,23 @@ and would kill the session running on the machine. Escape hatch: denver/ESCALATE
 RESULT FAIL: no /dev/kvm0 — host not booted with kvmctl; scaffold + build complete and captured
 above; boot probe pending the host reboot. This file must gain a RESULT PASS line from the
 post-reboot session (rerun: ESCALATE_ANSWERED=1 sh denver/autoresearch.sh 1 PHASE-0-SCAFFOLD).
+
+----------------------------------------------------------------------------------------------
+POST-REBOOT BOOT PROBE - 2026-11-13 18:2x UTC, ryzen metal, host booted into GRUB entry 29
+(`kvmctl kvmmem=4096`, the "KVM herd" entry), run by hand from the Mac over ssh (:2222) while
+the autoresearch driver was not running. Command: `sh /root/denver/vm-probe.sh` (now
+denver/vm-probe.sh). The stale VM from the host's old `akuma-install-*` services was stopped
+first (EBUSY, errno 16, on the first attempt - the slot, not KVM).
+----------------------------------------------------------------------------------------------
+== free the VM slot (a stale guest answers EBUSY)
+== boot: herd vm-run /root/denver/w/vm.spec
+== uname
+Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux
+== tokioprobe
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.14s)
+  title: Akuma
+RESULT PASS
+RESULT PASS

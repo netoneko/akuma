@@ -15,6 +15,12 @@ once for the why, never edit it.
   implementation exceeds ~2× the LOC estimate, stop and re-research (R5).
 - A gate passes only when the named probe line appears in captured output saved to
   `denver/gates/<gate>.log`. Self-assessment is not evidence.
+- **Booting the guest: use `sh denver/vm-probe.sh 2>&1 | tee denver/gates/<gate>.log`**, not a bare
+  `herd vm-run`. The host runs one VM at a time; a stale guest answers `the kernel refused the spec
+  (errno 16)` (EBUSY), which is a taken slot and not a broken KVM. The script frees the slot, boots,
+  waits for an ssh round trip, runs `uname` + `tokioprobe`, and stops the guest. Phase 0's gate
+  passed through it on the metal (2026-11-13). A different probe for a later gate: copy its shape,
+  keep the free-the-slot step and the stop at the end.
 
 ## Gates (per phase; the runbook holds the table)
 
