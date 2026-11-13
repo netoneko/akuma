@@ -18,6 +18,10 @@ no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`), and keep
 # the evidence rings the leak gate reads.
 trace-err = []
+# The JIT-permitting W^X relaxation (PHASE-2-WX, G1): `WX_ENFORCE` boots off - the `wx=0` hatch's
+# behaviour at compile time - and the pure checks in `akuma-syscalls-mem::wx` answer Allow. Off by
+# default (R6); one policy per kernel build, no per-program exemption (R7).
+wx-relaxed = ["akuma-syscalls-mem/wx-relaxed"]
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # The default devices, each wired by its `Kernel` method (`console()`, `disk()`, `net()`, `smp()`).

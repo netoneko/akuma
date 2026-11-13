@@ -18,11 +18,21 @@
 //! requests; Linux itself allows both, so this is deliberately *stricter than Linux*. Programs that need a
 //! JIT (V8, a JVM, LuaJIT, `libffi` closures on some targets) cannot run under it; the kernel keeps a switch
 //! (`wx=0` on the command line) rather than a per-program exemption.
+//!
+//! The compile-time statement of that switch is the `wx-relaxed` feature (off by default, R6): a kernel that
+//! builds with it has chosen to permit JITs, and every check here answers [`Wx::Allow`] - exactly what `wx=0`
+//! gives at runtime, no per-program exemption either way (R7). Sibling kernels already chose opposite
+//! policies (the metal grants W|X for V8, `AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`; taoxichuan made W^X
+//! unconditional, git `0dcc33e7`), so the choice belongs to the kernel build, not to this crate.
 
 use akuma_syscalls_linux::flags::prot;
 
 const PROT_WRITE: u64 = prot::PROT_WRITE as u64;
 const PROT_EXEC: u64 = prot::PROT_EXEC as u64;
+
+/// The `wx-relaxed` feature as a policy value: `true` means the JIT-permitting policy, and every
+/// check below answers [`Wx::Allow`].
+const RELAXED: bool = cfg!(feature = "wx-relaxed");
 
 /// The outcome of a W^X check.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -52,13 +62,25 @@ pub const EACCES: u64 = 13;
 /// Check the protection of a whole `mmap`/`mprotect` request: writable and executable together is refused.
 #[must_use]
 pub const fn check_prot(prot: u64) -> Wx {
-    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 { Wx::RefuseWriteExec } else { Wx::Allow }
+    if RELAXED {
+        Wx::Allow
+    } else if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        Wx::RefuseWriteExec
+    } else {
+        Wx::Allow
+    }
 }
 
 /// Check one page of an `mprotect` that asks for `prot`: executable is refused if the page was written.
 #[must_use]
 pub const fn check_page(prot: u64, page_written: bool) -> Wx {
-    if prot & PROT_EXEC != 0 && page_written { Wx::RefuseWrittenPage } else { Wx::Allow }
+    if RELAXED {
+        Wx::Allow
+    } else if prot & PROT_EXEC != 0 && page_written {
+        Wx::RefuseWrittenPage
+    } else {
+        Wx::Allow
+    }
 }
 
 /// Check a whole range for `mprotect`: the call, then each page's written bit (stopping at the first
@@ -69,8 +91,8 @@ pub fn check_range(prot: u64, mut page_written: impl FnMut(u64) -> bool, pages: 
     if w != Wx::Allow {
         return w;
     }
-    if prot & PROT_EXEC == 0 {
-        return Wx::Allow; // dropping or never gaining exec needs no per-page look
+    if RELAXED || prot & PROT_EXEC == 0 {
+        return Wx::Allow; // the relaxed policy, or no exec asked: nothing to refuse, no page to look at
     }
     for i in 0..pages {
         let v = check_page(prot, page_written(i));
@@ -81,7 +103,7 @@ pub fn check_range(prot: u64, mut page_written: impl FnMut(u64) -> bool, pages: 
     Wx::Allow
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "wx-relaxed")))]
 mod tests {
     use super::*;
     const PROT_NONE: u64 = prot::PROT_NONE as u64;
@@ -129,5 +151,29 @@ mod tests {
         assert_eq!(Wx::Allow.errno(), None);
         assert_eq!(Wx::RefuseWriteExec.errno(), Some(13));
         assert_eq!(Wx::RefuseWrittenPage.errno(), Some(13));
+    }
+}
+
+#[cfg(all(test, feature = "wx-relaxed"))]
+mod relaxed_tests {
+    use super::*;
+    const PROT_READ: u64 = prot::PROT_READ as u64;
+
+    #[test]
+    fn the_relaxed_policy_answers_allow_everywhere() {
+        assert_eq!(check_prot(PROT_WRITE | PROT_EXEC), Wx::Allow);
+        assert_eq!(check_page(PROT_READ | PROT_EXEC, true), Wx::Allow);
+        assert_eq!(check_range(PROT_WRITE | PROT_EXEC, |_| true, 8), Wx::Allow);
+        // The policy value changed; the refusals still answer EACCES when built by hand.
+        assert_eq!(Wx::RefuseWriteExec.errno(), Some(13));
+        assert_eq!(Wx::RefuseWrittenPage.errno(), Some(13));
+    }
+
+    #[test]
+    fn the_relaxed_range_walk_never_touches_a_page() {
+        let mut asked = 0;
+        let v = check_range(PROT_READ | PROT_EXEC, |i| { asked += 1; i == 2 }, 100);
+        assert_eq!(v, Wx::Allow);
+        assert_eq!(asked, 0);
     }
 }

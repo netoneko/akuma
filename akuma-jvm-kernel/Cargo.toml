@@ -28,6 +28,10 @@ shell = ["akuma-tokio-kernel/shell"]
 no-tests = ["akuma-tokio-kernel/no-tests"]
 # Name every syscall that answers a negative errno on the console.
 trace-err = ["akuma-tokio-kernel/trace-err"]
+# The JIT-permitting W^X relaxation (PHASE-2-WX, G1): permits W|X and RW->R+X for the JVM's code
+# cache, relayed 1:1 onto akuma-tokio-kernel. Off by default (R6) - a kernel build states its
+# policy by enabling it (the console propagation pattern, phase-0 D2).
+wx-relaxed = ["akuma-tokio-kernel/wx-relaxed"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

@@ -7,6 +7,13 @@ description = "The memory-syscall family's pure decisions: mmap's mapping-kind p
 [lints]
 workspace = true
 
+[features]
+# The JIT-permitting W^X policy (PHASE-2-WX, G1; off by default - R6: the repo's default build
+# keeps W^X). A kernel that builds with it permits W|X and exec-on-written pages, exactly what
+# the `wx=0` command-line hatch gives at runtime
+# (docs/archive/TAOXICHUAN_WX_POLICY.md); no per-program exemption (R7).
+wx-relaxed = []
+
 [dependencies]
 # The ABI (MAP_*/PROT_*/MREMAP_*/MADV_* tables) and the errno table. Both are
 # leaves. Deliberately NOT akuma-exec, and deliberately NOT akuma-mmap: this crate

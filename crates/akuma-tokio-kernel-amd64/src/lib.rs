@@ -266,8 +266,11 @@ use akuma_pte_amd64::{ADDR_MASK as PTE_ADDR, COW as PTE_COW, D as PTE_D, RW as P
 
 /// W^X (`akuma_syscalls_mem::wx`): no page is writable and executable, and a page written since it was
 /// mapped cannot be made executable. On by default; `wx=0` on the kernel command line turns it off for a
-/// guest that needs a JIT. Stricter than Linux on purpose.
-static WX_ENFORCE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+/// guest that needs a JIT. Stricter than Linux on purpose. The `wx-relaxed` feature (PHASE-2-WX, off by
+/// default - R6) is this hatch at compile time (docs/archive/TAOXICHUAN_WX_POLICY.md, "escape hatch"; the
+/// cmdline form stays for a build without the feature; there is no `wx=1` - the policy is the policy, R7).
+static WX_ENFORCE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(!cfg!(feature = "wx-relaxed"));
 fn wx_on() -> bool {
     WX_ENFORCE.load(core::sync::atomic::Ordering::Relaxed)
 }
