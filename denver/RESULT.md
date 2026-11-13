@@ -310,3 +310,11 @@ debt 2 paid: per-step `elapsed=` lines, no reconstruction).
 
 **Wall clock:** ~16 min (22:48–23:04 UTC). **Token spend:** the driver log
 (`/tmp/denver-autoresearch.log`) is the ledger.
+
+INTERVENTION (operator, after PHASE-2-FAULTNAME, 2026-11-13 ~23:30 UTC): the driver stopped with
+FATAL "bookkeeping incomplete" because session 5 wrote its LOOP_LOG gate record under a
+"## Gate ..." heading, and the driver counts only "### " headings. Operator changed that one
+heading line in denver/docs/LOOP_LOG.md to the "### PHASE-2-FAULTNAME - ..." form and relaunched
+the driver; no content and no answer or suggestion was given to the agent. Earlier operator
+fix the same day: the driver now puts /usr/local/rust/bin on PATH (cargo missing had read as a
+red cargo test; commit 8a64dec6).

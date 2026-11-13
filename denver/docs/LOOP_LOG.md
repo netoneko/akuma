@@ -184,7 +184,7 @@ NEXT GATE: PHASE-2-FAULTNAME
 
 ---
 
-## Gate PHASE-2-FAULTNAME — session 5, 2026-11-13 22:48–23:04 UTC — GREEN (closes G6; guest-proves G3)
+### PHASE-2-FAULTNAME — 2026-11-13 22:48–23:04 UTC, session 5 (goose, glm-5.3-flash) — GREEN (closes G6; guest-proves G3)
 
 **Goal:** close G6 (`denver/docs/REQUIREMENTS.md`): the workload's post-G1 death must be
 *named* — the row demanded the user-SIGSEGV delivery path print rip+cr2 with the `[Fault]`
