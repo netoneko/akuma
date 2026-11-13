@@ -115,7 +115,7 @@ H_S=$((H_T1 - H_T0))
 echo "CYCLE $cyv H1 seconds=$H_S (hypothesis stated -> verdict captured; done-when: under an hour)"
 
 echo "== hs_err evidence (the plan: 'a better failure is progress - hs_err is a milestone')"
-hfile=$($SSH "ls /root/hs_err_pid*.log 2>/dev/null | head -1")
+hfile=$($SSH "ls /root/hs_err_pid*.log 2>/dev/null | head -1" 2>&1 | grep "^/root" | head -1)
 if [ -n "$hfile" ]; then
     echo "-- guest $hfile (head)"
     timeout 30 $SSH "head -25 $hfile" 2>&1
@@ -130,10 +130,10 @@ fi
 
 echo "== verdict: every arm must have produced a clean NAME VERDICT line (RED is expected)"
 ok=1
-for pair in "getcpu:$g_getcpu" "auxv:$g_auxv" "rwx:$g_rwx"; do
-    arm=${pair%%:*}
-    body=${pair#*:}
-    echo "$body" | grep -qE "^$arm (PASS|RED)" || { echo "MISSING: clean verdict line for $arm"; ok=0; }
+# judge each captured body by its UPPERCASE prefix (the arm output lines are UPPERCASE)
+for up in GETCPU AUXV RWX; do
+    body=$(eval echo \${g_$(echo $up | tr A-Z a-z)})
+    echo "$body" | grep -qE "^$up (PASS|RED)" || { echo "MISSING: clean verdict line for $up"; ok=0; }
 done
 echo "$g_cycles" | grep -qE "^CYCLES PASS" || { echo "MISSING: CYCLES PASS"; ok=0; }
 echo "$jout" | grep -qE "^JVM (PASS|RED)" || { echo "MISSING: clean JVM verdict line"; ok=0; }

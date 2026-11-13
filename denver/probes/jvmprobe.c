@@ -222,24 +222,37 @@ static int arm_java(char **argv) {
     printf("JVM INFO exit=%d signal=%d bytes=%zu\n",
            WIFEXITED(st) ? WEXITSTATUS(st) : -1, WIFSIGNALED(st) ? WTERMSIG(st) : 0, n);
 
-    /* first informative line = the diagnosis (the attempt's blocker lines were exactly
-     * this shape); hs_err headers are '#' walls, so skip them, fall back to any text */
+    /* first informative line = the diagnosis; the REASON is usually the next line
+     * ("Error occurred during initialization of VM" / "Failed to mark memory page as
+     * executable" - the attempt doc's blocker lines). hs_err headers are '#' walls. */
     char first[200] = {0};
+    char reason[200] = {0};
     for (char *line = strtok(buf, "\n"); line; line = strtok(NULL, "\n")) {
-        if (*line && (strncmp(line, "#", 1) != 0 || strlen(line) > 30)) {
+        if (!*line || (line[0] == '#' && strlen(line) <= 30)) continue;
+        if (!first[0]) {
             snprintf(first, sizeof first, "%.190s", line);
-            break;
+            continue;
         }
+        if (!reason[0] && (strstr(line, "Failed") || strstr(line, "Error:") ||
+                           strstr(line, "error") || strstr(line, "Exception")))
+            snprintf(reason, sizeof reason, "%.190s", line);
+        printf("JVM-INFO raw: %s\n", line);
     }
     if (WIFSIGNALED(st)) {
-        printf("JVM RED signal=%d first=\"%s\"\n", WTERMSIG(st), first);
+        if (reason[0])
+            printf("JVM RED signal=%d first=\"%s\" reason=\"%s\"\n", WTERMSIG(st), first, reason);
+        else
+            printf("JVM RED signal=%d first=\"%s\"\n", WTERMSIG(st), first);
         return 1;
     }
     if (WIFEXITED(st) && WEXITSTATUS(st) == 0) {
         printf("JVM PASS %s\n", first);
         return 0;
     }
-    printf("JVM RED %s\n", first[0] ? first : "no output");
+    if (reason[0])
+        printf("JVM RED %s reason=\"%s\"\n", first, reason);
+    else
+        printf("JVM RED %s\n", first[0] ? first : "no output");
     return 1;
 }
 
