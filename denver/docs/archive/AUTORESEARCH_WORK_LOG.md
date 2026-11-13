@@ -112,3 +112,31 @@ the same day:
   the loop stops for a human. *Believed: goose failures are model failures. Amended: on a shared
   quota, goose will die at 3am with a 429, and a driver that counts that as "goose failed twice in
   a row" stops by breakfast for no reason.*
+
+## 2026-11-13 (session denver-01, PHASE-0-SCAFFOLD) — three machinery findings from the first real session
+
+**1. The driver did not stage the root manifests.** The scaffold gate's evidence includes a
+`members` line in the root `Cargo.toml` (and its `Cargo.lock` churn); the staging list covered
+only `denver akuma-jvm-kernel crates scripts/...`, so the driver would have committed a tree
+that cannot build its own kernel (a non-member `-p denver` fails). Fixed: staging now includes
+`Cargo.toml Cargo.lock`, and the package-test loop skips root-manifest-only paths (dirname `.`)
+so a members line does not pay a root-kernel host test. *Believed: gate evidence lives under
+gate-named paths. Measured: workspace membership is part of the evidence. Lesson: the staging
+list must follow what makes the tree build, not what the gate directory happens to contain.*
+
+**2. The box's toolchain does not enforce the repo pin, and never could build aarch64.** No
+rustup: `akuma-dev.env` puts standalone `/usr/local/rust` (cargo 1.101.0-nightly) on PATH, and
+its rustlib carries only `x86_64-unknown-{none,linux-musl}`. Consequences, recorded in
+`RESULT.md` so nobody rediagnoses: `rust-toolchain.toml` is not honored on this host (the pin
+exists for Mac-vs-ryzen parity; shanghai's proven stack was built with this same compiler), and
+the aarch64 default build is not runnable here — the R6 default-build surface on this box is the
+x86_64 + host surface. Not fixed, because nothing is broken: recorded as a machine fact.
+
+**3. Guests are impossible until the host reboots with `kvmctl`.** The first real boot probe
+failed at `open("/dev/kvm0")` ENOENT — exactly the documented semantics (kvm.md line 192; the
+device arms at boot only, `amd64/src/main.rs`). Firecracker shares the dependency; there is no
+QEMU anywhere on the box. The session escalated (`denver/ESCALATE.md`) rather than improvising:
+rebooting the machine that runs the session is machine policy, not a plan decision. *Lesson: a
+session brief that says "boot guests with whatever the machine has" should be read to include
+"and stop at the escape hatch when the machine has nothing" — three hypotheses were spent
+confirming a fact one doc line already stated.*
