@@ -1,0 +1,33 @@
+[package]
+name = "akuma-jvm-kernel"
+version = "0.1.0"
+edition = "2024"
+description = "Denver's platform front crate: akuma-tokio-kernel with a feature map and zero capabilities of its own - the entry! macro and the Kernel builder re-exported, every default device passed through under the same feature name. Lesson 3 of denver/docs/archive/KERNEL_HOWTO_BUILDING_CUSTOM_PLATFORM_KERNEL.md; later passes map patches onto existing infra behind these features (R2/R6), never a fork."
+# Relays akuma-tokio-kernel's linker script to the kernel binary (see build.rs).
+links = "akuma_jvm_kernel"
+
+[lints]
+workspace = true
+
+[features]
+# Pass-through, 1:1 with akuma-tokio-kernel's own map onto its machine half
+# (precedent: that crate's `console = ["akuma-tokio-kernel-amd64/console"]`).
+# A capability pass adds its feature here and maps it - nothing else moves.
+default = ["console", "disk", "net", "smp"]
+# COM1 (`Kernel::console`).
+console = ["akuma-tokio-kernel/console"]
+# ext2 on the first virtio-blk device as the root filesystem (`Kernel::disk`).
+disk = ["akuma-tokio-kernel/disk"]
+# The first virtio-net device with DHCP (`Kernel::net`); without it, loopback only.
+net = ["akuma-tokio-kernel/net"]
+# Application processors from `smp=N` (`Kernel::smp`).
+smp = ["akuma-tokio-kernel/smp"]
+# What busybox and bash call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
+shell = ["akuma-tokio-kernel/shell"]
+# Compile the boot self-tests of the shared crates out.
+no-tests = ["akuma-tokio-kernel/no-tests"]
+# Name every syscall that answers a negative errno on the console.
+trace-err = ["akuma-tokio-kernel/trace-err"]
+
+[dependencies]
+akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

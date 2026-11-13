@@ -1,0 +1,16 @@
+[package]
+name = "denver"
+version = "0.1.0"
+edition = "2024"
+description = "Denver: the teaching kernel over akuma-jvm-kernel - the Shanghai pattern's next student. Phase 0 scaffold: boots tokio through the jvm-kernel front crate; uname says denver."
+# `uname -n` is the package name (`Kernel::new(start_info, CARGO_PKG_NAME, ...)`).
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-jvm-kernel = { path = "../akuma-jvm-kernel", features = ["no-tests"] }
+
+[[bin]]
+name = "denver"
+path = "src/main.rs"

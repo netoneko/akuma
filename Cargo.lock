@@ -445,6 +445,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-jvm-kernel"
+version = "0.1.0"
+dependencies = [
+ "akuma-tokio-kernel",
+]
+
+[[package]]
 name = "akuma-kacho"
 version = "0.1.0"
 
@@ -1195,6 +1202,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "10d60334b3b2e7c9d91ef8150abfb6fa4c1c39ebbcf4a81c2e346aad939fee3e"
 dependencies = [
  "thiserror",
+]
+
+[[package]]
+name = "denver"
+version = "0.1.0"
+dependencies = [
+ "akuma-jvm-kernel",
 ]
 
 [[package]]
