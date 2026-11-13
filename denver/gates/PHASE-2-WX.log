@@ -1,0 +1,68 @@
+== free the VM slot (a stale guest answers EBUSY)
+== boot: herd vm-run /root/denver/w/vm-wx.spec
+== uname (the hash names the wx-relaxed build; the phase-1 RED kernel was 8dc2dbcc)
+Linux denver 0.1.0-8a658723-denver 8a658723-release x86_64 GNU/Linux
+== platform sanity: the policy flip must not regress tokio (phase 0's marker)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-8a658723-denver 8a658723-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.13s)
+  title: Akuma
+RESULT PASS
+== G1 verdict arm: the rwx suite (RED in phase 1: mmap-RWX-refused, rw_to_rx mprotect, both EACCES)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== G1 movement arm: java -version past the blocker-1 line (expected next blocker: getcpu, G2)
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=-1 signal=11 bytes=0
+JVM RED signal=11 first=""
+RESULT PASS
+===================================================================
+== PHASE-2-WX diagnostic boot (session 4, appended after the gate capture)
+== why: the movement arm died signal=11 bytes=0; name the fault (R8 diagnostics-first)
+== free the VM slot
+== uname: [ssh] connecting to 127.0.0.1:2247...
+[ssh] connect attempt 1 failed (Connection refused) — retrying
+Linux denver 0.1.0-8a658723-denver 8a658723-release x86_64 GNU/Linux
+== repro: java -version, then look for hs_err in /root (cwd of the ssh session)
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=-1 signal=11 bytes=0
+JVM RED signal=11 first=""
+rc=1
+
+[ssh] connecting to 127.0.0.1:2247...
+
+== how early? -Xlog:all=info on stderr - any output pins init progress
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 2s (attempt 1/10)
+[ssh] connecting to 127.0.0.1:2247...
+rc=127
+
+== G4 check: /proc there at all?
+[ssh] connecting to 127.0.0.1:2247...
+/bin/sh: ls: not found
+
+== stop the guest I started
+== diagnostic boot 2: hs_err check only (no -Xlog: it wedged the guest last boot)
+== uname: [ssh] connecting to 127.0.0.1:2247...
+[ssh] connect attempt 1 failed (Connection refused) — retrying
+Linux denver 0.1.0-8a658723-denver 8a658723-release x86_64 GNU/Linux
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=-1 signal=11 bytes=0
+JVM RED signal=11 first=""
+
+== hs_err search (busybox applets: bare ls is not on PATH - rig fact)
+[ssh] connecting to 127.0.0.1:2247...
+total 8
+drwx------    2 0        0             4096 Nov 13  2026 .
+drwxr-xr-x   10 0        0             4096 Nov 13  2026 ..
+
+[ssh] connecting to 127.0.0.1:2247...
+
+== stop the guest I started

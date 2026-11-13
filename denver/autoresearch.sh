@@ -90,6 +90,8 @@ mkdir "$LOCK" 2>/dev/null || { printf 'FATAL: another denver-autoresearch run ho
 trap 'rm -rf "$LOCK"' EXIT INT TERM
 mkdir -p "$W" "$GATES" "$RESEARCH" denver/docs/lessons
 
+PATH=$PATH:/usr/local/rust/bin; export PATH
+command -v cargo >/dev/null 2>&1 || die "cargo not on PATH"
 # Preflight: every check before the first session, like the shanghai starter.
 command -v "$GOOSE" >/dev/null 2>&1 || die "$GOOSE not on PATH"
 [ -r "$RUNBOOK" ] || die "$RUNBOOK missing - the procedure is the runbook"
