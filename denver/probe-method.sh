@@ -103,16 +103,23 @@ for arm in getcpu auxv rwx cycles; do
 done
 
 echo "-- guest: java -version (H1 is timed from the hypothesis line to the verdict line)"
-echo "HYPOTHESIS H1 ($(date +%s)): getcpu(2) is served nowhere on denver -> the getcpu arm answers ENOSYS; and the workload dies inside HotSpot init (the attempt's blocker shape) on BOTH kernels"
 H_T0=$(date +%s)
+echo "HYPOTHESIS H1 ($H_T0): getcpu(2) is served nowhere on denver -> the getcpu arm answers ENOSYS; and the workload dies inside HotSpot init (the attempt's blocker shape) on BOTH kernels"
 hline=$(timeout 60 $SSH "/bin/jvmprobe getcpu" 2>&1 | grep -E "^GETCPU" | head -1)
 echo "H1 getcpu verdict: $hline"
 jout=$(timeout 180 $SSH "/bin/jvmprobe java $JDK" 2>&1)
 echo "$jout"
 H_T1=$(date +%s)
 H_S=$((H_T1 - H_T0))
+H_NOTE=""
+if [ "$H_S" -lt 0 ]; then
+    # the host clock slewed backward between the two reads (machine fact, 2026-11-13);
+    # the logged epochs are the truth, the clamp keeps the arithmetic honest
+    H_NOTE=" clock-slewed epochs=$H_T0..$H_T1 (negative span clamped; wall clock bounds the method)"
+    H_S=0
+fi
 [ "$H_S" -le 3600 ] && cyv=PASS || cyv=FAIL
-echo "CYCLE $cyv H1 seconds=$H_S (hypothesis stated -> verdict captured; done-when: under an hour)"
+echo "CYCLE $cyv H1 seconds=$H_S$H_NOTE (hypothesis stated -> verdict captured; done-when: under an hour)"
 
 echo "== hs_err evidence (the plan: 'a better failure is progress - hs_err is a milestone')"
 hfile=$($SSH "ls /root/hs_err_pid*.log 2>/dev/null | head -1" 2>&1 | grep "^/root" | head -1)
@@ -130,11 +137,9 @@ fi
 
 echo "== verdict: every arm must have produced a clean NAME VERDICT line (RED is expected)"
 ok=1
-# judge each captured body by its UPPERCASE prefix (the arm output lines are UPPERCASE)
-for up in GETCPU AUXV RWX; do
-    body=$(eval echo \${g_$(echo $up | tr A-Z a-z)})
-    echo "$body" | grep -qE "^$up (PASS|RED)" || { echo "MISSING: clean verdict line for $up"; ok=0; }
-done
+echo "$g_getcpu" | grep -qE "^GETCPU (PASS|RED)" || { echo "MISSING: clean GETCPU verdict line"; ok=0; }
+echo "$g_auxv"   | grep -qE "^AUXV (PASS|RED)"   || { echo "MISSING: clean AUXV verdict line"; ok=0; }
+echo "$g_rwx"    | grep -qE "^RWX (PASS|RED)"    || { echo "MISSING: clean RWX verdict line"; ok=0; }
 echo "$g_cycles" | grep -qE "^CYCLES PASS" || { echo "MISSING: CYCLES PASS"; ok=0; }
 echo "$jout" | grep -qE "^JVM (PASS|RED)" || { echo "MISSING: clean JVM verdict line"; ok=0; }
 [ "$ok" = 1 ] && verdict "RESULT PASS" 0
