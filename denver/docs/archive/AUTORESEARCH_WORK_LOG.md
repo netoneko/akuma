@@ -140,3 +140,11 @@ rebooting the machine that runs the session is machine policy, not a plan decisi
 session brief that says "boot guests with whatever the machine has" should be read to include
 "and stop at the escape hatch when the machine has nothing" — three hypotheses were spent
 confirming a fact one doc line already stated.*
+
+**4. The root `.gitignore`'s `*.log` eats the gate logs.** `git add -A denver` silently skipped
+`denver/gates/PHASE-0-SCAFFOLD.log` (pattern `*.log`), so the driver would grep the on-disk file
+while the pushed record carried no proof. Fixed in the same staging block: `git add -f
+denver/gates` before the commit. *Lesson: an ignore pattern written for build noise and an
+evidence directory written for records disagree silently; `git status --short` the gate log's
+absence would have shown — check what the record commit actually captured, not only what the
+disk holds.*

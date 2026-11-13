@@ -217,6 +217,11 @@ commit_and_push() { # gate -> 0 ok, 4 checks red or commit failed. Docs and reco
     # members-line gate commit that is not committed is a broken tree for the
     # next session - the unforgivable exit).
     git add -A denver akuma-jvm-kernel crates Cargo.toml Cargo.lock scripts/kvm/goose/denver-01-autoresearch.md 2>/dev/null || true
+    # Gate logs are the evidence and must ride with the record: the root .gitignore's
+    # `*.log` would silently leave denver/gates/<gate>.log out of the commit - the
+    # driver would grep the on-disk file while litter lost the proof (found the hard
+    # way, session denver-01; see AUTORESEARCH_WORK_LOG.md).
+    git add -f denver/gates 2>/dev/null || true
     staged=$(git diff --cached --name-only)
     [ -n "$staged" ] || { log "commit: nothing staged"; return 0; }
     docs=$(printf '%s\n' "$staged" | grep -E '^(denver/(docs/|RESULT\.md|ESCALATE\.md|autoresearch\.sh|README|banner)|scripts/kvm/goose/denver-01)' || true)

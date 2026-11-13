@@ -1,0 +1,77 @@
+# PHASE-0-SCAFFOLD gate capture — 2026-11-13, session denver-01 (goose, glm-5.3-flash)
+
+Gate: denver/ + akuma-jvm-kernel/ exist; Denver boots tokio, uname says denver, feature parity
+with the pass-through (plan phase table; probe = tokioprobe, the marker convention the driver
+greps: RESULT PASS).
+
+Everything through the build is GREEN. The boot probe is BLOCKED by the host: the running Akuma
+kernel was not booted with `kvmctl`, so /dev/kvm0 does not exist and no guest can start on this
+machine today. Escalated: denver/ESCALATE.md (a reboot is a human's call — this session runs on
+the box it would reboot).
+
+## 1. Scaffold exists (green)
+
+- akuma-jvm-kernel/: front crate, 1:1 feature map onto akuma-tokio-kernel (console/disk/net/smp/
+  shell/no-tests/trace-err), entry!/Kernel re-export, zero capabilities, forbid(unsafe_code).
+- denver/: the three-file kernel of crates/akuma-tokio-kernel/README.md, package name `denver`
+  (CARGO_PKG_NAME is uname -n), banner within the shanghai size rules, consumes akuma-jvm-kernel.
+- Root Cargo.toml members += akuma-jvm-kernel, denver.
+
+## 2. Build (green, cold)
+
+```
+. /etc/akuma-dev.env && cargo build -p denver --target x86_64-unknown-none --release -j4
+   Compiling denver v0.1.0 (/src/github.com/netoneko/akuma/denver)
+    Finished `release` profile [optimized] target(s) in 22.91s
+```
+
+Same-green against the merged platform state (the merge of branch shanghai, tip d4a6c7d9):
+
+```
+cargo build -p akuma-amd64  --target x86_64-unknown-none --release -j4  # Finished in 37.97s
+cargo build -p taoxichuan   --target x86_64-unknown-none --release -j4  # Finished in 15.84s
+```
+
+R6 note recorded in RESULT.md: the aarch64 default target is not installed on this box's
+toolchain (rustlib carries x86_64-{unknown-none,unknown-linux-musl} only; no rustup, standalone
+/usr/local/rust 1.101.0-nightly) — the aarch64 kernel was never buildable on this host; the
+checkable default surface here is the x86_64 + host surface above, all green.
+
+## 3. Probe rig (prepared, /root/denver/w/)
+
+- denver kernel binary copied from target/x86_64-unknown-none/release/denver (2.29 MB ELF).
+- denver.img: byte-copy of shanghai's proven image (busybox, sshd, /bin/uname, /bin/tokioprobe,
+  authorized key); e2fsck -fn: "24/16384 files ... 1400/16384 blocks" — fsck clean.
+- vm.spec: type=kvm, kernel=/root/denver/w/denver, cmdline=init=/bin/sshd initargs=--port,22
+  smp=4 epoch=1793645322, ram_mib=3072, vcpus=4, disk=/root/denver/w/denver.img, disk_ram=0,
+  outbound=1, forward=2247:22.
+
+## 4. Boot attempt — three hypotheses, no boot
+
+H1 — Akuma KVM, the plan's own rig: `herd vm-run /root/denver/w/vm.spec`
+
+```
+[vm-run] no /dev/kvm0: the kernel was not booted with kvmctl
+```
+
+herd's vm_run does open("/dev/kvm0", O_RDWR) and the open failed. Precedent: docs/reference/
+subsystems/kvm.md line 192 — "`ls /dev` does not list it; `open` is `ENOENT` unless the kernel
+was booted with `kvmctl`" — and amd64/src/main.rs:334-348: the SVM hypervisor arms only on the
+`kvmctl` (or `kvmtest`) boot flag. The CURRENT host boot (`Akuma akuma-ryzen 0.0.9
+886dabf-release-smp-shared`) carries no such flag. There is no runtime arm.
+
+H2 — Firecracker (present: /root/fc/firecracker, and /root/fc/run.sh shows the working form):
+needs the same KVM device; docs/archive/AKUMA_FIRECRACKER_KVM.md — same `kvmctl`-armed boot
+required. Dead for the same reason.
+
+H3 — plain QEMU: no qemu-system binary anywhere on the box (/usr/local, /opt incl. the gentoo
+root at /opt/gentoo/root, /root). Nothing to run even TCG with.
+
+Per the runbook: the stall protocol's remedy (insert a diagnostic pass) does not apply — the
+diagnostic already exists and names the exact missing thing: a reboot with `kvmctl kvmmem=4096`
+on the host command line (kvm.md entry 30, 2026-10-22). A reboot is beyond this plan's authority
+and would kill the session running on the machine. Escape hatch: denver/ESCALATE.md.
+
+RESULT FAIL: no /dev/kvm0 — host not booted with kvmctl; scaffold + build complete and captured
+above; boot probe pending the host reboot. This file must gain a RESULT PASS line from the
+post-reboot session (rerun: ESCALATE_ANSWERED=1 sh denver/autoresearch.sh 1 PHASE-0-SCAFFOLD).
