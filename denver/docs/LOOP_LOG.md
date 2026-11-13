@@ -181,3 +181,65 @@ first-hand capture, gate run + diagnostic boots in one file). Kernel-change cycl
 from WIP commit to capture ≈ 11 min.
 
 NEXT GATE: PHASE-2-FAULTNAME
+
+---
+
+## Gate PHASE-2-FAULTNAME — session 5, 2026-11-13 22:48–23:04 UTC — GREEN (closes G6; guest-proves G3)
+
+**Goal:** close G6 (`denver/docs/REQUIREMENTS.md`): the workload's post-G1 death must be
+*named* — the row demanded the user-SIGSEGV delivery path print rip+cr2 with the `[Fault]`
+line, first-hand in `denver/gates/PHASE-2-FAULTNAME.log`.
+
+**Finding 0 (what decision the research forced):** the artifact (written first, R1)
+corrected this log's own PHASE-2-WX record before any run: the console census
+(`/root/denver/w/vmrun-diag.log`) already carried the naming line — `[Fault] ring3 PageFault
+rip=0xffffffffff600800 rsp=0x00006000014fe768 cr2=0xffffffffff600800 code=0x14` — one line
+above the slot line that record quoted, and `git log -L` shows the line in `aafbb973`, the
+kernel file's first commit. "The kernel names the death, not the address" was a misquote; the
+real gap was the *capture* (probe scripts carried ssh-side output only) and the
+address→module step. Decision: **zero kernel/crate LOC** (D17) — the gate runs the proven WX
+rig unchanged (D18: uname must carry `0.1.0-8a658723-denver`, mismatch = FAIL) with a probe
+that windows the console log per arm and names the module at ABI level (D19).
+
+**Commands and outcomes** (capture: `denver/gates/PHASE-2-FAULTNAME.log`; two gate runs, both
+RESULT PASS — run 1's interpretation line was false, see Interventions; run 2 is the
+record's evidence):
+
+| step | command | outcome |
+|---|---|---|
+| research first (R1) | `denver/docs/research/PHASE-2-FAULTNAME.md` (Finding 0, D17–D20) | precedents: the attempt doc's own next step — "a fault report that names the module (maps content, or the fault handler printing the VMA)" (git `d7878378`); the metal's fault-naming channel (`akuma-exceptions` `[SIGSEGV-HEAP] far= elr=`); `trace-err`'s `mm_dump_for` considered and rejected (slab-history ring, not the map; prints nothing for a never-mapped page) |
+| the probe | `denver/probe-faultname.sh` (probe-wx shape + epoch stamps + console window) | parsing dry-run verified against `vmrun-diag.log` (busybox grep/sed/cut) before booting; `sh -n` is the build check for a shell-only delta |
+| gate run 1 | `sh denver/probe-faultname.sh 2>&1 \| tee denver/gates/PHASE-2-FAULTNAME.log` | **RESULT PASS**, death named: rip=cr2=`0xffffffffff600800` code=0x14 — but the module branch printed a false SURPRISE (Interventions) |
+| gate run 2 (record's evidence) | same, after a one-line fix | **RESULT PASS**: `FAULT PASS rip=0xffffffffff600800 cr2=0xffffffffff600800 code=0x14 module=legacy-vsyscall-page`; fault line byte-identical across runs (deterministic death); run 1's capture overwritten by `tee` — noted here |
+
+**Verdict.** Gate GREEN: the death is named in the capture, first-hand, twice —
+`rip==cr2=0xffffffffff600800`, `code=0x14` (user instruction fetch, not-present): HotSpot
+jumps to the legacy vsyscall page because no vDSO exists (`AT_SYSINFO_EHDR` missing, phase 1)
+— the metal `hs_err` pc, now guest-proven. G6 closed without kernel code. REQUIREMENTS
+re-ranked openly (D20): **G3 (PHASE-2-VDSO) → G2 (PHASE-2-GETCPU) → G4 (PHASE-2-PROCFS) →
+G5** — the vDSO gap is the proven first blocker; `getcpu` sits behind a death that precedes
+it; maps stay behind `getcpu` because the next *unknown* (the attempt's blocker-3 NULL store)
+arrives only after init advances.
+
+**Interventions:** one. The probe's module branch compared a prefix-less hex capture against
+the `0x`-prefixed constant, so run 1 — already RESULT PASS — printed `module=unmapped` plus a
+false SURPRISE line. A probe whose interpretation can lie is a broken probe (L2's own rule,
+its parse-time sibling); fixed in one line and re-run, and the overwrite of run 1's capture
+is recorded here rather than hidden. Machine facts recorded (not fought): the console already
+streams to `$W/vmrun.log` — the fix was reading it with attribution (byte offsets into the
+log), not new plumbing; boot→ssh round trip ≈ 8 s on this box, the loop's floor so far.
+
+**Cycle measured** (L4, named): research→GREEN ≈ 35 min, of which each gate run ≈ 2 min
+including boot; per-step stamps are in the capture this time (L2 debt 2 paid), so the numbers
+are measured, not reconstructed. Stamps: wall clock 11 s / 7 s post-boot for runs 1–2.
+
+**Wall clock:** ~16 min (22:48–23:04 UTC). **Token spend:** the driver log is the ledger.
+
+**Transition.** Zero kernel interventions → the ladder's first blocker is now a *named,
+guest-proven* ABI gap, and the next pass is design work, not diagnostics: `NEXT GATE:
+PHASE-2-VDSO` (G3: research first — a minimal vDSO page + `AT_SYSINFO_EHDR` in
+`akuma-elf-exec` vs. provably serving the legacy fallback address; the gate arm already
+exists: `AUXV RED AT_SYSINFO_EHDR missing` from phase 1, expected to flip to `AUXV PASS` with
+the java arm past the vsyscall death).
+
+NEXT GATE: PHASE-2-VDSO

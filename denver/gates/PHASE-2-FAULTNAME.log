@@ -1,0 +1,29 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-wx.spec (elapsed=3s)
+== rig identity: uname must carry the WX-gate hash 0.1.0-8a658723-denver (D18) (elapsed=3s)
+Linux denver 0.1.0-8a658723-denver 8a658723-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (phase 0's marker) (elapsed=3s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-8a658723-denver 8a658723-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.36s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (RED in phase 1: mmap-RWX-refused, rw_to_rx mprotect, both EACCES) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== the death: java -version (expected JVM RED signal=11 - the death is this gate's subject) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=-1 signal=11 bytes=0
+JVM RED signal=11 first=""
+== the naming: grep the console window from byte 18176 (+2 s flush) (elapsed=5s)
+[Fault] ring3 PageFault rip=0xffffffffff600800 rsp=0x00006000014fe768 cr2=0xffffffffff600800 code=0x14 -- task killed
+[Fault] slot 5 killed (SIGSEGV)
+FAULT PASS rip=0xffffffffff600800 cr2=0xffffffffff600800 code=0x14 module=legacy-vsyscall-page
+  (rip==cr2 at the ABI constant: user fetch on the unmapped vsyscall page - the metal
+   hs_err named the same pc in phase 1; G3's mechanism, now guest-proven)
+== verdict (elapsed=7s)
+RESULT PASS
+== wall clock: seconds=7 (t0=1794610756 end=1794610763)

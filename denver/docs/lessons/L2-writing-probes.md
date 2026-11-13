@@ -38,6 +38,16 @@ the RED phase proves the probes themselves before any pass claims anything.
    bounded (`timeout` everywhere), platform sanity (`tokioprobe RESULT PASS`) before method
    evidence counts, and the suite's verdict is *clean verdict lines exist*, not *arms passed* —
    RED is the expected phase-1 outcome (gate = the method, phase-0 D12 convention).
+6. **The capture carries every side the evidence lives on.** — *Defect, quoted, fixed
+   2026-11-13 (PHASE-2-FAULTNAME, Finding 0):* session 4's records said the kernel prints
+   `[Fault] slot 5 killed (SIGSEGV)` "without an address" — but its own console census
+   (`/root/denver/w/vmrun-diag.log`) carried
+   `[Fault] ring3 PageFault rip=0xffffffffff600800 … cr2=0xffffffffff600800 code=0x14` one
+   line above. The gate captures never carried the console (ssh-side output only), and the
+   census quote dropped the line that mattered. Rule: a gate's capture must include every
+   channel the evidence lives on (here: the guest console = `$W/vmrun.log`, read with per-arm
+   byte-offset attribution, `-a`-tolerant greps), and a census quote carries the whole fault
+   block — not the line that fits the story.
 
 ## Gate
 
@@ -66,3 +76,14 @@ the RED phase proves the probes themselves before any pass claims anything.
   stamp `date +%s` at each arm (probe-method.sh's H1 shape already does this; copy it).
   Rig facts: bare `ls` is not on the guest ssh PATH (`/bin/busybox ls`); `-Xlog:all=info`
   wedges the guest — do not use it as a diagnostic there until the wedge is understood.
+- 2026-11-13 (PHASE-2-FAULTNAME GREEN): both debts paid — `denver/probe-faultname.sh` stamps
+  every step (`elapsed=`, slew-clamped, both epochs in the capture) and windows the console
+  log per arm (byte offsets into `$W/vmrun.log`), so the capture itself names the death:
+  `FAULT PASS rip=0xffffffffff600800 cr2=0xffffffffff600800 code=0x14
+  module=legacy-vsyscall-page` — the metal `hs_err` pc, now cross-machine confirmed from the
+  guest. The Do-6 defect was found and fixed in the same session (research Finding 0, before
+  any run). New sibling of the "verdicts lie" rule, parse-time edition: run 1 was already
+  RESULT PASS while its module branch compared prefix-less hex against the `0x`-prefixed
+  constant and printed a false SURPRISE — one-line fix, re-run, judged on run 2, the
+  overwrite of run 1 recorded in RESULT/LOOP_LOG rather than hidden. A probe that has passed
+  can still be lying; check its *interpretation* lines, not just its verdict.

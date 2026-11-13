@@ -246,3 +246,67 @@ owns).
 
 **Wall clock:** ~61 min (20:09–21:10 UTC). **Token spend:** not instrumented in-session; the
 driver log (`/tmp/denver-autoresearch.log`) is the ledger.
+
+---
+
+## Gate PHASE-2-FAULTNAME — session 5, 2026-11-13 22:48–23:04 UTC — GREEN (closes G6; guest-proves G3)
+
+**Goal:** name the workload's post-G1 death (G6): the capture must carry the user-SIGSEGV
+delivery path's rip+cr2 line, first-hand (`denver/gates/PHASE-2-FAULTNAME.log`).
+
+**What the research found first (R1, `denver/docs/research/PHASE-2-FAULTNAME.md` Finding 0):**
+the session-4 record was wrong in one material claim. The kernel *did* name the address: the
+WX gate's own console census (`/root/denver/w/vmrun-diag.log`) carries
+`[Fault] ring3 PageFault rip=0xffffffffff600800 rsp=0x00006000014fe768
+cr2=0xffffffffff600800 code=0x14 -- task killed` one line above the quoted
+`slot 5 killed (SIGSEGV)` line, and the line predates every denver gate (`git log -L`: it is
+in `aafbb973`, the kernel file's first commit). The real gap: no gate capture carried the
+console (the probe scripts read ssh-side output only), and the census quote dropped the line
+that mattered. "Unnamed SIGSEGV" was true only in the module sense. The G6 re-rank stays
+valid regardless — the gate's work became capture + interpretation: **zero kernel/crate LOC**
+(D17), the proven WX rig unchanged (D18: uname-hash identity check), and
+`denver/probe-faultname.sh` (D19): probe-wx shape + per-step epoch stamps (L2 debt 2) +
+console-window attribution (byte offsets into `$W/vmrun.log`) + ABI-level module naming
+(the legacy vsyscall page — the metal `hs_err` pc, cross-machine corroboration).
+
+**Gate evidence** (two runs, both `RESULT PASS`; run 2 is the record's evidence):
+
+```
+== the naming: grep the console window from byte 18176 (+2 s flush)
+[Fault] ring3 PageFault rip=0xffffffffff600800 rsp=0x00006000014fe768 cr2=0xffffffffff600800 code=0x14 -- task killed
+[Fault] slot 5 killed (SIGSEGV)
+FAULT PASS rip=0xffffffffff600800 cr2=0xffffffffff600800 code=0x14 module=legacy-vsyscall-page
+RESULT PASS
+```
+
+`code=0x14` = user-mode instruction fetch on a not-present page: HotSpot jumps to the legacy
+vsyscall page because no vDSO exists — G3's mechanism, now guest-proven (the metal `hs_err`
+named the same pc in phase 1). Death line byte-identical across the two runs (deterministic).
+Precedents cited in the research artifact (R9): the attempt doc's "fault report that names
+the module … or the fault handler printing the VMA" (git `d7878378`); `akuma-exceptions`'
+`[SIGSEGV-HEAP] far= elr=` (the metal's own fault-naming discipline); `trace-err`'s
+`mm_dump_for` considered and rejected (a slab-history ring, not the map — prints nothing for
+a never-mapped page; the honest module-namer is `/proc/<pid>/maps`, G4's gate).
+
+**Decision it forced (D20, re-ranked openly in REQUIREMENTS):** G3 (PHASE-2-VDSO) is first —
+the vDSO gap is the proven first blocker; G2 (`getcpu`) second (a death that precedes
+`os::init_2` cannot be unblocked by closing it); G4 (maps) third; G5 deferred.
+
+INTERVENTION: the probe's module-interpretation branch compared a prefix-less hex capture
+(`sed` captured after `rip=0x`) against the `0x`-prefixed vsyscall constant — run 1 was
+already RESULT PASS yet printed `module=unmapped` and a false SURPRISE line. Fixed in one
+line, re-run; `tee` overwrote run 1's capture, recorded here rather than hidden. Lesson
+echo: a probe whose interpretation can lie is a broken probe (L2's "unbuffered stdio or the
+verdicts lie", parse-time sibling).
+
+Machine facts recorded (not fought): the guest console already streams to `$W/vmrun.log` —
+capture was a read-with-attribution problem, not new plumbing; boot→ssh round trip ≈ 8 s on
+this box (the loop's floor so far); `-Xlog` wedge and busybox-PATH facts from session 4
+carried unchanged.
+
+**Kernel-change cycle measured** (L4, named): none this session — the gate is capture-only;
+research→GREEN ≈ 35 min, each gate run ≈ 2 min including boot, stamps in the capture (L2
+debt 2 paid: per-step `elapsed=` lines, no reconstruction).
+
+**Wall clock:** ~16 min (22:48–23:04 UTC). **Token spend:** the driver log
+(`/tmp/denver-autoresearch.log`) is the ledger.

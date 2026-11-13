@@ -41,7 +41,7 @@ WAIT=${DENVER_BOOT_WAIT_TRIES:-30}     # x 5 s
 SSH="ssh -y -i $W/key -p $PORT root@127.0.0.1"
 VMLOG=$W/vmrun.log
 RIGHASH="0.1.0-8a658723-denver"        # the proven WX-gate binary's uname hash (D18)
-VSYSCALL=0xffffffffff600800            # the legacy vsyscall page (Linux ABI constant; metal hs_err pc)
+VSYSCALL=ffffffffff600800             # the legacy vsyscall page (Linux ABI constant; metal hs_err pc)
 BLOCKER1="Failed to mark memory page as executable"
 T0=$(date +%s)
 
