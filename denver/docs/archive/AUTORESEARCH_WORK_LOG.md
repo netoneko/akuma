@@ -148,3 +148,15 @@ denver/gates` before the commit. *Lesson: an ignore pattern written for build no
 evidence directory written for records disagree silently; `git status --short` the gate log's
 absence would have shown — check what the record commit actually captured, not only what the
 disk holds.*
+
+**5. The escalation archive can be overwritten by its own answer cycle.** The loop check
+archives an answered escalation with `mv denver/ESCALATE.md
+denver/docs/archive/escalations/<date>-<gate-slug>.md`; a second escalation on the same gate
+on the same day (this phase-0 review, after the reboot escalation) mv'd onto exactly that
+path, replacing the earlier archive in the worktree. Fixed while filing the review: when the
+target exists the archive lands beside it with the driver pid
+(`<date>-<slug>-<pid>.md`). Applied mid-run deliberately: the block sits inside the already-
+parsed `while` body and the escalate path exits before any unparsed byte of the script
+executes; `sh -n` green. *Believed: the archive step is bookkeeping and idempotent. Measured:
+a same-key second record silently replaced the first. Lesson: every mv-into-archive in the
+machinery needs an exists-check — evidence moves must never be overwrites.*

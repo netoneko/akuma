@@ -18,11 +18,15 @@ code.
   `crates/akuma-tokio-kernel/README.md` and `shanghai/README.md` — **which were not on the
   branch** (plan written against the shanghai tree; driver checks out `denver`). The whole
   proven stack lives on branch `shanghai` (six gates green on this box).
-- A bare-metal amd64 box whose Akuma kernel may or may not have been booted with `kvmctl`
-  (`/dev/kvm0` exists only then); standalone `/usr/local/rust` toolchain (no rustup; no aarch64
-  std — the aarch64 default build is not runnable on this host).
-- The probe that currently fails: nothing boots; after this session, the build is green and the
-  boot probe waits only for a kvmctl-armed reboot (`denver/gates/PHASE-0-SCAFFOLD.log`).
+- A bare-metal amd64 box whose Akuma kernel may or may not have been booted with `kvmctl`;
+  when it is, the `/dev/kvm0` node exists but is **hidden from `ls /dev` by design** (kvm.md
+  § *VMs as services*): check it by opening it, or by `vm-run`'s own error text — never by
+  listing. Standalone `/usr/local/rust` toolchain (no rustup; no aarch64 std — the aarch64
+  default build is not runnable on this host).
+- The rig under `/root/denver/w/` and `denver/vm-probe.sh` (frees a stale slot, boots, waits
+  for an ssh round trip, probes, stops the guest). The probe is green:
+  `denver/gates/PHASE-0-SCAFFOLD.log` carries `RESULT PASS` twice — the hand-run after the
+  answered reboot, then session 2's first-hand rerun.
 
 ## Do (as-happened, 2026-11-13)
 
@@ -53,11 +57,18 @@ code.
    `Cargo.toml`/`Cargo.lock` the driver would leave exactly that out (D5). Checkable outcome:
    `sh -n denver/autoresearch.sh` and the staging list contains the manifests.
 6. **Boot under Akuma KVM.** `herd vm-run /root/denver/w/vm.spec` (spec: PVH kernel, ext2 disk,
-   `outbound=1`, a forwarded port that is not shanghai's 2246). Checkable outcome: guest console
-   in `vm.log`, then `uname -a` + tokioprobe over ssh with the captured `RESULT PASS`. —
-   **Blocked 2026-11-13: the host was not booted with `kvmctl`; no QEMU on the box; Firecracker
-   needs the same device. Escalated (denver/ESCALATE.md). The step itself is unchanged for the
-   redo.**
+   `outbound=1`, a forwarded port that is not shanghai's 2246) — via `sh denver/vm-probe.sh`,
+   which frees a stale slot first (a leftover guest answers EBUSY/errno 16 and reads as "KVM
+   broken"), waits for an *ssh round trip* (never a log marker), probes `uname` + tokioprobe,
+   and always stops the guest. Checkable outcome: `RESULT PASS` + `UNAME PASS Linux denver` in
+   the captured gate log. — **Blocked in session 1** (host not booted with `kvmctl`; no QEMU on
+   the box; Firecracker needs the same device → escalated, not worked around). **Completed in
+   session 2** after the answered reboot (GRUB entry 29, `kvmctl kvmmem=4096`): the human ran
+   the probe by hand first; the session re-proved it first-hand. Two plan-wrong facts the redo
+   surfaced, both now quoted in the Record: the device node is hidden from `ls` (a bare
+   `ls /dev/kvm0` ENOENT is *not* evidence KVM is disarmed — this session misread exactly that
+   and the file evidence corrected it), and the first post-reboot boot hits the stale-slot
+   EBUSY before it hits KVM.
 
 ## Gate
 
@@ -74,3 +85,14 @@ code.
   the README's `osaka`), D4 rig outside the tree (`/root/denver/w/`, precedent: shanghai
   RESULT.md), D5 driver carries root manifests (precedent: work-log driver fixes). Full record:
   `denver/RESULT.md`, `denver/docs/LOOP_LOG.md`; capture: `denver/gates/PHASE-0-SCAFFOLD.log`.
+- 2026-11-13, session 2 (the redo): answered escalation → kvmctl-armed host; step 6 closed with
+  the session's own `RESULT PASS` / `UNAME PASS Linux denver …` in the gate log (the human's
+  hand-run capture preserved above it). Where the plan was wrong, quoted: (a) session 1 wrote
+  "`/dev/kvm0` exists only then" — half-right; it exists *and is hidden from `ls /dev`* when
+  armed, so `ls` cannot discriminate armed from unarmed (kvm.md § *VMs as services*); check by
+  opening. (b) The gate table's "boot console captured alongside" — the probe script captures
+  `vm-run`'s console to a log outside the tree and the ssh output into the gate log; the proof
+  the gate greps is the ssh line, and the console is corroborating (`vmrun.log`). Phase 0's
+  done-when met; the phase needed one human intervention (the reboot), so the transition rule
+  stopped the loop at the phase summary (`denver/ESCALATE.md`). Decisions D6–D8: research
+  artifact addendum.

@@ -175,3 +175,35 @@ these estimates, stop and re-research (R5).
   fallback hypothesis only (stall protocol applies after three).
 - HTTPS probe needs `outbound=1` + the image's `nameserver 10.0.2.3` (shanghai gate 5 conditions,
   unchanged).
+
+---
+
+## Post-reboot addendum (session 2, the redo pass — written before this session's probe run, R1)
+
+Session 1's verdict stands unchanged; the plan survived contact with the answered escalation.
+What the redo pass had to decide, with precedents:
+
+**D6 — the escalation's answer is accepted as machine state, then re-proven first-hand.** The
+human rebooted into the kvmctl-armed kernel (GRUB entry 29, `kvmctl kvmmem=4096` — the exact
+remedy session 1 named), ran `sh denver/vm-probe.sh` by hand, appended the capture (it ends
+`RESULT PASS`; `UNAME PASS Linux denver …`), and committed it with the script as WIP
+`b0f1e325`. Precedent for accepting operator-supplied machine state: shanghai `RESULT.md`
+(rig prep outside the tree, human owns machine policy) and the escalation archive itself
+(`denver/docs/archive/escalations/2026-11-13-PHASE-0-SCAFFOLD.md` — "the next session only
+boots, probes, and records"). The session's own evidence is still first-hand: the probe is
+rerun by this session against the same rig and captured again (see `denver/gates/`).
+
+**D7 — `/dev/kvm0` must be checked by opening it, never by listing `/dev`.** The kvm
+reference says it outright (docs/reference/subsystems/kvm.md, § *VMs as services*): the device
+"is opened by the kernel's own `openat` arm like `/dev/power`, so `ls /dev` does not list it;
+`open` is `ENOENT` unless the kernel was booted with `kvmctl`." Session 1 correctly diagnosed
+the un-armed host from `vm-run`'s own error text, but this session initially re-read a bare
+`ls /dev/kvm0` → ENOENT as "still not armed" and was corrected by the file evidence
+(`vmrun.log` showing live guest cpuid/DNS relay lines). On an Akuma host, `ls` of a
+kernel-arm-style device node proves nothing; the check is the open, or the tool's own error
+(`[vm-run] no /dev/kvm0: …`). Precedent cited in session 1's capture; now also lived.
+
+**D8 — no new intervention is taken on the redo.** The reboot intervention is already
+recorded (session 1, `RESULT.md`); recording its answer is prose, not a new `INTERVENTION:`
+line — the runbook hands autonomy back per phase and the redo needed none (the probe ran
+green from the session's own hands; see the session-2 capture).

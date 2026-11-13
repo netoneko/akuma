@@ -271,7 +271,14 @@ while [ "$i" -le "$N" ]; do
         if [ "${ESCALATE_ANSWERED:-0}" = 1 ]; then
             mkdir -p denver/docs/archive/escalations
             eslug=$(printf '%s' "$g" | tr ' /:' '---')
-            mv denver/ESCALATE.md "denver/docs/archive/escalations/$(date +%F)-$eslug.md"
+            # Never overwrite an earlier escalation's archive (same date + gate slug,
+            # e.g. two escalations on one gate in one day): a second one lands beside
+            # the first with the driver pid. Found while filing the phase-0 review -
+            # the answered reboot escalation would have been mv'd over (its lesson:
+            # archives are evidence; see the gate-log gitignore entry below).
+            esar="denver/docs/archive/escalations/$(date +%F)-$eslug.md"
+            [ -e "$esar" ] || esar="denver/docs/archive/escalations/$(date +%F)-$eslug-$$.md"
+            mv denver/ESCALATE.md "$esar"
             log "escalation answered - archived to denver/docs/archive/escalations/"
         else
             log "FATAL: escape hatch open (denver/ESCALATE.md) - answer it, then: ESCALATE_ANSWERED=1 sh denver/autoresearch.sh 1 [$g]"

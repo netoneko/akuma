@@ -95,3 +95,21 @@ HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.14s)
   title: Akuma
 RESULT PASS
 RESULT PASS
+
+----------------------------------------------------------------------------------------------
+SESSION 2 (driver rerun after ESCALATE_ANSWERED=1) - 2026-11-13 18:2x UTC, ryzen metal.
+First-hand rerun by the session: sh denver/vm-probe.sh 2>&1 | tee -a denver/gates/PHASE-0-SCAFFOLD.log
+(same rig as the hand-run above; the script frees the slot, boots, ssh-probes, stops the guest)
+----------------------------------------------------------------------------------------------
+== free the VM slot (a stale guest answers EBUSY)
+== boot: herd vm-run /root/denver/w/vm.spec
+== uname
+Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux
+== tokioprobe
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.14s)
+  title: Akuma
+RESULT PASS
+RESULT PASS

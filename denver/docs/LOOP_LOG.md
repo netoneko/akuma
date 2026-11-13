@@ -48,4 +48,37 @@ the machine it would reboot). Escalation filed: `denver/ESCALATE.md`; capture:
 **Gate state:** NOT GREEN (build half proven, boot half pending the host reboot). NEXT GATE stays
 on this gate until `RESULT PASS` appears in `denver/gates/PHASE-0-SCAFFOLD.log`.
 
+### PHASE-0-SCAFFOLD — 2026-11-13, session 2 (goose, glm-5.3-flash; the redo pass)
+
+**What we did.** Took the answered escalation (`ESCALATE_ANSWERED=1`; archive:
+`denver/docs/archive/escalations/2026-11-13-PHASE-0-SCAFFOLD.md`): the human had rebooted the
+ryzen into the kvmctl-armed kernel (GRUB entry 29, `kvmctl kvmmem=4096` — exactly the remedy
+session 1 named), run the probe by hand over ssh, captured `RESULT PASS` into the gate log, and
+committed it with the rig script as WIP `b0f1e325`. Research addendum first (R1): decisions
+D6–D8 in `denver/docs/research/PHASE-0-SCAFFOLD.md`. Then the session's own first-hand rerun:
+`sh denver/vm-probe.sh 2>&1 | tee -a denver/gates/PHASE-0-SCAFFOLD.log` — slot freed, guest
+booted, ssh round trip answered `Linux denver 0.1.0-8dc2dbcc-denver`, tokioprobe
+`RUNTIME PASS` (4 workers) / `UNAME PASS` / `HTTPS PASS` / `RESULT PASS`, guest stopped. One
+machinery fix: the escalation archive step now never overwrites an earlier archive (work log,
+finding 5). **Gate GREEN**; phase 0's done-when holds: Denver boots tokio, `uname` says denver.
+
+**What decision it forced.**
+1. *Accept operator-supplied machine state, then re-prove it first-hand* (D6) — the hand-run
+   capture stands as evidence; the session's own capture proves the rig still green after it,
+   so the gate's proof is not borrowed.
+2. *Hidden device nodes are checked by opening, never by listing* (D7) — kvm.md says `/dev/kvm0`
+   is invisible to `ls /dev` by design; this session initially re-read a bare `ls` ENOENT as
+   "still not armed" and was corrected by the file evidence (`vmrun.log` carrying live guest
+   cpuid/DNS lines). Lesson L3 records it; the check is the open or vm-run's own error text.
+3. *The phase line stops the loop* — phase 0 ends with one recorded human intervention (the
+   reboot, session 1), and the runbook's transition rule says a phase that needed interventions
+   stops at its summary for human review ("autonomy is earned per phase"). Filed
+   `denver/ESCALATE.md` (QUESTION: review the phase-0 summary); `NEXT GATE` stays on this gate
+   with the recorded reason that it is already green — runbook step 2's "unless a recorded
+   reason says otherwise" sends the next session to phase 1 (lessons 1/2/4) after the review.
+
+**Gate state:** GREEN (`RESULT PASS` in `denver/gates/PHASE-0-SCAFFOLD.log`, first-hand session
+capture, hand-run capture preserved above it). Phase 0 summary written in `denver/RESULT.md`;
+loop stopped at the phase line for human review.
+
 NEXT GATE: PHASE-0-SCAFFOLD

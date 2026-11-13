@@ -53,3 +53,80 @@ the same currency (work log, 2026-11-13); this is the session's first and only o
 
 **Wall clock:** ~40 min (17:25–18:05 UTC). **Token spend:** not instrumented in-session; the
 driver log (`DENVER_LOG`, default `/tmp/denver-autoresearch.log`) is the ledger.
+
+---
+
+## Gate PHASE-0-SCAFFOLD — session 2 (the redo pass), 2026-11-13 18:22–18:50 UTC — GREEN
+
+**Goal:** unchanged (session 1's row above). The escalation was answered: the human rebooted
+the ryzen into the kvmctl-armed kernel (GRUB entry 29, `kvmctl kvmmem=4096` — the exact remedy
+session 1 named), ran `sh denver/vm-probe.sh` by hand over ssh (capture appended to the gate
+log, ending `RESULT PASS`), and committed it with the rig script as WIP `b0f1e325`. The driver
+archived the answered escalation (`denver/docs/archive/escalations/2026-11-13-PHASE-0-SCAFFOLD.md`)
+and launched this session.
+
+**Commands and outcomes** (capture: `denver/gates/PHASE-0-SCAFFOLD.log`, session-2 section):
+
+| step | command | outcome |
+|---|---|---|
+| research addendum (R1) | `denver/docs/research/PHASE-0-SCAFFOLD.md`, decisions D6–D8 | written before the probe run |
+| rig state check (D7) | `exec 3<>/dev/kvm0` — *open*, not `ls` (the node is hidden from `ls /dev` by design) | opens; host confirmed kvmctl-armed |
+| probe, first-hand | `sh denver/vm-probe.sh 2>&1 \| tee -a denver/gates/PHASE-0-SCAFFOLD.log` | **PASS** — stale slot freed, guest booted, ssh answered, guest stopped |
+
+Probe tail as captured this session (first-hand, appended below the hand-run section):
+
+```
+== uname
+Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux
+== tokioprobe
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.14s)
+  title: Akuma
+RESULT PASS
+RESULT PASS
+```
+
+**Verdict.** Gate GREEN on the session's own capture: `uname` says denver; tokio runs
+(multi-thread, 4 workers); HTTPS egress through the host relay. The redo needed no new
+intervention (D8): the reboot was session 1's, already recorded; the hand-run pass was the
+human's answer to it, and this session re-proved the rig first-hand rather than borrowing the
+capture. One machinery fix, logged in the work log (finding 5): the escalation-archive `mv`
+now never overwrites an earlier archive — this session's phase-review escalation would have
+replaced the reboot escalation's archive (same date, same gate slug).
+
+## Phase 0 summary — scaffold (runbook transition rule)
+
+| gate | verdict | interventions |
+|---|---|---|
+| PHASE-0-SCAFFOLD (sessions 1–2) | GREEN | 1 (the kvmctl host reboot) |
+
+**What phase 0 proved.** A new platform kernel is composition, not porting: the front crate
+`akuma-jvm-kernel` (~50 LOC, `forbid(unsafe_code)`, 1:1 feature map onto
+`akuma-tokio-kernel`) and the three-file kernel `denver/` (~50 LOC + banner) over the proven
+`akuma-tokio-kernel*` stack merged from shanghai — build green cold (22.9 s, session 1), boot
+green on the metal (this session). Zero kernel code of our own; feature parity with the
+pass-through by construction (it *is* the pass-through). The machine facts stand as recorded:
+standalone toolchain, no aarch64 std, x86_64 + host surface is the checkable R6 default here.
+
+**Decisions taken.** Session 1: D1 merge-not-port, D2 pass-through front crate, D3 three-file
+kernel, D4 rig outside the tree, D5 driver carries root manifests. Session 2: D6 accept
+operator-supplied machine state, then re-prove first-hand; D7 hidden device nodes are checked
+by opening, never by listing; D8 no new intervention taken on the redo. Precedents cited in
+the research artifact (R9).
+
+**Interventions.** One for the phase: the kvmctl host reboot (session 1, recorded there with
+what was stuck and what unblocked it; answered by the human). The redo pass itself needed
+none — no new intervention line was added this session.
+
+**Transition rule applied.** The phase's gate is green and records complete, but the phase
+needed a human intervention — per the runbook ("autonomy is earned per phase, not granted
+once") the loop stops at this summary for human review: `denver/ESCALATE.md` asks for the
+phase-0 review before phase 1 (lessons 1, 2, 4: build `denver/docs/REQUIREMENTS.md` from
+running the workload on this kernel, write the RED probes, measure the
+hypothesis-to-verdict cycle) opens. `NEXT GATE` stays `PHASE-0-SCAFFOLD` with the recorded
+reason (gate green) in `LOOP_LOG.md`.
+
+**Wall clock:** ~30 min (18:22–18:50 UTC). **Token spend:** not instrumented in-session; the
+driver log (`/tmp/denver-autoresearch.log`) is the ledger.
