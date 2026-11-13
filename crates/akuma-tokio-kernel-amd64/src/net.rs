@@ -1,0 +1,402 @@
+//! Stage 4: the network path.
+//!
+//! `akuma-net` (smoltcp, the AF_INET socket table) and `akuma-net-nic` (the
+//! virtio-net device and its DMA arenas) pulled in as crates — the socket
+//! *decisions* were already extracted, and the device layer with them; what
+//! this module supplies is the twelve function pointers in [`NetRuntime`]
+//! (the stack's entire upward surface) plus the two things a no-scheduler,
+//! no-interrupt kernel has to add by hand: a clock for smoltcp's timers, and
+//! a place to pump the NIC while a task sleeps or waits.
+//!
+//! # The clock
+//!
+//! smoltcp stamps everything (retransmit, DHCP, ARP ageing) with `now()` in
+//! microseconds. The source is the TSC, calibrated once at boot against the
+//! PIT — the same
+//! 8254 reference `akuma-amd64` uses, and the one device kvm0 emulates well
+//! enough to answer the channel-2 gate/output handshake through port 0x61
+//! (`amd64/src/kvm/linux.rs` wires 0x40–0x43 and 0x61). The calibration is
+//! bounded: if the PIT never reports its output pin, the TSC rate stays a
+//! guess and the boot says so — timers that drift make TCP slower, not
+//! wrong.
+//!
+//! # Pumping the NIC
+//!
+//! The guest has no IOAPIC and kvm0 never raises the NIC's interrupt line:
+//! frames arrive only when somebody calls [`netpoll`]. The idle thread drives
+//! it once per lap, the timer tick once per tick, and `wait_until`'s laps
+//! drive it from inside `akuma-net` while a blocking socket call waits. A
+//! sleeping task (glue's `nanosleep`) parks, so the core idles and the idle
+//! lap pumps.
+
+use akuma_net::NetRuntime;
+
+// ---------------------------------------------------------------------------
+// Port I/O — x86_64-only by construction (this crate never joins the root
+// `default-members`), still written as cfg-gated helpers so a stray host
+// build fails at compile time instead of at instruction decode.
+// ---------------------------------------------------------------------------
+
+/// One spin-loop hint.
+#[inline]
+fn pause() {
+    core::hint::spin_loop();
+}
+
+/// One WAIT lap that hands the host core back: the vCPU halts (a VM exit)
+/// until the next interrupt. The relay thread shares this core with the
+/// vCPU — the one-pinned-core note in KVM_RELAY_SYN_STALL.md — so a guest
+/// that only pause()-spins pegs the core and the relay starves: boot
+/// ph-6's P3 stall showed ~10 s of frozen gw_frames/rx delivery behind
+/// `hlt=0` and the host's guest core at 100%. `sti; hlt; cli` opens IF
+/// for exactly one instruction, so the LAPIC tick (armed before any
+/// caller) always wakes the lap. Wait loops only: the calibrator's PIT
+/// gate poll keeps the bare pause (an hlt would skew the TSC window).
+#[inline]
+pub fn wait_lap() {
+    // `sti; hlt; cli`: IF is open for the one hlt and restored right after; the
+    // only unmasked source is the tick, whose handler is reentrant with every
+    // caller of this fn.
+    crate::smp::park_halt();
+}
+
+/// Read the timestamp counter.
+fn rdtsc() -> u64 {
+    akuma_cpu::tsc::rdtsc()
+}
+
+// ---------------------------------------------------------------------------
+// The TSC clock, calibrated once against the PIT.
+// ---------------------------------------------------------------------------
+
+/// TSC increments per microsecond; 0 until [`calibrate`] has run.
+static TSC_PER_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Whether the PIT was there to calibrate against (`SYSTEM_CONTROL_B.present()` measured
+/// port 0x61 answering, and the window closed before the TSC drift could).
+static TSC_CALIBRATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Fallback rate for a machine with no PIT: 2.5 GHz, the rough order of the
+/// box's parts. Timer-driven behaviour (TCP retransmit, DHCP retry, the
+/// serve loop's 1 ms tick) scales with the error; the gate does not measure
+/// time, so a wrong guess costs latency, never correctness. The boot says
+/// the rate is a guess.
+const TSC_PER_US_GUESS: u64 = 2_500;
+
+/// The 8254's crystal frequency, Hz.
+const PIT_HZ: u64 = 1_193_182;
+/// Calibration window: ~50 ms of PIT counts (short enough to not slow the
+/// boot, long enough that TSC noise is rounding error).
+const PIT_COUNT: u32 = (PIT_HZ * 50_000 / 1_000_000) as u32;
+/// Bound on the OUT-pin wait, in spin iterations: the window above is 50 ms,
+/// so a wait ten times that means the gate never opened (no PIT behind port
+/// 0x61 — QEMU's `microvm` machine is wired exactly that way) and the boot
+/// should move on with the guessed rate rather than hang.
+const OUT_WAIT_BUDGET: u32 = 20_000_000;
+
+/// Calibrate the TSC against PIT channel 2, polled — no interrupts involved.
+///
+/// Called once, from `kernel_main`, after `lapic_init` (whose own calibration is the
+/// fallback rate) and **before** `exec_twin::init` registers [`uptime_us`] as the
+/// kernel's clock: registered first, the clock would read `rdtsc / 1` until this ran
+/// and then jump backwards under every deadline already computed against it.
+///
+/// Channel 2 in mode 0 (interrupt-on-terminal-count), gate enabled through
+/// port B, then the OUT pin polled until the count expires. `tsc / elapsed`
+/// is the rate. Every step is bounded so a missing PIT costs one guessed
+/// clock, never a hang.
+/// No usable PIT: take the TSC rate the LAPIC timer calibration already measured
+/// (`akuma_lapic_amd64::tsc_hz`, which runs before this), and only guess if that has not run.
+///
+/// The fixed guess alone made every guest clock wrong by `real / 2500`: under KVM there is no PIT
+/// behind port 0x61, the host TSC is ~3.8 GHz, and the "3m09" a build printed took 129 s on the
+/// host - 1.5x fast (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` section 3).
+fn use_lapic_rate(why: &str) {
+    let hz = akuma_lapic_amd64::tsc_hz();
+    if hz >= 1_000_000 {
+        let per_us = hz / 1_000_000;
+        TSC_PER_US.store(per_us, core::sync::atomic::Ordering::Relaxed);
+        TSC_CALIBRATED.store(true, core::sync::atomic::Ordering::Relaxed);
+        akuma_primitives::safe_print!(96, "  net: {why} -- TSC rate from the LAPIC calibration: {} cyc/us\n", per_us);
+    } else {
+        TSC_PER_US.store(TSC_PER_US_GUESS, core::sync::atomic::Ordering::Relaxed);
+        akuma_primitives::safe_print!(96, "  net: {why} -- TSC rate is a guess ({TSC_PER_US_GUESS}/us)\n");
+    }
+}
+
+pub fn calibrate() {
+    if !akuma_port::SYSTEM_CONTROL_B.present() {
+        use_lapic_rate("no PIT behind port 0x61");
+        return;
+    }
+    // Channel 2, mode 0, the count; then raise its gate (speaker off) so it starts down, and poll OUT.
+    akuma_port::PIT.load_channel2_oneshot(PIT_COUNT as u16);
+    let saved = akuma_port::SYSTEM_CONTROL_B.begin_channel2();
+    let t0 = rdtsc();
+    let mut guard = 0u32;
+    while !akuma_port::SYSTEM_CONTROL_B.channel2_output_high() {
+        pause();
+        guard += 1;
+        if guard > OUT_WAIT_BUDGET {
+            break;
+        }
+    }
+    let t1 = rdtsc();
+    akuma_port::SYSTEM_CONTROL_B.end_channel2(saved);
+    if guard > OUT_WAIT_BUDGET || t1 <= t0 {
+        use_lapic_rate("PIT output never rose");
+        return;
+    }
+    let elapsed_us = (u64::from(PIT_COUNT) * 1_000_000) / PIT_HZ;
+    let per_us = (t1 - t0).max(1) / elapsed_us.max(1);
+    TSC_PER_US.store(per_us.max(1), core::sync::atomic::Ordering::Relaxed);
+    TSC_CALIBRATED.store(true, core::sync::atomic::Ordering::Relaxed);
+    akuma_primitives::safe_print!(96, "  net: TSC calibrated vs PIT: {} cyc/us\n", per_us);
+}
+
+
+/// Microseconds since boot (the calibrated TSC): the kernel's one clock. The
+/// scheduler, `akuma-exec`, `akuma_primitives::clock` (so glue's time syscalls),
+/// futex deadlines and smoltcp all read this function (`exec_twin::init`).
+pub fn uptime_us() -> u64 {
+    let per_us = TSC_PER_US.load(core::sync::atomic::Ordering::Relaxed).max(1);
+    rdtsc() / per_us
+}
+
+// ---------------------------------------------------------------------------
+// Randomness.
+// ---------------------------------------------------------------------------
+
+/// Does this CPU implement `RDRAND`? CPUID leaf 1, ECX bit 30 — checked,
+/// not assumed: executing the instruction without the feature is `#UD`.
+#[cfg(target_arch = "x86_64")]
+fn has_rdrand() -> bool {
+    core::arch::x86_64::__cpuid(1).ecx & (1 << 30) != 0
+}
+
+/// A counter-based fallback, seeded from the TSC and mixed with SplitMix64.
+/// **Not a cryptographic source** — enough to keep TCP initial sequence
+/// numbers from repeating every boot; not enough for key exchange. The
+/// stage's honest answer for a CPU without `RDRAND`; the gate's byte
+/// comparison does not depend on which one ran.
+fn weak_fill(buf: &mut [u8]) {
+    static STATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    let seed = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, core::sync::atomic::Ordering::Relaxed) ^ rdtsc();
+    akuma_primitives::rng::splitmix_fill(seed, buf);
+}
+
+/// One word from `RDRAND`, retrying transient failures ten times (Intel's own
+/// recommendation); `None` when the hardware stays out of entropy.
+#[cfg(target_arch = "x86_64")]
+fn rdrand_word() -> Option<u64> {
+    for _ in 0..10 {
+        let mut value: u64 = 0;
+        let mut ok: u8 = 0;
+        // SAFETY: `rdrand` writes a general register and sets CF; no memory,
+        // no stack.
+        unsafe {
+            core::arch::asm!(
+                "rdrand {v}", "setc {ok}",
+                v = out(reg) value, ok = out(reg_byte) ok,
+                options(nomem, nostack),
+            );
+        }
+        if ok != 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// Fill `buf` from `RDRAND`; falls back to [`weak_fill`] when the CPU lacks the
+/// instruction, and for the tail if the hardware runs out of entropy (stated
+/// weak). Registered as both the `NetRuntime` hook (TCP ISNs) and the
+/// `getrandom(2)` arm (`sshd`'s key exchange reads it). The fill loop is
+/// `akuma_primitives::rng`'s; the instruction and this policy stay here.
+pub fn rng_fill(buf: &mut [u8]) {
+    #[cfg(target_arch = "x86_64")]
+    if has_rdrand() {
+        if let Err(filled) = akuma_primitives::rng::fill_from_words(buf, rdrand_word) {
+            weak_fill(&mut buf[filled..]);
+        }
+        return;
+    }
+    weak_fill(buf);
+}
+
+// ---------------------------------------------------------------------------
+// The NetRuntime table — twelve function pointers, each collapsed to what a
+// one-core, no-interrupt, no-scheduler kernel can honestly answer. The same
+// collapses `akuma-amd64` makes (see `amd64/src/net.rs`); written out one by
+// one so each is a decision with a reason attached.
+// ---------------------------------------------------------------------------
+
+/// Spin until `deadline_us`. The wait loops call this as a *backstop* between
+/// re-checks, and every lap pumps the NIC — on this guest there is no
+/// interrupt to wake anybody, so a backstop that did not poll would add its
+/// whole duration to every socket latency.
+fn park_until(deadline_us: u64) {
+    while uptime_us() < deadline_us {
+        netpoll();
+        wait_lap();
+    }
+}
+
+/// One lap of a socket waiter with nothing to do. `wait_until` drives
+/// `poll()` itself at the top of every lap; this hook only has to burn a
+/// bounded moment before the next re-check. [Q5 fix-cand] pump here too:
+/// a waiter that reaches this hook between predicate laps (send buffer
+/// full, e.g. sshd's exit report with the relay slot unacked) must keep
+/// the only pump in the kernel alive, or the guest deadlocks with its
+/// NIC ring unposted and its TX frames unflushed (Q5 wedge).
+fn blocking_relax() {
+    for _ in 0..64 {
+        netpoll();
+        wait_lap();
+    }
+}
+
+/// A waker that does nothing: nothing here is ever parked in a way a waker
+/// could resume — the wait loops poll.
+fn noop_waker() -> core::task::Waker {
+    use core::task::{RawWaker, RawWakerVTable, Waker};
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |_| RawWaker::new(core::ptr::null(), &VTABLE),
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+    // SAFETY: the vtable's four functions are all no-ops that ignore the
+    // data pointer, so a null pointer is never dereferenced.
+    unsafe { Waker::from_raw(RawWaker::new(core::ptr::null(), &VTABLE)) }
+}
+
+fn runtime() -> NetRuntime {
+    /// No parked core to ring a doorbell at: loopback frames ride the next
+    /// poll lap, and there is no `wfi` sleeper to end early.
+    fn noop() {}
+    NetRuntime {
+        uptime_us,
+        utc_seconds: || None, // no wall clock; nothing in akuma-net reads this hook
+        yield_now: || {
+            // [Q5 fix-cand] never a bare pause: every yield lap must keep
+            // the pump alive (see blocking_relax).
+            netpoll();
+            wait_lap();
+        },
+        blocking_relax,
+        park_until,
+        current_waker: noop_waker,
+        current_core_id: || 0,
+        current_box_id: || 0,
+        is_current_interrupted: || false, // no signal delivery in this kernel
+        rng_fill,
+        current_thread_id: || 0,
+        wake_netpoll: noop,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Bring-up and the poll pump.
+// ---------------------------------------------------------------------------
+
+/// One lap of the stack: drain the NIC into smoltcp, run its timers. The
+/// everything-path for inbound frames on this guest.
+///
+/// Bring-up and reentrancy guard (session ph): the tick backstop calls this
+/// from interrupt context while the task-context pumps (sshd's serve loop,
+/// the DHCP wait, the NetRuntime hooks) may be inside it, and a tick can
+/// fire before the stack exists. One lap at a time; a no-op until
+/// `net_init` brought the stack up.
+static NET_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static IN_LAP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub fn netpoll() {
+    if !NET_UP.load(core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    if IN_LAP.swap(true, core::sync::atomic::Ordering::Acquire) {
+        return;
+    }
+    #[cfg(feature = "trace-err")]
+    let t0 = uptime_us();
+    let _ = akuma_net::smoltcp_net::poll();
+    #[cfg(feature = "trace-err")]
+    lap_note(uptime_us().saturating_sub(t0));
+    IN_LAP.store(false, core::sync::atomic::Ordering::Release);
+}
+
+/// Trace builds: how long the stack's laps take. A lap runs with the kernel lock held, so a slow
+/// one is a stall for every core that wants the lock (docs/archive/TAOXICHUAN_J4_BKL_CONVOY.md).
+/// One line a second when anything ran: `laps` (all), `slow` (over 2 ms), `max_us`, `sum_us`.
+#[cfg(feature = "trace-err")]
+fn lap_note(dur_us: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAPS: AtomicU64 = AtomicU64::new(0);
+    static SLOW: AtomicU64 = AtomicU64::new(0);
+    static MAX: AtomicU64 = AtomicU64::new(0);
+    static SUM: AtomicU64 = AtomicU64::new(0);
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    LAPS.fetch_add(1, Relaxed);
+    SUM.fetch_add(dur_us, Relaxed);
+    if dur_us > 2_000 {
+        SLOW.fetch_add(1, Relaxed);
+    }
+    MAX.fetch_max(dur_us, Relaxed);
+    let now = uptime_us();
+    let next = NEXT.load(Relaxed);
+    if now >= next && NEXT.compare_exchange(next, now + 1_000_000, Relaxed, Relaxed).is_ok() {
+        akuma_primitives::safe_print!(
+            128,
+            "[netlap] laps={} slow={} max_us={} sum_us={}\n",
+            LAPS.swap(0, Relaxed),
+            SLOW.swap(0, Relaxed),
+            MAX.swap(0, Relaxed),
+            SUM.swap(0, Relaxed)
+        );
+    }
+}
+
+/// The socket layer with no NIC: `127.0.0.1` works, nothing else is reachable. A kernel
+/// that leaves `Kernel::net` unwired, or whose NIC probe failed.
+pub fn loopback_init() {
+    if akuma_net::init_loopback_only(runtime()).is_err() {
+        crate::console::puts("  net: loopback init failed\n");
+        return;
+    }
+    crate::console::puts("  net: loopback only\n");
+}
+
+#[cfg(feature = "net")]
+/// The stack itself (probe virtio-net, bring up smoltcp, start DHCP); the
+/// clock was calibrated earlier ([`calibrate`], before `exec_twin::init`).
+/// Then the DHCP wait: bounded, pumping the NIC, so the guest
+/// has its address before init asks the socket layer for a port.
+pub fn net_init() -> bool {
+    akuma_primitives::safe_print!(96, "  net: stack init begin\n");
+    if akuma_net::init(runtime(), true).is_err() {
+        crate::console::puts("  net: stack init failed -- no virtio-net device\n");
+        return false;
+    }
+    NET_UP.store(true, core::sync::atomic::Ordering::Release);
+    crate::raw_uart(b"[raw] stack up, dhcp loop\n");
+    crate::console::puts("  net: smoltcp stack up, DHCP requested\n");
+    let deadline = uptime_us() + 10_000_000; // 10 s
+    while uptime_us() < deadline {
+        netpoll();
+        if akuma_net::smoltcp_net::is_dhcp_configured() {
+            let ip = akuma_net::smoltcp_net::static_ipv4().addr;
+            akuma_primitives::safe_print!(
+                96,
+                "  net: DHCP configured, {}.{}.{}.{}\n",
+                ip[0],
+                ip[1],
+                ip[2],
+                ip[3]
+            );
+            return true;
+        }
+        wait_lap();
+    }
+    crate::console::puts("  net: DHCP not answered in 10 s -- continuing unaddressed\n");
+    false
+}

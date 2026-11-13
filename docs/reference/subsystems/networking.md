@@ -546,6 +546,8 @@ smoltcp. If that is wrong for AArch64, it is one call at boot, not a code change
   one errno for every failure hid both of them.
 - `archive/AKUMA_NET_SPLIT.md` — the crate survey, its test coverage, and the
   `unsafe` audit that produced `frames.rs` (bounds/borrow-checked frame storage)
-  and `nic.rs` (the one place virtio-drivers' begin/complete API is called).
+  and `nic.rs` (the one place the NIC's `unsafe` begin/complete API is called; the
+  device is `akuma_virtio::net::NetRaw` since 2026-11-01,
+  `archive/AKUMA_VIRTIO_IN_TREE.md`).
 - `../../runbooks/run-redis.md` — a worked end-to-end server on this stack,
   including which guest ports the runner actually forwards.

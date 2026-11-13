@@ -1,0 +1,153 @@
+[package]
+name = "akuma-tokio-kernel-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The machine half of akuma-tokio-kernel on amd64: a whole PVH guest kernel (boot, traps, memory, processes, signals, SMP, virtio disk and NIC) that runs unmodified Linux musl binaries, tokio programs included, over akuma-runtime-tokio. Moved from Taoxichuan's src/ (B15)."
+# Hands its linker script to the kernel binary through `akuma-tokio-kernel` (a dependency's
+# `rustc-link-arg` never reaches the binary that links it).
+links = "akuma_tokio_kernel_amd64"
+
+# Not in `default-members`: builds only for `x86_64-unknown-none`.
+[lints]
+workspace = true
+
+[features]
+# Compile the boot self-tests out, here and in the shared crates that carry them (glue's and
+# akuma-exec's): code a kernel built from this never runs.
+no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
+# Name every syscall that answers a negative errno on the console (`[err] nr=N -E`), and keep
+# the evidence rings the leak gate reads.
+trace-err = []
+# What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
+shell = ["akuma-runtime-tokio/shell"]
+# The default devices, each wired by its `Kernel` method (`console()`, `disk()`, `net()`, `smp()`).
+# COM1.
+console = ["dep:akuma-comconsole"]
+# ext2 on the first virtio-blk device as the root filesystem.
+disk = ["dep:akuma-ext2"]
+# The first virtio-net device with DHCP; without it the socket layer is loopback-only.
+net = []
+# Application processors from the command line's `smp=N`.
+smp = []
+
+# The kernel's own target only (the crate is empty elsewhere; see `src/lib.rs`).
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+# ---- The stage-1 crate lines, in boot order ---------------------------------
+#
+# The boot kit: PVH trampoline (boot.s — its `global_asm!` lives in the crate),
+# the physmap, kernel page tables, heap + PMM bring-up. One crate where
+# `amd64/src` used to be the only home of all four.
+akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
+# The console: COM1, minimal. The banner's only dependency at this stage.
+akuma-comconsole = { path = "../akuma-comconsole", optional = true }
+# The GDT/TSS descriptors this kernel loads (one core, no userspace yet — the
+# TSS exists so the table is the finished shape, not because ring 3 runs).
+akuma-gdt = { path = "../akuma-gdt" }
+# The IDT (table + lidt) and the trap entry stubs; the fault handlers that make
+# a wrong kernel *reportable* — a #PF prints `[Fault]` and halts instead of
+# triple-faulting the guest into silence.
+akuma-idt-amd64 = { path = "../akuma-idt-amd64" }
+akuma-trap-amd64 = { path = "../akuma-trap-amd64" }
+# The machine's own description of itself: the PVH handoff, the memory map, the
+# virtio-mmio command line.
+akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
+# The heap allocator (installed here as the global allocator) and the frame
+# allocator `paging` and `virtio` allocate through.
+akuma-alloc = { path = "../akuma-alloc" }
+akuma-pmm = { path = "../akuma-pmm" }
+# The leaf crate every shared crate talks through: the console hook
+# (`safe_print!`), the physmap limit, the virtio window.
+akuma-primitives = { path = "../akuma-primitives" }
+# virtio-mmio block: the root disk's transport and driver, polled.
+akuma-virtio = { path = "../akuma-virtio" }
+# ext2 on that disk: the root filesystem, and the `Filesystem` vocabulary it
+# implements.
+akuma-ext2 = { path = "../akuma-ext2", optional = true }
+akuma-vfs = { path = "../akuma-vfs" }
+# The shared mount table: the ext2 root is mounted at `/` in it, the same
+# instance `root_fs()` hands the dispatcher, so the arms that move to
+# `akuma-syscalls-glue` resolve paths through the table both kernels use
+# (TAOXICHUAN_CLEANUP_PLAN.md step 2a; amd64 did this as C1 step 4a).
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+# cr0/cr2/cr3/cr4 reads (fault reports, the WP bit), `invlpg`, `park`.
+akuma-cpu = { path = "../akuma-cpu" }
+# The copy-on-write write-fault decision (live PTE writable? marked? share count?).
+akuma-cow = { path = "../akuma-cow" }
+# The mmap slab's hole table (first-fit under the bump cursor), host-tested.
+akuma-mmap = { path = "../akuma-mmap" }
+# The FPU save area's sizes, offsets and power-on image (shared with the amd64 kernel).
+akuma-fpu-amd64 = { path = "../akuma-fpu-amd64" }
+# The CoW fork's per-entry decisions (skip/refuse/descend/copy/share) and free order, host-tested on a fake tree.
+akuma-user-tree = { path = "../akuma-user-tree" }
+# ---- The stage-2 crate line -------------------------------------------------
+#
+# Ring 3: the ELF slice parser, the Linux initial stack, the syscall MSR
+# setup and both crossings (`sysretq` in, the naked `syscall` stub back).
+# `PteProt`/`MemAttr` for the user mappings arrive via `akuma-boot-amd64`'s
+# `paging` re-export.
+akuma-ring3-amd64 = { path = "../akuma-ring3-amd64" }
+# The pure PT_INTERP / entry decisions (composition step 3/3b): the same
+# core akuma-elf (the amd64 kernel's loader) calls. This kernel maps the
+# interpreter itself; the crate only decides.
+akuma-elf-exec = { path = "../akuma-elf-exec" }
+# ---- The stage-3 crate line -------------------------------------------------
+# ---- The stage-8 crate line (trim step 2) -----------------------------------
+#
+# The wire shapes the dispatcher used to hand-write byte by byte (`st[24..28]`
+# style offsets in fill_stat64, the table-writer statfs, the getdents64 record
+# encoder, the utsname fields, the timespec/timeval writers): the shared
+# Linux-ABI structs with their layout assertions, and the x86_64 number table.
+# The full kernels consume both; this kernel copies amd64's call shape (fill
+# the asm-generic struct, `stat::to_x86_64` re-lays it, bytes to the task).
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-syscalls-abi = { path = "../akuma-syscalls-abi" }
+# pn S2: membarrier's command decode (the barrier itself is an effect here).
+akuma-syscalls-mem = { path = "../akuma-syscalls-mem" }
+# The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
+akuma-syscalls-proc = { path = "../akuma-syscalls-proc" }
+# ---- The stage-4 crate line -------------------------------------------------
+#
+# The network stack: the AF_INET socket table and the smoltcp interface
+# (`akuma-net`, decisions, host-tested, zero unsafe) over the virtio-net
+# device and its DMA arenas (`akuma-net-nic`, every unsafe in networking).
+# Both build for `x86_64-unknown-none` unchanged — `akuma-amd64` has never
+# carried them anywhere. What this kernel supplies is the `NetRuntime`
+# callback table (`src/net.rs`): a TSC clock calibrated against the
+# PIT, an RDRAND-backed RNG, and the no-op collapses a one-core,
+# no-interrupt, no-scheduler target makes of the park/wake hooks.
+akuma-net = { path = "../akuma-net" }
+# M4 slice 3 (session pd): the fork pull's remaining halves — the isolation
+# namespace every Process field carries, and the x86 UserAddressSpace walker
+# fork_process builds the child's address space with.
+akuma-isolation = { path = "../akuma-isolation", default-features = false }
+akuma-mmu = { path = "../akuma-mmu" }
+# The Process fields' lock type (amd64 and akuma-exec both build on it).
+spinning_top = "0.3"
+# TerminalState (the Process field's line-discipline cell) lives here.
+akuma-tty = { path = "../akuma-tty" }
+# Stage 8 M4 session pb: the exec/threading ladder pulled for the preemption
+# foundation (linkage proved; the exec_runtime twin lands next session), and
+# the LAPIC timer face extracted from amd64/src/lapic.rs so both kernels share
+# one implementation. akuma-port rides along: this kernel now masks the legacy
+# PICs before arming the timer, exactly as amd64's lapic::init does.
+akuma-exec = { path = "../akuma-exec" }
+akuma-threading = { path = "../akuma-threading" }
+akuma-lapic-amd64 = { path = "../akuma-lapic-amd64" }
+# The machine half of the scheduler (switch / can_run / FP state), shared with the metal kernel.
+akuma-sched-amd64 = { path = "../akuma-sched-amd64" }
+akuma-user-walk = { path = "../akuma-user-walk" }
+# A task's layout: regions, the brk window, the mmap slab and its holes, shared file mappings.
+akuma-user-layout = { path = "../akuma-user-layout" }
+akuma-pte-amd64 = { path = "../akuma-pte-amd64" }
+akuma-port = { path = "../akuma-port" }
+# The shared syscall bodies (TAOXICHUAN_CLEANUP_PLAN.md step 2c): arms move
+# from `dispatch_inner` to `handle_syscall` the way amd64's did. Same feature
+# set amd64 builds it with. Its user copies are `akuma-user-access`'s, whose
+# fault recovery (`user_copy_fixup`) this kernel's page-fault handler consults.
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "sc-epoll", "sc-eventfd"] }
+# The x86_64 ABI over glue for the fd family (open flags, struct stat, the
+# legacy numbers), shared with amd64.
+akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
+# The tokio surface: the allow-list, the hooks and the dispatch to glue (Phase 3).
+akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
+akuma-user-access = { path = "../akuma-user-access" }

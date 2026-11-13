@@ -65,10 +65,12 @@
 extern crate alloc;
 
 mod frame;
+pub mod holes;
 mod region;
 mod types;
 
 pub use frame::PhysFrame;
+pub use holes::HoleSet;
 pub use region::{
     FileBacking, MmapRegion, SharedWriteBack, detach_eager_regions_in_range,
     inherit_mmap_regions_for_cow_child, insert_region_sorted, mprotect_eager_regions_in_range,

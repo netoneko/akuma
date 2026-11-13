@@ -1,0 +1,36 @@
+# Own workspace root, like userspace/ncaprobe and userspace/nettest/rust: this
+# crate is NOT part of the repo-root workspace (the no_std kernel target) and NOT
+# a member of userspace/Cargo.toml (no_std on libakuma). It is a plain
+# std + musl + pthreads binary, because that is the runtime surface tokio uses.
+# Build with ./build-musl.sh; see README.md.
+[workspace]
+
+[package]
+name = "tokioprobe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "tokioprobe"
+path = "src/main.rs"
+
+[dependencies]
+# No new third-party crates: these are the dependency lines the repo's other
+# tokio probes already use. reqwest is nettest-reqwest's line verbatim (rustls +
+# ring + webpki-roots, so no CA bundle is needed in the guest); Cargo.lock
+# started as a copy of nettest/rust/reqwest/Cargo.lock so the resolved versions
+# match it (tokio 1.53.1, reqwest 0.12.28, rustls 0.23.43).
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# rt-multi-thread is the runtime goose and nca use. `process` is what runs
+# `uname -a`: it needs pipe2 + clone/execve + wait4 and SIGCHLD delivery, so it
+# also exercises tokio's signal driver (signal-hook-registry, as ncaprobe's
+# `full` already pulls in).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "process", "io-util", "net"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

@@ -343,6 +343,14 @@ limitations accepted and documented rather than silently left).
   broadcasts `SIGINT` to every process sharing the terminal's
   `foreground_pgid` instead of forwarding the byte. See
   [`../../archive/CTRL_C_SIGINT_DELIVERY.md`](../../archive/CTRL_C_SIGINT_DELIVERY.md).
+- **Who owns the child's stdin depends on the ABI sshd is built for.** Natively the
+  kernel's `SPAWN` owns it: sshd writes through `/proc/<pid>/fd/0` and ends it with
+  `close_child_stdin`. Built `libakuma/linux-abi` (Taoxichuan), the spawn is
+  `fork`+`execve` and sshd owns the write end of the child's stdin pipe
+  (`SpawnResult::stdin_fd`); EOF is closing it. `bridge_process` takes whichever the
+  spawn returned. A `linux-abi` spawn that gives the child no stdin pipe leaves the
+  pump feeding a descriptor the child does not read
+  ([`../../archive/TAOXICHUAN_SSH_STDIN_PUMP.md`](../../archive/TAOXICHUAN_SSH_STDIN_PUMP.md)).
 
 ## Background
 

@@ -134,6 +134,12 @@ fn memslot_refusals() {
     assert_eq!(t.check(&Region { uaddr: 0x1001, ..region(0, 0, LEAF) }), Err(Refused::UserRange));
     assert_eq!(t.check(&Region { uaddr: USER_TOP - 4096, ..region(0, 0, LEAF) }), Err(Refused::UserRange));
     assert_eq!(t.check(&Region { uaddr: u64::MAX - 4095, ..region(0, 0, LEAF) }), Err(Refused::UserRange));
+    // The device window (3..4 GiB) is devices', not RAM's: in it or across it refused,
+    // up to its edge and above it (where a 4 GiB guest's top GiB goes) accepted.
+    assert_eq!(t.check(&region(0, DEVICE_WINDOW_BASE, LEAF)), Err(Refused::Geometry));
+    assert_eq!(t.check(&region(0, DEVICE_WINDOW_BASE - LEAF, 2 * LEAF)), Err(Refused::Geometry));
+    assert!(t.check(&region(0, DEVICE_WINDOW_BASE - LEAF, LEAF)).is_ok());
+    assert!(t.check(&region(0, DEVICE_WINDOW_END, 512 * LEAF)).is_ok(), "the GiB above the window");
 }
 
 #[test]

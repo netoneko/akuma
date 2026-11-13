@@ -193,7 +193,7 @@ fn fatal(vector: &str, frame: &InterruptStackFrame, error_code: Option<u64>) -> 
     // a `mov cr3` ago was mapped — and the three words below are what tell it
     // apart from the other two in one line: `freed=1` means the root names a
     // torn-down address space, and `slot_root` names the task slot that was
-    // carrying it (`sched::hook_switch_to` installs exactly that value).
+    // carrying it (`akuma_sched_amd64::switch_to` installs exactly that value).
     //
     // Guarded on `percpu_installed`: `cpu_index` reads `gs:[0]`, and on a core
     // that faulted before `install_percpu` that is a dereference of 0 — a

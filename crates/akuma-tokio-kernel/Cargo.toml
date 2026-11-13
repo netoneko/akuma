@@ -1,0 +1,33 @@
+[package]
+name = "akuma-tokio-kernel"
+version = "0.1.0"
+edition = "2024"
+description = "A whole Akuma kernel that runs unmodified Linux binaries, tokio programs included, from one short main.rs: the entry macro, the Kernel builder, and the default devices as features. The machine half is per architecture (akuma-tokio-kernel-amd64)."
+# Relays the machine half's linker script to the kernel binary (see build.rs).
+links = "akuma_tokio_kernel"
+
+[lints]
+workspace = true
+
+[features]
+# Every default device. A kernel that wants fewer turns `default-features` off and names its own.
+default = ["console", "disk", "net", "smp"]
+# COM1 (`Kernel::console`).
+console = ["akuma-tokio-kernel-amd64/console"]
+# ext2 on the first virtio-blk device as the root filesystem (`Kernel::disk`).
+disk = ["akuma-tokio-kernel-amd64/disk"]
+# The first virtio-net device with DHCP (`Kernel::net`); without it, loopback only.
+net = ["akuma-tokio-kernel-amd64/net"]
+# Application processors from `smp=N` (`Kernel::smp`).
+smp = ["akuma-tokio-kernel-amd64/smp"]
+# What busybox and bash call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
+shell = ["akuma-tokio-kernel-amd64/shell"]
+# Compile the boot self-tests of the shared crates out.
+no-tests = ["akuma-tokio-kernel-amd64/no-tests"]
+# Name every syscall that answers a negative errno on the console.
+trace-err = ["akuma-tokio-kernel-amd64/trace-err"]
+
+# The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
+# *host's* under `cargo test`, and the machine halves build only for the kernel targets.
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+akuma-tokio-kernel-amd64 = { path = "../akuma-tokio-kernel-amd64" }

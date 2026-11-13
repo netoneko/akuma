@@ -66,10 +66,11 @@ pub struct PortRange {
 
 /// Every I/O port this crate can touch. The registry the types are checked
 /// against, and the list to read when asking "who owns port N?".
-pub const RANGES: [PortRange; 11] = [
+pub const RANGES: [PortRange; 12] = [
     PortRange { name: "pic-master-mask", first: 0x21, last: 0x21, width: 1 },
     PortRange { name: "pit", first: 0x40, last: 0x43, width: 1 },
     PortRange { name: "i8042-data", first: 0x60, last: 0x60, width: 1 },
+    PortRange { name: "system-control-b", first: 0x61, last: 0x61, width: 1 },
     PortRange { name: "i8042-status-command", first: 0x64, last: 0x64, width: 1 },
     PortRange { name: "cmos", first: 0x70, last: 0x71, width: 1 },
     PortRange { name: "pic-slave-mask", first: 0xA1, last: 0xA1, width: 1 },
@@ -190,6 +191,9 @@ pub const PIT: Pit = Pit;
 
 impl Pit {
     const CH0_DATA: u16 = 0x40;
+    const CH2_DATA: u16 = 0x42;
+    /// Channel 2, lobyte then hibyte, mode 0, binary.
+    const CH2_LOAD_MODE0: u8 = 0b1011_0000;
     const COMMAND: u16 = 0x43;
     /// Channel 0, lobyte then hibyte, mode 0 (interrupt on terminal count),
     /// binary.
@@ -210,6 +214,14 @@ impl Pit {
         raw::outb(Self::CH0_DATA, (count >> 8) as u8);
     }
 
+    /// Load `count` into channel 2 in mode 0 (the channel the PC speaker and TSC calibration use). Unlike channel 0
+    /// the gate is NOT hardwired high: the countdown starts when [`SystemControlB::begin_channel2`] raises it.
+    pub fn load_channel2_oneshot(&self, count: u16) {
+        raw::outb(Self::COMMAND, Self::CH2_LOAD_MODE0);
+        raw::outb(Self::CH2_DATA, (count & 0xFF) as u8);
+        raw::outb(Self::CH2_DATA, (count >> 8) as u8);
+    }
+
     /// Latch and return channel 0's status byte.
     #[must_use]
     pub fn channel0_status(&self) -> u8 {
@@ -226,6 +238,61 @@ impl Pit {
     #[must_use]
     pub fn channel0_output_high(&self) -> bool {
         self.channel0_status() & Self::STATUS_OUTPUT != 0
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System control port B (0x61)
+// ---------------------------------------------------------------------------
+
+/// System control port B (0x61).
+///
+/// Bit 0 gates PIT channel 2, bit 1 is the speaker data line, bit 5 (read-only) is channel 2's
+/// OUT pin. Bits 2-3 enable the parity / I/O-channel NMIs and 6-7 are read-only status, so this device **never writes
+/// any bit but 0 and 1** - there is no method that could disable an NMI source by accident.
+#[derive(Clone, Copy, Debug)]
+pub struct SystemControlB;
+
+pub const SYSTEM_CONTROL_B: SystemControlB = SystemControlB;
+
+impl SystemControlB {
+    const PORT: u16 = 0x61;
+    const GATE: u8 = 1 << 0;
+    const SPEAKER: u8 = 1 << 1;
+    const CH2_OUT: u8 = 1 << 5;
+
+    /// Is something behind the port? Flip the gate bit and read it back; a bus with no device behind it reads back
+    /// what was last written to *any* port (or all ones), so a stuck value reads as absent. The original byte is
+    /// restored. QEMU's `microvm` wires nothing here.
+    #[must_use]
+    pub fn present(&self) -> bool {
+        let orig = raw::inb(Self::PORT);
+        raw::outb(Self::PORT, orig ^ Self::GATE);
+        let readback = raw::inb(Self::PORT);
+        raw::outb(Self::PORT, orig);
+        readback & Self::GATE == (orig ^ Self::GATE) & Self::GATE
+    }
+
+    /// Raise channel 2's gate and silence the speaker, so a loaded count starts down. Returns the byte as it was, for
+    /// [`SystemControlB::end_channel2`].
+    #[must_use]
+    pub fn begin_channel2(&self) -> u8 {
+        let orig = raw::inb(Self::PORT);
+        raw::outb(Self::PORT, (orig & !Self::SPEAKER) | Self::GATE);
+        orig
+    }
+
+    /// Has channel 2's count expired (OUT high)?
+    #[must_use]
+    pub fn channel2_output_high(&self) -> bool {
+        raw::inb(Self::PORT) & Self::CH2_OUT != 0
+    }
+
+    /// Lower the gate and put the speaker bit back as `saved` had it; every other bit is left as it is now.
+    pub fn end_channel2(&self, saved: u8) {
+        let now = raw::inb(Self::PORT);
+        let low = Self::GATE | Self::SPEAKER;
+        raw::outb(Self::PORT, (now & !low) | (saved & Self::SPEAKER));
     }
 }
 

@@ -44,9 +44,7 @@ use smoltcp::socket::{tcp, udp, dhcpv4};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 
-use virtio_drivers::device::net::VirtIONetRaw;
-use akuma_virtio::VirtioTransport;
-use akuma_virtio::VirtioHal;
+use akuma_virtio::net::NetRaw;
 use crate::runtime::runtime;
 use crate::runtime::PreemptGuard;
 use akuma_net_nic::nicstat;

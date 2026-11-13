@@ -1,0 +1,12 @@
+[package]
+name = "akuma-user-tree"
+version = "0.1.0"
+edition = "2024"
+description = "The decisions of a copy-on-write fork over a 4-level user page-table tree: what to do with each entry (skip, refuse, descend, copy, share-and-demote), the order a failed or finished tree is freed in, and the shared-span policy as a named choice. Plans only: the walkers, PTE storage, invlpg and frame allocation stay in the kernel."
+
+[lints]
+workspace = true
+
+# Deliberately empty. Never `akuma-exec` or anything that depends on it (the layering rule
+# `akuma-mmap` and `akuma-syscalls-sync` state): this crate sits BELOW the process table.
+[dependencies]

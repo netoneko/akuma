@@ -116,26 +116,44 @@ static VM: Spinlock<Option<Vm>> = Spinlock::new(None);
 /// The in-kernel PIT/PIC/LAPIC, created by `CREATE_IRQCHIP`.
 static PLAT: Spinlock<Option<Platform>> = Spinlock::new(None);
 
-/// The nested page table over the memslots: PML4 -> PDPT -> PD of 2 MiB leaves, built at the first `RUN`.
+/// The nested page table over the memslots: PML4 -> PDPT -> directories of 2 MiB leaves,
+/// built at the first `RUN`. Slots may sit below or above the 3..4 GiB device window
+/// (`slots::check` refuses in/crossing it); a directory is allocated per GiB that holds a
+/// slot, so at most four are ever allocated — the window's GiB maps nothing.
 struct Npt {
     pml4: FreshFrame,
     _pdpt: FreshFrame,
-    _pd: FreshFrame,
+    _dirs: [Option<FreshFrame>; akuma_svm_amd64::rammap::MAX_DIRS],
 }
 
 fn build_npt(slots: &Table) -> Option<Npt> {
     let mut pml4 = FreshFrame::alloc_zeroed()?;
     let mut pdpt = FreshFrame::alloc_zeroed()?;
-    let mut pd = FreshFrame::alloc_zeroed()?;
+    let mut dirs = [const { None }; akuma_svm_amd64::rammap::MAX_DIRS];
     akuma_svm_amd64::wr64(pml4.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pdpt.pa() as u64));
-    akuma_svm_amd64::wr64(pdpt.bytes_mut(), 0, akuma_svm_amd64::npt::pointer(pd.pa() as u64));
-    for s in slots.iter() {
-        for i in 0..(s.region.size >> 21) {
-            let idx = ((s.region.gpa >> 21) + i) as usize;
-            akuma_svm_amd64::wr64(pd.bytes_mut(), idx * 8, akuma_svm_amd64::npt::leaf_2m(s.slice_off + (i << 21)));
+    for (d, dir) in dirs.iter_mut().enumerate() {
+        let base = (d as u64) << 30;
+        // A directory only for a GiB some slot actually covers; the window's GiB (and
+        // any GiB past the top) stays pointer-free in the PDPT.
+        if !slots.iter().any(|s| s.region.gpa < base + (1 << 30) && base < s.region.gpa + s.region.size) {
+            continue;
         }
+        let mut page = FreshFrame::alloc_zeroed()?;
+        for s in slots.iter() {
+            // `check` already refused a window-crossing or misaligned slot; the leaf
+            // writer's refusal is a belt-and-braces no-op here.
+            let _ = akuma_svm_amd64::rammap::fill_slot_directory(
+                page.bytes_mut(),
+                d,
+                s.region.gpa,
+                s.region.size,
+                s.slice_off,
+            );
+        }
+        akuma_svm_amd64::wr64(pdpt.bytes_mut(), d * 8, akuma_svm_amd64::npt::pointer(page.pa() as u64));
+        *dir = Some(page);
     }
-    Some(Npt { pml4, _pdpt: pdpt, _pd: pd })
+    Some(Npt { pml4, _pdpt: pdpt, _dirs: dirs })
 }
 
 fn irq_off<T>(f: impl FnOnce() -> T) -> T {
@@ -226,7 +244,7 @@ fn new_handle(kind: Kind, vcpu: u8) -> u64 {
 pub fn open(flags: u32) -> u64 {
     reap_handles();
     let r = new_handle(Kind::System, 0);
-    if (r as i64) >= 0 && flags & crate::fd::open_flags::O_CLOEXEC != 0
+    if r.cast_signed() >= 0 && flags & crate::fd::open_flags::O_CLOEXEC != 0
         && let Some(proc) = akuma_exec::process::current_process_shared()
     {
         proc.set_cloexec(r as u32);
@@ -243,7 +261,7 @@ fn answer(h: Handle, op: Op, arg: u64) -> u64 {
         Op::GetApiVersion => 12,
         Op::CheckExtension => u64::from(CAPS_YES.contains(&(arg as u32))),
         Op::GetSupportedCpuid => supported_cpuid(arg),
-        Op::GetMsrIndexList => crate::uaccess::write_val::<u32>(arg, 0).then_some(0).unwrap_or(errno::EFAULT),
+        Op::GetMsrIndexList => if crate::uaccess::write_val::<u32>(arg, 0) { 0 } else { errno::EFAULT },
         Op::GetVcpuMmapSize => RUN_MAP_SIZE,
         Op::CreateVm => create_vm(),
         Op::SetTssAddr => with_vm(|v| {
@@ -330,32 +348,6 @@ fn set_cpuid2(h: Handle, arg: u64) -> u64 {
     with_vcpu(h.vcpu, |vc, _| if vc.set_cpuid(&buf[..len], n) { 0 } else { errno::E2BIG })
 }
 
-/// Slice-1 check, logged: the bytes at guest-physical 0x201000 (the PVH entry the VMM loaded the kernel
-/// to) read through the slice and through the VMM's own mapping must agree, and not be zero.
-fn check_shared_memory() {
-    const GPA: u64 = 0x20_1000;
-    let (pa, ua) = irq_off(|| {
-        VM.lock().as_ref().map_or((None, None), |v| (v.slots.slice_offset(GPA), v.slots.user_addr(GPA)))
-    });
-    let (Some(pa), Some(ua)) = (pa, ua) else {
-        serial::puts("[kvmapi] shared-memory check: no slot at 0x201000\n");
-        return;
-    };
-    let mut via_slice = [0u8; 16];
-    let mut via_vmm = [0u8; 16];
-    let a = akuma_mmu::copy_from_phys(pa as usize, &mut via_slice);
-    let b = crate::uaccess::read_bytes(ua, &mut via_vmm);
-    serial::puts("[kvmapi] shared-memory check @0x201000: slice=");
-    for x in via_slice {
-        serial::put_hexn(u64::from(x), 2);
-    }
-    serial::puts(" vmm=");
-    for x in via_vmm {
-        serial::put_hexn(u64::from(x), 2);
-    }
-    serial::puts(if a && b && via_slice == via_vmm && via_slice != [0u8; 16] { " SAME\n" } else { " DIFFERENT\n" });
-}
-
 fn with_vm(f: impl FnOnce(&mut Vm) -> u64) -> u64 {
     irq_off(|| VM.lock().as_mut().map_or(errno::EINVAL, f))
 }
@@ -377,7 +369,7 @@ fn create_vm() -> u64 {
     vcpu::reset_trace();
     irq_off(|| *VM.lock() = Some(Vm::new(current_tgid())));
     let fd = new_handle(Kind::Vm, 0);
-    if (fd as i64) < 0 {
+    if fd.cast_signed() < 0 {
         irq_off(|| *VM.lock() = None);
     }
     fd
@@ -537,7 +529,7 @@ fn irqfd(arg: u64) -> u64 {
     let Some(a) = Irqfd::parse(&raw) else { return errno::EFAULT };
     let deassign = a.flags & 1 != 0;
     let id = crate::fd::eventfd_id_of(u64::from(a.fd));
-    let freed = with_vm(|v| {
+    with_vm(|v| {
         if deassign {
             for s in &mut v.irqfds {
                 if let Some((x, eid)) = *s
@@ -559,8 +551,7 @@ fn irqfd(arg: u64) -> u64 {
             }
             None => errno::ENOMEM,
         }
-    });
-    freed
+    })
 }
 
 fn ioeventfd(arg: u64) -> u64 {
@@ -612,7 +603,7 @@ pub fn ioctl(fd: u64, id: u32, req: u32, arg: u64) -> u64 {
     let size = ((req >> 16) & 0x3fff) as usize;
     if size > 0 && req >> 30 & 1 != 0 {
         serial::puts("[kvmapi]   in: ");
-        dump(arg, var_len(arg, req).unwrap_or(size.min(288)));
+        dump(arg, var_len(arg, req).unwrap_or_else(|| size.min(288)));
     }
     let r = match h {
         None => errno::EBADF,
@@ -632,16 +623,16 @@ pub fn ioctl(fd: u64, id: u32, req: u32, arg: u64) -> u64 {
     serial::puts(" arg=0x");
     serial::put_hexn(arg, 16);
     serial::puts(" -> ");
-    if (r as i64) < 0 {
+    if r.cast_signed() < 0 {
         serial::puts("-");
-        serial::put_dec((r as i64).unsigned_abs());
+        serial::put_dec(r.cast_signed().unsigned_abs());
     } else {
         serial::put_dec(r);
     }
     serial::puts("\n");
     if size > 0 && req >> 30 & 2 != 0 {
         serial::puts("[kvmapi]   out: ");
-        dump(arg, var_len(arg, req).unwrap_or(size.min(288)));
+        dump(arg, var_len(arg, req).unwrap_or_else(|| size.min(288)));
     }
     r
 }

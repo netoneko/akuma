@@ -1,0 +1,16 @@
+[package]
+name = "osaka"
+version = "0.1.0"
+edition = "2024"
+description = "Osaka: the sample kernel for akuma-tokio-kernel - one main.rs, the default devices, runs unmodified Linux binaries."
+
+# Not in `default-members`: an x86_64-unknown-none binary.
+[lints]
+workspace = true
+
+[dependencies]
+akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel", features = ["no-tests"] }
+
+[[bin]]
+name = "osaka"
+path = "src/main.rs"

@@ -8,7 +8,7 @@ use akuma_kvm_abi::fdargs::{Ioeventfd, Irqfd};
 use akuma_kvm_abi::runpage::{self, Exit};
 use akuma_kvm_abi::slots::Table;
 use akuma_kvm_abi::state::{
-    CPUID_ENTRY_LEN, CpuidEntry, Dtable, FPU_LEN, LIST_HDR, MSR_ENTRY_LEN, MsrEntry, Regs, Segment, Sregs,
+    CPUID_ENTRY_LEN, CpuidEntry, Dtable, FPU_LEN, MSR_ENTRY_LEN, MsrEntry, Regs, Segment, Sregs,
 };
 use akuma_svm_amd64 as svm;
 use akuma_svm_amd64::{ExitCode, Seg, SegAttr, Vmcb, ctrl, eventinj, exitinfo, mmio, save, tables};
@@ -179,31 +179,6 @@ impl Vcpu {
         v.set_rsp(r.rsp);
         v.set_rip(r.rip);
         v.set_rflags(r.rflags | 2);
-    }
-
-    pub(super) fn get_regs(&mut self) -> Regs {
-        let g = self.regs;
-        let v = self.vmcb();
-        Regs {
-            rax: v.rax(),
-            rbx: g.rbx,
-            rcx: g.rcx,
-            rdx: g.rdx,
-            rsi: g.rsi,
-            rdi: g.rdi,
-            rsp: v.rsp(),
-            rbp: g.rbp,
-            r8: g.r8,
-            r9: g.r9,
-            r10: g.r10,
-            r11: g.r11,
-            r12: g.r12,
-            r13: g.r13,
-            r14: g.r14,
-            r15: g.r15,
-            rip: v.rip(),
-            rflags: v.rflags(),
-        }
     }
 
     pub(super) fn set_sregs(&mut self, s: &Sregs, plat: &mut Platform) {
@@ -404,7 +379,7 @@ fn placed_core(id: usize) -> Option<usize> {
         return None;
     }
     let online = crate::smp::online_cpus();
-    let allowed = if kvm == 1 { akuma_vm_spec::affinity::online_mask(online) } else { kvm };
+    let allowed = if kvm == 1 { akuma_affinity::online_mask(online) } else { kvm };
     let placed = akuma_vm_spec::cores::place(wanted, allowed, |c| (c as usize) < online, id + 1)?;
     Some(usize::from(*placed.get(id.min(akuma_vm_spec::cores::MAX_PLACED - 1))?))
 }
@@ -529,12 +504,12 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
         match code {
             ExitCode::Cpuid => {
                 let (leaf, sub) = (v.rax() as u32, vc.regs.rcx as u32);
-                let [a, b, c, d] = vc.cpuid_lookup(leaf, sub);
+                let [eax, ebx, ecx, edx] = vc.cpuid_lookup(leaf, sub);
                 let mut v = Vmcb::new(vc.vmcb.bytes_mut());
-                v.set_rax(u64::from(a));
-                vc.regs.rbx = u64::from(b);
-                vc.regs.rcx = u64::from(c);
-                vc.regs.rdx = u64::from(d);
+                v.set_rax(u64::from(eax));
+                vc.regs.rbx = u64::from(ebx);
+                vc.regs.rcx = u64::from(ecx);
+                vc.regs.rdx = u64::from(edx);
                 let next = next_rip(&v, nrips, 2);
                 v.complete_instruction(next);
             }
@@ -563,18 +538,15 @@ fn run_inner(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, slots: &Table, np
                 let ticks = io_ticks();
                 if io.is_in {
                     let mine = with_plat(plat, |p| p.io_in(io.port, ticks));
-                    match mine {
-                        Some(val) => {
-                            let val = u64::from(val) & io.mask();
-                            let rax = v.rax();
-                            v.set_rax(if io.size == 4 { val } else { (rax & !io.mask()) | val });
-                            v.complete_instruction(next);
-                        }
-                        None => {
-                            vc.pending = Pending::IoIn { size: io.size, next };
-                            runpage::set_io(vc.page(), runpage::IO_IN, io.size, io.port, 0);
-                            return 0;
-                        }
+                    if let Some(val) = mine {
+                        let val = u64::from(val) & io.mask();
+                        let rax = v.rax();
+                        v.set_rax(if io.size == 4 { val } else { (rax & !io.mask()) | val });
+                        v.complete_instruction(next);
+                    } else {
+                        vc.pending = Pending::IoIn { size: io.size, next };
+                        runpage::set_io(vc.page(), runpage::IO_IN, io.size, io.port, 0);
+                        return 0;
                     }
                 } else {
                     let val = (v.rax() & io.mask()) as u32;
@@ -785,7 +757,7 @@ fn idle(vc: &mut Vcpu, plat: &Spinlock<Option<Platform>>, ev: &Events) -> Option
             return None;
         }
         let deadline = due.unwrap_or(now + 1_000).min(now + 1_000);
-        if IDLE_TURNS.load(core::sync::atomic::Ordering::Relaxed) % 4000 == 0 {
+        if IDLE_TURNS.load(core::sync::atomic::Ordering::Relaxed).is_multiple_of(4000) {
             let st = with_plat(plat, |p| p.irq_state(id, now));
             akuma_primitives::safe_print!(160, "[kvmapi] irq state pic={:#x} imr={:#x}/{:#x} lapic={:#x} ppr={:#x} lvt_timer={:#x} count={:#x} extint={}\n", st[0], st[1], st[2], st[3], st[4], st[5], st[6], st[7]);
         }
@@ -871,7 +843,7 @@ fn idle_note(vc: &mut Vcpu, now: u64, due: Option<u64>, can_wake: bool) {
     }
     // The lost-interrupt signature: halted with IF set and nothing that could ever wake the guest.
     let stuck = due.is_none() && !can_wake;
-    if n > 4000 * 6 && !(stuck && !TRACE_DUMPED.load(Ordering::Relaxed)) {
+    if n > 4000 * 6 && (!stuck || TRACE_DUMPED.load(Ordering::Relaxed)) {
         return;
     }
     let (rip, rflags) = {

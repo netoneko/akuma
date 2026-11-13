@@ -2768,7 +2768,23 @@ akuma_threading_x86_thread_entry_trampoline:
      * closure_ptr and rbx = the boxed-closure trampoline fn pointer at
      * exactly the stack slots this switch's `pop`s read them from. `jmp`,
      * not `call`: the trampoline is `fn(*mut ()) -> !` and never returns, so
-     * there is no return address to arrange. */
+     * there is no return address to arrange.
+     *
+     * First scheduler entry of a never-yet-run thread (ON_CPU's doc: the
+     * outgoing tid's gate "is cleared by rust_switch_finished ... at the
+     * task's first scheduler entry" — the AArch64 vector asm does it right
+     * after `mov sp, x0`). This trampoline IS that first entry on this
+     * target: a fresh task never returns to x86_switch_context's tail, so
+     * its `rust_switch_finished()` never runs for us. Without the call here
+     * the OUTGOING thread's ON_CPU gate stays latched forever, and pickers
+     * and `x86_runnable_exists` skip gated threads — the preempted thread
+     * can never be scheduled again. Seen on Taoxichuan stage 12: the first
+     * `sleep_until` park yielded (per its own contract) to the freshly
+     * seeded idle thread, the gate on the parker latched, idle saw nothing
+     * runnable and halted, and the whole guest wedged on its first timed
+     * poll (2026-10-31). Stack alignment: rsp == entry_slot here, 16-byte
+     * aligned, exactly the pre-`call` ABI state. */
+    call rust_switch_finished
     mov rdi, r12
     jmp rbx
 "#
@@ -5503,6 +5519,23 @@ pub fn test_swap_saved_ctx_ttbr0(_slot: usize, _ttbr0: u64) -> u64 {
 /// Test/diagnostic accessor: whether `tid`'s [`ON_CPU`] gate is set.
 pub fn on_cpu_flag(tid: usize) -> bool {
     tid < MAX_THREADS && ON_CPU[tid].load(Ordering::SeqCst) != 0
+}
+
+/// Release `slot`'s [`ON_CPU`] gate after its occupant ran to completion *in
+/// place* and control came back to the caller's own stack on the same core.
+///
+/// Taoxichuan's spawn crossing (`child_enter`) runs a child on a ring slot
+/// without the scheduler ever switching away from it for good: the gate the
+/// switch path raised is only lowered by the next switch's tail, which never
+/// comes for a slot whose last "switch" was the return into its parent. The
+/// slot then sits `TERMINATED` but `ON_CPU`, which [`slot_reusable`] refuses
+/// forever - one ring slot burned per command, and `x86_claim_slot` out of
+/// slots after a dozen. **Only call this when the occupant is dead and no core
+/// is executing on its stacks.**
+pub fn x86_release_on_cpu(slot: usize) {
+    if slot < MAX_THREADS {
+        ON_CPU[slot].store(0, Ordering::SeqCst);
+    }
 }
 
 /// Test/diagnostic accessor: how many [`ON_CPU`] gates are set. Bounded by the

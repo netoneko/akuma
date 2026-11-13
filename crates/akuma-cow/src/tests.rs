@@ -98,3 +98,24 @@ fn precedence_is_writable_then_marked_then_refs() {
     // not-marked beats "shared" (which would otherwise Copy)
     assert_eq!(f(false, false, 5).decide(), CowAction::Fault);
 }
+
+#[test]
+fn kernel_write_follows_the_user_fault_rules() {
+    use crate::{KernelWrite::*, kernel_write};
+    assert_eq!(kernel_write(false, false, false, 9), Allow, "unmapped: the translate reports it");
+    assert_eq!(kernel_write(true, true, true, 9), Allow, "already writable");
+    assert_eq!(kernel_write(true, false, true, 9), Break, "a marked share breaks first");
+    assert_eq!(kernel_write(true, false, true, 1), Break, "even a sole holder goes through the break (it takes in place)");
+    assert_eq!(kernel_write(true, false, false, 0), Allow, "untracked read-only: one holder");
+    assert_eq!(kernel_write(true, false, false, 1), Allow, "one holder");
+    assert_eq!(kernel_write(true, false, false, 2), Refuse, "shared and read-only on purpose");
+}
+
+#[test]
+fn private_copy_is_needed_only_for_a_present_shared_frame() {
+    use crate::needs_private_copy;
+    assert!(!needs_private_copy(false, 5));
+    assert!(!needs_private_copy(true, 0));
+    assert!(!needs_private_copy(true, 1));
+    assert!(needs_private_copy(true, 2));
+}

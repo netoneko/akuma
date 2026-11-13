@@ -7,8 +7,7 @@
 //! `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` §5.
 
 use akuma_primitives::mmio::MmioReg;
-use crate::transport::SteppedMmioTransport;
-use virtio_drivers::transport::mmio::{MmioTransport, VirtIOHeader};
+use crate::mmio::Transport;
 
 /// Upper bound on virtio-mmio slots. The *actual* count is
 /// [`akuma_primitives::addr::virtio_slots`], which the machine sets during early
@@ -68,24 +67,16 @@ fn device_id_at(addr: usize) -> u32 {
     device_id.read()
 }
 
-/// Build the transport over the virtio-mmio slot at `addr`, whose DeviceID the
-/// caller just matched against `device_id`. A slot whose header does not yield a
-/// working transport is logged and reported as `None`, so each sweep skips it.
-fn transport_at(slot: usize, device_id: u32, addr: usize) -> Option<SteppedMmioTransport<'static>> {
-    let header = core::ptr::NonNull::new(addr as *mut VirtIOHeader)?;
-
-    // SAFETY: `header` points at a virtio-mmio header inside the device mapping
-    // whose DeviceID the caller just matched, so the transport is being built
-    // over a real device of the expected kind.
-    // virtio-drivers 0.13 needs the MMIO region size so it can bound the config
-    // space. That is exactly the machine's slot stride: 0x200 on QEMU virt (eight
-    // slots packed in one page), 0x1000 under Firecracker.
-    let mmio_size = akuma_primitives::addr::virtio_stride();
-    let Ok(transport) = (unsafe { MmioTransport::new(header, mmio_size) }) else {
-        crate::safe_print!(64, "[virtio] slot {slot}: device {device_id} transport init failed\n");
-        return None;
-    };
-    Some(SteppedMmioTransport::new(transport))
+/// Build the transport over virtio-mmio slot `slot`, whose DeviceID the caller
+/// just matched against `device_id`. A slot that is not a version-2 device is
+/// logged and reported as `None`, so each sweep skips it.
+fn transport_at(slot: usize, device_id: u32) -> Option<Transport> {
+    let t = Transport::at_slot(slot);
+    if t.is_none() {
+        // QEMU's virtio-mmio is v1 (legacy) unless told `-global virtio-mmio.force-legacy=false`.
+        crate::safe_print!(128, "[virtio] slot {slot}: device {device_id} is not virtio-mmio v2 (QEMU needs -global virtio-mmio.force-legacy=false)\n");
+    }
+    t
 }
 
 /// Build the transport over the slot at kernel VA `addr`.
@@ -94,13 +85,13 @@ fn transport_at(slot: usize, device_id: u32, addr: usize) -> Option<SteppedMmioT
 /// binds the NIC at a known bus position).
 ///
 /// Refuses (`None`) an address that is not one of the machine's slots, which is
-/// what lets this be a safe function: the claim `MmioTransport::new` needs - "this
-/// is a virtio-mmio header in the device mapping" - is checked against the same
-/// slot table [`scan`] reads, not taken on the caller's word.
+/// what lets this be a safe function: "this is a virtio-mmio slot in the device
+/// mapping" is checked against the same slot table [`scan`] reads, not taken on
+/// the caller's word.
 #[must_use]
-pub fn transport_at_slot(addr: usize) -> Option<SteppedMmioTransport<'static>> {
+pub fn transport_at_slot(addr: usize) -> Option<Transport> {
     let slot = (0..num_slots()).find(|&i| slot_addr(i) == addr)?;
-    transport_at(slot, device_id_at(addr), addr)
+    transport_at(slot, device_id_at(addr))
 }
 
 /// Every virtio-mmio slot paired with the device id it advertises, in slot order.
@@ -124,8 +115,8 @@ pub fn scan() -> [(usize, u32); MAX_SLOTS] {
 /// Find the first virtio-mmio slot advertising `device_id`, returning
 /// `(slot_index, base_address)`.
 ///
-/// For drivers that do **not** use `virtio-drivers`' transport — `rng` hand-rolls
-/// its virtqueue against the raw base address — this is the whole probe. Drivers
+/// For drivers that do **not** use [`Transport`] — `rng` hand-rolls its
+/// virtqueue against the raw base address — this is the whole probe. Drivers
 /// that do want a transport should call [`probe`] instead.
 #[must_use]
 pub fn find(device_id: u32) -> Option<(usize, usize)> {
@@ -134,8 +125,8 @@ pub fn find(device_id: u32) -> Option<(usize, usize)> {
         .find(|&(_, addr)| device_id_at(addr) == device_id)
 }
 
-/// Find the first virtio-mmio slot advertising `device_id` and build an
-/// [`MmioTransport`] over it, returning `(slot_index, transport)`.
+/// Find the first virtio-mmio slot advertising `device_id` and build a
+/// [`Transport`] over it, returning `(slot_index, transport)`.
 ///
 /// A slot whose header does not yield a working transport is **skipped** and the
 /// scan continues, which is what `block.rs` and `audio.rs` did. `smoltcp_net.rs`
@@ -145,7 +136,7 @@ pub fn find(device_id: u32) -> Option<(usize, usize)> {
 /// fails on the slot you cared about is still visible in the boot log — losing
 /// that was the one real cost of the reconciliation.
 #[must_use]
-pub fn probe(device_id: u32) -> Option<(usize, SteppedMmioTransport<'static>)> {
+pub fn probe(device_id: u32) -> Option<(usize, Transport)> {
     probe_with(device_id, |i, transport| Some((i, transport)))
 }
 
@@ -160,14 +151,14 @@ pub fn probe(device_id: u32) -> Option<(usize, SteppedMmioTransport<'static>)> {
 /// turned "try the next virtio-blk" into "give up".
 pub fn probe_with<T>(
     device_id: u32,
-    mut make: impl FnMut(usize, SteppedMmioTransport<'static>) -> Option<T>,
+    mut make: impl FnMut(usize, Transport) -> Option<T>,
 ) -> Option<T> {
     for (i, addr) in (0..num_slots()).map(|i| (i, slot_addr(i))) {
         if device_id_at(addr) != device_id {
             continue;
         }
 
-        let Some(transport) = transport_at(i, device_id, addr) else {
+        let Some(transport) = transport_at(i, device_id) else {
             continue;
         };
 
@@ -190,14 +181,14 @@ pub fn probe_with<T>(
 /// at the first.
 pub fn probe_each(
     device_id: u32,
-    mut f: impl FnMut(usize, SteppedMmioTransport<'static>) -> bool,
+    mut f: impl FnMut(usize, Transport) -> bool,
 ) {
     for (i, addr) in (0..num_slots()).map(|i| (i, slot_addr(i))) {
         if device_id_at(addr) != device_id {
             continue;
         }
 
-        let Some(transport) = transport_at(i, device_id, addr) else {
+        let Some(transport) = transport_at(i, device_id) else {
             continue;
         };
 

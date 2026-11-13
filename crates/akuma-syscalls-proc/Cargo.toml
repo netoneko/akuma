@@ -1,0 +1,13 @@
+[package]
+name = "akuma-syscalls-proc"
+version = "0.1.0"
+edition = "2024"
+description = "The process family's pure decisions, shared by the x86 kernels: what a clone's flags ask for, what an exit ends, the wait status a death reports, and execve's argument budget. Decisions only; every effect (fork_process, clone_thread, the exit, the copy) stays in the kernel."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The clone flag bits. A leaf. Deliberately NOT akuma-exec: these decisions
+# need no process, thread or address space, and `akuma-exec` is big enough.
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

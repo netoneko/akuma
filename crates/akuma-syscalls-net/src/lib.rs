@@ -70,6 +70,8 @@ pub mod iff {
 /// `AF_INET`.
 const AF_INET: u16 = 2;
 
+pub mod sockaddr;
+
 /// One interface as `ifconfig` sees it. The kernel builds these from its one
 /// real smoltcp interface plus a synthetic `lo`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

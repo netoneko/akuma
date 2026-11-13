@@ -2,7 +2,8 @@
 //!
 //! # The obligation
 //!
-//! `virtio-drivers`' `VirtIONetRaw` splits receive and transmit into
+//! `akuma_virtio::net::NetRaw` (in-tree since 2026-11-01; it was `virtio-drivers`'
+//! `VirtIONetRaw`, whose contract it kept) splits receive and transmit into
 //! begin/complete pairs so the caller can keep several buffers in flight. Those
 //! four calls are `unsafe fn` for one reason, and it is the same reason each
 //! time:
@@ -45,11 +46,10 @@
 //! tests need no virtio knowledge. This applies it to the smoltcp path.
 
 use crate::frames::{FrameArena, FrameLease};
-use akuma_virtio::{VirtioHal, VirtioTransport};
-use virtio_drivers::device::net::VirtIONetRaw;
+use akuma_virtio::net::NetRaw;
 
 /// The virtio-net device this crate binds. `16` is the virtqueue depth.
-pub type NetDev = VirtIONetRaw<VirtioHal, VirtioTransport, 16>;
+pub type NetDev = NetRaw;
 
 /// A virtio-net device with the buffer-lifetime obligation folded in.
 pub struct Nic {

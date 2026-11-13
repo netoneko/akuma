@@ -3,7 +3,7 @@ extern crate std;
 use core::fmt::Write as _;
 
 use crate::arena::{Arena, MAX_EXTENTS};
-use crate::spec::{MAX_CMDLINE, MAX_FORWARDS, MAX_PATH, MAX_WIRE};
+use crate::spec::{MAX_CMDLINE, MAX_FORWARDS, MAX_PATH, MAX_RAM_MIB, MAX_WIRE};
 use crate::{Backend, DiskSource, Error, Forward, Spec};
 
 const GENTOO: &str = "type=kvm\nkernel=/boot/akuma-guest\ncmdline=init=/usr/bin/bash initargs=/akuma-kvm-init.sh\n\
@@ -91,6 +91,14 @@ fn comments_blank_lines_and_spaces_in_values() {
 }
 
 #[test]
+fn the_ram_ceiling_is_max_ram_mib() {
+    // MAX_RAM_MIB is the single source of the bound: the ceiling parses here and the
+    // refusal tests build ceiling+1 from it, so no literal can drift out of step.
+    let s = parse(std::format!("kernel=/k\nram_mib={MAX_RAM_MIB}\n").as_str()).expect("the ceiling parses");
+    assert_eq!(s.ram_mib, MAX_RAM_MIB);
+}
+
+#[test]
 fn every_rejection() {
     assert_eq!(parse(""), Err(Error::Missing));
     assert_eq!(parse("ram_mib=768\n"), Err(Error::Missing));
@@ -99,7 +107,8 @@ fn every_rejection() {
     assert_eq!(parse("kernel=/k\nnoequals\n"), Err(Error::BadLine));
     assert_eq!(parse("kernel=/k\nram_mib=abc\n"), Err(Error::BadValue));
     assert_eq!(parse("kernel=/k\nram_mib=15\n"), Err(Error::OutOfRange));
-    assert_eq!(parse("kernel=/k\nram_mib=1025\n"), Err(Error::OutOfRange));
+    assert_eq!(parse(std::format!("kernel=/k\nram_mib={}\n", MAX_RAM_MIB + 1).as_str()), Err(Error::OutOfRange));
+    assert_eq!(parse("kernel=/k\nram_mib=0\n"), Err(Error::OutOfRange));
     assert_eq!(parse("kernel=/k\nvcpus=0\n"), Err(Error::OutOfRange));
     assert_eq!(parse("kernel=/k\nvcpus=5\n"), Err(Error::OutOfRange));
     assert_eq!(parse("kernel=/k\nvcpus=-1\n"), Err(Error::BadValue));

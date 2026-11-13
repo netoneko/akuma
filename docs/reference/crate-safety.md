@@ -1,6 +1,36 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — *2026-10-22 (evening): one crate added, **`akuma-vm-spec`** (forbids, 0 sites; the VM spec shared by herd and the kernel) — the headline below is not regenerated.* Regenerated 2026-10-21 (second run of the day) with
+**Grade: A** — regenerated 2026-11-02 with `python3 scripts/cloc_akuma.py src crates`:
+**86 of 115 crates** forbid `unsafe`. 91321 of 92636 production lines (98.6%) sit outside any `unsafe`
+block; 368 production sites across `crates/`, 0 inside enforced crates, unchanged from the run before. The
+three new crates all forbid: `akuma-syscalls-proc` (84 production lines: clone kinds, exit scope, wait status,
+execve's argument budget, shared by amd64 and Taoxichuan), `akuma-user-layout` (232: a user address space's
+layout bookkeeping for a kernel that maps eagerly) and `akuma-runtime-tokio` (149: the syscall surface of a
+tokio program, [`subsystems/syscalls/runtime-tokio.md`](subsystems/syscalls/runtime-tokio.md)).
+`akuma-ring3-amd64` is 407 production lines (3 sites, 8 `unsafe` lines) since its ELF `Image` moved into `akuma-elf-exec`
+([`TAOXICHUAN_B8_ONE_ELF_LOADER.md`](../archive/TAOXICHUAN_B8_ONE_ELF_LOADER.md)).
+
+The run before, 2026-11-01: **83 of 112 crates** forbid `unsafe`. 90656 of 91971 production lines (98.6%) sit
+outside any `unsafe` block; 368 production sites across `crates/`, 0 inside
+enforced crates; `src/` is down to 136 production lines (the `bin`) and 0
+production sites. `akuma-virtqueue` (the split virtqueue and virtio-mmio protocol,
+pure) arrived later the same day and forbids; with it `akuma-virtio` went 12 -> 17
+sites, the device contracts that used to sit inside `virtio-drivers`
+(`archive/AKUMA_VIRTIO_IN_TREE.md`). Three crates arrived since the 2026-10-31 run, all forbidding:
+`akuma-syscalls-glue-amd64` (the x86_64 ABI layer under Taoxichuan's dispatch),
+`akuma-affinity` (the scheduler's CPU-mask decisions, out of `akuma-vm-spec`) and
+`akuma-user-walk` (page-walk user copies). The 2026-10-31 run read: twelve crates arrived since the 2026-10-21 run, most of them
+pulled out for the Taoxichuan kernel. Nine forbid from their first commit:
+`akuma-vm-spec`, `akuma-kvm-abi`, `akuma-comconsole`, `akuma-elf-exec`,
+`akuma-syscalls-eventfd`, `akuma-lapic-amd64`, `akuma-syscalls-signal`,
+`akuma-fpu-amd64` and `akuma-user-tree`. Three cannot, because they *are* the
+machine edge: `akuma-boot-amd64` (10 sites), `akuma-ring3-amd64` (8) and
+`akuma-sched-amd64` (52 — the context switch and FP save/restore, moved out of
+`amd64/src/sched.rs`, which is not counted here). The 2026-10-16 **Open** item
+below is closed: `akuma-net-rtl8169`, `akuma-usb` and `akuma-pci` each read 0
+sites now.
+
+The run before, 2026-10-21 (second run of the day), was
 `python3 scripts/cloc_akuma.py src crates` after the **`akuma-mmu` safe facade**
 ([`AKUMA_MMU_SAFE_FACADE.md`](../archive/AKUMA_MMU_SAFE_FACADE.md)): the four public
 `unsafe fn`s went safe or were deleted, the shootdown-hook transmutes became
@@ -59,7 +89,7 @@ lives in `amd64/` and is not counted here (`overlays/ryzen/`,
 [`AKUMA_AMD64_ON_RYZEN_LAPTOP.md`](../archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md)
 § 9). Most of the other six new forbidding crates since 2026-09-06
 (`akuma-fbcon`, `akuma-pty`, `akuma-hda`, …) arrived without a regeneration.
-**Open:** the script flags one `unsafe` site each inside three forbidding crates
+**Open (closed 2026-10-31, all three read 0):** the script flagged one `unsafe` site each inside three forbidding crates
 (`akuma-net-rtl8169`, `akuma-usb`, `akuma-pci`). `forbid` would not compile a
 real one, so these are counter hits, probably the word in a comment. They have
 not been chased.
@@ -390,6 +420,12 @@ host-test.
 | `akuma-rump` | device-independent orchestration for the rump raw-L2 path |
 | `akuma-scheduler` | discrete-event simulator for placement / netpoll wake policy |
 | `akuma-syscalls` | the shape of a syscall excursion (prologue/epilogue decisions, identity-slot model) |
+| `akuma-user-tree` | the CoW fork's per-entry decisions over a 4-level user tree (skip / refuse / descend / copy / share-and-demote), the free order, and the `SharedSpans` policy; plans only, no walker |
+| `akuma-syscalls-proc` | the process family's decisions: `clone` flag kinds, `exit` scope, the wait status encoding, execve's argument budget |
+| `akuma-user-layout` | a user address space's layout for an eagerly mapping kernel: regions, the `brk` window, the mmap slab's cursor and hole table, writable shared file mappings |
+| `akuma-runtime-tokio` | the syscall surface a tokio program needs: the allow-list of glue's calls by feature, glue's setup, the dispatch |
+| `akuma-fpu-amd64` | the amd64 FPU save area as pure byte algebra: `fxsave`/`xsave` sizes and offsets, the power-on image, and the `sanitize` rule that makes a program-supplied image safe to `xrstor` |
+| `akuma-syscalls-signal` | the signal bookkeeping: the `rt_sigaction` table and its wire image, execve reset, `rt_sigprocmask` algebra (no delivery) |
 | `akuma-syscalls-sync` | the futex family: op decode, waiter table, deadline algebra, `WAKE_OP`, wait-loop outcome |
 | `akuma-syscalls-poll` | the epoll/poll/select family: the fd-state → event-bits readiness map, the interest list and its `epoll_ctl` errno set, the `EPOLLET` armed-state decision, the `ppoll`/`pselect6` wire marshalling |
 | `akuma-tty` | termios vocabulary, session line discipline, Unix98 pty state machine |
@@ -885,3 +921,23 @@ is mechanical.
 3. `cargo clippy -p <name> --target $HOST -- -D warnings` and
    `cargo test -p <name> --target $HOST`.
 4. Add a row above.
+
+## Budgets: `unsafe`, copies and `mut`
+
+Three per-component counts, each with a gate that fails on growth (a component with no
+entry starts at 0) and a `--update` that writes the increase into a budget file, so the
+increase is reviewed beside the code that needed it. A decrease never fails and `--update`
+ratchets it down. All three are counted by `scripts/cloc_akuma.py`'s lexer, in production
+code only (not comments, strings, `#[cfg(test)]` items or test files).
+
+| measure | gate | budget | counts |
+|---|---|---|---|
+| `unsafe` | `scripts/check_unsafe_budget.py` | `unsafe-budget.json` | `unsafe` keyword sites; also that a `forbid` crate still forbids |
+| copies | `scripts/check_budgets.py copy` | `copy-budget.json` | `.clone()`, `.cloned()`, `.to_vec()`, `.to_owned()`, `.to_string()` calls, and calls to the whole-`FileDescriptor` copiers `get_fd(`/`table_get(` |
+| `mut` | `scripts/check_budgets.py mut` | `mut-budget.json` | `mut` keywords: `let mut`, `&mut`, `mut self`, `static mut` |
+
+The copy measure is wider than `.clone()` on purpose: the costliest copies in the tree were a
+whole `FileDescriptor` copied with `.cloned()` on the syscall path, and a `.clone()`-only count
+would not move when they are fixed. A copy that must stay (an `Arc` handed out of a locked
+static, a snapshot taken under a lock before I/O) is a reason in the budget diff, not a
+violation. Background: [`../archive/CLONE_AND_MUT_BUDGETS.md`](../archive/CLONE_AND_MUT_BUDGETS.md).

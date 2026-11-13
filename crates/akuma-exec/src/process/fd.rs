@@ -670,8 +670,8 @@ mod alloc_fd_tests {
 /// rather than against intentions. Each test states which syscall-level
 /// behaviour it is the table-level image of; the two `PINNED DIVERGENCE`
 /// tests carry the divergences `amd64/src/fd.rs`'s boot-suite self-tests pin
-/// end-to-end (`fd: a dup's cursor is independent`, `fd: a dup loses
-/// nonblock`) so the table layer cannot drift underneath them.
+/// end-to-end (`fd: a dup's cursor is independent`; `fd: a dup keeps nonblock`
+/// since 2026-11-01) so the table layer cannot drift underneath them.
 ///
 /// These run against the real locked table (not a model) and must keep
 /// passing, unmodified, through the extraction: after the rewire they are the
@@ -756,11 +756,10 @@ mod fdtable_characterization_tests {
         assert_eq!(position_of(&t, 3), Some(16));
     }
 
-    /// **PINNED DIVERGENCE** (`amd64/src/fd.rs` boot suite: "a dup loses
-    /// nonblock"): `nonblock` is keyed by fd *number*, and glue's `sys_dup`
-    /// does not copy it — the flag stays with the old number.
+    /// `nonblock` is keyed by fd *number*: a fresh number from `alloc_fd_from` starts without
+    /// it. A dup copies it explicitly (glue's `sys_dup` / `F_DUPFD`, the fdtable's `dup`).
     #[test]
-    fn pinned_nonblock_is_keyed_by_number_and_a_dup_insert_does_not_inherit_it() {
+    fn nonblock_is_keyed_by_number_and_a_bare_alloc_does_not_inherit_it() {
         ensure_test_runtime();
         let t = SharedFdTable::with_stdio();
         t.alloc_fd_from(0, file_at(0)); // fd 3
@@ -768,7 +767,7 @@ mod fdtable_characterization_tests {
         let entry = t.table.lock().get(&3).cloned().expect("fd 3 installed");
         let newfd = t.alloc_fd_from(0, entry);
         assert_eq!(newfd, 4);
-        assert!(!t.nonblock.lock().contains(&4), "PINNED DIVERGENCE: the dup loses the flag");
+        assert!(!t.nonblock.lock().contains(&4), "a bare alloc starts clear; dups copy the bit themselves");
         assert!(t.nonblock.lock().contains(&3), "the original keeps it");
     }
 

@@ -1,7 +1,7 @@
 //! Ring 3 for the minimal amd64 composition (taoxichuan stage 2).
 //!
-//! Everything a kernel needs to take one static non-PIE ELF image, build its
-//! initial user stack, and cross the ring boundary in both directions —
+//! Everything a kernel needs to build a task's initial user stack and cross
+//! the ring boundary in both directions —
 //! extracted as a crate rather than grown inline in `taoxichuan/`, per the
 //! experiment's composition rule. The full kernel's counterparts live in
 //! `amd64/src/usermode.rs` (9 k lines: demand paging, signals, threads, an
@@ -9,8 +9,9 @@
 //! `akuma-mmu`); none of that serves a task that only prints and exits, and
 //! pulling it would pull the whole MMU. What is here is the irreducible core:
 //!
-//! - [`Image`]: the `PT_LOAD` walk over an already-read image (`akuma-elf`
-//!   without `akuma-mmu` — segments are placed eagerly, no demand paging).
+//! (The `PT_LOAD` walk that was here moved to `akuma-elf-exec`'s `program`
+//! in B8, 2026-11-02: Taoxichuan places program and interpreter through one
+//! parser.)
 //! - [`build_stack`]: argc/argv/envp/auxv laid out the way Linux does, with
 //!   the auxv entries static musl reads at startup.
 //! - [`enable_syscalls`] / [`SYSCALL_ENTRY`]: `EFER.SCE` + `STAR`/`LSTAR`/
@@ -47,259 +48,6 @@ use akuma_cpu::msr::{self, Msr};
 #[cfg(test)]
 mod tests;
 
-// ---------------------------------------------------------------------------
-// ELF64: the `PT_LOAD` walk, over bytes the caller already read.
-// ---------------------------------------------------------------------------
-
-/// Upper bound on `PT_LOAD` segments. The reference image has four (separate
-/// code/rodata splits); 16 covers every static link this loader will meet.
-pub const MAX_SEGMENTS: usize = 16;
-
-/// Where an `ET_DYN` image (static-PIE — Alpine's `apk.static` is one) is
-/// placed. The image's link addresses start near zero, so the kernel shifts
-/// every `p_vaddr`, the entry and `AT_PHDR` by this base; musl's static-PIE
-/// startup (`__dls2`) does its own relocation in userspace, so the kernel
-/// processes no `RELA`s (the aarch64 kernel made the same move:
-/// `docs/archive/APK_MISSING_SYSCALLS.md`). The amd64 map has PIE code here,
-/// `mmap` at `0x6000_0000_0000` and the stack at `0x7000_0000_0000` — no
-/// overlap; `brk` follows `image_end` above the placed image.
-pub const PIE_BASE: u64 = 0x1000_0000;
-
-/// Software permissions of one segment — the `p_flags` triple, reduced to the
-/// three shapes a static link actually produces.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Prot {
-    /// Read-only data.
-    Ro,
-    /// Read-execute code.
-    Rx,
-    /// Read-write data (its `memsz > filesz` tail is `.bss`: zeroed pages).
-    Rw,
-}
-
-/// One `PT_LOAD` segment: where it sits, where its bytes are in the image,
-/// and how much of it is file-backed versus zero-filled.
-#[derive(Clone, Copy, Debug)]
-pub struct Segment {
-    /// Link address (the `p_vaddr` the image was linked at). For `ET_DYN`
-    /// (static-PIE) images this is already shifted by [`PIE_BASE`]; the
-    /// placement is the shift, and userspace relocates from there.
-    pub vaddr: u64,
-    /// Byte offset of the file-backed part within the image.
-    pub offset: u64,
-    /// File-backed length.
-    pub filesz: u64,
-    /// In-memory length, `>= filesz`; the tail is `.bss`.
-    pub memsz: u64,
-    pub prot: Prot,
-}
-
-/// Why [`Image::parse`] refused an image.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LoadError {
-    /// Missing or wrong `\x7fELF` magic.
-    Magic,
-    /// Not ELF64 little-endian (`EI_CLASS`/`EI_DATA`).
-    NotElf64Le,
-    /// Neither `ET_EXEC` nor `ET_DYN`.
-    NotExec,
-    /// The program header table is missing or outside the image.
-    PhdrTable,
-    /// A segment's file bytes run past the end of the image, or `memsz` is
-    /// smaller than `filesz`.
-    SegmentBounds,
-    /// More `PT_LOAD` segments than [`MAX_SEGMENTS`].
-    TooManySegments,
-    /// No `PT_LOAD` at all: nothing to enter.
-    NoSegments,
-}
-
-/// A parsed static ELF image: the entry point, the phdr facts musl needs in
-/// its auxv, and the segments to place.
-#[derive(Clone, Copy, Debug)]
-pub struct Image<'a> {
-    data: &'a [u8],
-    entry: u64,
-    /// Where the program header table lands once the image is placed —
-    /// `AT_PHDR`. Taken from `PT_PHDR` when present, else computed from the
-    /// segment that file-backs `e_phoff`.
-    phdr_va: u64,
-    phent: u64,
-    phnum: u64,
-    n_segments: usize,
-    segments: [Segment; MAX_SEGMENTS],
-    /// Highest byte of the placed image, page-rounded up: where `brk` starts.
-    image_end: u64,
-}
-
-const PHDR_SIZE: u64 = 56;
-const PT_LOAD: u32 = 1;
-const PT_PHDR: u32 = 6;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-
-impl<'a> Image<'a> {
-    /// Parse an already-read image. Bounds-checked throughout: every table and
-    /// segment access is range-tested against `data` before it is read, so a
-    /// truncated or hostile image is a [`LoadError`], never a panic.
-    pub fn parse(data: &'a [u8]) -> Result<Self, LoadError> {
-        if data.len() < 64 || data[..4] != [0x7f, b'E', b'L', b'F'] {
-            return Err(LoadError::Magic);
-        }
-        // EI_CLASS = 2 (ELF64), EI_DATA = 1 (two's complement, little-endian).
-        if data[4] != 2 || data[5] != 1 {
-            return Err(LoadError::NotElf64Le);
-        }
-        let e_type = u16::from_le_bytes([data[16], data[17]]);
-        if e_type != 2 && e_type != 3 {
-            return Err(LoadError::NotExec);
-        }
-        // ET_DYN (static-PIE): shift every link address by [`PIE_BASE`] — the
-        // one placement decision; userspace self-relocates from there.
-        let base = if e_type == 3 { PIE_BASE } else { 0 };
-        let rd = |off: usize| -> u64 {
-            let mut b = [0u8; 8];
-            b.copy_from_slice(&data[off..off + 8]);
-            u64::from_le_bytes(b)
-        };
-        let entry = rd(24) + base;
-        let e_phoff = rd(32);
-        let e_phentsize = u64::from(u16::from_le_bytes([data[54], data[55]]));
-        let e_phnum = u64::from(u16::from_le_bytes([data[56], data[57]]));
-        if e_phoff == 0 || e_phentsize < PHDR_SIZE || e_phnum == 0 {
-            return Err(LoadError::PhdrTable);
-        }
-        let table_end = e_phoff.checked_add(e_phnum.checked_mul(e_phentsize).ok_or(LoadError::PhdrTable)?);
-        let Some(table_end) = table_end else {
-            return Err(LoadError::PhdrTable);
-        };
-        if table_end > data.len() as u64 {
-            return Err(LoadError::PhdrTable);
-        }
-
-        let mut img = Self {
-            data,
-            entry,
-            phdr_va: 0,
-            phent: PHDR_SIZE,
-            phnum: e_phnum,
-            n_segments: 0,
-            segments: [Segment { vaddr: 0, offset: 0, filesz: 0, memsz: 0, prot: Prot::Ro }; MAX_SEGMENTS],
-            image_end: 0,
-        };
-
-        // First pass: collect the PT_LOADs.
-        for i in 0..e_phnum {
-            let ph = e_phoff + i * e_phentsize;
-            let p_type = u32::from_le_bytes([data[ph as usize], data[ph as usize + 1], data[ph as usize + 2], data[ph as usize + 3]]);
-            if p_type != PT_LOAD {
-                continue;
-            }
-            let p_flags = u32::from_le_bytes([data[ph as usize + 4], data[ph as usize + 5], data[ph as usize + 6], data[ph as usize + 7]]);
-            let p_offset = rd(ph as usize + 8);
-            let p_vaddr = rd(ph as usize + 16);
-            let p_filesz = rd(ph as usize + 32);
-            let p_memsz = rd(ph as usize + 40);
-            let seg_end = p_offset.checked_add(p_filesz).ok_or(LoadError::SegmentBounds)?;
-            if seg_end > data.len() as u64 || p_memsz < p_filesz {
-                return Err(LoadError::SegmentBounds);
-            }
-            if img.n_segments == MAX_SEGMENTS {
-                return Err(LoadError::TooManySegments);
-            }
-            let prot = if p_flags & PF_W != 0 {
-                Prot::Rw
-            } else if p_flags & PF_X != 0 {
-                Prot::Rx
-            } else {
-                Prot::Ro
-            };
-            img.segments[img.n_segments] =
-                Segment { vaddr: p_vaddr + base, offset: p_offset, filesz: p_filesz, memsz: p_memsz, prot };
-            img.n_segments += 1;
-        }
-        if img.n_segments == 0 {
-            return Err(LoadError::NoSegments);
-        }
-
-        // `AT_PHDR`: `PT_PHDR` names its own link address; without it, the
-        // table sits inside whatever segment file-backs `e_phoff`.
-        img.phdr_va = Self::phdr_from_load(&img, e_phoff);
-        for i in 0..e_phnum {
-            let ph = e_phoff + i * e_phentsize;
-            let p_type = u32::from_le_bytes([data[ph as usize], data[ph as usize + 1], data[ph as usize + 2], data[ph as usize + 3]]);
-            if p_type == PT_PHDR {
-                img.phdr_va = rd(ph as usize + 16) + base;
-                break;
-            }
-        }
-
-        for seg in &img.segments[..img.n_segments] {
-            img.image_end = img.image_end.max(seg.vaddr + seg.memsz);
-        }
-
-        Ok(img)
-    }
-
-    /// The link address of the program header table, from the `PT_LOAD` whose
-    /// file range covers `e_phoff` (the static-link case; a dynamic exe would
-    /// carry `PT_PHDR` and be caught above).
-    fn phdr_from_load(img: &Self, e_phoff: u64) -> u64 {
-        for seg in &img.segments[..img.n_segments] {
-            let end = seg.offset + seg.filesz;
-            if e_phoff >= seg.offset && e_phoff < end {
-                return seg.vaddr + (e_phoff - seg.offset);
-            }
-        }
-        0
-    }
-
-    /// Entry point (`e_entry`).
-    #[must_use]
-    pub fn entry(&self) -> u64 {
-        self.entry
-    }
-
-    /// `AT_PHDR`.
-    #[must_use]
-    pub fn phdr_va(&self) -> u64 {
-        self.phdr_va
-    }
-
-    /// `AT_PHENT`.
-    #[must_use]
-    pub fn phent(&self) -> u64 {
-        self.phent
-    }
-
-    /// `AT_PHNUM`.
-    #[must_use]
-    pub fn phnum(&self) -> u64 {
-        self.phnum
-    }
-
-    /// The placed segments, in program-header order.
-    #[must_use]
-    pub fn segments(&self) -> &[Segment] {
-        &self.segments[..self.n_segments]
-    }
-
-    /// The image's file-backed bytes for one segment (empty for a fully
-    /// zero-fill segment). Length `<= filesz`, by construction of [`Self::parse`].
-    #[must_use]
-    pub fn segment_bytes(&self, seg: &Segment) -> &[u8] {
-        let end = (seg.offset + seg.filesz) as usize;
-        &self.data[seg.offset as usize..end.min(self.data.len())]
-    }
-
-    /// Highest placed byte, page-rounded up: where the `brk` heap starts.
-    #[must_use]
-    pub fn image_end(&self) -> u64 {
-        self.image_end
-    }
-}
-
-// ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
 // The initial user stack: argc/argv/envp/auxv, the Linux layout.
 // ---------------------------------------------------------------------------
@@ -341,7 +89,7 @@ pub const AT_BASE: u64 = 7;
 /// Most `argv`+`envp` strings whose addresses the builder will remember.
 /// The composed kernel passes one argv entry and no env; the bound is a
 /// sanity check, not a resource decision.
-const MAX_STRS: usize = 32;
+const MAX_STRS: usize = 512;
 
 /// Lay out the initial user stack into `buf`, whose **last** byte is the last
 /// byte of the stack page at `stack_top` (i.e. `buf` is the tail of the stack,
@@ -472,24 +220,106 @@ struct SyscallStack(#[allow(dead_code)] [u8; SYSCALL_STACK_SIZE]);
 #[cfg(target_arch = "x86_64")]
 static SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
 
-/// The stack top the stub switches to. Fixed at first use: `enable_syscalls`
-/// stores it (a static's address is a link-time fact, but casting one to an
-/// integer is not const-evaluable, so the value is written at runtime rather
-/// than computed in a `static` initializer).
+/// One core's block, reached through `%gs` in ring 0. **Layout is the contract
+/// of the naked stub and of `akuma_cpu::percpu`**: `gs:[8]` the user `RSP`
+/// stash, `gs:[16]` the syscall stack top, `gs:[24]` the core index (u32),
+/// `gs:[32]` the running slot. Replaces the two single-core statics
+/// (`USER_RSP_STASH`, `SYSCALL_STACK_TOP`) this crate used to keep.
+///
+/// Invariant (the amd64 kernel's, `amd64/src/smp.rs`): in ring 0 `GS_BASE` is
+/// this core's block and `KERNEL_GS_BASE` is the program's; the stub, the
+/// IDT stubs and [`enter_user`] `swapgs` at every ring crossing.
 #[cfg(target_arch = "x86_64")]
-static SYSCALL_STACK_TOP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+#[repr(C, align(64))]
+pub struct PerCpu {
+    self_ptr: core::sync::atomic::AtomicU64,
+    user_rsp: core::sync::atomic::AtomicU64,
+    syscall_top: core::sync::atomic::AtomicU64,
+    index: core::sync::atomic::AtomicU32,
+    lapic_id: core::sync::atomic::AtomicU32,
+    slot: core::sync::atomic::AtomicU64,
+}
 
-/// Where the stub parked the interrupted user `RSP` before switching away.
-/// `syscall` does not hand over a stack pointer in a register, and the user
-/// stack must not be touched before the kernel chooses to, so the stash is
-/// kernel memory. Single core, `IF` off: no other writer exists. An
-/// `AtomicU64` because two writers exist on stage 4: the stub's asm, and
-/// the nested-task handoff (`user_rsp_stash`/`set_user_rsp_stash` below) —
-/// the atomic changes nothing for the asm, which takes the address and
-/// moves plain `mov`s (a `Relaxed` access is the same instruction), and it
-/// retires the manual `Sync`/volatile `unsafe` pair the cell needed.
 #[cfg(target_arch = "x86_64")]
-static USER_RSP_STASH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+const _: () = {
+    assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
+    assert!(core::mem::offset_of!(PerCpu, user_rsp) == 8);
+    assert!(core::mem::offset_of!(PerCpu, syscall_top) == 16);
+    assert!(core::mem::offset_of!(PerCpu, index) == 24);
+    assert!(core::mem::offset_of!(PerCpu, slot) == 32);
+};
+
+/// Most cores the per-CPU table holds.
+pub const MAX_CPUS: usize = 16;
+
+#[cfg(target_arch = "x86_64")]
+impl PerCpu {
+    const fn new() -> Self {
+        Self {
+            self_ptr: core::sync::atomic::AtomicU64::new(0),
+            user_rsp: core::sync::atomic::AtomicU64::new(0),
+            syscall_top: core::sync::atomic::AtomicU64::new(0),
+            index: core::sync::atomic::AtomicU32::new(0),
+            lapic_id: core::sync::atomic::AtomicU32::new(0),
+            slot: core::sync::atomic::AtomicU64::new(0),
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+static PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
+
+/// Point THIS core's `%gs` at `PERCPU[idx]` (and its program half at 0).
+/// Call once per core before any [`user_rsp_stash`]-family accessor, with
+/// interrupts off. Returns false for an `idx` past [`MAX_CPUS`].
+#[cfg(target_arch = "x86_64")]
+pub fn install_percpu(idx: usize, lapic_id: u32) -> bool {
+    let Some(block) = PERCPU.get(idx) else { return false };
+    let addr = core::ptr::from_ref::<PerCpu>(block) as u64;
+    block.self_ptr.store(addr, core::sync::atomic::Ordering::Relaxed);
+    block.index.store(idx as u32, core::sync::atomic::Ordering::Relaxed);
+    block.lapic_id.store(lapic_id, core::sync::atomic::Ordering::Relaxed);
+    // SAFETY: GS_BASE is this core's per-CPU base: a `static`, valid for the
+    // kernel's life; nothing reads `gs:` before this returns.
+    unsafe { msr::write(Msr::GsBase, addr) };
+    let _ = msr::set_user_gs_base(0);
+    true
+}
+
+/// This core's index (`gs:[24]`).
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn cpu_index() -> usize {
+    akuma_cpu::percpu::core_id() as usize
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn this_cpu() -> &'static PerCpu {
+    &PERCPU[cpu_index()]
+}
+
+/// Set core `idx`'s running slot from ANOTHER core (the BSP presets an AP's idle
+/// slot before it starts). Not for a core's own bookkeeping: use [`set_cpu_slot`].
+#[cfg(target_arch = "x86_64")]
+pub fn preset_cpu_slot(idx: usize, slot: u64) {
+    if let Some(b) = PERCPU.get(idx) {
+        b.slot.store(slot, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The slot this core runs now (`gs:[32]`).
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn cpu_slot() -> u64 {
+    this_cpu().slot.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record the slot this core runs now.
+#[cfg(target_arch = "x86_64")]
+pub fn set_cpu_slot(v: u64) {
+    this_cpu().slot.store(v, core::sync::atomic::Ordering::Relaxed);
+}
 
 /// The kernel's dispatcher, stored as an address so the naked stub can `call`
 /// it through memory (a naked function has no Rust-level names to reach).
@@ -583,21 +413,21 @@ pub fn user_rsp_stash() -> u64 {
     // Relaxed: single core, `IF` clear inside the syscall path — the same
     // discipline that owns every write to this static (the stub's own asm
     // included). The ordering carries no inter-core promise on purpose.
-    USER_RSP_STASH.load(core::sync::atomic::Ordering::Relaxed)
+    this_cpu().user_rsp.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Redirect the stub's user-`RSP` stash (see [`user_rsp_stash`]).
 #[cfg(target_arch = "x86_64")]
 pub fn set_user_rsp_stash(v: u64) {
     // Relaxed: as `user_rsp_stash` — single-core scratch, no ordering promise.
-    USER_RSP_STASH.store(v, core::sync::atomic::Ordering::Relaxed);
+    this_cpu().user_rsp.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// The stack top the stub switches to on the next `syscall`.
 #[cfg(target_arch = "x86_64")]
 #[must_use]
 pub fn syscall_stack_top() -> u64 {
-    SYSCALL_STACK_TOP.load(core::sync::atomic::Ordering::Relaxed)
+    this_cpu().syscall_top.load(core::sync::atomic::Ordering::Relaxed)
 }
 
 /// Point the stub's kernel stack at a lower region for a nested run. The
@@ -605,7 +435,7 @@ pub fn syscall_stack_top() -> u64 {
 /// stack's base and the current top untouched (the live dispatch frames).
 #[cfg(target_arch = "x86_64")]
 pub fn set_syscall_stack_top(v: u64) {
-    SYSCALL_STACK_TOP.store(v, core::sync::atomic::Ordering::Relaxed);
+    this_cpu().syscall_top.store(v, core::sync::atomic::Ordering::Relaxed);
 }
 
 /// Install `dispatcher` and point `EFER.SCE`/`STAR`/`LSTAR`/`SFMASK` at the
@@ -613,10 +443,26 @@ pub fn set_syscall_stack_top(v: u64) {
 #[cfg(target_arch = "x86_64")]
 pub fn enable_syscalls(dispatcher: Dispatcher) {
     DISPATCH.store(dispatcher as usize, core::sync::atomic::Ordering::Relaxed);
-    SYSCALL_STACK_TOP.store(
-        (&raw const SYSCALL_STACK) as usize as u64 + SYSCALL_STACK_SIZE as u64,
-        core::sync::atomic::Ordering::Relaxed,
-    );
+    enable_syscalls_this_core();
+}
+
+/// The per-core half of [`enable_syscalls`]: this core's `EFER.SCE`, `STAR`,
+/// `LSTAR`, `SFMASK`, and its syscall stack top. An AP calls it after
+/// [`install_percpu`]; the dispatcher is global and already stored.
+#[cfg(target_arch = "x86_64")]
+pub fn enable_syscalls_this_core() {
+    // The BSP's block: callers that never ran `install_percpu` still get one.
+    if msr::read(Msr::GsBase) == 0 {
+        let _ = install_percpu(0, 0);
+    }
+    // Only the BSP has the static boot band; an AP gets its stack top from
+    // the first task it switches to (`set_syscall_stack_top`).
+    if cpu_index() == 0 {
+        this_cpu().syscall_top.store(
+            (&raw const SYSCALL_STACK) as usize as u64 + SYSCALL_STACK_SIZE as u64,
+            core::sync::atomic::Ordering::Relaxed,
+        );
+    }
     // SCE: the `syscall` instruction itself. Without it, `syscall` is `#GP`.
     let efer = msr::read(Msr::Efer) | 1;
     // SAFETY: the documented contract of each MSR write; the values are this
@@ -682,10 +528,10 @@ pub extern "C" fn syscall_entry() {
     core::arch::naked_asm!(
         // In: RAX = nr, RCX = user RIP, R11 = user RFLAGS, RSP = user RSP
         // (not switched), args in RDI RSI RDX R10 R8 R9. `IF` is clear.
-        // No `swapgs`: this kernel has no per-CPU block, so `%gs` means
-        // nothing to ring 0 and there is nothing to swap.
-        "mov qword ptr [rip + {stash}], rsp",
-        "mov rsp, qword ptr [rip + {top}]",
+        // `swapgs`: ring 0's `%gs` is this core's per-CPU block from here.
+        "swapgs",
+        "mov qword ptr gs:[8], rsp",
+        "mov rsp, qword ptr gs:[16]",
         // 15 pushes (120 bytes) on top of 8 bytes of alignment padding:
         // 16-aligned at the call, frame at [rsp] matching `SyscallFrame`.
         "sub rsp, 8",
@@ -726,10 +572,9 @@ pub extern "C" fn syscall_entry() {
         "mov rax, [rsp]",
         // Back to the user stack — from the stash, not from the frame: the
         // user stack was never touched.
-        "mov rsp, qword ptr [rip + {stash}]",
+        "mov rsp, qword ptr gs:[8]",
+        "swapgs",
         "sysretq",
-        stash = sym USER_RSP_STASH,
-        top = sym SYSCALL_STACK_TOP,
         dispatch = sym DISPATCH,
     );
 }
@@ -771,6 +616,7 @@ pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
         "mov r10, [rdi + 0x30]",
         "mov rsp, [rdi + 0x78]", // rsp: the user stack (rdi still points at the frame)
         "mov rdi, [rdi + 0x58]", // last: spends the frame pointer
+        "swapgs",                // ring 0 -> ring 3: GS_BASE becomes the program's
         "sysretq",
     );
 }
@@ -782,242 +628,26 @@ pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
 // different table; the full kernel translates per arch, and so does this.)
 // ---------------------------------------------------------------------------
 
-/// Syscall numbers, x86_64.
+/// The x86_64 syscall numbers `akuma-syscalls-abi` cannot hold: x86-only
+/// calls with no asm-generic twin. (Akuma's private block went 2026-11-02:
+/// Taoxichuan serves no private call; libakuma's `linux-abi` build reads its
+/// uptime from `CLOCK_MONOTONIC`.) Every other
+/// number is `akuma_syscalls_abi::x86_64::*`, one row per call with both
+/// architectures' numbers and round-trip tests.
+///
+/// Until 2026-11-01 this was a second, 93-entry x86_64 table, and it drifted:
+/// `GETPID = 38` (`setitimer`; getpid is 39) and `SENDFILE = 39`, plus the
+/// misleading `SELECT_PSELECT6` and `PR_LIMIT64`
+/// (`docs/archive/SYSCALL_CONSTANT_AUDIT_2026_10_30.md`).
 pub mod nr {
-    /// `read(2)`.
-    pub const READ: u64 = 0;
-    /// `write(2)`.
-    pub const WRITE: u64 = 1;
-    /// `writev(2)` — musl's stdio flushes through this, even for a single
-    /// buffer (the empty `wbase` head is one zero-length iovec).
-    pub const WRITEV: u64 = 20;
-    /// `readv(2)` — musl's stdio reads every stream through this (one user
-    /// buffer plus the stream's pending window as the second iovec).
-    pub const READV: u64 = 19;
-    /// `access(2)` — apk probes paths it may skip (the syslog socket, key
-    /// directories) with this before opening them.
-    pub const ACCESS: u64 = 21;
-    /// `mmap(2)`.
-    pub const MMAP: u64 = 9;
-    /// `mprotect(2)`.
-    pub const MPROTECT: u64 = 10;
-    /// `munmap(2)`.
-    pub const MUNMAP: u64 = 11;
-    /// `brk(2)`.
-    pub const BRK: u64 = 12;
-    /// `ioctl(2)`.
-    pub const IOCTL: u64 = 16;
-    /// `pread64(2)` — musl's ldso reads a library's ELF headers with it
-    /// (`map_library`) before mapping; an explicit offset, the fd position
-    /// untouched.
-    pub const PREAD64: u64 = 17;
-    /// `stat(2)` — x86_64 keeps the legacy number, and musl's `stat()` maps
-    /// to it (not `newfstatat`); busybox `ls` stats its argument to learn
-    /// whether it is a directory.
-    pub const STAT: u64 = 4;
-    /// `close(2)` — the fd-table counterpart to `openat`'s allocation.
-    pub const CLOSE: u64 = 3;
-    /// `rt_sigaction(2)` — accepted and recorded-not: this kernel has no
-    /// signal delivery, so a registration has nothing to attach to. Returning
-    /// success for a no-op is what lets musl's startup proceed.
-    pub const RT_SIGACTION: u64 = 13;
-    /// `rt_sigprocmask(2)` — same no-op contract as `RT_SIGACTION`.
-    pub const RT_SIGPROCMASK: u64 = 14;
-    /// `getpid(2)` — x86_64 38. (Was 39: an off-by-one that both starved the
-    /// real getpid of an arm — the guest logged `unhandled ? (38)` — and made
-    /// nr 39, `sendfile` on x86_64, answer the pid.)
-    pub const GETPID: u64 = 38;
-    /// `sendfile(2)` — x86_64 39; named so the unhandled arm prints it. There
-    /// is no arm: no page-cache read/write path to serve it through.
-    pub const SENDFILE: u64 = 39;
-    /// `getuid(2)`.
-    pub const GETUID: u64 = 102;
-    /// `getgid(2)`.
-    pub const GETGID: u64 = 104;
-    /// `geteuid(2)`.
-    pub const GETEUID: u64 = 107;
-    /// `getegid(2)`.
-    pub const GETEGID: u64 = 108;
-    /// `exit(2)` — ends the calling thread; the only thread.
-    pub const EXIT: u64 = 60;
-    /// `arch_prctl(2)` — x86_64-specific: the FS/GS bases.
+    /// `arch_prctl(2)`: x86-only (musl's `__init_tp` sets the TLS base with it).
     pub const ARCH_PRCTL: u64 = 158;
-    /// `set_tid_address(2)`.
-    pub const SET_TID_ADDRESS: u64 = 218;
-    /// `clock_gettime(2)` — zeroed: this kernel has no clock (the host
-    /// tracks no wall time either), and the applets that call it only want
-    /// *a* time, not a true one.
-    pub const CLOCK_GETTIME: u64 = 228;
-    /// `gettimeofday(2)` — same contract as `CLOCK_GETTIME`.
-    pub const GETTIMEOFDAY: u64 = 96;
-    /// `getdents64(2)` — the directory read `ls` walks a directory with.
-    pub const GETDENTS64: u64 = 217;
-    /// `openat(2)` — the one path in; `dirfd` must be `AT_FDCWD` (absolute
-    /// paths only: this kernel has no working directory).
-    pub const OPENAT: u64 = 257;
-    /// `open(2)` — x86_64 keeps the legacy number, and musl's `open()` maps
-    /// to it; same contract as `OPENAT` minus the dirfd.
-    pub const OPEN: u64 = 2;
-    /// `lstat(2)` — legacy number; musl's `lstat()` maps to it. Does not
-    /// follow a final symlink.
-    pub const LSTAT: u64 = 6;
-    /// `fcntl(2)` — only the fd-flag commands busybox issues are served.
-    pub const FCNTL: u64 = 72;
-    /// `exit_group(2)` — musl's `exit(3)` calls this.
-    pub const EXIT_GROUP: u64 = 231;
-
-    // -- Stage 6, phase A: what apk.static needs to start (all x86_64
-    // -- numbers; the aarch64 crate keeps the generic numbering).
-
-    /// `fstat(2)` — x86_64's legacy number (aarch64 uses 80).
-    pub const FSTAT: u64 = 5;
-    /// `lseek(2)` — x86_64's legacy number (aarch64: 62).
-    pub const LSEEK: u64 = 8;
-    /// `uname(2)` (aarch64: 160).
-    pub const UNAME: u64 = 63;
-    /// `getcwd(2)` (aarch64: 17).
-    pub const GETCWD: u64 = 79;
-    /// `dup(2)` (aarch64: 23).
-    pub const DUP: u64 = 32;
-    /// `flock(2)` — stub: success, nothing locks (one task).
-    pub const FLOCK: u64 = 73;
-    /// `umask(2)` — stub: reports the conventional `0o022`.
-    pub const UMASK: u64 = 95;
-    /// `mremap(2)` — musl `realloc` on mmapped chunks.
-    pub const MREMAP: u64 = 25;
-    /// `statfs(2)` (aarch64: 43).
-    pub const STATFS: u64 = 137;
-    /// `fstatfs(2)` (aarch64: 44) — apk treats ENOSYS here as "forbidden".
-    pub const FSTATFS: u64 = 138;
-    /// `fchmod(2)` — stub: root's mode is the mode.
-    pub const FCHMOD: u64 = 91;
-
-    // -- Stage 6, phase C: unpack + commit (the *at family, x86_64).
-
-    /// `mkdirat(2)` (aarch64: 34).
-    pub const MKDIRAT: u64 = 258;
-    /// `newfstatat(2)` — musl's stat()/fstatat() on x86_64 (aarch64: 79).
-    pub const NEWFSTATAT: u64 = 262;
-    /// `unlinkat(2)` (aarch64: 35).
-    pub const UNLINKAT: u64 = 263;
-    /// `renameat(2)` (aarch64: 38).
-    pub const RENAMEAT: u64 = 264;
-    /// `linkat(2)` — apk 3 prefers it for hard-linked package files.
-    pub const LINKAT: u64 = 265;
-    /// `symlinkat(2)` (aarch64: 36).
-    pub const SYMLINKAT: u64 = 266;
-    /// `readlinkat(2)` (aarch64: 78).
-    pub const READLINKAT: u64 = 267;
-    /// `fchmodat(2)` — stub like `FCHMOD`.
-    pub const FCHMODAT: u64 = 268;
-    /// `fchownat(2)` — stub: everything is root already.
-    pub const FCHOWNAT: u64 = 260;
-    /// `faccessat(2)` (aarch64: 48).
-    pub const FACCESSAT: u64 = 269;
-
-    // -- Stage 6 checklist: numbers the unhandled arm may still print, named
-    // -- so a boot log reads as a plan. Most have no arm yet.
-
-    /// `poll(2)` (ppoll is 271).
-    pub const POLL: u64 = 7;
-    /// `dup2(2)` (dup3 is 292).
-    pub const DUP2: u64 = 33;
-    /// `dup3(2)`.
-    pub const DUP3: u64 = 292;
-    /// `eventfd2(2)` — libcurl's multi-stack wakeup fd (stage 8 session Q).
-    /// The state machine lives in `akuma-syscalls-eventfd`.
-    pub const EVENTFD2: u64 = 290;
-    /// `nanosleep` shares 35; `select(2)`.
-    pub const SELECT_PSELECT6: u64 = 23;
-    /// `sched_yield(2)`.
-    pub const SCHED_YIELD: u64 = 24;
-    /// `sendmsg(2)`.
-    pub const SENDMSG: u64 = 46;
-    /// `recvmsg(2)`.
-    pub const RECVMSG: u64 = 47;
-    /// `clone(2)` — phase D contingency (install scripts).
-    pub const CLONE: u64 = 56;
-    /// `execve(2)` — phase D contingency.
-    pub const EXECVE: u64 = 59;
-    /// `wait4(2)` — phase D contingency.
-    pub const WAIT4: u64 = 61;
-    /// `chdir(2)` (fchdir is 81).
-    pub const CHDIR: u64 = 80;
-    /// `fchdir(2)`.
-    pub const FCHDIR: u64 = 81;
-    /// `getrusage(2)`.
-    pub const GETRUSAGE: u64 = 98;
-    /// `sysinfo(2)`.
-    pub const SYSINFO: u64 = 99;
-    /// `sigaltstack(2)`.
-    pub const SIGALTSTACK: u64 = 131;
-    /// `pipe2(2)` — phase D contingency.
-    pub const PIPE2: u64 = 293;
-    /// `futex(2)`.
-    pub const FUTEX: u64 = 202;
-    /// `getsockname(2)`.
-    pub const GETSOCKNAME: u64 = 51;
-    /// `getpeername(2)`.
-    pub const GETPEERNAME: u64 = 52;
-    /// `setsockopt(2)`.
-    pub const SETSOCKOPT: u64 = 54;
-    /// `getsockopt(2)`.
-    pub const GETSOCKOPT: u64 = 55;
-    /// `set_robust_list(2)` — tolerated ENOSYS by sshd already.
-    pub const SET_ROBUST_LIST: u64 = 273;
-    /// `prlimit64(2)`.
-    pub const PR_LIMIT64: u64 = 302;
-    /// `kill(2)`.
-    pub const KILL: u64 = 62;
-    /// `utimensat(2)` — 280 here, not the asm-generic 88 the aarch64 side
-    /// uses; the guest's utimensat arrived as 280 and died unhandled as
-    /// apk's "failed to preserve mtime" install error.
-    pub const UTIMENSAT: u64 = 280;
-
-    // -- Stage 4: the socket family, the clock arms sshd's loop sleeps in,
-    // -- and Akuma's private syscalls (0x1000 base on x86_64 — 300 is
-    // -- `getcpu` here, so the AArch64 offsets cannot be reused; see
-    // -- `libakuma`'s numbering note).
-
-    /// `nanosleep(2)`.
-    pub const NANOSLEEP: u64 = 35;
-    /// `clock_nanosleep(2)`.
-    pub const CLOCK_NANOSLEEP: u64 = 230;
-    /// `socket(2)`.
-    pub const SOCKET: u64 = 41;
-    /// `connect(2)`.
-    pub const CONNECT: u64 = 42;
-    /// `accept(2)`.
-    pub const ACCEPT: u64 = 43;
-    /// `sendto(2)`.
-    pub const SENDTO: u64 = 44;
-    /// `recvfrom(2)`.
-    pub const RECVFROM: u64 = 45;
-    /// `shutdown(2)`.
-    pub const SHUTDOWN: u64 = 48;
-    /// `bind(2)`.
-    pub const BIND: u64 = 49;
-    /// `listen(2)`.
-    pub const LISTEN: u64 = 50;
-    /// `getppid(2)`.
-    pub const GETPPID: u64 = 110;
-    /// `gettid(2)`.
-    pub const GETTID: u64 = 186;
-    /// `getrandom(2)`.
-    pub const GETRANDOM: u64 = 318;
-    /// Akuma's private syscall base on x86_64.
-    pub const AKUMA_PRIVATE_BASE: u64 = 0x1000;
-    /// Akuma SPAWN: `spawn(path, argv, envp, stdin, stdin_len, flags)` —
-    /// returns the packed `pid | stdout_fd << 32` word.
-    pub const SPAWN: u64 = AKUMA_PRIVATE_BASE + 301;
-    /// Akuma WAITPID: `waitpid(pid, &status)` — pid when reaped, 0 while
-    /// running.
-    pub const WAITPID: u64 = AKUMA_PRIVATE_BASE + 303;
-    /// Akuma CLOSE_CHILD_STDIN: deliver EOF to a spawned child's stdin.
-    pub const CLOSE_CHILD_STDIN: u64 = AKUMA_PRIVATE_BASE + 326;
-    /// Akuma UPTIME: boot-relative time (libakuma's sshd/sh ask for it; the
-    /// aarch64 offsets cannot be reused below 0x1000+301 on x86_64).
-    pub const UPTIME: u64 = AKUMA_PRIVATE_BASE + 319;
+    /// `fork(2)` and `vfork(2)`: x86-only. musl issues `vfork` as the raw
+    /// number with no flags word.
+    pub const FORK: u64 = 57;
+    pub const VFORK: u64 = 58;
+    /// `pause(2)`: x86-only (asm-generic musl spells it `ppoll(0, 0, 0, 0)`).
+    pub const PAUSE: u64 = 34;
 }
 
 /// `openat(2)` flag bits (x86_64) and `dirfd` special values.

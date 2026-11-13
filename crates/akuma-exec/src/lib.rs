@@ -120,6 +120,11 @@ pub use akuma_mmu as mmu;
 /// (`docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.2). Re-exported under the old
 /// name so `process::image`'s three call sites and
 /// `akuma_exec::elf_loader::INTERP_BASE` in `src/exceptions.rs` are unchanged.
+///
+/// Behind `elf-loader` since 2026-11-01: the amd64 kernels load binaries their own
+/// way and use only [`process::ImageInstall`], so they compile neither this crate
+/// nor `elf` (~4,600 audit lines).
+#[cfg(feature = "elf-loader")]
 pub use akuma_elf as elf_loader;
 /// The preemptive scheduler — **moved to `akuma-threading` on 2026-09-02**
 /// (`docs/archive/AKUMA_EXEC_AUDIT.md` §6 step C): the thread pool, the
@@ -173,6 +178,7 @@ pub fn init(rt: ExecRuntime, cfg: ExecConfig) {
     // fields the loader used to read directly. These `require()` at use — a stub
     // registration turns inode-backed reads into silent zeros, which is the
     // `[FILL-SHORT/prefault]` self-host ICE.
+    #[cfg(feature = "elf-loader")]
     akuma_elf::register_vfs_hooks(akuma_elf::VfsHooks {
         read_file: rt.read_file,
         resolve_symlinks: rt.resolve_symlinks,

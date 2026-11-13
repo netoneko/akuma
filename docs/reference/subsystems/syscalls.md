@@ -88,6 +88,10 @@ to an actively-churning one doesn't inherit its risk).
 | `pidfd.rs` | pidfd_open/waitid | `sc-pidfd` (Tier 2) | [`syscalls/pidfd.md`](syscalls/pidfd.md) | A |
 | `timerfd.rs` | timerfd_create/settime | `sc-timerfd` | [`syscalls/timerfd.md`](syscalls/timerfd.md) | B |
 
+A **surface** composes families rather than implementing one: `crates/akuma-runtime-tokio` is the allow-list,
+setup and dispatch a kernel depends on to run tokio programs over glue
+([`syscalls/runtime-tokio.md`](syscalls/runtime-tokio.md), grade B).
+
 ## Feature gates & ExecRuntime stubs
 
 The `sc-*` features are compile-time gates. **Tier 1** (`sc-aio, sc-sysv-ipc,

@@ -16,7 +16,8 @@ akuma-cpu = { path = "../akuma-cpu" }
 # THIS crate can carry `#![forbid(unsafe_code)]`; see that crate's header.
 akuma-entry = { path = "../akuma-entry" }
 akuma-exceptions = { path = "../akuma-exceptions" }
-akuma-exec = { path = "../akuma-exec" }
+# `elf-loader`: herd, sshd and the rump server start through `spawn_process*`.
+akuma-exec = { path = "../akuma-exec", features = ["elf-loader"] }
 akuma-ext2 = { path = "../akuma-ext2" }
 akuma-fdt = { path = "../akuma-fdt" }
 akuma-gic = { path = "../akuma-gic" }

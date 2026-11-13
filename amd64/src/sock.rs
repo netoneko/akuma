@@ -106,21 +106,15 @@ pub fn sys_socket(domain: u64, ty: u64, _protocol: u64) -> u64 {
 /// What is local is only the *copy* across the privilege boundary, which is
 /// per-architecture (`akuma-user-access` is AArch64 asm).
 fn sockaddr_in_from_user(ptr: u64, len: u64) -> Option<SocketAddrV4> {
-    if len < core::mem::size_of::<SockAddrIn>() as u64 {
+    if len < sockaddr::SOCKADDR_IN_LEN as u64 {
         return None;
     }
-    let mut raw = [0u8; core::mem::size_of::<SockAddrIn>()];
+    let mut raw = [0u8; sockaddr::SOCKADDR_IN_LEN];
     if !crate::uaccess::read_bytes(ptr, &mut raw) {
         return None;
     }
-    // SAFETY: `SockAddrIn` is `repr(C)` and plain-old-data — four integer
-    // fields and a padding array, no pointers and no niches — so any 16 bytes
-    // are a valid value of it.
-    let sa: SockAddrIn = unsafe { core::ptr::read_unaligned(raw.as_ptr().cast()) };
-    if sa.sin_family != AF_INET as u16 {
-        return None;
-    }
-    Some(sa.to_addr())
+    let (ip, port) = sockaddr::decode_sockaddr_in(len, &raw).ok()?;
+    Some(SocketAddrV4::new(ip, port))
 }
 
 /// Write a `struct sockaddr_in` to user memory, returning its length.
@@ -128,22 +122,14 @@ fn sockaddr_in_to_user(ptr: u64, addr: SocketAddrV4) -> usize {
     if ptr == 0 {
         return 0;
     }
-    let sa = SockAddrIn::from_addr(&addr);
-    // SAFETY: `SockAddrIn` is `repr(C)` plain-old-data; viewing it as its own
-    // bytes is well defined.
-    let raw: &[u8] = unsafe {
-        core::slice::from_raw_parts((&raw const sa).cast::<u8>(), core::mem::size_of::<SockAddrIn>())
-    };
-    if !crate::uaccess::write_bytes(ptr, raw) {
+    let raw = sockaddr::encode_sockaddr_in(addr.ip, addr.port);
+    if !crate::uaccess::write_bytes(ptr, &raw) {
         return 0;
     }
     raw.len()
 }
 
-/// Map `akuma-net`'s errno (a positive `i32`) to the kernel's negative return.
-fn net_err(e: i32) -> u64 {
-    (-i64::from(e)) as u64
-}
+use akuma_syscalls_net::sockaddr::{self, net_err};
 
 /// `bind(fd, addr, addrlen)`.
 pub fn sys_bind(fd: u64, addr: u64, addrlen: u64) -> u64 {

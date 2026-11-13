@@ -17,11 +17,11 @@ use akuma_selftest::Suite;
 
 use akuma_ryzen_amd64::MachineDescription;
 
-pub use akuma_boot_amd64::mem::{HEAP_SIZE, heap_size, heap_size_for};
+pub use akuma_boot_amd64::mem::heap_size;
 
 // The self-test's physmap walk, under the same `no-tests` gate as the suite.
 #[cfg(not(feature = "no-tests"))]
-use crate::phys::phys_to_virt;
+use crate::phys::{PHYSMAP_LIMIT, phys_to_virt};
 
 /// Bring up heap then PMM. Returns false if the machine described no usable RAM.
 pub fn init(machine: &MachineDescription) -> bool {
@@ -114,7 +114,7 @@ pub fn smoke_test(t: &mut Suite) {
 fn physmap_covers_its_limit(t: &mut Suite) {
     // Probed at the last page rather than at the limit itself: the limit is
     // one past the end, and `phys_to_virt` asserts on it.
-    let last = PHYSMAP_LIMIT - PAGE_SIZE as u64;
+    let last = PHYSMAP_LIMIT - akuma_pte_amd64::PAGE_SIZE as u64;
     t.check_eq(
         "physmap: reaches PHYSMAP_LIMIT",
         crate::paging::translate(phys_to_virt(last) as usize).unwrap_or(u64::MAX),

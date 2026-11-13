@@ -19,6 +19,10 @@
 //!   stays the *program's*);
 //! * and nothing at all in `taoxichuan`, whose `AT_BASE` was hard 0.
 //!
+//! Since B8 (2026-11-02) Taoxichuan places its program through this crate too
+//! ([`program`]: the static-PIE base, `AT_PHDR`, where `brk` starts), so its
+//! loader has one parser and one page loop for program and interpreter.
+//!
 //! So the rule lived in one consumer and was missing from the other, which
 //! is exactly backwards for a fact about ELF files rather than about kernels.
 //! This crate holds the fact once: bounds-checked header/program-header
@@ -38,6 +42,16 @@
 /// kernel's mmap window.
 pub const INTERP_BASE: u64 = 0x3000_0000;
 
+/// Where an `ET_DYN` program (static-PIE: Alpine's `apk.static` is one) is placed.
+///
+/// Its link addresses start near zero, so every `p_vaddr`, the entry
+/// and `AT_PHDR` shift by this base; musl's static-PIE startup relocates itself
+/// in userspace, so no kernel processes `RELA`s. The same base `akuma-elf` uses.
+pub const PIE_BASE: u64 = 0x1000_0000;
+
+/// `AT_PHENT`: the one program-header size this crate accepts.
+pub const PHENT: u64 = 56;
+
 /// What refused an image. One variant per distinct refusal, so a caller's
 /// error path can name what happened without this crate formatting strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +70,11 @@ pub enum ExecErr {
     NoEntry,
     /// More `PT_LOAD` segments than the caller's output slice holds.
     TooManySegments,
+    /// A `PT_LOAD`'s file bytes run past the end of the image, or its `memsz`
+    /// is smaller than its `filesz`.
+    SegmentBounds,
+    /// A program with no `PT_LOAD` at all: nothing to enter.
+    NoSegments,
 }
 
 /// The `PT_INTERP` segment type.
@@ -83,10 +102,8 @@ pub struct LoadSeg {
     pub flags: u32,
 }
 
-/// ELF class/data/type positions this crate actually reads. ELF64 phdr size,
-/// fixed by the ABI; a table with any other stride is refused, not guessed.
-const PHENT: u64 = 56;
 const PT_LOAD: u32 = 1;
+const PT_PHDR: u32 = 6;
 /// The `e_phnum` escape value meaning "the real count is in section header
 /// 0" — no image this serves has it, and honoring it would mean a second
 /// lookup this crate has no use for.
@@ -213,12 +230,17 @@ pub fn interp_path(image: &[u8]) -> Result<Option<&[u8]>, ExecErr> {
 /// Filled into `out`; returns how many there are. The caller picks `base` — `0` for an
 /// `ET_EXEC` image at its link addresses, [`INTERP_BASE`] (or its own) for an
 /// `ET_DYN` one. Segments beyond `out.len()` are a [`ExecErr::
-/// TooManySegments`], not a silent truncation.
+/// TooManySegments`], not a silent truncation. Every segment's file bytes are
+/// inside `image` and `memsz >= filesz` ([`ExecErr::SegmentBounds`] otherwise),
+/// so a mapper may slice `image[offset..offset + filesz]` without a check.
 pub fn load_segments(image: &[u8], base: u64, out: &mut [LoadSeg]) -> Result<usize, ExecErr> {
     let mut n = 0;
     for (ty, offset, filesz, vaddr, flags, memsz) in phdrs(image)? {
         if ty != PT_LOAD {
             continue;
+        }
+        if offset.checked_add(filesz).is_none_or(|end| end > image.len() as u64) || memsz < filesz {
+            return Err(ExecErr::SegmentBounds);
         }
         if n >= out.len() {
             return Err(ExecErr::TooManySegments);
@@ -227,6 +249,51 @@ pub fn load_segments(image: &[u8], base: u64, out: &mut [LoadSeg]) -> Result<usi
         n += 1;
     }
     Ok(n)
+}
+
+/// The facts a loader needs about the program itself, beyond its segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Program {
+    /// What every link address shifted by: [`PIE_BASE`] for `ET_DYN`, else 0.
+    pub base: u64,
+    /// `e_entry` placed: `AT_ENTRY`, and the entry to cross with no interpreter.
+    pub entry: u64,
+    /// `AT_PHDR`: where the program header table is once placed. `PT_PHDR`'s
+    /// address when there is one, else inside the `PT_LOAD` that file-backs
+    /// `e_phoff`; 0 if neither does.
+    pub phdr_va: u64,
+    /// `AT_PHNUM`.
+    pub phnum: u64,
+    /// The highest placed byte (`vaddr + memsz` over the segments), not page
+    /// rounded: where `brk` starts, once the caller rounds it.
+    pub end: u64,
+}
+
+/// Place a program: its `PT_LOAD` segments and the [`Program`] facts.
+///
+/// The segments go into `out` as [`load_segments`] puts them, at the base the
+/// image's type decides. A program with no
+/// `PT_LOAD` is [`ExecErr::NoSegments`], one with `e_entry == 0`
+/// [`ExecErr::NoEntry`].
+pub fn program(image: &[u8], out: &mut [LoadSeg]) -> Result<(Program, usize), ExecErr> {
+    let (e_entry, phoff, _, phnum) = header(image)?;
+    // `header` accepted the type, so it is `ET_EXEC` (2) or `ET_DYN` (3).
+    let base = if rd16(image, 16) == Some(3) { PIE_BASE } else { 0 };
+    let n = load_segments(image, base, out)?;
+    if n == 0 {
+        return Err(ExecErr::NoSegments);
+    }
+    if e_entry == 0 {
+        return Err(ExecErr::NoEntry);
+    }
+    let segs = &out[..n];
+    let from_load = segs
+        .iter()
+        .find(|s| phoff >= s.offset && phoff < s.offset + s.filesz)
+        .map_or(0, |s| s.vaddr + (phoff - s.offset));
+    let phdr_va = phdrs(image)?.find(|p| p.0 == PT_PHDR).map_or(from_load, |p| p.3.wrapping_add(base));
+    let end = segs.iter().map(|s| s.vaddr.wrapping_add(s.memsz)).max().unwrap_or(0);
+    Ok((Program { base, entry: e_entry.wrapping_add(base), phdr_va, phnum, end }, n))
 }
 
 /// The interpreter's entry once mapped at `base` (`ET_DYN`: `e_entry` is a
@@ -284,7 +351,6 @@ mod tests {
         at
     }
 
-    const PT_LOAD: u32 = 1;
     const PT_INTERP: u32 = 3;
 
     #[test]
@@ -334,8 +400,8 @@ mod tests {
 
     #[test]
     fn segments_rebase_by_the_callers_base() {
-        let mut buf = [0u8; 512];
-        let n = elf(
+        let mut buf = [0u8; 0x1300];
+        elf(
             &mut buf,
             3,
             0x1560,
@@ -352,7 +418,7 @@ mod tests {
             memsz: 0,
             flags: 0,
         }; 4];
-        let k = load_segments(&buf[..n], 0x3000_0000, &mut segs).unwrap();
+        let k = load_segments(&buf, 0x3000_0000, &mut segs).unwrap();
         assert_eq!(k, 2);
         // The file offset is the segment's own `p_offset`, never derived from the (rebased)
         // vaddr: indexing the image by vaddr was the M5 crash on musl's ldso.
@@ -374,6 +440,55 @@ mod tests {
         );
         let mut segs = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 1];
         assert_eq!(load_segments(&buf[..n], 0, &mut segs), Err(ExecErr::TooManySegments));
+    }
+
+    #[test]
+    fn segment_file_bytes_must_be_in_the_image() {
+        let mut segs = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 2];
+        let mut buf = [0u8; 256];
+        // File bytes past the end of the image (a truncated `ld-musl`).
+        let n = elf(&mut buf, 3, 0x10, &[(PT_LOAD, 0x80, 0x100, 0, 5, 0x100)]);
+        assert_eq!(load_segments(&buf[..n], 0, &mut segs), Err(ExecErr::SegmentBounds));
+        // `memsz < filesz`.
+        let n = elf(&mut buf, 3, 0x10, &[(PT_LOAD, 0, 0x20, 0, 5, 0x10)]);
+        assert_eq!(load_segments(&buf[..n], 0, &mut segs), Err(ExecErr::SegmentBounds));
+        // An offset that overflows is out of bounds, not a wrap.
+        let n = elf(&mut buf, 3, 0x10, &[(PT_LOAD, u64::MAX, 2, 0, 5, 2)]);
+        assert_eq!(load_segments(&buf[..n], 0, &mut segs), Err(ExecErr::SegmentBounds));
+    }
+
+    #[test]
+    fn a_static_exec_program_is_placed_at_its_link_addresses() {
+        let mut buf = [0u8; 0x200];
+        // Text file-backs the ELF header and the phdr table (offset 0), so
+        // `AT_PHDR` is computed from it; data has a `.bss` tail.
+        elf(&mut buf, 2, 0x40_1000, &[(PT_LOAD, 0, 0x100, 0x40_0000, 5, 0x100), (PT_LOAD, 0x100, 0x80, 0x40_2000, 6, 0x300)]);
+        let mut segs = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 4];
+        let (p, n) = program(&buf, &mut segs).unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(p, Program { base: 0, entry: 0x40_1000, phdr_va: 0x40_0040, phnum: 2, end: 0x40_2300 });
+    }
+
+    #[test]
+    fn a_static_pie_program_moves_to_pie_base_with_its_phdr() {
+        let mut buf = [0u8; 0x200];
+        // `PT_PHDR` names the table's link address; it wins over the computed one.
+        elf(&mut buf, 3, 0x1560, &[(PT_PHDR, 0x40, 0x70, 0x40, 4, 0x70), (PT_LOAD, 0, 0x100, 0, 5, 0x2000)]);
+        let mut segs = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 4];
+        let (p, n) = program(&buf, &mut segs).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(segs[0].vaddr, PIE_BASE);
+        assert_eq!(p, Program { base: PIE_BASE, entry: PIE_BASE + 0x1560, phdr_va: PIE_BASE + 0x40, phnum: 2, end: PIE_BASE + 0x2000 });
+    }
+
+    #[test]
+    fn a_program_needs_a_segment_and_an_entry() {
+        let mut segs = [LoadSeg { vaddr: 0, offset: 0, filesz: 0, memsz: 0, flags: 0 }; 2];
+        let mut buf = [0u8; 256];
+        let n = elf(&mut buf, 2, 0x1000, &[(PT_INTERP, 0x80, 1, 0, 4, 1)]);
+        assert_eq!(program(&buf[..n], &mut segs), Err(ExecErr::NoSegments));
+        let n = elf(&mut buf, 2, 0, &[(PT_LOAD, 0, 0x10, 0x40_0000, 5, 0x10)]);
+        assert_eq!(program(&buf[..n], &mut segs), Err(ExecErr::NoEntry));
     }
 
     #[test]

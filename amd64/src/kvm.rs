@@ -1501,7 +1501,7 @@ fn pvh_guest(nrips: bool) {
 
     crumb(0x42);
     code_f.bytes_mut()[..PVH_CODE.len()].copy_from_slice(&PVH_CODE);
-    let l = svm::pvh::plan(PVH_TOP_GPA, PVH_CODE_REGION, PVH_TOP_GPA - PVH_CODE_REGION);
+    let l = svm::pvh::plan(PVH_TOP_GPA, PVH_CODE_REGION, PVH_TOP_GPA - PVH_CODE_REGION, 0, 0);
     svm::pvh::write_start(start_f.bytes_mut(), &l);
     svm::pvh::write_memmap(memmap_f.bytes_mut(), &l);
     if !svm::pvh::write_cmdline(cmdline_f.bytes_mut(), PVH_CMDLINE) {

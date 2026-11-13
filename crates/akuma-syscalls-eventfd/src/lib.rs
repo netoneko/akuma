@@ -17,6 +17,9 @@ pub const EAGAIN: i32 = 11;
 /// The errno eventfd2 answers for flags outside the three bits above.
 pub const EINVAL: i32 = 22;
 
+/// The errno a full table answers (no free slot: EMFILE).
+pub const EMFILE: i32 = 24;
+
 /// Linux's write(2) rejects a value that would push the counter past
 /// `u64::MAX - 1` with EAGAIN (a fresh read must always be able to clear it).
 const COUNTER_MAX: u64 = u64::MAX - 1;
@@ -94,6 +97,57 @@ impl EventFd {
     }
 }
 
+/// A fixed table of `N` eventfds, for a kernel with no allocator on this path.
+///
+/// Owns the slot bookkeeping only: lowest-free allocation, lookup, close. An
+/// fd names a slot by index, so a `dup`'d fd names the same counter; the
+/// caller decides when the last name closed and calls [`close`](Self::close).
+/// `None` from `read`/`write` means the slot is empty (the caller's EBADF).
+pub struct EventFdTable<const N: usize> {
+    slots: [Option<EventFd>; N],
+}
+
+impl<const N: usize> EventFdTable<N> {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self { slots: [None; N] }
+    }
+
+    /// `eventfd2`: validate, then take the lowest free slot. Flag errors are
+    /// reported before a full table is (Linux checks flags first).
+    pub fn create(&mut self, initval: u32, flags: u32) -> Result<usize, i32> {
+        let ef = EventFd::new(initval, flags)?;
+        let slot = self.slots.iter().position(Option::is_none).ok_or(EMFILE)?;
+        self.slots[slot] = Some(ef);
+        Ok(slot)
+    }
+
+    pub fn read(&mut self, idx: usize) -> Option<Result<u64, i32>> {
+        self.slots.get_mut(idx)?.as_mut().map(EventFd::read)
+    }
+
+    pub fn write(&mut self, idx: usize, val: u64) -> Option<Result<(), i32>> {
+        self.slots.get_mut(idx)?.as_mut().map(|ef| ef.write(val))
+    }
+
+    #[must_use]
+    pub fn can_read(&self, idx: usize) -> bool {
+        self.slots.get(idx).and_then(Option::as_ref).is_some_and(EventFd::can_read)
+    }
+
+    pub fn close(&mut self, idx: usize) {
+        if let Some(s) = self.slots.get_mut(idx) {
+            *s = None;
+        }
+    }
+}
+
+impl<const N: usize> Default for EventFdTable<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -144,5 +198,37 @@ mod tests {
     #[test]
     fn initval_lands_in_counter() {
         assert_eq!(EventFd::new(u32::MAX, 0).unwrap().counter, u64::from(u32::MAX));
+    }
+
+    #[test]
+    fn table_allocates_lowest_free_and_reuses_a_closed_slot() {
+        let mut t = EventFdTable::<2>::new();
+        assert_eq!(t.create(0, 0), Ok(0));
+        assert_eq!(t.create(0, 0), Ok(1));
+        assert_eq!(t.create(0, 0), Err(EMFILE));
+        t.close(0);
+        assert_eq!(t.create(7, 0), Ok(0));
+        assert_eq!(t.read(0), Some(Ok(7)));
+    }
+
+    #[test]
+    fn table_checks_flags_before_fullness() {
+        let mut t = EventFdTable::<1>::new();
+        t.create(0, 0).unwrap();
+        assert_eq!(t.create(0, 0x8000_0000), Err(EINVAL));
+    }
+
+    #[test]
+    fn table_empty_or_out_of_range_slot_is_none_not_a_panic() {
+        let mut t = EventFdTable::<2>::new();
+        assert_eq!(t.read(0), None);
+        assert_eq!(t.write(5, 1), None);
+        assert!(!t.can_read(9));
+        t.close(9);
+        let i = t.create(0, 0).unwrap();
+        assert_eq!(t.write(i, 3), Some(Ok(())));
+        assert!(t.can_read(i));
+        t.close(i);
+        assert!(!t.can_read(i));
     }
 }

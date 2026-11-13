@@ -635,6 +635,7 @@ out:
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0); /* stage-12 guest console is not a tty: unbuffered so a hung test still reports its predecessors */
     printf("epollops: epoll/poll/select semantics probe\n");
     fflush(stdout);
 

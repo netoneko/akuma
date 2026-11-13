@@ -1,3 +1,6 @@
+// Without `elf-loader` the loading half of this file compiles out; its imports stay.
+#![cfg_attr(not(feature = "elf-loader"), allow(unused_imports))]
+
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::string::ToString;
@@ -21,6 +24,7 @@ use super::{ChildKind, Process, read_current_pid, get_box_name};
 /// must agree on where a shebang line ends.
 pub const SHEBANG_MAX: usize = 256;
 
+#[cfg(feature = "elf-loader")]
 /// How many `#!` hops to follow before giving up — an interpreter may itself be
 /// a script. Same limit Linux uses (`BINPRM_MAX_RECURSION`), and it is what
 /// stops a script whose interpreter is itself from spinning forever.
@@ -77,6 +81,7 @@ pub fn shebang_hop(interpreter: &str, arg: Option<&str>, script_name: &str, prev
     hop
 }
 
+#[cfg(feature = "elf-loader")]
 /// Read `path`'s `#!` line. Only the first [`SHEBANG_MAX`] bytes are read, so a
 /// large non-ELF file costs one short read, not a slurp. An unreadable path
 /// yields `None` and the ELF loader reports the real error.
@@ -87,6 +92,7 @@ fn shebang_line_of(path: &str) -> Option<(String, Option<String>)> {
     Some((String::from(interpreter), arg.map(String::from)))
 }
 
+#[cfg(feature = "elf-loader")]
 /// Follow a `#!` chain from `resolved` (the symlink-resolved on-disk path) and
 /// return the ELF that should actually be loaded plus the argv prefix that
 /// replaces `argv[0]`.
@@ -128,6 +134,7 @@ pub fn resolve_shebang_chain(resolved: &str, display: &str) -> (String, Vec<Stri
     (elf_path, prefix)
 }
 
+#[cfg(feature = "elf-loader")]
 /// Spawn a process on a user thread for concurrent execution
 ///
 /// This function creates a new process from the ELF file and spawns it on a
@@ -146,6 +153,7 @@ pub fn spawn_process(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) ->
     Ok(thread_id)
 }
 
+#[cfg(feature = "elf-loader")]
 /// Spawn a process on a user thread with a channel for I/O
 ///
 /// Like spawn_process, but returns a ProcessChannel that can be used to
@@ -167,6 +175,7 @@ pub fn spawn_process_with_channel(
     spawn_process_with_channel_cwd(path, args, None, stdin, None)
 }
 
+#[cfg(feature = "elf-loader")]
 /// Spawn a process on a user thread with a channel for I/O and specified cwd
 ///
 /// # Arguments
@@ -187,6 +196,7 @@ pub fn spawn_process_with_channel_cwd(
     spawn_process_with_channel_ext(path, args, env, stdin, cwd, 0, false)
 }
 
+#[cfg_attr(not(feature = "elf-loader"), allow(dead_code))]
 /// Whether a spawn should inherit the caller's `TerminalState` rather than
 /// get a fresh one.
 ///
@@ -204,6 +214,7 @@ const fn spawn_inherits_terminal(pty: bool, box_id: u64) -> bool {
     !pty && box_id == 0
 }
 
+#[cfg(feature = "elf-loader")]
 /// Extended version of spawn_process_with_channel.
 ///
 /// `pty`: when `true`, the child's channel is marked as a real terminal
@@ -229,6 +240,7 @@ pub fn spawn_process_with_channel_ext(
     spawn_process_with_creds(path, args, env, stdin, cwd, box_id, pty, None)
 }
 
+#[cfg(feature = "elf-loader")]
 /// [`spawn_process_with_channel_ext`], with the child's credentials supplied
 /// rather than copied from the caller. `None` copies, as every other spawn
 /// does. The caller is responsible for having checked that `creds` is
@@ -652,6 +664,7 @@ pub fn spawn_process_with_creds(
 }
 
 
+#[cfg(feature = "elf-loader")]
 /// Execute a process that is already registered in the PROCESS_TABLE
 pub(crate) fn run_registered_process(pid: Pid) -> ! {
     // `prepare_for_execution`, `address_space.activate()` and `runtime().enter_user`

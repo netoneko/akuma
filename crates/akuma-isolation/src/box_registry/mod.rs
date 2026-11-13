@@ -1,8 +1,8 @@
 //! Box (container) registry
 //!
-//! Tracks active boxes and their metadata. The registry is global and
-//! protected by a spinlock with IRQs disabled for safe access from
-//! syscall and interrupt context.
+//! Tracks active boxes and their metadata: `BoxInfo` here, the live registry
+//! in `registry` (global, under a spinlock with IRQs disabled for safe access
+//! from syscall and interrupt context).
 //!
 //! # Why this lives in `akuma-isolation`
 //!
@@ -19,17 +19,32 @@
 //! inside this crate's `#![forbid(unsafe_code)]`. `akuma_exec::box_registry` and
 //! `akuma_exec::process::box_*` remain as re-exports, so no call site moved.
 //! Survey and rationale: `docs/archive/AKUMA_EXEC_SPLIT_AGAIN.md` §3.1.
+//!
+//! # Without `containers`
+//!
+//! A kernel built without the crate's `containers` feature has exactly one box,
+//! the host, and nothing can create another (the box syscalls are behind
+//! `sc-containers`). It gets [`host_only`] instead of the live registry: the
+//! same functions, answered for box 0 by construction, with no table, no lock
+//! and none of the `hierarchy`/`access` tree walks. `akuma-exec`, which cannot
+//! see this crate's features, calls the same names either way.
 
+#[cfg(feature = "containers")]
 pub mod hierarchy;
+#[cfg(feature = "containers")]
 pub mod access;
+#[cfg(feature = "containers")]
+mod registry;
+#[cfg(feature = "containers")]
+pub use registry::*;
+#[cfg(not(feature = "containers"))]
+pub mod host_only;
+#[cfg(not(feature = "containers"))]
+pub use host_only::*;
 
 use alloc::string::String;
-use alloc::vec::Vec;
-
-use spinning_top::Spinlock;
 
 use akuma_primitives::Pid;
-use akuma_primitives::irq::with_irqs_disabled;
 
 /// Information about an active box (container)
 #[derive(Debug, Clone)]
@@ -41,97 +56,6 @@ pub struct BoxInfo {
     pub primary_pid: Pid,
     /// Parent box ID. None for top-level boxes (direct children of the host).
     pub parent_box_id: Option<u64>,
-}
-
-static BOX_REGISTRY: Spinlock<alloc::collections::BTreeMap<u64, BoxInfo>> =
-    Spinlock::new(alloc::collections::BTreeMap::new());
-
-/// Register a new box in the global registry
-pub fn register_box(info: BoxInfo) {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().insert(info.id, info);
-    });
-}
-
-/// Unregister a box from the global registry
-#[must_use]
-pub fn unregister_box(id: u64) -> Option<BoxInfo> {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().remove(&id)
-    })
-}
-
-/// List all active boxes
-#[must_use]
-pub fn list_boxes() -> Vec<BoxInfo> {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().values().cloned().collect()
-    })
-}
-
-/// Find a box ID by name
-#[must_use]
-pub fn find_box_by_name(name: &str) -> Option<u64> {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().values().find(|b| b.name == name).map(|b| b.id)
-    })
-}
-
-/// Get a box's name by ID
-#[must_use]
-pub fn get_box_name(id: u64) -> Option<String> {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().get(&id).map(|b| b.name.clone())
-    })
-}
-
-/// Look up a box by ID (returns a clone)
-#[must_use]
-pub fn get_box_info(id: u64) -> Option<BoxInfo> {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().get(&id).cloned()
-    })
-}
-
-/// Find the box whose primary PID matches, excluding Box 0.
-/// Returns the box ID if found.
-#[must_use]
-pub fn find_primary_box(pid: Pid) -> Option<u64> {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().values()
-            .find(|b| b.primary_pid == pid && b.id != 0)
-            .map(|b| b.id)
-    })
-}
-
-/// [`hierarchy::reaches`] against the live registry, under its lock — no
-/// snapshot, so no allocation. For checks on hot paths (`kill`).
-#[must_use]
-pub fn box_reaches(source: u64, target: u64) -> bool {
-    if source == 0 || source == target {
-        return true;
-    }
-    with_irqs_disabled(|| hierarchy::reaches(&BOX_REGISTRY.lock(), source, target))
-}
-
-/// Initialize the box registry with Box 0 (Host)
-pub fn init_box_registry() {
-    register_box(BoxInfo {
-        id: 0,
-        name: String::from("host"),
-        root_dir: String::from("/"),
-        creator_pid: 0,
-        primary_pid: 1,
-        parent_box_id: None,
-    });
-}
-
-/// Get a snapshot of the registry (for hierarchy queries without holding the lock)
-#[must_use]
-pub fn registry_snapshot() -> alloc::collections::BTreeMap<u64, BoxInfo> {
-    with_irqs_disabled(|| {
-        BOX_REGISTRY.lock().clone()
-    })
 }
 
 /// The four-box registry both [`hierarchy`] and [`access`] test against:
@@ -147,7 +71,7 @@ pub fn registry_snapshot() -> alloc::collections::BTreeMap<u64, BoxInfo> {
 /// sibling subtree (box3) so a descendant walk that over-collects is visible;
 /// `access` needs the same two properties to tell "host reaches everything" apart
 /// from "everyone reaches everything".
-#[cfg(test)]
+#[cfg(all(test, feature = "containers"))]
 pub(crate) fn make_test_registry() -> alloc::collections::BTreeMap<u64, BoxInfo> {
     let mut reg = alloc::collections::BTreeMap::new();
     reg.insert(

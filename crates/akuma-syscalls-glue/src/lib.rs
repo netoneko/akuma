@@ -143,6 +143,8 @@ pub mod pipe;
 pub mod pty;
 pub mod poll;
 pub mod proc;
+/// `execve`'s argument reading and its process-side commit, shared by the x86 kernels.
+pub mod execve;
 mod cred;
 pub mod perm;
 /// AF_UNIX sockets — the kernel half.
@@ -800,15 +802,18 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MUNMAP => mem::sys_munmap(args[0] as usize, args[1] as usize),
         nr::CLONE => proc::sys_clone(args[0], args[1], args[2], args[3], args[4]),
         nr::CLONE3 => proc::sys_clone3(args[0], args[1] as usize),
+        #[cfg(feature = "exec")]
         nr::EXECVE => proc::sys_execve(args[0], args[1], args[2]),
+        #[cfg(feature = "akuma-native")]
         nr::UPTIME => time::sys_uptime(),
         // The floor control: no arguments read, no user memory touched, no
         // process resolved — a constant into x0. Everything this arm's cost
         // consists of is the boundary itself, which is the point.
+        #[cfg(feature = "akuma-native")]
         nr::AKUMA_GET_VERSION => version::sys_akuma_get_version(),
-        #[cfg(feature = "smoltcp")]
+        #[cfg(all(feature = "akuma-native", feature = "smoltcp"))]
         nr::RESOLVE_HOST => net::sys_resolve_host(args[0], args[1] as usize, args[2]),
-        #[cfg(not(feature = "smoltcp"))]
+        #[cfg(all(feature = "akuma-native", not(feature = "smoltcp")))]
         nr::RESOLVE_HOST => net_enetdown(),
         nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as usize),
         nr::PSELECT6 => flat(poll::sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5])),
@@ -821,27 +826,43 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RENAMEAT2 => flat(fs::sys_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32)),
         nr::STATX => flat(fs::sys_statx(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4])),
         nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize)),
+        #[cfg(all(feature = "exec", feature = "akuma-native"))]
         nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
-        nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
+        #[cfg(feature = "akuma-native")]
+        nr::AKUMA_KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
         #[cfg(feature = "sc-reboot")]
         nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
+        #[cfg(feature = "akuma-native")]
         nr::WAITPID => proc::sys_waitpid(args[0] as u32, args[1]),
         nr::GETRANDOM => proc::sys_getrandom(args[0], args[1] as usize),
+        #[cfg(feature = "akuma-native")]
         nr::TIME => time::sys_time(),
         nr::CHDIR => flat(fs::sys_chdir(args[0])),
         nr::CHROOT => flat(fs::sys_chroot(args[0])),
         nr::FCHDIR => fs::sys_fchdir(args[0] as u32),
+        #[cfg(feature = "akuma-native")]
         nr::SET_TERMINAL_ATTRIBUTES => term::sys_set_terminal_attributes(args[0], args[1], args[2]),
+        #[cfg(feature = "akuma-native")]
         nr::GET_TERMINAL_ATTRIBUTES => term::sys_get_terminal_attributes(args[0], args[1]),
+        #[cfg(feature = "akuma-native")]
         nr::SET_CURSOR_POSITION => term::sys_set_cursor_position(args[0], args[1]),
+        #[cfg(feature = "akuma-native")]
         nr::HIDE_CURSOR => term::sys_hide_cursor(),
+        #[cfg(feature = "akuma-native")]
         nr::SHOW_CURSOR => term::sys_show_cursor(),
+        #[cfg(feature = "akuma-native")]
         nr::CLEAR_SCREEN => term::sys_clear_screen(),
+        #[cfg(feature = "akuma-native")]
         nr::POLL_INPUT_EVENT => term::sys_poll_input_event(args[0], args[1] as usize, args[2]),
+        #[cfg(feature = "akuma-native")]
         nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
+        #[cfg(all(feature = "exec", feature = "akuma-native"))]
         nr::SPAWN_EXT => flat(proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5])),
+        #[cfg(feature = "akuma-native")]
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
+        #[cfg(feature = "akuma-native")]
         nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),
+        #[cfg(feature = "akuma-native")]
         nr::CORE_INIT => proc::sys_core_init(args[0] as usize, args[1]),
         #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
@@ -858,6 +879,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, args[1], args[2], args[3] as usize),
         nr::RT_SIGSUSPEND => signal::sys_rt_sigsuspend(args[0], args[1] as usize),
+        nr::RT_SIGPENDING => signal::sys_rt_sigpending(args[0], args[1] as usize),
         nr::RT_SIGTIMEDWAIT => flat(signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize)),
         nr::RT_SIGRETURN => 0,
         nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
@@ -872,6 +894,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FACCESSAT2 => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32)),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
+        #[cfg(feature = "akuma-native")]
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
         nr::GETPID => proc::sys_getpid(),
         nr::GETPPID => proc::sys_getppid(),
@@ -881,7 +904,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRESUID => cred::sys_getres(args[0], args[1], args[2], false),
         nr::GETRESGID => cred::sys_getres(args[0], args[1], args[2], true),
         nr::GETGROUPS => cred::sys_getgroups(args[0] as i32, args[1]),
-        nr::KILL_LINUX => proc::sys_kill(args[0] as u32, args[1] as u32),
+        nr::KILL => proc::sys_kill(args[0] as u32, args[1] as u32),
         nr::SETPGID => proc::sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
         nr::SETSID => proc::sys_setsid(),
@@ -1000,16 +1023,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             let cpusetsize = args[1] as usize;
             if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
-                // CPUs the process may run on. On the real shared-kernel SMP
-                // build that is the DTB-reported core count (BSP + secondaries,
-                // all online after `bringup_secondaries`); single-core builds
-                // report 1. The old code hardcoded `1`, so `busybox nproc` and
-                // cargo's `num_cpus` always saw one CPU and `cargo build`
-                // defaulted to `-j1` even on an SMP=2+ kernel.
-                #[cfg(kernel_smp_shared)]
+                // CPUs the process may run on: the kernel's `probed_core_count`
+                // hook. The AArch64 shared-kernel SMP build answers the
+                // DTB-reported core count (BSP + secondaries, all online after
+                // `bringup_secondaries`) and its single-core builds answer 1;
+                // Taoxichuan answers its online count. The old code hardcoded
+                // `1`, so `busybox nproc` and cargo's `num_cpus` always saw one
+                // CPU and `cargo build` defaulted to `-j1` even on an SMP=2+
+                // kernel. Until 2026-11-01 the hook was read only under
+                // `kernel_smp_shared`, which Taoxichuan does not build glue
+                // with, so tokio started one worker there at `smp=4`.
                 let nr_cpus: usize = crate::hooks::probed_core_count();
-                #[cfg(not(kernel_smp_shared))]
-                let nr_cpus: usize = 1;
                 let mask: u64 = if nr_cpus >= CPU_SET_BITS_PER_WORD {
                     u64::MAX
                 } else {
@@ -1390,7 +1414,7 @@ pub fn set_hooks(h: SyscallHooks) {
 }
 
 /// Which of these has a caller depends on the feature set — the rump five need
-/// `rump`, `probed_core_count` needs `smp-shared` — so the parity surface is
+/// `rump` — so the parity surface is
 /// deliberately wider than any single configuration uses. Same argument the
 /// virtio-audio stub carried: the syscall layer compiles unchanged either way.
 #[allow(dead_code)]

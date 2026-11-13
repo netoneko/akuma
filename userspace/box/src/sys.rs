@@ -205,6 +205,7 @@ mod calls {
         Some(SpawnResult {
             pid: (result & 0xFFFF_FFFF) as u32,
             stdout_fd: ((result >> 32) & 0xFFFF_FFFF) as u32,
+            stdin_fd: None,
         })
     }
 }

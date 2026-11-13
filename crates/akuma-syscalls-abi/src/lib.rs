@@ -439,6 +439,9 @@ syscall_table! {
     /// Added 2026-09-07. `akuma_syscalls_mem::mremap` holds the
     /// move-vs-expand decision both kernels build against.
     Mremap     => MREMAP     = 25,  nr::MREMAP;
+    /// x86_64 26, asm-generic 227. amd64 routes 26 to its own `mm::sys_msync`
+    /// before decoding; Taoxichuan dispatches it by this row (2026-11-01).
+    Msync      => MSYNC      = 26,  nr::MSYNC;
 
     /// Process-wide memory barrier. `akuma-syscalls-mem` has decoded its
     /// command set since that crate existed; only the number was absent.
@@ -454,6 +457,9 @@ syscall_table! {
     Exit       => EXIT       = 60,  nr::EXIT;
     ExitGroup  => EXIT_GROUP = 231, nr::EXIT_GROUP;
     Wait4      => WAIT4      = 61,  nr::WAIT4;
+    /// x86_64 247, asm-generic 95. Taoxichuan serves it through glue (2026-11-01);
+    /// amd64 answers `ENOSYS`, as it did before the row.
+    Waitid     => WAITID     = 247, nr::WAITID;
     SchedYield => SCHED_YIELD = 24, nr::SCHED_YIELD;
     /// x86_64 202 is `futex` and asm-generic 202 is `accept` — the crossing
     /// that would turn a park into a socket accept.
@@ -461,6 +467,9 @@ syscall_table! {
     SetTidAddress => SET_TID_ADDRESS = 218, nr::SET_TID_ADDRESS;
     SetRobustList => SET_ROBUST_LIST = 273, nr::SET_ROBUST_LIST;
     Prlimit64  => PRLIMIT64  = 302, nr::PRLIMIT64;
+    /// musl reaches it only when `prlimit64` answers `ENOSYS`; a program that
+    /// issues it by hand gets glue's `prlimit64(0, …)` answer.
+    Getrlimit  => GETRLIMIT  = 97,  nr::GETRLIMIT;
 
     // ── identity ───────────────────────────────────────────────────────────
     // What these *return* on the amd64 target is a separate question from what
@@ -546,10 +555,14 @@ syscall_table! {
     /// row is `=> 0`, because on AArch64 `rt_sigreturn` is consumed inside the
     /// EL0 sync handler and never reaches the dispatcher.
     RtSigreturn   => RT_SIGRETURN   = 15, nr::RT_SIGRETURN;
-    /// x86_64 62, asm-generic 129 — and `nr::KILL` is **Akuma's private 302**,
-    /// not this. Naming the wrong constant here would dispatch `kill(2)` into
-    /// the box-kill syscall.
-    Kill          => KILL           = 62, nr::KILL_LINUX;
+    /// x86_64 130, asm-generic 133. Glue's, for all three kernels: it arms the
+    /// restore-sigmask slot that each kernel's frame builder reads.
+    RtSigsuspend  => RT_SIGSUSPEND  = 130, nr::RT_SIGSUSPEND;
+    /// x86_64 127, asm-generic 136. No kernel served it until 2026-11-02.
+    RtSigpending  => RT_SIGPENDING  = 127, nr::RT_SIGPENDING;
+    /// x86_64 62, asm-generic 129. Akuma's private 302 is `nr::AKUMA_KILL`;
+    /// until 2026-11-01 it was `nr::KILL` and this row named `nr::KILL_LINUX`.
+    Kill          => KILL           = 62, nr::KILL;
     /// x86_64 131, asm-generic 132.
     Sigaltstack   => SIGALTSTACK    = 131, nr::SIGALTSTACK;
     /// x86_64 200, asm-generic 130.
@@ -658,6 +671,86 @@ syscall_table! {
     Syslog     => SYSLOG     = 103, nr::SYSLOG;
     Reboot     => REBOOT     = 169, nr::REBOOT;
     Getrandom  => GETRANDOM  = 318, nr::GETRANDOM;
+}
+
+/// The x86-only **legacy path spellings** as `*at` calls: `rename`, `mkdir`,
+/// `rmdir`, `link`, `unlink`, `symlink`, `readlink`, `chmod`, `chown`, `lchown`.
+///
+/// Each exists on x86_64, has no asm-generic twin (so [`Syscall`] cannot name
+/// it - rule 2 above), and means exactly "the `*at` call with `AT_FDCWD` in the
+/// directory slots". The fold lived as ten inline `match` arms in
+/// `amd64/src/usermode.rs`; Taoxichuan needed the same ten and a copy would
+/// drift, so it is here once and both kernels call it. Pure: no state, no
+/// user memory.
+///
+/// Divergences the fold carries from the amd64 record
+/// (`docs/archive/AKUMA_AMD64_4B_FOLD_BATCH1.md`): `symlink` (88) is
+/// `symlinkat(target, AT_FDCWD, linkpath)` - the dirfd is the SECOND argument.
+/// It once dispatched to `utimensat`, which returns 0 and creates nothing, so
+/// `ln -s` reported success for months. `rmdir` is `unlinkat` with
+/// `AT_REMOVEDIR`; `lchown` is `fchownat` with `AT_SYMLINK_NOFOLLOW`; `link`
+/// does not follow the source (flags 0).
+pub mod legacy {
+    use super::Syscall;
+
+    /// `AT_FDCWD` - the same value (-100) in both ABIs.
+    pub const AT_FDCWD: u64 = (-100i64) as u64;
+    /// `unlinkat` flag that makes it `rmdir`.
+    pub const AT_REMOVEDIR: u64 = 0x200;
+    /// `fchownat` flag that makes it `lchown`.
+    pub const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+
+    /// Every x86_64 number [`fold`] answers for.
+    pub const NUMBERS: [u64; 10] = [82, 83, 84, 86, 87, 88, 89, 90, 92, 94];
+
+    /// The `*at` call and arguments a legacy path syscall means, or `None`
+    /// when `nr` is not one of [`NUMBERS`].
+    #[must_use]
+    pub const fn fold(nr: u64, a: [u64; 6]) -> Option<(Syscall, [u64; 6])> {
+        let [a1, a2, a3, ..] = a;
+        Some(match nr {
+            82 => (Syscall::Renameat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
+            83 => (Syscall::Mkdirat, [AT_FDCWD, a1, a2, 0, 0, 0]),
+            84 => (Syscall::Unlinkat, [AT_FDCWD, a1, AT_REMOVEDIR, 0, 0, 0]),
+            86 => (Syscall::Linkat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
+            87 => (Syscall::Unlinkat, [AT_FDCWD, a1, 0, 0, 0, 0]),
+            88 => (Syscall::Symlinkat, [a1, AT_FDCWD, a2, 0, 0, 0]),
+            89 => (Syscall::Readlinkat, [AT_FDCWD, a1, a2, a3, 0, 0]),
+            90 => (Syscall::Fchmodat, [AT_FDCWD, a1, a2, 0, 0, 0]),
+            92 => (Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, 0, 0]),
+            94 => (Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, AT_SYMLINK_NOFOLLOW, 0]),
+            _ => return None,
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn every_legacy_number_is_x86_only() {
+            for n in NUMBERS {
+                assert!(Syscall::from_x86_64(n).is_none(), "{n} is also in the table");
+                assert!(fold(n, [0; 6]).is_some(), "{n} has no fold");
+            }
+            assert!(fold(2, [0; 6]).is_none());
+        }
+
+        #[test]
+        fn symlink_puts_the_dirfd_second() {
+            let (c, a) = fold(88, [11, 22, 0, 0, 0, 0]).unwrap();
+            assert_eq!(c, Syscall::Symlinkat);
+            assert_eq!(&a[..3], &[11, AT_FDCWD, 22]);
+        }
+
+        #[test]
+        fn flags_that_change_the_meaning() {
+            assert_eq!(fold(84, [5, 0, 0, 0, 0, 0]).unwrap().1[2], AT_REMOVEDIR);
+            assert_eq!(fold(94, [5, 1, 2, 0, 0, 0]).unwrap().1[4], AT_SYMLINK_NOFOLLOW);
+            assert_eq!(fold(92, [5, 1, 2, 0, 0, 0]).unwrap().1[4], 0);
+            assert_eq!(fold(89, [5, 6, 7, 0, 0, 0]).unwrap().1[..4], [AT_FDCWD, 5, 6, 7]);
+        }
+    }
 }
 
 /// `openat(2)`'s flag word, **on which architecture** — the second vocabulary

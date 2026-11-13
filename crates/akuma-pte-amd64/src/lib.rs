@@ -61,6 +61,9 @@ pub const PAT_4K: u64 = 1 << 7;
 /// writable the moment its frame happens to be shared — the trap
 /// `docs/archive/GRANT_RECORDS_VS_DENY_RECORDS.md` is about.
 pub const COW: u64 = 1 << 9;
+/// Dirty: the CPU sets it on a user store (a kernel store through the physmap does not - the kernel sets it
+/// itself where "written since mapped" matters, e.g. the W^X policy).
+pub const D: u64 = 1 << 6;
 /// No-execute. **Requires `EFER.NXE`**, which `boot.s` sets alongside `LME`;
 /// without it this is a reserved bit and setting it faults — on the first touch
 /// of a non-executable page, not when it is mapped.

@@ -159,7 +159,7 @@
 
 extern crate alloc;
 
-use alloc::collections::BTreeMap;
+mod cow_table;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
@@ -1532,28 +1532,16 @@ pub fn is_page_free(pa: usize) -> bool {
 // this lock's hold either, or that ordering deadlocks.
 // ============================================================================
 
-static COW_REFCOUNTS: Spinlock<BTreeMap<usize, u16>> = Spinlock::new(BTreeMap::new());
+static COW_REFCOUNTS: Spinlock<cow_table::CowTable> = Spinlock::new(cow_table::CowTable::new());
 
 /// Increment the CoW reference count for a physical address. First call for a
 /// new address inserts it with count=2 (parent + child). Subsequent calls
 /// increment by 1 (additional fork children).
 pub fn cow_ref_inc(pa: usize) {
     let (created, before, after) = akuma_primitives::irq::with_irqs_disabled(|| {
-        let mut table = COW_REFCOUNTS.lock();
-        match table.get_mut(&pa) {
-            Some(entry) => {
-                let before = *entry;
-                *entry = entry.saturating_add(1);
-                (false, before, *entry)
-            }
-            // First share: parent + child. (Formerly `or_insert(1)` + add, which
-            // made a created entry indistinguishable from an existing count of 1
-            // — the resurrection detector below needs the distinction.)
-            None => {
-                table.insert(pa, 2);
-                (true, 0, 2)
-            }
-        }
+        // First share stores 2 (parent + child), later ones add 1; `created` distinguishes a new entry
+        // from an existing count of 1, which the resurrection detector below needs.
+        COW_REFCOUNTS.lock().inc(pa)
     });
     // Resurrection detector: an inc that CREATED the entry on a
     // frame currently parked in quarantine means the caller took a reference to
@@ -1599,26 +1587,9 @@ pub fn cow_resurrection_count() -> usize {
 /// (meaning the caller should free the physical frame). Removes the entry from
 /// the table when count reaches 0 to avoid unbounded growth.
 pub fn cow_ref_dec(pa: usize) -> bool {
-    let (before, after, last) = akuma_primitives::irq::with_irqs_disabled(|| {
-        let mut table = COW_REFCOUNTS.lock();
-        match table.get_mut(&pa) {
-            Some(count) => {
-                let before = *count;
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    table.remove(&pa);
-                    (before, 0, true)
-                } else {
-                    (before, *count, false)
-                }
-            }
-            // Not tracked -> single owner -> safe to free. Recorded as `0->0`
-            // so an untracked decrement is still visible in the history: a run
-            // of these on a frame that *should* be shared is itself the
-            // desync.
-            None => (0, 0, true),
-        }
-    });
+    // Not tracked -> single owner -> safe to free, recorded as `0->0` so an untracked decrement is still
+    // visible in the history: a run of these on a frame that *should* be shared is itself the desync.
+    let (before, after, last) = akuma_primitives::irq::with_irqs_disabled(|| COW_REFCOUNTS.lock().dec(pa));
     cow_ledger_record(pa, true, before, after);
     last
 }
@@ -1628,7 +1599,7 @@ pub fn cow_ref_dec(pa: usize) -> bool {
 #[must_use]
 pub fn cow_ref_get(pa: usize) -> u16 {
     akuma_primitives::irq::with_irqs_disabled(|| {
-        COW_REFCOUNTS.lock().get(&pa).copied().unwrap_or(0)
+        COW_REFCOUNTS.lock().get(pa)
     })
 }
 

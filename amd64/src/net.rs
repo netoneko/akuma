@@ -165,18 +165,10 @@ fn weak_fill(buf: &mut [u8]) {
     use core::sync::atomic::{AtomicU64, Ordering};
     static STATE: AtomicU64 = AtomicU64::new(0);
 
-    let tsc = akuma_cpu::tsc::rdtsc();
-    let mut x = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) ^ tsc;
-    for chunk in buf.chunks_mut(8) {
-        // SplitMix64.
-        x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = x;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^= z >> 31;
-        let n = chunk.len();
-        chunk.copy_from_slice(&z.to_le_bytes()[..n]);
-    }
+    let seed = STATE.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed) ^ akuma_cpu::tsc::rdtsc();
+    // The SplitMix64 mixer is `akuma_primitives::rng`'s (host-tested; Taoxichuan
+    // uses the same one).
+    akuma_primitives::rng::splitmix_fill(seed, buf);
 }
 
 /// Fill `buf` with random bytes, from `RDRAND`.

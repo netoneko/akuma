@@ -220,7 +220,7 @@ sc-sysv-ipc = ["akuma-syscalls-glue/sc-sysv-ipc"]
 # `caller_may_mount` (box 0 only) always passes here as a result, matching
 # the single-box world this target already is.
 # `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
-sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-containers"]
+sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-containers", "akuma-isolation/containers"]
 # `console_notify` — the Akuma-private syscall (322) a userspace program calls
 # to put a framed line straight on the framebuffer/serial console (`/bin/wall`).
 # On by default *for this target only*: the HP bare-metal reference box has a
@@ -272,10 +272,12 @@ akuma-cpu = { path = "../crates/akuma-cpu" }
 # The SVM seed's VMCB vocabulary, exit codes and §15.5.1 guest-state checks —
 # host-tested there, consumed by `kvm.rs` on the metal.
 akuma-svm-amd64 = { path = "../crates/akuma-svm-amd64" }
+akuma-affinity = { path = "../crates/akuma-affinity" }
 akuma-vm-spec = { path = "../crates/akuma-vm-spec" }
 akuma-kvm-abi = { path = "../crates/akuma-kvm-abi" }
 # The Big Kernel Lock (`smp.rs`'s `bkl_enter`/`bkl_leave` forward here).
 akuma-bkl = { path = "../crates/akuma-bkl" }
+akuma-sched-amd64 = { path = "../crates/akuma-sched-amd64" }
 # Syscall identity across architectures. Proposal item 5's shape, and the amd64
 # port is why it exists: `akuma-syscalls-linux::nr` is asm-generic (aarch64)
 # numbering, and x86_64 Linux numbers everything differently.
@@ -423,6 +425,8 @@ akuma-kacho = { path = "../crates/akuma-kacho" }
 # The formats are shared either way, and the formats are where a divergence is
 # invisible: `ps` finds `utime` by counting to field 14 of a 44-field line.
 akuma-procfs = { path = "../crates/akuma-procfs" }
+# The FPU save area's sizes, offsets, power-on image and `sanitize` rule (shared with taoxichuan).
+akuma-fpu-amd64 = { path = "../crates/akuma-fpu-amd64" }
 # The per-process frame ledger — which physical frames a process holds and how
 # many VAs map each, with the two-counts rule and 14 host tests. Replaced this
 # target's `FrameSet`, a 2048-entry flat array with no refcounts whose ceiling
@@ -466,7 +470,7 @@ akuma-cow = { path = "../crates/akuma-cow" }
 # `global_namespace()` — the `Namespace` every `akuma_exec::Process` carries.
 # There are no boxes on this target, so every registered process names the one
 # global namespace, exactly as `Process::from_image` does on AArch64.
-akuma-isolation = { path = "../crates/akuma-isolation" }
+akuma-isolation = { path = "../crates/akuma-isolation", default-features = false }
 # The console line discipline: canonical mode, echo, backspace, Ctrl+D, and
 # `map_cr_to_nl`. Hand-rolling a console reader hits the CR-vs-NL bug on the
 # first Enter keypress; this crate is the tree's answer and is dependency-free.
@@ -513,6 +517,8 @@ akuma-syscalls-poll = { path = "../crates/akuma-syscalls-poll" }
 # the crate's own stated design: "the kernel performs every effect", and here
 # the effect is parking a thread on a scheduler the two targets do not share.
 akuma-syscalls-sync = { path = "../crates/akuma-syscalls-sync" }
+# The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
+akuma-syscalls-proc = { path = "../crates/akuma-syscalls-proc" }
 # The user-copy primitive: `copy_from_user_safe` and its x86_64 `rep movsb`
 # loop, plus `user_copy_fixup`, which `idt.rs`'s page-fault path consults to
 # turn a fault inside that loop into a returned EFAULT instead of a halt. The
@@ -547,7 +553,14 @@ akuma-locks-rw = { path = "../crates/akuma-locks-rw" }
 # without that registration the first syscall folded into glue panics in
 # `akuma_exec::runtime::config()`, which is a `Registered` cell.
 akuma-exec = { path = "../crates/akuma-exec" }
-akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp"] }
+# `exec`: box's `SPAWN_EXT` (private 315) is glue's `sys_spawn_ext`, which loads
+# through `akuma-exec`'s ELF loader. Row 8 of the tokio dependency analysis
+# (`3e2bb725`) put that path behind the feature and left it off here, so every
+# `box run` answered "failed to spawn" until 2026-11-01. Taoxichuan has no box
+# and keeps it off.
+akuma-syscalls-glue = { path = "../crates/akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native"] }
+# The x86-only syscall bodies both x86 kernels share; so far `kill` (moved from `signal.rs`).
+akuma-syscalls-glue-amd64 = { path = "../crates/akuma-syscalls-glue-amd64" }
 
 [[bin]]
 name = "akuma-amd64"

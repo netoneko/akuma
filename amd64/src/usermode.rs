@@ -1346,7 +1346,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             319 => crate::net::uptime_us(),
             326 => sys_close_child_stdin(a1),
             // `kill(pid, sig)` — Akuma-private 302, what libakuma's
-            // `kill_signal` issues. Glue's `nr::KILL` arm is the same
+            // `kill_signal` issues. Glue's `nr::AKUMA_KILL` arm is the same
             // `proc::sys_kill` that Linux `kill` (62, `Syscall::Kill` below)
             // reaches, so the two spellings deliver identically.
             //
@@ -1357,7 +1357,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 7).
             // sshd's session-teardown SIGHUP/SIGTERM is now real too, which is
             // the Linux behaviour.
-            302 => to_glue_raw(akuma_syscalls_linux::nr::KILL, [a1, a2, 0, 0, 0, 0]),
+            302 => to_glue_raw(akuma_syscalls_linux::nr::AKUMA_KILL, [a1, a2, 0, 0, 0, 0]),
             // `console_notify(ptr, len)` — Akuma-private 322, feature
             // `console-notify` (default-on for this target). Prints a
             // caller-supplied line straight to the framebuffer/serial console,
@@ -1455,6 +1455,12 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // `akuma_syscalls_abi`'s table first; if the call has an asm-generic number,
     // it belongs in the `match call` below, where the AArch64 kernel's
     // implementation can eventually serve it.
+    // The ten legacy path spellings (82/83/84/86/87/88/89/90/92/94) are
+    // `AT_FDCWD` folds owned by `akuma_syscalls_abi::legacy` - one table for
+    // this kernel and Taoxichuan; the symlink/utimensat history is its doc.
+    if let Some((call, args)) = akuma_syscalls_abi::legacy::fold(nr, [a1, a2, a3, a4, a5, a6]) {
+        return to_glue(call, args);
+    }
     match nr {
         // x86_64 158: the TLS-base primitive. No aarch64 number, and no
         // equivalent either — `arch_prctl(ARCH_SET_FS)` is what `set_tpidr_el0`
@@ -1500,53 +1506,6 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // neither existed.
         22 => return crate::fd::sys_pipe2(a1, 0),
         33 => return crate::fd::sys_dup2(a1, a2),
-        // The legacy, non-`at` path calls — x86_64 82/83/84/87/88/89 — as thin
-        // `AT_FDCWD` shims. `rmdir` (84) is `unlinkat` with `AT_REMOVEDIR`
-        // (0x200). Since 4b step 2 batch 1 the `*at` arms live in glue, so the
-        // shims hand it the asm-generic number (`to_glue` owns the hop) with
-        // `AT_FDCWD` in the dirfd slots — `AT_FDCWD` is -100 in both ABIs.
-        // `AKUMA_AMD64_4B_FOLD_BATCH1.md` records the divergences the fold
-        // adopted.
-        82 => return to_glue(Syscall::Renameat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
-        83 => return to_glue(Syscall::Mkdirat, [AT_FDCWD, a1, a2, 0, 0, 0]),
-        84 => return to_glue(Syscall::Unlinkat, [AT_FDCWD, a1, 0x200, 0, 0, 0]),
-        87 => return to_glue(Syscall::Unlinkat, [AT_FDCWD, a1, 0, 0, 0, 0]),
-        // `symlink(target, linkpath)` — x86_64 88.
-        //
-        // **This arm used to call `sys_utimensat`.** Its comment read
-        // "`utimensat` (280) / `futimens` (88)", and there is no `futimens`
-        // syscall in Linux at all — libc implements it as `utimensat(fd, NULL,
-        // times, 0)`. x86_64 88 is `symlink`, sitting between `unlink` (87) and
-        // `readlink` (89), both of which are correct shims two lines up. So
-        // `ln -s` handed its *link path* to `utimensat` as a `struct
-        // timespec[2]` pointer. Found 2026-09-07 while widening
-        // `akuma-syscalls-abi` for C1 — exactly the wrong-answer-not-a-compile-
-        // error class that widening exists to prevent, one layer up from the
-        // aarch64/x86_64 crossing.
-        //
-        // `symlinkat(target, newdirfd, linkpath)` takes the dirfd *second*.
-        88 => return to_glue(Syscall::Symlinkat, [a1, AT_FDCWD, a2, 0, 0, 0]),
-        // `link(old, new)` — x86_64 86. No asm-generic twin; `linkat` with
-        // both dirfds `AT_FDCWD` and no flags, which is exactly `link`'s
-        // meaning (the source is not followed). Had no arm at all, so busybox
-        // `ln` answered `ENOSYS` on this target.
-        86 => return to_glue(Syscall::Linkat, [AT_FDCWD, a1, AT_FDCWD, a2, 0, 0]),
-        // `readlink(path, buf, size)` — x86_64 89. Was a flat EINVAL while no
-        // symlink could exist; `symlinkat` made package symlinks real.
-        89 => return to_glue(Syscall::Readlinkat, [AT_FDCWD, a1, a2, a3, 0, 0]),
-        // `chmod(path, mode)` — x86_64 90. No asm-generic twin (`fchmodat` is
-        // the modern spelling), so per rule 2 it is an `AT_FDCWD` shim. It was
-        // `ENOSYS` for the whole life of the port and `git clone` chmods every
-        // file it writes (`docs/archive/RUST_TOOLCHAIN_AMD64.md`).
-        90 => return to_glue(Syscall::Fchmodat, [AT_FDCWD, a1, a2, 0, 0, 0]),
-        // `chown(path, uid, gid)` / `lchown` — x86_64 92/94. No asm-generic
-        // twins, so `AT_FDCWD` shims onto `fchownat`; `lchown` passes
-        // `AT_SYMLINK_NOFOLLOW` (0x100). `fchown` (93) is a real row now — it
-        // used to be shimmed here with the fd as a dirfd and a NULL path, which
-        // was harmless only while `fchownat` returned 0 for everything.
-        // `tar`/`apk` chown every file they unpack.
-        92 => return to_glue(Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, 0, 0]),
-        94 => return to_glue(Syscall::Fchownat, [AT_FDCWD, a1, a2, a3, 0x100, 0]),
         // `fork` (57) / `vfork` (58) — a real eager-copy fork; see `sys_fork`
         // (`vfork` gets the same, its "don't touch the parent" contract is moot
         // once the address space is copied). asm-generic has neither: `clone`
@@ -1674,10 +1633,10 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
     // is asm-generic. Handing it `1` meaning `write` would find the *wrong*
     // handler rather than none — so the vocabulary hop happens once, here,
     // through a table whose two halves are round-trip tested against each other.
-    // x86_64 nr 26 is `msync` — routed **before** the shared table because
-    // asm-generic has no msync number at all, and a fake aarch64 twin in the
-    // abi table would break its "a variant only exists if it has a number on
-    // both architectures" invariant to carry a lie. See `mm::sys_msync` for
+    // x86_64 nr 26 is `msync` — routed **before** the shared table to this
+    // kernel's own `mm::sys_msync` rather than glue's. (asm-generic does have
+    // msync, 227: `Syscall::Msync` is a row since 2026-11-01, and a comment
+    // here said otherwise until then.) See `mm::sys_msync` for
     // what it does and `MmapRegion::shared_write` for why it exists at all:
     // it is the flush `memmap2::MmapMut::flush` compiles to, and without it a
     // writable `MAP_SHARED` mapping could not be trusted at close.
@@ -1957,7 +1916,8 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // A non-main thread's is not — it must leave ring 3 without
             // touching `EXIT_STATUS`, the fd table or the spawn record, all of
             // which belong to the process it is only one thread of.
-            if crate::thread::current_is_main() {
+            let scope = akuma_syscalls_proc::exit::scope(false, !crate::thread::current_is_main());
+            if scope == akuma_syscalls_proc::exit::Scope::Group {
                 EXIT_STATUS.store(a1, Ordering::Relaxed);
             }
             mark_leave();
@@ -2198,11 +2158,19 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
             // x86_64's argument order is its own: `(flags, child_stack,
             // parent_tid, child_tid, tls)` — `tls` **last**, after `child_tid`,
             // where most architectures put it fourth.
-            if a1 & clone_flags::CLONE_VM != 0 {
+            // The decision is `akuma_syscalls_proc::clone::decode`, shared with
+            // Taoxichuan; it also answers Linux's `EINVAL` for `CLONE_THREAD`
+            // without `CLONE_SIGHAND`/`CLONE_VM` (2026-11-01).
+            use akuma_syscalls_proc::clone::{self as clone_decode, Kind};
+            let kind = match clone_decode::decode(a1, a2) {
+                Ok(k) => k,
+                Err(clone_decode::Invalid) => return errno::EINVAL,
+            };
+            if kind == Kind::Thread {
                 // `CLONE_VM|CLONE_THREAD` — a thread (`crate::thread`).
-                if a1 & clone_flags::CLONE_THREAD != 0 {
-                    return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
-                }
+                return crate::thread::sys_clone_thread(a1, a2, a3, a4, a5);
+            }
+            if let Kind::SpawnFork { child_stack } = kind {
                 // **`CLONE_VM` without `CLONE_THREAD` — musl's `posix_spawn`
                 // child** (`clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`, a separate
                 // stack, no `CLONE_SETTLS`). It was `ENOSYS` here for the whole
@@ -2239,7 +2207,7 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
                 // cause was none of that: each child's exit is a `SIGCHLD`,
                 // and a tick-time signal used to return through `sysretq`
                 // with `RCX = RIP` (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`).
-                return sys_spawn_clone(a2);
+                return sys_spawn_clone(child_stack);
             }
             sys_fork()
         }
@@ -2553,6 +2521,14 @@ fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6: u6
         // row added to `akuma-syscalls-abi` without its arm here used to fall
         // in silently (`brk` did, and earlier `fchdir`), where an undecoded
         // number at least prints `no row for`.
+        // `rt_sigsuspend` is glue's, beside `pause` (34) above: it arms the
+        // restore-sigmask slot, and `signal::deliver_pending` hands the saved
+        // mask to the frame (or puts it back when no handler runs).
+        Syscall::RtSigsuspend | Syscall::RtSigpending => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // Rows since 2026-11-01 (Taoxichuan serves them); this kernel has no
+        // route to glue's yet and answers `ENOSYS`, as it did undecoded.
+        // `Msync` never gets here: 26 is routed above, before the decode.
+        Syscall::Msync | Syscall::Waitid => errno::ENOSYS,
         _ => {
             akuma_primitives::safe_print!(
                 160,
@@ -2719,10 +2695,10 @@ fn affinity_slot(tid: u64) -> Option<usize> {
 }
 
 /// `sched_setaffinity(tid, len, mask)`: the request is decoded and clipped by
-/// `akuma_vm_spec::affinity`; `sched::set_affinity` stores it and moves the caller if needed.
+/// `akuma_affinity`; `sched::set_affinity` stores it and moves the caller if needed.
 fn sys_sched_setaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
     use crate::fd::errno;
-    use akuma_vm_spec::affinity;
+    use akuma_affinity as affinity;
     const MAX: usize = 128;
     let len = len as usize;
     if len < 8 {
@@ -2749,7 +2725,7 @@ fn sys_sched_getaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
         return errno::EINVAL;
     }
     let Some(slot) = affinity_slot(tid) else { return errno::ESRCH };
-    let mask = akuma_vm_spec::affinity::report(crate::sched::affinity_of(slot), crate::smp::online_cpus());
+    let mask = akuma_affinity::report(crate::sched::affinity_of(slot), crate::smp::online_cpus());
     if !crate::uaccess::write_bytes(mask_ptr, &mask.to_le_bytes()) {
         return errno::EFAULT;
     }
@@ -4337,7 +4313,8 @@ pub fn alloc_pid() -> u32 {
 /// `CLONE_SETTLS` — pairs with an x86_64-specific *argument position*, so
 /// keeping the two facts in one file is worth more than the deduplication.
 pub mod clone_flags {
-    pub const CLONE_VM: u64 = 0x0000_0100;
+    // `CLONE_VM` left 2026-11-01: the thread/spawn/fork decision is
+    // `akuma_syscalls_proc::clone::decode` now.
     pub const CLONE_THREAD: u64 = 0x0001_0000;
     pub const CLONE_SETTLS: u64 = 0x0008_0000;
     // `CLONE_PARENT_SETTID`, `CLONE_CHILD_SETTID` and `CLONE_CHILD_CLEARTID`
@@ -4963,21 +4940,32 @@ fn user_cstr(ptr: u64, max: usize) -> Option<alloc::vec::Vec<u8>> {
 /// (`no input files`, `cannot open output file a.out`) with nothing pointing
 /// at the kernel. `E2BIG` is what Linux answers and is impossible to
 /// misattribute.
-fn user_strv(ptr: u64, max: usize) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
-    // The initial stack is where every one of these strings lands
-    // ([`loader::build_stack`]), so it is the honest ceiling on their total
-    // size. Refusing here rather than there keeps the kernel from copying
+/// One `execve`'s argument budget, across argv and envp together
+/// (`akuma_syscalls_proc::exec`): the initial stack is where every string lands
+/// ([`loader::build_stack`]), so half of it is the honest ceiling on their total.
+fn exec_arg_budget() -> akuma_syscalls_proc::exec::Budget {
+    akuma_syscalls_proc::exec::Budget::new(
+        loader::MAX_ARGV + loader::MAX_ENVP,
+        akuma_config::MAX_ARG_STRLEN,
+        ELF_STACK_PAGES * 4096 / 2,
+    )
+}
+
+fn user_strv(
+    ptr: u64,
+    max: usize,
+    budget: &mut akuma_syscalls_proc::exec::Budget,
+) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>>> {
+    // `budget` ([`exec_arg_budget`]) is charged as each string is read.
+    // Refusing here rather than at the stack build keeps the kernel from copying
     // megabytes out of ring 3 to build an argv that cannot be placed — and
     // `build_stack` still has its own `rsp < base` check, because this one is
     // about the copy and that one is about the arithmetic.
-    const ARG_BYTES_MAX: usize = ELF_STACK_PAGES * 4096 / 2;
-
     let mut out = alloc::vec::Vec::new();
     if ptr == 0 {
         return Some(out);
     }
     let entry = |i: usize| crate::uaccess::read_val::<u64>(ptr + (i as u64) * 8).unwrap_or(0);
-    let mut bytes = 0usize;
     for i in 0..max {
         // A bad array pointer ends the list, like a NULL entry would.
         let p = entry(i);
@@ -4997,10 +4985,7 @@ fn user_strv(ptr: u64, max: usize) -> Option<alloc::vec::Vec<alloc::vec::Vec<u8>
         // `MAX_ARG_STRLEN` is the shared cap glue uses, so the two kernels
         // refuse the same argument rather than one of them mangling it.
         let s = user_cstr(p, akuma_config::MAX_ARG_STRLEN)?;
-        bytes = bytes.saturating_add(s.len() + 1);
-        if bytes > ARG_BYTES_MAX {
-            return None;
-        }
+        budget.charge(s.len()).ok()?;
         out.push(s);
     }
     // `max` entries and still no terminator: the caller has more to say than
@@ -5118,28 +5103,21 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {    use crate
         return errno::ENOSYS;
     }
 
-    let Some(path_bytes) = user_cstr(path_ptr, 256) else {
-        return errno::EFAULT;
+    // The path against the process's `cwd`, and argv/envp under one budget:
+    // glue's `execve::read_request`, shared with Taoxichuan (2026-11-01).
+    let mut budget = exec_arg_budget();
+    let req = match akuma_syscalls_glue::execve::read_request(
+        path_ptr,
+        argv_ptr,
+        envp_ptr,
+        loader::MAX_ARGV,
+        loader::MAX_ENVP,
+        &mut budget,
+    ) {
+        Ok(r) => r,
+        Err(r) => return r,
     };
-    let Ok(path) = core::str::from_utf8(&path_bytes) else {
-        return errno::EINVAL;
-    };
-    // Against the process's own directory — see [`process_relative_path`].
-    let path = process_relative_path(path);
-
-    let argv_owned = {
-        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
-            return crate::fd::errno::E2BIG;
-        };
-        if v.is_empty() {
-            v.push(path_bytes.clone());
-        }
-        v
-    };
-    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
-        return crate::fd::errno::E2BIG;
-    };
-
+    let (path, argv_owned, envp_owned) = (req.path, req.argv, req.envp);
     do_execve(slot, path, argv_owned, envp_owned)
 }
 
@@ -5417,11 +5395,8 @@ fn do_execve(
     // `argv[0]` would be a name the caller chose rather than something that
     // opens. `/proc/<pid>/exe` reports `exe`, which only this line and spawn
     // write — `name` is the `comm` that `prctl(PR_SET_NAME)` may rename later.
-    {
-        let mut img = proc.image.lock();
-        img.exe.clone_from(&new_name);
-        img.name = new_name;
-    }
+    // (`/proc` identity and the close-on-exec sweep are glue's
+    // `execve::commit`, below, shared with Taoxichuan.)
 
     // Image replacement committed — *now* close the close-on-exec descriptors.
     // POSIX's point of no return: a successful `execve` closes every
@@ -5445,7 +5420,9 @@ fn do_execve(
     // `execve` was written (`akuma-syscalls-glue`'s `sys_execve`); the sweep is
     // shared code and this call site is what was missing.
     // `docs/archive/AMD64_TRASHCAN_ISSUES.md` §1.
-    proc.close_cloexec_fds_releasing();
+    let new_args_bytes: alloc::vec::Vec<alloc::vec::Vec<u8>> =
+        new_args.iter().map(|a| a.clone().into_bytes()).collect();
+    akuma_syscalls_glue::execve::commit(proc, &new_name, &new_args_bytes);
 
     // A new program in an existing slot starts with a clean group: a stale
     // `exit_group` flag from the image just replaced would kill its first
@@ -5790,8 +5767,9 @@ pub fn sys_spawn(
     };
 
     // argv[0] defaults to the path if the caller passed none.
+    let mut budget = exec_arg_budget();
     let argv_owned = {
-        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV) else {
+        let Some(mut v) = user_strv(argv_ptr, loader::MAX_ARGV, &mut budget) else {
             return crate::fd::errno::E2BIG;
         };
         if v.is_empty() {
@@ -5804,7 +5782,7 @@ pub fn sys_spawn(
     // any spawned child on this target, so anything reading `TERM`, `PATH`,
     // `HOME` or `TZ` got nothing. `sys_execve` has always honoured it through
     // the same loader entry point; this is that call, with the same caps.
-    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP) else {
+    let Some(envp_owned) = user_strv(envp_ptr, loader::MAX_ENVP, &mut budget) else {
         return crate::fd::errno::E2BIG;
     };
     let argv_refs: alloc::vec::Vec<&[u8]> =
@@ -6487,7 +6465,7 @@ pub fn spawn_stale_group_state_test(t: &mut Suite) {
         t.check("stale group: a free spawn slot to poison", false);
         return;
     };
-    crate::thread::set_group_exit_status(next, (-(SIGTERM as i32)) as u32);
+    crate::thread::set_group_exit_status(next, (-(SIGTERM.cast_signed())).cast_unsigned());
     crate::thread::set_group_exiting(next);
 
     let path = b"/bin/hello\0";
@@ -6990,6 +6968,33 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
     }
     crate::fd::sys_close(stdout_fd);
     Some((status, out))
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// `rt_sigsuspend` from ring 3, through busybox ash's `wait`, which parks in
+/// it with every signal blocked around the call.
+///
+/// The trapped `SIGUSR1` must end the `wait` (status 128 + 10), its handler
+/// must run, and the mask from before the `sigsuspend` must be back after it:
+/// the second `kill` is delivered only if `SIGUSR1` is not left blocked by the
+/// call's temporary mask. `ENOSYS` (this kernel's answer until 2026-11-02)
+/// made ash's loop spin with every signal blocked.
+pub fn sigsuspend_test(t: &mut Suite) {
+    if crate::fs::read_file("/bin/busybox").is_err() || crate::fs::read_file("/bin/sh").is_err() {
+        t.note("sigsuspend: busybox /bin/sh not on the disk; skipped", 0);
+        return;
+    }
+    let cmd = b"trap 'echo got' USR1; (sleep 1; kill -USR1 $$) & wait; echo rc=$?; kill -USR1 $$; echo end\0";
+    let Some((status, out)) = run_sh_capture(cmd) else {
+        t.check("sigsuspend: sh spawned", false);
+        return;
+    };
+    t.check_eq("sigsuspend: the shell exited 0", status, 0);
+    const WANT: &[u8] = b"got\nrc=138\ngot\nend\n";
+    t.check(
+        "sigsuspend: trap ran, wait said 138, and the mask was restored (trap ran again)",
+        out.windows(WANT.len()).any(|w| w == WANT),
+    );
 }
 
 #[cfg(not(feature = "no-tests"))]
@@ -7775,6 +7780,29 @@ pub fn dispatch_smoke_test(t: &mut Suite, have_fs: bool) {
         "dispatch: pidfd_send_signal on an unopened fd is EBADF",
         syscall_dispatch(424, 999, 15, 0, 0, 0, 0),
         (-9i64) as u64,
+    );
+    // Linux's one `pidfd_open` flag is `PIDFD_NONBLOCK`; `O_CLOEXEC` is refused
+    // (every pidfd is close-on-exec anyway), and before the pid is looked at.
+    t.check_eq(
+        "dispatch: pidfd_open(O_CLOEXEC) is EINVAL",
+        syscall_dispatch(434, 999_999, 0x8_0000, 0, 0, 0, 0),
+        (-22i64) as u64,
+    );
+
+    // `rt_sigsuspend` and `rt_sigpending` are glue's. A bad `sigsetsize` is
+    // `EINVAL` from glue's own check: an answer, where this kernel used to
+    // give `ENOSYS` for both.
+    t.check("dispatch: rt_sigsuspend 130 -> 133", hop(Syscall::RtSigsuspend, 130, nr::RT_SIGSUSPEND));
+    t.check("dispatch: rt_sigpending 127 -> 136", hop(Syscall::RtSigpending, 127, nr::RT_SIGPENDING));
+    t.check_eq(
+        "dispatch: rt_sigsuspend with sigsetsize 4 is EINVAL",
+        syscall_dispatch(130, 0, 4, 0, 0, 0, 0),
+        (-22i64) as u64,
+    );
+    t.check_eq(
+        "dispatch: rt_sigpending with sigsetsize 16 is EINVAL",
+        syscall_dispatch(127, 0, 16, 0, 0, 0, 0),
+        (-22i64) as u64,
     );
 
     // The `sc-aio` rows. `io_setup` 206 -> asm-generic 0 is the sharpest of

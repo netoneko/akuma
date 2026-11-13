@@ -1,0 +1,10 @@
+[package]
+name = "akuma-user-walk"
+version = "0.1.0"
+edition = "2024"
+description = "User-memory access by page walk: the region check, the page-chunked copy loops, the NUL-terminated string and pointer-array readers - generic over a Walk the kernel implements (one physmap frame access per page). No page tables, no unsafe: Taoxichuan's uaccess contract, host-tested."
+
+[lints]
+workspace = true
+
+[dependencies]

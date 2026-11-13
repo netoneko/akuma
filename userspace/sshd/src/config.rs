@@ -91,13 +91,17 @@ pub const DEFAULT_MAX_SESSIONS: usize = 24;
 /// fresh client has to care they exist.
 pub const DEFAULT_LOGIN_GRACE_SECS: u64 = 120;
 
-/// Default [`SshdConfig::idle_timeout_secs`] (10 min), after which the
-/// client-alive probe goes out; the session dies
+/// Default [`SshdConfig::idle_timeout_secs`] (30 s): the keepalive interval -
+/// after this much inbound silence the server sends a `keepalive@openssh.com`
+/// global request (OpenSSH's `ClientAliveInterval`), and the session dies
 /// `DEFAULT_IDLE_PROBE_GRACE_MS` (90 s) later if the probe was never
-/// answered — so a vanished peer is reaped ~11½ min after its last byte,
-/// while a healthy client (which answers global requests per RFC 4254 §4)
-/// is never reaped no matter how long it sits silent.
-pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 600;
+/// answered - so a vanished peer is reaped ~2 min after its last byte, while a
+/// healthy client (which answers global requests per RFC 4254 §4) is never
+/// reaped no matter how long it sits silent. It was 10 min, which left a
+/// command that prints nothing for minutes (a long `cargo build` piped
+/// through `tail`) with no packet on the wire in either direction, and the
+/// connection did not survive intermediaries that drop idle flows.
+pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 30;
 
 /// Default shell: busybox's multicall entry point, present on every
 /// bootstrap/devbox image (`scripts/populate_disk.sh` always symlinks it).

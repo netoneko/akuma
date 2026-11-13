@@ -1,3 +1,6 @@
+// Without `elf-loader` the loading half of this file compiles out; its imports stay.
+#![cfg_attr(not(feature = "elf-loader"), allow(unused_imports))]
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use alloc::sync::Arc;
@@ -6,9 +9,11 @@ use crate::runtime::config;
 use crate::process::types::{Pid, YieldOnce};
 use crate::process::channel::{ProcessChannel, get_channel};
 use crate::process::children::{lookup_process_shared, read_current_pid};
+#[cfg(feature = "elf-loader")]
 use crate::process::spawn::spawn_process_with_channel_cwd;
 use super::get_box_info;
 
+#[cfg(feature = "elf-loader")]
 /// Execute an ELF binary from the filesystem with per-process I/O (blocking)
 ///
 /// This spawns the process on a user thread and polls for completion.
@@ -25,6 +30,7 @@ pub fn exec_with_io(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>) -> 
     exec_with_io_cwd(path, args, None, stdin, None)
 }
 
+#[cfg(feature = "elf-loader")]
 /// exec_with_io with explicit cwd
 pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
     // Spawn process with channel and cwd
@@ -64,6 +70,7 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
     Ok((channel.exit_code(), stdout_data))
 }
 
+#[cfg(feature = "elf-loader")]
 /// Execute an ELF binary from the filesystem (legacy API for backwards compatibility)
 ///
 /// # Arguments
@@ -77,6 +84,7 @@ pub fn exec(path: &str) -> Result<i32, String> {
     Ok(exit_code)
 }
 
+#[cfg(feature = "elf-loader")]
 /// Execute a binary asynchronously and return its output when complete
 ///
 /// Spawns the process on a user thread and polls for completion,
@@ -94,6 +102,7 @@ pub async fn exec_async(path: &str, args: Option<&[&str]>, stdin: Option<&[u8]>)
     exec_async_cwd(path, args, None, stdin, None).await
 }
 
+#[cfg(feature = "elf-loader")]
 /// exec_async with explicit cwd and env
 pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>) -> Result<(i32, Vec<u8>), String> {
 
@@ -142,6 +151,7 @@ pub fn get_process_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
     get_channel(thread_id)
 }
 
+#[cfg(feature = "elf-loader")]
 /// Execute a binary with streaming output to an async writer
 ///
 /// Spawns the process on a user thread and streams output to the
@@ -163,6 +173,7 @@ where
     exec_streaming_cwd(path, args, None, stdin, None, output).await
 }
 
+#[cfg(feature = "elf-loader")]
 /// exec_streaming with explicit cwd and env
 pub async fn exec_streaming_cwd<W>(path: &str, args: Option<&[&str]>, env: Option<&[String]>, stdin: Option<&[u8]>, cwd: Option<&str>, output: &mut W) -> Result<i32, String>
 where

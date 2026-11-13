@@ -54,6 +54,7 @@ dependencies = [
  "akuma-syscalls-log",
  "akuma-syscalls-mem",
  "akuma-syscalls-poll",
+ "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-timer",
@@ -67,8 +68,11 @@ dependencies = [
  "smoltcp",
  "spinning_top",
  "talc",
- "virtio-drivers",
 ]
+
+[[package]]
+name = "akuma-affinity"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-alloc"
@@ -84,6 +88,7 @@ dependencies = [
 name = "akuma-amd64"
 version = "0.0.8"
 dependencies = [
+ "akuma-affinity",
  "akuma-alloc",
  "akuma-bkl",
  "akuma-boot",
@@ -105,6 +110,7 @@ dependencies = [
  "akuma-fdtable",
  "akuma-fpcache",
  "akuma-fpcache-rw",
+ "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-hda",
  "akuma-hid",
@@ -134,16 +140,19 @@ dependencies = [
  "akuma-pte-amd64",
  "akuma-rtw89",
  "akuma-ryzen-amd64",
+ "akuma-sched-amd64",
  "akuma-selftest",
  "akuma-sntp",
  "akuma-svm-amd64",
  "akuma-syscalls",
  "akuma-syscalls-abi",
  "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
  "akuma-syscalls-linux",
  "akuma-syscalls-mem",
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-proc",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-threading",
@@ -391,6 +400,10 @@ name = "akuma-fpcache-rw"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-fpu-amd64"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-gdt"
 version = "0.1.0"
 
@@ -557,7 +570,6 @@ dependencies = [
  "log",
  "smoltcp",
  "spinning_top",
- "virtio-drivers",
 ]
 
 [[package]]
@@ -572,7 +584,6 @@ dependencies = [
  "akuma-virtio",
  "smoltcp",
  "spinning_top",
- "virtio-drivers",
 ]
 
 [[package]]
@@ -688,8 +699,33 @@ name = "akuma-rump"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-runtime-tokio"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-primitives",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
+ "akuma-syscalls-linux",
+ "akuma-vfs-glue",
+]
+
+[[package]]
 name = "akuma-ryzen-amd64"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-sched-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-affinity",
+ "akuma-cpu",
+ "akuma-exec-core",
+ "akuma-fpu-amd64",
+ "akuma-primitives",
+ "akuma-threading",
+]
 
 [[package]]
 name = "akuma-scheduler"
@@ -766,6 +802,8 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-net",
  "akuma-syscalls-poll",
+ "akuma-syscalls-proc",
+ "akuma-syscalls-signal",
  "akuma-syscalls-sync",
  "akuma-syscalls-time",
  "akuma-timer",
@@ -776,6 +814,19 @@ dependencies = [
  "log",
  "smoltcp",
  "spinning_top",
+]
+
+[[package]]
+name = "akuma-syscalls-glue-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-exec",
+ "akuma-primitives",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-linux",
+ "akuma-user-access",
+ "akuma-vfs-glue",
 ]
 
 [[package]]
@@ -813,6 +864,7 @@ dependencies = [
 name = "akuma-syscalls-net"
 version = "0.1.0"
 dependencies = [
+ "akuma-net",
  "akuma-syscalls-linux",
 ]
 
@@ -823,6 +875,17 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-linux",
 ]
+
+[[package]]
+name = "akuma-syscalls-proc"
+version = "0.1.0"
+dependencies = [
+ "akuma-syscalls-linux",
+]
+
+[[package]]
+name = "akuma-syscalls-signal"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-syscalls-sync"
@@ -864,6 +927,60 @@ dependencies = [
  "akuma-cpu",
  "akuma-kacho",
  "arm_pl031",
+]
+
+[[package]]
+name = "akuma-tokio-kernel"
+version = "0.1.0"
+dependencies = [
+ "akuma-tokio-kernel-amd64",
+]
+
+[[package]]
+name = "akuma-tokio-kernel-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-boot-amd64",
+ "akuma-comconsole",
+ "akuma-cow",
+ "akuma-cpu",
+ "akuma-elf-exec",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-fpu-amd64",
+ "akuma-gdt",
+ "akuma-idt-amd64",
+ "akuma-isolation",
+ "akuma-lapic-amd64",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-port",
+ "akuma-primitives",
+ "akuma-pte-amd64",
+ "akuma-ring3-amd64",
+ "akuma-runtime-tokio",
+ "akuma-ryzen-amd64",
+ "akuma-sched-amd64",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
+ "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
+ "akuma-syscalls-proc",
+ "akuma-threading",
+ "akuma-trap-amd64",
+ "akuma-tty",
+ "akuma-user-access",
+ "akuma-user-layout",
+ "akuma-user-tree",
+ "akuma-user-walk",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "spinning_top",
 ]
 
 [[package]]
@@ -915,6 +1032,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-user-layout"
+version = "0.1.0"
+dependencies = [
+ "akuma-mmap",
+ "akuma-user-walk",
+]
+
+[[package]]
 name = "akuma-user-space"
 version = "0.1.0"
 dependencies = [
@@ -923,6 +1048,14 @@ dependencies = [
  "akuma-primitives",
  "spinning_top",
 ]
+
+[[package]]
+name = "akuma-user-tree"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-user-walk"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-vfs"
@@ -950,7 +1083,6 @@ dependencies = [
  "akuma-syscalls-ipc",
  "akuma-syscalls-log",
  "akuma-syscalls-net",
- "akuma-timer",
  "akuma-vfs",
  "akuma-virtio",
  "spinning_top",
@@ -962,10 +1094,15 @@ version = "0.1.0"
 dependencies = [
  "akuma-dma",
  "akuma-primitives",
+ "akuma-virtqueue",
  "spinning_top",
  "virtio-drivers",
  "zerocopy",
 ]
+
+[[package]]
+name = "akuma-virtqueue"
+version = "0.1.0"
 
 [[package]]
 name = "akuma-vm-spec"
@@ -1151,6 +1288,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
+name = "osaka"
+version = "0.1.0"
+dependencies = [
+ "akuma-tokio-kernel",
+]
+
+[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1215,6 +1359,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "shanghai"
+version = "0.1.0"
+dependencies = [
+ "akuma-tokio-kernel",
+]
+
+[[package]]
 name = "smoltcp"
 version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1267,36 +1418,7 @@ dependencies = [
 name = "taoxichuan"
 version = "0.1.0"
 dependencies = [
- "akuma-alloc",
- "akuma-boot-amd64",
- "akuma-comconsole",
- "akuma-cpu",
- "akuma-elf-exec",
- "akuma-exec",
- "akuma-ext2",
- "akuma-fdtable",
- "akuma-gdt",
- "akuma-idt-amd64",
- "akuma-isolation",
- "akuma-lapic-amd64",
- "akuma-mmu",
- "akuma-net",
- "akuma-pipes",
- "akuma-pmm",
- "akuma-port",
- "akuma-primitives",
- "akuma-ring3-amd64",
- "akuma-ryzen-amd64",
- "akuma-syscalls-abi",
- "akuma-syscalls-eventfd",
- "akuma-syscalls-linux",
- "akuma-syscalls-poll",
- "akuma-threading",
- "akuma-trap-amd64",
- "akuma-tty",
- "akuma-vfs",
- "akuma-virtio",
- "spinning_top",
+ "akuma-tokio-kernel",
 ]
 
 [[package]]

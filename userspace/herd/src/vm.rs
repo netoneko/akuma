@@ -15,7 +15,7 @@
 //! | `vm_type` | backend: `kvm` (default) or `firecracker` (reserved) |
 //! | `vm_kernel` | kernel image |
 //! | `vm_cmdline` | guest command line tail (rest of the line, spaces kept) |
-//! | `vm_ram_mib` | guest RAM, 16-1024 |
+//! | `vm_ram_mib` | guest RAM, 16-4096 |
 //! | `vm_vcpus` | virtual processors, 1-4 |
 //! | `vm_cores` | host cores the virtual processors may run on (`4-5`); the kernel's `kvmcores=` is the allowed set, so a core outside it is ignored |
 //! | `vm_disk` | disk image path, or `/dev/nvme0n1p<N>` to use that NVMe partition in place (empty: the machine's second virtio-blk) |
@@ -217,9 +217,11 @@ mod tests {
 
     #[test]
     fn rejections_name_the_key() {
+        // The bound is the spec's, not a number here: the ceiling plus one.
+        let over = alloc::format!("{}", akuma_vm_spec::spec::MAX_RAM_MIB + 1);
         for (k, v, e) in [
             ("vm_vcpus", "9", Error::OutOfRange),
-            ("vm_ram_mib", "4096", Error::OutOfRange),
+            ("vm_ram_mib", over.as_str(), Error::OutOfRange),
             ("vm_ram_mib", "lots", Error::BadValue),
             ("vm_disk_ram", "maybe", Error::BadValue),
             ("vm_forward", "22", Error::BadValue),

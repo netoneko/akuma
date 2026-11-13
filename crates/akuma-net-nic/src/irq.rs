@@ -25,7 +25,7 @@ const VIRTIO_NET_QUEUE_TRANSMIT: u32 = 1;
 
 /// MMIO base of NIC0, captured during [`init`]. 0 until then.
 ///
-/// Held separately from the `VirtIONetRaw` inside `NETWORK` because the IRQ
+/// Held separately from the `NetRaw` inside `NETWORK` because the IRQ
 /// handler must reach it **without taking a lock**: the core it interrupted may
 /// be the one holding `NETWORK`, and a handler that blocked on it would wedge
 /// the machine. A raw MMIO base in an atomic is the same discipline the timer
@@ -99,7 +99,7 @@ pub fn nic_irq_ack() {
 ///
 /// `transmit_begin` notifies only when `VirtQueue::should_notify()` allows, and
 /// QEMU negotiates `VIRTIO_F_EVENT_IDX`, so that can be false. The blocking
-/// `VirtIONetRaw::send` this replaced checks the same flag — but then *spins
+/// `NetRaw::send` this replaced checks the same flag — but then *spins
 /// until the used ring advances*, which waits the suppression out and forces
 /// the host to pick the frame up. Async submit has no such backstop, so a
 /// suppressed notify leaves the frame sitting in the avail ring.

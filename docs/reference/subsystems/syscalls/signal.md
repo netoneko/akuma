@@ -101,7 +101,21 @@ delivers the waking signal saves the *pre-suspend* mask as `uc_sigmask` (so
 `rt_sigreturn` restores it), then polls `pending_signals_raw` in a
 10 ms-sliced `schedule_blocking` loop until something not blocked by the
 suspend mask (or an unblockable signal) is pending. Always returns `EINTR`,
-per POSIX — it never returns via the normal 0 path.
+per POSIX — it never returns via the normal 0 path. `pause` (x86_64 34, no
+asm-generic number) is the same loop with the current mask.
+
+All three kernels serve both from glue. **Whoever delivers signals at the
+syscall return owns the slot from there:** a handler frame records the saved
+mask as `uc_sigmask`, and a return that enters no handler must put the saved
+mask back itself. The x86 kernels take the slot once per return
+(`amd64/src/signal.rs::deliver_pending`, Taoxichuan's
+`child::deliver_at_return`) and do both; AArch64 takes it only while building a
+frame, so a woken-then-discarded signal leaves the temporary mask installed
+(open, [`archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md`](../../../archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md)).
+
+`rt_sigpending` (`sys_rt_sigpending`) answers the calling thread's pending
+signals that its mask blocks (Linux's `do_sigpending`; Akuma pends every signal
+on a thread).
 
 ## Pending signals: kill / tkill / tgkill
 

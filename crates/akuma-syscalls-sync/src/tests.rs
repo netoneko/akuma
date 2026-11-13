@@ -586,3 +586,82 @@ fn a_wait_then_wake_round_trip_composes() {
     assert_eq!(step(Located::Nowhere, false, key, NEVER, 0), Step::Woken);
     assert_eq!(t.keys(), 0);
 }
+
+mod body_tests {
+    use crate::body::{self, Kernel};
+    use crate::table::{WaiterId, WaiterTable};
+    use core::cell::RefCell;
+
+    #[derive(Clone, Copy)]
+    struct W(usize);
+    impl WaiterId for W {
+        fn tid(self) -> usize {
+            self.0
+        }
+    }
+    struct K {
+        t: RefCell<WaiterTable<W>>,
+        mem: RefCell<[u32; 4]>,
+        resumed: RefCell<usize>,
+    }
+    impl Kernel for K {
+        type W = W;
+        fn table<R>(&self, f: impl FnOnce(&mut WaiterTable<W>) -> R) -> R {
+            f(&mut self.t.borrow_mut())
+        }
+        fn namespace(&self, _p: bool) -> u32 {
+            7
+        }
+        fn read_u32(&self, a: u64) -> Option<u32> {
+            self.mem.borrow().get((a / 4) as usize).copied()
+        }
+        fn write_u32(&self, a: u64, v: u32) -> bool {
+            self.mem.borrow_mut().get_mut((a / 4) as usize).map(|s| *s = v).is_some()
+        }
+        fn read_timespec(&self, _a: u64) -> Option<(i64, i64)> {
+            Some((0, 0))
+        }
+        fn now_us(&self) -> u64 {
+            0
+        }
+        fn utc_us(&self, _n: u64) -> Option<u64> {
+            None
+        }
+        fn resume(&self, w: &[W]) {
+            *self.resumed.borrow_mut() += w.len();
+        }
+        fn wait(&self, _: u64, _: u32, _: u32, _: u64, _: bool) -> u64 {
+            0
+        }
+    }
+    fn k() -> K {
+        K { t: RefCell::new(WaiterTable::new()), mem: RefCell::new([0; 4]), resumed: RefCell::new(0) }
+    }
+
+    #[test]
+    fn wake_takes_queued_waiters_and_resumes_them() {
+        let k = k();
+        k.t.borrow_mut().enqueue((7, 0), W(1), u32::MAX);
+        k.t.borrow_mut().enqueue((7, 0), W(2), u32::MAX);
+        assert_eq!(body::wake(&k, 0, 1, u32::MAX, true), 1);
+        assert_eq!(*k.resumed.borrow(), 1);
+        assert_eq!(body::wake_key(&k, 7, 0, 10), 1);
+    }
+
+    #[test]
+    fn cmp_requeue_checks_the_word_and_faults_on_unmapped() {
+        let k = k();
+        assert_eq!(body::requeue(&k, 0, 4, 1, 1, Some(9), true), body::EAGAIN);
+        assert_eq!(body::requeue(&k, 400, 4, 1, 1, Some(0), true), body::EFAULT);
+        k.t.borrow_mut().enqueue((7, 0), W(1), u32::MAX);
+        k.t.borrow_mut().enqueue((7, 0), W(2), u32::MAX);
+        // wake 1, move 1
+        assert_eq!(body::requeue(&k, 0, 4, 1, 1, Some(0), true), 2);
+    }
+
+    #[test]
+    fn wake_op_faults_on_unmapped_second_word() {
+        let k = k();
+        assert_eq!(body::wake_op(&k, 0, 400, 1, 1, 0, true), body::EFAULT);
+    }
+}

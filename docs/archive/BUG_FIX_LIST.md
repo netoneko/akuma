@@ -7,30 +7,34 @@ are assigned per *file* (the dominant subsystem of that investigation doc), not 
 a handful of grab-bag docs (e.g. `AKUMA_SELF_HOSTING.md`, `KERNEL_SPLIT_BUGS.md`) mix bugs
 from several subsystems under one write-up.
 
+Taoxichuan's own fixes (the tokio kernel in `crates/akuma-tokio-kernel-amd64`, its rigs and its experiment) are in
+[`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md). A fix found through Taoxichuan in code the other kernels
+also run (glue, a shared crate) is counted here, once, and that list points at it.
+
 ## Statistics
 
-- **Total distinct fixes counted:** 1470
-- **Docs contributing at least one fix:** 406
+- **Total distinct fixes counted:** 1481
+- **Docs contributing at least one fix:** 415
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 242 | 16.5% | 33 |
-| Memory & Virtual Memory | 176 | 12.0% | 57 |
-| Scheduler & Process Management | 139 | 9.5% | 43 |
-| SMP & Locking | 136 | 9.3% | 56 |
-| Networking | 94 | 6.4% | 35 |
+| Syscall / ABI Compatibility Audits | 245 | 16.5% | 35 |
+| Memory & Virtual Memory | 177 | 12.0% | 58 |
+| Scheduler & Process Management | 139 | 9.4% | 43 |
+| SMP & Locking | 136 | 9.2% | 56 |
+| Networking | 95 | 6.4% | 36 |
 | Userspace Apps & Libraries | 40 | 2.7% | 21 |
 | Rump Kernel & Syscall Proxy | 26 | 1.8% | 6 |
-| Toolchain & Self-Hosting | 91 | 6.2% | 13 |
-| SSH | 39 | 2.7% | 18 |
-| VFS & Filesystem | 134 | 9.1% | 40 |
-| Boot & Drivers | 141 | 9.6% | 22 |
+| Toolchain & Self-Hosting | 91 | 6.1% | 13 |
+| SSH | 39 | 2.6% | 18 |
+| VFS & Filesystem | 134 | 9.0% | 40 |
+| Boot & Drivers | 141 | 9.5% | 22 |
 | Signals & Exceptions | 40 | 2.7% | 15 |
-| Misc / Cross-cutting | 59 | 4.0% | 19 |
+| Misc / Cross-cutting | 64 | 4.3% | 23 |
 | Console & Terminal | 58 | 3.9% | 18 |
-| Containers | 55 | 3.7% | 10 |
-| **Total** | **1470** | **100.0%** | **406** |
+| Containers | 56 | 3.8% | 11 |
+| **Total** | **1481** | **100.0%** | **415** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -50,7 +54,7 @@ from several subsystems under one write-up.
 
 ---
 
-## Syscall / ABI Compatibility Audits (242 fixes, 33 docs)
+## Syscall / ABI Compatibility Audits (245 fixes, 35 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -323,7 +327,14 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `EPOLLONESHOT` was masked off as a registration bit and never acted on, so Bun's one-shot writability poll on stdout/stderr (always writable here) returned the same event forever and `claude` spun (318 M syscalls in 72 s), starving its UI of keyboard input; `InterestList` disarms a one-shot entry once it reports, until `EPOLL_CTL_MOD` or a re-ADD
 - `FileDescriptor::EpollFd` had no readiness arm and fell into `Unmodelled` (ready for whatever was asked), so an `epoll_wait` over an inner epoll returned at once forever and Claude Code spun at ~2 M syscalls/s; an inner epoll is `EPOLLIN`-ready only while its own list has something pending (`Entry::would_report`, which records no edge, depth-bounded at 4)
 
-## Memory & Virtual Memory (176 fixes, 57 docs)
+### docs/archive/DUP_LOST_O_NONBLOCK.md
+- glue's `sys_dup` and `F_DUPFD`/`F_DUPFD_CLOEXEC` (and `akuma-fdtable`'s `dup`/`dup_min`) did not copy the old number's `O_NONBLOCK` bit to the new one, as `dup3` did, so tokio's signal driver drained a blocking `try_clone()` of its non-blocking socketpair and parked forever on the second read, stopping the whole runtime; every kernel on glue had it, Taoxichuan's signal delivery was the first to run the drain
+
+### docs/archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md
+- glue's `pidfd_open` accepted `O_CLOEXEC` and made the fd close-on-exec only on request; Linux accepts only `PIDFD_NONBLOCK`, answers `EINVAL` for anything else and makes every pidfd close-on-exec (found by `pidfdprobe` on Linux 6.17 first; fixed for all three kernels)
+- `rt_sigpending` (x86_64 127, asm-generic 136) was served by no kernel: no abi row, no glue arm; new `signal::sys_rt_sigpending` (Linux's `do_sigpending`) routed on all three
+
+## Memory & Virtual Memory (177 fixes, 58 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -616,6 +627,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/AMD64_UNSAFE_REDUCTION_TRAP_MSR.md
 - A loaded-segment page whose map failed was never freed; the owned, not-yet-published `phys::FreshFrame` (freed on `Drop`, handed on with `publish()`) replaces the raw physmap view
 - The test program's failure arm freed a frame the address space already tracked; the same `FreshFrame` ownership removes it
+
+### docs/archive/KVM_GUEST_RAM_CAP_LIFTED.md
+- Guest RAM was capped at 1 GiB by the NPT's single directory page of 2 MiB leaves, echoed by `MAX_RAM_MIB = 1024` in the spec crate and `GPA_LIMIT = 1 << 30` in the memslot table, so any bigger VM was refused before boot (the self-hosting fixed point needs 3 GiB); the layout is now `akuma_svm_amd64::rammap` — flat to 3 GiB, then the PC shape: the 3..4 GiB device window (virtio-mmio, local APIC) stays unmapped and excess RAM moves above 4 GiB, with the NPT growing one directory page per RAM-holding GiB, the PVH memory map reporting both extents, and memslots refused in/across the window
 
 ## Scheduler & Process Management (139 fixes, 43 docs)
 
@@ -1107,7 +1121,7 @@ aren't recorded anywhere else.)
 - `/proc/stat` reported cpu0 100 % busy with an idle guest: `allow_tick` halted inside the calling task without crediting the halted time (`idle_loop` already did), so a core whose only task halts that way read fully busy; TSC measurement showed 12-13 % and `allow_tick` now credits its halt.
 - A task spinning on the hypervisor's device lock while holding the BKL deadlocked against a holder that needed the BKL back (found with on-demand cores, `smp::ensure_started`); `lock_dev` now drops the BKL between attempts.
 
-## Networking (94 fixes, 35 docs)
+## Networking (95 fixes, 36 docs)
 
 ### docs/archive/KVM_RELAY_SYN_STALL.md
 - The KVM host relay wedged on the ryzen under overlapping sessions: a forward slot reused one source port for every connection and the gateway's TCP sent its SYN once (no retransmit), so a guest holding the previous connection on that tuple never answered, the slot stayed `connecting`, the listen backlog filled and the port refused. Fixed with a rotating source-port generation per slot and a SYN retry (4 s) that gives up by resetting the client (`Gateway::fwd_reopen`, `relay.rs`); the SYNs a first 1.5 s retry chased were slow, not lost
@@ -1273,6 +1287,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/POST_AMD64_CODE_AUDIT.md
 - smoltcp's DNS socket failed on the first `NXDOMAIN` with one configured server (QEMU slirp `NXDOMAIN`s `example.com` while `1.1.1.1` answers) while the hand-rolled `amd64/src/dns.rs` walked resolvers; one shared, host-tested `akuma-dns` client walks the resolver list on a timeout or an answer without a record, and `dns.rs` and smoltcp's DNS socket are deleted
+
+### docs/archive/AKUMA_VIRTIO_IN_TREE.md
+- the in-tree `NetRaw::send` sent the Ethernet frame verbatim where `virtio-drivers`' `send` had chained a zeroed `virtio_net_hdr` in front, so QEMU read the frame's first 12 bytes as the header: DHCP was never answered and ssh never connected while the disk on the same ring code worked; `send` now chains a static zero header descriptor ahead of the frame
 
 ## Userspace Apps & Libraries (40 fixes, 21 docs)
 
@@ -2079,7 +2096,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AMD64_METAL_CONTROL_RUN.md
 - Emulating a trapped `MRS` with `rt == 31` on AArch64 wrote word 31 of the trap frame (`sp_el0`) instead of discarding the result as `XZR`, as the read side already did
 
-## Misc / Cross-cutting (59 fixes, 19 docs)
+## Misc / Cross-cutting (64 fixes, 23 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2198,6 +2215,21 @@ aren't recorded anywhere else.)
 - A stepped-over `HLT` left the interrupt shadow set: `sti; hlt; cli` intercepts `HLT` inside the one-instruction shadow `STI` opens, the handler advanced RIP but left the bit in the VMCB, and the next entry delivered nothing; every place the hypervisor completes an instruction now clears it.
 - The host's Gentoo box re-set the hostname to `localhost` from its OpenRC `conf.d/hostname`, so the herd oneshot that names a guest was not enough; the guests are `akuma-kvm`/`akuma-gentoo` and the host `akuma-ryzen`, split by hostname service.
 
+### docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md
+(Shared-crate fixes only; the doc's six Taoxichuan fixes are counted in `TAOXICHUAN_BUG_FIX_LIST.md`.)
+- `SIG_UNBLOCK` in `akuma-syscalls-signal` left a stray SIGKILL/SIGSTOP bit in the mask forever (`cur & !(set & !UNBLOCKABLE)` instead of `cur & !set`), found by the differential test against the glue formula it replaced
+- `akuma-pmm`'s CoW share-count table was a `BTreeMap` (a heap node per shared frame, so forking a 100k-page process made 100k allocations under the lock); it is a lazily-chunked flat table, differential-tested against the old map
+
+### docs/archive/KVM_GUEST_DISK_856_MIB_RACE.md
+- the host reported a 1 GiB `kvm0` guest disk as 856 MiB: `boot_dev.sh` stopped `vm-dev` but left its conf enabled while it copied and rewrote the 1 GiB image, and herd's ~20 s reload tick started the enabled-but-stopped service mid-rewrite; the script now disables the service first and enables and starts it only after the image and confs are in place
+
+### docs/archive/AUDIT_SURFACE_METHODOLOGY.md
+- `scripts/cloc_akuma.py`'s `#[cfg]` scanner never closed a gated span on the *last* field, variant or match arm (no `;`, no braces of its own), so it swallowed the code after it: `akuma-ext2`'s `#[cfg(test)] counters` field took 30 production lines and `akuma-net-nic`'s `#[cfg(test)] Scripted` variant the 200-line production `impl ExternalDevice`; spans now end at their list's `,` and at the enclosing bracket, and a `;` inside `[T; N]` no longer ends an item (159 lines back to production)
+
+### docs/archive/TAOXICHUAN_CLEANUP_PLAN.md
+(Akuma's half only; the plan's Taoxichuan fixes are counted in `TAOXICHUAN_BUG_FIX_LIST.md`.)
+- `akuma-amd64`'s self-test build (without `no-tests`) had not compiled since the stage-1 boot-kit extraction (`43edbffc`): the physmap self-test named constants that moved to `akuma-boot-amd64`, and four imports and two functions (`kvm::api::check_shared_memory`, `Vcpu::get_regs`) were dead; fixed with the analysis-row trims (`a4cd34b2`)
+
 ## Console & Terminal (58 fixes, 18 docs)
 
 ### docs/archive/VEC_AUDIT.md
@@ -2296,7 +2328,7 @@ aren't recorded anywhere else.)
 ### docs/archive/TTY_CTRL_C_JOB_CONTROL.md
 - `^C` could not interrupt a job-control shell's foreground job (`sleep 100` from `sh -i`, over ssh, on both kernels) because `kill_process_group` always spared the group leader, which there is the job itself; `TerminalState` records the session shell's group and spares the leader only while the foreground group is that one
 
-## Containers (55 fixes, 10 docs)
+## Containers (56 fixes, 11 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -2375,6 +2407,9 @@ aren't recorded anywhere else.)
 - a `box run` child's uid read as 4294967292 in about five spawns in six on amd64: `reattach` sends `SIGWINCH`, `pend_signal_to_group` raised the per-thread interrupt bit for every signal and glue's prologue turned it into `EINTR` on the child's first syscall (`getuid`), which busybox's `check_suid` took for the real uid; `process::signal::signal_can_act` no longer raises the bit for an ignored signal with default-ignore action and no handler
 - `paths::sanitize_name` dropped any registry host containing a `.`, so every tag for a registry shared the store directory of the image it was made from and `box rmi` of the registry-qualified tag deleted `app:1`; only Docker Hub's spellings collapse now
 
+### docs/archive/AMD64_BOX_SPAWN_EXT_REGRESSION.md
+- every amd64 `box run` answered `failed to spawn /bin/busybox` (12 box-suite checks): gating glue's `execve`/`SPAWN`/`SPAWN_EXT` behind a new `exec` feature turned it on only for AArch64, on the premise that both x86 kernels load with their own loaders, but amd64's box spawns still go through glue's; `amd64/Cargo.toml` enables `exec`
+
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
 Also scanned 2026-10-20 (the amd64 metal, signal-return and `/proc` work, 16 archive docs added or edited). Counted above: AARCH64_SMP_HOOKS_RACE, AMD64_TLB_STUCK_MMAP_REGIONS, AMD64_FORK_VS_THREADS_SEGV, AKUMA_STALE_TID_ZOMBIE_SLOT, AMD64_PHYSMAP_SELFTEST_LAST_PDE, AMD64_UNSAFE_REDUCTION_TRAP_MSR, AMD64_MAC_BUILT_KERNEL_METAL_HANG (its one fix is the `cycle.py` truncated install; the hang itself is unexplained and not counted), AKUMA_PROC_TREE_UNIFICATION, AMD64_METAL_CONTROL_RUN (its one `MRS rt == 31` fix; the run record itself is not a fix), and POST_AMD64_CODE_AUDIT (its one fix, the shared `akuma-dns` client). AMD64_UNSAFE_REDUCTION_TRAP_MSR's `ls /root` investigation and its round-3 frame-ownership fixes carry six more bullets, split under VFS and Memory. Three fixes had been recorded only in `docs/reference/` docs (poll.md, power.md, tty.md); reference docs hold current state, not history, so their incident records were moved to EPOLL_ONESHOT_AND_NESTED_SPIN, WATCHDOG_FEED_BUCKET and TTY_CTRL_C_JOB_CONTROL and are counted there. Fix commits on the branch with no doc to cite are not counted: sshd's missing `HOME` (`ac41e664`), the stale `uname` SHA in worktrees (`5a577983`), the Tokyo Night prompt's unbracketed SGR escapes (`c7d2a8e7`). Five runbooks that were investigation logs or handoffs rather than procedures were moved into `docs/archive/` under conventional names (THREAD_SPAWN_SEGV_INVESTIGATION, CARGO_CANNOT_REACH_CRATES_IO, AMD64_J4_BUILD_CRASH_HUNT, AMD64_EXT2_CORRUPTION_HANDOFF, AKUMA_AMD64_HDA_AUDIO_BRIEF). Each is the maintained summary of fixes already counted under their archive originals, so none gets a bullet of its own: THREAD_SPAWN_SEGV_INVESTIGATION under MPROTECT_TLB_ASID_BUG, CLONE_TIDFLAGS_THREAD_LIST_LOCK, THREAD_STATES_RACES_TID_GENERATIONS and TRAMPOLINE_STALE_PROCESS_RELR (its `NO-TRAPFRAME` hardening is already a bullet); CARGO_CANNOT_REACH_CRATES_IO (the `sys_pselect6` `exceptfds` fix) under CARGO_CRATES_IO_CONNECT_FAIL; AMD64_J4_BUILD_CRASH_HUNT (the `execve` `EIO`) under AKUMA_AMD64_TARGETED_SHOOTDOWN; AMD64_EXT2_CORRUPTION_HANDOFF under AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION; AKUMA_AMD64_HDA_AUDIO_BRIEF (its six HDA defects) under AKUMA_AMD64_HDA_REWRITE. No counted fix: AARCH64_CLAUDE_BUN_SEGV, AMD64_CLAUDE_LOGIN_INPUT_STUCK and AMD64_CRUSH_ORPHANS_AFTER_PTY_CLOSE are **open** by their own headers (reproduced, not root-caused; the third is a hypothesis only); CLONE_AUDIT is an audit with no defect attached; AKUMA_TTY_EXTRACTION is a behaviour-preserving extraction whose step 2 is open; AKUMA_AMD64_PIPE_TABLE_UNIFICATION took a two-line edit and is already named here.
@@ -2426,3 +2461,5 @@ Also scanned 2026-10-22 (the `kvm-linux-rung` branch — the Linux guest under t
 Also scanned 2026-10-23 (the `kvm-part-1` branch — the SVM hypervisor, `kvm0` guests under herd, the `/dev/kvm` node, affinity, `/dev/net/tun`, the goose-glm dev cycle, 114 commits — ahead of merging it to `main`). Counted above: AKUMA_FIRECRACKER_KVM gained eight (the `/dev/kvm` node's handle-table, `EBUSY`, yield and BKL-window bugs, the 5th-run heap corruption, the `sched_setaffinity` stub, the constant `processor` field, the per-iovec `writev` on the tap), AKUMA_KVM_DEV_CYCLE (the CMOS corruption: two writers) is new under Boot & Drivers, AKUMA_KVM_AKUMA_GUEST (four) under Misc / Cross-cutting, and KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE (one) and KVM_CPU_ACCOUNTING (two) under SMP & Locking. Carry no counted fix: AKUMA_IPV6 (a scoping note — a missing feature, not a defect), AKUMA_KVM_NETBSD_GUEST (a capability; its "not obvious" list is traps — one VM at a time, `console=com` required — not defects), KVM_OUTBOUND_NETWORKING (a feature, off by default, with one open item), AMD64_KVM_REBOOT_NOTE_PERMISSION_MAPS and the two `docs/handoff/` files (hand-off notes). KVM_BKL_EXIT_HANDLING_AND_BULK_WEDGE's second half, the ~63 MB relay wedge and the relay slot that is never freed after it, is **open and pre-existing**, so adds no bullet; the `/dev/net/tun` guest wedge in AKUMA_FIRECRACKER_KVM is **open** (theories ranked in the doc). Fix-shaped commits with no archive doc to cite, named rather than left silent: `b0c82641` (`akuma-mmu` host build, ranged-walk flag only read on the kernel target — a build break, no runtime defect) and `158ed98d` (a clippy sweep). `AKUMA_FDTABLE_EXTRACTION` and `AKUMA_MMU_SAFE_FACADE` stay behaviour-preserving extractions, `CLONE_AUDIT` an audit with its findings counted elsewhere; the already-listed AKUMA_KVM, AKUMA_KVM_LINUX_GUEST, KVM_RELAY_SYN_STALL and UDP_REPLY_WAIT_TIMER_STORM gained nothing new on this branch since their last update.
 
 Also scanned 2026-10-24 (the Firecracker guest hang on `kvm-part-1`: 5 code commits, 1 archive doc). Counted above: FIRECRACKER_GUEST_HANG, two fixes. It **resolves** the `/dev/net/tun` guest wedge that AKUMA_FIRECRACKER_KVM and the 2026-10-23 paragraph above call open — that wedge was the first of the two counted fixes, not a tap or virtio-net defect, so AKUMA_FIRECRACKER_KVM gains no bullet. UDP_REPLY_WAIT_TIMER_STORM gained a correction (its second `recvfrom` was the second fix) and no bullet. Fix-shaped commits with no archive doc to cite, named rather than left silent: the `num_buffers = 1` in `tun::read_frame` (a correct but unrelated hardening of the receive header, not a counted defect) and the `evring`/`strace_pid` instrumentation (diagnostic aids, no defect).
+
+Also scanned 2026-11-02 (closing `rust-org-il-experiment`, 536 commits and about 70 archive docs, most of them the Taoxichuan experiment and its cleanup). Counted above: DUP_LOST_O_NONBLOCK, TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND (two shared-glue fixes), AKUMA_VIRTIO_IN_TREE, AMD64_BOX_SPAWN_EXT_REGRESSION, KVM_GUEST_DISK_856_MIB_RACE, AUDIT_SURFACE_METHODOLOGY, TAOXICHUAN_CLEANUP_PLAN (its one amd64 fix), KVM_GUEST_RAM_CAP_LIFTED, and the two shared-crate bullets of TAOXICHUAN_BUGS_FOUND_2026_10_30. **Every Taoxichuan-only fix moved to `TAOXICHUAN_BUG_FIX_LIST.md`**, including the six that were counted here under TAOXICHUAN_BUGS_FOUND_2026_10_30 and the TAOXICHUAN_SMP fixes (`dac8a275`, the AP's `IA32_APIC_BASE` enable; `5108b5e5`, which this paragraph used to name, is TAOXICHUAN_CARGO_STALL_REGRESSION's pipe-EOF fix and is counted there). No counted fix, open by their own text: AKUMA_RYZEN_HERD_STOP_GUEST_RESET (the ryzen reset on `herd stop goose-glm`, seen once), AMD64_THREADPROBE_EXIT_ZERO_FLAKE (logged as a flake by decision), GOOSE_SERVE_IDLE_SPIN, HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD. No fix, measurement or record: AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS, CLONE_AUDIT_2026_11_01 and CLONE_AND_MUT_BUDGETS (the audit's findings are not done), LINE_COUNT_ANALYSIS_POST_AMD64, RUST_ORG_IL_TALK, GOOSE_GLM_SERVE_ON_RYZEN (setup; its traps are workarounds), MINIMAL_SELF_HOSTING_EXPERIMENT (the brief). The branch's edits to AKUMA_FIRECRACKER_AMD64, AKUMA_FIRECRACKER_KVM, AKUMA_KVM_DEV_CYCLE and AMD64_J4_BUILD_CRASH_HUNT add no fix. AKUMA_AMD64_SCHED_CRATE's one fix is Taoxichuan's (the trace build's idle-lap dump) and is counted there. No doc to cite: `d6ee7d97` (`akuma-threading`'s x86 fresh-thread trampoline never released the outgoing thread's `ON_CPU` gate, so the first switch to a never-run thread could leave its predecessor unschedulable; named only as a bisect row in TAOXICHUAN_CARGO_STALL_REGRESSION).

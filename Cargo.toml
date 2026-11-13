@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "amd64", "taoxichuan", "crates/*"]
+members = [".", "amd64", "taoxichuan", "osaka", "shanghai", "crates/*"]
 default-members = [
     ".",
     "crates/akuma-alloc",
@@ -70,6 +70,8 @@ default-members = [
     "crates/akuma-sntp",
     "crates/akuma-svm-amd64",
     "crates/akuma-vm-spec",
+    "crates/akuma-affinity",
+    "crates/akuma-virtqueue",
     "crates/akuma-kvm-abi",
     "crates/akuma-cmos-rtc",
     "crates/akuma-syscalls",
@@ -86,7 +88,13 @@ default-members = [
     "crates/akuma-syscalls-net",
     "crates/akuma-syscalls-poll",
     "crates/akuma-syscalls-eventfd",
+    "crates/akuma-syscalls-signal",
+    "crates/akuma-fpu-amd64",
+    "crates/akuma-user-tree",
     "crates/akuma-syscalls-sync",
+    "crates/akuma-syscalls-proc",
+    "crates/akuma-runtime-tokio",
+    "crates/akuma-user-layout",
     "crates/akuma-tty",
     "crates/akuma-syscalls-time",
     "crates/akuma-timer",
@@ -635,10 +643,11 @@ sc-reboot = ["dep:akuma-boot", "akuma-vfs-glue/sc-reboot", "akuma-syscalls-glue/
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp", "akuma-syscalls-glue/smoltcp", "akuma-kernel-core/smoltcp", "akuma-kernel-glue/smoltcp"]
 
 # virtio-sound output driver (src/audio.rs + /dev/dsp). Enabled by default;
-# dropped by the size/extreme profiles' `--no-default-features` builds. Pulls in
-# virtio-drivers' `alloc` feature, which gates its `sound` module. Designed to be
-# small/bounded enough to opt back into `extreme` (4 MB) via `--features sound`.
-sound = ["virtio-drivers/alloc", "akuma-virtio/sound", "akuma-kernel-glue/sound"]
+# dropped by the size/extreme profiles' `--no-default-features` builds. The one
+# thing that still compiles `virtio-drivers` (through `akuma-virtio/sound`): blk
+# and net are driven in-tree. Designed to be small/bounded enough to opt back
+# into `extreme` (4 MB) via `--features sound`.
+sound = ["akuma-virtio/sound", "akuma-kernel-glue/sound"]
 
 # Use the legacy GICv2 MMIO interrupt-controller driver (src/gic.rs) instead of
 # the default GICv3 driver (src/gic_v3.rs). GICv2 works under QEMU TCG
@@ -679,7 +688,7 @@ fs-cache = ["akuma-ext2/fs-cache"]
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
 sc-aio          = ["akuma-syscalls-glue/sc-aio"]
 sc-sysv-ipc     = ["dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc", "akuma-syscalls-glue/sc-sysv-ipc"]
-sc-containers   = ["akuma-vfs-glue/sc-containers", "akuma-syscalls-glue/sc-containers"]
+sc-containers   = ["akuma-vfs-glue/sc-containers", "akuma-syscalls-glue/sc-containers", "akuma-isolation/containers"]
 sc-timerfd      = ["akuma-syscalls-glue/sc-timerfd"]
 # Tier 2 — each needs a no-op ExecRuntime callback stub when off (see main.rs).
 sc-eventfd      = ["akuma-syscalls-glue/sc-eventfd", "akuma-kernel-glue/sc-eventfd"]
@@ -758,7 +767,8 @@ akuma-net-unix = { path = "crates/akuma-net-unix" }
 akuma-net-yarn = { path = "crates/akuma-net-yarn" }
 # virtio Hal + MMIO probe + the block/rng/audio drivers.
 akuma-virtio = { path = "crates/akuma-virtio" }
-akuma-exec = { path = "crates/akuma-exec" }
+# `elf-loader`: this kernel loads binaries through `akuma-exec` (execve, spawn).
+akuma-exec = { path = "crates/akuma-exec", features = ["elf-loader"] }
 # The exception path: vector table, EL0/EL1 trap handlers, EL0 syscall entry,
 # CoW breaks, demand paging, signal delivery. Extracted from
 # `src/exceptions.rs` 2026-09-01 — `docs/archive/AKUMA_EXCEPTIONS_EXTRACTION.md`.
@@ -816,7 +826,7 @@ akuma-rump = { path = "crates/akuma-rump", optional = true }
 # (src/syscall/reboot.rs); the PSCI SMC call itself stays in smp_shared.rs.
 # Named `-boot`, not `-reboot`: a natural future home for src/boot.rs's logic too.
 akuma-boot = { path = "crates/akuma-boot", optional = true }
-akuma-isolation = { path = "crates/akuma-isolation" }
+akuma-isolation = { path = "crates/akuma-isolation", default-features = false }
 # Machine description read from the FDT at run time. Required, not optional:
 # Firecracker's GIC redistributor base moves with `vcpu_count`, so no
 # compile-time constant can address it (docs/reference/firecracker/README.md
@@ -834,8 +844,7 @@ spinning_top = "0.3"
 # `std`; no `max_level_*` feature here on purpose — filtering is the sink's job,
 # and a compile-time cap cannot be undone at runtime.
 log = { version = "0.4", default-features = false }
-smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
-virtio-drivers = { version = "0.13", default-features = false }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 akuma-timer = { path = "crates/akuma-timer" }
 # Time syscalls (clock_gettime/settime, itimers, adjtimex) and the boot-time
 # SNTP fallback for platforms with no RTC (Firecracker) — extracted from
@@ -856,7 +865,7 @@ akuma-syscalls = { path = "crates/akuma-syscalls" }
 
 # The syscall dispatcher and its families. Was `src/syscall/` — see
 # docs/archive/SRC_SYSCALL_EXTRACTION.md.
-akuma-syscalls-glue = { path = "crates/akuma-syscalls-glue", default-features = false }
+akuma-syscalls-glue = { path = "crates/akuma-syscalls-glue", default-features = false, features = ["exec", "akuma-native"] }
 
 # Per-pid syscall trace rings behind `/proc/<pid>/syscalls`. Split out of
 # `src/syscall/` so `src/vfs/proc.rs` can read them without `src/vfs/` depending
@@ -878,6 +887,7 @@ akuma-syscalls-ipc = { path = "crates/akuma-syscalls-ipc", optional = true }
 # family implementation on the akuma-syscalls-time model (AKUMA_EXTRACT_SYSCALLS.md
 # §8), taken first because every futex bug in docs/archive/ is a property of one
 # of those four things and each one previously cost a -j4 self-host build to find.
+akuma-syscalls-signal = { path = "crates/akuma-syscalls-signal" }
 akuma-syscalls-sync = { path = "crates/akuma-syscalls-sync" }
 # The epoll/poll/select family's pure logic: the fd-state -> event-bits
 # readiness map, the interest list and its epoll_ctl errno set, the EPOLLET

@@ -11,7 +11,9 @@ pub mod creds;
 pub mod dac;
 pub mod mount;
 pub mod net;
+#[cfg(feature = "containers")]
 pub mod overlay_fs;
+#[cfg(feature = "containers")]
 pub mod subdir_fs;
 
 use alloc::sync::Arc;

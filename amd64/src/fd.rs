@@ -105,8 +105,10 @@
 //!   fixing that honestly is a change to `akuma-exec`'s `FileDescriptor`
 //!   (an `Arc` inside the variant), not to this file.
 //! - **`nonblocking` is keyed by fd number** (the table's `nonblock` set),
-//!   where [`Entry::nonblocking`] used to be keyed by description — so
-//!   `dup`ping a non-blocking socket loses the flag.
+//!   where [`Entry::nonblocking`] used to be keyed by description. Every dup
+//!   copies the bit (since 2026-11-01; it used to be lost, which parked
+//!   tokio's signal driver), so only a later `F_SETFL` on one of the two
+//!   differs from Linux.
 //!
 //! # Descriptors 0/1/2 are real (C2 slice 6)
 //!
@@ -688,11 +690,8 @@ pub fn pipe_write_id(fd: u64) -> Option<usize> {
 /// Is `fd` marked `O_NONBLOCK`? `false` for anything not in the table.
 ///
 /// Read from the table's `nonblock` set — keyed by **fd number**, which is
-/// where `sys_fcntl`'s `F_SETFL` has always mirrored it. The per-description
-/// `Entry::nonblocking` this replaces meant `dup` *kept* the flag across the
-/// new name; the set means the dup **loses** it. That is
-/// `akuma-syscalls-glue`'s existing behaviour, adopted with the flip and
-/// pinned in the module header.
+/// where `sys_fcntl`'s `F_SETFL` has always mirrored it. A dup copies the bit
+/// (glue's `sys_dup`, `F_DUPFD`, `dup3`); see the module header.
 #[must_use]
 pub fn is_nonblocking(fd: u64) -> bool {
     fd < MAX_FDS as u64 && cur_table().nonblock.lock().contains(&(fd as u32))
@@ -3665,10 +3664,11 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         );
     }
 
-    // `nonblock` is keyed by fd number now (the table's set, where `F_SETFL`
-    // always mirrored it): a dup of a non-blocking descriptor **loses** the
-    // flag. Also pinned — it is the other half of glue's `dup` model, see
-    // `is_nonblocking`'s header.
+    // `nonblock` is keyed by fd number (the table's set, where `F_SETFL`
+    // always mirrored it), and a dup **copies** it: on Linux the flag is the
+    // open description's and the dup shares it. Until 2026-11-01 the dup lost
+    // it, and tokio's signal driver parked on a dup of its non-blocking pipe
+    // (`docs/archive/DUP_LOST_O_NONBLOCK.md`).
     {
         let a = sys_openat(0, path.as_ptr() as u64, 0, 0);
         t.check_eq("fd: F_SETFL nonblock succeeds", sys_fcntl(a, 4, 0x800), 0);
@@ -3679,9 +3679,9 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
         );
         let b = sys_dup(a);
         t.check_eq(
-            "fd: a dup loses nonblock (glue divergence, pinned)",
+            "fd: a dup keeps nonblock",
             sys_fcntl(b, 3, 0),
-            0,
+            0x800,
         );
         t.check_eq("fd: the original keeps it", sys_fcntl(a, 3, 0), 0x800);
         sys_close(a);

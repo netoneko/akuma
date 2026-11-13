@@ -79,8 +79,8 @@ const CHUNK_COPY: usize = 1 << 20;
 const AKUMA_DISK_IMAGE_PATH: &str = "/boot/akuma-guest-root.img";
 /// The Akuma guest's RAM. The kernel takes a fixed 512 MiB heap
 /// (`amd64/src/mem.rs` `HEAP_SIZE`) out of one region and refuses to boot when the
-/// region is smaller; the rest is its frame allocator. One page directory of
-/// 2 MiB nested leaves maps 1 GiB, which bounds this.
+/// region is smaller; the rest is its frame allocator. The nested page table covers
+/// 4 GiB (`svm::rammap`), which bounds this.
 const AKUMA_RAM_BYTES: u64 = 768 << 20;
 
 /// The NIC's register window: the next slot after the disk's (the guest finds devices
@@ -487,11 +487,13 @@ enum RamSrc {
     Pmm { alloc_pa: usize, alloc_pages: usize },
 }
 
-/// Guest RAM: one contiguous run of host frames, 2-MiB-aligned, so guest-physical `g` is
-/// host-physical `base + g`.
+/// Guest RAM: one contiguous run of host frames, 2-MiB-aligned. Its guest-physical map
+/// is `svm::rammap::plan(bytes)` (flat to 3 GiB, then the PC shape around the device
+/// window), so guest-physical `g` is host-physical `map.host(base, g)`.
 struct Ram {
     base: u64,
     bytes: u64,
+    map: svm::rammap::Map,
     src: RamSrc,
 }
 
@@ -499,8 +501,9 @@ impl Ram {
     /// From the reserve when there is one (**refused**, not retried elsewhere, when it has no
     /// room); from the page allocator when there is none.
     fn alloc(bytes: u64) -> Option<Self> {
+        let map = svm::rammap::plan(bytes)?;
         match super::ctl::carve(bytes) {
-            super::ctl::Carve::Reserved { pa, off } => Some(Self { base: pa, bytes, src: RamSrc::Reserved { off } }),
+            super::ctl::Carve::Reserved { pa, off } => Some(Self { base: pa, bytes, map, src: RamSrc::Reserved { off } }),
             super::ctl::Carve::Refused { free } => {
                 p("[KVM] linux: refused: guest RAM does not fit the kvmmem= reserve (");
                 dec(free >> 20);
@@ -511,21 +514,38 @@ impl Ram {
                 let alloc_pages = ((bytes + RAM_ALIGN) / 4096) as usize;
                 let alloc_pa = akuma_pmm::alloc_pages_contiguous_zeroed(alloc_pages)?;
                 let base = (alloc_pa as u64 + RAM_ALIGN - 1) & !(RAM_ALIGN - 1);
-                Some(Self { base, bytes, src: RamSrc::Pmm { alloc_pa, alloc_pages } })
+                Some(Self { base, bytes, map, src: RamSrc::Pmm { alloc_pa, alloc_pages } })
             }
         }
     }
 
-    /// Copy `src` into guest-physical `gpa`. False if it leaves RAM.
+    /// The host-physical address of guest-physical `gpa`: `None` in the device window
+    /// or past RAM.
+    fn host(&self, gpa: u64) -> Option<u64> {
+        self.map.host(self.base, gpa)
+    }
+
+    /// Copy `src` into guest-physical `gpa`. False if it leaves RAM (a write may not
+    /// straddle the device window either: `host` of both ends must agree).
     fn write(&self, gpa: u64, src: &[u8]) -> bool {
-        gpa.checked_add(src.len() as u64).is_some_and(|end| end <= self.bytes)
-            && akuma_mmu::copy_to_phys((self.base + gpa) as usize, src)
+        if src.is_empty() {
+            return self.host(gpa).is_some();
+        }
+        let Some(h) = self.host(gpa) else { return false };
+        let Some(end) = gpa.checked_add(src.len() as u64) else { return false };
+        let Some(t) = self.host(end - 1) else { return false };
+        t - h == src.len() as u64 - 1 && akuma_mmu::copy_to_phys(h as usize, src)
     }
 
     /// Copy guest-physical `gpa` out. False if it leaves RAM.
     fn copy_out(&self, gpa: u64, dst: &mut [u8]) -> bool {
-        gpa.checked_add(dst.len() as u64).is_some_and(|end| end <= self.bytes)
-            && akuma_mmu::copy_from_phys((self.base + gpa) as usize, dst)
+        if dst.is_empty() {
+            return self.host(gpa).is_some();
+        }
+        let Some(h) = self.host(gpa) else { return false };
+        let Some(end) = gpa.checked_add(dst.len() as u64) else { return false };
+        let Some(t) = self.host(end - 1) else { return false };
+        t - h == dst.len() as u64 - 1 && akuma_mmu::copy_from_phys(h as usize, dst)
     }
 }
 
@@ -777,26 +797,33 @@ impl Drop for Ram {
     }
 }
 
-/// The nested page table: PML4 -> PDPT -> PD of 2 MiB leaves, covering exactly
-/// guest RAM. Everything else (the local APIC, the I/O APIC, ROMs, the
-/// framebuffer) is absent — a guest that touches it takes a nested page fault
-/// and the run stops there, naming the address.
+/// The nested page table: PML4 -> PDPT -> directories of 2 MiB leaves, covering exactly
+/// guest RAM as `svm::rammap` lays it out — three GiBs below the device window and, past
+/// 3 GiB of RAM, the GiB above it. Everything else (the device window with the local APIC
+/// and virtio-mmio pages, ROMs, the framebuffer) is absent — a guest that touches it
+/// takes a nested page fault and the run stops there, naming the address. The window's
+/// GiB gets no directory at all, so at most four are ever allocated.
 struct Npt {
     pml4: FreshFrame,
     _pdpt: FreshFrame,
-    _pd: FreshFrame,
+    _dirs: [Option<FreshFrame>; svm::rammap::MAX_DIRS],
 }
 
 fn build_npt(ram: &Ram) -> Option<Npt> {
     let mut pml4 = FreshFrame::alloc_zeroed()?;
     let mut pdpt = FreshFrame::alloc_zeroed()?;
-    let mut pd = FreshFrame::alloc_zeroed()?;
+    let mut dirs = [const { None }; svm::rammap::MAX_DIRS];
     svm::wr64(pml4.bytes_mut(), 0, svm::npt::pointer(pdpt.pa() as u64));
-    svm::wr64(pdpt.bytes_mut(), 0, svm::npt::pointer(pd.pa() as u64));
-    for i in 0..(ram.bytes >> 21) {
-        svm::wr64(pd.bytes_mut(), i as usize * 8, svm::npt::leaf_2m(ram.base + (i << 21)));
+    for (d, dir) in dirs.iter_mut().enumerate() {
+        if !ram.map.covers((d as u64) << 30) {
+            continue;
+        }
+        let mut page = FreshFrame::alloc_zeroed()?;
+        svm::rammap::fill_directory(page.bytes_mut(), ram.map, ram.base, d);
+        svm::wr64(pdpt.bytes_mut(), d * 8, svm::npt::pointer(page.pa() as u64));
+        *dir = Some(page);
     }
-    Some(Npt { pml4, _pdpt: pdpt, _pd: pd })
+    Some(Npt { pml4, _pdpt: pdpt, _dirs: dirs })
 }
 
 /// What the loader found.
@@ -858,8 +885,9 @@ fn load_kernel(path: &str, ram: &Ram, chunk: &mut FreshFrame) -> Result<Loaded, 
     }
     let entry = entry.ok_or("no PVH entry note (a bzImage, or a kernel built without CONFIG_PVH)")?;
 
-    // Leave the top of RAM to the handoff pages.
-    let limit = ram.bytes - 0x4000;
+    // Segments load low: they must fit the extent below the device window — short of the
+    // handoff pages when the map is flat (then they sit at the low extent's top).
+    let limit = if ram.map.high.bytes == 0 { ram.bytes - 0x4000 } else { ram.map.low.bytes };
     let mut bytes = 0u64;
     for s in &loads[..nloads] {
         let end = s.pa.checked_add(s.memsz).ok_or("segment wraps")?;

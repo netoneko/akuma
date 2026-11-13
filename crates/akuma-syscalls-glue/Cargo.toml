@@ -9,12 +9,12 @@ akuma-bkl = { path = "../akuma-bkl" }
 akuma-config = { path = "../akuma-config" }
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-exec = { path = "../akuma-exec" }
-akuma-isolation = { path = "../akuma-isolation" }
+akuma-isolation = { path = "../akuma-isolation", default-features = false }
 akuma-mmu = { path = "../akuma-mmu" }
 akuma-net = { path = "../akuma-net", default-features = false }
 # eventfd's state machine (stage 8 session Q seam-cut): the counter/flag
 # decisions used by this crate's eventfd.rs, shared with taoxichuan.
-akuma-syscalls-eventfd = { path = "../akuma-syscalls-eventfd" }
+akuma-syscalls-eventfd = { path = "../akuma-syscalls-eventfd", optional = true }
 akuma-net-unix = { path = "../akuma-net-unix" }
 akuma-net-yarn = { path = "../akuma-net-yarn" }
 akuma-pipes = { path = "../akuma-pipes" }
@@ -26,13 +26,18 @@ akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 # The `SIOCGIF*` / `/proc/net/dev` byte layout, shared with the amd64 port so
 # the two kernels cannot drift on the `struct ifreq` stride.
 akuma-syscalls-net = { path = "../akuma-syscalls-net" }
+# rt_sigprocmask's mask algebra (shared with taoxichuan; differential-tested against this crate's old inline formula).
+akuma-syscalls-signal = { path = "../akuma-syscalls-signal" }
 akuma-syscalls-log = { path = "../akuma-syscalls-log" }
 akuma-syscalls-mem = { path = "../akuma-syscalls-mem" }
 akuma-reclock = { path = "../akuma-reclock" }
 akuma-syscalls-poll = { path = "../akuma-syscalls-poll" }
 akuma-syscalls-sync = { path = "../akuma-syscalls-sync" }
+# The process family's pure decisions (clone kinds, exit scope, wait status, execve's budget).
+akuma-syscalls-proc = { path = "../akuma-syscalls-proc" }
 akuma-syscalls-time = { path = "../akuma-syscalls-time" }
-akuma-timer = { path = "../akuma-timer" }
+# The counter frequency, for `read-profile`'s histogram buckets only.
+akuma-timer = { path = "../akuma-timer", optional = true }
 akuma-vfs = { path = "../akuma-vfs" }
 akuma-vfs-glue = { path = "../akuma-vfs-glue" }
 akuma-virtio = { path = "../akuma-virtio" }
@@ -40,7 +45,7 @@ akuma-virtio = { path = "../akuma-virtio" }
 akuma-boot = { path = "../akuma-boot", optional = true }
 akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 spinning_top = "0.3"
-smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "socket-dns", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
+smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
 log = { version = "0.4", default-features = false }
 
 [features]
@@ -51,7 +56,7 @@ log = { version = "0.4", default-features = false }
 #
 # **The bin must therefore use `default-features = false`** — same as it does for
 # `akuma-net` — or an `extreme-size` build would silently gain smoltcp.
-default = ["smoltcp"]
+default = ["smoltcp", "exec", "akuma-native"]
 
 # Every one is forwarded from the bin, which owns the real definitions.
 sc-reboot = ["dep:akuma-boot"]
@@ -65,13 +70,23 @@ no-tests = []
 extreme = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 sc-aio = []
-sc-containers = []
+sc-containers = ["akuma-isolation/containers"]
 sc-epoll = []
 sc-pidfd = []
 sc-timerfd = []
-sc-eventfd = []
+sc-eventfd = ["dep:akuma-syscalls-eventfd"]
 rump = []
-read-profile = []
+# `execve` and Akuma's native `SPAWN`/`SPAWN_EXT`, which load through
+# `akuma-exec`'s ELF loader. The amd64 kernels load binaries themselves and
+# leave it off (the calls are then `ENOSYS` here); the AArch64 kernel enables it.
+exec = ["akuma-exec/elf-loader"]
+read-profile = ["dep:akuma-timer"]
+# Akuma's own syscall numbers (300-328 under asm-generic, `0x1000 +` that on
+# x86_64): `spawn`/`spawn_ext`/`waitpid`, the terminal and cursor calls,
+# `resolve_host`, `uptime`, `time`, `get_version`, `core_init`, the box stack.
+# libakuma's programs use them; a kernel that serves only the Linux ABI
+# (Taoxichuan, through `akuma-runtime-tokio`) leaves them off, and they are `ENOSYS`.
+akuma-native = []
 
 [lints]
 workspace = true

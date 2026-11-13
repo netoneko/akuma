@@ -38,17 +38,21 @@ after dropping the locks.
 
 Both are glue's adopted `dup` model, pinned at three layers: the crate's
 tests, `akuma-exec`'s `fdtable_characterization_tests`, and the amd64 boot
-suite (`amd64/src/fd.rs`: "a dup's cursor is independent", "a dup loses
+suite (`amd64/src/fd.rs`: "a dup's cursor is independent", "a dup keeps
 nonblock"):
 
 1. **`dup` copies the payload by value** — two descriptors on one file carry
    independent cursors. POSIX shares the open file description. The design
    that would fix it, and the reason it stayed a recommendation, is
    `docs/archive/AKUMA_FDTABLE_EXTRACTION.md` § "The dup fix".
-2. **`nonblock` is keyed by fd number** — `dup` of a non-blocking descriptor
-   loses the flag (`dup_to`/`sys_dup3` copies it; `dup`/`sys_dup` does not),
-   and an `alloc_fd_from` always clears both bits for the number it hands
-   out, so a closed fd's stale bit can never survive a reuse
+2. **`nonblock` is keyed by fd number** — every dup (`dup`, `dup2`/`dup3`,
+   `F_DUPFD`) *copies* the bit, so a dup starts non-blocking when its original
+   is, as on Linux; a later `F_SETFL` on one does not reach the other (Linux
+   shares the flag). Until 2026-11-01 `dup` and `F_DUPFD` dropped it, and tokio's
+   signal driver, which drains a dup of its non-blocking socketpair until
+   `EAGAIN`, parked forever (`docs/archive/DUP_LOST_O_NONBLOCK.md`). An
+   `alloc_fd_from` always clears both bits for the number it hands out, so a
+   closed fd's stale bit can never survive a reuse
    (`docs/archive/NCA_FD_NONBLOCK_TOCTOU.md`).
 
 ## Rules

@@ -1,0 +1,16 @@
+# Load-bearing - same reason as ../../nettest/rust/stdlib/.cargo/config.toml:
+# cargo walks UP from the crate directory, so without this file the probe
+# inherits the repo root's `aarch64-unknown-none` (the no_std kernel target,
+# which has no `std`) and the build fails.
+[build]
+target = "aarch64-unknown-linux-musl"
+
+[target.aarch64-unknown-linux-musl]
+linker = "aarch64-linux-musl-gcc"
+rustflags = ["-C", "link-arg=-static"]
+
+# amd64 (Taoxichuan, the amd64 kernel, bare metal): `ARCH=x86_64 ./build-musl.sh`
+# passes `--target` to select this one.
+[target.x86_64-unknown-linux-musl]
+linker = "x86_64-linux-musl-gcc"
+rustflags = ["-C", "link-arg=-static"]

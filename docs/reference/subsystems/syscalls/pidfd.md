@@ -41,13 +41,14 @@ real fd via `proc.alloc_fd`.
 
 `sys_pidfd_open(pid, flags)` (`pidfd.rs:40`, syscall 434):
 
-1. Rejects any flag outside `O_NONBLOCK | O_CLOEXEC` with `EINVAL`.
+1. Rejects any flag but `PIDFD_NONBLOCK` (= `O_NONBLOCK`) with `EINVAL`, `O_CLOEXEC` included, as
+   Linux does ([`archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md`](../../../archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md)).
 2. Requires `get_child_channel(pid)` to exist — i.e. `pid` must be a live or
    recently-exited **child** of the caller. Returns `ESRCH` if not; Akuma
    can't distinguish Linux's "no such pid" from "exists but isn't my child"
    here, so it always reports `ESRCH` rather than guessing `EINVAL`.
-3. Creates the table entry, allocates an fd, applies `O_CLOEXEC`/
-   `O_NONBLOCK` from `flags`, and logs `[pidfd] open pid=... → fd=...`.
+3. Creates the table entry, allocates an fd, always sets close-on-exec,
+   applies `O_NONBLOCK` from `flags`, and logs `[pidfd] open pid=... → fd=...`.
 
 ## Background
 

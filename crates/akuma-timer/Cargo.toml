@@ -14,4 +14,8 @@ workspace = true
 # instead of at every call site. Zero dependencies of its own.
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-kacho = { path = "../akuma-kacho" }
+
+# AArch64 only: the PL031 is QEMU virt's RTC; amd64 reads the CMOS clock
+# (`akuma-cmos-rtc`).
+[target.'cfg(target_arch = "aarch64")'.dependencies]
 arm_pl031 = { version = "0.2", default-features = false }

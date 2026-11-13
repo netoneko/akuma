@@ -79,6 +79,23 @@ impl<'a> SteppedMmioTransport<'a> {
     }
 }
 
+impl SteppedMmioTransport<'static> {
+    /// A `virtio-drivers` transport over the slot an in-tree [`crate::mmio::Transport`]
+    /// already validated. Only the sound driver still needs one.
+    #[must_use]
+    pub fn over(t: &crate::mmio::Transport) -> Option<Self> {
+        let header = core::ptr::NonNull::new(t.base() as *mut virtio_drivers::transport::mmio::VirtIOHeader)?;
+        // virtio-drivers 0.13 bounds the config space by the region size: the
+        // machine's slot stride (0x200 on QEMU virt, 0x1000 under Firecracker).
+        let size = akuma_primitives::addr::virtio_stride();
+        // SAFETY: `header` is the base of a virtio-mmio slot in the kernel's device
+        // mapping, which `crate::mmio::Transport::at_slot` checked shows the magic
+        // and version 2.
+        let inner = unsafe { MmioTransport::new(header, size) }.ok()?;
+        Some(Self::new(inner))
+    }
+}
+
 impl Transport for SteppedMmioTransport<'_> {
     /// The one method that is not a plain delegation.
     ///

@@ -34,7 +34,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BUDGET = os.path.join(ROOT, "docs", "reference", "unsafe-budget.json")
-PATHS = ["src", "crates", "amd64"]
+PATHS = ["src", "crates", "amd64", os.path.join("taoxichuan", "src")]
 
 
 def measure():

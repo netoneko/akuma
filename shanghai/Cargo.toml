@@ -1,0 +1,14 @@
+[package]
+name = "shanghai"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel", features = ["no-tests"] }
+
+[[bin]]
+name = "shanghai"
+path = "src/main.rs"

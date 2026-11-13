@@ -232,7 +232,7 @@ impl VirtioSmoltcpDevice {
     /// With `net-noalloc` the frame is staged directly in a ring slot and
     /// submitted with `transmit_begin`, which returns immediately; the device's
     /// completion is reaped on a later pass. Without it, every frame goes
-    /// through `VirtIONetRaw::send`, which spins until the host consumes the
+    /// through `NetRaw::send`, which spins until the host consumes the
     /// descriptor — 20-26 us per packet with `NETWORK` held and IRQs masked
     /// (`docs/archive/AKUMA_NET_ISSUES.md` §3.2).
     /// `pub(crate)` for the same reason as [`Self::take_rx_frame`] — the
@@ -271,7 +271,7 @@ impl VirtioSmoltcpDevice {
             // Every slot was still in flight after `CLAIM_SPINS` reaps. The
             // frame is dropped — smoltcp retransmits — but `consume`'s contract
             // still requires the fill closure to run, so it writes into a buffer
-            // nothing reads. Falling back to `VirtIONetRaw::send` here would be
+            // nothing reads. Falling back to `NetRaw::send` here would be
             // a bug, not a slow path: see `TxRing::claim`.
             //
             // A diverted (loopback) frame is unaffected by NIC saturation, so it

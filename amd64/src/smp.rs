@@ -326,7 +326,7 @@ pub fn need_resched() -> bool {
 //   tracked a per-core recursion depth and transferred it between tasks on a
 //   switch; `KernelLock` is reentrant by owner core, so a nested `enter_kernel`
 //   is a no-op and there is no depth to transfer (`sched.rs`'s
-//   `hook_transfer_lock_depth` is a no-op now, and `Machine::bkl_depth` is
+//   `Platform::transfer_lock_depth` is a no-op now, and `Machine::bkl_depth` is
 //   gone). Every `bkl_enter` on this target arrives *from ring 3* and every
 //   `bkl_leave` goes *to* it — verified site by site — so "depth > 1" never
 //   existed; what the depth simulated ("a task born in kernel code holds
@@ -960,12 +960,12 @@ fn enable_sse() {
 /// machine. Set by the BSP in `early_init`, before the scheduler can switch, and
 /// read by `sched.rs` to choose `xsave64` over `fxsave64` — one flag for every
 /// core, because the parts this boots on are homogeneous.
-pub static XSAVE_ON: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+pub use akuma_sched_amd64::XSAVE_ON;
 
 /// `XCR0` value this kernel enables: x87 (bit 0), SSE (1), AVX (2). Its
 /// `xsave` area is 832 bytes (512 legacy + 64 header + 256 `ymm` upper
 /// halves), which `sched.rs::XsArea` is sized for. AVX-512 state is left off.
-pub const XCR0_ENABLED: u64 = 0b111;
+pub use akuma_sched_amd64::XCR0_ENABLED;
 
 /// Turn on `CR4.OSXSAVE` and set `XCR0` to [`XCR0_ENABLED`], if cpuid says the
 /// part has XSAVE and AVX. Per core (CR4 and XCR0 are), so the BSP and every AP

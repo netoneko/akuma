@@ -28,12 +28,14 @@
 //! | file offset (`KernelFile::position`) | the payload `D` itself | the description |
 //!
 //! The two flag sets are keyed by **fd number**, not by description. That is a
-//! pinned divergence from POSIX (where both flags live on the open file
-//! description and `dup` shares them), adopted by `akuma-syscalls-glue`'s
-//! table and pinned by the boot suite (`amd64/src/fd.rs`: "a dup loses
-//! nonblock") and by `akuma-exec`'s characterization tests. [`FdTable::dup_to`]
-//! copies the non-blocking bit old→new the way glue's `sys_dup3` does, and
-//! [`FdTable::dup`] does not copy it the way glue's `sys_dup` does not;
+//! pinned divergence from POSIX, where `O_NONBLOCK` lives on the open file
+//! description and every dup *shares* it. Every dup here (`dup`, `dup2`/`dup3`,
+//! `F_DUPFD`) **copies** the non-blocking bit old→new, so a dup starts with the
+//! flag, as on Linux; what still differs is a later `fcntl(F_SETFL)` on one of
+//! the two, which the other does not see. (Until 2026-11-01 `dup` and
+//! `F_DUPFD` dropped the bit, and tokio's signal driver - which drains a dup of
+//! its non-blocking socketpair until `EAGAIN` - parked forever;
+//! `docs/archive/DUP_LOST_O_NONBLOCK.md`.)
 //! [`FdTable::alloc_fd_from`] clears both bits for the number it hands out, so
 //! a stale flag can never survive a close-reuse cycle
 //! (`docs/archive/NCA_FD_NONBLOCK_TOCTOU.md`).
@@ -248,15 +250,17 @@ impl<'t, D> FdTable<'t, D> {
     /// `clone_fd_refs`), exactly once, before any close of either name can
     /// run. `None` when `oldfd` names nothing (`EBADF`).
     ///
-    /// The non-blocking bit is **not** copied: it is keyed by number and this
-    /// is the composition glue's `sys_dup` performs (pinned divergence; see
-    /// the module doc).
+    /// The non-blocking bit is copied old→new (the description's flag on
+    /// Linux, which a dup shares; see the module doc).
     pub fn dup(&mut self, old: u32) -> Option<Dup<D>>
     where
         D: Clone,
     {
         let payload = self.names.get(&old)?.clone();
         let fd = self.alloc_fd_from(0, payload.clone());
+        if self.nonblock.contains(&old) {
+            self.nonblock.insert(fd);
+        }
         Some(Dup { fd, payload })
     }
 
@@ -300,8 +304,8 @@ impl<'t, D> FdTable<'t, D> {
 
     /// `fcntl(oldfd, F_DUPFD | F_DUPFD_CLOEXEC, min)`: copy `oldfd`'s payload
     /// to the lowest free number at or above `min_fd`. `cloexec_flag` selects
-    /// `F_DUPFD_CLOEXEC`'s marking; the non-blocking bit is not copied (same
-    /// pinned per-number rule as [`Self::dup`]). `None` is `EBADF`.
+    /// `F_DUPFD_CLOEXEC`'s marking; the non-blocking bit is copied, as in
+    /// [`Self::dup`]. `None` is `EBADF`.
     pub fn dup_min(&mut self, old: u32, min_fd: u32, cloexec_flag: bool) -> Option<Dup<D>>
     where
         D: Clone,
@@ -310,6 +314,9 @@ impl<'t, D> FdTable<'t, D> {
         let fd = self.alloc_fd_from(min_fd, payload.clone());
         if cloexec_flag {
             self.cloexec.insert(fd);
+        }
+        if self.nonblock.contains(&old) {
+            self.nonblock.insert(fd);
         }
         Some(Dup { fd, payload })
     }
@@ -560,7 +567,7 @@ mod tests {
     }
 
     #[test]
-    fn dup_copies_by_value_to_the_lowest_number_without_the_nonblock_bit() {
+    fn dup_copies_by_value_to_the_lowest_number_with_the_nonblock_bit() {
         let mut parts = table();
         with_stdio(&mut parts);
         let mut t = view(&mut parts);
@@ -569,11 +576,13 @@ mod tests {
         let d = t.dup(3).expect("dup of an open fd");
         assert_eq!(d.fd, 4, "the lowest free number");
         assert_eq!(d.payload, 7, "the copy, for the caller's reference bump");
-        assert!(!t.is_nonblock(4), "a fresh number has no stale bits");
-        t.set_nonblock(3);
+        assert!(t.is_nonblock(4), "the dup starts with the flag, as on Linux");
+        t.clear_nonblock(3);
         let d = t.dup(3).expect("dup again");
         assert_eq!(d.fd, 5);
-        assert!(!t.is_nonblock(5), "PINNED DIVERGENCE: the dup does not inherit the flag");
+        assert!(!t.is_nonblock(5), "a blocking original dups to a blocking copy");
+        t.set_nonblock(3);
+        assert!(!t.is_nonblock(5), "PINNED DIVERGENCE: a later F_SETFL does not reach the dup");
         assert!(t.dup(99).is_none(), "EBADF");
     }
 
@@ -613,6 +622,9 @@ mod tests {
         let d = t.dup_min(3, 4, true).expect("F_DUPFD_CLOEXEC");
         assert_eq!(d.fd, 4, "the floor is a floor, not a fixed address");
         assert!(t.is_cloexec(4));
+        t.set_nonblock(3);
+        let d = t.dup_min(3, 20, true).expect("F_DUPFD_CLOEXEC of a non-blocking fd");
+        assert!(t.is_nonblock(d.fd), "the flag comes with it (tokio's try_clone)");
         assert!(t.dup_min(99, 0, false).is_none(), "EBADF");
     }
 

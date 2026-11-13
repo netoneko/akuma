@@ -83,10 +83,31 @@ re-add what they need. `Cargo.toml:361-369`.
 
 | Feature | Effect | Source |
 |---|---|---|
-| `sound` | virtio-sound output (`/dev/dsp`). | `Cargo.toml:321` |
+| `sound` | virtio-sound output (`/dev/dsp`). The only thing that still compiles `virtio-drivers` (and `zerocopy`, `safe-mmio`, `bitflags` 2, `thiserror`): block and net are driven in-tree (`archive/AKUMA_VIRTIO_IN_TREE.md`). | `Cargo.toml` |
 | `extreme` | Profile discriminator for build.rs (tighter IMAGE_SIZE/stack). | `Cargo.toml:337` |
 | `fs-cache` | Large ext2 block cache (clock eviction) — keeps toolchain resident across spawns. **In `default`**, so any build that doesn't pass `--no-default-features` has it. Cap set at mount by `src/fs.rs` as `min(RAM/8, 384 MB)`. Observe it via the `[FSCACHE]` PSTATS line. Not combinable with `extreme`. | `Cargo.toml:356` |
 | `no-tests` | Drops boot self-test suites; sets `akuma-net/small-sockets`. | `Cargo.toml:125` |
+
+### Crate features the amd64 kernels leave off
+
+Not bin features: each is a crate's own, turned on by the AArch64 kernel's manifests and left off by `akuma-amd64` and
+Taoxichuan, which load binaries with their own loaders and reach `akuma-exec` only through `Process::install_image`.
+
+| Feature | Effect | Source |
+|---|---|---|
+| `akuma-exec/elf-loader` | The ELF loader: the `akuma-elf` (+ `elf`) dependency and its `elf_loader` re-export, `Process::from_elf*`, `replace_image*`, the `spawn_process*` / `exec*` helpers, and `embedded-io-async`. Off, `ImageInstall::deferred_segments` takes an uninhabited `DeferredLazySegment`, so it can only be `&[]`. Turned on by the bin, `akuma-kernel-glue` (herd/sshd/rump spawns) and `akuma-exceptions` (`INTERP_BASE`). Off saves Taoxichuan ~5,400 audit lines. | `crates/akuma-exec/Cargo.toml` |
+| `akuma-syscalls-glue/exec` | `execve` and the native `SPAWN`/`SPAWN_EXT` (and their helpers); forwards `akuma-exec/elf-loader`. In glue's `default`, and named explicitly by the bin (which uses `default-features = false`). Off, the three numbers fall to `ENOSYS`. | `crates/akuma-syscalls-glue/Cargo.toml` |
+
+### Crate features Taoxichuan leaves off
+
+Turned on by both other kernels, left off by Taoxichuan, which serves only the Linux ABI through `akuma-runtime-tokio`.
+What a tokio program calls, and so what may be left off, is measured by B10's census
+([`../../archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md`](../../archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md)).
+
+| Feature | Effect | Source |
+|---|---|---|
+| `akuma-syscalls-glue/akuma-native` | Akuma's own numbers (asm-generic 300-328; `0x1000 +` that on x86_64): `spawn`, `spawn_ext`, `waitpid`, `kill`, the terminal and cursor calls, `resolve_host`, `uptime`, `time`, `get_version`, `core_init`, `set_box_stack`, `close_child_stdin`, `set_tpidr_el0`. libakuma's programs use them. In glue's `default`; named by the bin and `akuma-amd64`. Off, the numbers fall to `ENOSYS`. `spawn`/`spawn_ext` also need `exec`. | `crates/akuma-syscalls-glue/Cargo.toml` |
+| `akuma-runtime-tokio/shell` | Not a tokio feature: the 23 calls glue serves that a shell and its tools make and no tokio program does (job control, the other ids, limits and accounting, `sync`, `membarrier`, the clock and hostname setters). Taoxichuan's own `shell` feature (in its `default`) turns it on; `--no-default-features` builds a kernel that serves only the tokio surface. | `crates/akuma-runtime-tokio/Cargo.toml`, `taoxichuan/Cargo.toml` |
 
 `userspace-sshd` and `many-sessions` are documented under
 [Networking stack](#networking-stack) above, alongside the other

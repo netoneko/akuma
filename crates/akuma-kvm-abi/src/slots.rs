@@ -5,7 +5,8 @@
 //! slice of the reserved block and **remaps the VMM's range onto it**, so a slot records both: where the
 //! VMM sees the memory and which offset of the slice backs it. The nested page table then maps
 //! `gpa -> slice base + slice offset` with 2 MiB leaves, which is why `gpa`, `size` and the slice
-//! offset must be 2 MiB aligned and the guest bounded as `kvm0`'s RAM is (<= 1 GiB).
+//! offset must be 2 MiB aligned and the guest bounded as the NPT covers it: 4 GiB of RAM laid out
+//! by `akuma_svm_amd64::rammap` — below, above, never across the device window.
 
 use crate::{rd32, rd64};
 
@@ -13,8 +14,15 @@ pub const ARG_LEN: usize = 32;
 pub const MAX_SLOTS: usize = 8;
 /// NPT leaf size.
 pub const LEAF: u64 = 2 << 20;
-/// The guest-physical ceiling the nested page table covers (one directory of 2 MiB leaves).
-pub const GPA_LIMIT: u64 = 1 << 30;
+/// The guest-physical ceiling the nested page table covers: RAM of 4 GiB laid out by
+/// `akuma_svm_amd64::rammap` — three GiB below the device window and one GiB above it —
+/// ends by 5 GiB.
+pub const GPA_LIMIT: u64 = 5 << 30;
+/// The device window `[DEVICE_WINDOW_BASE, DEVICE_WINDOW_END)` (`3..4` GiB): the
+/// virtio-mmio page at `0xD000_0000` and the local-APIC page at `0xFEE0_0000` live here,
+/// so no memslot may sit in or cross it.
+pub const DEVICE_WINDOW_BASE: u64 = 3 << 30;
+pub const DEVICE_WINDOW_END: u64 = 4 << 30;
 /// The VMM's range must be page aligned.
 pub const PAGE: u64 = 4096;
 
@@ -40,7 +48,8 @@ pub enum Refused {
     Slot,
     /// Any flag set (dirty logging, read-only): not supported.
     Flags,
-    /// `gpa`/`size` not 2 MiB aligned, size zero, or beyond [`GPA_LIMIT`].
+    /// `gpa`/`size` not 2 MiB aligned, size zero, beyond [`GPA_LIMIT`], or in/crossing
+    /// the device window.
     Geometry,
     /// `uaddr` not page aligned, or the user range wraps / leaves the user half.
     UserRange,
@@ -79,6 +88,12 @@ impl Table {
         }
         let end = r.gpa.checked_add(r.size).ok_or(Refused::Geometry)?;
         if r.size == 0 || !r.gpa.is_multiple_of(LEAF) || !r.size.is_multiple_of(LEAF) || end > GPA_LIMIT {
+            return Err(Refused::Geometry);
+        }
+        // The device window is devices', not RAM's: a slot in or across it would map
+        // leaves over the virtio-mmio and local-APIC pages. Ending exactly at its base
+        // is RAM up to the window, and allowed.
+        if r.gpa < DEVICE_WINDOW_END && end > DEVICE_WINDOW_BASE {
             return Err(Refused::Geometry);
         }
         let uend = r.uaddr.checked_add(r.size).ok_or(Refused::UserRange)?;

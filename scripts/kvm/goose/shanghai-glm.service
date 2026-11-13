@@ -1,0 +1,15 @@
+[Unit]
+Description=goose (GLM) one-shot starter: fires the Shanghai brief once, a few minutes after boot
+Documentation=file:/root/akuma-handoff/scripts/kvm/goose/shanghai-01-new-kernel.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/shanghai_glm_starter.sh
+User=root
+# goose may work for hours; the starter must never be killed by a start timeout.
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

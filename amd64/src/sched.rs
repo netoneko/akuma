@@ -74,10 +74,8 @@ use crate::usermode::UserCtx;
 // because that is where the type lives and this file needs nothing else from
 // the bigger crate; the two paths name one struct.
 use akuma_exec_core::process::UserContext;
-use alloc::vec::Vec;
-use akuma_primitives::OnceCopy;
 use akuma_primitives::cell::BorrowCell;
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Per-thread kernel stack. Generous: these are `Vec` allocations from a large
 /// heap, and a stack overflow here has no guard page to catch it.
@@ -98,285 +96,15 @@ pub const STACK_SIZE: usize = 32 * 1024;
 /// nothing.
 pub const MAX_TASKS: usize = akuma_primitives::preempt::MAX_THREADS;
 
-/// One thread's x87/SSE/AVX register file, in `xsave` (standard-format) layout.
-///
-/// The kernel is soft-float and never touches these registers, so a thread's
-/// SSE state used to survive a preemption by accident: whatever was in the xmm
-/// registers when the tick landed was still there when it resumed — *on the
-/// same core*. A thread that resumes on another core finds that core's
-/// registers instead, and a thread interleaved with a second SSE-using process
-/// on one core never had that luck. Saved and restored around every switch.
-///
-/// 832 bytes = 512 legacy (`fxsave` layout, which is also what a machine
-/// without XSAVE uses — only the first 512 are touched then) + 64 `xsave`
-/// header + 256 for the `ymm` upper halves, i.e. `XCR0 = 0b111`
-/// (`smp::XCR0_ENABLED`). 64-byte aligned as `xsave64` requires.
-#[repr(C, align(64))]
-#[derive(Clone, Copy)]
-pub struct FxArea([u8; 832]);
+/// The FP state of one thread and the instructions that move it: `akuma-sched-amd64`'s.
+pub use akuma_sched_amd64::{FxArea, fpu_reset_live, fpu_restore_live, fpu_save_live};
 
-impl FxArea {
-    /// Bytes of the image, in `xsave` standard-format layout: 512 legacy
-    /// (`fxsave`), the 64-byte header at 512, `ymm` upper halves at 576.
-    pub const SIZE: usize = 832;
-    /// `MXCSR`'s offset in the legacy area.
-    const MXCSR: usize = 24;
-    /// `MXCSR_MASK`'s offset in the legacy area — written by `fxsave`; `0`
-    /// means the pre-SSE2 default mask applies.
-    const MXCSR_MASK: usize = 28;
-    /// `XSTATE_BV`'s offset: which components the image holds.
-    const XSTATE_BV: usize = 512;
-    /// `XCOMP_BV`'s offset: must be 0 for the standard (non-compacted) form.
-    const XCOMP_BV: usize = 520;
-    /// The header's reserved tail, which `xrstor` requires to be zero.
-    const HEADER_RESERVED: core::ops::Range<usize> = 528..576;
-    /// Default `MXCSR_MASK` when the CPU reports 0 (Intel SDM, `FXRSTOR`).
-    const MXCSR_MASK_DEFAULT: u32 = 0xFFBF;
+/// The per-slot machine record: `akuma-sched-amd64`'s, over this kernel's `UserCtx`.
+type Machine = akuma_sched_amd64::Machine<UserCtx>;
 
-    /// An all-zero image. Not a valid *state* to load — `MXCSR` 0 unmasks every
-    /// SSE exception — but the right starting point for an `xsave`, whose
-    /// header must not carry a previous image's bits.
-    pub const fn zeroed() -> Self {
-        Self([0; 832])
-    }
-
-    /// The state a guest or a fresh program starts with ([`FxArea::initial`]).
-    pub const fn reset_state() -> Self {
-        Self::initial()
-    }
-
-    /// The 512-byte `fxsave` legacy area: x87 and SSE state, the part a guest without `XSAVE` uses.
-    pub fn legacy_mut(&mut self) -> &mut [u8] {
-        &mut self.0[..512]
-    }
-    /// The reset state a program expects: x87 control word `0x37F`, `MXCSR`
-    /// `0x1F80` (every SSE exception masked). Not all-zero: an all-zero `MXCSR`
-    /// unmasks every exception, and the first inexact result in ring 3 would
-    /// raise `#XM` — an "unhandled vector" halt, from a program that did
-    /// nothing wrong. `XSTATE_BV` (header offset 0) says x87+SSE are live so
-    /// `xrstor` loads the values above; AVX is in its init state (all zero).
-    const fn initial() -> Self {
-        let mut a = [0u8; 832];
-        a[0] = 0x7F;
-        a[1] = 0x03;
-        a[24] = 0x80;
-        a[25] = 0x1F;
-        a[512] = 0b11;
-        Self(a)
-    }
-
-    /// Make an image a ring-3 program handed back through `rt_sigreturn` safe
-    /// to `xrstor`/`fxrstor`.
-    ///
-    /// Both instructions take a `#GP` — **in ring 0**, on the path that is
-    /// restoring the frame — for exactly four things in the image: reserved
-    /// `MXCSR` bits set, `XSTATE_BV` naming a component `XCR0` does not enable,
-    /// a non-zero `XCOMP_BV` (the compacted form, which the standard-form
-    /// `xrstor` refuses) and a non-zero reserved header. Everything else in the
-    /// image is the program's own business: a garbage x87 control word hurts
-    /// only the program that supplied it. Linux's `restore_sigcontext` filters
-    /// the same four (`validate_user_xstate_header`, the `mxcsr` mask).
-    pub fn sanitize(&mut self) {
-        let mask = mxcsr_mask();
-        let mxcsr = u32::from_le_bytes(self.0[Self::MXCSR..Self::MXCSR + 4].try_into().unwrap()) & mask;
-        self.0[Self::MXCSR..Self::MXCSR + 4].copy_from_slice(&mxcsr.to_le_bytes());
-        self.0[Self::MXCSR_MASK..Self::MXCSR_MASK + 4].copy_from_slice(&mask.to_le_bytes());
-        if smp::XSAVE_ON.load(Ordering::Relaxed) {
-            let bv = u64::from_le_bytes(self.0[Self::XSTATE_BV..Self::XSTATE_BV + 8].try_into().unwrap())
-                & smp::XCR0_ENABLED;
-            self.0[Self::XSTATE_BV..Self::XSTATE_BV + 8].copy_from_slice(&bv.to_le_bytes());
-            self.0[Self::XCOMP_BV..Self::XCOMP_BV + 8].fill(0);
-            self.0[Self::HEADER_RESERVED].fill(0);
-        }
-    }
-}
-
-/// The CPU's `MXCSR_MASK`: which `MXCSR` bits may be set at all. Read once
-/// from an `fxsave` image (that is how the SDM says to discover it) and cached;
-/// `0` in the image means the default.
-static MXCSR_MASK: AtomicU32 = AtomicU32::new(0);
-
-fn mxcsr_mask() -> u32 {
-    let cached = MXCSR_MASK.load(Ordering::Relaxed);
-    if cached != 0 {
-        return cached;
-    }
-    let mut probe = FxArea::zeroed();
-    // SAFETY: a 64-byte-aligned 832-byte buffer; `fxsave64` writes its 512-byte
-    // image and nothing else, and reading the FPU state changes nothing.
-    unsafe {
-        core::arch::asm!("fxsave64 [{out}]", out = in(reg) probe.0.as_mut_ptr(), options(nostack, preserves_flags));
-    }
-    let raw = u32::from_le_bytes(probe.0[FxArea::MXCSR_MASK..FxArea::MXCSR_MASK + 4].try_into().unwrap());
-    let mask = if raw == 0 { FxArea::MXCSR_MASK_DEFAULT } else { raw };
-    MXCSR_MASK.store(mask, Ordering::Relaxed);
-    mask
-}
-
-/// Save the **live** x87/SSE/AVX register file into `out`.
-///
-/// For signal delivery: the kernel is soft-float, so between a trap from ring 3
-/// and this call the registers still hold what the interrupted instruction left
-/// in them, and a context switch in between saved and restored them around the
-/// other thread (`hook_switch_to`). `out` must be zeroed or a previous image —
-/// `xsave64` does not read it, but a stale header in a buffer that is then only
-/// partly rewritten would be a lie.
-pub fn fpu_save_live(out: &mut FxArea) {
-    // SAFETY: `out` is a 64-byte-aligned 832-byte buffer sized for `XCR0 =
-    // 0b111`'s standard-format image, which is all that is requested.
-    unsafe {
-        if smp::XSAVE_ON.load(Ordering::Relaxed) {
-            core::arch::asm!(
-                "xsave64 [{out}]",
-                out = in(reg) out.0.as_mut_ptr(),
-                in("eax") smp::XCR0_ENABLED as u32,
-                in("edx") 0u32,
-                options(nostack, preserves_flags)
-            );
-        } else {
-            core::arch::asm!("fxsave64 [{out}]", out = in(reg) out.0.as_mut_ptr(), options(nostack, preserves_flags));
-        }
-    }
-}
-
-/// Load `inp` into the live register file.
-///
-/// **`inp` must have been through [`FxArea::sanitize`]** if any byte of it came
-/// from ring 3 — see there for the four ways an unsanitized image is a ring-0
-/// `#GP`. The kernel's own images (`FxArea::initial`) are valid by construction.
-pub fn fpu_restore_live(inp: &FxArea) {
-    // SAFETY: as `fpu_save_live`, with the direction reversed; the validity
-    // obligation on the image is the caller's and is stated above.
-    unsafe {
-        if smp::XSAVE_ON.load(Ordering::Relaxed) {
-            core::arch::asm!(
-                "xrstor64 [{inp}]",
-                inp = in(reg) inp.0.as_ptr(),
-                in("eax") smp::XCR0_ENABLED as u32,
-                in("edx") 0u32,
-                options(nostack, preserves_flags)
-            );
-        } else {
-            core::arch::asm!("fxrstor64 [{inp}]", inp = in(reg) inp.0.as_ptr(), options(nostack, preserves_flags));
-        }
-    }
-}
-
-/// Put the live register file into the state a fresh program starts with —
-/// what a signal handler is entered with, as on Linux (`fpu__clear_user_states`).
-pub fn fpu_reset_live() {
-    static INITIAL: FxArea = FxArea::initial();
-    fpu_restore_live(&INITIAL);
-}
-
-/// The machine state `akuma-threading` deliberately knows nothing about, one
-/// entry per crate thread slot.
-///
-/// Everything the *scheduler* needs — state, context, wake flags, deadlines,
-/// generation, `ON_CPU` — is in the crate. This is only what a switch has to
-/// install on the CPU, plus the three scheduling *facts* the crate asks about
-/// through [`akuma_threading::X86ArchHooks::can_run`].
-struct Machine {
-    /// Page-table root to install when this thread runs. `0` means "the
-    /// kernel's", which is what every kernel thread uses.
-    space_root: AtomicU64,
-    /// Where the syscall path saves this thread's stacks. A [`BorrowCell`] rather
-    /// than a bag of atomics because the syscall assembly addresses it by offset
-    /// through [`BorrowCell::as_ptr`]; the cell cannot see that, and the BKL
-    /// protocol is what keeps the assembly and Rust off the same slot.
-    uctx: BorrowCell<UserCtx>,
-    /// Stack the CPU switches to when this thread traps from ring 3.
-    trap_stack_top: AtomicU64,
-    /// This slot's kernel stack and its trap stack, once it has been given them.
-    ///
-    /// Kept so a **recycled** slot reuses the stacks it already owns. Without
-    /// these, reclaiming a slot would `leak()` two fresh 32 KiB stacks every
-    /// time and turn a slot leak into a memory leak — strictly worse than the
-    /// exhaustion it was meant to fix. Set once, never replaced.
-    stacks: OnceCopy<Stacks>,
-    /// This thread's SSE/x87 registers while it is not running. Handed to
-    /// `xsave`/`xrstor` by pointer.
-    fx: BorrowCell<FxArea>,
-    /// Runs for the life of the kernel and never finishes — the netpoll loop,
-    /// and every core's idle thread. [`all_user_tasks_finished`] ignores these
-    /// so the boot's drive loop still ends when the *shell* exits rather than
-    /// spinning against a thread that is alive on purpose.
-    daemon: AtomicBool,
-    /// The thread that runs a core when nothing else will. Never chosen by the
-    /// round-robin scan; switched to explicitly, by its own core.
-    idle: AtomicBool,
-    /// The only core allowed to run this thread, or [`NO_CPU`]. The boot thread
-    /// is pinned to the boot core — it drives the self-tests against that core's
-    /// LAPIC — and every idle thread to its own.
-    pinned: AtomicU32,
-    /// The cores this thread may use (`sched_setaffinity`; bit `c` = core `c`), or 0 for any.
-    /// Inherited by every slot this thread creates ([`prepare_task_slot`]); the decision is
-    /// `akuma_vm_spec::affinity::can_run`.
-    affinity: AtomicU64,
-}
-
-/// A thread's two stacks, as memory the kernel owns and the CPU also writes.
-///
-/// Words of `AtomicU64` rather than bytes: the stack is used by running code
-/// through the stack pointer, which Rust cannot see, so the allocation is
-/// `UnsafeCell`-shaped from the start — and that is what lets the canary at its
-/// base be read and written through a shared reference with no `unsafe`. The
-/// stack proper is addressed by [`Stacks::kernel_base`] / [`Stacks::trap_base`],
-/// which are only numbers handed to the context switch.
-#[derive(Clone, Copy)]
-struct Stacks {
-    kernel: &'static [AtomicU64],
-    trap: &'static [AtomicU64],
-}
-
-impl Stacks {
-    /// Two fresh zeroed stacks, leaked: a thread's stack must outlive the frame
-    /// that made it. Bounded by `MAX_TASKS`, because a slot is given its pair once.
-    fn leak_new() -> Self {
-        fn one() -> &'static [AtomicU64] {
-            let words: Vec<AtomicU64> = (0..STACK_SIZE / 8).map(|_| AtomicU64::new(0)).collect();
-            // No alignment is promised beyond 8, and none is needed: the context
-            // builder masks the entry slot to 16 (`x86_build_closure_context`)
-            // and the trap stack's top is masked below.
-            words.leak()
-        }
-        Self { kernel: one(), trap: one() }
-    }
-
-    fn kernel_base(self) -> usize {
-        self.kernel.as_ptr() as usize
-    }
-
-    fn trap_base(self) -> usize {
-        self.trap.as_ptr() as usize
-    }
-}
-
-impl Machine {
-    const fn empty() -> Self {
-        Self {
-            space_root: AtomicU64::new(0),
-            uctx: BorrowCell::new(UserCtx::new()),
-            trap_stack_top: AtomicU64::new(0),
-            stacks: OnceCopy::new(),
-            fx: BorrowCell::new(FxArea::initial()),
-            daemon: AtomicBool::new(false),
-            idle: AtomicBool::new(false),
-            pinned: AtomicU32::new(NO_CPU),
-            affinity: AtomicU64::new(0),
-        }
-    }
-}
-
-/// The machine table, indexed by crate thread slot.
-///
-/// A plain `static`, not a `static mut`: the scalars a switch and the picker read
-/// are atomics (relaxed — the same `mov` the raw-pointer reads compiled to), and
-/// the two records the CPU and the assembly touch are [`BorrowCell`]s. Every
-/// writer is kernel code, kernel code holds the BKL, and a switch keeps it held,
-/// so the table sees one core at a time; what the types add is that a violation
-/// is a panic and not a data race. An out-of-range slot is a bounds-check panic.
-static MACHINE: [Machine; MAX_TASKS] = [const { Machine::empty() }; MAX_TASKS];
+/// The machine table, indexed by crate thread slot. Every writer is kernel code, kernel code holds
+/// the BKL, and a switch keeps it held, so the table sees one core at a time.
+static MACHINE: [Machine; MAX_TASKS] = [const { Machine::new(UserCtx::new()) }; MAX_TASKS];
 
 /// Page-frame bits of a page-table root, matching what `akuma-mmu` records in
 /// its freed-L0 ring. `CR3`'s low 12 bits are flags (`PWT`/`PCD`) and the top
@@ -402,268 +130,130 @@ fn current() -> usize {
     smp::current_task()
 }
 
-// ---------------------------------------------------------------------------
-// The hooks: everything `akuma-threading` cannot do for itself on this target
-// ---------------------------------------------------------------------------
+/// This kernel, as `akuma-sched-amd64` sees it: the facts a switch needs (page tables, the TSS,
+/// the per-CPU block) and the diagnostics this kernel wires to its own counters and console.
+struct Amd64;
 
-/// Install `to`'s machine state on this core, with `from` still current and
-/// before the stack moves.
-///
-/// The order inside is the contract, and every line of it was a bug once:
-///
-/// - `CR3` **before** the switch — every address space shares the kernel's
-///   upper-half mappings, so the stack and the code stay mapped across the
-///   write. Written only when the root actually changes: "same value" used to
-///   be treated as "maybe a different address space" — a freed root frame can
-///   be the next process's root (see [`finish`]) — so the write doubled as an
-///   unconditional TLB flush. That hazard is closed upstream of here:
-///   `free_or_defer_as_frames` refuses to free an L0 that any core's live
-///   `CR3` (`any_core_on_l0`, fed by `paging::activate`'s publish on *every*
-///   write, line-checked against this core) or any saved context still
-///   references — it parks the frames instead. So `want == active_root()`
-///   proves the root frame was never freed under us, i.e. it is the *same
-///   live address space* and there is nothing to flush. Kernel-root →
-///   kernel-root and sibling-thread switches skip the `mov cr3` entirely;
-///   the `[SWITCH FREED-CR3]` tripwire below still runs on every switch-in.
-///   Only kernel-root to kernel-root skipped it before this refinement.
-/// - `%fs` restored only when set. `IA32_FS_BASE` is one per-core register and
-///   `arch_prctl` is its only writer, so a thread that set it keeps its value
-///   only as long as nothing else runs. A shell and the child it forked each
-///   have their own TLS; without this the child's `execve` leaves the parent on
-///   the child's base.
-/// - `%gs` restored **unconditionally**, because the kernel's own `%gs` is the
-///   other half of the pair and a stale user value would follow a thread that
-///   never set one onto another core.
-/// - `fxsave` of `from` before `fxrstor` of `to`, for the reason [`FxArea`]
-///   gives.
-fn hook_switch_to(from: usize, to: usize) {
-    // Switch-in bookkeeping, before any of the machine effects: this is the one
-    // point every resume of every slot passes through, so a slot with
-    // `SWITCH_INS == 0` provably never ran. See [`dump_slot_table`].
-    if to < MAX_TASKS {
-        SWITCH_INS[to].fetch_add(1, Ordering::Relaxed);
-        LAST_CORE[to].store(smp::cpu_index() as u32, Ordering::Relaxed);
+impl akuma_sched_amd64::Platform for Amd64 {
+    type User = UserCtx;
+    const STACK_SIZE: usize = STACK_SIZE;
+
+    fn machines() -> &'static [Machine] {
+        &MACHINE
     }
-    let (from_m, to_m) = (&MACHINE[from], &MACHINE[to]);
-    {
-        let mut want = match to_m.space_root.load(Ordering::Relaxed) {
-            0 => KERNEL_ROOT.load(Ordering::Relaxed),
-            root => root,
-        };
-        // F8 tripwire, x86 spelling — the counterpart of `akuma-threading`'s
-        // `[SGI-S FREED-L0]`. A slot whose `space_root` names an L0 the free
-        // path has already handed back to the PMM is a dead address space one
-        // `mov cr3` away from being live again: the frame is reissued as
-        // something else, its PML4 slot 511 stops naming the kernel's PDPT, and
-        // the very next kernel access faults not-present from ring 0.
-        //
-        // # Why this reports and demotes rather than reporting and proceeding
-        //
-        // Both halves of the original destroyed their own evidence, and the
-        // only capture this bug has is what that cost: a photograph of `[SWIT`
-        // and a cold machine (`proposals/AMD64_SWITCH_FREED_CR3_UAF.md`).
-        //
-        // * The message was seven `serial::puts` calls, and `serial::LOCK` is
-        //   per call — so a peer core lands between two of them, and a core
-        //   that dies mid-report truncates it mid-word. One `StackWriter` and a
-        //   single flush, the rule `idt::dump_user_registers_and_memory`
-        //   already states for the same reason.
-        // * It then fell through into the `mov cr3` below, which is the
-        //   *fatal* step: a reissued root triple-faults the box the moment ring
-        //   0 touches anything, and recovery is a power cycle at the machine.
-        //   So the root is not installed. The slot is demoted to the kernel
-        //   root, which maps every page ring 0 touches and — since
-        //   `paging::drop_identity_map` cleared PML4 slot 0 — nothing at all in
-        //   the lower half. A user thread resuming on it takes an ordinary
-        //   not-present fault at its first ring-3 instruction and dies with a
-        //   `SIGSEGV`; a kernel thread is unaffected. One process for the
-        //   machine is the trade, and it keeps the next occurrence readable
-        //   over ssh instead of on a camera.
-        //
-        // `space_root` is zeroed with it so the slot settles on the kernel root
-        // rather than re-tripping on every later switch-in, and the counter is
-        // asserted zero by the boot suite ([`freed_cr3_trips`]).
-        if akuma_mmu::l0_recently_freed(want & L0_BASE_MASK) {
-            let n = FREED_CR3_TRIPS.fetch_add(1, Ordering::Relaxed);
-            if n < CANARY_REPORT_LIMIT {
-                let mut w = akuma_primitives::console::StackWriter::<192>::new();
-                let _ = core::fmt::write(
-                    &mut w,
-                    format_args!(
-                        "[SWITCH FREED-CR3] root={:#x} from_slot={} to_slot={} \
-                         core={} state={} demoted=kernel-root\n",
-                        want,
-                        from,
-                        to,
-                        smp::cpu_index(),
-                        threading::get_thread_state(to),
-                    ),
-                );
-                w.flush();
-            }
-            to_m.space_root.store(0, Ordering::Relaxed);
-            want = KERNEL_ROOT.load(Ordering::Relaxed);
+    fn new_user() -> UserCtx {
+        UserCtx::new()
+    }
+    fn cpu_index() -> usize {
+        smp::cpu_index()
+    }
+    fn current_task() -> usize {
+        current()
+    }
+    fn kernel_root() -> u64 {
+        KERNEL_ROOT.load(Ordering::Relaxed)
+    }
+    fn active_root() -> u64 {
+        paging::active_root()
+    }
+    unsafe fn activate(root: u64) {
+        // SAFETY: the trait's contract - a live PML4 that maps the kernel half.
+        unsafe { paging::activate(root) };
+    }
+    fn set_kernel_stack(top: u64) {
+        crate::gdt::set_kernel_stack(top);
+    }
+    fn set_current_uctx(user: *mut UserCtx) {
+        smp::set_current_uctx(user);
+    }
+    fn user_bases(_slot: usize, user: &UserCtx) -> (u64, u64) {
+        (user.fs_base, user.gs_base)
+    }
+    fn l0_recently_freed(l0: u64) -> bool {
+        akuma_mmu::l0_recently_freed(l0)
+    }
+    fn lock_held() -> bool {
+        smp::bkl_held()
+    }
+
+    fn switch_entry(_from: usize, to: usize) {
+        // Switch-in bookkeeping: the one point every resume of every slot passes through, so a
+        // slot with `SWITCH_INS == 0` provably never ran. See [`dump_slot_table`].
+        if to < MAX_TASKS {
+            SWITCH_INS[to].fetch_add(1, Ordering::Relaxed);
+            LAST_CORE[to].store(smp::cpu_index() as u32, Ordering::Relaxed);
         }
-        // Skip only when this core already walks exactly this root. The skip is
-        // sound because of the liveness gate, not because of the comparison:
-        // an L0 whose frame value equals our live CR3 cannot have been torn
-        // down (that free would have seen this core in `any_core_on_l0` and
-        // deferred), so equality is the same address space, never a recycled
-        // frame. Under BKL here, so the gate's decision cannot race this read.
-        if want != paging::active_root() {
-            // SAFETY: `want` is the incoming thread's own root or the kernel's;
-            // the liveness gate above refused a recycled L0, and both map the
-            // kernel image, this stack and the heap.
-            unsafe { paging::activate(want) };
+    }
+    fn freed_root(root: u64, from: usize, to: usize) {
+        let n = FREED_CR3_TRIPS.fetch_add(1, Ordering::Relaxed);
+        if n < CANARY_REPORT_LIMIT {
+            let mut w = akuma_primitives::console::StackWriter::<192>::new();
+            let _ = core::fmt::write(
+                &mut w,
+                format_args!(
+                    "[SWITCH FREED-CR3] root={:#x} from_slot={} to_slot={} core={} state={} demoted=kernel-root\n",
+                    root,
+                    from,
+                    to,
+                    smp::cpu_index(),
+                    threading::get_thread_state(to),
+                ),
+            );
+            w.flush();
         }
-
-        // Where a ring-3 trap by the incoming thread will land, on this core.
-        crate::gdt::set_kernel_stack(to_m.trap_stack_top.load(Ordering::Relaxed));
-
-        // Repoint the per-thread syscall context: the incoming thread may
-        // resume inside its own syscall and read it on the way back to ring 3.
-        smp::set_current_uctx(to_m.uctx.as_ptr());
-
-        // **Unconditionally, exactly as `%gs` below.** `IA32_FS_BASE` is one
-        // register per *core*, so skipping the write when the incoming task has
-        // no base of its own does not leave `%fs` "unset" — it leaves the
-        // outgoing thread's TLS pointer live for whoever runs next. That is the
-        // argument the `%gs` line already makes, one line down, and the
-        // asymmetry looks like an oversight rather than a decision: nothing in
-        // ring 0 reads `%fs` (the kernel's per-CPU block is `%gs`), so writing
-        // 0 for a kernel or not-yet-`arch_prctl`'d task costs one `wrmsr` and
-        // takes away a stale user base.
-        //
-        // The window it closes: a freshly `execve`d main thread starts with
-        // `UserCtx::fs_base == 0` and does not call `arch_prctl(ARCH_SET_FS)`
-        // until musl's `__init_tp`. Every instruction of `ld-musl` before that
-        // used to run on whatever TLS base the previous thread on this core
-        // left behind — another process's, in another address space.
-        // Suspected in the `-j4` `#GP` at `rip=0x3004_65ec`, which is inside
-        // `ld-musl` (`INTERP_BASE` is `0x3000_0000`); see
-        // `AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13.
-        let (fs, gs) = to_m.uctx.with(|u| (u.fs_base, u.gs_base));
-        if fs == 0 && from_m.uctx.with(|u| u.fs_base) != 0 && !to_m.idle.load(Ordering::Relaxed) {
-            // How often the window was actually open. A zero here would have
-            // retired the hypothesis without a boot.
-            STALE_FS_WINDOWS.fetch_add(1, Ordering::Relaxed);
-        }
-        // A non-canonical value (none can be stored: `arch_prctl` refuses them)
-        // is skipped rather than `#GP`ing the switch.
-        let _ = akuma_cpu::msr::set_fs_base(fs);
-        let _ = akuma_cpu::msr::set_user_gs_base(gs);
-
-        // The switch's cross-core safety argument changed 2026-09-20: it used
-        // to be "`ON_CPU` is cleared before the stack moves, and no peer can
-        // observe that until this core releases the kernel lock" — an argument
-        // that only held when the lock was in fact held, which is what made
-        // every switch require the BKL and every parked-mid-syscall task own
-        // it for its whole sleep (the frozen-`serving` storm). Now the
-        // outgoing thread's `ON_CPU` gate STAYS SET through the switch
-        // (prev-handoff, `x86_yield_now`), a peer's picker skips gated
-        // threads, and a lockless switch is safe by the gate alone — which is
-        // what was meant to let `block_current`/`block_until_deadline` release
-        // across the sleep. That release was reverted the same night, and
-        // `yield_now`'s dropped-window exception on 2026-09-26: both ended in
-        // this report followed by silence, because the *resumed* thread was
-        // switched out holding the core's lock and is owed it back — the gate
-        // makes the stacks safe, not the thread's assumptions. So a non-zero
-        // count is a wedge signature again, and the boot suite asserts zero
-        // (`idt.rs`, "every context switch held the kernel lock").
-        if !smp::bkl_held() {
-            let n = SWITCH_WITHOUT_BKL.fetch_add(1, Ordering::Relaxed);
-            if n < CANARY_REPORT_LIMIT {
-                // One `print_str`, not a dozen `puts`: `serial::LOCK` is per
-                // call, so a peer core's `safe_print!` lands between two of
-                // them and shreds the line — the first capture of this report
-                // read `[SWITCH NO-BKL] from=[SWITCH BADFRAME] cur=128 …`.
-                //
-                // `via=` is the whole value of the report, and it is a per-core
-                // tag rather than a stack walk for a measured reason — see
-                // [`YIELD_TAG`].
-                let mut w = akuma_primitives::console::StackWriter::<128>::new();
-                let _ = core::fmt::write(&mut w, format_args!(
+    }
+    fn stale_fs_window() {
+        STALE_FS_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    }
+    fn switch_without_lock(from: usize, to: usize) {
+        let n = SWITCH_WITHOUT_BKL.fetch_add(1, Ordering::Relaxed);
+        if n < CANARY_REPORT_LIMIT {
+            let mut w = akuma_primitives::console::StackWriter::<128>::new();
+            let _ = core::fmt::write(
+                &mut w,
+                format_args!(
                     "[SWITCH NO-BKL] from={} to={} core={} via={}\n",
-                    from, to, smp::cpu_index(),
-                    yield_tag_name(YIELD_TAG[smp::cpu_index() % 8].load(Ordering::Relaxed))));
-                w.flush();
-            }
+                    from,
+                    to,
+                    smp::cpu_index(),
+                    yield_tag_name(YIELD_TAG[smp::cpu_index() % 8].load(Ordering::Relaxed))
+                ),
+            );
+            w.flush();
         }
+    }
+    fn check_stacks(from: usize, to: usize) {
         check_canaries(from, "switch-out");
         check_canaries(to, "switch-in");
-
-        let fx_out = from_m.fx.as_ptr();
-        let fx_in = to_m.fx.as_ptr().cast_const();
-        // SAFETY: both pointers are 64-byte-aligned `FxArea`s of live slots — the
-        // outgoing one is saved into, the incoming one restored from — and the
-        // switch protocol (the `ON_CPU` gate) keeps any other core off both for
-        // the duration.
-        unsafe {
-          if smp::XSAVE_ON.load(Ordering::Relaxed) {
-            core::arch::asm!(
-                "xsave64 [{out}]",
-                "xrstor64 [{inp}]",
-                out = in(reg) fx_out,
-                inp = in(reg) fx_in,
-                in("eax") smp::XCR0_ENABLED as u32,
-                in("edx") 0u32,
-                options(nostack, preserves_flags)
-            );
-        } else {
-            core::arch::asm!(
-                "fxsave64 [{out}]",
-                "fxrstor64 [{inp}]",
-                out = in(reg) fx_out,
-                inp = in(reg) fx_in,
-                options(nostack, preserves_flags)
-            );
-          }
-        }
+    }
+    fn slot_prepared(slot: usize, stacks: &akuma_sched_amd64::Stacks) {
+        paint_canary(stacks.kernel);
+        paint_canary(stacks.trap);
+        reset_slot_counters(slot);
+    }
+    fn set_current_task(slot: usize) {
+        smp::set_current_task(slot);
+    }
+    fn idle_task() -> usize {
+        smp::idle_task()
+    }
+    // `transfer_lock_depth`: the default no-op. Since 5b the BKL is `akuma_bkl`'s,
+    // reentrant by owner core, so the lock stays with the core across a switch and
+    // there is no per-thread depth to move.
+    fn allow_tick() {
+        allow_tick();
+    }
+    fn write_user_context(slot: usize, ctx: &UserContext) {
+        write_user_context(slot, ctx);
+    }
+    fn read_user_context(slot: usize) -> Option<UserContext> {
+        read_user_context(slot)
     }
 }
-
-/// Hand the kernel lock's recursion depth from the outgoing thread to the
-/// incoming one. The lock itself stays with this core.
-///
-/// A no-op since 5b: the BKL is `akuma_bkl`'s, reentrant by owner core, so
-/// there is no depth to transfer — the lock stays with the core across the
-/// switch and the bookkeeping this hook used to move does not exist. The hook
-/// is kept because `akuma-threading`'s `X86ArchHooks` requires it.
-fn hook_transfer_lock_depth(_from: usize, _to: usize) {}
-
-/// May this core run `slot`?
-///
-/// Idle threads are excluded outright rather than pinned-out: they are reached
-/// only through [`akuma_threading::X86ArchHooks::idle_slot`], never by the
-/// round-robin scan, or a core with work to do would hand itself to its own
-/// idle thread.
-fn hook_can_run(slot: usize) -> bool {
-    let cpu = smp::cpu_index() as u32;
-    let m = &MACHINE[slot];
-    let pinned = m.pinned.load(Ordering::Relaxed);
-    if m.idle.load(Ordering::Relaxed) {
-        return false;
-    }
-    // A reserved core (a running VM's, see [`reserve_cores`]) runs only what is pinned to it
-    // or what asked for it by affinity.
-    akuma_vm_spec::affinity::can_run(
-        (pinned != NO_CPU).then_some(pinned),
-        m.affinity.load(Ordering::Relaxed),
-        RESERVED_CORES.load(Ordering::Relaxed),
-        cpu,
-    )
-}
-
-/// Cores kept for tasks pinned to them: the picker never hands an unpinned thread to one.
-/// Set while a VM runs on them (`kvm::linux`), so a guest's virtual processor is not
-/// time-sliced against sshd on its own core. Core 0 is never reserved (the boot thread and
-/// the tick bookkeeping live there). A thread already running on a core when its bit is set
-/// keeps it until it next switches out.
-static RESERVED_CORES: AtomicU64 = AtomicU64::new(0);
 
 /// Reserve the cores in `mask` (bit `c` = core `c`; bit 0 is ignored); 0 releases them all.
 pub fn reserve_cores(mask: u64) {
-    RESERVED_CORES.store(mask & !1, Ordering::Relaxed);
+    akuma_sched_amd64::reserve_cores(mask);
 }
 
 /// The affinity mask of task `slot` (0 = any core).
@@ -671,7 +261,7 @@ pub fn affinity_of(slot: usize) -> u64 {
     MACHINE.get(slot).map_or(0, |m| m.affinity.load(Ordering::Relaxed))
 }
 
-/// Set the affinity mask of task `slot` (already normalised by `akuma_vm_spec::affinity::effective`).
+/// Set the affinity mask of task `slot` (already normalised by `akuma_affinity::effective`).
 /// If `slot` is the running thread and stands on a core the mask excludes, it moves now (parks until
 /// a picker on an allowed core hands it back); any other thread leaves at its next switch-out.
 /// False if the running thread could not be moved.
@@ -718,7 +308,7 @@ pub fn repin_current(cpu: usize) -> bool {
 /// switch-in will install — the x86 half of the address-space free gate.
 ///
 /// `Machine::space_root` is this target's saved `TTBR0`: an off-CPU slot holds
-/// one, [`hook_switch_to`] writes it to `CR3` verbatim, and no per-core registry
+/// one, `akuma_sched_amd64::switch_to` writes it to `CR3` verbatim, and no per-core registry
 /// can see it (`akuma_mmu::any_core_on_l0` only knows what a core is running
 /// *now*). Freeing an L0 under such a reference is the ssh-wedge crash — the
 /// frame comes back as something else, PML4 slot 511 stops naming the kernel's
@@ -831,18 +421,9 @@ fn register_hooks() {
         note_current_expected_l0: threading::note_current_expected_l0,
         current_thread_is_terminated: threading::current_thread_is_terminated,
     });
-    threading::register_x86_arch_hooks(threading::X86ArchHooks {
-        switch_to: hook_switch_to,
-        current_slot: smp::current_task,
-        set_current_slot: smp::set_current_task,
-        idle_slot: smp::idle_task,
-        can_run: hook_can_run,
-        transfer_lock_depth: hook_transfer_lock_depth,
-        allow_tick,
-        write_user_context,
-        read_user_context,
-        prepare_task_slot,
-    });
+    // The whole table is `akuma_sched_amd64::hooks`: the switch, `can_run` and
+    // `prepare_task_slot` are the crate's, the rest [`Amd64`]'s `Platform` methods.
+    threading::register_x86_arch_hooks(akuma_sched_amd64::hooks::<Amd64>());
 
     // The scheduler also wants a clock and a console. The other four fields are
     // the AArch64 GIC's vocabulary, and on this target they are **no-ops with a
@@ -1276,22 +857,14 @@ pub fn init() {
 /// leaves it alone. Called by the boot core, under the BKL, before the core is
 /// started.
 pub fn register_idle_task(cpu: usize) -> Option<usize> {
-    let slot = threading::x86_claim_slot()?;
     // This path does not go through `prepare_task_slot`, so it clears the
     // per-occupant counters itself. Low slots have usually been through the
-    // boot self-tests by the time SMP bring-up runs.
+    // boot self-tests by the time SMP bring-up runs. Under the BKL; the slot is
+    // INITIALIZING, so nothing can schedule it. Adopted rather than published
+    // (the crate's `register_idle`): it is a context that already exists.
+    let slot = threading::x86_claim_slot()?;
     reset_slot_counters(slot);
-    // Under the BKL; the slot is INITIALIZING, so nothing can schedule it.
-    let m = &MACHINE[slot];
-    m.daemon.store(true, Ordering::Relaxed);
-    m.idle.store(true, Ordering::Relaxed);
-    m.pinned.store(cpu as u32, Ordering::Relaxed);
-    m.space_root.store(0, Ordering::Relaxed);
-    m.trap_stack_top.store(0, Ordering::Relaxed);
-    // Adopted rather than published: this is a context that already exists and
-    // is about to be running, not one the scheduler will enter through a seeded
-    // stack frame. `x86_adopt_running_thread` latches `ON_CPU` for it, which is
-    // what stops a peer core picking up a stack its own core is executing.
+    akuma_sched_amd64::mark_idle(&MACHINE[slot], cpu);
     threading::x86_adopt_running_thread(slot);
     Some(slot)
 }
@@ -1855,7 +1428,7 @@ fn yield_tag_name(tag: u32) -> &'static str {
 /// `ON_CPU` argument rests on. `0` is the expected value.
 /// How many times each slot has been switched **in**, and by which core last.
 ///
-/// Written in [`hook_switch_to`], the single point every resume passes through
+/// Written in `akuma_sched_amd64::switch_to`, the single point every resume passes through
 /// — a kernel thread's first entry, a ring-3 thread's, and every one after. A
 /// slot with `SWITCH_INS == 0` has therefore never executed a single
 /// instruction, which is the distinction `ps` cannot draw: its `TIME` column is
@@ -1998,7 +1571,7 @@ gated={} gated_dead={}\n",
         let (hits, skip_gate, skip_pin) = akuma_threading::x86_slot_pick_counts(slot);
         let (wake, woken, slot_gen) = akuma_threading::x86_slot_wait_debug(slot);
         let core = LAST_CORE[slot].load(Ordering::Relaxed);
-        // Under the BKL, the same discipline `hook_can_run` uses; `slot` is in
+        // Under the BKL, the same discipline `akuma_sched_amd64::can_run` uses; `slot` is in
         // range by the loop bound.
         let (root, daemon, idle, pinned) = {
             let m = &MACHINE[slot];
@@ -2032,7 +1605,7 @@ sc={} scn={} gen={} root=0x{:x} daemon={} idle={} pin={} park={}:{} pid={:?}\n",
 }
 
 /// Switches into a non-idle task with no TLS base of its own, from one that had
-/// one — the window the unconditional `%fs` restore in [`hook_switch_to`]
+/// one — the window the unconditional `%fs` restore in `akuma_sched_amd64::switch_to`
 /// closes. Diagnostics only; reported by the boot suite.
 static STALE_FS_WINDOWS: AtomicU64 = AtomicU64::new(0);
 
@@ -2052,7 +1625,7 @@ pub fn switches_without_bkl() -> u64 {
 }
 
 /// Switch-ins whose slot named a page-table root the PMM already has back — the
-/// F8 tripwire in [`hook_switch_to`]. `0` is the expected value.
+/// F8 tripwire in `akuma_sched_amd64::switch_to`. `0` is the expected value.
 ///
 /// A non-zero count means the address-space free gate let an L0 go while a task
 /// slot was still carrying it, and the switch **demoted** the slot to the kernel
@@ -2111,7 +1684,7 @@ fn check_canaries(slot: usize, when: &str) {
 /// The running task's `UserCtx` slot, if this core has published one.
 fn current_uctx_cell() -> Option<&'static BorrowCell<UserCtx>> {
     // Null before the first switch on a core (and for nothing else): the pointer
-    // is always `MACHINE[slot].uctx.as_ptr()` (`hook_switch_to`, `init`), so the
+    // is always `MACHINE[slot].uctx.as_ptr()` (`akuma_sched_amd64::switch_to`, `init`), so the
     // slot's own cell *is* the thing it names — reached by index, not dereferenced.
     if smp::current_uctx().is_null() {
         return None;
@@ -2141,39 +1714,7 @@ pub fn read_current_uctx<R>(f: impl FnOnce(&UserCtx) -> R) -> Option<R> {
 }
 
 pub fn prepare_task_slot(slot: usize) -> Option<usize> {
-    // The slot is INITIALIZING and not running.
-    let m = MACHINE.get(slot)?;
-
-    // Leaked deliberately on first use: a thread's stack must outlive the frame
-    // that made it. Bounded by `MAX_TASKS`, not by how many processes ever ran,
-    // because a recycled slot arrives here with its pair already set. The second
-    // stack is for traps taken while this thread is in ring 3; separate from its
-    // kernel stack because a preempted thread is suspended on the interrupt
-    // frame, and the two must not overlap.
-    let stacks = if let Some(stacks) = m.stacks.get() { stacks } else {
-        m.stacks.set(Stacks::leak_new());
-        m.stacks.get()?
-    };
-    let stack_top = stacks.kernel_base() + STACK_SIZE;
-    // Repainted on every reuse, not only on first allocation: a recycled slot
-    // inherits its pair, and a canary checked but never rewritten would report
-    // the previous occupant's overflow forever.
-    paint_canary(stacks.kernel);
-    paint_canary(stacks.trap);
-    let trap_top = (stacks.trap_base() + STACK_SIZE) & !0xf;
-
-    reset_slot_counters(slot);
-    // Under the BKL; the slot is INITIALIZING, so nothing runs on it.
-    m.trap_stack_top.store(trap_top as u64, Ordering::Relaxed);
-    m.space_root.store(0, Ordering::Relaxed);
-    m.daemon.store(false, Ordering::Relaxed);
-    m.idle.store(false, Ordering::Relaxed);
-    m.pinned.store(NO_CPU, Ordering::Relaxed);
-    // A child starts where its creator may run (fork/clone/exec keep the mask).
-    m.affinity.store(MACHINE[current()].affinity.load(Ordering::Relaxed), Ordering::Relaxed);
-    m.uctx.set(UserCtx::new());
-    m.fx.set(FxArea::initial());
-    Some(stack_top)
+    akuma_sched_amd64::prepare_task_slot::<Amd64>(slot)
 }
 
 /// Point an **unpublished** slot's page-table root at `root`.
@@ -2195,7 +1736,7 @@ pub fn set_task_space_root(task_slot: usize, root: u64) {
 }
 
 /// The page-table root a task slot will be given on its next switch-in — the
-/// value [`hook_switch_to`] writes to `CR3`, `0` meaning [`kernel_root`].
+/// value `akuma_sched_amd64::switch_to` writes to `CR3`, `0` meaning [`kernel_root`].
 ///
 /// A **diagnostic** reader, for the fatal-exception dump and the freed-root
 /// tripwire: a `CR3` that names a torn-down address space is invisible in the

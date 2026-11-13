@@ -124,6 +124,46 @@ pub fn apic_id() -> u32 {
     read_reg(REG_ID) >> 24
 }
 
+// ── the IPI face (ICR) ──────────────────────────────────────────────────────
+
+const REG_ICR_LOW: usize = 0x300;
+const REG_ICR_HIGH: usize = 0x310;
+const ICR_SEND_PENDING: u32 = 1 << 12;
+/// INIT (delivery mode 101), level-triggered, asserted / de-asserted.
+const ICR_INIT_ASSERT: u32 = 0x0000_C500;
+const ICR_INIT_DEASSERT: u32 = 0x0000_8500;
+/// STARTUP (delivery mode 110); the vector goes in bits 7:0.
+const ICR_STARTUP: u32 = 0x0000_4600;
+
+fn icr_wait_idle() {
+    while read_reg(REG_ICR_LOW) & ICR_SEND_PENDING != 0 {
+        core::hint::spin_loop();
+    }
+}
+
+fn send_ipi(dest_apic_id: u32, low: u32) {
+    icr_wait_idle();
+    write_reg(REG_ICR_HIGH, dest_apic_id << 24);
+    write_reg(REG_ICR_LOW, low);
+    icr_wait_idle();
+}
+
+/// INIT one core (assert then de-assert, as the MP specification has it).
+pub fn send_init(dest_apic_id: u32) {
+    send_ipi(dest_apic_id, ICR_INIT_ASSERT);
+    send_ipi(dest_apic_id, ICR_INIT_DEASSERT);
+}
+
+/// STARTUP one core: it begins in real mode at `vector << 12`.
+pub fn send_startup(dest_apic_id: u32, vector: u8) {
+    send_ipi(dest_apic_id, ICR_STARTUP | u32::from(vector));
+}
+
+/// Fixed-delivery IPI of `vector` to one core.
+pub fn send_fixed(dest_apic_id: u32, vector: u8) {
+    send_ipi(dest_apic_id, u32::from(vector));
+}
+
 /// Software-enable the LAPIC and park spurious deliveries on `spurious_vector`.
 /// The amd64 kernel calls this from `init_ap` (the per-core SMP path); taoxichuan
 /// reaches it through [`init`].

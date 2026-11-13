@@ -76,14 +76,10 @@ pub fn vfork_waiters_contains_for_test(child_pid: u32) -> bool {
 /// Linux `wait*status`: normal exit is `(code & 0xff) << 8` (WIFEXITED / WEXITSTATUS).
 /// Negative `code` is treated as stopped-by-signal: low 7 bits = signal number.
 pub fn encode_wait_status(code: i32) -> u32 {
-    if code < 0 {
-        
-        (-code) as u32 & 0x7F
-    } else {
-        ((code as u32) & 0xFF) << 8
-    }
+    akuma_syscalls_proc::exit::wait_status(code)
 }
 
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_set_tpidr_el0(address: u64) -> u64 {
     akuma_cpu::sysreg::set_tpidr_el0(address);
     0
@@ -248,10 +244,60 @@ static UTSNAME: [u8; UTS_LEN] = {
 static NODENAME: Spinlock<Option<akuma_syscalls_linux::uts::Field>> = Spinlock::new(None);
 static DOMAINNAME: Spinlock<Option<akuma_syscalls_linux::uts::Field>> = Spinlock::new(None);
 
+/// A kernel's own `uname` identity: `sysname`, the default `nodename`, `release`, `version`.
+///
+/// `machine` stays the compiled architecture's. Glue answers `Akuma` for a kernel that sets none - the AArch64 kernel and amd64 - and one that does gets its own
+/// name back: Taoxichuan said `Linux`/`taoxichuan` until its `uname` arm moved here
+/// (`74962ae5`), and then reported Akuma's. A field longer than 64 bytes is cut.
+/// Fields are whole `utsname` fields, so a kernel can assemble one at run time with no
+/// allocation ([`uts_join`]).
+#[derive(Clone, Copy, Debug)]
+pub struct UtsIdentity {
+    pub sysname: akuma_syscalls_linux::uts::Field,
+    pub nodename: akuma_syscalls_linux::uts::Field,
+    pub release: akuma_syscalls_linux::uts::Field,
+    pub version: akuma_syscalls_linux::uts::Field,
+}
+
+static IDENTITY: Spinlock<Option<UtsIdentity>> = Spinlock::new(None);
+
+/// Register this kernel's [`UtsIdentity`] (once, at init). `sethostname` still overrides
+/// the nodename afterwards.
+pub fn set_uts_identity(id: UtsIdentity) {
+    *IDENTITY.lock() = Some(id);
+}
+
+/// One `utsname` field from `parts` joined end to end, cut at 64 bytes (no allocation).
+#[must_use]
+pub fn uts_join(parts: &[&str]) -> akuma_syscalls_linux::uts::Field {
+    let mut buf = [0u8; akuma_syscalls_linux::uts::NAME_MAX];
+    let mut n = 0;
+    for b in parts.iter().flat_map(|p| p.bytes()) {
+        if n == buf.len() {
+            break;
+        }
+        buf[n] = b;
+        n += 1;
+    }
+    let mut f = akuma_syscalls_linux::uts::Field::empty();
+    let _ = f.set(&buf[..n]);
+    f
+}
+
 pub(super) fn sys_uname(buf: u64) -> u64 {
     if !validate_user_ptr(buf, UTS_LEN) { return EFAULT; }
     if copy_to_user(buf, &UTSNAME).is_err() {
         return EFAULT;
+    }
+    // A kernel's own identity over glue's defaults, field by field (whole 65-byte fields,
+    // so a shorter name leaves no tail of the default).
+    let id = *IDENTITY.lock();
+    if let Some(id) = id {
+        for (index, name) in [(0usize, id.sysname), (1, id.nodename), (2, id.release), (3, id.version)] {
+            if copy_to_user(buf + (index * UTS_FIELD_LEN) as u64, name.as_bytes()).is_err() {
+                return EFAULT;
+            }
+        }
     }
     // Overlay the two writable fields. Copied out under the lock and written
     // after it drops: `copy_to_user` can fault.
@@ -745,6 +791,7 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
     sys_clone_pidfd(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid, cl_args.pidfd)
 }
 
+#[cfg(feature = "exec")]
 pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let path = match copy_from_user_str(path_ptr, 1024) {
@@ -813,6 +860,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     do_execve(resolved_path, args, env)
 }
 
+#[cfg(feature = "exec")]
 pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> u64 {
     // Execute permission (`EACCES`). Root passes on any file with some x bit;
     // see `akuma_isolation::dac::may`. Set-user-ID bits are never honoured:
@@ -1008,6 +1056,7 @@ pub fn do_execve(resolved_path: String, args: Vec<String>, env: Vec<String>) -> 
     ret.unwrap_or(ESRCH)
 }
 
+#[cfg(feature = "exec")]
 fn exec_shebang(script_path: String, file_data: Vec<u8>, original_args: Vec<String>, env: Vec<String>) -> u64 {
     // Parse everything we need out of `file_data` into OWNED strings first:
     // this function recurses into do_execve, whose successful exec erets and
@@ -1449,6 +1498,7 @@ pub(super) fn sys_getpid() -> u64 {
 /// herd (`userspace/herd`) still calls this to try pinning a service to a
 /// secondary core and already treats `ENOSYS` as the expected result under
 /// shared-kernel SMP, so this stub stays for ABI compatibility.
+#[cfg(feature = "akuma-native")]
 pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
     let _ = (core_idx, init_program_ptr);
     ENOSYS
@@ -1655,6 +1705,7 @@ const _: () = {
     assert!(core::mem::offset_of!(SpawnOptions, cred_flags) == 108);
 };
 
+#[cfg(feature = "exec")]
 /// The credentials a `SPAWN_EXT` asks for, checked against the caller's: the
 /// caller's own, lowered by `setgroups`/`setgid`/`setuid` in the order a
 /// privilege-dropping wrapper makes them. `None` = not requested (inherit).
@@ -1691,6 +1742,7 @@ fn spawn_creds(o: &SpawnOptions) -> Result<Option<akuma_isolation::creds::Creds>
     Ok(Some(c))
 }
 
+#[cfg(feature = "exec")]
 pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     if ptr == 0 { return Vec::new(); }
     let mut args = Vec::new();
@@ -1711,10 +1763,12 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
     args
 }
 
+#[cfg(feature = "exec")]
 /// Spawn flag bits (Akuma's own SPAWN ABI, arg6). Keep in sync with
 /// `libakuma::SPAWN_FLAG_PTY`.
 const SPAWN_FLAG_PTY: u64 = 1;
 
+#[cfg(feature = "exec")]
 pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, flags: u64) -> SysResult {
     // arg6 carries spawn flags. Bit 0 (SPAWN_FLAG_PTY) marks the child's stdin
     // as a terminal so the kernel line discipline runs (sshd sets it for an
@@ -1759,6 +1813,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     Err(ENOMEM)
 }
 
+#[cfg(feature = "exec")]
 /// The size of `SpawnOptions` before `env_ptr`/`env_len` were appended.
 ///
 /// A `/bin/box` or `/bin/herd` on disk can be older than the kernel booting it —
@@ -1768,6 +1823,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
 /// stack and use it as an `envp` pointer.
 const SPAWN_OPTIONS_V1_SIZE: usize = 72;
 
+#[cfg(feature = "exec")]
 /// `SPAWN_EXT(path, options, options_len)`.
 ///
 /// `options_len` is the size of the caller's `SpawnOptions`. Zero means "the
@@ -1879,6 +1935,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
 /// syscalls are routed to that box's rump_server); any other value is a no-op
 /// (smoltcp default). herd calls this for a `stack = rump` service. Without the
 /// `rump` kernel feature the call is harmlessly ignored.
+#[cfg(feature = "akuma-native")]
 pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
     // Repointing a box's network stack decides where its AF_INET syscalls are
     // proxied, so it is only the owner's call — otherwise any process could
@@ -1912,6 +1969,7 @@ pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
 /// this function — reached from outside the crate rather than reimplemented
 /// beside it, which is what keeps the two authorization checks above from
 /// existing in one kernel and not the other.
+#[cfg(feature = "akuma-native")]
 pub fn sys_close_child_stdin(pid: u32) -> u64 {
     let caller = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ESRCH };
     let target = match akuma_exec::process::lookup_process_shared(pid) { Some(p) => p, None => return ESRCH };
@@ -1961,6 +2019,7 @@ pub(super) fn sys_kill(pid: u32, sig: u32) -> u64 {
     if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
 }
 
+#[cfg(feature = "akuma-native")]
 pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 

@@ -59,6 +59,7 @@ pub const RT_SIGPROCMASK: u64 = 135;
 pub const RT_SIGACTION: u64 = 134;
 pub const RT_SIGRETURN: u64 = 139;
 pub const RT_SIGSUSPEND: u64 = 133;
+pub const RT_SIGPENDING: u64 = 136;
 pub const GETRANDOM: u64 = 278;
 pub const GETCWD: u64 = 17;
 pub const FCNTL: u64 = 25;
@@ -83,7 +84,13 @@ pub const WAIT4: u64 = 260;
 pub const WAITID: u64 = 95;
 pub const RESOLVE_HOST: u64 = 300;
 pub const SPAWN: u64 = 301;
-pub const KILL: u64 = 302;
+/// Akuma-private `kill(pid, sig)`, what libakuma's `kill_signal` issues.
+///
+/// Named `AKUMA_KILL` (2026-11-01; was `KILL`) so that `KILL` is Linux's 129, as in
+/// every other table: one name meaning three numbers across the tree is how
+/// the next wrong constant gets written (`SYSCALL_CONSTANT_AUDIT_2026_10_30.md`
+/// finding 3).
+pub const AKUMA_KILL: u64 = 302;
 pub const WAITPID: u64 = 303;
 pub const TIME: u64 = 305;
 pub const CHDIR: u64 = 49;
@@ -157,7 +164,8 @@ pub const GETTID: u64 = 178;
 pub const GETRESUID: u64 = 148;
 pub const GETRESGID: u64 = 150;
 pub const GETGROUPS: u64 = 158;
-pub const KILL_LINUX: u64 = 129;
+/// Linux `kill(2)` (asm-generic). Was `KILL_LINUX` until 2026-11-01.
+pub const KILL: u64 = 129;
 pub const SETPGID: u64 = 154;
 pub const GETPGID: u64 = 155;
 /// `getsid(2)`.

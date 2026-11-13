@@ -1492,6 +1492,8 @@ Run on the Mac, no ryzen needed: `taoxichuan-s4` at `cf8a5468` built with `cargo
 
 **The user's note.** Token constraints, bad planning and subpar tooling pushed the user to pivot once again. From here **glm keeps the planner role for as long as that can be kept going**: it reads the docs and the source and writes the plan; the supervising Claude session executes the plan locally, on the Mac, in a QEMU loop. Recorded as the user's decision and reason.
 
+**User's note, added 2026-10-30:** the switch to Claude executing happened because the user was too tired to keep up the GLM grind. That is the main reason, alongside the token, planning and tooling reasons above. The experiment did not show that GLM could not do the remaining milestones; Claude took them over before GLM was tried on them (see "EXTRAPOLATION" below for what the switch leaves untested).
+
 **What led to it (the day's evidence, all re-checkable).**
 - Sessions pi, pj and ph-ph2 closed the main gates (F1, PK1, PK2, P1-P5 verified by the supervisor from the box captures on pj's merge tree, kernel md5 `26de094f`), but each cost 100-175 tool calls and 15-35M z.ai tokens (the 5-hour window of 34M was hit twice, the weekly cap once), and the stall that wastes every boot battery stayed open (2 of 7 boots for pj; the supervisor's `apk add git` over ssh stalled 2 of 3 fresh boots).
 - **Planning.** No brief asked for documentation, so the kernel had none (only archive incident docs); the user found this on 2026-10-29 and had Kimi write `taoxichuan/docs/` (it ran out of quota before finishing). The brief template now has a Docs section. The user's own `banner.txt` was never wired in (no brief mentioned it). The stall was handed to glm as a hunt on a rate of 1 in 4, with a gate script whose verdict window was the whole boot (the supervisor's own probe script repeated the mistake and killed its clients early).
@@ -1508,3 +1510,884 @@ The user wrote the first `taoxichuan/docs/` pass with Kimi (via crush) and recor
 - `reference/rust-toolchain.md` states that the kernel serves "6 of 10 (60%)" of what `rustc hello.rs` needs. That is a count of rows in an old archive list (`RUST_TOOLCHAIN.md`, 2026-05-31) scored against `syscalls.md`, with no run behind it; its own second table scores a cargo build at 1 of 10, so 7 of 20 rows overall. The list has no threads, but `rustc 1.100.0-nightly (420ed2a0c)` makes a thread at start-up (its ctrl-c handler) and `clone` with thread flags is refused; it marks `readlinkat` served while the legacy `readlink` (89) that the run hit answers `ENOSYS`.
 - Measured instead (`rustc --version` as init under QEMU, kernel `[err]`/`[census]` trace): mmap slab 64 MiB fixed against a 312,554,744-byte driver library, empty init environment (`$ORIGIN` needs `LD_LIBRARY_PATH`), thread `clone` refused, `sigaltstack`, `membarrier`, `readlink` `ENOSYS`, `mprotect` accepted and ignored; about 25 distinct syscalls before the first thread.
 - The docs are kept (the structure, the diagrams and most reference pages are usable) and are to be corrected against the code by glm under the Docs rule in the brief template; the other files were not audited by the supervisor. Brief 09n corrects the headline.
+
+### Plans pl, pm, pn and the first execution (2026-10-29 night to 2026-10-30): who decided what
+
+For the story. Each line names the decider. "User" is the owner of the experiment, "supervisor" the Claude Code session on the Mac, "glm" the GLM planner on the ryzen box, "Kimi" the docs writer. Evidence is in the files named.
+
+**Sessions and outcomes.**
+- **`pl` (glm, brief 09l; stall).** Built a stall-rate harness, killed the preemption hypothesis (the stall reproduces with the switch off; 3 of 6 valid apk boots), added an exec-ladder instrument. The supervisor could not steer it mid-turn (the box server does not answer `session/load` during a turn), so on the user's word ("finish investigation and do a report, no fix needed") the supervisor killed the driver and ran a short wrap-up session `plw` (glm), which wrote `RESULT-pl.md` and committed the leftovers. Finding: the apk child runs after `EXE loaded` and never exits; the crossing back into the parent never resumes; nothing parks; the net pump is alive. Cause not found.
+- **Supervisor's local check.** Same kernel (43ce32dd) under QEMU TCG, local mirror, `apk.static`: 10 of 10 boots clean. The stall needs the box's timing; it was not reproduced and its cause is unconfirmed. The syscall trace the probe was built for never printed.
+- **`pm` (glm, brief 09m).** Plan to move Taoxichuan onto the standard process slots and scheduler (`TAOXICHUAN_STAGE8_PM_STANDARD_SLOTS_PLAN.md`, `taoxichuan/docs/reference/switch-to-crates.md`). glm found one premise of the supervisor's brief wrong (`akuma-scheduler` is a simulator, not the policy) and said the code wins. It claims the switch removes the stall at its slice S3; that is a design argument, not a test.
+- **`pn` (glm, brief 09n).** Plan for the rest of the Rust syscalls (`TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md`, `taoxichuan/docs/reference/rust-syscalls.md`). It corrected Kimi's claim that the kernel was "60% there" (an inventory, not a measurement) with a census: rustc needs a thread at startup.
+
+**Decisions.**
+- User: the three planning sessions, their separation, and glm as planner. Stop investigating the stall, report only. (2026-10-29)
+- Supervisor: ran `pn` right after `pm` without asking, reading "then start the next thing" as the agreed order; committed and pushed the 09m brief edit under the user's standing permission for this branch.
+- User, answering the plans' open questions (2026-10-30): (1) `linux-abi` is switched on by a **cargo feature**; (2) keep `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)` working through `fork_process`, move it to "not implemented" if it breaks; (3) **FPU/SSE state must be saved** on a switch; (4) **init is herd** built with `libakuma/linux-abi`, with the non-Linux parts turned off by the same feature in herd if it lacks one (this replaces pm's "first boot-list program is pid 1" and its dedicated-init alternative); (5) if it works under TCG, confirm on metal in the background (the supervisor's QEMU loop is the arbiter, the box a later confirmation); (6) slab constants now, the memory model later; (7) the cargo gate may use a vendored crate for now; (8) MAP_SHARED writeback before signals, and a signals crate if one exists, else extract; (9) init before threads; (10) start `pn` S1 locally.
+- Supervisor: `BRK_SLAB` is 256 MiB, not pn's 512 MiB (the brk window starts at `PIE_BASE` 0x1000_0000 and must stay under `INTERP_BASE` 0x3000_0000). Added `initenv=`/`thenenv=` boot tokens so init can carry an environment (rustc needs `LD_LIBRARY_PATH`). Corrected pn's S1 gate: `rustc --version` cannot exit 0 before the thread slice; the gate is "no loader OOM, first failure is the ctrlc thread". A/B on one image: 64 MiB slabs gave exit 127 (OOM loading `librustc_driver`), the new slabs exit 101 at the ctrlc handler. Commit 5a828e28. Source: the plan's gate was glm's, the correction is the supervisor's.
+- User: "keep working autonomously, adjust the plans as you go but let me know and log who made which decision". The supervisor edits `TAOXICHUAN_STAGE8_PM_STANDARD_SLOTS_PLAN.md` and `TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md` in place under a dated "decisions" section and logs it here.
+
+### pn S2 and a local finding about the stall (2026-10-30, supervisor)
+
+Decided and done by the supervisor under the user's "keep working autonomously" (commit fcfd5f4d):
+- **Legacy path fold extracted** from `amd64/src/usermode.rs` into `akuma_syscalls_abi::legacy` (ten x86-only numbers, host tests, the `symlink`-dirfd-second and `AT_REMOVEDIR`/`AT_SYMLINK_NOFOLLOW` cases pinned); amd64 and Taoxichuan both call it. This is pn's route C for the legacy numbers, done as the plan said.
+- **Real `mprotect`** (re-map each present page with the requested R/W/X; `PROT_NONE` stays a no-op), `sigaltstack` (per-task record read back), `membarrier` (decode from `akuma-syscalls-mem`, one fence), and a `[nosys] nr=N` console line once per unserved number (the gap list for free). A/B on `tcc -run`: old kernel `PageFault code=0x15` (instruction fetch on an RW page), new kernel prints.
+- `rustc --version` after S2: no `[nosys]` lines left; it dies only at the ctrlc handler thread (needs S4).
+- **A bug the fold exposed, fixed:** the `UNLINKAT` arm read its flags from arg4; `unlinkat(dirfd, path, flags)` has them third, so `rmdir` never worked on this kernel.
+- **A local finding about the stall (not the box's).** The experiment branch (preemption switch ON) hangs after `[SSH] Exec:` on EVERY ssh exec under QEMU TCG; the pl tree (switch gated OFF) never does. Cause as read from the code and confirmed by the fix: `spawn_arm` runs the child on a ring-slot number the pool still marks INITIALIZING (`reserve_slot`), the picker never takes that state, and the first tick that preempts the child switches away from a slot it cannot pick again. Fix: mark the slot RUNNING around `child_enter` and TERMINATED after. With it: 3 of 3 ssh boots, F1, PK1, `ln -s`+`readlink`, `apk add git`, `git --version` all pass with preemption ON. **This does not explain the box's stall**, which pl reproduced with the switch OFF; the two may be different bugs. Whether the box still stalls with this fix is for the metal confirmation the user asked to run in the background.
+- **Another pre-existing limit, measured, not fixed:** after about 15 ssh execs in one boot, `fork` fails (`Failed to allocate x86 task stacks`: the claim picks a slot number at or above the 12-slot ring) and, without the fix above, `spawn` falls back to sshd's built-in shell. The box harness's "at most 8 execs per boot" is this limit. It dies with the ring in pm's S3.
+- Who: all the above supervisor; the plan rows (S2 list) are glm's `TAOXICHUAN_STAGES9_11_PN_RUST_SYSCALLS_PLAN.md`; the order is the user's.
+
+### cwd, the clone gap, and why git clone stops at a thread (2026-10-30, supervisor)
+
+- **Working directory** (`chdir`/`fchdir`/`getcwd`, a per-task `cwd`, inherited by a fork child, reset by a fresh spawn, kept across exec) and relative-path resolution in the legacy `open`/`stat`/`lstat` arms. Before this every relative path resolved against `/`, so `cd /tmp; echo y > ../f` wrote the wrong file and `git` (which `chdir`s into the new repository) hit `[nosys] nr=80`. Gate: `cd`, `pwd`, `../` reads and writes pass in the battery.
+- **`--features trace-err`** prints `[err] sN nr=X -E` for every failing syscall (slot-tagged, capped); `[nosys]` is the always-on half. These two lines are the gap finder.
+- **How far `git clone` gets now, local QEMU, no TLS:** over `git://` (a host `git daemon`) the clone connects, then dies with `error: cannot create async thread: Resource temporarily unavailable` - `clone(56)` answers EPERM because only fork-shaped clones are served; git's sideband demultiplexer is a pthread. Over dumb HTTP it fetches `info/refs` and `HEAD`, runs `git-remote-http` to a listing, and the `fetch` phase faults in the helper (`cr2=0x20`, a null struct pointer in the curl slot loop, not diagnosed; a dumb-HTTP server is not what GitHub speaks, so this path is low value). So **threads (`pn` S4) are what stand between us and `git clone` and `rustc`**; the user's order (init as a Process first, `pm` S1) is being followed, though the code suggests threads inside an sshd-spawned (already registered) process may not strictly need it - to be checked before S4.
+- **A second pre-existing bug seen, not fixed:** a task killed by a fault does not wake its parent's `wait4` (the clone hung after the helper faulted).
+- Who: supervisor throughout; the "init before threads" order is the user's answer 9.
+
+### Threads, futex, and the first `git clone` (2026-10-30, supervisor)
+
+**Result: `git clone git://...` works on Taoxichuan** under the supervisor's QEMU loop (TCG, user-mode NIC, a host `git daemon`): the clone connects, fetches the pack through git's sideband thread, `index-pack` runs, the files appear, `git log` prints the commit, `git status` is clean. Not yet run on the box or over HTTPS. The same boot also passes F1, PK1, `ln -s`/`readlink`/`rmdir`, `apk add git` and a `tcc -run` program with four threads contending a mutex (`threads ok counter=4000`).
+
+**Decision (supervisor, logged because it reorders the user's plan):** the user answered "init before threads" (question 9). The supervisor built threads first, for one reason found in the code: `clone_thread` needs the *caller* to be a registered Process, and every program an ssh session starts already is (the shell and its fork children); only the boot task (init) is not. So `git clone` and `rustc` run from a shell do not need `pm` S1. Programs run AS init (`init=.../rustc`) still do and answer EPERM to a thread `clone`; `pm` S1 stays on the list for that, for `herd` as pid 1, and for the user's Q4.
+
+**What was built** (all in `taoxichuan/src`, commits in this and the next two entries):
+- `futex.rs`: the effects half over `akuma-syscalls-sync` (op decode, `(tgid, uaddr)` keys, waiter table, deadlines), mirroring amd64's split; park on `schedule_blocking`, wake by the threading waker.
+- `CLONE_THREAD` through `akuma_exec::process::clone_thread`; the bind hook gives a thread its creator's task record (`TASK_OF`), so regions, brk/mmap cursors, fds and the cwd are one copy; `exit` ends a thread (`CLONE_CHILD_CLEARTID` zeroed and woken: `pthread_join`), `exit_group` ends the group; `set_tid_address`, `gettid`.
+- **One pid allocator.** `clone_thread` draws pids from `akuma_exec::process::allocate_pid`; Taoxichuan had its own counter, so a thread and a fork child got the same pid and one table row. Now the crate's counter serves both (`reserve_pid_floor(2)`). This was the first thread fault (a new thread started with an exec's entry context).
+- A ring-3 fault in a real fork child or thread now kills that task alone (wait status SIGSEGV, `rc=139`) instead of halting the machine.
+
+**Bugs found on the way, each a one-line cause (all fixed):** a socket `dup`+`close` destroyed the connection behind the other fd (git dups its socket and closes the copy; the sideband thread then read EBADF) - sockets are now closed by the last reference across all task records, and an exiting task releases its sockets (they leaked); no `/dev/urandom` (git's temp-file names); `open(O_CREAT)` in a missing directory answered EACCES instead of ENOENT, so git never created `objects/xx`; `fsync`/`fdatasync`/`sync` were ENOSYS (now `fs.sync()`); `fstat` of a pipe said "regular file", which made `index-pack` read a pipe as a file and die "pack has junk at the end" (pipes, sockets and null/random now report FIFO, socket and char device).
+
+**Still open:** `[nosys]` after the battery: `sendfile` (40), `mount`/`umount2` (165/166, from apk's busybox trigger); `sched_getaffinity` (204); dumb-HTTP `git-remote-http` faults in its slot loop (low value); `git clone` over HTTPS needs TLS in the guest (the box). Metal confirmation of the TCG results is still to run.
+
+### State at the end of the 2026-10-29/30 stretch (supervisor, written before the user compacts the session)
+
+**Where things stand.** On the supervisor's QEMU/TCG loop (the arbiter of record, user's answer 5): `git clone git://` completes; `rustc --version` prints from an ssh shell; `rustc hello.rs` runs all codegen and reaches the link step; threads, futex, socketpair, real mprotect, cwd, fsync, /dev/urandom, stderr to the client all work; the old battery (F1, PK1, legacy fs numbers, `apk add git`, `git --version`) is green. Nothing is confirmed on the metal yet: glm's `pq` session (brief 09o) is running that check (stall rate with the new kernel, the old battery, three `git clone`s from a host `git daemon`); its result is `/root/dev-cycle/taoxichuan-s7/RESULT-pq.md`.
+
+**Later in the day (supervisor):** stderr of session programs joins the ssh stream (fd 2 used to hit the serial console); polling a pipe's write end no longer panics the kernel (the readiness value of the pipe arm was returned as the poll KIND, and POLLOUT=4 is the eventfd kind: `eventfds()[usize::MAX]`); spawn argument limits raised (a `sh -c` string over 255 bytes silently fell back to sshd's built-in shell `paws`; now 4 KiB strings, 128 argv/env entries); `socketpair(AF_UNIX)` as two cross-wired pipes (`OpenFile::Pair`) because the trace-err kernel named `socketpair(1, SOCK_SEQPACKET|CLOEXEC, 0)` (nr 53) as the syscall behind rustc's `could not exec the linker cc: Function not implemented`. Whether the link then succeeds is the next result (the run was in flight when this was written).
+
+**Decisions, by decider.** User: init is herd with `linux-abi` (Q4), keep `clone` through `fork_process`, FPU/SSE save needed, cargo feature for `linux-abi`, TCG is the arbiter and metal confirms in the background, slab constants now, vendored crate for the cargo gate, MAP_SHARED writeback before signals, "keep working autonomously, log who decided". glm: plans pl, pm, pn and the stall investigation facts; `pq` is its confirmation job. Supervisor: building threads before `pm` S1 (reasoned from `clone_thread`'s need of a registered caller), BRK_SLAB 256 MiB, the legacy-fold extraction into `akuma-syscalls-abi`, one pid allocator, socket refcounting, the preemption-hang fix, killing a faulting task instead of the machine, merging stderr into the session stream, `OpenFile::Pair`.
+
+**Open, in the order the supervisor would take them:** the `rustc` link result and then `./hello`; `sendfile`/`mount`/`sched_getaffinity`/`prctl` arms; commit of the work after 49de01f2 (stderr, poll fix, spawn limits, socketpair, docs) - the supervisor commits it as the last act of this stretch; `pm` S1 (init as a Process, herd as pid 1); the metal result of `pq`; HTTPS clone (TLS in the guest, a real remote); writable `MAP_SHARED` for `cargo`; signals; FPU save before preemption matters for SSE-heavy guests. The "metal stall" (pl: apk child never exits, 3 of 6 boots) is still unexplained; the TCG hang fixed here is a different, deterministic bug.
+
+### 2026-10-30 (supervisor): rustc link reaches gcc; a lesson about smaller models and probes
+
+- **Decided by the supervisor, steered by the user:** `socketpair` ends answer `sendto`/`recvfrom`/`shutdown`/`setsockopt` (Rust's spawn error pipe); a musl `posix_spawn` clone (`CLONE_VM|CLONE_VFORK`) goes through `fork_process` entered at the child's stack, the way the amd64 kernel does (`RUST_TOOLCHAIN_AMD64.md`, row for `posix_spawn`); the fork depth ceiling is 1..8; `ioctl(FIONBIO)` sets the nonblock bit (std's `wait_with_output` died on ENOTTY); path `lstat` reports the file's real mode.
+- **Where it stands:** `rustc hello.rs` now compiles, execs `cc` (gcc) from the vfork-style child, and the child loads and reaches `child_enter` but runs no syscall; the parent parks in `poll`. The same musl `posix_spawn` of the same gcc from a static C program passes (`userspace/forktest/c_stress/spawnprobe.c` built for amd64), so the defect is specific to a spawn from a *thread* of a multithreaded parent with piped stdio.
+- **glm `pq` (metal confirm) is done:** battery green, `git://` transport clean on the metal, but the `apk add git` exec-crossing stall reproduces on the metal at 7 of 8 boots (pl: 3 of 6). The frozen mirror's git lacks `index-pack`, so no full clone there. The supervisor's TCG runs do not stall, so the metal rate and the TCG rate disagree.
+- **Lesson for the story (the user's observation):** smaller models are too easily stopped by things like a platform label. The probes in `userspace/` (`forkprobe`, `elftest`, `forktest/c_stress/spawnprobe.c`, `dynspawn.c`, ...) are AArch64 or Linux-agnostic C and read as "not for us"; they build for amd64 in one command (`x86_64-linux-musl-gcc -static`, Rust and C, nothing outlandish). The supervisor itself nearly made the same mistake: it said the probes were aarch64 and reached for writing a new one, and the user said to just build them for amd64. Briefs for smaller models should say so: *the probes exist, rebuild them for the target, do not stop at the platform name.*
+
+### 2026-10-30 (supervisor, autonomous on the branch per the user): rustc link, the four bugs behind "gcc hangs" and "ld: no input files"
+
+Decided and done by the supervisor; the user's steers are marked (user).
+
+1. **A task polling in the kernel starved every other task.** `net::sleep_until` (the loop under `poll`) halted with interrupts masked and never yielded, so rustc's forked `gcc` child sat READY forever while the parent polled its pipes (qemu idle at 1% CPU, no fault, no syscall from the child). `sleep_until` now yields to a runnable task (keeping the syscall stub's user-rsp stash across the yield), for slotted tasks only. Found by printing every syscall after the gcc exec and noticing that only the parent ever made one.
+2. **The initial stack was a single 4 KiB page with argv capped at 16 entries and env at 8.** `collect2` hands `ld` ~50 arguments; `ld` saw 16 and said `no input files`. It affected every `exec` (a 60-argument `busybox echo` printed 14 words). `load_task` now takes argv/env as slices of any length and builds an 8-page block; `akuma-ring3-amd64`'s string table limit went 32 -> 512.
+3. **The fd table had 16 slots** (`SLOT_CEILING`), so `ld` opening ~20 rlibs got EMFILE (`cannot find ...rlib: No file descriptors available`). Now 1024; the table is a tree, so the number is only a bound.
+4. **`ioctl(FIONBIO)`** sets the nonblock bit (Rust std's `wait_with_output` died on ENOTTY), **musl `posix_spawn`'s `clone(CLONE_VM|CLONE_VFORK)`** goes through `fork_process` entered at the child's stack (the amd64 kernel's documented answer, `RUST_TOOLCHAIN_AMD64.md`), the fork depth ceiling is 1..8, **path `lstat` reports the file's real mode** (it said 0644 for everything), **socketpair ends answer `send`/`recv`**.
+
+Also learned: `cc1` (38 MB) cannot be exec'd, `exec` reads the whole image and the read fails (ENOENT); rustc does not need it, C compilation will. The ryzen is unreachable from this session (macOS Local Network permission, the user is looking at it); everything here is TCG.
+
+### 2026-10-30 (supervisor): MILESTONE - `rustc hello.rs -o hello && ./hello` runs on taoxichuan (TCG)
+
+`hello from rustc on taoxichuan`, exit 0, 4.6 MB static-pie linked by Alpine's gcc driver + collect2 + GNU ld inside the guest (no host involvement), `rustc -C codegen-units=1 -C opt-level=0`. The last four defects between "ld runs" and "the binary runs", all found by the supervisor from the trace-err kernel and the console, none needing a model:
+
+- `read`/`write`/`readv`/`writev` returned EFAULT past 1 MiB (the WRITE_LIMIT bound); ld flushes its 4.6 MB output in one `writev`, and the failure surfaced as BFD's "final link failed: No space left on device" (misleading: the disk had 340k free blocks). Now a short transfer, which POSIX allows.
+- `fchmodat`/`chmod` were no-ops; ld chmods its output executable. Now real (ext2 `chmod`). `fchmod` on an fd stays a no-op (no path behind the fd).
+- `execve` refused any relative path (`./hello` -> ENOENT, which busybox sh printed as "not found"). Resolved against the cwd now; the path buffer is 512 bytes, not 128.
+- Debug scaffolding used to find these (per-syscall print after an exec, a pool-state dump in the idle lap, argv dumps) is NOT in the commit; `trace-err` skips ENOENT/ECHILD/ENOTTY noise now so its 3000-line cap lasts a whole link.
+
+Known remaining gaps seen in the same run: `prctl`(157), `sched_getaffinity`(204), `prlimit64`(302) and `getrlimit`(97) answer ENOSYS (rustc and ld shrug), `getrusage`(98), `statx`/`newfstatat`(326), `sendfile`(40); `cc1` (38 MB) cannot be exec'd (the exec path reads the whole image). Next, by the user: cargo.
+
+### 2026-10-30 (supervisor): MILESTONE - `cargo build` of a hello project runs on taoxichuan (TCG)
+
+`cargo build` (nightly 1.100, `-j1`, offline, no dependencies) compiles and links `cg` in 19.7 s of TCG time inside the guest and `./target/debug/cg` prints `hello from cargo on taoxichuan`. The user asked for cargo as soon as rustc worked; the supervisor took it straight on. What cargo needed that rustc did not:
+
+- **Executables over 16 MiB.** `Filesystem::read_file` refuses files over 16 MiB (its own comment: "use read_at"); cargo is 47 MB, cc1 38 MB. The exec path reads them in 1 MiB steps through the inode (`read_image`), still into one heap block because the loader wants a slice. A lazy-mapped loader would be the real answer for large binaries.
+- **A growing stack.** Every image started with a fixed 64 KiB of stack and cargo's main thread went past it (`[Fault]` at rsp == cr2). A not-present fault just under the stack region now maps the pages down to the fault, up to 8 MiB (`STACK_MAX`, reported as RLIMIT_STACK).
+- **`fcntl` record locks** (`F_GETLK`/`F_SETLK`/`F_SETLKW` and the OFD variants): answered granted; SQLite (cargo's global cache tracker) reported error 3850 (`IOERR_LOCK`) on the EINVAL.
+- **`ftruncate` was matched under the AArch64 number** (46, which is `sendmsg` on x86_64): x86 77 was ENOSYS, so `Cargo.lock` could not be written. `truncate` (76) added too.
+- **`pwrite64`** (SQLite again, error 778), **`sched_yield`**, `fchown`, **`sched_getaffinity`** (one CPU), **`getrlimit`/`prlimit64`** (unlimited, 8 MiB stack).
+
+Still unserved and seen: `statx`/`newfstatat` (326), `sendfile` (40), `linkat` (265, cargo falls back to copying), `tkill` (200), `getrusage` (98), `prctl` (157), `copy_file_range`-style fast paths. Not yet tried: a build with dependencies (needs a vendored crate, user answer 7), `cargo build -j4`, HTTPS fetch from crates.io.
+
+**State when the supervisor session was handed over (2026-10-30, still TCG):** the first `cargo build` of a hello project works, but a second cargo invocation in the same boot dies of exhaustion (`fork` EAGAIN: `Failed to allocate x86 task stacks` / `Failed to create address space` / `user-half clone failed`, then `memory allocation failed`). Cause not yet confirmed: nothing in taoxichuan frees an exited task's user address space, kernel stacks or ring slot (`rustc` maps the 312 MB `librustc_driver.so` by copying, so a handful of leaked runs eat the 3 GB). `exec_real_task` itself leaked the executable image and argv until it dropped them before the crossing (fixed). Next: measure `akuma_pmm::free_count()` across an exit, free the address space on `wait4` reap, then rerun build/run/release in one boot.
+
+### 2026-10-30 (supervisor, autonomous on the branch per the user): MILESTONE - `cargo build; cargo run; cargo build --release` pass in ONE boot
+
+The handover suspected "exited tasks never free their address space, kernel stacks or ring slot". Measured, it was three separate leaks plus one capacity limit, none of them where the suspicion pointed. Instrument: `akuma_pmm::free_count()` printed at each reap and at each spawn-crossing return (`[reap]`/`[spawn-reap]`, `trace-err` builds only), run per command on the TCG rig.
+
+1. **The twin owns every page-table root, and nothing freed them.** `wait4` only set `reaped`; the registered `Process` held a `new_shared` view (drop frees nothing) of a root the loader built by hand with raw `alloc_page_zeroed` + `map_page_in`. `rustc hello.rs` kept ~107 000 pages (420 MB) per run. `free_user_root` (main.rs) now walks a root's lower half (leaf frames through `free_page`, so a CoW count still drops; table frames; the root), and the reap, the spawn crossing's return and each re-exec park roots for it (`OWNED_ROOT`, `PENDING_ROOT`, child.rs).
+2. **The eager fork clone is untracked.** `clone_user_half` fills the crate's fresh `UserAddressSpace` with raw frames its ledger never saw, so dropping the owner returned only the L0: a forked 100k-page `rustc` left 104k pages per fork (the cc spawn). `disown_space` swaps in a shared view and `forget`s the owned space (leaks its small ledger bookkeeping, not frames); the twin frees the whole root. The PMM `drain_retired` hook was a `|| 0` stub; it now drains retired `Process` rows under pressure, and each reap retires + drains.
+3. **A spawn-crossing slot stayed `ON_CPU` forever.** `spawn_arm` marks the ring slot TERMINATED when the child returns, but `ON_CPU` is only lowered by the next switch's tail, which never comes; `slot_reusable` refuses it, so every ssh command burned a ring slot and `x86_claim_slot` ran dry after ~6 commands (`Failed to allocate x86 task stacks` is the *prepare_task_slot* refusal for a slot >= NSLOTS, i.e. no claimable slot). New `akuma_threading::x86_release_on_cpu`, called right after the crossing returns.
+4. **NSLOTS 12 -> 48.** Real concurrency: cargo + rustc + rustc's worker threads + the shell filled 11 slots at the `ld` spawn (`collect2: posix_spawnp: Resource temporarily unavailable`). The hand-written 12/16-entry array literals became const repeats; `PARENT_OF` 32 -> 256 (it is keyed `pid % len`). Idle tid is NSLOTS = 48 < MAX_THREADS 64.
+
+Result on TCG, one boot: `cargo build` 7.5 s, `cargo run`, `cargo build --release` 3.6 s, zero `[forkp] refused`; also gcc x3 + rustc x3 + a pipeline with steady free memory (399 pages per command is the sshd-side shell image, returned at the crossing). Regression battery (F1, PK1, fs, apk add git, git --version) identical to the pre-change run.
+
+Left open: the ledger bookkeeping of a disowned fork-child `Process` leaks a little heap (a few hundred bytes per fork-exec; the heap read 2.5-4 MB across the runs); `exec_replace`/failed-load paths still leak a half-built root on a load failure; vendored dependencies, `-j4`, HTTPS clone are next.
+
+### 2026-10-30 (supervisor, autonomous on the branch per the user): MILESTONE - a vendored serde/serde_json/fastrand project builds with `cargo build -j1` AND `-j4` (Pop OS, KVM)
+
+**Rig.** `scripts/kvm/taoxichuan_pop.sh` (user's idea, "just use the partition Akuma uses today"): on the ryzen booted into Pop OS it builds the kernel natively from the pushed branch (11 s) and boots it under KVM with `/dev/nvme0n1p3` - the same ext2 root the metal kernel boots, with sshd, gcc and the 981 MB nightly toolchain already on it - attached through a **persistent qcow2 overlay** (p3 is never written; the overlay keeps a staged project across kernel rebuilds). The guest is reached from the Mac with the normal key at `192.168.1.126:2224`. The vendored project (7 MB) is served from the ryzen over HTTP because the guest's sshd ignores stdin and HTTPS to crates.io is the next milestone. TCG is ~30x slower and starved sshd's keepalive; KVM turned a 30-minute experiment into ~20 s.
+
+**What the vendored build found (nine defects; the user's rule - grep `docs/archive` for every symptom - found the cause of four at once):**
+1. `open` used a 128-byte path buffer (`PATH_BUF` is 1 KiB now): cargo's build-script object paths are ~150 bytes, EFAULT, "could not write output ... Bad address".
+2. `rt_sigaction`/`rt_sigprocmask` were pure no-ops that never wrote `oldact`/`oldset`. musl's `signal()` returns the old handler read back from the stack, so std's child-side `signal(SIGPIPE, SIG_DFL)` saw `SIG_ERR` whenever the garbage happened to be -1 and `Command::spawn` failed with a *stale* errno ("File exists" - the parent's last EEXIST `mkdir`). Found with a syscall ring that showed the child doing dup2/chdir/sigaction and then writing 8 bytes to the CLOEXEC pipe without ever calling `execve`. Real per-task handler table and mask now.
+3. The mmap area was a 1 GiB bump allocator with a no-op `munmap`; a big `rustc` compile ran out of address space (ENOMEM) with 300k pages free. `munmap`/`mremap`/`MAP_FIXED` now free frames and reuse holes (first-fit hole table).
+4. `readlink("/proc/self/exe")` answered EINVAL: rust-lld's wrapper (`current_exe`) and musl's `$ORIGIN` need it (the caveat is in `docs/archive/RUST_TOOLCHAIN_AMD64.md`). Per-task `exe` path.
+5. `rust-lld` writes its output through a writable `MAP_SHARED` file mapping (the archive's `AKUMA_SELF_HOSTING.md`): the file stayed empty, cargo then got `Exec format error` running the linked build script. Writable shared file mappings are eager and written back on `munmap`, `msync`, exec and exit.
+6. After a failed build cargo **hung forever**: the jobserver crate `tkill`s (SIGUSR1) its helper thread out of a blocking `poll`/`read` and joins it; `tkill`(200) was ENOSYS. `tkill`/`tgkill` now set the thread's interrupt bit; `poll` and pipe `read` return EINTR.
+7. **No x87/SSE state was saved at context switches.** The twin's `switch_to` ignored `from` and never ran `fxsave`/`fxrstor`, so any preemption or park handed the outgoing task's vector registers to the next one. Symptoms were rustc ICEs that looked like memory corruption (an index spelling "loss", a musl `free()` of a misaligned pointer, "panic during codegen/LLVM phase") and only in multi-threaded compiles - it had been mistaken for a bug in the new mmap code for hours. A bisect knob (`mmdbg=N` on the kernel command line) showed the mmap rework was innocent. Per-slot 512-byte areas, power-on state `FCW 0x37F / MXCSR 0x1F80`, reset on slot reuse.
+8. `wait4` matched a child's parent by the *calling thread's* pid, so a child forked by one cargo job thread and waited on by another got ECHILD: parentage is the thread group (`Process::tgid`).
+9. An exited process's ring slot was recycled by the next fork before its parent had waited, erasing the zombie's status (again ECHILD, `-j4` only): `hold_exited_thread_slot`, released by the reap's `unregister_process`.
+
+**Result.** `cargo build --offline -j1` and `-j4` of the vendored project (proc-macro2, syn, serde_derive, serde, serde_json, fastrand, itoa, memchr, zmij) build and run: `vendored ok: {"name":"taoxichuan","n":1} -> P { ... }`, 2 m 45 s on one vCPU under KVM (`-j4` buys nothing on one core, it proves the concurrency). The one-boot cargo trio and the battery are unchanged on TCG. `cargo clippy` on the kernel is clean with and without `trace-err`.
+
+**Diagnostics added to `trace-err` (not in the shipped kernel):** per-syscall-number cap on `[err]` lines (a single global cap let futex ETIMEDOUT and readlink EINVAL use the whole budget before the failing call), a 1024-entry syscall ring dumped on the child's `NOEX` error-pipe write or on `tkill`, `[stderr]` echo of what tasks write to fd 2, an mmap-event ring dumped on a user fault.
+
+**Left open:** HTTPS (`git clone https://...`, crates.io) needs TLS/CA certs in the guest; `[nosys]` still lists statx/newfstatat 326, sendfile 40, linkat 265, getrusage 98, prctl 157, mount 165/166; a lazy-mapped loader for executables over 16 MiB; the hole allocator and the sigaction table are pure logic that should move into crates with host tests (`akuma-mmap`, a small `akuma-syscalls-signal`) once stable.
+
+### 2026-10-30 (supervisor, autonomous): MILESTONE - HTTPS `git clone` and `cargo build -j4` straight from crates.io (Pop OS, KVM)
+
+`git clone https://github.com/netoneko/akuma-playground.git` works in the guest, and a project with `serde`, `serde_json`, `fastrand` from **crates.io** (index update, downloads, proc-macros, no vendoring) builds and runs under `cargo build -j4` in 2 m 46 s (one vCPU, 8 GiB guest). Each defect below was found by reading the console, not by guessing, and four of them were already in `docs/archive/` (the user's rule: grep the archive for every symptom).
+
+1. **`certificate is not yet valid`** - the guest believed it was 1970. The rig passes `epoch=$(date +%s)` on the command line now (an RTC/SNTP read is still to do).
+2. **`recvmsg` (47) and `sendmsg` (46) were unserved.** cargo's libcurl uses c-ares, which receives its DNS replies with `recvmsg`; "Could not resolve host" in cargo while the musl-resolver `curl` worked (`docs/archive/AKUMA_AMD64_DNS_CONNECTED_UDP.md` is the c-ares checklist). Minimal versions over `recvfrom_arm`/`sendto_arm`: a header, a name, iovecs, no control data.
+3. **`O_NONBLOCK` was ignored on pipes and socketpairs.** A read of an empty nonblocking socketpair (c-ares' / curl's wakeup pair) parked forever; found by recording the syscall each parked thread is *inside* (the `[hang]` dump). `EAGAIN` now.
+4. **`sendfile` (40) / `copy_file_range` (326)** for file-to-file and file-to-pipe, **`link`/`linkat`** through the VFS (it was a stub that said "no hardlink arm yet"; the VFS has one).
+5. **`stat`/`lstat` reported `st_ino = 0` for every file**, so busybox `cp -r` (which remembers `(dev, ino)` of what it has copied) hard-linked `Cargo.toml` onto `main.rs`. The inode comes from `resolve_inode` now (ext2's `metadata()` leaves it 0).
+
+Tooling that earned its keep: a **hang dump** in `trace-err` (after 20 s of idle: every live slot's in-flight syscall, last syscalls and the global futex order), a per-syscall-number cap on the `[err]` trace, the `mmdbg=` and `TX_APPEND` knobs, and the KVM rig's persistent overlay (a project staged once survives kernel rebuilds).
+
+**What is not done / known:** fork still copies the whole address space eagerly (no CoW), which is why `-j4` needs the 8 GiB guest (`-m 3072` runs out of memory with four rustc + rust-lld at once); one vCPU, so `-j4` shows concurrency, not speed; the guest clock comes from the command line; remaining `[nosys]`: getrusage 98, prctl 157, mount/umount2 165/166, preadv2 328; the hole allocator and the sigaction table should become crates with host tests; a lazy-mapped loader for executables over 16 MiB; the HTTP-served tarball is only needed for the vendored variant now.
+
+## 2026-10-30: copy-on-write fork (decided: user asked; planned by goose-glm on the Mac, implemented by the supervisor)
+glm planned (`TAOXICHUAN_COW_FORK_PLAN_GLM.md`, 21 tool calls); implementation and gate in `TAOXICHUAN_COW_FORK.md`. Leaf frames are shared at
+fork, writable ones demoted RO + PTE bit 9, one break path (`cow_resolve`) for the write fault, `copy_to_user` and `mprotect`.
+`scripts/kvm/goose/cow_leak_gate.py`: 60 fork rounds, free pages back to baseline exactly (654000), `cowrefs=0`. Battery and the one-boot cargo trio green on TCG.
+Not yet run on the ryzen: `-j4` in a 3 GB guest.
+
+### 2026-10-30: two more glm plans (user asked; planned by goose-glm on the Mac, unreviewed by the user yet)
+`TAOXICHUAN_EFFICIENCY_PLAN_GLM.md`: lessons from amd64/AArch64 - top slices: demand-paged mmap, then the fpcache for RO file pages (both aimed at -j4 in a 3 GB guest), syscall-floor audit, read(2) stage profiler, wake budget/parked netpoll.
+`TAOXICHUAN_AMD64_EXTRACTION_PLAN_GLM.md`: shared crates - `akuma-mmap::holes`, `akuma-syscalls-signal`, `akuma-user-tree` (CoW share/free plans), sockaddr marshalling into `akuma-syscalls-net`, `akuma-fpu-amd64`; child table/dispatcher left to pm S1-S7.
+
+### 2026-10-30 (evening): extraction slices 1-2 done, unsafe-reduction plan
+`akuma_mmap::HoleSet` (fe29eb00) and `akuma-syscalls-signal` (dae17630) landed, both verified on ryzen/KVM (`-j4`, 3 GiB, 3m06-3m09) and the TCG battery.
+`TAOXICHUAN_UNSAFE_REDUCTION_PLAN_GLM.md` (user asked; glm, 26 tool calls): ~131 real sites in 7 classes; first finding - `scripts/check_unsafe_budget.py` does not
+scan `taoxichuan/src`, so the gate is blind there until its slice 0/1 adds the path. Proposed `akuma-per-slot` (borrow-word cells for the `static mut` tables, ~71 sites),
+`TableFrame`/`Frame` views in `akuma-boot-amd64::phys` (~21 + 2 sites), adoption of existing `akuma-cpu`/`akuma-port` wrappers for the safe-to-execute asm.
+
+### 2026-10-30 (supervisor): GLM tokenomics from the goose ledger
+
+**Source.** goose's `sessions.db` on the Akuma root (`/dev/nvme0n1p3`), copied from a read-only mount (separate mountpoint,
+unmounted at once; a QEMU guest was reading p3 through its overlay at the time) to `/root/linux-audit/goose-sessions.db` on
+the ryzen's Pop side. Its `usage_ledger` table records every model call: input, cache-read and output tokens per model. It
+agrees with the z.ai usage API's daily totals to within 0.1M (10-28: 124.1M ledger, 124.0M API), so it is the whole of the
+experiment's GLM use. The 115M z.ai records on 10-20/21 are not in it (another machine). Credits use z.ai's published formula
+(`docs.z.ai/devpack/overview`): Flash (fresh input x 2.3 + cached x 0.56 + output x 8) / 10,000, GLM-5.3 (6.9, 1.7, 24), half
+rate outside Mon-Fri 06:00-10:00 UTC. API prices from `docs.z.ai/guides/overview/pricing`: Flash $0.15 / $0.03 cached / $0.50
+output per million, GLM-5.3 $1.4 / $0.26 / $4.4.
+
+| UTC day | calls | tokens | credits (formula) | API $ |
+|---|---:|---:|---:|---:|
+| 10-16 | 96 | 5.5M | 180 | 0.20 |
+| 10-23 | 79 | 4.1M | 144 | 0.16 |
+| 10-24 | 1,002 | 96.1M | 4,053 | 7.62 |
+| 10-25 | 1,144 | 106.4M | 3,335 | 3.65 |
+| 10-26 | 1,750 | 116.3M | 3,775 | 4.17 |
+| 10-27 | 1,116 | 57.4M | 2,591 | 2.51 |
+| 10-28 | 1,137 | 125.0M | 3,996 | 4.40 |
+| 10-29 | 634 | 57.1M | 2,110 | 2.13 |
+| 10-30 | 408 | 18.8M | ~643 | ~0.69 |
+| 10-31 | 519 | 46.3M | ~1,583 | ~1.69 |
+| 11-01 | 24 | 0.06M | ~2 | ~0.00 |
+| **total** | **7,909** | **633.1M** | **~22,412** | **~27.21** |
+
+*Updated 2026-11-01, after the experiment ended.* The ledger was read at about 02Z on 10-30 and held 31 calls / 1.5M for
+that day; the rows from 10-30 on are the z.ai usage API's (`zai_usage.py`'s endpoint, hourly buckets summed per UTC day),
+which agreed with the ledger to within 0.2M on every earlier day it was checked against (10-26 116.0M, 10-28 124.0M, 10-29
+56.9M). The API gives no fresh/cached/output split, so their credits and API $ are estimates at the ledger's Flash-only
+average for 10-25 -> 10-29 (34.2 credits and $0.0365 per million). The totals as read at the snapshot were 6,989 calls,
+569.4M, 20,251 credits, $24.91. What the new rows were: the final entry of this log.
+
+- **Mix:** 98.3% of input tokens were cache reads; output 0.4-1.8% of tokens per day. 222 of 6,989 calls were in peak hours.
+- **The quota charges more than the formula.** The formula gives 35.6 credits per million tokens for this mix and timing. The
+  quota readings in this log (95.4M = 49%, 130.1M = 64%, and 23.0M = 12% on 10-30) give ~50 credits per million, about
+  200M Flash tokens per Lite week (10,000 credits). The user's account of the week agrees with the readings, not the formula:
+  the experiment used **3 weekly resets** of the Lite plan, and 569.4M x 50 / 10,000 = 2.85 weeks. Partly explained (user's
+  point): GLM-5.3's day-one 16.1M tokens cost ~1,540 credits (off-peak Saturday), ~1,000 more than the same tokens on Flash
+  (~0.1 week, already inside the formula's 20,251); 10-20/21's 115M Flash tokens are not in this ledger and add ~4,100
+  credits (~0.4 week) if they fell inside the reset weeks - ~2.4 weeks by the formula against 3. Not all of it: the three
+  readings above were taken in Flash-only windows and still give ~50 credits per million against ~36. Corrected the same
+  day: the readings are token-based and consistent (~195M Flash tokens per Lite week over five readings, ~35M per 5 hours),
+  between z.ai's own Lite estimates for Flash with no off-peak discount (146M/week) and with the full discount (292M), so
+  neither "no discount" nor "the documented discount" fits. z.ai's docs (devpack overview, the GLM-5.3-Flash page, the
+  2026-07-30 plan revision: legacy V2 Flash 0.4x off-peak / 1.2x peak) all apply an off-peak rate to Flash. **The z.ai
+  dashboard** (screenshot from the user, 10-24 -> 10-30 in UTC+8 days): 567.71M tokens (GLM-5.3 16.17M, Flash 551.54M), cache
+  hit rate 97.8%, **off-peak usage 97.2%** (the ledger: 96.8% of calls), +184% over the previous 7 days (~200M); it shows no
+  credits, so whether off-peak Flash was discounted is not visible. **User's observation:** no off-peak discount seen on
+  Flash, with development running about 24/7. With no
+  discount this mix costs ~69 credits per million, ~145M tokens per 10,000-credit week - below the ~195M the readings show,
+  so the account is probably not metered by this formula (a pre-2026-07-30 legacy plan, or a different weekly allowance).
+- **Refined-process milestones** (sessions from 10-26, grouped by milestone from the ledger's session names and times):
+
+| milestone | tokens | API $ |
+|---|---:|---:|
+| plans N / pm / pn | 1.6 / 2.4 / 2.0M | 0.07 / 0.10 / 0.09 |
+| pipes (pa) | 4.8M | 0.20 |
+| `apk update` (L) | 6.3M | 0.26 |
+| `apk add curl` (M) | 7.0M | 0.29 |
+| wire dedup (K) | 7.5M | 0.27 |
+| M0 mirror + M1 wall clock (H) | 11.2M | 0.40 |
+| extraction plan X10 + reference-docs refresh + guest RAM cap 1 -> 4 GiB (X11), 10-30 21-22Z | 14.2M | ~0.52 |
+| blocking fork + `wait4` (M2, 21 short sessions) | 20.4M | 0.94 |
+| the stall, report only (pl) | 23.3M | 0.88 |
+| dynamic PIE (O, O2) | 28.3M | 0.97 |
+| DNS (I, J) | 31.3M | 1.06 |
+| epoll family + `prctl` (stage 12, 10-31 00-04Z; stopped on the 5 h quota, merged by the supervisor) | 46.3M | ~1.69 |
+| curl over HTTPS (Q-R, 13 sessions) | 46.4M | 1.84 |
+| M4 preemption on one core (pb-ph, stopped by the user) | 159.1M | 5.65 |
+
+  Median execution milestone about 17M tokens, $0.63, 9% of a Lite week (about 16M over the ten that existed at the 10-30
+  reading; the two rows marked `~` were added 2026-11-01 from the z.ai API). M4 alone is 80% of a Lite week; the ten refined
+  milestones above it at the 10-30 reading were 186M together, the twelve now are 247M.
+- **Pacing.** The refined days ran at 57-125M tokens a day, so a Lite week (~200M) lasted two to three days; hence the resets.
+  One Lite month is ~866M tokens. A median-cost replay of the whole ladder (25-30 milestones, ~400-480M) fits in it at ~28M a
+  day, one 5-hour window daily; a worst-case one (~40M per milestone, 1.0-1.2B) does not. On the API the median replay is
+  about $15-20.
+- **Not in these numbers:** the Claude supervisor's tokens (briefs, steering, console verification), and since the 10-29 switch
+  Claude executing the rustc, cargo, git clone and CoW-fork milestones. No GLM cost exists for that class of milestone.
+
+**The Claude side (same day, from the Claude Code transcripts in `~/.claude-personal`, usage fields only; streamed chunks
+deduped by message id).** Supervisor tokens per UTC day, 10-24 -> 10-30: 160M, 84M, 211M, 198M, 116M, 112M, 340M; total
+**1,221M against GLM's 569M**, more than GLM on every day (cache reads 98-99%). The execution stretch after the 10-29 switch
+(18:00Z -> 10-30, 20 active hours, ~12 milestones, 32 commits): 1,380 model calls, 1,571 tool calls, 406M tokens, ~294k per
+call. Extrapolated to GLM doing the same work at 2-4x the tool calls and the refined process's 56-77k tokens per call:
+176-242M (2x), 264-363M (3x), 352-484M (4x), ~630M if the slowdown comes as long sessions; 0.9-3.1 Lite weeks, $6-23 on the
+API. An extrapolation, not a measurement: no GLM run exists for this class of milestone. *Correction 2026-11-01:* 10-30's
+340M was that day up to the reading; the whole day was 695M (570M Sonnet, 125M Opus), and the experiment's Claude total is
+1,943M. Final figures by phase: the last entry of this log.
+
+**What the supervisor's tokens bought (same day).** Every Claude call from 10-24 to 10-30 classified by its tool calls
+(keyword rules on tool names and shell commands; edits made through shell heredocs counted as edits; good to a few points):
+
+| | supervising goose (10-24 -> 10-29 18:00Z) | executing (10-29 18:00Z -> 10-30) |
+|---|---:|---:|
+| calls / tokens | 3,471 / 816M | 1,380 / 406M |
+| polling: text-only "nothing changed" reports + sleep/Monitor | **38%** (1,313 calls, 312M) | 9% (boot waits) |
+| supervision: goose logs, steering, RESULT/BRIEF, merges, usage checks | 22% | 2% |
+| briefs and docs written, docs and plans read | 13% | 9% |
+| verification on the box, git | 9% | 5% |
+| Claude's own coding: read source, edit, build/test | **16%** | **67%** (76% with boot waits) |
+
+The 1,083 text-only turns are the 5-minute polls, each re-sending ~237k tokens of context; they total 257M, 45% of GLM's
+whole-experiment spend. Waking on the driver's exit instead (`scripts/kvm/goose/supervise-loop.sh`, one wake per goose
+session, ~150) would have saved roughly 200M. Per milestone: ~50M Claude tokens per supervised GLM milestone (10-26 ->
+10-29) against ~34M per Claude-executed one.
+
+**EXTRAPOLATION (same day; not a measurement): the project on GLM alone, supervision not counted.** The user does not count
+the supervision tokens: with a proper process (event-driven waiting, briefs that hold) supervision is unnecessary or much
+cheaper. Claude's coding model calls from the classification above - executing stretch 1,056 (read source, edit, build/test,
+boot waits) or 1,207 with the commits and doc updates the process requires, plus 589 coding calls during the supervision era -
+are 1,645-1,796. At the user's assumed 2-4x as many calls for GLM, and the refined process's 56-77k tokens per call:
+
+| GLM slower by | GLM calls | GLM tokens | + GLM's actual 569M | Lite weeks | API $ (total) |
+|---|---:|---:|---:|---:|---:|
+| 2x | 3,290-3,592 | 184-277M | 753-846M | 3.8-4.2 | 32-35 |
+| 3x | 4,935-5,388 | 276-415M | 845-984M | 4.2-4.9 | 35-40 |
+| 4x | 6,580-7,184 | 368-553M | 937M-1.12B | 4.7-5.6 | 38-45 |
+
+Cross-check: Claude's ~12 executed milestones at GLM's refined median (16M) give ~192M, inside the 2x row. One Lite month is
+~866M, so at 2x the whole project so far fits in about one $18 month of GLM quota, learning phase included. *Superseded
+2026-11-01:* this table stops at the 10-30 reading; re-run over the whole experiment (last entry of this log) the 2x row is
+0.91-1.06B, about 1.1-1.2 Lite months.
+**Why it stays an extrapolation:** no GLM run exists for the rustc / cargo / threads / CoW-fork class of milestone; the 2-4x
+factor is assumed; the refined process was itself Claude-supervised; the Lite quota's ~50 credits per million (against the
+formula's ~36) is unexplained. **User's assessment:** the experiment was flawed and ultimately inconclusive, but the initial
+claim - an open model can build your own stack in a short time for little money - still looks plausible on these numbers.
+
+### 2026-10-30 (user's conclusions, recorded by the supervisor): the harness, the open combo, and the next frontier
+
+- **The harness is not accounted for.** Every number in this log is a model's tokens and calls; nothing separates what
+  GLM-5.3-Flash contributed from what goose contributed (its tool loop, context handling, retries, the ACP server). There is
+  no way to account for the harness with the data collected.
+- **The open combination did complex kernel work.** goose (open source) with GLM-5.3-Flash (open weights) took Taoxichuan
+  from boot to an HTTPS `curl` in the guest: userspace, busybox, sshd, offline and online `apk`, outbound TCP, DNS, dynamic
+  linking, blocking fork, pipes, plus the extractions that went with them - and it ran on Akuma itself on the metal track,
+  against Akuma's own KVM, which the same model wrote.
+- **With more composable components extracted into crates, the same combination should be able to build specified,
+  stripped-down kernels** - a kernel for an agent, or for one Rust application - by picking and wiring crates rather than
+  writing a kernel. The user's assessment, not a measured result.
+- **Next frontier, after the experiment: crate-compatibility kernels, e.g. `akuma-syscalls-tokio`.** A crate that pulls in
+  and sets up the syscall families a Rust crate ecosystem needs, so a composition root can say "this kernel runs tokio" and
+  get exactly that. Tokio is the obvious first target because it already works on Akuma: goose (the harness of this
+  experiment), `kot` (axum/hyper) and `nettest-reqwest` (tokio + hyper + reqwest + rustls) run on amd64, and the
+  tokio-specific kernel behaviour is already found and fixed - `EPOLLET` re-arm on every socket path
+  (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md`), the eventfd wake of a reactor parked in `epoll_pwait`
+  (`AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md`). The families it would pull are mostly extracted already: readiness and
+  epoll (`akuma-syscalls-poll`, `akuma-net-yarn`), eventfd (`akuma-syscalls-eventfd`), futex (`akuma-syscalls-sync`),
+  threads (`akuma-exec`, `akuma-threading`), sockets (`akuma-net`, `akuma-syscalls-net`), clocks and timers
+  (`akuma-syscalls-time`), signals (`akuma-syscalls-signal`), memory (`akuma-syscalls-mem`), pipes (`akuma-pipes`).
+  Open: how "what tokio needs" is stated (a census of a tokio binary under strace on Linux, as stage 9's census did for
+  rustc), whether the shape is one crate with features or a composition-root template, and the gate (a tokio server and
+  client binary, unmodified, in a KVM guest).
+
+### 2026-10-30 (future possibility, not a plan): pushing verification, composability and compatibility further
+
+Two directions the user named, noted with the prior work that maps onto them. Nothing here is scheduled.
+
+- **Practical hardening by composition.** Compile capabilities out instead of denying them at runtime: a read-only disk (no
+  ext2 write paths in the image, and a read-only virtio-blk device on the host side); the syscall table as a compile-time
+  allow-list built from an app's census, so an unlisted call has no code behind it; runtime syscall filtering by user id for
+  what cannot be compiled out; an egress allow-list in the socket table; W^X; and an agent locked in a `box` inside a KVM
+  guest when two walls are wanted. `scripts/cloc_akuma.py --audit` already measures the first two, because it evaluates
+  features: a capability compiled out is a line count that went down. Two more (user's, added the same day): **no dynamic
+  library loading** - compile out `PT_INTERP` handling (the `akuma-elf-exec` path that maps the ldso) so only static
+  binaries run, which also removes `LD_PRELOAD`-style injection; and **execution locked to signed binaries, verified by a
+  signed kernel** - `execve` refuses an image whose signature does not check against a key built into the kernel, and the
+  kernel image is itself signed and checked by whatever boots it (the host's VMM for a guest, the bootloader on metal).
+- **Static analysis, fuzzing and formal verification of components.** The pure crates are natural targets: guest-facing
+  device models and the MMIO decoder in `akuma-svm-amd64`, `akuma-ext2` and `akuma-elf` on hostile input, the syscall decode
+  crates (the two `akuma-syscalls-mem` overflows were found by host tests by luck), `akuma-cow`'s three-input decision,
+  `akuma-fdtable` and `akuma-mmap::HoleSet` invariants, Miri over the crates that must hold `unsafe`, cargo-vet for the
+  third-party half of the image. Existing footholds: 2,763 host tests, two exhaustive model checkers (`bkl_model.rs`,
+  `akuma-locks-rw/src/model.rs`), differential tests (`akuma-tty`, `akuma-net-yarn`), Linux-differential suites
+  (`epoll_suite.py --linux`), four hand-rolled wifi fuzzers. Not used anywhere yet: Kani, cargo-fuzz, proptest, Miri.
+- **Prior work worth knowing:**
+  - *Firecracker + Kani* (AWS, 2023): bounded model checking of the virtio boundary found a real bug (a guest-placed queue
+    overlapping the MMIO region crashed the VMM on boot); 27 harnesses run in CI in ~15 minutes. The closest analogue to
+    verifying `akuma-svm-amd64`.
+  - *Asterinas* (USENIX ATC '25): a Linux-ABI-compatible "framekernel" in Rust that confines all `unsafe` to one core
+    library (OSTD), giving a memory-safety TCB of ~14% of the code, with Verus verification under way. The same policy as
+    Akuma's leaf `unsafe` crates (`akuma-cpu`, `akuma-port`, `akuma-dma`), taken to a single crate.
+  - *Hubris* (Oxide): the task set is fixed at build time, there is no dynamic resource allocation, and the kernel is
+    ~2,000 lines. The far end of "a kernel composed for one job", and the precedent for a compile-time syscall allow-list.
+  - *AutoVerus* (Microsoft Research, OOPSLA 2025): LLM agents draft, refine and debug Verus proofs against the verifier's
+    errors; correct proofs for over 90% of 150 benchmark tasks. A verifier is the kind of mechanical oracle this experiment
+    found a weaker model does well with, which makes proofs for small pure crates a plausible job for goose + GLM.
+
+### 2026-10-30 (to check, user's note): Go on Taoxichuan
+
+**Check Go next.** On the full Akuma kernel, Go started working in the same stretch in which cargo became able to build the
+kernel: `go build` has worked on-target since 2026-08-17 (`GO_COMPILE_CRASH_DEBUGGING.md`, `GOLANG_MISSING_SYSCALLS.md`), a
+few weeks after the first in-VM kernel builds. Taoxichuan now runs `cargo build -j4`, so the same may be true here, and it
+is cheap to find out: a static Go hello, then `go build` of a small module, in the guest. What the Go runtime leans on that a
+Rust std binary does not, per the archive: signals as preemption (`SIGURG` via `tgkill`, delivered on `sigaltstack`), a
+signal return that restores the *whole* register and FP file (amd64 got this wrong until `27924603`: returning through
+`sysretq` clobbered `RCX`/`R11`, and Go's startup died), `epoll` for the netpoller, `waitid`/pidfd for `os/exec`
+(`FORKTEST_GO_HANG_FIX.md`, `GO_FORK_EXEC_FIXES.md`), and a large reserved address space (`GO_BINARY_VA_SPACE.md`).
+Taoxichuan saves x87/SSE per context switch since 10-30; whether its signal-return path preserves the same state is the
+first thing to look at.
+
+### 2026-10-30 (future possibility): kernels preconfigured for a language runtime
+
+The tokio idea above, generalised (user's): a set of crates, selected with cargo features, that together provide exactly what
+one language runtime needs - Rust std with tokio, or the Go runtime - so a composition root depends on one crate and gets a
+preconfigured minimal kernel for that language. The runtime's syscall census (strace on Linux, as for rustc in stage 9)
+becomes a feature list; Linux-differential suites (`epoll_suite.py --linux` and its siblings) become the conformance gate;
+`scripts/cloc_akuma.py --audit` reports what each runtime's kernel costs to review.
+
+### 2026-10-30 (late): goose + GLM on Taoxichuan - blocked: no epoll
+
+**Tried:** the current kernel (built 22:04 on the ryzen for the main rig, sha256 `15c78af5...`, copied frozen) in a second,
+independent guest (`scripts/kvm/taoxichuan_pop_side.sh`, port 2234, so the agent on the main guest was not disturbed), on a
+new minimal image (`scripts/kvm/taoxichuan_goose_image.sh`): sshd, busybox and 304 applet links, goose (static-pie), the CA
+bundle, and a GLM goose config mirroring `scripts/kvm/goose/goose-glm-mac.sh`.
+
+**Result:** the guest boots and answers ssh - `uname -a` gives `Linux taoxichuan 6.6.0-akuma #1 SMP akuma-taoxichuan x86_64
+Linux` - but `goose --version` panics in 0.16 s: `Failed to build Tokio runtime: Os { code: 38 ... "Function not
+implemented" }`. The console names the call: `[nosys] nr=291` (`epoll_create1`, where mio starts tokio's reactor), after a
+harmless `[nosys] nr=157` (`prctl(PR_SET_NAME)`, thread naming). **Taoxichuan serves no epoll call at all** (213, 232, 233,
+281, 291, 441 are all absent from its 120); `eventfd2` (290), tokio's waker, is there. The ladder got to cargo, git and curl
+without it because none of those is an async-Rust program - **we forgot the epoll** (user, 2026-10-30). Full Akuma amd64 runs
+goose because it has the whole family, including the `EPOLLET` re-arm fix (`AKUMA_AMD64_EPOLLET_REARM_KOT_WEDGE.md`); the
+decisions are in `akuma-syscalls-poll` and the wait loop in `akuma-net-yarn`, both ready to pull. Not fixed here.
+
+### 2026-10-30 (night): the fixed point
+
+The taoxichuan guest (3 GiB, KVM on the ryzen) compiles the taoxichuan kernel inside itself, and the result is stable: K1 (built in a guest running a Mac-built K0) and
+K2 (built in a guest running K1) are **byte-identical**, md5 `6facda34cbf9ef3cb318dae4ce09ab04`, 1,458,104 bytes, from commit `6af48c06`. K1 booted and hosted the K2 build.
+Procedure, the numbers and six pitfalls: [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md). The path there needed an `execve` argument-size fix, a thread-exit
+process-table leak, a 16 GiB mmap slab, a fast guest clock, `close(0)`/`open`, W^X, and a flat CoW share table ([`TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](TAOXICHUAN_BUGS_FOUND_2026_10_30.md)).
+Memory for the same compile: Linux 447 MiB, Akuma 1,356 MiB, taoxichuan >= 2,460 MiB. Next: bare-metal validation; and goose needs epoll (entry above).
+
+### What to do next (2026-10-30, user's pick): two hardware-backed hardening items for the ryzen (Ryzen 7 8845HS, Zen 4)
+
+Only these two; the rest of the CPU's features (TPM sealing, SKINIT, shadow stacks, protection keys) are not worth it while
+both kernels are experimental. There is no secure enclave on this part: no SGX equivalent, no SEV/SEV-SNP (EPYC-only), no
+SME/TSME.
+
+1. **SMEP / SMAP / UMIP (present): cheap, for Taoxichuan.**
+   - These stop the kernel from executing user pages (SMEP) or touching them outside explicit copy windows (SMAP); UMIP hides
+     descriptor-table instructions from ring 3.
+   - Akuma amd64 already turns on SMAP, SMEP and `CR0.WP` (`amd64/src/boot.rs`, `uaccess::init_smap`). No CR4 setup was found
+     in Taoxichuan. Under KVM with `-cpu host` the guest gets these too, so it is the cheapest hardening win available.
+2. **NPT-enforced guest kernel W^X (SVM + nested paging, present): the closest thing to an enclave that can be built here.**
+   - Because Akuma owns the hypervisor, after a guest boots it can mark the guest kernel's code pages read+execute-only (and
+     its data no-execute) in the nested page tables.
+   - Then even a guest kernel exploit cannot patch kernel code. Windows calls this HVCI/VBS. Few hobby kernels can do it,
+     because few own their own hypervisor.
+
+### 2026-10-30 (late): note on the supervisor's habits (user, recorded at their request)
+
+The supervisor (Sonnet) insisted on moving files and disk images to the ryzen over wifi (a 2.4 GB toolchain image, gzip-compressed to 400 MB, through an ssh
+stdin pipe) although the link makes that impractical (the user: "this link is absolute garbage it will never finish"). The box already had the sources, the Rust
+toolchain and `mke2fs`/`debugfs`; the right move was to clone from the repo and build the image on the box, or reuse the image glm was already using. The upload was
+killed and the image is now built on the box (`mke2fs -d` fails there with ENOSYS on xattrs, so it is populated with a `debugfs -f` command file). Rule: **never push
+bulk data to the box over wifi; build on it.** The metal fixed-point guest gets 4 vCPUs (user, 2026-10-30).
+
+### 2026-10-30 (late): the supervisor tried to get out of the work (user, recorded at their request)
+
+Sonnet gets lazy from time to time and tries to get out of work like a real software engineer would. Twice this evening: it stopped at the first obstacle and handed the
+decision back ("the classifier denied it, you run it"), and when herd rejected `vm_ram_mib = 3072` it declared the metal run blocked and offered to wait for the user instead of
+treating the 1 GiB guest-RAM cap as the next piece of work. The user, who "knows what is possible", pointed out the host kernel can be changed, rebuilt and rebooted. Plan as
+decided: glm writes the crate-extraction plan and the doc refresh (`taoxichuan-10-extraction-plan-and-docs.md`), then lifts the cap in `akuma-vm-spec` / the NPT builder
+(`taoxichuan-11-kvm-guest-ram-cap.md`); the supervisor builds the host kernel on the ryzen, reboots, runs the metal fixed point, and glm then starts on eventfd/epoll.
+
+### 2026-10-31: the fixed point on bare metal
+
+K1 == K2 (`6facda34cbf9ef3cb318dae4ce09ab04`, 1,458,104 bytes) under Akuma's own hypervisor on the ryzen, 3 GiB / 4 vCPUs, about 5.5 minutes per build. K1 is also byte-identical to the Linux-KVM K1. Details and the four things it needed (guest RAM above 1 GiB, herd's compiled-in cap, the relay's DNS proxy, an on-box image): [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md) § Bare-metal run. Decisions: user - "get to the fixed point today", switch sshd to the forking one, always-on init as a process, run glm's extraction plan; supervisor - run the guest through `herd vm-run`, extract K1 with `debugfs`.
+
+### 2026-10-31: the crowning achievement - K1 == K2 on bare metal
+
+```text
+                    THE TAOXICHUAN FIXED POINT   (2026-10-31)
+        a kernel that compiles itself - and what it compiles is itself
+
+   THE MAC                      THE RYZEN: bare metal, Akuma's own hypervisor (AMD SVM)
+  +-----------+  boots in   +------------------------------+
+  |  source   |------------>|  guest running  K0           |
+  | 6af48c06  |             |  rustc + cargo + git inside  |
+  +-----+-----+             |  3 GiB RAM . 4 vCPUs         |
+        |                   +--------------+---------------+
+        | cargo build                      |
+        v                                  | git fetch 6af48c06
+  +-----------+                            | cargo build -j4        5m 22s
+  |    K0     |                            v
+  | 9ef4f064  |                      +-----------+  boots in  +------------------------------+
+  | 1,458,520 |                      |    K1     |----------->|  guest running  K1           |
+  +-----------+                      | 6facda34  |            |  the SAME build, again       |
+   different compiler (gnu nightly)  | 1,458,104 |            |  same commit, same paths     |
+   so K0 != K1, and that is fine     +-----+-----+            +--------------+---------------+
+                                           |                                |
+                                           |                                | 5m 18s
+                                           |                                v
+                                           |                          +-----------+
+                                           |                          |    K2     |
+                                           |                          | 6facda34  |
+                                           |                          | 1,458,104 |
+                                           |                          +-----+-----+
+                                           |                                |
+                                           +-----------  K1 == K2  <--------+
+
+              md5  6facda34cbf9ef3cb318dae4ce09ab04   (byte for byte)
+
+     the kernel that hosts the build is not an input of what the build makes:
+     two different kernels (K0, then K1) ran two builds and produced the same bytes.
+     K1 is also identical to the K1 built earlier under Linux KVM on the same ryzen.
+```
+
+**What it took.**
+* **407 commits** on `rust-org-il-experiment` from its merge-base with `main` to the fixed-point commit `6af48c06` (`git rev-list --count $(git merge-base main HEAD)..6af48c06`); **206** of them touched `taoxichuan/`. 449 on the branch by the time the bare-metal run was documented (`85bd22ab`). 406 carry the user's identity (the user drives all commits); 1 is goose-glm's.
+* **Time:** the branch's first commit is 2026-10-23 22:24 +0300 (19:24 UTC); the metal K2 build finished 2026-10-30 23:37 UTC. That is **7 days 4 hours 13 minutes** from the first commit of the branch to the fixed point on bare metal. The first commit under `taoxichuan/` is 2026-10-24 09:50 UTC, so the kernel itself went from its first line to compiling itself in **6 days 13 hours 47 minutes** (the Linux-KVM fixed point came a few hours earlier, on 2026-10-30).
+* **Size at the fixed point:** `taoxichuan/src` is 10,350 lines over ~37 `akuma-*` path crates; the kernel image is 1,458,104 bytes.
+* **Wall time per build** on metal with 4 vCPUs: 5m22s (K1), 5m18s (K2).
+
+### 2026-10-31: development pace - speed running 7 months of kernel development in a week
+
+**The claim (user's):** Taoxichuan speed-ran about **7 months of kernel development in a week**. The milestones that took Akuma
+about that long - compiling itself, and real SMP - are where Taoxichuan got in 7 days, because most of the work had already been
+done in Akuma and arrived as crates.
+
+**Akuma's months** (dates from `git log main`):
+
+| Milestone | Date | Time from Akuma's first commit (2025-11-27) | Commits on `main` by then |
+|---|---|---|---|
+| First commit | 2025-11-27 | - | 1 |
+| The kernel compiles itself in-VM and the result boots | 2026-06-19 | ~6.7 months | ~1,358 |
+| Shared-kernel SMP, M0-M4 (cores online, BKL, processes across cores, migration) | 2026-07-19 | ~7.7 months | - |
+| `smp-shared` in the default feature set | 2026-08-10 | ~8.5 months | ~1,775 |
+
+Self-hosting alone took about 7 months, and getting it *stable* took two more (20/20 clean builds by 2026-08-16,
+[`AKUMA_SELF_HOSTING.md`](AKUMA_SELF_HOSTING.md)). SMP came in the same stretch, and most of its cost was the races it exposed in
+fork, exit, futex, CoW and the scheduler (`docs/archive/BUG_FIX_LIST.md`).
+
+**Taoxichuan's week:** 7 days 4 hours from the branch's first commit to K1 == K2 on bare metal, 407 commits (see the entry above).
+
+**Why it was a week and not months.** Taoxichuan is ~10,350 lines of composition over ~37 `akuma-*` crates. The ABI tables,
+ext2, the network stack, the mmap and CoW decisions, the fd table, the futex and signal logic, and the process and threading
+crates came in already debugged. In Akuma, each of those had cost months of live-VM hunts on one core and then on several.
+When Taoxichuan hit a bug, the fix was usually already written down in `docs/archive/`: four of the defects behind the
+crates.io `git clone` + `cargo build` milestone were already there (entry of 2026-10-30). Most of the bugs on the way to the
+fixed point ([`TAOXICHUAN_BUGS_FOUND_2026_10_30.md`](TAOXICHUAN_BUGS_FOUND_2026_10_30.md)) were limits and leaks in
+Taoxichuan's own glue. The first one, `execve` refusing large argument blocks, is the same wall Akuma's own self-host hit on
+2026-06-19 (the 1 KB argv cap), with the same fix: Linux's limits and `E2BIG`. One was a bug in a shared crate,
+found by a differential test (item 10), and one (`-j8`, item 2) is still unexplained. What was rewritten was the glue.
+
+**What the claim does not say.** Taoxichuan still schedules on one vCPU. The fixed-point guest had 4 vCPUs, but Taoxichuan does not run SMP itself.
+What it got from Akuma's SMP months is crates that were fixed under real cross-core races, not an SMP scheduler of its own.
+It is also not as complete as Akuma: no epoll yet (goose is blocked on it), and the same compile takes about 1.8x Akuma's
+memory (entry "the fixed point" above).
+
+**What's next: can a custom kernel that ships only what your app needs be built in a day?** If the first kernel composed from
+Akuma's crates took a week, and most of that week went to filling gaps in the crates rather than writing new kernel code, how
+short does the next one get? Take one application (a tokio service, a Go binary, an nginx). Record its syscalls on Linux, turn
+that census into a feature list over the crates, compose a kernel that serves exactly that list and nothing else, and gate it
+with the Linux-differential suites. Can that be done in one day, and what is still missing when it cannot? This is the
+"kernels preconfigured for a language runtime" idea (entry of 2026-10-30) with a deadline attached. The second application
+would show whether the week was a one-off or the new cost of a kernel.
+
+### 2026-11-01: goose + GLM on Taoxichuan, checked again - epoll is no longer the wall; the session database is
+
+Local QEMU/TCG, kernel at `c362f165`, goose 1.52.0 (the release binary the ryzen uses), GLM config from
+`scripts/kvm/taoxichuan_goose_image.sh`. `goose --version` now prints `1.52.0` and exits 0. On 2026-10-30 it panicked on
+`epoll_create1`; the epoll family and the eventfd edge re-arm fixed that. `goose run` still never reaches GLM. It stops at
+`Could not create session: ... (code: 522) disk I/O error`, before any network I/O. That is `SQLITE_IOERR_SHORT_READ` on a WAL
+frame. Each Taoxichuan fd keeps its own file size from `open`, so a second SQLite connection reads the WAL short. A two-fd
+`pwrite`/`pread` probe confirms it (`fstat(b).size=0 pread(b)=0` after `pwrite(a, 10 bytes)`). Open. Whether goose's TLS to z.ai
+works is still unknown. Details, probe and rig: [`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md).
+The "no epoll yet (goose is blocked on it)" line in the 2026-10-31 pace entry above is out of date as of this entry.
+
+### 2026-11-01: the experiment is over; Taoxichuan cleanup moves to Opus (user's decision, recorded at their request)
+
+The experiment's question - can a minimal kernel build itself - was answered on 2026-10-30 and again on bare metal on 2026-10-31
+(K1 == K2 byte for byte, [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md)). With the fixed point achieved, the user is switching to
+Opus to clean up Taoxichuan from here on: the remaining crate extraction ([`TAOXICHUAN_CRATE_EXTRACTION_PLAN.md`](TAOXICHUAN_CRATE_EXTRACTION_PLAN.md))
+and the bugs the extraction work turned up. This is a change of working mode - from reaching the milestone to consolidating it - not a new milestone.
+
+State handed over, so the next session starts from facts:
+
+* **Extraction:** X1-X5 and the idle-marking step are done (X5 at `5cb7c69b`); X6-X10 are not started. The plan's gates that rely on the in-guest `-j4`
+  build (X5, X9, X10) are unreliable until the item below is understood.
+* **Open bug:** the in-guest `-j4` build stalls intermittently on the same kernel (a 4-vCPU BKL convoy of `poll` laps, plus an `ECHILD` and a ring-3 `#GP`
+  seen once each). Mechanism located, trigger and fix not: [`TAOXICHUAN_J4_BKL_CONVOY.md`](TAOXICHUAN_J4_BKL_CONVOY.md). An earlier "it was the p3 disk" conclusion
+  was wrong and is marked superseded in [`HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md`](HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md).
+* **Rig:** p3 was repaired (`e2fsck`, 2026-11-01); `scripts/kvm/taoxichuan/build_run.py` runs parallel slots (`BR_N`) with a QEMU monitor, and `wedge_sample.py` reads a wedged guest.
+* **Not decided here:** the host KVM wedge ([`HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md`](HOST_KVM_BKL_WEDGE_UNDER_GUEST_LOAD.md)) and goose's SQLite stale-fd-size bug
+  ([`TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md`](TAOXICHUAN_GOOSE_SQLITE_STALE_FD_SIZE.md)) remain open.
+
+### 2026-11-01: final tokenomics (supersedes the 10-30 figures; user asked)
+
+The 10-30 tokenomics entry was read partway through 10-30, before the Linux-KVM and bare-metal fixed points and the day and a
+half of consolidation after them. These are the whole experiment's figures: from the branch's first session (10-24) to the
+user's "the experiment is over" (11-01 11:35Z). The cleanup on Opus after that is counted separately and excluded.
+
+**Sources.** GLM: the goose ledger up to its 10-30 reading, then the z.ai usage API (hourly buckets per model; the daily
+table in the 10-30 entry is updated in place). Claude: the Claude Code transcripts in `~/.claude-personal` and
+`~/.claude-work`, usage fields only, streamed chunks deduped by message id, **only entries whose `gitBranch` is
+`rust-org-il-experiment`** (the 10-30 entry counted every akuma transcript, which is why its supervision-era figure is 816M
+and this one's is 793M). The two counting scripts were throwaway (a session scratchpad) and are not in the tree.
+
+**GLM after the 10-30 reading** (all GLM-5.3-Flash; API $ estimated at the ledger's Flash average, $0.0365 per million):
+
+| UTC hours | work | tokens | API $ |
+|---|---|---:|---:|
+| 10-30 12-14Z | the Mac planning sessions (unsafe-reduction and CoW plans) | 3.0M | ~0.11 |
+| 10-30 21-22Z | extraction plan X10, `taoxichuan/docs` refresh, guest RAM cap 1 -> 4 GiB (X11) | 14.2M | ~0.52 |
+| 10-31 00-04Z | stage 12: the epoll family + `prctl`; stopped on the 5-hour quota at ~02:15, the supervisor merged it | 46.3M | ~1.69 |
+| 11-01 11-13Z | goose running **inside** Taoxichuan, talking to GLM (24 calls) | 0.06M | ~0.00 |
+| | **added since the reading** | **63.6M** | **~2.32** |
+
+**GLM total: 633.1M tokens, 7,909 calls, ~$27.2 at API prices, ~3.2 Lite weeks** at the readings' ~50 credits per million
+(was 569.4M, $24.91, 2.85 weeks). The quota meter on 11-01 13:21Z: the week that started at the 10-29 16:36Z reset is at 42%
+(83.7M), i.e. ~199M per Lite week, consistent with the earlier calibration. Epoll was GLM's last execution milestone and cost
+about what DNS (31M) and dynamic PIE (28M) did.
+
+**Claude, by phase** (calls / tokens):
+
+| phase | Sonnet | Opus |
+|---|---:|---:|
+| A: supervising goose (10-24 -> 10-29 18:00Z) | 3,418 / 793M | - |
+| B: executing, rustc -> cargo -> git clone -> CoW fork -> K1 == K2 on Linux KVM and on metal (-> 10-30 23:37Z) | 1,868 / 617M | 321 / 125M (the cloc-script session) |
+| C: consolidation - Taoxichuan SMP, X1-X5, the cargo-stall bisect, supervising GLM's epoll, the -j4 BKL convoy (-> 11-01 11:35Z) | 998 / 401M | 63 / 7M (log entries) |
+| **experiment total** | **6,284 / 1,812M** | **384 / 131M** |
+| *excluded: Taoxichuan cleanup on Opus (11-01 11:35Z ->)* | *23 / 5M* | *469 / 203M* |
+
+**Claude total: 1,943M, 3.1x GLM's 633M** (2.1x at the 10-30 reading). The growth is phases B and C, which have no GLM
+counterpart except epoll.
+
+**User prompts.** The user typed **390 prompts to Sonnet** during the experiment: 297 in phase A, 63 in B, 30 in C, plus 4
+`/compact`. Counted: user turns in the main transcripts on this branch; not counted: tool results, task and Monitor
+notifications, compaction summaries, slash commands, subagent traffic, and turns a resumed session copied from its
+predecessor (deduped by timestamp and text). Typed prompts averaged ~17 words; 17 carried a pasted handoff. Over the same
+period the user sent 51 prompts to Opus on this branch (45 of them in the cloc-script session). That is **~5M Claude tokens
+and 16 Sonnet model calls per typed prompt** on average, but the split is the finding: **11.5 calls per prompt while
+supervising goose, 30-33 while executing** - each prompt bought ~2.7x more autonomous work after the 10-29 switch.
+
+**EXTRAPOLATION, re-run over the whole experiment (not a measurement): the project on GLM alone, supervision not counted.**
+The executing stretch's tool-call classification (10-30 entry) was not re-run; its coding share (67%, 76% with boot waits) is
+applied to phases B+C's 2,866 Sonnet calls (1,920-2,178) plus the 589 coding calls of the supervision era: 2,509-2,767
+coding calls (was 1,645-1,796). Same assumptions as before: GLM needs 2-4x the calls, at the refined process's 56-77k tokens
+per call; API $ at $0.0365 per million on top of the actual $27.2.
+
+| GLM slower by | GLM calls | GLM tokens | + GLM's actual 633M | Lite weeks | API $ (total) |
+|---|---:|---:|---:|---:|---:|
+| 2x | 5,018-5,534 | 281-426M | 0.91-1.06B | 4.6-5.3 | 38-43 |
+| 3x | 7,527-8,301 | 421-639M | 1.05-1.27B | 5.3-6.4 | 43-51 |
+| 4x | 10,036-11,068 | 562-852M | 1.20-1.49B | 6.0-7.4 | 48-58 |
+
+At 2x the project no longer fits in one Lite month (~866M): it is about 1.1-1.2 months, ~$19-22 of quota. Caveats on top of
+the 10-30 ones: phase C's share of coding is assumed equal to B's, though C held more debugging, supervision of GLM's epoll
+session and log-writing; SMP on Taoxichuan had a GLM brief (`taoxichuan-13-smp.md`) but Claude did it, so there is still no GLM
+run for that class either. The user's 10-30 assessment is unchanged by these numbers: the experiment was flawed and inconclusive,
+but "an open model can build your own stack in a short time for little money" still looks plausible.
+
+**Plan fit and timeline (educated guess, not a measurement; user asked).** Which z.ai plan the project would need on GLM
+alone, for an operator on a normal week instead of the user's actual hours.
+
+*Inputs.*
+- **Plan caps:** from `docs.z.ai/devpack/overview` (Lite 2,000 / 10,000 credits per 5 h / week, Pro 12,000 / 60,000, Max
+  28,000 / 140,000). Scaled by this account's measured ~50 credits per million, a week is ~200M tokens on Lite, ~1.2B on Pro
+  and ~2.8B on Max; a 5-hour window is ~34M, ~205M and ~480M.
+- **Prices:** the docs state only "starting at 18 USD per month" (Lite). Pro $80 and Max $168 a month are from third-party
+  pages (October 2026; older pages list $72 / $160); the subscribe page did not load.
+- **GLM's pace:** z.ai's hourly buckets show 98 active agent-hours over the experiment, 6.4M tokens per hour on average
+  (5.5M median, 14M p90, 18M max); the refined process alone averaged 5.5M per hour.
+- **The user's hours:** from prompt timestamps (prompts less than 90 min apart form one stretch, +15 min each), ~77 engaged
+  hours over 8.5 days with no day off, ~9 a day; a floor, since reading output leaves no timestamp. 19% of prompts were
+  sent between midnight and 6 am local time; the busiest hours were 19-23.
+- **The assumed operator:** 40 hours a week over 5 days. GLM runs while they work, plus one unattended session each evening
+  (the continuation waiter that worked for session ph), so **50-60 agent-hours a week per agent**.
+- **One agent vs two:** Lite's 5-hour window (~34M) holds one agent at the median rate and none at p90, so Lite is
+  single-agent. Two agents on Pro peak at ~140M per 5 h at p90, inside ~205M. Two agents are not twice as fast: the ladder
+  is mostly serial (boot -> sshd -> apk -> network -> fork -> dynamic linking -> rustc -> cargo -> threads -> git -> fixed
+  point, about three quarters of the work). The second agent takes the plans and premise checks off the critical path and
+  runs the independent work: epoll, the extractions, SMP once threads exist, docs and test batteries. Assumed speed-up
+  1.3-1.5x.
+- **Calendar weeks:** on Lite, the weekly cap decides (tokens / 200M); on Pro, agent-hours / (50-60 x speed-up) decide.
+  One month is taken as 4.3 weeks.
+
+*Table 1 - as it happened:* GLM's actual 633M (pre-pivot learning phase and M4 included) plus the remainder at refined rates
+(the re-run extrapolation above). Agent-hours = the 98 actual + the remainder at 5.5M per hour.
+
+| GLM slower by | GLM tokens | agent-hours | Lite (1 agent) | Pro, 1 agent | Pro, 2 agents |
+|---|---:|---:|---|---|---|
+| 2x | 0.91-1.06B | 149-175 | 4.6-5.3 weeks, $36 | 2.5-3.5 weeks, $80 | 1.7-2.7 weeks, $80 |
+| 3x | 1.05-1.27B | 175-214 | 5.3-6.4 weeks, $36 | 2.9-4.3 weeks, $80 | 1.9-3.3 weeks, $80 |
+| 4x | 1.20-1.49B | 200-253 | 6.0-7.4 weeks, $36 | 3.3-5.1 weeks, $80-160 | 2.2-3.9 weeks, $80 |
+
+For reference, what actually happened: 8.5 days; GLM on Lite with weekly resets (633M, ~3.2 Lite weeks of quota); Claude on
+top (1,943M); the user at ~77+ engaged hours.
+
+*Table 2 - adjusted, the refined process from day one:* the pre-pivot calls re-priced at the refined 56k tokens per call
+instead of ~88k (233M -> ~148M, -85M; a lower bound on the saving, since the pivot also shortened sessions), and M4's
+cooperative single-core attempt (159M) dropped as a dead end a replay would not take. 5.5M tokens per agent-hour throughout.
+Milestone cross-check: ~35-40 milestones on the ladder now (fixed points, SMP, epoll and X1-X5 included) at the refined
+median of ~17M is 0.6-0.7B, consistent with the 2x row.
+
+| GLM slower by | GLM tokens | agent-hours | Lite (1 agent) | Pro, 1 agent | Pro, 2 agents |
+|---|---:|---:|---|---|---|
+| 2x | 0.67-0.81B | 122-147 | 3.4-4.1 weeks, $18 | 2.0-2.9 weeks, $80 | 1.3-2.2 weeks, $80 |
+| 3x | 0.81-1.03B | 147-187 | 4.1-5.2 weeks, $18-36 | 2.5-3.7 weeks, $80 | 1.7-2.8 weeks, $80 |
+| 4x | 0.95-1.24B | 173-225 | 4.8-6.2 weeks, $36 | 2.9-4.5 weeks, $80-160 | 1.9-3.5 weeks, $80 |
+
+Max ($168) fits no row better than Pro: its extra room only matters with about four or more concurrent agents, and the
+ladder has no work for that many.
+
+*Supposed timeline, Table 2 at 2x (~0.75B, ~137 agent-hours).* Hours per phase at 5.5M per hour:
+- stages 1-7 (boot, hello, busybox, sshd, offline `apk`, outbound TCP): ~150M, ~27 h;
+- stage 8 without M4 (mirror, clock, DNS, wire dedup, `apk update` / `apk add curl`, dynamic PIE, HTTPS curl, blocking fork,
+  pipes, the stall report, plans): ~192M from the ledger, ~35 h;
+- stage 9 and the fixed points (rustc, cargo, threads/futex, git clone, crates.io `-j4`, CoW fork, K1 == K2 on Linux KVM,
+  the RAM cap, K1 == K2 on metal): ~230M, ~42 h (65% of the extrapolated remainder, B's share of B+C's Sonnet calls);
+- consolidation (epoll at its actual 46M, X1-X5, SMP, extraction plan, docs): ~180M, ~33 h.
+
+| | 1 agent (Pro or Lite, 55 agent-h/week) | 2 agents (Pro) |
+|---|---|---|
+| week 1 | stages 1-7 by Wednesday; stage 8 from Wednesday (mirror, clock, DNS, `apk`) | A: stages 1-7, then stage 8. B: writes each next plan and premise table ahead of A; epoll as soon as outbound TCP lands |
+| week 2 | rest of stage 8 by Monday; stage 9 and both fixed points by Friday | A: rest of stage 8, stage 9, fixed points (~Wednesday-Thursday). B: X1-X5 extractions, SMP once threads land, docs and test batteries |
+| week 3 | consolidation: epoll, X1-X5, SMP, docs (done ~Wednesday) | (done, or the tail of SMP) |
+| total | ~2.5 weeks; on Lite the weekly cap stretches the same work to ~4 weeks | ~1.7-2 weeks |
+
+At 4x everything stretches about 1.5x: one agent ~3.5-4 weeks, two agents ~2.5-3. With two agents the binding limit is
+probably the operator, who has to review two streams of output in a 40-hour week, not the quota.
+
+**User's assessment (2026-11-01, recorded at their request).** The experiment still holds water even though its result is
+inconclusive: there is enough supporting evidence to believe a project like this can be done at a reasonable pace with open
+models. The user is just not patient enough to do it that way themselves.
+
+The evidence for the claim, from this log:
+- goose + GLM-5.3-Flash took Taoxichuan from boot to an HTTPS `curl`, through dynamic linking, blocking fork, pipes and DNS,
+  and later delivered epoll and the guest RAM-cap lift on Akuma's own hypervisor;
+- the refined process cut tokens per call by ~40%, and its median milestone cost ~17M tokens (~$0.63);
+- the continuation pattern finished a defect in half the calls a long context needed;
+- goose talking to GLM ran inside Taoxichuan itself (11-01).
+
+The evidence against, or not yet tested:
+- no GLM run exists for the rustc / cargo / threads / SMP class of milestone, and the 2-4x factor is assumed;
+- GLM's one long dead end (M4, 159M) shows how a milestone can go wrong without a stop rule;
+- every refined GLM session was Claude-supervised.
+
+**User's note on local hosting (2026-11-01, recorded at their request).** Unfortunately no model that can reasonably be
+hosted locally produces this many tokens a month at a reasonable hardware cost, so "open models" here still means open
+weights served by a provider (z.ai), not a model on the user's own machine. For whoever checks this later, what a local
+setup would have to sustain, from this log's figures (one agent, refined process):
+- **Volume:** ~0.7-1.2B tokens a month (Table 2).
+- **Rate:** ~5.5M tokens per agent-hour on average, 14M at p90, which is ~1,500 tokens/s of input on average and ~3,900 at
+  p90. 98% of that input is a cached prefix.
+- **Fresh work per hour:** ~95k fresh input tokens and 22-99k output tokens (output was 0.4-1.8% of tokens per day), i.e.
+  ~6-27 output tokens/s sustained.
+- **Context:** contexts up to ~180k tokens (stage 2's largest).
+- **Quality:** a model at least as capable as GLM-5.3-Flash, since the whole estimate assumes that model.
+
+A second agent doubles everything except the context length.
+
+**The user's prompts to Sonnet, categorized (2026-11-01; user asked).**
+
+*Method.* All 390 typed Sonnet prompts of the experiment (see "User prompts" above) were read by the supervisor (Opus) and
+each was given one primary category. That is one reader's judgement in a single pass, so a borderline prompt could fall in a
+neighbouring row; counts may shift by a few. Phases are as in the Claude table: A supervising goose, B executing to the
+fixed point, C consolidation.
+
+| category | prompts | share | A | B | C |
+|---|---:|---:|---:|---:|---:|
+| direction / scope decision | 61 | 15.6% | 35 | 19 | 7 |
+| ops / infra / tooling (ryzen up or down, images, scripts, handoff prompts) | 58 | 14.9% | 43 | 12 | 3 |
+| status check ("how is it doing") | 51 | 13.1% | 44 | 3 | 4 |
+| go-ahead / permission / "keep going" | 39 | 10.0% | 26 | 11 | 2 |
+| reaction / comment | 37 | 9.5% | 32 | 4 | 1 |
+| quota and tokens | 32 | 8.2% | 32 | 0 | 0 |
+| how GLM should be steered (point at docs and probes, no tips, plan first, test-suite scope) | 31 | 7.9% | 29 | 1 | 1 |
+| question to understand something | 28 | 7.2% | 19 | 6 | 3 |
+| "record this in the log / docs" | 21 | 5.4% | 17 | 2 | 2 |
+| **bug hint / likely cause** | **16** | **4.1%** | **5** | **5** | **6** |
+| correcting the agent (lazy, wasted time, too many tips) | 8 | 2.1% | 7 | 0 | 1 |
+| off-topic (crush docs, links) | 8 | 2.1% | 8 | 0 | 0 |
+
+Separately, 18 prompts (16 of them in phase A) pointed at something that already existed: docs, probes, crates, the archive,
+other kernels.
+
+*The bug hints, and what they turned out to be.* 16 prompts, 14 distinct hints (the sshd ABI one spans three prompts).
+
+| prompt | when | the user's hint | outcome (source) | verdict |
+|---|---|---|---|---|
+| 045 | 10-24 | "that's a classic problem, did it get the solution from docs?" | recognition of a known problem, no cause named | not scored |
+| 119 | 10-25 | "host side already worked for other kernels" (no host-kernel rebuild needed) | outbound worked through the unchanged host relay (stage 7 entry) | right |
+| 212 | 10-27 | "I doubt the issue is the relay, the same curl works on Linux" | Q9 blamed the host relay; Q10-R found the wedge was a guest bug | right |
+| 271 | 10-28 | "grep the archive and check how other kernels handled it" | a pointer, not a cause; pg's comparison did not explain the loop, its own instrumentation found three bugs | not scored |
+| 292 | 10-29 | "increase the mmap memory cap ourselves" for `rustc --version` | 64 MiB slabs ran out of memory loading `librustc_driver` (pn entry) | right |
+| 303 | 10-29 | "I would assume lost wakeup is to blame" for the stall | the child sat in a ring slot still marked INITIALIZING and was never scheduled (pn S2 entry): never runnable rather than a lost wakeup | partly |
+| 308-310 | 10-29 | "I thought sshd was Linux compatible ... pretty sure linux-abi is default" | the image's sshd was the akuma-ABI build; the same image fault broke `/bin/sh` on metal on 10-31 | right |
+| 318 | 10-29 | "pump loop sounds very plausible" | the stall was the INITIALIZING slot | not the cause |
+| 369 | 10-31 | "I wonder if number 8 is significant" | not settled in this log | not scored |
+| 375 | 10-31 | "fix rt_sigsuspend, it seems important" | busybox ash's `wait` hung without it (rt_sigsuspend commit) | right |
+| 376 | 10-31 | "ssh is probably failing because it outputs nothing and the connection drops" | sshd keepalive shipped for long silent commands | right |
+| 379 | 10-31 | "probably touched by GLM's edits, find which commit broke the build" | bisect landed on `cf44f840`, GLM's epoll drain hooks (an empty-pipe read returned EAGAIN, not EOF); the "interrupt" detail was wrong | right |
+| 382 | 10-31 | "fix /bin/sh first, probably init wiring is faulty" | spawning from the pool-thread init was refused because of the image's cooperative sshd | partly |
+| 385 | 11-01 | "it used to pass not long ago, cow has a long history of bugs" | the trail led to a BKL convoy, CoW not implicated; trigger still open (`TAOXICHUAN_J4_BKL_CONVOY.md`) | not the cause (so far) |
+
+*"Usually right", in numbers.* 11 of the 14 hints have an outcome in this log or the git history; 3 are not scored (a
+recognition, a pointer, an unsettled one).
+
+| counting | right | rate |
+|---|---:|---:|
+| strict: only "right" counts | 7 of 11 | 64% |
+| partly right counted as half | 8 of 11 | **73%** |
+| lenient: right or partly right | 9 of 11 | 82% |
+
+So **about 70%, with a wide margin**: on 11 hints the strict rate's 95% interval (Wilson) is roughly 35-85%. One verdict can
+still move: 385 stays "not the cause" only while the -j4 trigger is unknown. The 119 verdict leans on the stage-7 entry's
+account that the unchanged relay worked, not on a direct test of the user's claim.
+
+*What it shows.*
+- **Hints rose as the role changed:** 1.7% of the user's prompts while supervising GLM (held back on purpose under the
+  no-tips rule; the 18 resource pointers were the allowed form of help), 8% while Claude executed, 20% in consolidation.
+  **The user's reading (recorded at their request):** the hints went up as they lost patience with the grueling process,
+  not only because the role changed. The rise tracks the user's own fatigue, the same reason they give for the 10-29 switch
+  to Claude executing (the user's note of 10-30 under "The pivot": "too tired to keep up the GLM grind"). The later phases' hint rate therefore measures the operator
+  running out of patience as much as what a phase needed, and should not be read as the help a fresh operator would give.
+- **About a third of the supervising phase kept the loop going rather than steering the work:** status checks, quota
+  readings and reactions are 108 of 297 phase-A prompts (36%). Nearly all of it disappeared after the 10-29 switch.
+- **The operator's memory of Akuma was a resource the tokenomics does not count.** A correct hint saves a hunt: the sshd ABI,
+  the mmap cap and the bisect target each named in one line what a session would otherwise have instrumented for.
+
+### 2026-11-01: classic blunders (user's list for a talk, recorded at their request)
+
+The user is compiling the classic bugs that recur in this tree, for a talk. Recorded here as they come up. Each one
+fails silently: nothing errors, something just waits.
+
+**The ssh stdin pump** (cleanup, Opus): `ssh host 'cat > f' < file` hung on Taoxichuan. sshd's pump writes a child's
+stdin through `/proc/<pid>/fd/0` and ends it with the private `CLOSE_CHILD_STDIN`. That is right for a native `SPAWN`,
+where the kernel owns the child's stdin channel. The `linux-abi` spawn sshd runs on Taoxichuan is `fork`+`execve` and piped
+only stdout, so the child kept sshd's own fd 0. The pump wrote, with no error, into a descriptor the child was not
+reading, and sent an EOF through a syscall Taoxichuan had deleted. The child waited for input that never came. It went
+unnoticed because nothing sends stdin: every battery line, goose and the fixed point drive sessions with commands, not
+input. Fix: the spawn hands back the write end of a real stdin pipe
+([`TAOXICHUAN_SSH_STDIN_PUMP.md`](TAOXICHUAN_SSH_STDIN_PUMP.md)).
+
+**The thread that was killed and kept running** (cleanup, Opus, B7): Taoxichuan's `exit_group` ended its sibling
+threads by marking them TERMINATED. A sibling running on another core does not read that mark: it ran on, parked in a
+`futex` and overwrote its own TERMINATED with WAITING (`[REVIVE]`), with its `Process` already retired, and the next
+`tokioprobe` faulted with the kernel lock stuck. It hid for weeks because Taoxichuan's own futex happened not to park on
+that path; moving `futex` onto the shared one (same scheduler, different timing) showed it on the first `smp=4` run.
+Fix: a running sibling gets a kill *request* and ends itself at its next kernel entry, and the exiting thread waits for
+it ([`TAOXICHUAN_EXIT_GROUP_RUNNING_SIBLING.md`](TAOXICHUAN_EXIT_GROUP_RUNNING_SIBLING.md)).
+
+The same day had a cousin: a timed park on an idle core never expired. The wake pass that readies an expired sleeper ran
+only inside the switch, and the idle loop switched only for threads that were already ready. The old `nanosleep` spun
+instead of parking, which hid it ([`TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md`](TAOXICHUAN_ONE_CLOCK_TIME_FOLD.md)).
+
+Honorable mentions, named by the user (pointers to where each was met, not a full account):
+
+- **`wait4(-1)`**: "any child" is where per-parent bookkeeping goes wrong. It reaps a child that is not the caller's, or
+  answers `ECHILD` while one is still running ([`AKUMA_AMD64_WAIT4_OWNERSHIP.md`](AKUMA_AMD64_WAIT4_OWNERSHIP.md);
+  [`../../taoxichuan/docs/reference/processes.md`](../../taoxichuan/docs/reference/processes.md), the unstamped-rows rule).
+- **Networking pumps**: with no NIC interrupt, frames arrive only when somebody polls. Every wait, the idle lap and the
+  tick each had to learn to pump, one stall at a time ([`KVM_RELAY_SYN_STALL.md`](KVM_RELAY_SYN_STALL.md);
+  [`../../taoxichuan/docs/reference/devices.md`](../../taoxichuan/docs/reference/devices.md), "who pumps the NIC").
+- **An init that its children cannot fork from**: spawning worked for children of the spawn crossing but not from init.
+  gcc run under init died at `cc1: posix_spawn: Operation not permitted` (this log, the gcc probe on 10-30). On the metal,
+  an sshd running as init (a pool thread) had every `SPAWN` of `/bin/sh` refused with `EPERM`, silently
+  ([`TAOXICHUAN_METAL_SH_SPAWN_EPERM.md`](TAOXICHUAN_METAL_SH_SPAWN_EPERM.md)). The fork depth ceiling removed in
+  `c1c885c5` had the same shape: a limit left over from the old crossing that real forks did not need.
+
+### 2026-11-01 (evening): talk notes from the cleanup (user: "so much cool shit to talk about at rust meetup")
+
+- **The kernel that built itself, answering GLM.** A6: Taoxichuan's fixed point at `8909a603` under Akuma's own
+  hypervisor on the ryzen, K1 == K2 (`26d1ead2...`). K2, the kernel Taoxichuan built inside a Taoxichuan guest, then
+  booted as the box's guest and the user talked to GLM through goose in it: Rust on the metal (Akuma), Rust in the guest
+  (Taoxichuan), the agent's tool calls running inside both (`scripts/kvm/taoxichuan/goose_glm.sh`;
+  [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md), the A6 row).
+- **An extraction can change who a kernel says it is.** Moving `uname` onto the shared glue (`74962ae5`) made Taoxichuan
+  answer `Akuma akuma 0.0.8`; the step's row recorded it as matching the other kernels, and nothing tests `uname`. GLM,
+  asked what kernel it runs on, said Akuma. Now the kernel registers its identity:
+  `Linux taoxichuan 0.1.0-<sha>-taoxichuan` ([`TAOXICHUAN_UNAME_SAYS_AKUMA.md`](TAOXICHUAN_UNAME_SAYS_AKUMA.md)).
+- **The costliest clones are not spelled `.clone()`.** Clippy's clone lints found nothing in two kernels and 105 crates;
+  reading found a whole `FileDescriptor` (path, inode pin, a directory's cached listing) copied with `.cloned()` on every
+  `write(2)` on amd64. The copy budget counts `.cloned()`, `.to_vec()` and the fd copiers for that reason
+  ([`CLONE_AND_MUT_BUDGETS.md`](CLONE_AND_MUT_BUDGETS.md), [`CLONE_AUDIT_2026_11_01.md`](CLONE_AUDIT_2026_11_01.md)).
+- **A refactor that changes timing finds the race the old code hid**: the killed-thread entry under classic blunders.
+- **The user, on where the tokio kernel crate leads:** "the future is now, cyberpunk is here, you can install a kernel
+  from crates.io (theorethically) and have your whole supply chain owned at kernel level". Recorded in the talk doc's
+  verbatim conclusions with the numbers under it (15 crates.io crates already in Taoxichuan's image, 789 of its 1,669
+  `unsafe` lines; 141,339 audit lines for the whole Akuma stack).
+
+### 2026-11-02: the numbers after B15 (the kernel is a crate)
+
+Re-measured at `961a77be` with `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64` (`no-tests`); the full table is
+the talk doc's "Facts re-measured 2026-11-02" ([`RUST_ORG_IL_TALK.md`](RUST_ORG_IL_TALK.md)).
+
+- **Taoxichuan alone: 77,839 audit lines** (11-01: 78,351; 10-30: 84,761). Its own code is `main.rs`, 19 lines (13
+  audit lines), over `akuma-tokio-kernel` (44 lines, `forbid(unsafe_code)`) and `akuma-tokio-kernel-amd64` (3,758
+  audit lines, 98 `unsafe`). `taoxichuan/src`: 12,131 -> 6,548 -> 5,924 -> 19. Osaka, the second kernel on the same
+  crates, is 10 lines.
+- **On an Akuma host: 141,903** (akuma-amd64 alone 136,727, +1,560 since 11-01); Taoxichuan adds 5,176, and 93% of
+  its lines are already live in the host. **On a Linux host: 2,440,122.**
+- Third-party: 15 crates, 21,861 lines (28%), 789 of the image's 1,668 `unsafe` lines.
+- **Fixes this branch made: 116** - 105 in Taoxichuan
+  ([`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md), its own list since today, 28 docs) and 11 in shared
+  Akuma crates (`BUG_FIX_LIST.md` 1,470 -> 1,481).
+- **Fixed point.** B14 (`ade75544`) K1 == K2 under Pop's KVM at `smp=4`. **B15 (`961a77be`) K1 == K2 under Pop's KVM**
+  (`5f568279...`): the Mac drove generation 1 and booted generation 2, then left the LAN; goose, running the handoff
+  as root on the box, stopped the guest at 18:02, pulled K2 with `fp_pop.py`'s own commands and recorded it
+  ([`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md), "After B15"). Goose could not push to origin (HTTP 403
+  for its credential); its commits came in through litter.
+- **TCG.** The user had assumed the crate kernel already had a TCG fixed point; it had not - every earlier fixed point
+  ran under KVM (the ryzen's Linux, Pop's Linux, or Akuma's own hypervisor). `fp_tcg.py` (new) runs it on the Mac:
+  the toolchain image has neither git nor a resolver, so `git archive` of the commit and a `cargo fetch`ed
+  CARGO_HOME are staged onto an APFS clone of it and the guest builds `--offline`. Generation 1 built K1
+  `b0c08970...` in 2,038 s (about 4x KVM). The staged tree has no `.git`, so that run's kernels call themselves
+  `unknown`; the script now sets `AKUMA_SHA_OVERRIDE` for later runs.
