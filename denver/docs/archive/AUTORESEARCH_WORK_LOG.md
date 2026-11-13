@@ -77,6 +77,21 @@ lock-guard exits without touching the lock; only the owner cleans up (trap or ex
 teaches: diagnostics before action. Test drivers with `DRY_RUN=1` on a throwaway branch — and a test
 that can fire a real session should set the env that proves it cannot.
 
+## 2026-11-13 (evening) — the kimi auth error: the driver did not pin its endpoint
+
+**What happened.** The first real launch died on a kimi auth error. The driver sources
+`/etc/goose.env` (which sets `GOOSE_MODEL=glm-5.3-flash`) — but that file carries no endpoint host,
+so the provider host fell through to `~/.config/goose/config.yaml`, which carries *kimi* defaults
+(`api.kimi.com`, model `kimi-for-coding`). Result: the GLM model name sent to kimi's endpoint; auth
+refused. Believed: sourcing the env file is enough. Measured: the model and the host come from
+different places, and they disagree.
+
+**Fixed.** The driver pins the whole quartet before the first session — `GOOSE_PROVIDER=openai`,
+`GOOSE_MODEL=glm-5.3-flash`, `OPENAI_HOST=https://api.z.ai`,
+`OPENAI_BASE_PATH=api/coding/paas/v4/chat/completions` — each still overridable from the
+environment. *Lesson: a config cascade (env file → config.yaml → ambient env) is a failure
+convention waiting for a launch from the wrong shell; a batch driver pins what it depends on.*
+
 ## 2026-11-13 (later still) — WIP cadence and the quota wait
 
 Two protocol changes, both pragmatic, both logged here because they *amend* rules written earlier

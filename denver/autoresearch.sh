@@ -136,6 +136,16 @@ session() { # n gate
     loop_before=$(count '^### ' "$LOOP")
     interv_before=$(count 'INTERVENTION:' "$RESULT")
     if [ -r /etc/goose.env ]; then . /etc/goose.env; fi
+# Pin the GLM endpoint: config.yaml may carry kimi defaults (api.kimi.com), and a launching
+# shell without the GLM env sends glm-5.3-flash to kimi's host - the kimi auth error the
+# first real run died of. The trio below is what the infra itself runs on; any of these may
+# still be overridden from the environment.
+GOOSE_PROVIDER=${GOOSE_PROVIDER:-openai}
+GOOSE_MODEL=${GOOSE_MODEL:-glm-5.3-flash}
+OPENAI_HOST=${OPENAI_HOST:-https://api.z.ai}
+OPENAI_BASE_PATH=${OPENAI_BASE_PATH:-api/coding/paas/v4/chat/completions}
+export GOOSE_PROVIDER GOOSE_MODEL OPENAI_HOST OPENAI_BASE_PATH
+log "model: $GOOSE_MODEL via $GOOSE_PROVIDER at $OPENAI_HOST"
     GOOSE_MODE=auto "$GOOSE" run --with-builtin developer -n "$sess" -i "$instr" >> "$LOG" 2>&1 &
     pid=$!
     # Watchdog: kills only the goose process this script started, never a VM by pattern.
