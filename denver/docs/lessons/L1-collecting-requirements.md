@@ -1,0 +1,52 @@
+# Lesson 1 — collecting requirements (living)
+
+**Motivating archive doc:** the plan §Part I lesson 1; worked example
+`TAOXICHUAN_JVM_ATTEMPT_2026_11_09.md` (**not on branch `denver`** — recovered from git
+`d7878378`; a fuller `main` checkout lives at `/src/akuma-merge`). This page is the living
+version — *Do* rewritten as-happened, *Record* appended per pass.
+
+## Goal
+
+One sentence: the workload tells you what to build — run it, catalogue every failure as a
+capability gap with evidence, and rank by the workload's own order, never by taste.
+
+## You have
+
+- A kernel that boots tokio (`uname` says denver, phase 0 GREEN) and a host box whose kernel is
+  also Akuma — two kernels to A/B against, one binary to run on both.
+- The workload one rung up the ladder: `java -version` (Corretto 21.0.13 alpine musl x86_64,
+  188.8 MiB, already on the host).
+- No requirements table yet; the attempt doc's blocker table as the format to beat.
+
+## Do (as-happened, 2026-11-13)
+
+1. **Run the workload on the best kernel first.** `java -version` on the host metal → SIGSEGV
+   0.02 s into `JNI_CreateJavaVM`, `hs_err` written. — *Plan-wrong, quoted:* the plan says "run
+   the workload on the best kernel" expecting the richest kernel to fail *latest*; on Akuma the
+   richest (metal 0.0.9) failed at the vsyscall page **before** the known W^X blocker fired —
+   a gap the aarch64 attempt never saw. The metal leg is not a formality: it is where new gaps
+   show up first.
+2. **A/B the same binary on every kernel you can reach** (D11). Same JRE into the guest image
+   (`cp -a` the host's tree — both userlands are alpine musl, zero rebuilding) → guest run.
+   The guest died at W^X (the attempt's blocker 1), the metal at vsyscall — two different first
+   failures from one binary, and each kernel's gap list starts where its own run stopped.
+3. **Order by the workload's init order.** The attempt's order (W^X → getcpu → NULL store)
+   reproduced on the guest exactly; REQUIREMENTS.md's rank is that order, with the metal-only
+   vDSO gap slotted after the guest-proven ones. — *Plan-wrong:* "suspects stay hypotheses"
+   needs a place to *put* them; the table's Suspects section (kept out of the rank) is that
+   place — the NULL store is unreachable until W^X closes, so it must not outrank getcpu.
+4. **Write the table before any closing code.** `denver/docs/REQUIREMENTS.md`: gap → evidence
+   (the captured verdict lines, verbatim) → closing pass. Evidence lines come from the gate
+   log only, never from memory.
+
+## Gate
+
+| passes when | probe |
+|---|---|
+| `denver/docs/REQUIREMENTS.md` exists, every row's evidence is a captured verdict line, rank = workload init order, suspects separated | `denver/gates/PHASE-1-METHOD.log` (guest + metal legs) |
+
+## Record
+
+- 2026-11-13 (PHASE-1-METHOD GREEN): table written from first-hand lines; G1 W^X (guest-proven),
+  G2 getcpu (both kernels), G3 vDSO (metal-proven, guest-unreached), G4 procfs auxv/maps
+  (diagnostics), G5 time cost (deferred). Decisions: D11 (A/B both kernels). Zero interventions.

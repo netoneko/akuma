@@ -130,3 +130,72 @@ reason (gate green) in `LOOP_LOG.md`.
 
 **Wall clock:** ~30 min (18:22–18:50 UTC). **Token spend:** not instrumented in-session; the
 driver log (`/tmp/denver-autoresearch.log`) is the ledger.
+
+---
+
+## Gate PHASE-1-METHOD — session 3, 2026-11-13 19:34–20:15 UTC — GREEN
+
+**Goal:** open phase 1 (lessons 1, 2, 4 — the method): REQUIREMENTS.md from a first-hand
+workload run; the RED probe suite written before any closing code; the hypothesis-to-verdict
+cycle measured. Review of phase 0 answered before this session (archive:
+`denver/docs/archive/escalations/2026-11-13-PHASE-0-SCAFFOLD.md`).
+
+**Commands and outcomes** (capture: `denver/gates/PHASE-1-METHOD.log`):
+
+| step | command | outcome |
+|---|---|---|
+| research first (R1) | `denver/docs/research/PHASE-1-METHOD.md` (D9–D12) | attempt doc recovered from git `d7878378` (not on branch); metal `hs_err` identified as gap #1 |
+| workload, metal leg | `denver/probes/jvmprobe java /usr/bin/java` | **RED** SIGSEGV pc=0xffffffffff600800 (vsyscall, RIP inside it), SIGABRT after hs_err — repro of `hs_err_pid6587.log` (2026-11-09) |
+| workload, guest leg | image: proven root + JRE via `sh denver/probe-image.sh`; `/bin/jvmprobe java /opt/jdk/bin/java` | **RED** `Error occurred during initialization of VM reason="Failed to mark memory page as executable…"` — the attempt's blocker 1, first-hand on x86_64 |
+| RED suite, both legs | `jvmprobe getcpu / auxv / cycles / rwx` | guest: `GETCPU RED ENOSYS`, `AUXV RED AT_SYSINFO_EHDR missing`, `RWX RED EACCES` ×2, `CYCLES PASS 4367/4189 cyc/call`; metal: same ENOSYS/auxv-REDs, but `RWX PASS rw_to_rx=42` (kernel 0.0.9 allows RWX — policy moved) and `CYCLES PASS 558/680` |
+| platform sanity | `/bin/tokioprobe` in the jdk image | **PASS** (tokio intact on the 640 MiB image: RUNTIME/UNAME/HTTPS + `RESULT PASS`) |
+| measured loop | `HYPOTHESIS H1` → verdict → `CYCLE PASS H1 seconds=0` (clamped; host clock slewed -1 s mid-run, epochs logged) | whole method 9 s wall clock |
+| deliverables | `denver/docs/REQUIREMENTS.md`; lessons L1/L2/L4 | gap table ranked by the JVM's init order (G1 W^X → G2 getcpu → G3 vDSO → G4 procfs → G5 time), suspects separated |
+
+**Verdict.** Gate GREEN on the session's own capture: every probe arm produced a clean named
+verdict on both kernels (RED the expected outcome); workload-failure evidence captured on both
+kernels with the metal `hs_err` in the log; H1 cycle measured under an hour with room to spare.
+No kernel code written — phase 1 is the method phase (R6 surface untouched).
+
+**Interventions:** none this session. Machine facts recorded (not fought): host clock slewed
+backward 1 s mid-run (measurement clamps + logs epochs); Akuma 0.0.9 metal answers mmap-RWX
+allowed where the guest's tokio-kernel stack answers EACCES by design (`akuma-syscalls-mem::wx`);
+the kernel has no xattr syscalls (`mke2fs -d` aborts without `-E no_copy_xattrs`); no vDSO
+anywhere (`AT_SYSINFO_EHDR` absent from auxv on both kernels; `/proc/self/auxv` ENOENT).
+
+**Transition rule applied.** Phase 1's gates are green with records complete and the phase
+needed **zero** human interventions — per the runbook the agent opens phase 2 itself: NEXT GATE
+`PHASE-2-WX` (G1, first blocker in the JVM's own init order; the gate will grep `RWX PASS` from
+the guest plus the java arm getting past the `Failed to mark memory page…` line).
+
+**Wall clock:** ~41 min (19:34–20:15 UTC). **Token spend:** not instrumented in-session; the
+driver log (`/tmp/denver-autoresearch.log`) is the ledger.
+
+---
+
+## Phase 1 summary — method (runbook transition rule)
+
+| gate | verdict | interventions |
+|---|---|---|
+| PHASE-1-METHOD (lessons 1, 2, 4 — one gate, D9) | GREEN | 0 |
+
+**What phase 1 proved.** The method exists and runs in minutes, measured: the workload ran on
+two kernels with one binary (D11), the RED suite was written before any closing kernel code
+(lesson 2, `jvmprobe` named arms), and the hypothesis-to-verdict cycle is in the gate log
+(`CYCLE PASS H1 seconds=0`, whole method 9 s wall clock — the kernel-change cycle is explicitly
+phase 2's measurement, not claimed here). The curriculum has its first real requirements table:
+`denver/docs/REQUIREMENTS.md`, ranked by the JVM's own init order, with the attempt's blocker 1
+reproduced first-hand on x86_64 (`Failed to mark memory page as executable`) and a NEW gap the
+aarch64 attempt never saw (metal vsyscall SIGSEGV = missing vDSO, G3). Zero kernel code, zero
+interventions, machine facts recorded as constraints.
+
+**Decisions taken.** D9 phase 1 = one gate; D10 probes = one C binary with named arms
+(jitprobe shape, built on the host's alpine musl gcc); D11 workload A/B on both kernels;
+D12 gate marker stays `RESULT PASS`, judged on method evidence. Precedents cited in
+`denver/docs/research/PHASE-1-METHOD.md` (R9), including the worked example recovered from git
+history and the `/src/akuma-merge` main checkout.
+
+**Transition.** Zero interventions → the agent opens phase 2 itself: `NEXT GATE: PHASE-2-WX`
+(G1: the W^X relaxation behind an off-by-default feature in `akuma-syscalls-mem::wx`, mapped
+1:1 through `akuma-jvm-kernel` → `denver`; gate greps `RWX PASS` from the guest and the java
+arm past the blocker-1 line).

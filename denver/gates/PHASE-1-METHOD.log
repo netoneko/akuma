@@ -1,0 +1,80 @@
+== free the VM slot (a stale guest answers EBUSY)
+== boot: herd vm-run /root/denver/w/vm-jdk.spec
+== uname
+Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux
+== lesson 1, metal leg: the workload on the host kernel (the A/B of D11)
+-- metal: getcpu
+GETCPU RED ENOSYS
+-- metal: auxv
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV RED AT_SYSINFO_EHDR missing
+AUXV INFO /proc/self/auxv unreadable errno=2 (No such file or directory)
+-- metal: rwx
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+-- metal: cycles
+CYCLES PASS getpid=1390 cyc/call clock_gettime=1090 cyc/call (no vDSO: syscall path)
+-- metal: java -version
+JVM INFO loader present
+JVM INFO exit=-1 signal=6 bytes=559
+JVM-INFO raw: #  SIGSEGV (0xb) at pc=0xffffffffff600800, pid=1822, tid=75
+JVM-INFO raw: # JRE version:  (21.0.13+1) (build )
+JVM-INFO raw: # Java VM: OpenJDK 64-Bit Server VM (21.0.13.0.3+1-alpine-r0, mixed mode, sharing, tiered, compressed oops, compressed class ptrs, g1 gc, linux-amd64)
+JVM-INFO raw: # Core dump will be written. Default location: core.1822 (may not exist)
+JVM-INFO raw: # An error report file with more information is saved as:
+JVM-INFO raw: # /src/github.com/netoneko/akuma/hs_err_pid1822.log
+JVM RED signal=6 first="# A fatal error has been detected by the Java Runtime Environment:" reason="# An error report file with more information is saved as:"
+== lesson 1/2, guest leg: the workload + the RED suite on the denver kernel
+== platform sanity first: the bigger image must not regress tokio (phase 0's marker)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-8dc2dbcc-denver 8dc2dbcc-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.22s)
+  title: Akuma
+RESULT PASS
+-- guest: getcpu
+[ssh] connecting to 127.0.0.1:2247...
+GETCPU RED ENOSYS
+-- guest: auxv
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV RED AT_SYSINFO_EHDR missing
+AUXV INFO /proc/self/auxv unreadable errno=2 (No such file or directory)
+-- guest: rwx
+[ssh] connecting to 127.0.0.1:2247...
+RWX RED mmap-RWX-refused errno=13 (Permission denied)
+RWX RED rw_to_rx mprotect errno=13 (Permission denied)
+-- guest: cycles
+[ssh] connecting to 127.0.0.1:2247...
+CYCLES PASS getpid=4229 cyc/call clock_gettime=4368 cyc/call (no vDSO: syscall path)
+-- guest: java -version (H1 is timed from the hypothesis line to the verdict line)
+HYPOTHESIS H1 (1794599837): getcpu(2) is served nowhere on denver -> the getcpu arm answers ENOSYS; and the workload dies inside HotSpot init (the attempt's blocker shape) on BOTH kernels
+H1 getcpu verdict: GETCPU RED ENOSYS
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=1 signal=0 bytes=121
+JVM-INFO raw: Failed to mark memory page as executable - check if grsecurity/PaX is enabled
+JVM RED Error occurred during initialization of VM reason="Failed to mark memory page as executable - check if grsecurity/PaX is enabled"
+CYCLE PASS H1 seconds=0 (hypothesis stated -> verdict captured; done-when: under an hour)
+== hs_err evidence (the plan: 'a better failure is progress - hs_err is a milestone')
+-- guest hs_err: none (the failure left no report - the JVM INFO lines above are the evidence)
+-- metal hs_err_pid1822.log (head)
+#
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  SIGSEGV (0xb) at pc=0xffffffffff600800, pid=1822, tid=75
+#
+# JRE version:  (21.0.13+1) (build )
+# Java VM: OpenJDK 64-Bit Server VM (21.0.13.0.3+1-alpine-r0, mixed mode, sharing, tiered, compressed oops, compressed class ptrs, g1 gc, linux-amd64)
+# Problematic frame:
+# V  [libjvm.so+0xaef710]
+#
+# Core dump will be written. Default location: core.1822 (may not exist)
+#
+== verdict: every arm must have produced a clean NAME VERDICT line (RED is expected)
+RESULT PASS
+== wall clock: method seconds=9
