@@ -2314,6 +2314,12 @@ fn spawn_full(
             // open across execve), then the originals are redundant — close
             // all four, including the two ends this side never uses.
             syscall(syscall::DUP3, out_write as u64, fd::STDOUT as u64, 0, 0, 0, 0);
+            // stderr rides the same pipe as stdout (what a pty gives, and what
+            // `sshd` can carry: one stream per session). Without this the child
+            // inherited the spawner's own fd 2 — the host console on Akuma — so
+            // every diagnostic and an interactive shell's prompt (ash writes it
+            // to stderr) vanished from the client.
+            syscall(syscall::DUP3, out_write as u64, fd::STDERR as u64, 0, 0, 0, 0);
             syscall(syscall::DUP3, in_read as u64, fd::STDIN as u64, 0, 0, 0, 0);
             close(out_write);
             close(out_read);
