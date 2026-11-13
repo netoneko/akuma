@@ -114,6 +114,13 @@ impl Write for SshStream {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn main() {
+    // `sshd --version` answers before anything loads or binds: a box can run an sshd
+    // that predates a fix and nothing else says which build it is (a 2026-11-10 sshd
+    // looked like a kernel bug on 2026-11-13, `docs/archive/SSH_PIPE_SESSIONS_LOST_STDERR.md`).
+    if args().any(|a| a == "--version") {
+        println(&format!("sshd rev {}", libakuma::GIT_REV));
+        exit(0);
+    }
     println(&format!("[SSHD] Starting userspace SSH server (rev {})...", libakuma::GIT_REV));
 
     // 1. Load config from file first

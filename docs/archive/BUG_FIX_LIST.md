@@ -13,7 +13,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1593
+- **Total distinct fixes counted:** 1594
 - **Docs contributing at least one fix:** 475
 - **Subsystem categories:** 15
 
@@ -22,19 +22,19 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Syscall / ABI Compatibility Audits | 256 | 16.1% | 38 |
 | Memory & Virtual Memory | 201 | 12.6% | 72 |
 | Scheduler & Process Management | 154 | 9.7% | 50 |
-| SMP & Locking | 141 | 8.9% | 60 |
+| SMP & Locking | 141 | 8.8% | 60 |
 | Networking | 104 | 6.5% | 38 |
 | Userspace Apps & Libraries | 42 | 2.6% | 23 |
 | Rump Kernel & Syscall Proxy | 26 | 1.6% | 6 |
 | Toolchain & Self-Hosting | 94 | 5.9% | 14 |
-| SSH | 43 | 2.7% | 22 |
-| VFS & Filesystem | 149 | 9.4% | 48 |
+| SSH | 44 | 2.8% | 22 |
+| VFS & Filesystem | 149 | 9.3% | 48 |
 | Boot & Drivers | 144 | 9.0% | 25 |
 | Signals & Exceptions | 50 | 3.1% | 20 |
 | Misc / Cross-cutting | 69 | 4.3% | 25 |
 | Console & Terminal | 63 | 4.0% | 22 |
 | Containers | 57 | 3.6% | 12 |
-| **Total** | **1593** | **100.0%** | **475** |
+| **Total** | **1594** | **100.0%** | **475** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1673,7 +1673,7 @@ aren't recorded anywhere else.)
 - A cargo-cached ELF is uplifted without relinking, so the wrapper never runs and the gate's aarch64 control kernel booted the middleware `.bin`; `mw_gate.sh` runs `mkbin.sh` on the ELF after every build
 - `shanghai/build.rs` was amd64-only (no `BOOT_STACK_SIZE` branch), so Shanghai did not build for aarch64
 
-## SSH (43 fixes, 22 docs)
+## SSH (44 fixes, 22 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - Every SSH session ran as one future inside a single `sshd` process, so `panic = "abort"` — which is process-wide, not future- or thread-scoped — meant *any* panic on *any* connection dropped every other live session with it. `PROTOCOL_UNDER_LOAD.md` fixed the one known trigger (a malformed pre-KEX packet) while explicitly noting the blast radius itself remained; this closes that. Each accepted connection is now served by its own `fork()`ed child, which inherits the socket through the fd-table copy (`FdTable::clone_deep_for_fork` → `socket_clone_ref`, refcounted on close by `remove_socket` — machinery that already existed and was already correct for this case). Zero kernel changes were needed: `docs/MISSING_SOCKET_MACHINERY.md` had concluded the handoff was unbuildable, having surveyed `sys_spawn`, `SCM_RIGHTS` and procfs but not `fork()`, where the fd is never handed over at all. Verified by SIGKILLing one live session under load — exactly one peer ended, three ran to completion, the server kept serving. Bounded by a new `max_sessions` (default 24) against the global `MAX_PROCESSES = 64`, since a fully-occupied session now costs two process slots. On by default (`fork-sessions`); `SSHD_FORK_SESSIONS=0` reverts to the cooperative executor for memory-constrained images
@@ -1760,6 +1760,7 @@ aren't recorded anywhere else.)
 
 ### docs/archive/SSH_PIPE_SESSIONS_LOST_STDERR.md
 - The `linux-abi` spawn's pipe path `dup3`ed only fd 0 and fd 1, so a session child kept the spawner's fd 2 (the host console on Akuma): every diagnostic of `ssh host 'cmd'` vanished, and an interactive shell's prompt (ash writes it to stderr) never reached the client; fd 2 now shares the stdout pipe
+- `libakuma/build.rs` reran only on `.git/HEAD` or the index, so `GIT_REV` (the rev in sshd's and herd's startup line) could name a stale commit after a soft reset, an empty commit, or in a worktree; it tracks the reflog, branch ref, `packed-refs` and common dir now, and `sshd --version` reports the rev without starting a server
 
 ### docs/archive/SSHD_DEAD_CLIENT_TEARDOWN.md
 - A client that vanished mid-command left its server-side shell running for about two minutes
