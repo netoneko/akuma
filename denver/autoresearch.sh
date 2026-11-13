@@ -212,7 +212,11 @@ commit_and_push() { # gate -> 0 ok, 4 checks red or commit failed. Docs and reco
                    # --no-verify; code pays targeted `cargo test -p` per touched crate first
                    # (repo-wide hooks would check everything; the loop pays per token).
     g=$1
-    git add -A denver akuma-jvm-kernel crates scripts/kvm/goose/denver-01-autoresearch.md 2>/dev/null || true
+    # Root manifests are part of the record when a gate adds workspace members or
+    # locks: without them the committed tree cannot build its own kernel (a
+    # members-line gate commit that is not committed is a broken tree for the
+    # next session - the unforgivable exit).
+    git add -A denver akuma-jvm-kernel crates Cargo.toml Cargo.lock scripts/kvm/goose/denver-01-autoresearch.md 2>/dev/null || true
     staged=$(git diff --cached --name-only)
     [ -n "$staged" ] || { log "commit: nothing staged"; return 0; }
     docs=$(printf '%s\n' "$staged" | grep -E '^(denver/(docs/|RESULT\.md|ESCALATE\.md|autoresearch\.sh|README|banner)|scripts/kvm/goose/denver-01)' || true)
@@ -221,6 +225,11 @@ commit_and_push() { # gate -> 0 ok, 4 checks red or commit failed. Docs and reco
         pkgs=""
         for f in $code; do
             d=$(dirname "$f")
+            # The workspace root's own manifest (and the lock) are not "a crate
+            # touched": testing the whole root kernel for a members line would pay
+            # a root-package host test every session. Member crates under it are
+            # still tested through their own paths.
+            if [ "$d" = "." ]; then continue; fi
             while [ "$d" != "." ] && [ ! -f "$d/Cargo.toml" ]; do d=$(dirname "$d"); done
             if [ -f "$d/Cargo.toml" ]; then
                 name=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$d/Cargo.toml" | head -1)
