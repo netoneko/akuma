@@ -67,6 +67,15 @@ GOOSE=${GOOSE_BIN:-goose}
 TMO=${SESSION_TIMEOUT_SECS:-14400}
 QW=${QUOTA_WAIT_SECS:-600}
 QMR=${QUOTA_MAX_RETRIES:-12}
+# Goose knobs, all env-overridable, defaults conservative. Measured (6 sessions,
+# 2026-11-13: ~98% of input tokens are cache reads, cost = context size x calls;
+# docs/archive/GOOSE_GLM_LOCAL_OPTIMIZATIONS.md on litter/goose-bench-results): a tight
+# --max-turns cut a task off before its deliverable, so the default keeps headroom and the
+# session brief says to write records before turn ~120. Compaction
+# (GOOSE_AUTO_COMPACT_THRESHOLD) shrank context in the local bench but is UNTESTED on GLM -
+# it stays OFF by default (see the DENVER_COMPACT gate in session()).
+MAXTURNS=${DENVER_MAX_TURNS:-150}
+MAXREP=${DENVER_MAX_TOOL_REPETITIONS:-5}
 N=${1:-1}
 FORCE_GATE=${2:-}
 RUNBOOK=denver/docs/runbooks/AUTORESEARCH.md
@@ -104,6 +113,21 @@ git rev-parse --verify -q denver >/dev/null || die "no branch denver"
 git checkout -q denver
 log "=== denver autoresearch: $N session(s) on $(git log --oneline -1 | head -1) ==="
 
+# Drift visibility, not fatal: the operator merges litter/main on their own schedule; the
+# loop only needs the number in the log so drift is a decision, not a surprise.
+if ! git fetch litter main >/dev/null 2>&1; then
+    log "preflight: git fetch litter main failed (offline?) - using the stale ref if any"
+fi
+behind=$(git rev-list --count denver..litter/main 2>/dev/null) || behind=
+if [ -n "$behind" ]; then
+    log "preflight: denver is $behind commit(s) behind litter/main"
+    if [ "$behind" -gt 50 ]; then
+        log "WARNING: >50 commits behind litter/main - merge before adding more gates"
+    fi
+else
+    log "preflight: drift vs litter/main unknown"
+fi
+
 next_gate() {
     if [ -n "$FORCE_GATE" ]; then printf '%s' "$FORCE_GATE"; return; fi
     if [ -r "$LOOP" ]; then
@@ -125,6 +149,8 @@ session() { # n gate
         cat "$RECIPE"
         printf '\n## This session\n\n'
         printf 'Gate: %s (taken from LOOP_LOG.md NEXT GATE; session %s of this script run)\n' "$g" "$n"
+        printf 'Context economy (read denver/docs/EFFICIENCY.md once - it has the measured why): orient from denver/docs/STATE.md (the generated digest) instead of cat-ing LOOP_LOG.md/REQUIREMENTS.md whole; take sed -n ranges or tail for anything long; never list the repo root.\n'
+        printf 'Turn budget: --max-turns %s. Write your records (research artifact, LOOP_LOG entry, RESULT.md, gate log) before turn ~120 - a session cut off before its records fails the bookkeeping check.\n' "$MAXTURNS"
         printf 'Capture the probe output to %s - it passes when the RESULT PASS line appears there.\n' "$glog"
         printf 'Write the research artifact first (rule R1): %s/<pass>.md\n' "$RESEARCH"
         printf 'Interventions you needed go into %s as `INTERVENTION: ...` lines.\n' "$RESULT"
@@ -136,6 +162,7 @@ session() { # n gate
     if [ "${DRY_RUN:-0}" = 1 ]; then printf 'DRY: would run: %s run --with-builtin developer -n %s -i %s\n' "$GOOSE" "$sess" "$instr"; return 0; fi
 
     loop_before=$(count '^### ' "$LOOP")
+    hl2_before=$(count '^## ' "$LOOP")
     interv_before=$(count 'INTERVENTION:' "$RESULT")
     if [ -r /etc/goose.env ]; then . /etc/goose.env; fi
 # Pin the GLM endpoint: config.yaml may carry kimi defaults (api.kimi.com), and a launching
@@ -148,7 +175,16 @@ OPENAI_HOST=${OPENAI_HOST:-https://api.z.ai}
 OPENAI_BASE_PATH=${OPENAI_BASE_PATH:-api/coding/paas/v4/chat/completions}
 export GOOSE_PROVIDER GOOSE_MODEL OPENAI_HOST OPENAI_BASE_PATH
 log "model: $GOOSE_MODEL via $GOOSE_PROVIDER at $OPENAI_HOST"
-    GOOSE_MODE=auto "$GOOSE" run --with-builtin developer -n "$sess" -i "$instr" >> "$LOG" 2>&1 &
+    # Compaction is opt-in only: the local bench saw it shrink context, but nobody has run
+    # it on GLM or on a gate-sized task - an untested context strategy mid-loop is a risk.
+    # So the env is stripped here unless DENVER_COMPACT=1 opts in explicitly.
+    if [ "${DENVER_COMPACT:-0}" = 1 ] && [ -n "${GOOSE_AUTO_COMPACT_THRESHOLD:-}" ]; then
+        log "session $n: compaction ON (GOOSE_AUTO_COMPACT_THRESHOLD=$GOOSE_AUTO_COMPACT_THRESHOLD; DENVER_COMPACT opt-in - untested on GLM)"
+    else
+        unset GOOSE_AUTO_COMPACT_THRESHOLD 2>/dev/null || true
+    fi
+    GOOSE_MODE=auto "$GOOSE" run --with-builtin developer -n "$sess" -i "$instr" \
+        --max-turns "$MAXTURNS" --max-tool-repetitions "$MAXREP" >> "$LOG" 2>&1 &
     pid=$!
     # Watchdog: kills only the goose process this script started, never a VM by pattern.
     ( sleep "$TMO"; kill "$pid" 2>/dev/null ) &
@@ -167,6 +203,13 @@ log "model: $GOOSE_MODEL via $GOOSE_PROVIDER at $OPENAI_HOST"
         log "session $n: goose exited rc=$rc (125+ = timeout kill)"
         return 9
     fi
+
+    # Per-session ledger + digest (quota = context size x calls): two cheap local reads
+    # right after the session ends, so the next session orients from denver/docs/STATE.md
+    # (~2k) instead of re-reading 39k of LOOP_LOG, and so the spend lands in
+    # COST_LEDGER.md. Both are committed with the docs commit below.
+    sh denver/bookkeep.sh --digest >> "$LOG" 2>&1 || log "session $n: bookkeep --digest failed (non-fatal)"
+    sh denver/bookkeep.sh --cost --append >> "$LOG" 2>&1 || log "session $n: bookkeep --cost --append failed (non-fatal)"
 
     # A mid-session escalation: the agent asked for help while working. Commit what is in the
     # tree so litter shows the question, then stop. Archiving happens at the loop check when
@@ -187,6 +230,15 @@ log "model: $GOOSE_MODEL via $GOOSE_PROVIDER at $OPENAI_HOST"
 
     # Judge the bookkeeping, never the gate's truth: the pieces the loop needs to continue.
     loop_after=$(count '^### ' "$LOOP")
+    if [ "$loop_after" -le "$loop_before" ] && [ -f denver/bookkeep.sh ] \
+       && [ "$(count '^## ' "$LOOP")" -gt "$hl2_before" ]; then
+        # The record may exist but under a `## ` heading: this driver counts only `### `
+        # (session 5 lost its entry to exactly that form). One repair pass via
+        # bookkeep.sh --fix, then re-check, before declaring the record skipped.
+        log "session $n: LOOP_LOG entry under a ## heading - sh denver/bookkeep.sh --fix, then re-check"
+        sh denver/bookkeep.sh --fix >> "$LOG" 2>&1 || log "session $n: bookkeep --fix failed"
+        loop_after=$(count '^### ' "$LOOP")
+    fi
     interv_after=$(count 'INTERVENTION:' "$RESULT")
     if [ ! -s "$glog" ]; then
         log "session $n: no captured output at $glog - bookkeeping incomplete"
@@ -210,6 +262,18 @@ log "model: $GOOSE_MODEL via $GOOSE_PROVIDER at $OPENAI_HOST"
     return 0
 }
 
+nohost_check() { # <crate-dir> <pkg> -> rc 0 = the package cannot host-test
+    # A bare-metal kernel crate whose build.rs relays a linker script
+    # (DEP_*_LINKER_SCRIPT) dies in build.rs under `cargo test -p`
+    # ("exports a linker script: NotPresent"): the script only exists in a
+    # kernel-target build. Those get `cargo build -p --target x86_64-unknown-none
+    # --release` instead; everything else keeps cargo test. Explicit overrides:
+    # DENVER_NOHOST_TEST="pkg1 pkg2".
+    d=$1; p=$2
+    case " ${DENVER_NOHOST_TEST:-} " in *" $p "*) return 0 ;; esac
+    [ -f "$d/build.rs" ] && grep -q 'LINKER_SCRIPT' "$d/build.rs"
+}
+
 commit_and_push() { # gate -> 0 ok, 4 checks red or commit failed. Docs and records take
                    # --no-verify; code pays targeted `cargo test -p` per touched crate first
                    # (repo-wide hooks would check everything; the loop pays per token).
@@ -230,6 +294,7 @@ commit_and_push() { # gate -> 0 ok, 4 checks red or commit failed. Docs and reco
     code=$(printf '%s\n' "$staged" | grep -vE '^(denver/(docs/|RESULT\.md|ESCALATE\.md|autoresearch\.sh|README|banner)|scripts/kvm/goose/denver-01)' || true)
     if [ -n "$code" ]; then
         pkgs=""
+        checked=" "
         for f in $code; do
             d=$(dirname "$f")
             # The workspace root's own manifest (and the lock) are not "a crate
@@ -238,15 +303,19 @@ commit_and_push() { # gate -> 0 ok, 4 checks red or commit failed. Docs and reco
             # still tested through their own paths.
             if [ "$d" = "." ]; then continue; fi
             while [ "$d" != "." ] && [ ! -f "$d/Cargo.toml" ]; do d=$(dirname "$d"); done
-            if [ -f "$d/Cargo.toml" ]; then
-                name=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$d/Cargo.toml" | head -1)
-                if [ -n "$name" ]; then pkgs="$pkgs $name"; fi
+            [ -f "$d/Cargo.toml" ] || continue
+            name=$(sed -n 's/^name *= *"\(.*\)"/\1/p' "$d/Cargo.toml" | head -1)
+            [ -n "$name" ] || continue
+            case "$checked" in *" $name "*) continue ;; esac
+            checked="$checked$name "
+            pkgs="$pkgs $name"
+            if nohost_check "$d" "$name"; then
+                log "check: cargo build -p $name --target x86_64-unknown-none --release (bare-metal kernel crate: build.rs needs the linker script, no host test)"
+                cargo build -p "$name" --target x86_64-unknown-none --release >> "$LOG" 2>&1 || { log "commit: cargo build -p $name FAILED - code stays uncommitted"; return 4; }
+            else
+                log "check: cargo test -p $name (touched by this session)"
+                cargo test -p "$name" >> "$LOG" 2>&1 || { log "commit: cargo test -p $name FAILED - code stays uncommitted"; return 4; }
             fi
-        done
-        pkgs=$(printf '%s\n' $pkgs | sort -u)
-        for p in $pkgs; do
-            log "check: cargo test -p $p (touched by this session)"
-            cargo test -p "$p" >> "$LOG" 2>&1 || { log "commit: cargo test -p $p FAILED - code stays uncommitted"; return 4; }
         done
         git commit --no-verify -m "denver: gate $g - code; targeted checks:$pkgs" -- $code >> "$LOG" 2>&1 || { log "commit (code) failed"; return 4; }
         log "committed code for gate [$g]"
