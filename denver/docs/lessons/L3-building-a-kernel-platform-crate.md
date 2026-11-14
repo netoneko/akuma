@@ -96,3 +96,16 @@ code.
   done-when met; the phase needed one human intervention (the reboot), so the transition rule
   stopped the loop at the phase summary (`denver/ESCALATE.md`). Decisions D6–D8: research
   artifact addendum.
+- 2026-11-14 (PHASE-2-PROCFS GREEN): a verbatim walk move (D27) is portable exactly as far as
+  the ownership model it assumes. The metal's `pid_map_rows` resolves the non-shared *owner*
+  and rejects shared views (the freed-tables hazard); the tokio kernel's `disown_space` makes
+  **every** registered `Process` a `new_shared` borrowed view of a root the kernel itself owns
+  (`OWNED_ROOT`, parked-not-freed at exec) — so owner resolution answered `None` for every pid
+  and `maps` stayed absent (errno=2) while `auxv` — served off plain `Process` fields through
+  the same hook table — worked, which is what pinned the divergence to the model, not the
+  registration. Fix: a sibling walk, `pid_map_rows_of_kernel_owned_roots` (leader's regions,
+  pid's own view, the same l0 re-check; `with_process`'s exclusive slot hold excludes the
+  concurrent swap), chosen at the runtime's registration — the model knowledge stays in the
+  kernel stack that owns it; no model flag, no new hook table. Residual recorded: per-view
+  locks over one root mean a sibling's fault can flip a PTE mid-walk — the staleness class
+  the kernel's own reclaim sweep already walks under.

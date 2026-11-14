@@ -97,3 +97,13 @@ the RED phase proves the probes themselves before any pass claims anything.
   paid again in the same session: the RED-2 console window named the bisect verdict's death
   (`cr2=0xffffffffff600020`) first-hand — capture-with-attribution did the research work of
   a whole diagnostic pass.
+- 2026-11-14 (PHASE-2-PROCFS GREEN, after one false FAIL): the same rule, fourth limb — the
+  *variable*, not the value. Run 1 FAILed a healthy rig because the probe defined `VDSoHASH`
+  but compared `$MERGEDHASH`; the unset variable expanded to the empty pattern, and `*""*`
+  matches any uname — the python-checked-constants rule guards the *value*, nothing guarded
+  the *name*. Fixed by naming, plus a fail-fast guard (an empty identity constant aborts the
+  probe before boot), so the failure mode can only be loud, never spurious. Same session, a
+  probe-cost fact measured twice: the guest's sshd cannot carry a connection while the NAME
+  arm runs java with the 2 ms maps poll (nine reconnect stalls over ~2.5 min, no recovery
+  even after the workload died) — a probe's own cadence is part of its cost; the attribution
+  report may need a slower poll or a console-side path (G9's session owns that choice).

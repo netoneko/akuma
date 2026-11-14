@@ -1,0 +1,6 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-procfs.spec (elapsed=4s)
+== rig identity: uname says denver, NOT 8a658723, NOT  (D31) (elapsed=8s)
+Linux denver 0.1.0-5b0587fa-denver 5b0587fa-release x86_64 GNU/Linux
+RESULT FAIL: the vdso rig binary booted - it does not serve procfs-diag; staging failed
+== wall clock: seconds=8 (t0=1794632432 end=1794632440)

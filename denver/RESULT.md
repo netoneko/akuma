@@ -386,3 +386,70 @@ it deliberately did not:
 Session 7 (OPERATOR-IMPROVEMENTS, LOOP_LOG) landed the loop-efficiency changes on top:
 `denver/bookkeep.sh`, driver edits, `denver/docs/EFFICIENCY.md`, STATE.md digest,
 COST_LEDGER.md.
+
+## PHASE-2-PROCFS — 2026-11-14 ~06:00–06:50 UTC, session 8 (goose, glm-5.3-flash) — GREEN (closes G4)
+
+Second session on this gate (session 7 wrote the research artifact, the kernel-side
+D27–D29 work in commits through 5b0587fa, the staged rig, and the D31 probe; its first
+probe execution died on a probe defect — see INTERVENTION 1). This session fixed the
+probe, executed it, diagnosed the one failing arm, fixed the kernel, and captured
+`RESULT PASS` in `denver/gates/PHASE-2-PROCFS.log` (guest `0.1.0-f0dcacb6-denver`).
+
+- **Result:** G4 flipped. `MAPS PASS lines=10 exec_lines=4 bytes=418` — `/proc/self/maps`
+  serves real page-table rows (static-PIE image at `0x10000000`, stack at
+  `0x6ffffffff000`); `AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096
+  AT_SYSINFO_EHDR matches stack=18446744073699061760` — `/proc/self/auxv` serves the
+  whole 15-pair table, agreeing with the stack vector; phase 1's `errno=2` evidence
+  line is gone. Ride-alongs green: tokioprobe `RESULT PASS`, `RWX PASS rw_to_rx=42`,
+  stack-auxv disclosure unchanged.
+- **The kernel fix (D32, research artifact):** `maps` was absent because the moved walk
+  (D27) resolves the *metal* owner — a non-shared process — and the tokio kernel's
+  `disown_space` makes every registered `Process` a `new_shared` **borrowed view** of a
+  root the kernel itself owns (`OWNED_ROOT` per slot; a dead image's root is parked, not
+  freed). Owner resolution answered `None` for every pid ⇒ file absent (errno=2) —
+  while `auxv`, served off plain `Process` fields through the same hook table, worked,
+  which pinned the divergence to the address-space model, not the registration.
+  `auxv`/`maps` divergence was the bisect; no extra boot needed (L4: cheapest possible).
+  Fix: `pid_map_rows_of_kernel_owned_roots` (leader's regions, pid's own view, the same
+  l0 re-check; `with_process`'s exclusive slot hold excludes the concurrent swap) in
+  `akuma-exec::process::maps_rows`, registered by `akuma-runtime-tokio` under
+  `procfs-diag` — model knowledge stays in the kernel stack that owns it; no model
+  flag, no new hook table (R7). The metal keeps `pid_map_rows` verbatim (its builds
+  re-verified green). Host tests: `akuma-procfs` 45 pass; `akuma-exec`/`akuma-mmu` are
+  bare-metal-build-only on this box (recorded in L4).
+- **The payoff arm's limit (recorded, not hidden):** the NAME arm
+  (`jvmprobe name /opt/jdk/bin/java 3005fc41 -version`) starves the guest's sshd —
+  java startup plus the 2 ms `/proc/<pid>/maps` poll drops the connection within
+  seconds and sshd never recovers (nine reconnect stalls over ~2.5 min; reproduced
+  standalone after the gate run). Its diagnostic window *did* work: both runs' console
+  shows the workload dying at the exact expected rip —
+  `[Fault] ring3 PageFault rip=0x000000003005fc41 ... cr2=0x0 code=0x6` + `slot killed
+  (SIGSEGV)` — while the poll ran. What the gate proves: the files serve, the workload
+  dies at the expected rip, the rip constant survives a third machine. What it does
+  **not** yet give G9: the maps snapshot attributing `0x3005fc41` to a module — the
+  attribution report cannot cross the wedged sshd. G9's session should first capture it
+  with a slower poll (jvmprobe change) or a console-side path.
+- **Verdict honesty (D31 vs implementation):** the implemented probe FAILs the NAME arm
+  only on `NAME MISSING`/the W^X blocker line; with ssh starved, neither `NAME PASS`
+  nor `NAME SURPRISE` crossed the wire and the verdict arms did not fire —
+  `RESULT PASS` rests on conditions 1–6 plus the console fault recurrence, not on an
+  attribution verdict. Recorded here because the log line alone over-states the arm.
+
+INTERVENTION: run 1 of the D31 probe (session 7, 05:00:32 UTC) FAILed a healthy rig:
+the probe defined `VDSoHASH` but compared `$MERGEDHASH`; the unset variable expanded to
+the empty pattern, and `*""*` matches any uname — a false "the vdso rig binary booted"
+against the correct procfs rig. Fixed by naming + a fail-fast guard (empty identity
+constant aborts before boot; the failure mode can only be loud). Fourth limb of L2's
+"verdicts lie" rule: python-check the *value*, compile-check the *name*.
+
+INTERVENTION: host toolchain facts, recorded for the next sessions — `cargo` at
+`/usr/local/rust/bin` (nightly 1.101, std for `x86_64-unknown-linux-musl` +
+`x86_64-unknown-none` + rust-src) is shadowed by the system Alpine rustc 1.96.1 unless
+`PATH=/usr/local/rust/bin:$PATH` (the driver does this at line ~102); host tests need
+`--target x86_64-unknown-linux-musl` (`akuma-procfs` host-tests green; `akuma-exec`,
+`akuma-mmu` compile only bare-metal). Building the gate kernel overwrites
+`target/.../denver` with the default build if run after it — stage in that order
+(default first, gate last), verified by size (gate ≈ +29 KB).
+
+INTERVENTION: the NAME arm's ssh starvation (detail above) — probe-side cadence, not a
+kernel defect; two reproductions; data for G9's method choice, not a gate condition.

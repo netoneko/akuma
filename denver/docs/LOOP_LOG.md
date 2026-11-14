@@ -375,3 +375,71 @@ recorded in RESULT.md with what it verified and what it did not.
 
 **Transition.** The ladder's next rung is diagnostic, per the re-rank:
 NEXT GATE: PHASE-2-PROCFS
+
+### PHASE-2-PROCFS — 2026-11-14 06:00–06:50 UTC, session 8 (goose, glm-5.3-flash) — GREEN (closes G4; the fault can be named now)
+
+**What we did.** Second session on the gate. Session 7 had done the research (R1), the
+kernel-side D27–D29 work (walk moved to `akuma-exec`, auxv retention + `render_auxv`,
+feature relay, "kernel builds green default+gate"), the staged rig (`denver-procfs` +
+`vm-procfs.spec`, D30), and the D31 probe — whose first execution (05:00:32 UTC) FAILed
+**on a probe defect, not a rig defect**: it defined `VDSoHASH` but compared
+`$MERGEDHASH`, and the unset variable's empty pattern matched any uname (the gate log
+of that run is preserved as `PHASE-2-PROCFS.typo-fail.log`). This session: fixed the
+naming + added a fail-fast guard, ran the probe — six of seven arms GREEN
+(tokioprobe, RWX ride, stack-auxv disclosure, **procfs-auxv with stack agreement**,
+and the abort: `MAPS RED /proc/self/maps errno=2` — maps still absent while auxv
+worked, *through the same hook table*), diagnosed that bisect without another boot,
+fixed the kernel, re-ran, captured `RESULT PASS` (guest `0.1.0-f0dcacb6-denver`,
+wall 188 s, stamped).
+
+**The decision the failure forced (D32).** `errno=2` on maps = `pid_map_rows` returned
+`None` = the file *absent*, the glue's own absence rule. Auxv working through the same
+table proved the registration and the feature were live — the divergence was the
+**address-space ownership model**: the moved walk (D27) resolves the metal's non-shared
+*owner* and rejects shared views (the freed-tables hazard, PROC_MAPS_WALK_FREED_TABLES),
+but the tokio kernel's `disown_space` makes **every** registered `Process` a
+`new_shared` borrowed view of a root the kernel itself owns (`OWNED_ROOT` per slot,
+parked-not-freed at exec) — so the owner resolution answered `None` for every pid. Two
+layers of the walk (the owner lookup *and* the `is_shared()` re-check) assumed the
+metal. Fix: a sibling walk `pid_map_rows_of_kernel_owned_roots` (leader's regions, pid's
+own view, the same l0 re-check under `with_process`'s exclusive slot hold), registered
+by `akuma-runtime-tokio` under `procfs-diag` — the model knowledge stays in the kernel
+stack that owns it; no model flag, no new hook table (R7). The metal keeps
+`pid_map_rows` verbatim; its build re-verified green, default build re-verified green
+(R6). Precedents searched before deciding (R9): the hazard doc itself, `disown_space`/
+`OWNED_ROOT` (proc.rs:668–691), `pid_auxv_of`'s tgid fallback (the runtime-side
+model-specific policy precedent), `kernel-glue`'s by-design stub, and the arm64
+`address_space_owner_pid_for_fault` (resolve by what the running state says when the
+map can't name an owner).
+
+**What GREEN means, honestly.** G4's files serve: 10 maps lines including the
+executable image rows; auxv 15 pairs agreeing with the stack vector byte-for-byte on
+`AT_SYSINFO_EHDR`. The NAME arm's *diagnostic window* worked — both runs' console shows
+the workload dying at the exact expected rip (`0x3005fc41`, cr2=0, code=6) while the
+poll ran — but its **attribution report cannot cross the guest's sshd**: java startup
+plus the 2 ms maps poll starves sshd within seconds and it never recovers (reproduced
+standalone; nine reconnect stalls). So `RESULT PASS` rests on conditions 1–6 + the
+console fault recurrence; the rip→module snapshot is **still to capture**, and G9's
+first job is exactly that (slower poll or console-side path — REQUIREMENTS G9 row
+updated with the gate name).
+
+**Machine facts recorded (not fought):** host toolchain — `/usr/local/rust/bin`'s
+nightly is shadowed by system Alpine rustc unless PATH is fixed (the driver does this);
+host tests need `--target x86_64-unknown-linux-musl`; `akuma-exec`/`akuma-mmu` are
+bare-metal-build-only; the default and gate kernel builds share one output path — stage
+default-first, gate-last, verify by size (gate ≈ +29 KB). Guest console on
+`$W/vmrun.log` carried the fault lines with attribution offsets again (the
+FAULTNAME/ VDSO capture pattern, reused unchanged).
+
+**Interventions:** three, all in RESULT.md — the probe's name mismatch (false FAIL on a
+healthy rig), the toolchain PATH/target facts, and the NAME-arm ssh starvation
+(probe-side cadence, not a kernel defect).
+
+**Cycle measured** (L4, third measurement, stamped): complete probe run 188 s; edit→
+gate-build ≈ 1 min; build→stage→PASS ≈ 3 min; the session's first two probe
+executions were aborted-but-informative (constant defect; model divergence) — the third
+was the first complete run and it was GREEN.
+
+**Transition.** G4 closed; the ladder's next rung is the fix the diagnostics were built
+for — the rip has a kill site but no owner yet:
+NEXT GATE: PHASE-2-NULLSTORE

@@ -1,0 +1,66 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-procfs.spec (elapsed=3s)
+== rig identity: uname says denver, NOT 8a658723, NOT 3531cf69 (D31) (elapsed=4s)
+Linux denver 0.1.0-f0dcacb6-denver f0dcacb6-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (phase 0's marker) (elapsed=4s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-f0dcacb6-denver f0dcacb6-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.59s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (rides; this binary carries wx-relaxed AND vsyscall AND procfs-diag) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== the disclosure survives: the stack-auxv arm (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096 AT_SYSINFO_EHDR matches stack=18446744073699061760
+== the G4 flip 1: /proc/self/maps (phase 1 and earlier: absent) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+MAPS-LINE: 10000000-10001000 r--p 00000000 00:00 0 
+MAPS-LINE: 10001000-10004000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10006000-10008000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000a000-1000c000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000e000-1000f000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000f000-10011000 r--p 00000000 00:00 0 
+MAPS-LINE: 10011000-10013000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10052000-10063000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10093000-10094000 rw-p 00000000 00:00 0 
+MAPS-LINE: 6ffffffff000-700000000000 rw-p 00000000 00:00 0 
+MAPS PASS lines=10 exec_lines=4 bytes=418
+== the G4 flip 2: /proc/self/auxv (phase 1's evidence line: errno=2 - it must be gone) (elapsed=6s)
+  (stack vector and /proc render agree: the kernel answers the same table twice)
+== the payoff: the NAME arm - fork+exec java, poll /proc/<pid>/maps to death, attribute rip 0x3005fc41 (elapsed=6s)
+Terminated
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 2s (attempt 1/10)
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 4s (attempt 2/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 6s (attempt 3/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 8s (attempt 4/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 10s (attempt 5/10)
+[ssh] connecting to 127.0.0.1:2247...
+== the console window: what did the workload do this time (elapsed=186s)
+-- console window: fault line:
+[Fault] ring3 PageFault rip=0x000000003005fc41 rsp=0x00006fffffffba50 cr2=0x0000000000000000 code=0x6 -- task killed
+-- console window: slot line:
+[Fault] slot 7 killed (SIGSEGV)
+  (the G9 NULL store recurred at the expected rip - the NAME arm above names its owner)
+== verdict (elapsed=188s)
+RESULT PASS
+== wall clock: seconds=188 (t0=1794637620 end=1794637808)

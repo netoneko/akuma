@@ -48,14 +48,6 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   protocol never reached two hypotheses on one question). Machine facts recorded: host clock
   slew, kernel 0.0.9's RWX baseline vs the guest stack's EACCES, no xattr syscalls (mke2fs
   needed `-E no_copy_xattrs`).
-
-## Record
-
-- 2026-11-13 (PHASE-1-METHOD GREEN): H1 measured at 0–1 s (clamped; epochs logged), whole
-  method 9 s wall clock, three gate runs total (two parser-bug verdicts, one GREEN — the stall
-  protocol never reached two hypotheses on one question). Machine facts recorded: host clock
-  slew, kernel 0.0.9's RWX baseline vs the guest stack's EACCES, no xattr syscalls (mke2fs
-  needed `-E no_copy_xattrs`).
 - 2026-11-13 (PHASE-2-WX GREEN): the kernel-change cycle, phase 2's first measurement (Do step
   2, kept honest by naming *which* cycle): feature build 24 s cold-chain; rebuild → stage →
   boot → RESULT PASS ≈ 4 min; WIP commit → gate capture ≈ 11 min; one gate run, GREEN first
@@ -71,3 +63,15 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   fix. The RED bought the design outright: the bisects (one variable per boot, verdicts in
   the research artifact's table) split map vs auxv-pair in two boots where three hypotheses
   of armchair analysis had argued — the stall protocol's cheapest possible resolution.
+- 2026-11-14 (PHASE-2-PROCFS GREEN): the kernel-change cycle, third measurement, stamped in
+  the capture: complete probe run 188 s (boot ≈ 3 s; the tail is the NAME arm's ssh
+  starvation, measured again standalone — see L2); edit→gate-build ≈ 1 min
+  (`cargo build -p denver --target x86_64-unknown-none --release
+  --features wx-relaxed,vsyscall,procfs-diag`; default build re-verified 30 s); build→stage→
+  PASS ≈ 3 min. Host-side checks on this box need the driver's own PATH
+  (`PATH=/usr/local/rust/bin:$PATH` — the system Alpine rustc 1.96.1 otherwise shadows the
+  nightly) and `--target x86_64-unknown-linux-musl` for host-testable crates (`akuma-procfs`:
+  45 tests pass; `akuma-exec`/`akuma-mmu` are bare-metal-build-only). Third execution of the
+  D31 probe was the first complete one and it was GREEN — the two-session gate (research +
+  probe in session 1, fix + records in session 2) spent its first two runs buying two real
+  findings (the false-FAIL constant, the model divergence) before the pass.

@@ -1,0 +1,31 @@
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 2s (attempt 1/10)
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 4s (attempt 2/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 6s (attempt 3/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 8s (attempt 4/10)
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 10s (attempt 5/10)
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 12s (attempt 6/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 14s (attempt 7/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 16s (attempt 8/10)
+[ssh] connecting to 127.0.0.1:2247...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 18s (attempt 9/10)

@@ -190,3 +190,55 @@ Verification order: `cargo test -p akuma-exec -p akuma-procfs` (host), metal sti
 builds (`cargo build -p akuma-kernel-amd64 --target x86_64-unknown-none`), default
 kernels unchanged (`cargo build -p denver`, `-p taoxichuan`), clippy on touched
 crates, then the gate kernel build + stage + run (D30/D31).
+
+## Verification (session 8, 2026-11-14) — GREEN, with one model finding and one recorded limit
+
+Probe executions: (1) session 7's run FAILed on the probe itself — `VDSoHASH` defined,
+`$MERGEDHASH` compared; the empty pattern matched any uname (capture preserved as
+`PHASE-2-PROCFS.typo-fail.log`); fixed + a fail-fast guard. (2) First full run here:
+six arms GREEN, `MAPS RED /proc/self/maps errno=2` beside a working
+`AUXV PASS procfs-auxv` **through the same hook table** — the registration and feature
+provably live, so the divergence was the address-space model. (3) After the fix:
+`RESULT PASS`, guest `0.1.0-f0dcacb6-denver`, wall 188 s
+(`denver/gates/PHASE-2-PROCFS.log`).
+
+**Finding 0 (the model divergence, D32).** D27 moved the walk "verbatim" — but the
+walk's first step, `address_space_owner_of`, encodes the *metal* model: the registered
+`Process` **owns** its tables, `is_shared()` marks a `CLONE_VM` member whose owner holds
+the real lock. The tokio kernel's `disown_space` (`akuma-tokio-kernel-core/src/proc.rs`,
+`OWNED_ROOT` per slot, old roots parked at exec not freed) makes **every** Process a
+`new_shared` *borrowed view* — so the owner resolution answers `None` for every pid, and
+`pid_map_rows`' `is_shared()` re-check would reject any self-walk besides. On the metal
+`None` means "tables freed, do not walk"; on tokio it means "kernel-owned, walk your own
+view" — same signal, opposite meanings, which is why the fix is a **sibling walk** at the
+registration site, not a flag: `pid_map_rows_of_kernel_owned_roots` (leader's regions via
+tgid — `pid_auxv_of`'s shape; pid's own view; the same l0 re-check; `with_process`'s
+exclusive slot hold excludes the concurrent `disown_space` swap). The metal registers
+`pid_map_rows` unchanged. Residual, recorded in the fn's doc: per-view locks over one
+root mean a sibling's fault can flip a PTE mid-walk — the staleness class the kernel's
+own reclaim sweep already walks under.
+
+**Recorded limit (the NAME arm).** java startup + the 2 ms maps poll starves the
+guest's sshd within seconds; it never recovers (two runs; standalone reproduction).
+The arm's window did work — the console caught the workload dying at the exact
+expected rip (`rip=0x3005fc41 cr2=0x0 code=0x6`) both times — but the attribution
+snapshot cannot cross ssh. G9's first job: re-take it with a slower poll or a
+console-side path. The implemented probe FAILs the arm only on `NAME MISSING`/the W^X
+blocker line, so this run's `RESULT PASS` rests on conditions 1–6 + the console
+recurrence (D31's `NAME PASS ∨ NAME SURPRISE` was not exercised) — stated here so the
+log line is not over-read.
+
+**Verification order as run (R5 budget):** `cargo test -p akuma-procfs --target
+x86_64-unknown-linux-musl` (45 pass; host tests need the musl triple + the driver's
+PATH — `akuma-exec`/`akuma-mmu` are bare-metal-build-only), `cargo build -p akuma-exec
+--target x86_64-unknown-none --release` (green, one pre-existing `allocator_api`
+warning), metal `-p akuma-kernel-amd64` (green), default `-p denver` (green, R6),
+gate `-p denver --features wx-relaxed,vsyscall,procfs-diag` (green; stage gate-LAST —
+the default build overwrote the first stage and was caught by size: gate ≈ +29 KB).
+
+- **D32 — the tokio kernels register the kernel-owned-roots walk.** New
+  `pid_map_rows_of_kernel_owned_roots` in `akuma-exec::process::maps_rows` (~40 LOC +
+  doc); `akuma-runtime-tokio`'s `procfs-diag` registration swaps to it. Model knowledge
+  stays in the kernel stack that owns it (the runtime chooses its walk the way
+  `pid_auxv_of` already chooses its tgid fallback); no model flag crosses crates, no
+  new hook table (R7). Total session kernel delta ≈ 74 LOC — inside R5.
