@@ -9,7 +9,7 @@ description = "Denver: the teaching kernel over akuma-jvm-kernel - the Shanghai 
 workspace = true
 
 [dependencies]
-akuma-jvm-kernel = { path = "../akuma-jvm-kernel", features = ["no-tests"] }
+akuma-jvm-kernel = { path = "../crates/akuma-jvm-kernel", features = ["no-tests"] }
 
 [features]
 # The JIT-permitting W^X relaxation (PHASE-2-WX, G1): the policy this kernel exists to carry,

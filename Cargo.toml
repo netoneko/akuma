@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "taoxichuan", "shanghai", "akuma-jvm-kernel", "denver", "crates/*"]
+members = [".", "taoxichuan", "shanghai", "denver", "crates/*"]
 default-members = [
     ".",
     "crates/akuma-alloc",

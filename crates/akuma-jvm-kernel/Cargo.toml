@@ -59,4 +59,4 @@ getcpu = ["akuma-tokio-kernel/getcpu"]
 fault-signal = ["akuma-tokio-kernel/fault-signal"]
 
 [dependencies]
-akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }
+akuma-tokio-kernel = { path = "../akuma-tokio-kernel" }

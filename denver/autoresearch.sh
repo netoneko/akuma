@@ -282,7 +282,7 @@ commit_and_push() { # gate -> 0 ok, 4 checks red or commit failed. Docs and reco
     # locks: without them the committed tree cannot build its own kernel (a
     # members-line gate commit that is not committed is a broken tree for the
     # next session - the unforgivable exit).
-    git add -A denver akuma-jvm-kernel crates Cargo.toml Cargo.lock scripts/kvm/goose/denver-01-autoresearch.md 2>/dev/null || true
+    git add -A denver crates Cargo.toml Cargo.lock scripts/kvm/goose/denver-01-autoresearch.md 2>/dev/null || true
     # Gate logs are the evidence and must ride with the record: the root .gitignore's
     # `*.log` would silently leave denver/gates/<gate>.log out of the commit - the
     # driver would grep the on-disk file while litter lost the proof (found the hard

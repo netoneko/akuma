@@ -42,7 +42,7 @@ code.
    `cargo build -p akuma-amd64/-p taoxichuan` green (the pairing moved together). — The
    extraction moved code *into* shared crates, so the crates state is only coherent with its
    paired root/metal wiring; a partial copy is fork-shaped (R5).
-3. **Write the front crate as a pure pass-through.** `akuma-jvm-kernel/`: features 1:1 onto
+3. **Write the front crate as a pure pass-through.** `crates/akuma-jvm-kernel/`: features 1:1 onto
    `akuma-tokio-kernel`, `entry!`/`Kernel` re-export, the linker-script relay (`links =
    "akuma_jvm_kernel"`, `cargo:linker_script=`), `#![forbid(unsafe_code)]`. Checkable outcome:
    it compiles for the host and maps every feature the machine half offers.

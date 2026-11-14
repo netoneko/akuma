@@ -36,7 +36,7 @@ protocol: record it, insert a diagnostic pass if one is missing, re-rank `REQUIR
 - Branch `denver`; the driver commits and pushes to `litter` (`git push litter denver`) after the
   bookkeeping check — docs with `--no-verify`, code after targeted `cargo test -p` on the crates you
   touched; never push to `origin`; never rewrite history.
-- You change only `denver/`, `akuma-jvm-kernel/`, and existing crates behind **off-by-default
+- You change only `denver/`, `crates/akuma-jvm-kernel/`, and existing crates behind **off-by-default
   features** (R6). No middleware, no hook tables (R7). Workspace lints stay clean (R3).
 - Boot guests with whatever the machine has: Akuma KVM or the QEMU line in the relevant README.
   Never kill a VM by pattern; stop only the one you started (its pid file).

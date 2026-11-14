@@ -1,6 +1,14 @@
-# denver
+# Denver
 
-denver is an experimental platform kernel, written almost entirely by GLM-5.3-flash
+```text
+   /\        /\        /\        /\        /\
+  /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
+ /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
+_/                                    \_     Beans System Debauchery:
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       kernel for Clojure
+```
+
+Denver is an experimental platform kernel, written almost entirely by GLM-5.3-flash
 working in autoresearch mode — one gate per session, captured probe output as the only
 judge (`docs/runbooks/AUTORESEARCH.md`), a human operator in the loop. The goal was
 twofold: condense the previous experiments into a set of generic lessons for building
@@ -12,6 +20,51 @@ in Clojure, from a fresh kernel booting under KVM on metal. Every rule below is 
 by a captured gate log or a recorded decision — nothing here is doctrine without
 evidence. The links go to the living lesson files, which carry the full worked example
 and the per-gate `Record` trail.
+
+## A platform kernel as a collection of crates
+
+Denver is not a kernel written from scratch. It is a manifest: one binary crate and one
+front crate that pick, by name, which existing Akuma crates make up the kernel. The whole
+`Cargo.toml` of the binary is a list of features, each relayed 1:1 to the front crate and
+off by default, so the default build stays what it was (rule R6):
+
+```toml
+[package]
+name = "denver"
+
+[dependencies]
+akuma-jvm-kernel = { path = "../crates/akuma-jvm-kernel", features = ["no-tests"] }
+
+[features]
+wx-relaxed       = ["akuma-jvm-kernel/wx-relaxed"]        # JIT code cache: RWX, RW -> R+X
+vsyscall         = ["akuma-jvm-kernel/vsyscall"]          # the legacy page HotSpot hardcodes
+fold-regpreserve = ["akuma-jvm-kernel/fold-regpreserve"]  # keep the caller's six arg registers
+sysinfo          = ["akuma-jvm-kernel/sysinfo"]           # heap sizing reads it
+fault-signal     = ["akuma-jvm-kernel/fault-signal"]      # null checks reach HotSpot's SIGSEGV handler
+shell            = ["akuma-jvm-kernel/shell"]             # getrlimit, getpgid, ... (full file: Cargo.toml)
+```
+
+`akuma-jvm-kernel` ([`crates/akuma-jvm-kernel`](../crates/akuma-jvm-kernel)) has no
+capability of its own: it re-exports `akuma-tokio-kernel`'s `entry!` macro and `Kernel`
+builder and maps each feature name onto the crate below it. A new capability is one feature
+line per layer, never a fork.
+
+```text
+ denver                     the binary: main.rs, banner.txt, the feature list
+   |   features, 1:1
+   v
+ akuma-jvm-kernel           front crate: entry!, Kernel, zero capabilities
+   |   features, 1:1
+   v
+ akuma-tokio-kernel         the platform: tokio on bare metal (Taoxichuan's, shared)
+   |   picks the machine half by target
+   +--> akuma-tokio-kernel-aarch64
+   '--> akuma-tokio-kernel-amd64    the machine half: the arms the features switch on
+          |
+          +-- akuma-runtime-tokio, akuma-syscalls-glue(-amd64), akuma-exec
+          +-- akuma-mmu, akuma-pmm, akuma-vfs, akuma-ext2, akuma-net, akuma-tty
+          '-- akuma-trap-amd64, akuma-ring3-amd64, akuma-sched-amd64, ...
+```
 
 ## The lessons
 

@@ -64,7 +64,7 @@ log tail, sleeps `QUOTA_WAIT_SECS`, and retries the same session with the budget
 
 | phase | contains | done when |
 |---|---|---|
-| **0 — scaffold** | `denver/` + `akuma-jvm-kernel/` crates exist; lesson 3's gate | Denver boots tokio, `uname` says denver |
+| **0 — scaffold** | `denver/` + `crates/akuma-jvm-kernel/` crates exist; lesson 3's gate | Denver boots tokio, `uname` says denver |
 | **1 — method** | lessons 1, 2, 4: requirements table, RED probes, measured loop | `REQUIREMENTS.md` complete; every probe fails cleanly; one hypothesis-to-verdict cycle measured under an hour |
 | **2 — passes** | Part II, one pass per capability, ranked by `REQUIREMENTS.md` | no open gap that blocks phase 3; each pass has research + gate + record |
 | **3 — ladder** | `java -version` → Java hello world → evaluate → Clojure web server | `curl localhost:PORT` returns `Hello, World from Clojure` |

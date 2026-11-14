@@ -65,4 +65,4 @@ server and an interactive ssh that had needed a workaround all day.
     # is any of them already in a gated set?
     grep -n "S::Prlimit64\|S::Getrlimit\|S::Getpgid" crates/akuma-runtime-tokio/src/lib.rs
     # which features does the sibling enable that this build does not?
-    grep -n "^default" taoxichuan/Cargo.toml akuma-jvm-kernel/Cargo.toml denver/Cargo.toml
+    grep -n "^default" taoxichuan/Cargo.toml crates/akuma-jvm-kernel/Cargo.toml denver/Cargo.toml
