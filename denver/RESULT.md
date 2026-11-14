@@ -687,3 +687,57 @@ SET_BOX_STACK=324) is the D58 two-table lesson made concrete. G5 stays deferred.
   recovery design mid-gate — the reader had to become `jvmprobe java` (pipe capture, the phase-1
   arm), not a new file protocol. Known guest applet list (`/bin/busybox ls` from L2) was
   incomplete: check the command surface BEFORE designing file-based recovery.
+
+## Gate PHASE-3-JAVAWORKLOAD — session 17, 2026-11-14 ~15:12–15:45 UTC — GREEN (the second rung: a compiled class runs on the guest — `Hello.class` loads from `/work`, exit 0, marker captured; wall 9 s; zero new kernel code)
+
+**Goal:** the re-rank's new order — run a compiled class (`Hello.class`): the first java rung
+that exercises class loading, GC threads, and the file/classpath paths `-version` never touches.
+PASS bar deliberately stricter than D60 (this is a workload gate, not a capture gate): exit=0
+AND the marker line, else RESULT FAIL with the datum named.
+
+**Commands and outcomes** (full capture: `denver/gates/PHASE-3-JAVAWORKLOAD.log`; attempt 1
+preserved: `denver/gates/PHASE-3-JAVAWORKLOAD.attempt1-classformat.log`):
+
+- `python3 denver/probes/mkhello.py` → `Hello.class` 372 bytes, Java 21 (major 65), hand-assembled
+  (D64: no javac exists — host and guest are JRE-only, JEP 330 source mode dies in VM init; R9
+  search across `docs/archive/`, `docs/reference/`, `shanghai/`, `taoxichuan/` found no bytecode
+  precedent). `python3 denver/probes/verifyclass.py` → `VERIFY PASS` (strict read-back parser;
+  the host JRE cannot run-verify — it SIGSEGVs at the vsyscall address `ffffffffff600800` in VM
+  init, the L1 datum measured on this Linux host).
+- Staging (D65): `cp denver-jdk.img denver-hello.img`; `debugfs -w mkdir /work`;
+  `debugfs -w write .../Hello.class /work/Hello.class`; dump-back `cmp` byte-identical;
+  `e2fsck -f -n` clean. `vm-hello.spec` = vm-getcpu.spec with only `disk=` changed — the kernel
+  binary stays `denver-getcpu` (d4acb339), which the uname identity check REQUIRES.
+- Attempt 1 (wall 11 s): `JVM INFO exit=1` + `JVM RED Error: LinkageError occurred while loading
+  main class Hello reason="java.lang.ClassFormatError: Field \"<init>\" in class Hello has
+  illegal signature \"()V\""` — HotSpot read `fields_count` as `interfaces_count` (the u2 the
+  builder AND the checker both omitted) and parsed the methods table as fields. The pipe arm
+  named it in <1 s; the class-load diagnostic arm showed CDS serving shared classes.
+- Attempt 2 (wall 9 s): `JVM INFO exit=0 signal=0 bytes=27` + `JVM PASS
+  HELLO-DENVER-WORKLOAD-PASS` — **READABLE-RUN**; diagnostic arm skipped (run already clean);
+  console window: no fault, no kill, old rip absent; census re-measured the suspects NON-fatal:
+  readlink(89) EINVAL ×13 (growing-buffer shape 0xfe7→0x1000), setitimer(38) ×3, membarrier(324)
+  ×5 (the D58 double-fire), getrlimit(97) ×5, prlimit64(302) ×5 — hypotheses still, no death
+  named.
+
+**Verdict:** `RESULT PASS` — the rung is climbed: class loading from a classpath directory,
+HotSpot verification, main invocation, println through the pipe — kernel d4acb339 unchanged,
+zero new kernel code (R6-perfect gate).
+
+**Interventions (4):**
+- INTERVENTION: the host-JRE run-verify was impossible — the Linux host's own JRE SIGSEGVs at
+  the vsyscall address during VM init (pc `libjvm.so+0xaef710`, the exact death the denver
+  kernel closes); the verifier became a structural read-back parser, and the guest's HotSpot is
+  the ground-truth verifier (a class-file defect costs one 11 s boot, named to the field).
+- INTERVENTION: verifyclass.py caught two mkhello.py bugs pre-boot — ldc's operand written as
+  u2 (decodes as `ldc #0` + stray opcode) and the Code attribute emitted without its
+  max_stack/max_locals/code_length header. The read-back practice works; see next line for its
+  limit.
+- INTERVENTION: builder AND checker shared one blind spot — both omitted `interfaces_count`
+  (JVMS 4.1), so the verifier "verified" a structurally invalid file; attempt 1's RED named it.
+  A checker that shares the author's assumptions verifies nothing; the receiver is the verifier.
+- INTERVENTION: `denver/gates/` is gitignored — gate logs need `git add -f` (precedent: every
+  prior gate log is tracked the same way); the WIP commit chain stopped silently on the ignored
+  path until checked.
+
+NEXT GATE: PHASE-3-JAVACLASSLIB

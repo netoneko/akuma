@@ -178,3 +178,18 @@ the RED phase proves the probes themselves before any pass claims anything.
   silently never ran (parse-time verdicts-lie, third sighting; attempt 1 also printed
   READABLE-HANG from the same page that showed the session had returned — its log is
   preserved as `PHASE-3-JAVAVERSION.attempt1-misattributed-hang.log`).
+- 2026-11-14 (PHASE-3-JAVAWORKLOAD GREEN): two instrument lessons. (1) **A checker that shares
+  the author's assumptions verifies nothing** — the hand-assembled class file's structural
+  verifier (`verifyclass.py`) caught two real builder bugs pre-boot (ldc operand width; Code
+  attribute missing its header) and then passed a structurally invalid file because builder AND
+  checker had made the same omission (`interfaces_count`, JVMS 4.1); the guest's HotSpot named
+  the defect in <1 s through the pipe arm (`ClassFormatError: Field "<init>" illegal signature
+  "()V"`) — **the receiver is the verifier**: for generated artifacts, a RED on the real
+  consumer costs one boot, so verify structurally AND plan on the consumer's own error message
+  as the ground truth. (2) **The run-verify may be impossible where you are** — the Linux host's
+  own JRE SIGSEGVs at the vsyscall address in VM init (the L1 datum measured on this host too),
+  so "just run it on the host" was never an option; the structural verifier substituted, and its
+  blind spot was the cost paid for knowing that. Also: staging files into a guest image copies
+  the rig (`cp denver-jdk.img denver-hello.img` + `debugfs -w write`, jvmprobe-to-`/bin`
+  precedent) — never modify a proven image in place; and gate logs are gitignored, `git add -f`
+  is the tracked precedent.

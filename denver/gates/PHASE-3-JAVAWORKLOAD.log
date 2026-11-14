@@ -1,0 +1,83 @@
+== host-side staging sanity: the hello image exists and carries /work/Hello.class (elapsed=0s)
+  in image:     438  100644 (0)      0      0     372 14-Nov-2026 15:29 Hello.class
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-hello.spec (proven kernel d4acb339 + staged hello disk) (elapsed=3s)
+== rig identity: uname carries the GREEN kernel d4acb339, no older rig (elapsed=7s)
+Linux denver 0.1.0-d4acb339-denver d4acb339-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=7s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-d4acb339-denver d4acb339-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.11s)
+  title: Akuma
+RESULT PASS
+== feature-set proof: the getcpu arm (one PASS proves getcpu/sysinfo/wx/vsyscall/procfs-diag/fold/lazyrel all ride) (elapsed=8s)
+[ssh] connecting to 127.0.0.1:2247...
+GETCPU PASS cpu=1 node=0
+== guest-side staging identity: the guest can NAME the class before java is blamed (elapsed=8s)
+total 1
+-rw-r--r--    1 0        0              372 Nov 14  2026 Hello.class
+  guest sees /work/Hello.class - image staging confirmed on the far side
+== B0: channel baseline (poke before any dispatch) (elapsed=8s)
+[ssh] connecting to 127.0.0.1:2247...
+ALIVE-B0
+== THE ARM (reader): jvmprobe java - pipe capture, blocking read, ZERO polling (L2 rule, D63/D66; alarm bounds mean the exit report always returns) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=27
+JVM PASS HELLO-DENVER-WORKLOAD-PASS
+  (reader arm wall=0s; child alarm=90s, parent alarm=120s inside jvmprobe)
+== diagnostic arm (fires only on a non-RUN outcome): class-load trace names the failing resolution step (elapsed=9s)
+  skipped: the run already READABLE-RUN
+== console window: old death absent + census (elapsed=9s)
+-- console window: fault line:
+<none>
+-- console window: kill line:
+<none>
+-- console window: evidence lines:
+[err] s3 nr=102 -38 a=0x6fffffffffc4,0x2f,0x2f
+[err] s3 nr=104 -38 a=0x6fffffffffc2,0x6ffffffffe58,0x6ffffffffe58
+[err] s3 nr=106 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s3 nr=105 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s3 nr=110 -38 a=0x50409d,0x50409c,0x4
+[err] s3 nr=102 -38 a=0x6fffffffffc4,0x2f,0x2f
+[err] s3 nr=104 -38 a=0x6fffffffffc2,0x6ffffffffe28,0x6ffffffffe28
+[err] s3 nr=106 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s3 nr=105 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s3 nr=110 -38 a=0x50409d,0x50409c,0x4
+[nosys] nr=38
+[err] s3 nr=38 -38 a=0x0,0x6fffffffbb80,0x6fffffffbba0
+[err] s4 nr=38 -38 a=0x0,0x6fffffffbb80,0x6fffffffbba0
+[nosys] nr=324
+[err] s4 nr=324 -38 a=0x8,0x0,0x300a7278
+[err] s4 nr=324 -38 a=0x10,0x0,0x0
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xfe7
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xfeb
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xfef
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xff6
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0x1000
+[err] s5 nr=324 -38 a=0x8,0x0,0x60000002c7a8
+[ring] tkill by s5; its last syscalls:
+[ring] nr=200 a=0x4,0x22,0x300a6b28 -> 0 rip=0x30044415
+[ring] nr=13 a=0x22,0x6000014fb940,0x0 -> 0 rip=0x3005f26c
+-- console window: syscall census (trace-err buckets, top counts):
+     13 nr=89
+     10 nr=9
+      5 nr=98
+      5 nr=97
+      5 nr=324
+      5 nr=302
+      4 nr=72
+      4 nr=2
+      3 nr=38
+      3 nr=3
+      3 nr=102
+      2 nr=8
+      2 nr=5
+      2 nr=4
+      2 nr=229
+== verdict (elapsed=9s)
+READABLE-RUN: Hello.class loaded from /work through the classpath, ran to completion (exit=0, arm wall=0s), marker captured: class loading + GC threads + classpath file paths + println all served by kernel d4acb339 unchanged
+  the phase-3 ladder's second rung is GREEN - zero new kernel code
+RESULT PASS
+== wall clock: seconds=9 (t0=1794670214 end=1794670223)

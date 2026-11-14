@@ -720,4 +720,51 @@ from the boot's own slots (the akuma-private `SET_BOX_STACK`=324) — one number
 B1 banner-parse bug, and the guest command surface (no cat/sleep/command) forcing the reader-arm
 redesign mid-gate.
 
-NEXT GATE: PHASE-3-JAVAWORKLOAD
+### PHASE-3-JAVAWORKLOAD — 2026-11-14, session 17 (~15:12–15:45 UTC) — GREEN (the second rung: a compiled class runs — `Hello.class` loads from `/work` through the classpath, prints its marker, exit 0; the class is hand-assembled bytecode because no javac exists anywhere in the lineage)
+
+**What we did.** The re-rank's new order was "run a compiled class (`Hello.class`) — the first java
+rung that exercises class loading, GC threads, and the file/classpath paths `-version` never
+touches." Zero kernel code moved again: the gate runs the proven GREEN kernel d4acb339 unchanged
+(uname identity requires it, every older hash rejected); only the disk differs. The hard part was
+the class file itself, and the research artifact (D64) started from a measured negative: there is
+**no javac anywhere** — host and guest are both JRE-only (bin listings), JEP 330 source mode dies
+in VM init, and the R9 search (`javac|.class|bytecode` across `docs/archive/`, `docs/reference/`,
+`shanghai/`, `taoxichuan/`) found no bytecode precedent — the taoxichuan JVM attempt stopped at
+image building. So `denver/probes/mkhello.py` hand-assembles Java 21 (major 65) bytecode, and
+because the HOST cannot run-verify (its own JRE SIGSEGVs at the vsyscall address
+`ffffffffff600800` during VM init — L1's "best kernel first" datum measured on this Linux host
+too), `denver/probes/verifyclass.py` verifies structurally: a strict read-back parser. That
+verifier earned its keep immediately — it caught two builder bugs before any boot (ldc's operand
+written two bytes wide; the Code attribute emitted without its max_stack/max_locals/code_length
+header) — and then missed the one that mattered, because **builder and checker shared the same
+blind spot: both omitted the `interfaces_count` u2** between `super_class` and `fields_count`
+(JVMS 4.1). Attempt 1 (`PHASE-3-JAVAWORKLOAD.attempt1-classformat.log`) was still the loop
+working: the pipe arm returned in <1 s with HotSpot's own precise diagnosis — `ClassFormatError:
+Field "<init>" in class Hello has illegal signature "()V"` — the JVM had read fields_count as
+interfaces_count (0) and parsed the methods table as fields. **The receiver is the verifier:**
+the guest's HotSpot names a class-file defect to the exact field in under a second, so the cost
+of a RED is one 11 s boot, not a debugging session; fix, fresh restage (`denver-hello.img` =
+copy of `denver-jdk.img` + `/work/Hello.class` via debugfs — jvmprobe reached `/bin` the same
+way; the proven image is never modified in place), attempt 2: **READABLE-RUN — `JVM INFO exit=0
+signal=0 bytes=27` + `JVM PASS HELLO-DENVER-WORKLOAD-PASS`, wall 9 s** — class loading from a
+classpath directory, HotSpot verification, main invocation, and println all served by d4acb339
+unchanged. The console window re-measured the suspect list under a real workload: readlink(89)
+EINVAL ×13 with the same growing-buffer shape (0xfe7→0x1000), setitimer(38), membarrier(324)
+double-fire, getrlimit(97), prlimit64(302) — **all non-fatal; no death was named, so they stay
+hypotheses, not gaps** (lesson 1's discipline). The class-load trace (diagnostic arm, fired on
+attempt 1) showed the CDS archive serving shared classes — "source: shared objects file" — so
+the mapped archive works too.
+
+**What it forced.** The ladder climbs by workload, not by kernel guesswork: the only way the
+unranked suspects become rows is a workload that reaches them, so the next rung is a bigger
+compiled workload — exceptions (throw/catch/unwind), user threads (clone/join), file I/O through
+the java.io path, allocation pressure through G1 — staged through the same debugfs shape and
+read through the same pipe arm. G5 stays deferred per its own recorded condition ("revisit with
+a perf pass if the ladder stalls on speed" — it is climbing). New gate: **PHASE-3-JAVACLASSLIB**.
+
+**Interventions:** four, in RESULT.md — the host-JRE verifier was impossible (vsyscall death in
+VM init), two builder bugs caught by the read-back verifier pre-boot, the interfaces_count
+omission that BOTH tools shared (named by the guest JVM, not by either host tool), and the gate
+logs' gitignore needing `git add -f` (prior logs tracked the same way).
+
+NEXT GATE: PHASE-3-JAVACLASSLIB

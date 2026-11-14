@@ -63,3 +63,11 @@ capability gap with evidence, and rank by the workload's own order, never by tas
   Lesson: the rank is a snapshot of the workload's init order *at a kernel policy state* — a
   closed gap re-orders the queue, so every pass ends by re-reading the table against fresh
   evidence, not by taking its own NEXT line forward blindly.
+- 2026-11-14 (PHASE-3-JAVAWORKLOAD GREEN): the ladder climbs by **workload reach**, not kernel
+  guesswork — the suspects (readlink 89, setitimer 38, membarrier 324, getrlimit 97, prlimit64
+  302) re-measured non-fatal under a real class load, so they stay hypotheses; they only become
+  rows when a workload that REACHES them dies naming one. The next rung was therefore chosen for
+  reach, not for kernel convenience: exceptions, user threads, java.io file I/O, G1 allocation
+  pressure (G12). Also measured: there is no javac anywhere in this lineage (both JREs; JEP 330
+  dead in VM init; no bytecode precedent in archive/reference/shanghai/taoxichuan) — the
+  workload instrument itself had to be built (`mkhello.py`, hand-assembled bytecode).

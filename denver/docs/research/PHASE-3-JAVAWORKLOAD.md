@@ -94,8 +94,36 @@ None from this session — the phase's one experiment (DENVER_COMPACT=1) was pro
 the JAVAVERSION session; the per-phase rule allows exactly one.
 
 ## Machine notes carried (L2)
-
 ONE VM at a time (free the slot first, stop at the end, its own pid only); wait for an
 ssh round trip, never a log marker; grep console-derived text -a-tolerantly; invoke as
 `sh <file>` (no `#!` exec on Akuma). Capture: `sh denver/probe-javaworkload.sh 2>&1 |
 tee denver/gates/PHASE-3-JAVAWORKLOAD.log`.
+
+## Record (2026-11-14, session 17) — D67 attempt 1: the builder and the checker shared the blind spot
+
+Attempt 1 (`denver/gates/PHASE-3-JAVAWORKLOAD.attempt1-classformat.log`, wall 11 s): `JVM RED
+Error: LinkageError … reason="java.lang.ClassFormatError: Field "<init>" in class Hello has
+illegal signature "()V""`. HotSpot read `fields_count` as `interfaces_count` — the u2 between
+`super_class` and `fields_count` (JVMS 4.1) that BOTH `mkhello.py` and `verifyclass.py` omitted
+— and parsed the methods table as fields. The structural verifier passed a structurally invalid
+file: **a checker that shares the author's assumptions verifies nothing**. It still caught two
+earlier bugs pre-boot (ldc operand width; Code attribute missing max_stack/max_locals/
+code_length), so the read-back practice earns its keep — its limit is exactly the author's own
+blind spot. Prediction (b) was wrong in an instructive way: the death was named not by the
+console census or readlink(89) but by the JVM's own ClassFormatError, delivered by the pipe arm
+in <1 s — **the receiver is the verifier**; a class-file defect costs one 11 s boot, not a
+debugging session.
+
+## Record — D68 attempt 2: GREEN, and the suspects re-measured non-fatal under a real workload
+
+`denver/gates/PHASE-3-JAVAWORKLOAD.log` (wall 9 s): `JVM INFO exit=0 signal=0 bytes=27` +
+`JVM PASS HELLO-DENVER-WORKLOAD-PASS` — class loading from a classpath directory, HotSpot
+verification, main invocation, println; kernel d4acb339 unchanged, zero new kernel code. The
+console window re-measured the suspect list under real class loading: readlink(89) EINVAL ×13
+(same growing-buffer shape, still non-fatal — libjli's exec-name resolution evidently falls
+back cleanly), setitimer(38), membarrier(324) double-fire, getrlimit(97), prlimit64(302) — all
+present, none fatal, **still hypotheses, not gaps**. Attempt 1's diagnostic arm (class+load
+trace) showed the CDS archive serving shared classes ("source: shared objects file") — the
+mapped archive works on this kernel. Next rung: PHASE-3-JAVACLASSLIB — a compiled workload
+exercising exceptions, user threads, file I/O, and allocation pressure; the only way the
+unranked suspects become rows is a workload that reaches them.
