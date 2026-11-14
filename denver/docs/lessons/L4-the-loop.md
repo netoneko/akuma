@@ -64,3 +64,10 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   diagnostics-first rule paid for itself twice in one session: the console census re-ranked the
   curriculum for free (no rebuild needed to learn `getcpu` was unreached), and the two appended
   boots named the movement raw-SIGSEGV/no-report before any fix could be guessed at.
+- 2026-11-13 (PHASE-2-VDSO GREEN): the kernel-change cycle, second measurement, this time
+  stamped (the FAULTNAME debt fully paid): edit→build ≈ 20–23 s with two features; boot→ssh
+  round trip ≈ 3–5 s (new floor, WX/FAULTNAME was ≈ 8 s); full gate run ≈ 7 s; research →
+  GREEN ≈ 80 min including one RED design verdict, two bisect boots, and a probe-constant
+  fix. The RED bought the design outright: the bisects (one variable per boot, verdicts in
+  the research artifact's table) split map vs auxv-pair in two boots where three hypotheses
+  of armchair analysis had argued — the stall protocol's cheapest possible resolution.

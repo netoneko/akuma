@@ -318,3 +318,41 @@ heading line in denver/docs/LOOP_LOG.md to the "### PHASE-2-FAULTNAME - ..." for
 the driver; no content and no answer or suggestion was given to the agent. Earlier operator
 fix the same day: the driver now puts /usr/local/rust/bin on PATH (cargo missing had read as a
 red cargo test; commit 8a64dec6).
+
+### PHASE-2-VDSO — GREEN (closes G3; 2026-11-13 23:37–2026-11-14 00:5x UTC, session 6)
+
+Gate capture: `denver/gates/PHASE-2-VDSO.log` (run 3 = the record: rig `0.1.0-e0924225-denver`,
+boot line names both pages, tokioprobe `RESULT PASS`, `RWX PASS rw_to_rx=42`,
+`AUXV PASS AT_SYSINFO_EHDR=18446744073699061760`, java arm no-signal/no-vsyscall-fetch at the
+new `Too small maximum heap` blocker, `RESULT PASS`, wall clock 7 s). Research artifact:
+`denver/docs/research/PHASE-2-VDSO.md` (Findings 0+1, D21–D26).
+
+Run ledger: run 1 RED (tokioprobe SEGV — Finding 1's design verdict: the first build disclosed
+a non-ELF page as `AT_SYSINFO_EHDR` and musl's static-PIE startup parses the value unchecked);
+two un-judged bisect boots (map-only PASS → map innocent; pair-only SEGV, console-named
+`cr2=0xffffffffff600020` → pair guilty); run 2 RESULT PASS with a false SURPRISE line (the
+intervention below); run 3 clean PASS (the record). The RED-1/RED-2 verdicts are data, not
+failure: they are what forced Finding 1 and the valid-ELF disclosure.
+
+INTERVENTION: the probe's expected-value constant for the auxv arm (`AUXV PASS
+AT_SYSINFO_EHDR=<decimal>`) was computed by hand and was wrong — run 2 was already RESULT PASS
+yet printed a false SURPRISE line against a correct kernel. Fixed with a python-checked
+constant (`0xffffffffff5ff000` = 18446744073699061760) and re-run; `tee` overwrote run 2's
+capture, recorded here rather than hidden. Same defect class as PHASE-2-FAULTNAME's run 1 (a
+probe whose interpretation can lie is a broken probe), new limb: the *constant*, not the parse.
+Lesson echo filed on L2 Record.
+
+Machine facts recorded (not fought): boot→ssh round trip ≈ 3–5 s this session (faster than the
+≈8 s FAULTNAME floor — the box was idle); the kernel-change cycle measured end-to-end (L4):
+build ≈ 20–23 s, full gate run ≈ 7 s, research→GREEN ≈ 80 min including the RED and bisects.
+R6 surface re-verified post-Finding-1: default `denver` 23.0 s, default `taoxichuan` 22.6 s,
+gate kernel 20.3 s; clippy clean on the delta (one pre-existing `akuma-exec`
+`stable_features` warning, untouched by this pass). The two bisect boots used a
+`feature = "never"` cfg hold-out and a temporary `#[allow(dead_code)]`; both reverted before
+the GREEN build (the committed tree carries neither).
+
+Kernel delta (≈70 LOC, all behind `vsyscall`, off by default): `crates/akuma-ring3-amd64`
+(gated `AT_SYSINFO_EHDR = 33` + pin test), `crates/akuma-tokio-kernel-amd64` (the `vsyscall`
+module: legacy stub page + valid exports-free vDSO ELF, `map_vsyscall()` at boot, gated auxv
+pair), relay manifests ×3. Zero changes to `akuma-syscalls-*`, no middleware, no hook tables
+(R7).

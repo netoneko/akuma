@@ -243,3 +243,89 @@ exists: `AUXV RED AT_SYSINFO_EHDR missing` from phase 1, expected to flip to `AU
 the java arm past the vsyscall death).
 
 NEXT GATE: PHASE-2-VDSO
+
+### PHASE-2-VDSO — 2026-11-13 23:37–2026-11-14 00:5x UTC, session 6 (goose, glm-5.3-flash) — GREEN (closes G3; the ladder jumps two rungs)
+
+**Goal:** close G3 (`denver/docs/REQUIREMENTS.md`): the workload must get past the
+guest-proven death at the legacy vsyscall page (`rip=cr2=0xffffffffff600800 code=0x14`,
+FAULTNAME) — the row's two candidates: a minimal vDSO + `AT_SYSINFO_EHDR` vs. serving the
+fallback address.
+
+**What the research forced (R1, `denver/docs/research/PHASE-2-VDSO.md`, Findings 0+1,
+D21–D26):** first-hand disassembly over recall, both directions.
+
+- *Finding 0 (HotSpot):* the metal `hs_err` frame (`V [libjvm.so+0xaef710]`,
+  `RAX=RIP=0xffffffffff600800`) disassembles to **HotSpot hardcoding the legacy getcpu slot
+  as a sign-extended imm32 and calling it as a C function** — the auxv key plays no role on
+  that path, and a full objdump sweep of the JRE finds exactly one vsyscall reference. The
+  transition line's "vDSO + auxv would unblock the workload" assumption was wrong before any
+  code: the *page* is the consumer interface.
+- *Finding 1 (musl — paid for with a RED):* the first build disclosed the non-ELF stub page
+  as `AT_SYSINFO_EHDR`; **tokioprobe — no JVM anywhere — died with SIGSEGV**. The bisect
+  (one variable per boot): map-only → PASS; pair-only → SEGV, named by the console
+  (`cr2=0xffffffffff600020`, rip inside tokioprobe's own text). Disassembly of the fault site
+  (`tokioprobe+0x179dd3`): **musl's static-PIE startup seeks key 33 by name (`cmp $0x21`)
+  and parses the value as an ELF with no magic check** — e_phoff/e_phnum, phdrs for
+  PT_LOAD/PT_DYNAMIC, dynamic entries to DT_NULL, then symbol tables or a clean
+  "no vDSO symbols" return. Finding 0's "musl ignores the key" stands corrected in the
+  artifact; the correction is itself the session's lesson about recall vs. binaries.
+- *The ship shape (D21/D22-revised):* two pages, two honest objects. The legacy stubs
+  (`gettimeofday/time/getcpu`, `mov nr,%eax; syscall; ret`, `0xcc` padding) mapped user-RX at
+  the ABI-fixed `0xffffffffff600000` — HotSpot's interface, not disclosed; a **valid,
+  exports-free vDSO ELF** one page below (`DT_NULL`-only dynamic array — every resolver's
+  lookup cleanly returns "not found" and falls back to syscalls) disclosed as
+  `AT_SYSINFO_EHDR` at `0xffffffffff5ff000`. One boot-time `paging::map_page` call into the
+  kernel root per page; the PML4[511] widen (present-entry widening in
+  `akuma-pte-amd64::step_down`) keeps kernel-image siblings `U=0`-guarded; `copy_kernel_half`
+  hands both to every task — zero per-exec cost (D23). Feature `vsyscall`, off by default,
+  relayed 1:1 down the five-crate chain (D25, the wx-relaxed shape); rig = `denver-vdso` +
+  `vm-vdso.spec` (D15's second-rig rule); probe = `denver/probe-vdso.sh` (D26, faultname
+  shape).
+
+**Commands and outcomes** (capture: `denver/gates/PHASE-2-VDSO.log`; three judged runs —
+run 1 RED on the tokioprobe sanity arm (Finding 1's design defect), the bisect boots
+un-judged diagnostics, runs 2–3 GREEN with run 3 as the record):
+
+| step | command | outcome |
+|---|---|---|
+| research first (R1) | `denver/docs/research/PHASE-2-VDSO.md` | Findings 0+1, D21–D26; precedents: the metal loader's 14-entry auxv + its own `hs_err` (absence precedent), `read_syscall_cost.c`/`AKUMA_SYSCALLS_TOKIO_DEP_ANALYSIS.md` ("no vDSO on Akuma" named as a class), `rg -il 'vsyscall\|vdso\|AT_SYSINFO'` over shanghai/taoxichuan/tokio-kernel → zero hits (nothing to copy), the attempt doc's blocker 2 (same gap, arch-dependent interface) |
+| kernel delta | `vsyscall` feature, ≈70 LOC | default builds byte-unchanged (denver 23.0 s, taoxichuan 22.6 s re-verified post-Finding-1); clippy clean on the delta (one pre-existing `akuma-exec` warning, untouched) |
+| gate run 1 | `sh denver/probe-vdso.sh …` | **RED**: tokioprobe SEGV — the auxv disclosure was a non-ELF page; Finding 1 born |
+| bisects (un-judged, one variable per boot) | map-only / pair-only | map innocent; pair guilty — the console named the death (G6's capability paying for itself immediately) |
+| gate run 2 | same | **RESULT PASS** but a false SURPRISE line: the probe's hand-computed expected constant disagreed with the kernel's correct value (INTERVENTION) |
+| gate run 3 (record) | same, constant fixed | **RESULT PASS** clean: rig `0.1.0-e0924225-denver` (WX hash absent), boot line names both pages, tokioprobe `RESULT PASS`, `RWX PASS rw_to_rx=42`, `AUXV PASS AT_SYSINFO_EHDR=18446744073699061760`, java arm **no signal, no vsyscall fetch** — `exit=1` at a NEW blocker: `Too small maximum heap` |
+
+**Verdict.** Gate GREEN — G3 closed. The ladder moved **two** rungs: past the vsyscall death
+*and* past the getcpu exit point, exactly as D24 predicted (census: `nr=168` answered ENOSYS
+through the stub and init advanced; HotSpot's `cmp $-1` wrapper reads the pre-zeroed cpu → 0).
+The first fatal is now **G7** (new row): `sysinfo(2)` unserved → `_SC_PHYS_PAGES` fails →
+HotSpot heap sizing exits cleanly with `Too small maximum heap` — the smallest arm in the
+table (one syscall, validate + `copy_to_user` + the guest's real RAM). `epoll_pwait2` (229)
+and `getrandom` (309) ENOSYS'd later and are held as suspects (G8), not gaps. Re-rank
+recorded openly in REQUIREMENTS: **G7 (PHASE-2-MEMINFO) → G2 → G4 → G5** (G5's real-vDSO
+payoff now has a live consumer: musl's own resolver).
+
+**Interventions:** one. The probe's expected-value constant for the auxv arm was computed by
+hand and was wrong; run 2 — already RESULT PASS — printed a false SURPRISE line against a
+correct kernel. Same defect class as FAULTNAME's run-1 (a probe whose interpretation can lie
+is a broken probe), different limb: this time it was the *constant*, not the parse. Fixed
+with a python-checked constant and re-run; `tee` overwrote run 2's capture, recorded here
+rather than hidden. The two bisect boots are not interventions — they are the stall
+protocol's one-variable-per-verdict discipline working as designed. No operator
+intervention was needed; autonomy holds.
+
+**Cycle measured** (L4, kernel-change cycle, named): edit→build ≈ 20–23 s
+(`--features wx-relaxed,vsyscall`); build→stage→boot→first verdict ≈ 3–5 s (boot→ssh round
+trip is now the floor, faster than WX/FAULTNAME's ≈ 8 s); full gate run ≈ 7 s; research→GREEN
+including the RED-1 design verdict, two bisect boots, and the constant fix ≈ 80 min wall
+clock (stamps in the capture; the bisect boots' verdicts live in this entry and RESULT.md).
+
+**Wall clock:** ~80 min (23:37–00:5x UTC). **Token spend:** the driver log
+(`/tmp/denver-autoresearch.log`) is the ledger.
+
+**Transition.** Zero kernel interventions; the next pass is the ladder's smallest arm:
+`NEXT GATE: PHASE-2-MEMINFO` (G7 — serve `sysinfo(2)` behind the default-off feature map so
+`_SC_PHYS_PAGES` answers and HotSpot sizes the heap; expected movement: the JVM past heap
+sizing toward whatever G8's suspects actually do).
+
+NEXT GATE: PHASE-2-MEMINFO

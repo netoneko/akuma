@@ -87,3 +87,13 @@ the RED phase proves the probes themselves before any pass claims anything.
   constant and printed a false SURPRISE — one-line fix, re-run, judged on run 2, the
   overwrite of run 1 recorded in RESULT/LOOP_LOG rather than hidden. A probe that has passed
   can still be lying; check its *interpretation* lines, not just its verdict.
+- 2026-11-13 (PHASE-2-VDSO GREEN): the same rule, third limb — the *constant*. Run 2 was
+  already RESULT PASS while its expected-value constant for the auxv arm disagreed with the
+  kernel's correct disclosure (`AT_SYSINFO_EHDR=18446744073699061760` = `0xffffffffff5ff000`,
+  python-verified; the hand-computed decimal in the probe was wrong) and printed a false
+  SURPRISE. Rule upgraded: **every ABI constant that lands in a grep pattern is data —
+  derive it with a tool (`python3`/`printf '%d'`), never by hand**, and prefer grepping the
+  hex with the value converted once, where a wrong digit is visible. The FAULTNAME debt
+  paid again in the same session: the RED-2 console window named the bisect verdict's death
+  (`cr2=0xffffffffff600020`) first-hand — capture-with-attribution did the research work of
+  a whole diagnostic pass.
