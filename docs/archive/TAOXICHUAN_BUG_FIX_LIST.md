@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 125
-- **Docs contributing at least one fix:** 39
+- **Total distinct fixes counted:** 132
+- **Docs contributing at least one fix:** 43
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 37 | 29.6% | 6 |
-| Exec & ELF Loading | 12 | 9.6% | 5 |
-| Processes, Fork, Threads & Scheduling | 35 | 28.0% | 10 |
-| Memory & Copy-on-Write | 16 | 12.8% | 6 |
-| Signals | 5 | 4.0% | 2 |
-| Networking & Readiness | 4 | 3.2% | 2 |
-| SMP, Time & Boot | 12 | 9.6% | 6 |
-| Build & Integration | 4 | 3.2% | 2 |
-| **Total** | **125** | **100.0%** | **39** |
+| Syscalls, Files & Pipes | 40 | 30.3% | 7 |
+| Exec & ELF Loading | 12 | 9.1% | 5 |
+| Processes, Fork, Threads & Scheduling | 35 | 26.5% | 10 |
+| Memory & Copy-on-Write | 18 | 13.6% | 7 |
+| Signals | 6 | 4.5% | 3 |
+| Networking & Readiness | 4 | 3.0% | 2 |
+| SMP, Time & Boot | 12 | 9.1% | 6 |
+| Build & Integration | 5 | 3.8% | 3 |
+| **Total** | **132** | **100.0%** | **43** |
 
 **Largest single write-ups:**
 
@@ -41,7 +41,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ---
 
-## Syscalls, Files & Pipes (37 fixes, 6 docs)
+## Syscalls, Files & Pipes (40 fixes, 7 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `SyscallFrame` listed r10/r8/r9 in push order where the stack holds r9/r8/r10, so arguments 4 and 6 were swapped for every call with more than three; latent until the first `mmap`, where musl's flags arrived in the offset slot and `echo` ran out of memory (stage 3)
@@ -91,6 +91,11 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ### docs/archive/SYSCALL_CONSTANT_AUDIT_2026_10_30.md
 - `akuma-ring3-amd64::nr` (Taoxichuan's dispatch table) had `GETPID = 38` and `SENDFILE = 39`, both off by one, so `setitimer` (38) answered the caller's pid while it still had a `GETPID` arm; the third x86_64 table is gone
+
+### docs/archive/DENVER_BRANCH_FIXES.md
+- the legacy-syscall fold rewrote the caller's six argument registers in its saved frame and the stub popped them back into ring 3, so `stat` (folded to `fstatat`) returned musl's saved `buf` in `r8` zeroed and its copy-out stored to NULL, killing `java -version`; the arguments as they arrived go back after the call (`fold-regpreserve`)
+- `sysinfo(2)` was served nowhere, so musl's `sysconf(_SC_PHYS_PAGES)` failed and HotSpot sized a too-small heap and exited with `Too small maximum heap`; one arm translating glue's answer (`sysinfo`)
+- the `shell` syscall set (`getrlimit`/`prlimit64`, `getpgid`, `getppid`, `getrusage`, `clock_getres`, `membarrier`) was never enabled on the denver build, so the JDK HTTP server died in `IOUtil.fdLimit` and interactive ssh spun; one feature relay line (`9ec07523`)
 
 ## Exec & ELF Loading (12 fixes, 5 docs)
 
@@ -173,7 +178,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 - `exit_group`'s `kill_siblings` decided from the state word whether a sibling was executing, but on the hooked scheduler the `ON_CPU` gate says that: a thread another core had just picked, and the leader (marked terminated unconditionally by `task_exit_code`), kept running in user mode while the reap freed its frames, so killtree faulted in about half the smp=4 boots; `x86_hold_off_cpu` holds the gate, and a thread that cannot be held is asked to end itself
 - The amd64 fault report read `CR2` live after `lazy::fill`, which can park on a disk read, so it (and `grow_user_stack`) could act on another task's fault address; it is captured once at entry
 
-## Memory & Copy-on-Write (16 fixes, 6 docs)
+## Memory & Copy-on-Write (18 fixes, 7 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `mmap` demanded `fd == -1` for `MAP_ANONYMOUS` while libakuma passes 0 (Linux ignores it), so sshd's first allocation answered `ENODEV` (stage 4)
@@ -203,7 +208,11 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md
 - a lazy file mapping pinned its inode until the process was reaped, never at `munmap`, so a file mapped, unmapped and then unlinked kept its blocks for the life of the process (16 MB held after `unlink` in `unlinkspace`); a pin covers the VA range its records live in, `release_pages` trims it, and it goes when no unfilled record or shared record in it names the inode
 
-## Signals (5 fixes, 2 docs)
+### docs/archive/DENVER_BRANCH_FIXES.md
+- the W^X policy refused RWX and RW to R+X, which is HotSpot's code cache, so the JVM died at init; `wx-relaxed` answers Allow (`RWX PASS rw_to_rx=42`)
+- no legacy vsyscall page and no vDSO, so `libjvm.so`'s hardcoded `0xffffffffff600800` took a ring-3 instruction fault (`code=0x14`); the page is mapped user-RX from the kernel root and an exports-free vDSO ELF is disclosed as `AT_SYSINFO_EHDR` (`vsyscall`)
+
+## Signals (6 fixes, 3 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `rt_sigaction`/`rt_sigprocmask` were no-ops that never wrote `oldact`/`oldset`, so std's child-side `signal(SIGPIPE, SIG_DFL)` read stack garbage as `SIG_ERR` and `Command::spawn` failed with a stale errno ("File exists")
@@ -213,6 +222,9 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 - the dispatcher restored the user-`rsp` stash at exit, which undid the `rsp` a signal frame or `rt_sigreturn` set, so a handler ran on the interrupted stack and never reached the restorer
 - `kill`/`tkill` on the caller itself set an interrupt flag that made its next glue call answer `EINTR` without running, so musl's `raise` lost its mask restore; the flag is consumed at every return to ring 3
 - exit never reparented children, so a killed tree's grandchildren stayed registered under a dead parent and `killtree` exhausted the 48-slot ring by its third round
+
+### docs/archive/DENVER_BRANCH_FIXES.md
+- a synchronous ring-3 fault killed the task instead of reaching its SIGSEGV handler, so `javac`'s JIT-compiled implicit null checks died; `faultsig.rs` ports the metal's fault-to-signal path and restores from the ucontext at `rt_sigreturn` (`fault-signal`, `bdf3a2b2`)
 
 ## Networking & Readiness (4 fixes, 2 docs)
 
@@ -250,7 +262,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK.md
 - `bkl::enter` could be reached with interrupts on, so a timer tick during a ticket wait took a second ticket behind the suspended outer one and every core queued behind them (about 1 amd64 boot in 8, 0 of 100 after); it masks interrupts for the whole wait (`BklCpu::irq_save`/`irq_restore`)
 
-## Build & Integration (4 fixes, 2 docs)
+## Build & Integration (5 fixes, 3 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `akuma-boot-amd64` assembled its AT&T `boot.s` unconditionally, which broke the Mac's pre-commit hook (`att_syntax` is x86-only); the `global_asm!` is gated on `target_arch = "x86_64"` (stage 1)
@@ -259,6 +271,9 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ### docs/archive/TAOXICHUAN_B21_AARCH64.md
 - `1dfa9efa` left `mm_dump_for` without its `#[cfg(feature = "trace-err")]` when `fault_code_dump` was inserted between them, so an amd64 build without `trace-err` did not compile
+
+### docs/archive/DENVER_BRANCH_FIXES.md
+- the committed `sigprobe` binary stored its `rax = 99` edit at ucontext byte 152 (the `rcx` slot) while the source says 144, so the gate reported a `rt_sigreturn` bug the kernel did not have (a register dump of all 17 saved `gregs` showed it restoring exactly what was written); rebuilt from source, PASS on the same kernel
 
 ---
 
@@ -287,6 +302,7 @@ These are fixes to code every kernel runs, so the Akuma list counts them:
 - `UNLINKED_FILE_SPACE_RETURNED_LATE.md`: ext2 finished a deferred free only at the next unlink or create, so a file unlinked
   while mapped or open kept its blocks after the last `munmap`/`close`, and after exit.
 - `SIGNAL_FATAL_DEFAULT_LINUX.md`: glue's `signal_is_fatal_default` dropped `SIGUSR1`/`SIGUSR2` and the real-time signals, `sys_tkill` ran the default action on its caller, and the dispatch prologue answered `rt_sigprocmask` with `EINTR`; found bringing signals to aarch64 Taoxichuan (B21 A5.7).
+- `DENVER_BRANCH_FIXES.md`: `akuma-exec`'s `/proc/<pid>/maps` leaf walk called an amd64-only method and broke the AArch64 build.
 - `ETXTBSY_TEXT_BUSY.md`: a file being executed could be rewritten (the tokio kernels' signed-exec proof died with SIGSEGV); the fix is in ext2 and glue's `openat`, so every kernel has it.
 
 

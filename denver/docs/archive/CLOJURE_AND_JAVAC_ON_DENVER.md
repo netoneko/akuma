@@ -75,10 +75,10 @@ thread pool, which keeps the JVM alive for 60 s after the script ends unless the
   (hit counter 1, then 2; `/json` returns `{"server":"clojure 1.12.0","hits":2,"java":"21.0.13.0.3","cpus":4}`), and a
   real pty ssh session works **without** `--shell-arg +m` (prompt, `ls`, `javac -version`, `java ...` all run), because
   `getpgid` is served now.
-- `sigprobe` (`denver/probes/sigprobe.c`) reports **FAIL**: the SIGSEGV is delivered correctly (si_signo 11,
-  si_code 1, si_addr 0, rip delta 3, cr2 0) and the saved-`rip` edit takes effect, but the saved-`rax` edit does
-  not (returns 0, want 99). Unexplained; a likely cause, **not confirmed**, is `rt_sigreturn` overwriting `rax` with
-  its own return value. javac and Clojure do not need it; other JVM trap paths might.
+- **(Resolved 2026-11-14, evening)** `sigprobe` reported **FAIL** (the `rax` edit did not survive `rt_sigreturn`). It was
+  the probe, not the kernel: the committed binary stored the edit at ucontext byte 152 (the `rcx` slot) while its source says
+  144. Rebuilt from source it prints `SIGPROBE PASS` on the same kernel build, and a dump of all 17 saved registers showed
+  the kernel restoring exactly what the program wrote (`docs/archive/DENVER_BRANCH_FIXES.md`, item 7).
 - Not run: the `-Xint` arm, the R6 check that the default build's `.text` is unchanged, repeat runs.
 - No LOOP_LOG entry or gate log for PHASE-3-JAVAC; the loop never reached them.
 - The guest clock is host uptime-based, so the guest's own `time` output is wrong (it printed 0.73 s for a 2 s run).

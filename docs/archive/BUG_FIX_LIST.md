@@ -13,8 +13,8 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1592
-- **Docs contributing at least one fix:** 474
+- **Total distinct fixes counted:** 1593
+- **Docs contributing at least one fix:** 475
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -31,10 +31,10 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | VFS & Filesystem | 149 | 9.4% | 48 |
 | Boot & Drivers | 144 | 9.0% | 25 |
 | Signals & Exceptions | 50 | 3.1% | 20 |
-| Misc / Cross-cutting | 69 | 4.3% | 25 |
+| Misc / Cross-cutting | 70 | 4.4% | 26 |
 | Console & Terminal | 63 | 4.0% | 22 |
 | Containers | 57 | 3.6% | 12 |
-| **Total** | **1592** | **100.0%** | **474** |
+| **Total** | **1593** | **100.0%** | **475** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -2301,7 +2301,7 @@ aren't recorded anywhere else.)
 - Every group `SIGKILL` cost 2 s on AArch64: each thread's `kill_thread_group` grace-waited for siblings in their own grace waits; `claim_group_exit` makes the first caller do the teardown
 - amd64 `kill` could return `EINTR` without sending (glue's dispatch prologue), orphaning a child; signal senders are exempt from the gate
 
-## Misc / Cross-cutting (69 fixes, 25 docs)
+## Misc / Cross-cutting (70 fixes, 26 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2443,6 +2443,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AKUMA_FEATURE_AUDIT.md
 - amd64 mounted the shared `/proc` without `sc-sysv-ipc` forwarded to `akuma-vfs-glue`, so it had the SysV queue syscalls but no `/proc/sysvipc/msg`
+
+### docs/archive/DENVER_BRANCH_FIXES.md
+- `akuma-exec`'s `/proc/<pid>/maps` leaf walk (moved there by the denver loop) called `UserAddressSpace::for_each_user_leaf`, which only the amd64 struct has, so the default AArch64 kernel failed with E0599; the walk is gated to x86_64 with an AArch64 stub returning region rows only
 
 ## Console & Terminal (63 fixes, 22 docs)
 

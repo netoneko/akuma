@@ -26,7 +26,7 @@ its limits are in the last two sections. One run, one model, one box: an experim
 | Scala 2.13.14: `scalac` compiles a program in the guest and the class runs | works (operator-run, one run, ~3 s compile) |
 | Groovy 4.0.22 runs a script in the guest | works (operator-run, one run) |
 | Standard HTTP server (JDK `com.sun.net.httpserver`, from Clojure) serving a response to a client outside the guest | works (operator-run, one run): HTTP 200 from the Mac. First blocked by `getrlimit`/`prlimit64` not served; fixed by enabling the `shell` syscall set (one-line feature relay, 88 B) |
-| `sigprobe` (does `rt_sigreturn` restore an edited `rax`?) | FAIL, unexplained; javac and Clojure do not need it |
+| `sigprobe` (does `rt_sigreturn` restore an edited `rax`?) | FAIL as committed; **a stale probe binary, PASS rebuilt from source (corrected 2026-11-14, see `docs/archive/DENVER_BRANCH_FIXES.md`)** |
 
 ## Where it ran: Akuma all the way down
 
@@ -174,7 +174,7 @@ not read as more than it is:
 - Token totals are sums of `accumulated_*` columns in goose's `sessions.db` for sessions named `denver-*`; the z.ai
   weekly figure (187.1M) also includes other goose use that week.
 - javac and Clojure are operator runs, one each; the loop's PHASE-3-JAVAC gate and `LOOP_LOG` entry do not exist.
-- `sigprobe` FAIL and the unrun `-Xint` arm are open. Interventions are an incomplete count.
+- The `sigprobe` FAIL was a stale probe binary, not a kernel bug (corrected 2026-11-14); the unrun `-Xint` arm is open. Interventions are an incomplete count.
 
 ## Ideas for the future
 

@@ -1,6 +1,5 @@
 {
   "untyped_address_params": {
-    "crates/akuma-kernel-amd64": 39,
     "crates/akuma-alloc": 3,
     "crates/akuma-boot-aarch64": 1,
     "crates/akuma-boot-amd64": 15,
@@ -11,7 +10,7 @@
     "crates/akuma-entry": 4,
     "crates/akuma-exceptions": 15,
     "crates/akuma-exceptions-forensics": 1,
-    "crates/akuma-exec": 49,
+    "crates/akuma-exec": 50,
     "crates/akuma-exec-core": 3,
     "crates/akuma-fdt": 2,
     "crates/akuma-firecracker": 1,
@@ -22,9 +21,10 @@
     "crates/akuma-gic": 2,
     "crates/akuma-hda": 1,
     "crates/akuma-kernel": 1,
+    "crates/akuma-kernel-amd64": 33,
     "crates/akuma-kernel-glue": 6,
     "crates/akuma-kvm-abi": 3,
-    "crates/akuma-kvm-amd64": 13,
+    "crates/akuma-kvm-amd64": 8,
     "crates/akuma-lapic-amd64": 1,
     "crates/akuma-machine-facts": 3,
     "crates/akuma-mem-policy": 1,
@@ -52,11 +52,12 @@
     "crates/akuma-syscalls-mem": 10,
     "crates/akuma-threading": 8,
     "crates/akuma-tokio-kernel-aarch64": 16,
-    "crates/akuma-tokio-kernel-amd64": 37,
+    "crates/akuma-tokio-kernel-amd64": 39,
     "crates/akuma-tokio-kernel-core": 38,
     "crates/akuma-user-layout": 8,
     "crates/akuma-user-space": 1,
     "crates/akuma-user-walk": 8,
+    "crates/akuma-usermode-amd64": 1,
     "crates/akuma-virtio": 5,
     "crates/akuma-xhci": 11
   }
