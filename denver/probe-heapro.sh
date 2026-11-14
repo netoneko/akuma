@@ -151,6 +151,10 @@ case "$mma" in
     *"MMARMS PASS commit-RW"*"MMARMS PASS commit-RX call=42"*) ;;
     *) verdict "RESULT FAIL: the code-cache commit shape did not hold" 1 ;;
 esac
+case "$mma" in
+    *"MMARMS PASS rwx call=42"*) ;;
+    *) verdict "RESULT FAIL: no MMARMS PASS rwx call=42 - the W+X mmap was not writable (exec_write_bit did not take; the old kernel REDs rwx-mapped-perm-w)" 1 ;;
+esac
 redline=$(printf '%s\n' "$mma" | grep 'MMARMS RED\|CRASH' | grep -v 'rwx-mapped-perm')
 [ -n "$redline" ] && { echo "$redline"; verdict "RESULT FAIL: mmaparms printed a RED/CRASH line outside the recorded rwx-policy divergence" 1; }
 

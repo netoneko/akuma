@@ -483,8 +483,15 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
     let (write, exec) = if prot & u64::from(PROT_EXEC) == 0 {
         (prot & u64::from(PROT_WRITE) != 0, false)
     } else {
-        // W^X refused W+X above, so an executable mapping is never writable.
-        (false, true)
+        // An executable mapping's write bit: under the strict policy `check_prot`
+        // refused every `W|X` call above, so this arm only carries RX requests and
+        // the write bit is `false`. Under `wx-relaxed` the call was allowed - the
+        // kernel has chosen to permit JITs - and silently stripping `W` here made
+        // every `RWX` mmap read-only-executable: the first write into it faulted
+        // `code=0x7` on an unmarked page and killed the JVM's mapping-heavy init
+        // (PHASE-2-HEAPRO; the recorded "mmap W+X dropped W" divergence was this
+        // gap, not a policy). Honor the request, as `mprotect` already does.
+        (akuma_syscalls_mem::wx::exec_write_bit(prot), true)
     };
     // `PROT_NONE`: a record nothing fills (or, eagerly, a page without the user bit).
     #[allow(clippy::verbose_bit_mask)] // PROT_NONE is spelled as the bits it lacks

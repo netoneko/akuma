@@ -84,6 +84,25 @@ pub const fn check_page(prot: u64, page_written: bool) -> Wx {
     }
 }
 
+/// The write bit an executable `mmap` mapping gets.
+///
+/// Under the strict policy this question is unreachable for `W|X` requests —
+/// [`check_prot`] refused the call — so the answer is `false` (the request had
+/// no write bit, or never got here). Under `wx-relaxed` the kernel has chosen
+/// to permit JITs, and honoring the request's write bit is what Linux answers:
+/// silently stripping `W` made every `RWX` mmap read-only-executable, and the
+/// first write into it died at `code=0x7` on an unmarked page — the JVM's
+/// RWX mappings were exactly that death (PHASE-2-HEAPRO; the recorded
+/// "mmap W+X dropped W" divergence was this gap, not a policy).
+#[must_use]
+pub const fn exec_write_bit(prot: u64) -> bool {
+    if RELAXED {
+        prot & PROT_WRITE != 0
+    } else {
+        false
+    }
+}
+
 /// Check a whole range for `mprotect`: the call, then each page's written bit (stopping at the first
 /// offender, so the caller changes nothing when this is not `Allow`).
 #[must_use]
@@ -176,5 +195,13 @@ mod relaxed_tests {
         let v = check_range(PROT_READ | PROT_EXEC, |i| { asked += 1; i == 2 }, 100);
         assert_eq!(v, Wx::Allow);
         assert_eq!(asked, 0);
+    }
+
+    #[test]
+    fn the_relaxed_exec_mapping_honors_the_write_bit() {
+        // The policy's whole point: a kernel that permits JITs answers Linux's
+        // shape - the request's own write bit, not a silent strip.
+        assert!(exec_write_bit(PROT_WRITE | PROT_EXEC));
+        assert!(!exec_write_bit(PROT_READ | PROT_EXEC));
     }
 }
