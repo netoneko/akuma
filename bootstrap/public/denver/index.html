@@ -108,10 +108,20 @@ _/                                    \_     Beans System Debauchery:
                   ::::---#@%%*</pre>
   <div>
   <p class="lead"><a href="https://github.com/netoneko/akuma">Akuma</a> is a bare-metal kernel written in Rust. It is Linux ABI-compatible, runs on aarch64 and amd64, and is released under the BSD 2-clause license.</p>
-  <p>Akuma runs on real hardware with real drivers. It serves as a basis for other, more experimental kernels that look at what open-weight models can do in open-source kernel development and systems programming. Akuma is a self-hosting kernel, which means it builds itself: rustc and cargo run on Akuma and compile Akuma's own source. <a href="https://akuma.sh/self-hosting-rust-kernel">Hear the talk</a> (rust.org.il).</p>
+  <p>Akuma runs on real hardware with real drivers. It serves as a basis for other, more experimental kernels that look at what open-weight models can do in open-source kernel development and systems programming. Akuma is a self-hosting kernel, which means it builds itself: rustc and cargo run on Akuma and compile Akuma's own source. <a href="https://akuma.sh/self-hosting-rust-kernel">Here is the talk</a> presented at <a href="https://">rust.org.il</a> in November 2026.</p>
   <p>It is built from small host-tested crates, and amd64 includes its own hypervisor, which is what Denver runs on.</p>
   </div>
   </div>
+</section>
+
+<section class="slide">
+  <span class="tag">screencast</span>
+  <h2>A Clojure web server on Denver</h2>
+  <div class="term" role="img" aria-label="Animated terminal: build the kernel, build the image, boot under QEMU, curl the Clojure server">
+    <div class="bar"><span id="ttitle">overlays/denver</span><span><button id="replay" type="button">replay</button></span></div>
+    <pre id="screen" aria-hidden="true"></pre>
+  </div>
+  <noscript><p>Enable JavaScript to play the screencast. The commands are in the next section.</p></noscript>
 </section>
 
 <section class="slide">
@@ -130,7 +140,7 @@ akuma-tokio-kernel      the platform: tokio on bare metal
 
 <section class="slide">
   <span class="tag">the result</span>
-  <h2>What it did, measured</h2>
+  <h2>Stats</h2>
   <div class="stats">
     <div><b>~24 h</b><span>bare kernel to a JVM</span></div>
     <div><b>JDK 21</b><span>HotSpot, G1, C1 + C2</span></div>
@@ -185,15 +195,6 @@ akuma-tokio-kernel      the platform: tokio on bare metal
   </div>
 </section>
 
-<section class="slide">
-  <span class="tag">screencast</span>
-  <h2>A Clojure web server on Denver</h2>
-  <div class="term" role="img" aria-label="Animated terminal: build the kernel, build the image, boot under QEMU, curl the Clojure server">
-    <div class="bar"><span id="ttitle">overlays/denver</span><span><button id="replay" type="button">replay</button></span></div>
-    <pre id="screen" aria-hidden="true"></pre>
-  </div>
-  <noscript><p>Enable JavaScript to play the screencast. The commands are in the next section.</p></noscript>
-</section>
 
 <section class="slide">
   <span class="tag">try it</span>
