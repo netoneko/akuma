@@ -19,3 +19,4 @@ session denver-PHASE-2-HEAPRO wall=65 in=16.5M out=108k final_ctx=188k cache_rea
 session denver-PHASE-2-MEMINFO wall=22 in=2.8M out=58k final_ctx=105k cache_read=96% tools=70
 session denver-PHASE-2-GETCPU wall=48 in=10.7M out=97k final_ctx=159k cache_read=98% tools=142
 session denver-PHASE-2-GETCPU wall=62 in=12.3M out=119k final_ctx=184k cache_read=98% tools=271
+session denver-PHASE-3-JAVAVERSION wall=23 in=3.5M out=51k final_ctx=100k cache_read=97% tools=63
