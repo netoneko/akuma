@@ -681,4 +681,43 @@ per HEAPRO/MEMINFO's standing record. G2 **closed**; G5 stays deferred; phase 3 
 **Interventions:** three, in RESULT.md — the stale R6 snapshot (stash compare needed),
 the marker diagnostic build, and the twice-misread `nr=309` console line.
 
-NEXT GATE: PHASE-3-JAVAVERSION
+### PHASE-3-JAVAVERSION — 2026-11-14, session 16 (~14:52–15:35 UTC) — GREEN (the capture gate: `java -version` is GREEN — exit 0, full banner, <1 s; the "capture problem" was the capture probe's own 2 ms poller)
+
+**What we did.** Phase 2 ended java-free; phase 3 opened on the standing HEAPRO→MEMINFO→GETCPU
+record: java's fate = "no fault, no exit, output unrecoverable over ssh" for three consecutive
+gates, so the capture gate ran BEFORE any java-side or kernel-side guess (diagnostics-before-bugs,
+fourth application). Zero kernel code moved: the gate runs the proven GREEN getcpu rig (d4acb339)
+unchanged — uname identity REQUIRES it, every older hash rejected — and the research artifact
+(D59) started from a confound nobody had tested: every "sshd starved" window had dispatched java
+through the `name` arm, whose parent polls `/proc/<pid>/maps` at 500 Hz. Attempt 1 (new
+`denver/probe-javaversion.sh`: channel baselines, poller-less foreground dispatch, 300 s window,
+poke ladder) killed the hang story in 45 s — the session RETURNED — and fell over twice honestly:
+the guest image carries no `cat`/`sleep`/`command` (recovery answers 127; B1 never ran, its parse
+took the ssh banner line), and the verdict chain printed READABLE-HANG from the same page that
+showed the session had returned. Attempt 1's log is preserved as
+`PHASE-3-JAVAVERSION.attempt1-misattributed-hang.log`; the probe's verdict chain now reads the
+session-return datum. Attempt 2 stopped inventing capture shapes and used the reader that was in
+the image all along: `jvmprobe java` (the phase-1 workload arm) — fork, pipe over stdout/stderr,
+parent BLOCKS on read. Whole gate wall 9 s.
+
+**What decision it forced (D63).** `JVM INFO exit=0 signal=0 bytes=179` +
+`JVM PASS openjdk version "21.0.13.0.3" 2026-10-24` — **`java -version` is GREEN on the denver
+kernel**, the phase-3 ladder's first rung. The three-gate "no fault, no exit, output
+unrecoverable" record is corrected: it was the capture instrumentation's own 2 ms poller
+(D59-H1), and the file-recovery path was dead twice over (no guest-side reader exists at all).
+The capture problem closes by instrument choice, not kernel work; the mmdbg hatch (D51) and the
+console-dev shape (D61) stay recorded, unranked, unused. New order: the next java rung is a
+REAL workload — PHASE-3-JAVAWORKLOAD, run a compiled class (`Hello.class`) on the guest. The
+census rides as suspects, all passed by `-version` itself: setitimer(38), membarrier(324),
+getrlimit(97), prlimit64(302) ENOSYS'd and java printed its banner anyway;
+`readlink`(89) EINVAL ×12 (0xfe7→0x1000 buffers, `/proc/self/exe`-shaped) is the one new named
+suspect — HotSpot reaches for its own path and the kernel answers EINVAL; non-fatal for
+`-version`, a candidate blocker for anything that resolves paths. G5 stays deferred. The D58
+two-table lesson got concrete: `[nosys] nr=324` fires both from java (x86_64 membarrier) and
+from the boot's own slots (the akuma-private `SET_BOX_STACK`=324) — one number, two tables.
+
+**Interventions:** three, in RESULT.md — attempt 1's misattributed verdict (log preserved), the
+B1 banner-parse bug, and the guest command surface (no cat/sleep/command) forcing the reader-arm
+redesign mid-gate.
+
+NEXT GATE: PHASE-3-JAVAWORKLOAD

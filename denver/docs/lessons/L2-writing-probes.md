@@ -163,3 +163,18 @@ the RED phase proves the probes themselves before any pass claims anything.
   passed the gate (wall 83 s). Console corollary recorded in Do 7: the gate's own
   `[nosys] nr=309 -38` line was misattributed to sshd noise twice — attribution before
   dismissal.
+- 2026-11-14 (PHASE-3-JAVAVERSION GREEN): **the instrument can BE the failure.** Three
+  gates recorded "java: no fault, no exit, output unrecoverable over ssh" — all three
+  windows dispatched java through the `name` arm, whose parent polls `/proc/<pid>/maps`
+  at 500 Hz (D59). Remove the poller and the same session returns in <45 s; read through
+  the pipe arm (`jvmprobe java`: fork, dup2 pipe over stdout/stderr, parent BLOCKS on
+  read) and the answer comes back in <1 s with the exit report and every raw line.
+  `java -version` was green the whole time. Rules paid and filed: (1) java gates read
+  through the pipe arm — the 2 ms name-arm poller is retired from every future java
+  capture; (2) check the guest's command surface before designing file-based recovery —
+  the image has no `cat`/`sleep`/`command` on the ssh PATH (recovery answered 127 three
+  times before anyone looked); (3) parse captures by CONTENT, never by position — B1's
+  `head -1` took the ssh client's own `[ssh] connecting …` banner and the baseline
+  silently never ran (parse-time verdicts-lie, third sighting; attempt 1 also printed
+  READABLE-HANG from the same page that showed the session had returned — its log is
+  preserved as `PHASE-3-JAVAVERSION.attempt1-misattributed-hang.log`).

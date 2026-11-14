@@ -651,3 +651,39 @@ the gate's moment is a datum, not noise.
 - INTERVENTION: the gate's own `[nosys] nr=309` + `[err] s4 nr=309 -38` console lines were
   attributed to sshd noise twice, costing the diagnosis several turns — per-line
   attribution (which nr, which slot, which moment) before "noise" is now the rule.
+
+## Gate PHASE-3-JAVAVERSION — 2026-11-14 ~14:52–15:35 UTC, session 16 (goose, glm-5.3-flash) — GREEN (the capture gate: `java -version` GREEN, exit 0, banner, <1 s; the standing "capture problem" was the probe's own poller)
+
+| record | what | outcome |
+|---|---|---|
+| research artifact | `denver/docs/research/PHASE-3-JAVAVERSION.md` (D59 the confound, D60 verdict rules, D61 console-dev shape — retired not-needed, D62 attempt-1 rig facts, D63 the gate capture) | written before any run (R1); D59 tested before any kernel work |
+| code | NONE — the capture gate runs the proven GREEN getcpu rig (d4acb339) unchanged; uname identity requires it, older hashes rejected | the R6-perfect gate: nothing to compare |
+| probe | `denver/probe-javaversion.sh` (getcpu shape: stamps, free-the-slot, stop at end) — B0/B1 channel baselines, reader arm `jvmprobe java` (pipe capture, zero polling), file+pokes fallback, console window + census, `/dev/console` probe | attempt 1 found two rig facts + two probe bugs; attempt 2 read the datum in 9 s wall |
+| attempt 1 | preserved: `denver/gates/PHASE-3-JAVAVERSION.attempt1-misattributed-hang.log` | poller-less foreground arm RETURNED in <45 s (hang story dead, H1/H4 confirmed); no `cat`/`sleep`/`command` on the guest (recovery = 127); verdict mislabelled READABLE-HANG |
+| gate | `sh denver/probe-javaversion.sh` → `denver/gates/PHASE-3-JAVAVERSION.log` | **RESULT PASS**, wall 9 s, guest d4acb339: `JVM INFO exit=0 signal=0 bytes=179` + `JVM PASS openjdk version "21.0.13.0.3" 2026-10-24` — tokioprobe sane, GETCPU PASS cpu=1 (feature set rides), no fault in the window, old rip absent |
+
+**The correction (standing record, HEAPRO→MEMINFO→GETCPU):** "no fault, no exit, output
+unrecoverable over ssh" was the `name` arm's own 2 ms `/proc/<pid>/maps` poller — remove the
+poller and the same session ends in under a minute; use the pipe arm and the answer comes back
+in under a second. java's fate was never captured because the capture instrument was the thing
+starving the guest. L2 carries the rule; REQUIREMENTS carries the corrected ranking.
+
+**Suspects recorded, unranked** (all passed by `-version` itself): setitimer(38), membarrier(324),
+getrlimit(97), prlimit64(302) ENOSYS'd mid-run — banner printed anyway; **`readlink`(89) EINVAL
+×12** (buffers growing 0xfe7→0x1000, `/proc/self/exe`-shaped) — the one new named suspect for
+path-resolving workloads; `[nosys] nr=324` double-fire (java's membarrier vs the akuma-private
+SET_BOX_STACK=324) is the D58 two-table lesson made concrete. G5 stays deferred.
+
+**Interventions (3):**
+- INTERVENTION: attempt 1's verdict chain printed READABLE-HANG while the same capture showed the
+  arm's session had RETURNED in <45 s — the label was wrong, the datum was right there; the log
+  is preserved (`PHASE-3-JAVAVERSION.attempt1-misattributed-hang.log`) and the probe now keys the
+  hang verdict off `kill -0` session-liveness explicitly. Parse-time verdicts-lie, third sighting.
+- INTERVENTION: B1 never ran — `head -1` of the ssh capture took the client's own
+  `[ssh] connecting to …` banner, not the guest's `command -v sleep` answer (which is empty: the
+  image has no sleep, no cat, no command applets on the ssh PATH). Parse captures by CONTENT
+  (`grep -v connecting`), never by position.
+- INTERVENTION: the guest command surface (no cat/sleep/command) invalidated every /tmp-file
+  recovery design mid-gate — the reader had to become `jvmprobe java` (pipe capture, the phase-1
+  arm), not a new file protocol. Known guest applet list (`/bin/busybox ls` from L2) was
+  incomplete: check the command surface BEFORE designing file-based recovery.

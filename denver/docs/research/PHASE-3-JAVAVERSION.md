@@ -114,9 +114,69 @@ read big captures — this session's gate log alone is ~15k chars re-sent on eve
 call. Measure: the next sessions' `input_tokens`/final-ctx rows in COST_LEDGER.md versus
 the phase-2 rows (98–99% cache reads ⇒ cost tracks final ctx × calls).
 
-## D61 (recorded, not built): the console-side capture shape
+## D62 (attempt 1, 2026-11-14 ~14:55 UTC): the poller-less arm ends the 300 s hang story in 45 s — and two rig facts fell out
 
-If verdict case 4 lands, the next diagnostic pass adds `/dev/console` behind
+`sh denver/probe-javaversion.sh` attempt 1 (`denver/gates/PHASE-3-JAVAVERSION.attempt1-misattributed-hang.log`):
+
+- **The foreground file arm RETURNED within 45 s** (the poke loop's `kill -0` failed after
+  poke 1 — the ssh session was already over). Three gates of "no fault, no exit in ≥90 s"
+  and a poller-less dispatch ends in under a minute: H1 confirmed in the strong direction,
+  H4 confirmed too — **java exits, and quickly**.
+- **The guest command surface is near-empty**: `cat /tmp/java-out.log` answers `127`
+  (command not found), `command -v sleep` prints nothing — there is no `cat`, no `sleep`,
+  no `command` on the ssh PATH (`/bin/busybox ls` was already known, L2). Every
+  /tmp-file-based recovery ever attempted was doomed twice: once by the starvation
+  (H1's poller), and again because **no guest-side reader exists to send the file back**.
+- Two probe bugs found by their own output (the parse-time verdicts-lie rule, again):
+  the B1 parse took `head -1` of a capture whose first line is the ssh client's own
+  `[ssh] connecting to …` banner (B1 never actually ran), and the verdict chain printed
+  `READABLE-HANG` while the session-return datum on the same page said the arm had
+  RETURNED — attempt 1's PASS label is misattributed; the log is preserved as evidence
+  and the canonical gate log is attempt 2's.
+
+## D63 (attempt 2 = the gate capture): the reader arm was in the image all along — `jvmprobe java`
+
+Attempt 1 eliminated the two designed paths (files unreadable guest-side; foreground
+sessions can return but carry no payload). The third shape is composition, not invention:
+`arm_java` (`denver/probes/jvmprobe.c`, the phase-1 workload arm) forks java, dup2's a
+**pipe** over its stdout/stderr, and the parent BLOCKS on `read` — no polling, no
+starvation, no guest-side file reader needed; the output comes back over ssh with an
+exit report (`JVM INFO exit= signal= bytes=`) and every raw line (`JVM-INFO raw:`).
+
+Result (`denver/gates/PHASE-3-JAVAVERSION.log`, guest d4acb339 unchanged, whole gate wall 9 s):
+
+```
+JVM INFO exit=0 signal=0 bytes=179
+JVM-INFO raw: OpenJDK Runtime Environment (build 21.0.13.0.3+1-alpine-r0)
+JVM-INFO raw: OpenJDK 64-Bit Server VM (build 21.0.13.0.3+1-alpine-r0, mixed mode, sharing)
+JVM PASS openjdk version "21.0.13.0.3" 2026-10-24
+```
+
+**`java -version` is GREEN on the denver kernel**: exit 0, full banner, reader-arm wall
+<1 s. The phase-3 capture problem is closed by instrument choice, not kernel code —
+D59's H1 held: the `name` arm's 2 ms maps-poller was the entire "no fault, no exit,
+output unrecoverable" standing record of HEAPRO→MEMINFO→GETCPU. The correction is
+recorded in REQUIREMENTS (re-rank) and L2.
+
+The window's census, read with x86_64 names (the D58 discipline; phase-1's census names
+already agree): setitimer(38) ENOSYS ×3, membarrier(324) ENOSYS ×5, getrlimit(97) ×5,
+prlimit64(302) ×5 — **all passed by a JVM that then printed its version and exited 0**;
+`readlink`(89) EINVAL ×12 (buffer growing 0xfe7→0x1000 — `/proc/self/exe`-shaped, served
+as a non-symlink or missing: **recorded suspect, non-fatal for `-version`**); `tkill`
+(200, sig 34) with the dying-slot syscall ring = HotSpot's normal shutdown posts.
+`[nosys] nr=324` also fires from the boot's own slots (s3/s4) — the akuma-private
+`SET_BOX_STACK`=324 collision with x86_64 membarrier is the D58 two-table lesson made
+concrete, recorded not judged. `/dev/console` write answers rc=1 (D61 stays unbuilt —
+case 4 never fired). B1 was skipped (no sleep in the image — datum recorded); H2/H3 die
+with H1 anyway: the channel answered pokes and the full session in the same minute.
+
+**D61 disposition: retired as not-needed.** The console-side capture shape stays in this
+artifact as the precedent map (the `/dev/tty` fd shape) for any future channel-death,
+but no gate needs it today.
+
+## D61 (recorded, not built — now retired as not-needed, see D63): the console-side capture shape
+
+If verdict case 4 had landed, the next diagnostic pass would add `/dev/console` behind
 `console-dev` (off by default, R6): open arm returns a fd whose `write` prints the user
 bytes to the kernel console (the `/dev/tty` fd shape; glue prints already reach it), so
 `java -version > /dev/console 2>&1; echo JAVARC=$? >> /dev/console` reads the datum out
