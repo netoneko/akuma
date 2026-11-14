@@ -63,6 +63,12 @@ getcpu = ["akuma-jvm-kernel/getcpu"]
 # Off by default (R6); the gate kernel is the denver-getcpu feature set plus this
 # (rig: denver-faultsig).
 fault-signal = ["akuma-jvm-kernel/fault-signal"]
+# The `shell` syscall set (`akuma-runtime-tokio::shell`), relayed 1:1: getpgid/setpgid/getsid/setsid (job control,
+# interactive ssh without `--shell-arg +m`), getrlimit/prlimit64 (the JDK's NIO selector reads the fd limit: the
+# standard HTTP server needs it), getppid, getrusage, clock_getres, membarrier, times, the id getters. Taoxichuan
+# enables it by default; denver builds `--no-default-features` and never had it. Off by default (R6); the gate kernel
+# is the denver-faultsig feature set plus this (rig: denver-shell).
+shell = ["akuma-jvm-kernel/shell"]
 
 [[bin]]
 name = "denver"
