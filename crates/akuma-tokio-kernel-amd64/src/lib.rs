@@ -1782,6 +1782,21 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
             akuma_syscalls_abi::Syscall::Sysinfo.to_aarch64(),
             &[fr.arg1(), 0, 0, 0, 0, 0],
         ),
+        // `getcpu` (PHASE-2-GETCPU, G2): musl's `sched_getcpu` and any direct
+        // caller performs nr 168 and fell to the default ENOSYS (`GETCPU RED
+        // ENOSYS` since PHASE-1; the vsyscall stub's -38 only *softened* the
+        // JVM's own path — HotSpot's wrapper tolerates it and reads the
+        // pre-zeroed cpu). The taoxichuan aarch64 precedent's shape: the
+        // caller's core from `ring3::cpu_index()`, node 0, the copies out in
+        // glue, `EFAULT` on failure; the decision is pure
+        // (`akuma-syscalls-linux::sched`). Off by default (R6); PHASE-2-GETCPU
+        // research artifact, D55.
+        #[cfg(feature = "getcpu")]
+        akuma_syscalls_abi::x86_64::GETCPU => akuma_syscalls_glue::sched::sys_getcpu(
+            fr.arg1(),
+            fr.arg2(),
+            ring3::cpu_index() as u32,
+        ),
         ring3::nr::PAUSE => akuma_syscalls_glue::sys_pause(),
         akuma_syscalls_abi::x86_64::RT_SIGRETURN => child::sigreturn_arm(fr),
         // musl's realloc on an mmapped chunk (`akuma_tokio_kernel_core::mm`'s).

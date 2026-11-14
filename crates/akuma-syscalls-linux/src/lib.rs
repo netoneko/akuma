@@ -79,6 +79,7 @@ pub mod io;
 pub mod net;
 pub mod nr;
 pub mod proc;
+pub mod sched;
 pub mod signal;
 pub mod stat;
 pub mod time;

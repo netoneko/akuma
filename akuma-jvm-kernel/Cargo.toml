@@ -50,6 +50,9 @@ lazy-release-sweep = ["akuma-tokio-kernel/lazy-release-sweep"]
 # sysinfo(2) through glue (PHASE-2-MEMINFO, G7): the arm lives in the amd64 half;
 # HotSpot's heap sizing (musl sysconf → sysinfo, nr 99) died on its ENOSYS.
 sysinfo = ["akuma-tokio-kernel/sysinfo"]
+# getcpu(2) through glue (PHASE-2-GETCPU, G2): the arm lives in the amd64 half;
+# musl's sched_getcpu (raw nr 168) must not ENOSYS for direct callers.
+getcpu = ["akuma-tokio-kernel/getcpu"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

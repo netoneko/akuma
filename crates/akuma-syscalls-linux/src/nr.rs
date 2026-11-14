@@ -222,6 +222,7 @@ pub const MEMBARRIER: u64 = 283;
 /// `memfd_create(name, flags)`: an anonymous file (served as an unlinked temp file).
 pub const MEMFD_CREATE: u64 = 279;
 pub const RT_SIGTIMEDWAIT: u64 = 137;
+pub const GETCPU: u64 = 168;
 pub const PRCTL: u64 = 167;
 pub const GETRUSAGE: u64 = 165;
 pub const MSYNC: u64 = 227;

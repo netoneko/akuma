@@ -144,6 +144,7 @@ pub mod chardev;
 pub mod pty;
 pub mod poll;
 pub mod proc;
+pub mod sched;
 /// The end of a process: `finish_process`, the same sequence on both kernels.
 pub mod exit;
 /// `execve`'s argument reading and its process-side commit, shared by the x86 kernels.
