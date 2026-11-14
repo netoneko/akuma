@@ -186,4 +186,118 @@ not read as more than it is:
 ## Background
 
 - `denver/docs/archive/CLOJURE_AND_JAVAC_ON_DENVER.md`, `denver/docs/EFFICIENCY.md`, `denver/RESULT.md`,
-  `denver/docs/LOOP_LOG.md`, `denver/docs/OPERATOR_LOG.md` (branch `denver-operator-notes`)
+  `denver/docs/LOOP_LOG.md`, the appendix below (the operator log)
+
+## Appendix: operator log (2026-11-14)
+
+The human's notes, kept apart from `LOOP_LOG.md` and `RESULT.md` while the loop ran (the driver's bookkeeping checks
+those files, so free text there could trip it). Merged here from the branch `denver-operator-notes`
+(`denver/docs/OPERATOR_LOG.md`, last commit `a548bc65`) when the loop stopped; the entries are as written then, plus
+the night entry at the end. The loop never read or wrote them.
+
+### 2026-11-14 — a real Java program runs on the denver kernel
+
+The operator logged in to the denver guest over ssh from a Mac and ran Java by hand. In the operator's
+words: "oh my god it does work", and they asked for it to be noted here that they are **extremely
+impressed**. The run is the work of the GLM-5.3-Flash loop (about 17 gate sessions on 2026-11-13/14),
+directed and not edited by the operator.
+
+What was checked by hand, outside the loop's own probes:
+
+- `java -cp /work Hello` and `java -version` run in the KVM guest (kernel `d4acb339`, OpenJDK
+  21.0.13, mixed mode, G1, 4 CPUs, 3 GiB, JIT on: `-XX:+PrintCompilation` shows C1 compilations).
+- `Logo.java` (the Akuma banner, `userspace/sshd/src/banner.txt`) compiled with a real `javac --release 21`
+  on the Mac, then run on the Mac and on denver: **identical output, 801 bytes, same sha256**.
+- An interactive ssh session (pty) into the guest from the Mac works, with `sshd` built from `main`
+  (`9f623b22`) and the shell started with job control off.
+
+Findings made while doing it (kernel gaps for the loop; the operator has not edited kernel code):
+
+1. **`getpgid` (nr 121) answers ENOSYS.** (*Resolved the same evening: see the last entry below; the `shell` feature serves it.*) busybox `ash` on a tty spins on it at startup, so an interactive
+   shell hangs with no prompt. Workaround: `sshd --shell-arg +m`. The sshd version was not the cause.
+2. **The guest's uptime is the host's uptime.** Guest `/proc/uptime` read 49569.79 s while the box's was
+   49584.46 s, for a guest booted minutes earlier. The same clock explains `sysinfo uptime=31956`
+   in PHASE-2-MEMINFO (read there as "the clock hook IS registered"), and probably sshd's idle watch
+   declaring a live session silent for 49278 s (not proven; workaround `--idle-timeout-secs 0`).
+3. **javac crashes.** The runtime carries `jdk.compiler` (69 modules incl. jshell, javadoc); only the
+   `bin/javac` launcher is missing. `java -m jdk.compiler/com.sun.tools.javac.Main -version` dies:
+   `[Fault] ring3 PageFault rip=0x6000118848e3 cr2=0x8 code=0x4 -- task killed`, instruction bytes
+   `44 8b 52 08` = `mov 0x8(%rdx),%r10d` with `rdx=0`, inside an `rwxs` mapping (the JIT code cache).
+   Hypothesis, unverified: an implicit null check in JIT code. HotSpot expects the kernel to deliver
+   SIGSEGV to its handler and turns it into a NullPointerException; the kernel killed the task instead.
+
+Operator setup, for reproducing (no secrets here): separate image copy `/root/denver/w/denver-dev.img`
+(not the loop's `denver-hello.img`), `vm-dev.spec` (port 2248, `epoch=` set to the current time, which
+the guest uses as its initial date), `sshd` from `main`. One guest at a time: the loop's gate scripts
+begin with `echo stop > /dev/kvm0` and will drop an operator session.
+
+### 2026-11-14 (later) — operator correction given to the loop
+
+While the loop was in PHASE-3-JAVACLASSLIB writing a bytecode assembler (`mkworkload.py`, 520 lines),
+the operator gave it a correction through the session brief (`scripts/kvm/goose/denver-01-autoresearch.md`,
+section "Operator correction (2026-11-14)"; committed by the driver with the next docs commit). This is a
+deliberate operator hint to the experiment and is recorded here so the run stays honest about it:
+
+- Content: it could have escalated for a real `javac`; the operator checked and staged real-javac sources and
+  classes at `/root/denver/javac/` on the box (not in git); suggested using them instead of the assembler.
+- The measurement behind it: real-javac `Workload`/`Worker` run on kernel `d4acb339` (unchanged) with
+  `java -Xms64m -Xmx1536m -cp /work Workload`: exit 0, all markers incl. `WORKLOAD-ALL-PASS`. The loop's own
+  first JAVACLASSLIB gate (assembler classes) failed with `exit=1`, markers missing. One run each; the
+  inference "the classes, not the kernel" is not proven.
+- Takes effect from the NEXT session's brief; the running session had already built its brief.
+
+### 2026-11-14 (later still) — priority change given to the loop: javac is its last stretch
+
+The operator decided the rest of the project will be finished with other models and that a working `javac`
+inside the guest is realistically the GLM loop's last stretch, with about one session of weekly quota left.
+The session brief (`scripts/kvm/goose/denver-01-autoresearch.md`, section "Operator priority change") now tells
+the next session to: add the javac crash to `REQUIREMENTS.md` itself and rank it first; close JAVACLASSLIB with
+the staged real-javac classes if they pass; spend its remaining quota on the javac gate; write records early.
+It carries the fault record and the unverified hypothesis (implicit null checks need SIGSEGV delivery to a user
+handler), and a definition of done: javac compiles a `.java` in the guest and the class it makes runs.
+Like the earlier correction, this is a deliberate operator hint and is recorded here so the run stays honest;
+takes effect from the next session's brief.
+
+### 2026-11-14 (evening) — operator verification: javac works inside the guest
+
+The GLM loop hit the z.ai quota (5h 100%, week 95%) at ~call 155 of the javac session, before running its own
+javac gate. Its committed `faultsig` port (`bdf3a2b2`) plus its uncommitted edits (checkpointed by the operator as
+`38f16b2d`) were built and run by the operator; this is an operator measurement, not a loop gate.
+
+- Kernel: `cargo build -p denver --target x86_64-unknown-none --release` with the getcpu feature set plus
+  `fault-signal` (box, `/usr/local/rust/bin`), 27 s; uname `0.1.0-38f16b2d-denver`. Rig: `/root/denver/w/denver-faultsig`
+  + `denver-faultsig.img` (copy of the dev image + `sigprobe`, `Workload.java`, `Logo.java`).
+- `java -m jdk.compiler/com.sun.tools.javac.Main -version` -> `javac 21.0.13.0.3`, rc 0, no `[Fault]` line
+  (before: SIGSEGV at rip 0x6000118848e3, task killed).
+- javac compiled `Logo.java` in the guest (1842-byte class, same size as the Mac's); the guest-compiled class
+  prints output IDENTICAL to the Mac run. javac compiled `Workload.java`; the produced class ran with every marker
+  incl. `WORKLOAD-ALL-PASS`. Console fault count for the whole session: 0.
+- `sigprobe` reports FAIL: the SIGSEGV is delivered (si_signo=11, si_code=1, si_addr=0, ripdelta=3, cr2=0) and the
+  saved-`rip` edit takes effect, but the saved-`rax` edit does not (`rc=0`, want 99). Unexplained; likely
+  `rt_sigreturn` overwriting rax with its own return value. javac and the workloads do not depend on it, but other
+  JVM paths might. The agent was editing `faultsig.rs`/`child.rs` when cut off.
+- Not done: no loop gate/LOOP_LOG entry for PHASE-3-JAVAC, `-Xint` arm not run, default-build `.text` unchanged
+  check (R6) not run, no repeat runs (one run each).
+
+### 2026-11-14 (night) — the shell feature, an HTTP server, three more languages
+
+Operator-run, one run each unless noted. Detail and numbers are in the sections above and in
+`CLOJURE_AND_JAVAC_ON_DENVER.md`; this entry is the timeline.
+
+- Clojure 1.12.0, Scala 2.13.14 (`scalac` in the guest) and Groovy 4.0.22 ran on the fault-signal kernel (zero `[Fault]`
+  lines). Jars from Maven Central, SHA-1 checked; sources committed under `denver/samples/`.
+- Env files and wrappers (`denver/samples/env/`: `java.env`, `clojure.env`, `scala.env`, `groovy.env`, wrappers `javac`
+  `clojure` `scalac` `scala` `groovy`, `install.sh`) so the tools run by name from a bare ssh session; the JDK's launchers
+  are symlinked into `/usr/local/bin`.
+- The standard JDK HTTP server (from Clojure) first died with `Function not implemented` (`IOUtil.fdLimit`); the console's
+  `[nosys]` numbers 97 (`getrlimit`) and 302 (`prlimit64`) pointed at `akuma_runtime_tokio::shell`, a syscall set
+  taoxichuan enables by default and denver never did. Fix: `shell = ["akuma-jvm-kernel/shell"]` in `denver/Cargo.toml`
+  (`9ec07523`), +88 B. The server then answered `HTTP/1.1 200 OK` to a `curl` from the Mac (VM spec `forward=8080:8080`),
+  and a real pty ssh session ran **without** `--shell-arg +m` (finding 1 above is resolved). Lesson:
+  `denver/docs/lessons/L5-find-the-feature-flag.md`.
+- Process slip, recorded: the `9ec07523` commit touched a Cargo manifest but was made with `--no-verify`, so the
+  pre-commit hook (clippy, tests, secret scan) did not run on it.
+- State at the quota cutoff: the weekly z.ai window was 95% used, resetting Thursday 2026-11-19 16:36 UTC (18:36 IST). The
+  operator will finish the remaining paperwork (`LOOP_LOG` entry for PHASE-3-JAVAC, lessons) with the loop after the reset.
+  Still open: `sigprobe` `rax` edit (unexplained), the loop's own javac gate, the R6 default-`.text` check for the
+  fault-signal and shell kernels.

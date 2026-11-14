@@ -102,5 +102,5 @@ there is no `javac` launcher in the runtime.
 ## Background
 
 - `denver/docs/research/PHASE-3-JAVAC.md` (the loop's design: decisions D73-D76, the four-arm probe plan)
-- `denver/docs/OPERATOR_LOG.md` on branch `denver-operator-notes` (operator corrections and this verification)
+- the operator log, now the appendix of `AUTORESEARCH_EXPERIMENT_RESULTS.md` (operator corrections and this verification)
 - `denver/docs/research/PHASE-3-JAVACLASSLIB.md` (why real-javac classes passed where the hand-assembled ones failed)
