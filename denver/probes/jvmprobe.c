@@ -527,6 +527,106 @@ static int arm_mmaparms(void) {
     return WEXITSTATUS(st);
 }
 
+/* ---------------- lazyrel (PHASE-2-HEAPRO D46; the release sweep) ----------------
+ * The NULLFIX java death was a write to a PRESENT read-only page at a VA whose
+ * only event was a MAP_FIXED release: the release sweep is present-only, so the
+ * P=0 lazy records a lazy mapping leaves in the leaf slots survive it, and the
+ * not-present fault arm (`lazy::fill`) decodes them with no region check — the
+ * released range comes back. This arm reproduces that java-free, one fork per
+ * sub-arm (the crashy path IS the pass, so the child dies by design):
+ *
+ *   anon: mmap 2 MiB RW ANON|PRIVATE|NORESERVE (NORESERVE => lazy whatever the
+ *         size), touch two pages, munmap, write the released VA.
+ *         fixed: SIGSEGV -> LAZYREL PASS anon-release-kills
+ *         buggy: lazy::fill serves a fresh zero page, the write succeeds
+ *                -> LAZYREL RED stale-anon-write
+ *   file: mmap 2 MiB RO PRIVATE of /bin/jvmprobe (demand-paged file records,
+ *         MMAP_FILE_BACKED_LAZY), read byte 0, munmap, read the released VA.
+ *         fixed: SIGSEGV -> LAZYREL PASS file-release-kills
+ *         buggy: the stale byte reads back -> LAZYREL RED stale-file-read
+ *                (a write there would be the java death shape)
+ * Every marker the child prints names its point, so a SIGSEGV is attributable:
+ * the parent reports signal deaths relative to the last marker. */
+#define LAZYREL_LEN (2ul * 1024 * 1024)
+
+static int child_lazyrel_anon(void) {
+    volatile char *p = mmap(NULL, LAZYREL_LEN, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (p == MAP_FAILED) {
+        printf("LAZYREL RED anon-mmap errno=%d (%s)\n", errno, estr(errno));
+        return 1;
+    }
+    p[0] = 1;
+    p[4096] = 1;
+    if (p[0] != 1 || p[4096] != 1) {
+        printf("LAZYREL RED anon-touch readback=%d/%d\n", p[0], p[4096]);
+        return 1;
+    }
+    if (munmap((void *)p, LAZYREL_LEN) != 0) {
+        printf("LAZYREL RED anon-munmap errno=%d (%s)\n", errno, estr(errno));
+        return 1;
+    }
+    printf("LAZYREL INFO anon released; writing (fixed kernel: SIGSEGV expected)\n");
+    p[0] = 2;
+    printf("LAZYREL RED stale-anon-write survived readback=%d (lazy::fill served the released range)\n", p[0]);
+    return 1;
+}
+
+static int child_lazyrel_file(void) {
+    int fd = open("/bin/jvmprobe", O_RDONLY);
+    if (fd < 0) {
+        printf("LAZYREL RED file-open errno=%d (%s)\n", errno, estr(errno));
+        return 1;
+    }
+    volatile char *q = mmap(NULL, LAZYREL_LEN, PROT_READ, MAP_PRIVATE, fd, 0);
+    if (q == MAP_FAILED) {
+        printf("LAZYREL RED file-mmap errno=%d (%s)\n", errno, estr(errno));
+        close(fd);
+        return 1;
+    }
+    close(fd);
+    int b = q[0];
+    if (b < 0) {
+        printf("LAZYREL RED file-touch read=%d\n", b);
+        return 1;
+    }
+    if (munmap((void *)q, LAZYREL_LEN) != 0) {
+        printf("LAZYREL RED file-munmap errno=%d (%s)\n", errno, estr(errno));
+        return 1;
+    }
+    printf("LAZYREL INFO file released; reading (fixed kernel: SIGSEGV expected)\n");
+    b = q[0];
+    printf("LAZYREL RED stale-file-read byte=0x%x (lazy::fill served the released range)\n", b);
+    return 1;
+}
+
+/* One fork per sub-arm: the PASS path is a signal death, so the parent judges
+ * the wait status against the child's last printed marker. */
+static int run_lazyrel_child(int (*child)(void), const char *what) {
+    pid_t pid = fork();
+    if (pid == 0) _exit(child());
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (WIFSIGNALED(st)) {
+        if (WTERMSIG(st) == SIGSEGV) {
+            printf("LAZYREL PASS %s-release-kills (SIGSEGV: the released range stayed dead)\n", what);
+            return 0;
+        }
+        printf("LAZYREL RED %s CRASH signal=%d (not SIGSEGV - not the designed death)\n", what, WTERMSIG(st));
+        return 1;
+    }
+    /* The child printed its own RED line naming the stale-fill survival. */
+    return WEXITSTATUS(st);
+}
+
+static int arm_lazyrel(void) {
+    int fails = run_lazyrel_child(child_lazyrel_anon, "anon");
+    fails += run_lazyrel_child(child_lazyrel_file, "file");
+    if (!fails)
+        printf("LAZYREL PASS both released ranges stayed dead (lazy records swept)\n");
+    return fails ? 1 : 0;
+}
+
 /* ---------------- sysinfo (PHASE-2-NULLSTORE D35; G7's feed) ----------------
  * `sysinfo(2)` was ENOSYS in phase 1 and the merged tree presumed it served over
  * by main's memory changes (REQUIREMENTS G9 row, "unverified: no sysinfo probe
@@ -706,6 +806,7 @@ static void usage(void) {
     fprintf(stderr,
             "usage: jvmprobe getcpu|auxv|cycles|rwx|maps|mmaparms|sysinfo|java CMD [ARG]...\n"
             "       jvmprobe name CMD EXPECTED_RIP_HEX [ARG]...\n"
+            "       jvmprobe lazyrel\n"
             "  one arm per invocation; NAME VERDICT detail on stdout; exit 0 iff PASS\n");
 }
 
@@ -723,6 +824,7 @@ int main(int argc, char **argv) {
     if (!strcmp(arm, "mmaparms")) return arm_mmaparms();
     if (!strcmp(arm, "sysinfo")) return arm_sysinfo();
     if (!strcmp(arm, "regpreserve")) return arm_regpreserve();
+    if (!strcmp(arm, "lazyrel")) return arm_lazyrel();
     if (!strcmp(arm, "name")) return argc < 4 ? usage(), 2 : arm_name(argv + 2);
     if (!strcmp(arm, "java")) return argc < 3 ? usage(), 2 : arm_java(argv + 2);
     return usage(), 2;
