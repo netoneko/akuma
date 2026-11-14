@@ -81,3 +81,19 @@ serving the fallback) → G2 (PHASE-2-GETCPU) → G4 (PHASE-2-PROCFS) → G5 (de
 **Re-rank 2026-11-14, after the operator merge verification (recorded reason, as this file requires):** the merge (3531cf69) moved the workload again, and this time the evidence came from rebuilt gate captures, not from a session: G7's clean `Too small maximum heap` exit is gone from the java arm (presumed served over by main's memory/sysinfo changes — unverified, no sysinfo probe ran, so G7 drops to a verification pass), and the death is now the attempt's blocker-3 NULL store (G9, new row: rip=0x3005fc41, cr2=0x0, code=0x6 — a user-mode write to NULL). A NULL store cannot be fixed from a bare rip: no maps exist to attribute it to a module, and the runbook's own rule applies a third time ("fix diagnostics before bugs: a pass that makes the failure readable outranks a pass that guesses at the fix"). G2 stays behind both (HotSpot's wrapper tolerates the stub's ENOSYS; the raw arm still REDs for direct callers). **New order: G4 (PHASE-2-PROCFS — auxv/maps so the G9 rip gets an owner; diagnostics before the unknown) → G9 (the NULL-store fix, named once PROCFS lands) → G7 (PHASE-2-MEMINFO, demoted to verifying sysinfo(2) on the merged tree) → G2 (PHASE-2-GETCPU) → G5 (deferred), G8 still held as suspects.**
 
 **Re-rank 2026-11-14, after PHASE-2-NULLSTORE GREEN (recorded reason, as this file requires):** G4 closed (PROCFS), and G9's NULL store is no longer just *named* — the mechanism is measured (D38: the syscall-internal fault-retry path rebuilds the user GPR file; research artifact + the gate log's regpreserve ride-along). The fix's first job is a kernel bisect, not a contract read, so G9's fix keeps the top slot with a diagnostic opening; G7's verification question was answered in passing (`SYSINFO INFO errno=38` on `800e8c80` — sysinfo served nowhere on the merged tree), so PHASE-2-MEMINFO moves to an implementation pass with its datum already recorded, still behind the fix (HotSpot reaches heap sizing only once the death moves past fstatat). **New order: G9 (PHASE-2-NULLFIX: bisect → fix behind an off-by-default feature → regpreserve all-REGPASS → the java arm MOVES) → G7 (PHASE-2-MEMINFO: serve sysinfo(2) with the guest's real RAM, R4 shape, off-by-default feature) → G2 (PHASE-2-GETCPU) → G5 (deferred), G8 still held as suspects (+ the mmap-W+X-never-writable divergence, a new suspect with a measured datum).**
+
+**Re-rank 2026-11-14, after PHASE-2-HEAPRO GREEN (recorded reason, as this file requires):**
+the present-RO heap write was not a memory-management record bug at all — it was the WX
+relaxation's silent W-drop on executable mmaps (D49: under `wx-relaxed` the *call* was
+allowed but the slab mmap arm still encoded every exec mapping `write=false`; java's RWX
+mmap came back RO-X and its first write died at code=0x7 unmarked). G8's recorded divergence
+suspect ("mmap W+X never-writable") is **CLOSED as honored-under-wx-relaxed** — the strict
+policy refused the call outright, so no silent drop remains in any build. The gate's other
+arm (lazy-release-sweep) closed a real record-survival hole java-free (released ranges stay
+dead; lazyrel PASS both arms). The java arm moved WITHOUT a capturable new death — no fault
+in the window, output unrecoverable (sshd starved) — so the next first fatal is uncaptured,
+and the ranked order stands: **G7 (PHASE-2-MEMINFO: serve sysinfo(2) with the guest's real
+RAM — today's feed again `SYSINFO INFO errno=38`) doubles as the next java-arm diagnostic**;
+G2 behind it; G5 deferred. Recorded as suspects, unranked (D51): the slab placer's
+mmap(NULL)-on-live-base collisions (data-corruption class — the ring shows three-plus), and
+the mmdbg-gated release bodies (a bisect hatch that gates correctness; default 7 is honest).

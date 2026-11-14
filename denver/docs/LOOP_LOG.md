@@ -552,3 +552,49 @@ the designed 180 s timeout, and the guest-side arm carried the verdict anyway;
 expectation fix + mid-gate image re-injection, the window recovery.
 
 NEXT GATE: PHASE-2-HEAPRO
+
+### PHASE-2-HEAPRO — 2026-11-14, session 13 (~09:47–10:55 UTC) — GREEN (G9's death moved twice: the sweep fixed a real record hole java-free, and the write itself was the WX relaxation's silent W-drop — D49)
+
+**What we did.** The gate opened on D44's story: the release sweep is present-only, lazy
+records (P=0 software leaves) survive every release, and the not-present fault arm
+(`lazy::fill`, no region check possible from below akuma-exec) re-serves them — the
+released range comes back. Fix one: `lazy-release-sweep` (off by default, R6) —
+`unmap_present`'s x86 body also clears the range's non-present non-zero leaves, outside
+the shared walker (mprotect must keep its lazy records), no TLB maintenance (a P=0 leaf
+is never cached). The probe grew `jvmprobe lazyrel`: released anon and released
+file-lazy ranges must stay DEAD (the child's SIGSEGV is the pass) — both PASS.
+
+**What attempt 1 forced.** An honest FAIL: java died at the same rip/cr2/code on the
+sweep kernel. The preserved attempt log + the rig's vmrun.log ring rewrote the story
+(D48): java had mmap'd the death VA RWX (prot 7) successfully — the RO PTE was that
+mapping's own fill; the releases the `[mm]` events prove live are the mmap **slab** arms
+(a second mmap implementation, mmdbg-gated, default 7 — whose release_pages already
+cleared records), and the ring showed `mmap(NULL)` answering live fixed bases three-plus
+times (a placer defect, recorded not fixed, D51). The real root cause (D49): the WX
+relaxation was **incomplete** — under `wx-relaxed` the W+X *call* was allowed but the
+slab mmap arm still encoded every exec mapping `write=false`; java's RWX heap came back
+RO-X and its first write died exactly as observed. Fix two: `wx::exec_write_bit` — the
+request's write bit honored when the kernel build permits JITs, as mprotect already does;
+strict builds unchanged (the call is refused outright; 47-byte relocation-level `.text`
+shift, semantics pinned by 46+46 host tests on the musl target).
+
+**What the run forced about the probe (D42's rule, third strike).** The rwx arm judged
+the mapping from `/proc/self/maps` — which does not show the mmap slab — so it REDd
+regardless of the kernel; the recorded "W+X dropped W" divergence was half probe gap.
+Rewritten write-then-call: `MMARMS PASS rwx call=42` on the gate kernel.
+
+**The payoff.** Attempt 3: RESULT PASS, wall 37 s (`denver/gates/PHASE-2-HEAPRO.log`,
+guest c921d625) — all riding arms green (tokioprobe, RWX, MAPS+AUXV, MMARMS incl. rwx,
+SYSINFO INFO errno=38 for G7, regpreserve 20/20, lazyrel both arms), and the java arm
+MOVED with no fault at all in the window: the old rip never appeared, java was still
+running when the window closed, and the output was unrecoverable (sshd starved). The new
+first fatal is uncaptured — the next pass opens with a capture problem (longer window /
+output recovery), not a fix. G7 (PHASE-2-MEMINFO) holds the top slot and doubles as that
+diagnostic; G8's divergence suspect is closed; the placer collisions and the mmdbg hatch
+are recorded suspects (D51).
+
+**Interventions:** three, in RESULT.md — the host-test target re-payment (musl target or
+E0463), attempt-1's preserved FAIL log + vmrun.log ring recovery, the lying rwx arm
+rewritten with two image re-injections.
+
+NEXT GATE: PHASE-2-MEMINFO

@@ -531,3 +531,52 @@ but `ring3 map/regs/stack`, `[mm]` and `[fault-code]` did not. Recovered from th
 rig's `vmrun.log` (the real console capture) and appended post-verdict. Rule of
 thumb going forward: display bounds are not evidence bounds — grep the source
 file, and size window displays to the ring's cap (40) + attribution (~15), not 30.
+
+INTERVENTION: host tests for the touched pure crates E0463'd ("can't find crate
+for core") on bare `cargo test -p` — the pinned nightly has no host-std core on
+this box. Resolved with `--target x86_64-unknown-linux-musl` (L4's PROCFS shape,
+re-paid): 46 strict / 46 relaxed green for akuma-syscalls-mem.
+
+INTERVENTION: attempt 1 verdict was an honest FAIL (java died at the old rip on
+the sweep-only kernel); its gate log is preserved as
+PHASE-2-HEAPRO.attempt1-FAIL.log and its death's full ring was read from the
+rig's vmrun.log — the head-40 evidence display cut the attribution again
+(the NULLFIX display-bounds fact, recurring; the verdict now cites vmrun.log).
+
+INTERVENTION: the rwx probe arm could never PASS — it judged the mapping from
+/proc/self/maps, which does not show mmap-slab mappings, so saw_w stayed -1
+(the recorded "W+X dropped W" divergence was half probe gap, D42 again).
+Rewritten write-then-call; two image re-injections carried the new jvmprobe
+(attempts 2 and 3).
+
+## PHASE-2-HEAPRO — 2026-11-14 ~09:47–10:55 UTC, session 13 (goose, glm-5.3-flash) — GREEN (the death moved; the W+X silent drop named and closed)
+
+Three gate runs, one research artifact, two kernel changes, both behind off-by-default
+features. `RESULT PASS` in `denver/gates/PHASE-2-HEAPRO.log` (guest
+`0.1.0-c921d625-denver`, wall 37 s): all riding arms green (tokioprobe, RWX, MAPS+AUXV,
+MMARMS incl. the new `MMARMS PASS rwx call=42`, `SYSINFO INFO errno=38` recorded for G7,
+regpreserve 20/20, LAZYREL PASS both arms), and the java arm MOVED — the old death rip
+`60000067cd7a` never appeared and no java fault reached the window at all.
+
+- **Result:** the NULLFIX java death (user write to a present RO page, code=0x7,
+  pte unmarked refs=2) is closed by `wx::exec_write_bit` (D49): under `wx-relaxed` a
+  W-bearing executable mmap honors its write bit (the old slab mmap arm silently encoded
+  every exec mapping `write=false` — java's RWX heap came back RO-X). The strict policy
+  refused the call outright, so no silent drop remains in any build; strict `.text`
+  carries only 47 relocation-level byte shifts, semantics pinned by 46+46 host tests
+  (`--target x86_64-unknown-linux-musl`). G8's recorded divergence suspect is CLOSED.
+  The gate's other arm, `lazy-release-sweep` (D44/D45), closes a real record-survival
+  hole — released ranges stay dead (lazyrel PASS anon + file) — and rides on all future
+  gate kernels.
+- **Records:** research artifact `denver/docs/research/PHASE-2-HEAPRO.md` (D43–D51),
+  attempt logs preserved (`PHASE-2-HEAPRO.attempt1-FAIL.log`,
+  `PHASE-2-HEAPRO.attempt2-FAIL.log`), REQUIREMENTS re-ranked (G7/PHASE-2-MEMINFO next),
+  LOOP_LOG entry recorded, L4 Do 5/6 + Record updated.
+- **Next gate's data:** the java arm moved WITHOUT a capturable new death — no fault in
+  the 10 s window, `/tmp/java-out.log` unrecoverable (sshd starved, RC=127). The new
+  first fatal is uncaptured; PHASE-2-MEMINFO opens with a capture problem (longer
+  window, output recovery), and sysinfo(2) is still served nowhere.
+- **Recorded suspects, unranked (D51):** the slab placer hands `mmap(NULL)` ranges
+  overlapping live fixed mappings (java's ring: three-plus collisions — data-corruption
+  class); the `mmdbg` bisect hatch gates the slab's release bodies (default 7 is honest;
+  any lower value makes munmap/MAP_FIXED silent no-ops that answer success).

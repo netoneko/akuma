@@ -180,3 +180,71 @@ nullfix spec's disk and port, new kernel path). jvmprobe grows a `lazyrel` arm
 None new — PHASE-2-NULLSTORE's recorded proposal (knob
 `GOOSE_TOOL_CALL_CUTOFF` at default, judged by this session's `final_ctx` in
 COST_LEDGER.md) stands for the phase; the operator owns applying it.
+
+## Outcome (session 13, 2026-11-14 ~09:47–10:55 UTC — GREEN on attempt 3)
+
+**Verdict: PASS** (`denver/gates/PHASE-2-HEAPRO.log`, guest `0.1.0-c921d625-denver`,
+wall 37 s) — conditions 1–8 green (tokioprobe, RWX, MAPS+AUXV, MMARMS incl. the new
+`MMARMS PASS rwx call=42`, SYSINFO INFO errno=38 recorded for G7, regpreserve 20/20,
+LAZYREL PASS both arms) and (9) **MOVED**: the old rip `60000067cd7a` never appeared.
+The console window carries only the two lazyrel children's designed deaths
+(rip `0x10002bb0` code=0x4 read / `0x10002ac0` code=0x6 write, both cr2=0x600000000000,
+slot 4) — **no java fault at all in the window**: java survived past the old death and
+was still running when the window closed. `/tmp/java-out.log` was unrecoverable (sshd
+starved, RC=127). **The new first fatal is uncaptured** — capturing it is the next
+pass's first datum, not a fix.
+
+**D48 — attempt 1's honest FAIL rewrote the root cause.** The lazy-release-sweep
+kernel (`b111b83e`) passed lazyrel and regpreserve but java died at the SAME
+rip/cr2/code (log preserved: `PHASE-2-HEAPRO.attempt1-FAIL.log`). The death's full
+ring in the rig's `vmrun.log` (the head-40 evidence display cut it again — the
+NULLFIX display-bounds fact, recurring) named what D44 missed:
+- `nr=9 a=0x6000112e9000,0x270000,0x7 -> <same addr>`: java had **mmap'd the death
+  VA RWX (prot 7), successfully** — the RO PTE at death was that mapping's own fill,
+  not a stale record.
+- Every `mmap(NULL)` in the ring answered a just-mapped fixed base (three-plus
+  collisions) — a placer defect, recorded as D51, not fixed here.
+- The releases the `[mm]` events prove live are the mmap **slab** arms
+  (`akuma-tokio-kernel-core/mm.rs`, `mmdbg`-gated, default 7), whose
+  `release_pages` already clears lazy records per page. D44's sweep closes a real
+  synchronous hole (lazyrel proves the released range stays dead) and rides on, but
+  was not the death.
+
+**D49 — the death's root cause: the WX relaxation was incomplete.** The slab mmap
+arm decoded **every executable mapping as `write=false`** ("W^X refused W+X above,
+so an executable mapping is never writable") — but under `wx-relaxed` the *call*
+was allowed (`check_prot` → Allow), so java's RWX mmap silently became RO-X and the
+first write into it died at code=0x7 unmarked: the exact death PTE (present, RO,
+NX-clear, A-set, D-clear). The recorded "mmap W+X dropped W; Linux honors it"
+divergence was this gap, not a policy. The fix: `akuma_syscalls_mem::wx::exec_write_bit(prot)`
+— strict: `false` (the arm is unreachable for W+X; `check_prot` refused the call);
+wx-relaxed: the request's write bit, as `mprotect` already honors. Strict build
+R6 evidence: `.text` differs from HEAD's by **47 scattered bytes** (relocation
+shifts from the added branch; same size) — behavior-identical by construction
+(`check_prot` refuses W+X before the arm; RX-only requests answer `false`), pinned
+by the crate's host tests: **46 strict / 46 relaxed** (incl. the new
+`the_relaxed_exec_mapping_honors_the_write_bit`), `--target x86_64-unknown-linux-musl`
+(L4's PROCFS shape; bare `cargo test -p` E0463s on this box — no host core).
+
+**D50 — the probe arm was lying too (D42's rule, again).** The rwx sub-arm judged
+the mapping from `/proc/self/maps` — but maps shows the glue regions, **not the
+mmap slab's**, so `saw_w` was always −1 and the arm REDd regardless of what the
+kernel did. The recorded divergence was half probe gap. Rewritten to the direct
+test: mmap W+X → write the code in (the write bit, *tested*) → call it. Fixed
+kernel: `MMARMS PASS rwx call=42`; a stripping kernel kills the child on the memcpy.
+
+**D51 — recorded, not fixed (the re-rank owns them):**
+- **The slab placer hands out occupied ranges**: java's ring shows `mmap(NULL)`
+  answering live fixed bases three-plus times. The layout is hole-table + bump
+  cursor; a later reservation's `lazy::reserve` overwrites live mappings' records
+  (present PTEs survive the sweep — the fill-vs-record split). Data-corruption
+  class; next datum: any fault window after a `mmap(NULL, PROT_NONE)` landing on a
+  fixed base.
+- **`mmdbg` (default 7) gates the slab's release bodies**: below the mask bits,
+  munmap/MAP_FIXED releases are silent no-ops that still answer success. A bisect
+  scaffold that gates correctness — the default is honest, but the hatch is loaded.
+- Two variables shipped in this gate (sweep + write bit). The java movement is
+  attributable to the write bit by D48's ring analysis, not by an A/B; a
+  sweep-less A/B was not run.
+
+Experiment proposal: unchanged (PHASE-2-NULLSTORE's `GOOSE_TOOL_CALL_CUTOFF` stands).

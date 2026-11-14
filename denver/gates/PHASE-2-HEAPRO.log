@@ -1,0 +1,140 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-heapro.spec (elapsed=3s)
+== rig identity: uname says denver, NOT 72be5c55, NOT 800e8c80, NOT f0dcacb6, NOT 3531cf69 (elapsed=8s)
+Linux denver 0.1.0-c921d625-denver c921d625-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=8s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-c921d625-denver c921d625-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.34s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (rides; this binary carries wx-relaxed AND vsyscall AND procfs-diag AND trace-err AND fold-regpreserve AND lazy-release-sweep) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== procfs-diag alive: the maps arm (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+MAPS-LINE: 10000000-10001000 r--p 00000000 00:00 0 
+MAPS-LINE: 10001000-10005000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10007000-10009000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000b000-1000d000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000f000-10010000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10010000-10013000 r--p 00000000 00:00 0 
+MAPS-LINE: 10013000-10015000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10054000-10065000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10095000-10096000 rw-p 00000000 00:00 0 
+MAPS-LINE: 6ffffffff000-700000000000 rw-p 00000000 00:00 0 
+MAPS PASS lines=10 exec_lines=4 bytes=418
+== procfs-diag alive: the auxv arm (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096 AT_SYSINFO_EHDR matches stack=18446744073699061760
+== the contract facts, java-free (D35): mmaparms (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+MMARMS PASS len0 MAP_FAILED EINVAL
+MMARMS PASS oversize MAP_FAILED errno=12
+MMARMS PASS reserve base=0x600000000000 size=50331648 prot=NONE
+MMARMS PASS commit-RW write-readback off=0
+MMARMS PASS commit-RX call=42
+MMARMS PASS rwx call=42
+== sysinfo recorded (G7's feed; this gate does not judge it) (elapsed=10s)
+[ssh] connecting to 127.0.0.1:2247...
+SYSINFO INFO errno=38 (Function not implemented)
+  (recorded for the G7 pass)
+== the NULLFIX fix rides: regpreserve - every canary kept (D47 condition 7) (elapsed=10s)
+[ssh] connecting to 127.0.0.1:2247...
+REGPASS r8 kept across lazy-fault store
+REGPASS r9 kept across lazy-fault store
+REGPASS r10 kept across lazy-fault store
+REGPASS r11 kept across lazy-fault store
+REGPASS rdi kept across lazy-fault store
+REGPASS rsi kept across lazy-fault store
+REGPASS rdx kept across lazy-fault store
+REGPASS rcx kept across lazy-fault store
+REGPASS r8 kept across syscall
+REGPASS r9 kept across syscall
+REGPASS r10 kept across syscall
+REGPASS rdi kept across syscall
+REGPASS rsi kept across syscall
+REGPASS rdx kept across syscall
+REGINFO c-start
+REGINFO c-mmap q=0x600000001000
+REGINFO c-syscall stat returned -2 (rdx canary kept)
+REGPASS r8 kept across kernel-write-to-unfaulted-page
+REGPASS r9 kept across kernel-write-to-unfaulted-page
+REGPASS r10 kept across kernel-write-to-unfaulted-page
+REGPASS rdi kept across kernel-write-to-unfaulted-page
+REGPASS rsi kept across kernel-write-to-unfaulted-page
+REGPASS rdx kept across kernel-write-to-unfaulted-page
+== THE FIX, java-free: lazyrel - a released range must stay dead (D47 condition 8) (elapsed=10s)
+[ssh] connecting to 127.0.0.1:2247...
+LAZYREL INFO anon released; writing (fixed kernel: SIGSEGV expected)
+LAZYREL PASS anon-release-kills (SIGSEGV: the released range stayed dead)
+LAZYREL INFO file released; reading (fixed kernel: SIGSEGV expected)
+LAZYREL PASS file-release-kills (SIGSEGV: the released range stayed dead)
+LAZYREL PASS both released ranges stayed dead (lazy records swept)
+== the payoff: the java arm - the death must MOVE (D37/D41 honesty); sshd may starve (session 8's data) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+  (arm dispatched; java's output goes to /tmp/java-out.log guest-side)
+== the console window: the old death must be absent (elapsed=26s)
+-- console window: fault line:
+[Fault] ring3 PageFault rip=0x0000000010002bb0 rsp=0x00006ffffffffd30 cr2=0x0000600000000000 code=0x4 -- task killed
+-- console window: kill line:
+[Fault] slot 4 killed (SIGSEGV)
+-- console window: evidence lines:
+[Fault] ring3 PageFault rip=0x0000000010002ac0 rsp=0x00006ffffffffd30 cr2=0x0000600000000000 code=0x6 -- task killed
+[mm] kind=1 0x600000000000..0x600000001000 covers fault
+[mm] kind=1 0x600000000000..0x600003000000 covers fault
+[mm] kind=1 0x600000000000..0x600000001000 covers fault
+[mm] kind=1 0x600000000000..0x600000200000 covers fault
+[fault-code] rip=0x10002ac0 pte=0x206b7025 pa=0x206b7000 refs=3 read=true bytes=[c6, 01, 02, 0f, be, 31, e8, 66, 1a, 00, 00, b8, 01, 00, 00, 00]
+[Fault] ring3 map at rip=0x0000000010002ac0 in 0x10001000-0x10005000 r-xs
+[Fault] ring3 map below rip=0x0000000010002ac0 in 0x10000000-0x10001000 r--s
+[Fault] ring3 map above rip=0x0000000010002ac0 in 0x10007000-0x10009000 r-xs
+[Fault] ring3 regs rip=0x0000000010002ac0 rsp=0x00006ffffffffd30 rax=0x0 rbx=0x100111da rcx=0x600000000000 rdx=0x1
+[Fault] ring3 regs rsi=0x6ffffffffc90 rdi=0x100102c0 rbp=0x6fffffffffa9 r8=0x10014120 r9=0x10010278 r10=0x44
+[Fault] ring3 regs r11=0x246 r12=0x2 r13=0x6ffffffffe38 r14=0x10002a20 r15=0x0
+[Fault] ring3 stack [rsp+0..+64)=00006ffffffffe38 0000600000000000 0000000000000000 00000000100022e0 0000000000000000 c28a103245dd00a5 0000000000000000 0000000000000005
+[Fault] ring3 stack [rsp+64..+128)=0000000000000000 0000000010001799 0000000000000000 00006fffffffff90 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+[Fault] ring3 stack [rsp+128..+192)=0000000000000000 c28a103245dd00a5 0000000000000000 0000000000000002 00006ffffffffe38 0000000010001090 00006ffffffffe50 0000000000000000
+[Fault] ring3 stack [rsp+192..+256)=0000000000000000 00000000100038d5 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000000000000 0000000010001e90
+[ring] nr=20 a=0x1,0x6ffffffffc90,0x1 -> 1 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffffc30,0x1 -> 68 rip=0x1000b936
+[ring] nr=11 a=0x600000000000,0x200000,0x3 -> 0 rip=0x10003ca3
+[ring] nr=9 a=0x0,0x200000,0x3 -> 105553116266496 rip=0x10003bc3
+[ring] nr=14 a=0x2,0x6ffffffffc90,0x0 -> 0 rip=0x10003f46
+[ring] nr=14 a=0x2,0x6ffffffffbe0,0x0 -> 0 rip=0x10003f46
+[ring] nr=218 a=0x10095950,0x10011b78,0x10095818 -> 4 rip=0x1000b10b
+[ring] nr=11 a=0x600000000000,0x1000,0xffffffff -> 0 rip=0x10003ca3
+[ring] nr=11 a=0x600000001000,0x1000,0xffffffff -> 0 rip=0x10003ca3
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 55 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 55 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 55 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 55 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 54 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 54 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 53 rip=0x1000b936
+[ring] nr=4 a=0x600000000000,0x600000001000,0x7777777777777007 -> -2 rip=0x100027e3
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 32 rip=0x1000b936
+[ring] nr=9 a=0x0,0x1000,0x3 -> 105553116270592 rip=0x10003bc3
+[ring] nr=20 a=0x1,0x6ffffffffa00,0x1 -> 1 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff9c0,0x1 -> 15 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 32 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 32 rip=0x1000b936
+[ring] nr=20 a=0x1,0x6ffffffff7c0,0x2 -> 32 rip=0x1000b936
+MOVED: the death moved - the old HEAPRO rip never appeared
+-- a fault at a DIFFERENT rip is progress (D41): its attribution/ring above are the next gate's data
+== best-effort: recover java's output (never a pass condition) (elapsed=37s)
+[ssh] connecting to 127.0.0.1:2247...
+RC=127
+  (sshd did not answer or the file has no version line - the console window above is the verdict's evidence)
+== verdict (elapsed=37s)
+MOVEMENT: the HEAPRO present-RO write is FIXED behind lazy-release-sweep - lazyrel all-PASS (released ranges stay dead), regpreserve rides, and the java arm never returned to the old death
+RESULT PASS
+== wall clock: seconds=37 (t0=1794652890 end=1794652927)

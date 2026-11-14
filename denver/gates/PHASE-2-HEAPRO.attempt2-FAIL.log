@@ -1,0 +1,47 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-heapro.spec (elapsed=3s)
+== rig identity: uname says denver, NOT 72be5c55, NOT 800e8c80, NOT f0dcacb6, NOT 3531cf69 (elapsed=3s)
+Linux denver 0.1.0-c921d625-denver c921d625-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=3s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-c921d625-denver c921d625-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.19s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (rides; this binary carries wx-relaxed AND vsyscall AND procfs-diag AND trace-err AND fold-regpreserve AND lazy-release-sweep) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== procfs-diag alive: the maps arm (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+MAPS-LINE: 10000000-10001000 r--p 00000000 00:00 0 
+MAPS-LINE: 10001000-10002000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10003000-10005000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10007000-1000a000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000b000-1000c000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000d000-1000e000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000f000-10010000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10010000-10013000 r--p 00000000 00:00 0 
+MAPS-LINE: 10013000-10015000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10054000-10065000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10095000-10096000 rw-p 00000000 00:00 0 
+MAPS-LINE: 6ffffffff000-700000000000 rw-p 00000000 00:00 0 
+MAPS PASS lines=12 exec_lines=6 bytes=500
+== procfs-diag alive: the auxv arm (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096 AT_SYSINFO_EHDR matches stack=18446744073699061760
+== the contract facts, java-free (D35): mmaparms (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+MMARMS PASS len0 MAP_FAILED EINVAL
+MMARMS PASS oversize MAP_FAILED errno=12
+MMARMS PASS reserve base=0x600000000000 size=50331648 prot=NONE
+MMARMS PASS commit-RW write-readback off=0
+MMARMS PASS commit-RX call=42
+MMARMS RED rwx-mapped-perm-w=-1 (mmap W+X dropped W; Linux honors it) base=0x600003000000
+RESULT FAIL: no MMARMS PASS rwx call=42 - the W+X mmap was not writable (exec_write_bit did not take; the old kernel REDs rwx-mapped-perm-w)
+== wall clock: seconds=5 (t0=1794652638 end=1794652643)

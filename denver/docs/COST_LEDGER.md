@@ -13,3 +13,5 @@ session denver-improve wall=26 in=3.6M out=78k final_ctx=111k cache_read=97% too
 session denver-PHASE-2-PROCFS wall=73 in=17.5M out=102k final_ctx=175k cache_read=99% tools=151
 session denver-PHASE-2-PROCFS wall=44 in=4.5M out=68k final_ctx=114k cache_read=97% tools=227
 session denver-PHASE-2-NULLSTORE wall=76 in=17.7M out=123k final_ctx=194k cache_read=99% tools=184
+session denver-PHASE-2-NULLSTORE wall=15 in=2.1M out=38k final_ctx=72k cache_read=97% tools=233
+session denver-PHASE-2-NULLFIX wall=41 in=7.6M out=71k final_ctx=134k cache_read=98% tools=104

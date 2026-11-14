@@ -34,6 +34,16 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
    any fix would have been: `mmap-RWX-allowed` on metal (baseline moved), `AT_SYSINFO_EHDR
    missing` (the vDSO suspect named), `CYCLES PASS 4189 cyc/call` (the VM-trap tax quantified).
    No kernel code was written this phase — the requirements table is the deliverable.
+5. **Preserve the failed attempt's capture before re-running (`cp` the gate log first).**
+   An honest FAIL is data: PHASE-2-HEAPRO's attempt-1 log held the ring that rewrote the
+   root cause (D48) after the fix-in-hand was already proven innocent. A verdict that
+   overwrites its own evidence can only be repeated, not learned from.
+6. **A probe arm must be able to PASS in principle on the thing it judges.** The rwx arm
+   read `/proc/self/maps` — which does not show the mmap slab — and REDd regardless of the
+   kernel; three gates carried the "divergence" it named. Before recording a kernel
+   divergence from a probe, ask what the probe would print on a kernel that does the right
+   thing (D42's rule, extended: a probe *channel* that cannot see the thing reports
+   blindness, not verdicts).
 
 ## Gate
 
@@ -90,3 +100,14 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   *measured mechanism* (D38) for the price of one boot. Named ≠ understood; if the
   evidence leaves a mechanical question open and a java-free arm can answer it, spend the
   boot before writing the transition.
+- 2026-11-14 (PHASE-2-HEAPRO GREEN on attempt 3): the kernel-change cycle, fourth
+  measurement — research → GREEN ≈ 70 min, three gate runs (attempt-1 honest FAIL, a
+  probe-gap FAIL that was really a PASS of the mechanism, the GREEN), two kernel-change
+  cycles (sweep ≈ 2 min build+stage; write-bit ≈ 30 s) and two image re-injections
+  (~1–2 min each). The FAIL was the gate's most valuable event: the preserved attempt log
+  + the rig's vmrun.log ring rewrote the root cause (the sweep-in-hand was proven innocent
+  and the RWX silent W-drop named) at the price of one boot (Do 5). The lying-probe catch
+  (Do 6) came free with the rewritten arm: `MMARMS PASS rwx call=42` both tests the fix
+  and retires a three-gate "divergence". Movement without a capturable death is a new
+  shape: the next gate opens on a capture problem (longer window / output recovery), not
+  a fix — and the host-test target fact re-paid (musl target or E0463; L4's PROCFS entry).
