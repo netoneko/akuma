@@ -1,0 +1,4 @@
+#!/bin/sh
+# scala [-cp dir] MainClass args:  runs a compiled Scala main class with the Scala library on the classpath
+. /etc/scala.env
+exec "$JAVA_HOME/bin/java" ${JAVA_OPTS:-$JAVA_OPTS_DEFAULT} -cp "$SCALA_LIB:${CLASSPATH:-.}" "$@"

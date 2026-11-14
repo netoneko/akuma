@@ -1,0 +1,4 @@
+#!/bin/sh
+# clojure [clojure.main args]:  clojure script.clj | clojure -e '(+ 1 2)' | clojure   (REPL)
+. /etc/clojure.env
+exec "$JAVA_HOME/bin/java" ${JAVA_OPTS:-$JAVA_OPTS_DEFAULT} -cp "$CLOJURE_CP${CLASSPATH:+:$CLASSPATH}" clojure.main "$@"

@@ -1,0 +1,4 @@
+#!/bin/sh
+# javac for a denver guest: the JDK ships no launcher here, so start the compiler module's main class.
+. /etc/java.env
+exec "$JAVA_HOME/bin/java" ${JAVA_OPTS:-$JAVA_OPTS_DEFAULT} -m jdk.compiler/com.sun.tools.javac.Main "$@"

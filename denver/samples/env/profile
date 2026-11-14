@@ -1,0 +1,3 @@
+# /etc/profile for a denver guest: login shells get the Java environment and the language homes.
+. /etc/java.env
+for f in clojure scala groovy; do [ -r /etc/$f.env ] && . /etc/$f.env; done

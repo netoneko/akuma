@@ -63,6 +63,15 @@ thread pool, which keeps the JVM alive for 60 s after the script ends unless the
 
 ## What is still open
 
+- **The standard JDK HTTP server does not start (kernel gap, to be done later).** A Clojure server on
+  `com.sun.net.httpserver` (`denver/samples/clojure/server.clj`) dies at startup with
+  `java.io.IOException: Function not implemented` from `sun.nio.ch.IOUtil.fdLimit`, reached through
+  `EPollSelectorProvider.openSelector` (the NIO selector reads the fd limit). The guest console shows `[nosys]` for
+  syscall **97 (`getrlimit`)** and **302 (`prlimit64`)** among others, once each, which is the likely cause; I did not
+  confirm that serving them fixes it. Both syscalls have implementations in the full amd64 kernel's glue
+  (`akuma-syscalls-glue`), not in the tokio kernel. A blocking `ServerSocket` server may avoid the selector and was not
+  tried. The VM spec needs a `forward=8080:8080` line to reach the guest from outside (added on the box's spec).
+
 - `sigprobe` (`denver/probes/sigprobe.c`) reports **FAIL**: the SIGSEGV is delivered correctly (si_signo 11,
   si_code 1, si_addr 0, rip delta 3, cr2 0) and the saved-`rip` edit takes effect, but the saved-`rax` edit does
   not (returns 0, want 99). Unexplained; a likely cause, **not confirmed**, is `rt_sigreturn` overwriting `rax` with

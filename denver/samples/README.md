@@ -14,3 +14,16 @@ Sources used in the operator verification (`denver/docs/archive/CLOJURE_AND_JAVA
 Jars (Maven Central, SHA-1 checked against the `.sha1` files): `org/clojure/clojure/1.12.0`, `org/clojure/spec.alpha/0.5.238`,
 `org/clojure/core.specs.alpha/0.4.74`, `org/scala-lang/scala-{compiler,library,reflect}/2.13.14`,
 `org/apache/groovy/groovy/4.0.22`. Not committed (binary).
+
+## Environment files (`env/`)
+
+Modelled on `scripts/box/akuma-dev.env`: sshd sets no environment, so wrappers source an env file themselves.
+`env/install.sh` (run on the guest, `sh /work/env/install.sh /work/env`) installs `/etc/{java,clojure,scala,groovy}.env`,
+`/etc/profile`, wrappers `javac clojure scalac scala groovy` in `/usr/local/bin` (on the default `PATH`; shebang scripts
+run in the guest), and symlinks the JDK's launchers (`java`, `keytool`, ...) there. Jars go in `/opt/clojure`,
+`/opt/scala`, `/opt/groovy`. The guest has no `javac` launcher, so the `javac` wrapper runs
+`java -m jdk.compiler/com.sun.tools.javac.Main`. Tested from a bare ssh session: `javac`, `clojure -e`, `scalac` +
+`scala`, `groovy -e`.
+
+`clojure/server.clj` currently does not start in a denver guest: see "What is still open" in
+`denver/docs/archive/CLOJURE_AND_JAVAC_ON_DENVER.md` (`getrlimit`/`prlimit64` not served).

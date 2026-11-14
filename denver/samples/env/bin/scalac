@@ -1,0 +1,4 @@
+#!/bin/sh
+# scalac [scalac args]:  scalac -d out Hello.scala   (add -classpath to override; the library is on it by default)
+. /etc/scala.env
+exec "$JAVA_HOME/bin/java" -Xss4m -Xmx${SCALAC_XMX:-1500m} -cp "$SCALA_CP" scala.tools.nsc.Main -usejavacp "$@"

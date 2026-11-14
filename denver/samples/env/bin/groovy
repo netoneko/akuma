@@ -1,0 +1,4 @@
+#!/bin/sh
+# groovy [groovy.ui.GroovyMain args]:  groovy script.groovy | groovy -e 'println 1+1'
+. /etc/groovy.env
+exec "$JAVA_HOME/bin/java" ${JAVA_OPTS:-$JAVA_OPTS_DEFAULT} -cp "$GROOVY_JAR" groovy.ui.GroovyMain "$@"
