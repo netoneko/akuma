@@ -443,3 +443,61 @@ was the first complete run and it was GREEN.
 **Transition.** G4 closed; the ladder's next rung is the fix the diagnostics were built
 for — the rip has a kill site but no owner yet:
 NEXT GATE: PHASE-2-NULLSTORE
+
+### PHASE-2-NULLSTORE — 2026-11-14, sessions 9–10 (research+probe, run to PASS) and session 11 ~08:50–09:00 UTC (records + ride-along) — GREEN (G9 named to first order; fix pass becomes PHASE-2-NULLFIX)
+
+**What we did.** Session 9 wrote the research (R1) and landed the console-side attribution
+(D33: `fault_attribution` at the ring3 kill path — map rows around rip, the GPR file,
+stack qwords — plus D34, the `trace-err` relay, both machine-crate, off-by-default).
+Session 10 built the probe (D35/D36: the `mmaparms`/`sysinfo` java-free arms, the seven
+pass conditions) and ran it to `RESULT PASS` (guest `0.1.0-800e8c80-denver`, wall 43 s:
+rig identity, tokioprobe, RWX ride, MAPS 12 lines / AUXV 15 pairs agreeing on
+`AT_SYSINFO_EHDR`, MMARMS contract facts, SYSINFO recorded, **NAME PASS** — the
+kernel-side map row covers the python-checked rip and the host arithmetic names ld-musl
+fstatat's copy-out) — and was cut off before its records. Session 11 opened on exactly
+that state: evidence in, bookkeeping missing. STATE.md + the gate log + git reconstructed
+the narrative without one whole-file read (the digest did its designed job); no probe
+re-run was needed — the log's guest stamp is HEAD and its NAME lines match the
+working-tree probe's format, so the evidence is current by construction.
+
+**The gate's payoff, read end-to-end (D38).** The console window's ring line is the death
+explained: musl's fstatat ran the raw `stat` (nr=4) with a REAL buf
+(`a2=0x6fffffffba80`) — SUCCESS — then its own copy-out faulted at the `rep stos` with
+rdi=0. r8/r9/r10 were zeroed across the syscall. The `regpreserve` canary arm (staged
+into the image at 07:57, never dispatched by the passing script; session 11 booted the
+gate build once and ran it java-free) confirmed the class: lazy faults and plain syscalls
+keep every register canary; **the kernel copying syscall results into an unfaulted user
+page clobbers ALL six callee regs**, restoring the syscall's *internal* marshaled
+arguments (`rdi=0xffffffffffffff9c`=AT_FDCWD, `rdx`=the buf). G9's NULL store is a
+**trap-frame preservation bug on the syscall-internal fault-retry path** — not a
+userspace NULL, not the mmap contract. Also in the log, recorded-not-judged: mmap W+X
+encodes never-writable here (Linux honors it) — a fix candidate for the suspects list,
+unrelated to G9's cr2=0 death.
+
+**The decision the measurement forced.** D37 offered the fix-in-this-gate branch only for
+"a small, precedented contract fix"; what the evidence named is the frame-handling core
+of the syscall dispatch — not small, and not yet bisected (the arm's shape-(b) vs shape-(c)
+split is the axis: the same stat with a pre-faulted buf page keeps regs if the
+fault-inside-copy-out is the trigger). Honest branch taken: GREEN = named to first order;
+the fix is the next pass's opening job. **NEXT GATE: PHASE-2-NULLFIX** — (1) bisect the
+clobber path in `akuma-tokio-kernel-amd64`'s dispatch; (2) fix behind an off-by-default
+feature relayed 1:1 (R6), metal untouched; (3) regpreserve all-REGPASS; (4) the java arm
+MOVES or the fix isn't one (D37). SYSINFO `errno=38` in the same log feeds G7: main's
+merged changes did not serve sysinfo — PHASE-2-MEMINFO stays on the ladder behind the fix.
+
+**Machine facts recorded (not fought):** an arm staged into the image but never dispatched
+by the probe script is dead evidence — dispatch every arm you stage, or run it standalone
+(java-free arms cross the wire even while java stalls nothing). The guest ended on its own
+after the ride-along's ssh timeout; the first `echo stop` EINVAL'd *because* it was already
+gone — re-issued, zero vm processes remained, no orphaned slot. And the commit-hygiene
+catch: session 10's kernel-side refinements to D33 (stack window 64→256 B in four lines;
+`ring_dump_slot` newest-first, capped — the gate log's format matches this exact state)
+were left uncommitted, so the passing kernel was built from the working tree, not HEAD;
+session 11 verified both builds green (gate feature set 27.9 s, default 26.9 s, lints
+clean) and committed source and evidence together — the proof and the code it ran on now
+share a commit.
+
+**Interventions:** two, both in RESULT.md — the cut-off session's records (reconstructed,
+not re-run), and the staged-but-never-dispatched arm.
+
+NEXT GATE: PHASE-2-NULLFIX

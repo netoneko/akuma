@@ -10,3 +10,6 @@ session denver-PHASE-2-FAULTNAME wall=17 in=2.5M out=50k final_ctx=86k cache_rea
 session denver-PHASE-2-VDSO wall=62 in=19.3M out=131k final_ctx=220k cache_read=99% tools=138
 session denver-merge-main wall=35 in=11.0M out=68k final_ctx=151k cache_read=99% tools=136
 session denver-improve wall=26 in=3.6M out=78k final_ctx=111k cache_read=97% tools=69
+session denver-PHASE-2-PROCFS wall=73 in=17.5M out=102k final_ctx=175k cache_read=99% tools=151
+session denver-PHASE-2-PROCFS wall=44 in=4.5M out=68k final_ctx=114k cache_read=97% tools=227
+session denver-PHASE-2-NULLSTORE wall=76 in=17.7M out=123k final_ctx=194k cache_read=99% tools=184

@@ -107,3 +107,18 @@ the RED phase proves the probes themselves before any pass claims anything.
   arm runs java with the 2 ms maps poll (nine reconnect stalls over ~2.5 min, no recovery
   even after the workload died) — a probe's own cadence is part of its cost; the attribution
   report may need a slower poll or a console-side path (G9's session owns that choice).
+- 2026-11-14 (PHASE-2-NULLSTORE GREEN): two probe facts, both measured. (a) **An arm that
+  isn't dispatched is dead evidence**: `regpreserve` was compiled and staged into the
+  guest image (binary+image same-second mtimes prove it) but probe-nullstore.sh had no
+  dispatch line — the `RESULT PASS` run carried it unused, and the fix gate would have
+  started from a hypothesis instead of a measurement. Rule: every staged arm gets a
+  dispatch line before the run is called complete, or a documented standalone invocation
+  (java-free arms cross sshd's wire even while java runs — dispatch them *after* the
+  verdict, ride-along style, exactly as session 11 did). (b) **The register-canary arm
+  pattern** (canaries in callee regs → operation → read-back, HOST = ABI truth): three
+  shapes (lazy fault / plain syscall / kernel-copy-out-into-unfaulted-page) split a
+  "regs got clobbered somewhere" suspicion into a located trigger in ONE run —
+  lazy and plain syscall kept every canary, only the kernel-write shape lost all six,
+  and the restored *values* (AT_FDCWD, the buf) identified what rebuilt them. The shape
+  library generalizes: any "state changes across a ring transition" question is one
+  canary arm per candidate transition away from a verdict.

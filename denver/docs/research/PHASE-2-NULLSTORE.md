@@ -195,3 +195,54 @@ Knob: `GOOSE_TOOL_CALL_CUTOFF` left at default (10) — this session's biggest s
 tool outputs were the maps/gate-log greps; measure `final ctx` in COST_LEDGER.md
 against PHASE-2-PROCFS's 123k to judge whether the cutoff summarizes well on GLM
 before the operator ever enables it. (Recorded, not applied — the operator owns it.)
+
+---
+
+## Outcome (session 11, 2026-11-14 ~08:50–09:00 UTC — the verdict, then what the evidence forced)
+
+**Verdict: PASS** (`denver/gates/PHASE-2-NULLSTORE.log`, guest `0.1.0-800e8c80-denver` =
+HEAD, wall 43 s) — conditions 1–7 green: rig identity, tokioprobe, RWX ride, `MAPS PASS`
+lines=12 / `AUXV PASS` 15 pairs, MMARMS (with one **recorded-not-judged** divergence: an
+executable mmap encodes as never-writable here, Linux honors W+X — mm.rs's own comment; a
+fix candidate for the REQUIREMENTS suspects, not G9's shape: G9's death stores to cr2=0),
+`SYSINFO INFO errno=38` (ENOSYS — recorded; **G7's feed: main's merged changes did not
+serve sysinfo**), and NAME PASS (fault at the python-checked rip; the kernel-side
+`[Fault] ring3 map` row covers it; the host arithmetic names **ld-musl fstatat's
+copy-out**). Session 10 ran this and was cut off before its records; session 11
+reconstructed from STATE.md + the gate log + git and needed no re-run (the log's guest
+stamp is HEAD and its NAME lines match the working-tree probe's format).
+
+**D38 — the ring read end-to-end, then its java-free confirmation.** The console window's
+ring line names the upstream: musl's fstatat ran the raw `stat` (nr=4,
+a1=path=0x6fffffffbd20, **a2=buf=0x6fffffffba80 — a real buffer**) at rip=0x3005fbfa,
+SUCCESS (ret 0) — then its own copy-out faulted at the `rep stos` with rdi=0x0: the saved
+buf (r8) and r9/r10 were 0 by the time a *successful* syscall returned. The staged-but-
+never-dispatched `regpreserve` arm (java-free; sshd survives) confirmed the class on the
+same build this session, `REGPASS/REGRED` in the gate log's ride-along section:
+
+- lazy-fault fill (first store to a fresh anon page): every canary kept;
+- a plain syscall: every canary kept;
+- **the death-site shape — the kernel copying syscall results into an UNFAULTED user
+  page: ALL SIX callee regs clobbered**, restored as the syscall's *internal* marshaled
+  arguments (rdi=`0xffffffffffffff9c`=AT_FDCWD, rsi=a mapping base, rdx=the buf; the
+  `stat` itself returned −2 ENOENT as expected).
+
+Class, measured: **the syscall-internal fault-retry path (copy_to_user fault → fill →
+retry) rebuilds the saved user GPR file.** For the JVM that zeroed musl's saved r8 and
+turned a successful stat into the NULL store. Not a userspace bug, not the mmap contract —
+a trap-frame preservation bug in `akuma-tokio-kernel-amd64`'s syscall dispatch around the
+retry re-entry.
+
+**Next gate: PHASE-2-NULLFIX** (G9's fix pass; the name goes into REQUIREMENTS and the
+LOOP_LOG transition). Opening jobs, in order: (1) bisect the clobber path — the arm's
+(b)/(c) split is the axis (the same `stat` with a PRE-faulted buf page should keep regs if
+the fault-inside-copy-out is the trigger, not the syscall number); (2) fix the
+preservation behind an off-by-default feature relayed 1:1 (R6; the D29/D34 relay shape),
+metal untouched; (3) `regpreserve` expects REGPASS on every shape; (4) the java arm must
+MOVE — a different fault line or progress past fstatat — never die the same way (D37's
+honesty rule). Precedents to read first (R9): the metal's frame discipline
+(`usermode.rs`, `strace_nr=`) and the Chromium archive's Fixes 10–13 class (a kernel
+answering a transition detail wrong, read through the dying caller's eyes).
+
+*(The experiment proposal above stays as recorded — knob `GOOSE_TOOL_CALL_CUTOFF`, judged
+by this session's `final_ctx` in COST_LEDGER.md against PROCFS's 175k/123k rows.)*

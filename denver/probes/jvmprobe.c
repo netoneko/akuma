@@ -478,16 +478,38 @@ static int child_mmaparms(void) {
             if (v != 42) fails++;
         }
     }
-    /* (3) RWX under wx-relaxed */
+    /* (3) RWX under wx-relaxed. Recorded, not judged: this kernel's mmap
+     * arm encodes an executable mapping as never-writable (mm.rs mmap_arm:
+     * "W^X refused W+X above, so an executable mapping is never writable"),
+     * while real Linux honors W+X — the metal run of this very arm passes
+     * the write+call. So read what the mapping BECAME from /proc/self/maps
+     * (non-crashing) and name the divergence if it shows. */
     unsigned char *wx = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (wx == MAP_FAILED) { printf("MMARMS INFO rwx mmap errno=%d (%s) (policy refused)\n", errno, estr(errno)); }
     else {
-        memcpy(wx, code, sizeof code);
-        int (*f2)(void) = (int (*)(void))wx;
-        int v = f2();
-        printf("MMARMS %s rwx call=%d\n", v == 42 ? "PASS" : "RED", v);
-        if (v != 42) fails++;
+        char want[32];
+        snprintf(want, sizeof want, "%lx-", (unsigned long)wx & ~0xFFFUL);
+        int saw_w = -1;
+        FILE *m = fopen("/proc/self/maps", "r");
+        char line[256];
+        while (m && fgets(line, sizeof line, m))
+            if (!strncmp(line, want, strlen(want))) {
+                const char *p = strchr(line, ' ');
+                saw_w = p ? (p[2] == 'w') : -1; /* perms = p[1..4]: rwx */
+                break;
+            }
+        if (m) fclose(m);
+        if (saw_w == 1) {
+            memcpy(wx, code, sizeof code);
+            int (*f2)(void) = (int (*)(void))wx;
+            int v = f2();
+            printf("MMARMS %s rwx call=%d\n", v == 42 ? "PASS" : "RED", v);
+            if (v != 42) fails++;
+        } else {
+            printf("MMARMS RED rwx-mapped-perm-w=%d (mmap W+X dropped W; Linux honors it) base=%p\n", saw_w, (void *)wx);
+            fails++;
+        }
     }
     munmap(base, RES);
     return fails ? 1 : 0;
@@ -527,6 +549,150 @@ static int arm_sysinfo(void) {
     return 0;
 }
 
+/* ---------------- regpreserve (PHASE-2-NULLSTORE) ----------------
+ * The kill-site evidence: JLI_Launch passed a real &sbuf (lea -0xc0(%rbp)) but
+ * fstatat received buf=0; the fatal syscall's return also restored rsi/r9 to
+ * their fstatat-ENTRY values instead of the syscall's. Class: user GPRs change
+ * across a ring transition (fault or syscall). This arm sets canaries in the
+ * caller-saved registers and reads them back after (a) a lazy fault (the first
+ * store to a fresh anonymous page — the fill path) and (b) a plain syscall
+ * (getppid; rcx/r11 are architecturally clobbered by the `syscall`
+ * instruction itself, so they are excluded from (b) only). HOST = the ABI
+ * truth; GUEST = the suspect. VERDICT: REGPASS kept | REGRED reg=..!=.. . */
+static int child_regpreserve(void) {
+    int fails = 0;
+    void *p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) { printf("REGRED mmap errno=%d\n", errno); return 1; }
+    unsigned long addr = (unsigned long)p;
+
+    /* (a) lazy fault: canaries -> first store to the fresh page (faults, the
+     * kernel fills, retries) -> read back. */
+    unsigned long o8, o9, o10, o11, osi, odx, odi, ocx;
+    asm volatile(
+        "movabs $0x1111111111111001, %%r8\n\t"
+        "movabs $0x2222222222222002, %%r9\n\t"
+        "movabs $0x3333333333333003, %%r10\n\t"
+        "movabs $0x4444444444444004, %%r11\n\t"
+        "movabs $0x5555555555555005, %%rdi\n\t"
+        "movabs $0x6666666666666006, %%rsi\n\t"
+        "movabs $0x7777777777777007, %%rdx\n\t"
+        "movabs $0x8888888888888008, %%rcx\n\t"
+        "movb $0x42, (%[ad])\n\t"
+        "movq %%r8, %[o8]\n\t"
+        "movq %%r9, %[o9]\n\t"
+        "movq %%r10, %[o10]\n\t"
+        "movq %%r11, %[o11]\n\t"
+        "movq %%rdi, %[odi]\n\t"
+        "movq %%rsi, %[osi]\n\t"
+        "movq %%rdx, %[odx]\n\t"
+        "movq %%rcx, %[ocx]\n\t"
+        : [o8]"=m"(o8), [o9]"=m"(o9), [o10]"=m"(o10), [o11]"=m"(o11),
+          [odi]"=m"(odi), [osi]"=m"(osi), [odx]"=m"(odx), [ocx]"=m"(ocx)
+        : [ad]"r"(addr)
+        : "rax", "r8", "r9", "r10", "r11", "rdi", "rsi", "rdx", "rcx", "memory", "cc");
+    struct { const char *n; unsigned long got, want; } fa[] = {
+        { "r8", o8, 0x1111111111111001UL }, { "r9", o9, 0x2222222222222002UL },
+        { "r10", o10, 0x3333333333333003UL }, { "r11", o11, 0x4444444444444004UL },
+        { "rdi", odi, 0x5555555555555005UL }, { "rsi", osi, 0x6666666666666006UL },
+        { "rdx", odx, 0x7777777777777007UL }, { "rcx", ocx, 0x8888888888888008UL },
+    };
+    for (int i = 0; i < 8; i++) {
+        if (fa[i].got == fa[i].want) printf("REGPASS %s kept across lazy-fault store\n", fa[i].n);
+        else { printf("REGRED %s=0x%lx != 0x%lx across lazy-fault store\n", fa[i].n, fa[i].got, fa[i].want); fails++; }
+    }
+
+    /* (b) syscall boundary: canaries -> getppid -> read back (rcx/r11 are the
+     * `syscall` instruction's own clobbers, excluded). */
+    unsigned long s8, s9, s10, sdi, ssi, sdx;
+    asm volatile(
+        "movabs $0x1111111111111001, %%r8\n\t"
+        "movabs $0x2222222222222002, %%r9\n\t"
+        "movabs $0x3333333333333003, %%r10\n\t"
+        "movabs $0x5555555555555005, %%rdi\n\t"
+        "movabs $0x6666666666666006, %%rsi\n\t"
+        "movabs $0x7777777777777007, %%rdx\n\t"
+        "mov $110, %%eax\n\t"
+        "syscall\n\t"
+        "movq %%r8, %[s8]\n\t"
+        "movq %%r9, %[s9]\n\t"
+        "movq %%r10, %[s10]\n\t"
+        "movq %%rdi, %[sdi]\n\t"
+        "movq %%rsi, %[ssi]\n\t"
+        "movq %%rdx, %[sdx]\n\t"
+        : [s8]"=m"(s8), [s9]"=m"(s9), [s10]"=m"(s10),
+          [sdi]"=m"(sdi), [ssi]"=m"(ssi), [sdx]"=m"(sdx)
+        :
+        : "rax", "r8", "r9", "r10", "rdi", "rsi", "rdx", "rcx", "r11", "memory", "cc");
+    struct { const char *n; unsigned long got, want; } sb[] = {
+        { "r8", s8, 0x1111111111111001UL }, { "r9", s9, 0x2222222222222002UL },
+        { "r10", s10, 0x3333333333333003UL },
+        { "rdi", sdi, 0x5555555555555005UL }, { "rsi", ssi, 0x6666666666666006UL },
+        { "rdx", sdx, 0x7777777777777007UL },
+    };
+    for (int i = 0; i < 6; i++) {
+        if (sb[i].got == sb[i].want) printf("REGPASS %s kept across syscall\n", sb[i].n);
+        else { printf("REGRED %s=0x%lx != 0x%lx across syscall\n", sb[i].n, sb[i].got, sb[i].want); fails++; }
+    }
+    /* (c) THE SHAPE FROM THE DEATH SITE: the kernel itself writes the result
+     * into an UNFAULTED user page (stat's 144-byte copy out; the ring-0 fault
+     * → fill → retry path). Canaries around it. */
+    printf("REGINFO c-start\n");
+    void *q = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (q == MAP_FAILED) { printf("REGRED mmap2 errno=%d\n", errno); return 1; }
+    unsigned long qaddr = (unsigned long)q;
+    printf("REGINFO c-mmap q=%p\n", q);
+    unsigned long k8, k9, k10, kdi, ksi, kdx, kr;
+    asm volatile(
+        "movabs $0x1111111111111001, %%r8\n\t"
+        "movabs $0x2222222222222002, %%r9\n\t"
+        "movabs $0x3333333333333003, %%r10\n\t"
+        "movabs $0x5555555555555005, %%rdi\n\t"
+        "movabs $0x6666666666666006, %%rsi\n\t"
+        "movabs $0x7777777777777007, %%rdx\n\t"
+        "mov %[pa], %%rdi\n\t"        /* stat(path, q): q never touched */
+        "mov %[qb], %%rsi\n\t"
+        "mov $4, %%eax\n\t"
+        "syscall\n\t"
+        "movq %%rax, %[kr]\n\t"
+        "movq %%r8, %[k8]\n\t"
+        "movq %%r9, %[k9]\n\t"
+        "movq %%r10, %[k10]\n\t"
+        "movq %%rdi, %[kdi]\n\t"
+        "movq %%rsi, %[ksi]\n\t"
+        "movq %%rdx, %[kdx]\n\t"
+        : [k8]"=m"(k8), [k9]"=m"(k9), [k10]"=m"(k10),
+          [kdi]"=m"(kdi), [ksi]"=m"(ksi), [kdx]"=m"(kdx), [kr]"=m"(kr)
+        : [pa]"r"(addr), [qb]"r"(qaddr)
+        : "rax", "r8", "r9", "r10", "rdi", "rsi", "rdx", "rcx", "r11", "memory", "cc");
+    printf("REGINFO c-syscall stat returned %ld (rdx canary %s)\n", (long)kr,
+           kdx == 0x7777777777777007UL ? "kept" : "LOST");
+    struct { const char *n; unsigned long got, want; } kc[] = {
+        { "r8", k8, 0x1111111111111001UL }, { "r9", k9, 0x2222222222222002UL },
+        { "r10", k10, 0x3333333333333003UL },
+        { "rdi", kdi, 0x5555555555555005UL }, { "rsi", ksi, 0x6666666666666006UL },
+        { "rdx", kdx, 0x7777777777777007UL },
+    };
+    for (int i = 0; i < 6; i++) {
+        if (kc[i].got == kc[i].want) printf("REGPASS %s kept across kernel-write-to-unfaulted-page\n", kc[i].n);
+        else { printf("REGRED %s=0x%lx != 0x%lx across kernel-write-to-unfaulted-page\n", kc[i].n, kc[i].got, kc[i].want); fails++; }
+    }
+    munmap(q, 4096);
+    munmap(p, 4096);
+    return fails ? 1 : 0;
+}
+
+static int arm_regpreserve(void) {
+    pid_t pid = fork();
+    if (pid == 0) _exit(child_regpreserve());
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (WIFSIGNALED(st)) {
+        printf("REGRED CRASH signal=%d\n", WTERMSIG(st));
+        return 1;
+    }
+    return WEXITSTATUS(st);
+}
+
 /* ---------------- main ---------------- */
 static void usage(void) {
     fprintf(stderr,
@@ -548,6 +714,7 @@ int main(int argc, char **argv) {
     if (!strcmp(arm, "maps")) return arm_maps();
     if (!strcmp(arm, "mmaparms")) return arm_mmaparms();
     if (!strcmp(arm, "sysinfo")) return arm_sysinfo();
+    if (!strcmp(arm, "regpreserve")) return arm_regpreserve();
     if (!strcmp(arm, "name")) return argc < 4 ? usage(), 2 : arm_name(argv + 2);
     if (!strcmp(arm, "java")) return argc < 3 ? usage(), 2 : arm_java(argv + 2);
     return usage(), 2;

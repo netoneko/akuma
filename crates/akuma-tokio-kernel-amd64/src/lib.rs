@@ -1151,25 +1151,31 @@ fn fault_attribution(t: &Trap<'_>) {
         g.r14,
         g.r15
     );
-    let mut words = [0u8; 64];
+    let mut words = [0u8; 256];
     if copy_from_user(&mut words, t.frame.rsp) {
-        // Eight stack qwords, oldest convention: [rsp] first. A return address
-        // among them names the caller once the probe maps it onto a module.
-        let w = core::array::from_fn::<u64, 8, _>(|i| {
+        // Thirty-two stack qwords, [rsp] first. `fstatat`'s frame is 0xc8 deep,
+        // so its return address lands at [rsp+0xc8] — qword 25; the 144-byte
+        // `struct stat` musl fills sits at [rsp+0x30..0xc0]. Both inside this
+        // window; a return address among these names the caller.
+        let w = core::array::from_fn::<u64, 32, _>(|i| {
             u64::from_le_bytes(words[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]))
         });
-        akuma_primitives::safe_print!(
-            224,
-            "[Fault] ring3 stack [rsp..+64)={:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}\n",
-            w[0],
-            w[1],
-            w[2],
-            w[3],
-            w[4],
-            w[5],
-            w[6],
-            w[7]
-        );
+        for half in 0..4 {
+            akuma_primitives::safe_print!(
+                224,
+                "[Fault] ring3 stack [rsp+{}..+{})={:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}\n",
+                half * 64,
+                half * 64 + 64,
+                w[half * 8],
+                w[half * 8 + 1],
+                w[half * 8 + 2],
+                w[half * 8 + 3],
+                w[half * 8 + 4],
+                w[half * 8 + 5],
+                w[half * 8 + 6],
+                w[half * 8 + 7]
+            );
+        }
     } else {
         akuma_primitives::safe_print!(64, "[Fault] ring3 stack [rsp..+64) unreadable\n");
     }
@@ -1520,10 +1526,18 @@ fn trace_ring(nr: u64, r: u64, a1: u64, a2: u64, a3: u64, rip: u64) {
 /// Print `slot`'s entries among the newest `last` of the syscall ring, oldest first.
 #[cfg(feature = "trace-err")]
 fn ring_dump_slot(slot: i32, last: usize) {
+    // Newest first (PHASE-2-NULLSTORE: the death window must include the FINAL
+    // calls; an oldest-first scan of a shared ring showed samples from the
+    // middle of the window and hid the lethal syscall). Capped at `last`.
     RING.view(|head, ring| {
-        for i in 0..N {
+        let mut shown = 0;
+        for i in (0..N).rev() {
+            if shown >= last {
+                break;
+            }
             let (sl, n, x, y, z, ret, rp) = ring[(head + i) % N];
-            if n != 0 && sl == slot && i + last >= N {
+            if n != 0 && sl == slot {
+                shown += 1;
                 akuma_primitives::safe_print!(
                     112, "[ring] nr={} a=0x{:x},0x{:x},0x{:x} -> {} rip=0x{:x}\n",
                     n, x, y, z, ret as i64, rp

@@ -75,3 +75,18 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   D31 probe was the first complete one and it was GREEN — the two-session gate (research +
   probe in session 1, fix + records in session 2) spent its first two runs buying two real
   findings (the false-FAIL constant, the model divergence) before the pass.
+- 2026-11-14 (PHASE-2-NULLSTORE GREEN, across a cut): the loop's first **records-after-cutoff
+  reconstruction**, and the digest did its designed job. Session 10 reached `RESULT PASS`
+  (guest = HEAD, wall 43 s) and was killed before its records; session 11 rebuilt the
+  narrative from STATE.md + the gate log + `git diff` alone — no whole-file read, no probe
+  re-run needed (the log's guest stamp being HEAD plus its NAME lines matching the
+  working-tree probe's format made the evidence current *by construction*). What the
+  cutoff cost is now a number: 194k final ctx, 184 calls, 76 min (COST_LEDGER) spent to
+  leave records the next session had to rediscover; the records-before-turn-~120 rule is
+  load-bearing, not ceremony. Second lesson in the same event: **the rig is a cheap
+  oracle after the verdict, too** — the prior session had compiled and staged a canary
+  arm (`regpreserve`) but never dispatched it; booting the same gate build once and
+  running the java-free arm over ssh converted the gate's "named" verdict into a
+  *measured mechanism* (D38) for the price of one boot. Named ≠ understood; if the
+  evidence leaves a mechanical question open and a java-free arm can answer it, spend the
+  boot before writing the transition.

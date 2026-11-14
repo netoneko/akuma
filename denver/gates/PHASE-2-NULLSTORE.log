@@ -1,0 +1,165 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-nullstore.spec (elapsed=3s)
+== rig identity: uname says denver, NOT f0dcacb6, NOT 3531cf69 (elapsed=7s)
+Linux denver 0.1.0-800e8c80-denver 800e8c80-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=7s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-800e8c80-denver 800e8c80-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.22s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (rides; this binary carries wx-relaxed AND vsyscall AND procfs-diag AND trace-err) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== procfs-diag alive: the maps arm (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+MAPS-LINE: 10000000-10001000 r--p 00000000 00:00 0 
+MAPS-LINE: 10001000-10004000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10007000-10009000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000a000-1000b000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000c000-1000d000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000e000-1000f000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000f000-10010000 r--p 00000000 00:00 0 
+MAPS-LINE: 10011000-10012000 r--p 00000000 00:00 0 
+MAPS-LINE: 10012000-10014000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10053000-10064000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10094000-10095000 rw-p 00000000 00:00 0 
+MAPS-LINE: 6ffffffff000-700000000000 rw-p 00000000 00:00 0 
+MAPS PASS lines=12 exec_lines=5 bytes=500
+== procfs-diag alive: the auxv arm (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096 AT_SYSINFO_EHDR matches stack=18446744073699061760
+== the contract facts, java-free (D35): mmaparms (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+MMARMS PASS len0 MAP_FAILED EINVAL
+MMARMS PASS oversize MAP_FAILED errno=12
+MMARMS PASS reserve base=0x600000000000 size=50331648 prot=NONE
+MMARMS PASS commit-RW write-readback off=0
+MMARMS PASS commit-RX call=42
+MMARMS RED rwx-mapped-perm-w=-1 (mmap W+X dropped W; Linux honors it) base=0x600003000000
+== sysinfo recorded (G7's feed; this gate does not judge it) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+SYSINFO INFO errno=38 (Function not implemented)
+  (recorded for the G7 pass)
+== the payoff: the java arm - the CONSOLE now names the death (D33/D34); sshd may starve (session 8's data) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+[ssh] reconnecting in 2s (attempt 1/10)
+[ssh] connecting to 127.0.0.1:2247...
+  (arm dispatched; its stdout was expected to stall - the verdict is console-side)
+== the console window: fault + attribution + the dying task's syscall ring (elapsed=41s)
+-- console window: fault line:
+[Fault] ring3 PageFault rip=0x000000003005fc41 rsp=0x00006fffffffba50 cr2=0x0000000000000000 code=0x6 -- task killed
+-- console window: slot line:
+[Fault] slot 7 killed (SIGSEGV)
+-- console window: attribution lines (D33):
+[Fault] ring3 map at rip=0x000000003005fc41 in 0x3005f000-0x3006a000 r-xs
+[Fault] ring3 map below rip=0x000000003005fc41 in 0x30057000-0x30058000 r-xs
+[Fault] ring3 map above rip=0x000000003005fc41 in 0x3006b000-0x3006d000 r-xs
+[Fault] ring3 map at rip=0x000000003005fc41 in 0x3005f000-0x3006a000 r-xs
+[Fault] ring3 map below rip=0x000000003005fc41 in 0x30057000-0x30058000 r-xs
+[Fault] ring3 map above rip=0x000000003005fc41 in 0x3006b000-0x3006d000 r-xs
+[Fault] ring3 regs rip=0x000000003005fc41 rsp=0x00006fffffffba50 rax=0x0 rbx=0x6fffffffbd20 rcx=0x12 rdx=0x6fffffffba80
+[Fault] ring3 regs rsi=0x6fffffffbd20 rdi=0x0 rbp=0x6fffffffbc00 r8=0x0 r9=0x0 r10=0x0
+[Fault] ring3 regs r11=0x246 r12=0x6fffffffcd20 r13=0x1000 r14=0x60000002cca1 r15=0x6fffffffdd20
+[Fault] ring3 regs rip=0x000000003005fc41 rsp=0x00006fffffffba50 rax=0x0 rbx=0x6fffffffbd20 rcx=0x12 rdx=0x6fffffffba80
+[Fault] ring3 regs rsi=0x6fffffffbd20 rdi=0x0 rbp=0x6fffffffbc00 r8=0x0 r9=0x0 r10=0x0
+[Fault] ring3 regs r11=0x246 r12=0x6fffffffcd20 r13=0x1000 r14=0x60000002cca1 r15=0x6fffffffdd20
+[Fault] ring3 stack [rsp+0..+64)=00006fffffffbb20 00006fffffffba60 0000000000000008 00006fffffffbd20 00000000ffffffff 0000000000000000 0000000000000001 00000000000001a5
+[Fault] ring3 stack [rsp+64..+128)=0000000000000001 00000000000081a4 0000000000000000 0000000000000000 0000000001348518 0000000000001000 0000000000009a43 000000006ae5ac1c
+[Fault] ring3 stack [rsp+128..+192)=0000000000000000 000000006af7e8aa 0000000000000000 000000006af7e8aa 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+[Fault] ring3 stack [rsp+192..+256)=00006fffffffbd20 00006000000093ab 00000000300a7d50 0000100000000000 00006fffffffbc6c 0000000000001000 0000000000000000 0000000000000000
+[Fault] ring3 stack [rsp+0..+64)=00006fffffffbb20 00006fffffffba60 0000000000000008 00006fffffffbd20 00000000ffffffff 0000000000000000 0000000000000001 00000000000001a5
+[Fault] ring3 stack [rsp+64..+128)=0000000000000001 00000000000081a4 0000000000000000 0000000000000000 0000000001348518 0000000000001000 0000000000009a43 000000006ae5ac1c
+[Fault] ring3 stack [rsp+128..+192)=0000000000000000 000000006af7e8aa 0000000000000000 000000006af7e8aa 0000000000000000 0000000000000000 0000000000000000 0000000000000000
+[Fault] ring3 stack [rsp+192..+256)=00006fffffffbd20 00006000000093ab 00000000300a7d50 0000100000000000 00006fffffffbc6c 0000000000001000 0000000000000000 0000000000000000
+-- console window: evidence lines (D34):
+[fault-code] rip=0x3005fc41 pte=0x2083d025 pa=0x2083d000 refs=2 read=true bytes=[f3, 48, ab, 48, 8b, 44, 24, 40, 31, ff, 41, 0f, 11, 00, 66, 0f]
+[ring] nr=4 a=0x6fffffffbd20,0x6fffffffba80,0x6fffffffba80 -> 0 rip=0x3005fbfa
+[ring] nr=11 a=0x60000002d000,0x1000,0x0 -> 0 rip=0x300579e7
+[ring] nr=3 a=0x3,0x60000002d510,0x0 -> 0 rip=0x30060593
+[ring] nr=9 a=0x0,0x1000,0x3 -> 105553116450816 rip=0x30057812
+[ring] nr=2 a=0x6fffffffdd20,0x8000,0x1b6 -> 3 rip=0x30061834
+[ring] nr=21 a=0x6fffffffaaf0,0x0,0xffffffff -> 0 rip=0x3006b1ab
+[ring] nr=89 a=0x60000000d9ff,0x6fffffffaaf0,0x1000 -> 17 rip=0x3006bc5e
+[ring] nr=10 a=0x10003000,0x1000,0x1 -> 0 rip=0x300383e9
+[ring] nr=10 a=0x60000002b000,0x1000,0x1 -> 0 rip=0x300383e9
+[ring] nr=10 a=0x300a3000,0x1000,0x1 -> 0 rip=0x300383e9
+[ring] nr=10 a=0x600000010000,0x1000,0x1 -> 0 rip=0x300383e9
+[ring] nr=3 a=0x3,0x0,0x0 -> 0 rip=0x300698ca
+[ring] nr=9 a=0x60000002b000,0x2000,0x3 -> 105553116442624 rip=0x30057812
+[ring] nr=9 a=0x600000025000,0x6000,0x1 -> 105553116418048 rip=0x30057812
+[ring] nr=9 a=0x600000015000,0x10000,0x5 -> 105553116352512 rip=0x30057812
+[ring] nr=9 a=0x0,0x1b000,0x1 -> 105553116340224 rip=0x30057812
+[ring] nr=5 a=0x3,0x6ffffffff640,0x6ffffffff640 -> 0 rip=0x3005fb6a
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30042b2c
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> 3 rip=0x300698ca
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> -2 rip=0x300698ca
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> -2 rip=0x300698ca
+[ring] nr=2 a=0x6ffffffff6c0,0x88000,0x0 -> -2 rip=0x300698ca
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> -2 rip=0x300698ca
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> -2 rip=0x300698ca
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> -2 rip=0x300698ca
+[ring] nr=3 a=0x3,0x0,0x0 -> 0 rip=0x300698ca
+[ring] nr=9 a=0x600000010000,0x2000,0x3 -> 105553116332032 rip=0x30057812
+[ring] nr=9 a=0x60000000d000,0x3000,0x1 -> 105553116319744 rip=0x30057812
+[ring] nr=9 a=0x600000003000,0xa000,0x5 -> 105553116278784 rip=0x30057812
+[ring] nr=9 a=0x0,0x11000,0x1 -> 105553116270592 rip=0x30057812
+[ring] nr=5 a=0x3,0x6ffffffff640,0x6ffffffff640 -> 0 rip=0x3005fb6a
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30042b2c
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> 3 rip=0x300698ca
+[ring] nr=2 a=0x6ffffffff900,0x88000,0x0 -> -2 rip=0x300698ca
+[ring] nr=89 a=0x300a27a5,0x6ffffffff900,0x200 -> 17 rip=0x3006bc5e
+[ring] nr=9 a=0x10005000,0x1000,0x0 -> 105553116266496 rip=0x30057812
+[ring] nr=12 a=0x10007000,0xf27a406295ed0775,0x6ffffffffe88 -> 268464128 rip=0x3002ad2a
+[ring] nr=12 a=0x0,0xf27a406295ed0775,0x6ffffffffe88 -> 268455936 rip=0x3002ad03
+[ring] nr=218 a=0x300a6f90,0x300a6b28,0x10 -> 4 rip=0x30042070
+[ring] nr=158 a=0x1002,0x300a6b28,0x10 -> 0 rip=0x30069856
+[fault-code] rip=0x3005fc41 pte=0x2083d025 pa=0x2083d000 refs=3 read=true bytes=[f3, 48, ab, 48, 8b, 44, 24, 40, 31, ff, 41, 0f, 11, 00, 66, 0f]
+[ring] nr=4 a=0x6fffffffbd20,0x6fffffffba80,0x6fffffffba80 -> 0 rip=0x3005fbfa
+[ring] nr=11 a=0x60000002d000,0x1000,0x0 -> 0 rip=0x300579e7
+[ring] nr=3 a=0x3,0x60000002d510,0x0 -> 0 rip=0x30060593
+== the naming arithmetic (D36 condition 7): range covers the rip, module = ld-musl fstatat (elapsed=43s)
+NAME PASS rip=0x000000003005fc41 in 3005f000-3006a000 perms=r-xs (run base 0x3005f000 is a present-page piece)
+NAME MODULE base=0x30000000 module=ld-musl offset=0x5fc41 -> ld-musl RX segment (0x14000..0x6c59f): fstatat's copy-out (`rep stos`)
+== verdict (elapsed=43s)
+MOVEMENT: G9's NULL store is NAMED - kernel-side attribution + the dying task's syscall ring are in the window; the fix pass reads them
+RESULT PASS
+== wall clock: seconds=43 (t0=1794642138 end=1794642181)
+
+== post-verdict ride-along (2026-11-14 08:53–08:56 UTC, session 11): the regpreserve arm ==
+== staged into denver-jdk.img at 07:57 with the passing binary but NEVER dispatched by the passing run's script; booted THIS gate build fresh and dispatched it java-free (sshd healthy throughout); evidence for the FIX gate (PHASE-2-NULLFIX), not a pass condition ==
+[ssh] connecting to 127.0.0.1:2247...
+Linux denver 0.1.0-800e8c80-denver 800e8c80-release x86_64 GNU/Linux
+REGPASS r8 kept across lazy-fault store
+REGPASS r9 kept across lazy-fault store
+REGPASS r10 kept across lazy-fault store
+REGPASS r11 kept across lazy-fault store
+REGPASS rdi kept across lazy-fault store
+REGPASS rsi kept across lazy-fault store
+REGPASS rdx kept across lazy-fault store
+REGPASS rcx kept across lazy-fault store
+REGPASS r8 kept across syscall
+REGPASS r9 kept across syscall
+REGPASS r10 kept across syscall
+REGPASS rdi kept across syscall
+REGPASS rsi kept across syscall
+REGPASS rdx kept across syscall
+REGINFO c-start
+REGINFO c-mmap q=0x600000001000
+REGINFO c-syscall stat returned -2 (rdx canary LOST)
+REGRED r8=0x0 != 0x1111111111111001 across kernel-write-to-unfaulted-page
+REGRED r9=0x0 != 0x2222222222222002 across kernel-write-to-unfaulted-page
+REGRED r10=0x0 != 0x3333333333333003 across kernel-write-to-unfaulted-page
+REGRED rdi=0xffffffffffffff9c != 0x5555555555555005 across kernel-write-to-unfaulted-page
+REGRED rsi=0x600000000000 != 0x6666666666666006 across kernel-write-to-unfaulted-page
+REGRED rdx=0x600000001000 != 0x7777777777777007 across kernel-write-to-unfaulted-page
+REG READ: lazy-fault fill and a plain syscall preserve every canary; the death-site shape (the kernel copying syscall results into an UNFAULTED user page) clobbers ALL SIX callee regs, restoring the syscall's INTERNAL marshaled arguments (rdi=0xffffffffffffff9c=AT_FDCWD, rsi=a mapping base, rdx=the buf; the stat itself returned -2 ENOENT as expected). G9's mechanism, now measured: the syscall-internal fault-retry path rebuilds the saved user GPR file - musl's fstatat held the caller's real buf in r8 across the raw stat (ring: nr=4 a2=0x6fffffffba80 ret=0), the same clobber zeroed r8, and its copy-out `rep stos` went through rdi=0.
+== slot stop: the guest had ended on its own after the arm's ssh timeout; stop re-issued (first attempt EINVAL'd for that reason), 0 vm processes remain ==

@@ -453,3 +453,56 @@ INTERVENTION: host toolchain facts, recorded for the next sessions — `cargo` a
 
 INTERVENTION: the NAME arm's ssh starvation (detail above) — probe-side cadence, not a
 kernel defect; two reproductions; data for G9's method choice, not a gate condition.
+
+## PHASE-2-NULLSTORE — 2026-11-14, sessions 9–10 (run to PASS, cut off before records) + session 11 ~08:50–09:00 UTC — GREEN (G9 named to first order)
+
+**Session 9–10 work (recovered from git + the gate log, reconstructed by session 11):**
+research artifact (R1, D33–D37), console-side attribution at the ring3 kill path
+(`fault_attribution`: map rows around rip + GPR file + stack qwords, behind `procfs-diag`;
+`trace-err` relayed per D34; metal untouched, default builds byte-identical), probe
+`denver/probe-nullstore.sh` (D36: seven conditions) with jvmprobe `mmaparms`/`sysinfo`
+java-free arms (D35). Probe run: `RESULT PASS` in `denver/gates/PHASE-2-NULLSTORE.log`
+(guest `0.1.0-800e8c80-denver` = HEAD, wall 43 s). What the gate proves: the NULL store is
+**named and explained to first order** — musl fstatat's copy-out (`rep stos`) through a
+buf register the KERNEL zeroed: the raw `stat` inside fstatat succeeded with a real buf
+(ring nr=4 a2=0x6fffffffba80 ret 0), then r8/r9/r10 came back 0. Session 11 ran the
+staged-but-never-dispatched `regpreserve` canary arm java-free on the same build: lazy
+faults and plain syscalls keep every canary; the kernel-copy-out-into-an-unfaulted-page
+shape clobbers all six callee regs, restoring the syscall's internal marshaled arguments
+(rdi=AT_FDCWD, rdx=the buf) — **the syscall-internal fault-retry path rebuilds the user
+GPR file** (D38 in the research artifact). Verdict per D37's honest branch: GREEN = named;
+the fix (trap-frame preservation, bisected first) is PHASE-2-NULLFIX's opening job. Also
+recorded-not-judged in the same log: mmap W+X encodes never-writable (Linux honors W+X) —
+fix candidate for the suspects; `SYSINFO INFO errno=38` — G7's feed (main's merged changes
+did not serve sysinfo; PHASE-2-MEMINFO stays behind the fix).
+
+INTERVENTION: session 10 was cut off after `RESULT PASS` but before its records (LOOP_LOG
+entry, RESULT section, REQUIREMENTS update, the gate-log commit) — exactly the failure
+mode the records-before-turn-~120 rule exists for. Session 11 reconstructed from
+STATE.md + the gate log + git diffs (the log's guest stamp is HEAD; its NAME lines match
+the working-tree probe's format → the evidence is current, no re-run needed). Cost: one
+session's context wasted (194k final ctx, 76 min — COST_LEDGER); the digest mechanism
+itself worked as designed.
+
+INTERVENTION: the `regpreserve` arm was compiled and staged into denver-jdk.img (07:57,
+binary+image same-second mtimes) but probe-nullstore.sh has no dispatch for it — the
+passing run carried dead evidence. Session 11 booted the gate build once and dispatched
+the arm over ssh (java-free → sshd healthy), producing the fix gate's measured datum.
+Rule for probes: an arm that isn't dispatched by the script must be runnable standalone,
+and every staged arm gets a dispatch line before the run is called complete.
+
+INTERVENTION: the ride-along's guest ended on its own after the arm's ssh timeout; the
+first `echo stop > /dev/kvm0` EINVAL'd because the slot was already free — re-issued,
+zero vm processes remained (pgrep). Slot discipline held: one boot, one arm, nothing
+orphaned.
+
+INTERVENTION: session 10's kernel-side refinements to D33 (`fault_attribution` stack
+window 64→256 B; `ring_dump_slot` newest-first capped) were left UNCOMMITTED at the
+cutoff — the gate kernel (`/root/denver/w/denver-nullstore`, mtime 07:42) was built from
+the working tree, so the gate log's output format corresponds to uncommitted source.
+Session 11 re-verified both targets green (`cargo build -p denver --target
+x86_64-unknown-none --release` with and without
+`--features wx-relaxed,vsyscall,procfs-diag,trace-err`; 27.9 s / 26.9 s, lints clean)
+and committed source + evidence in one commit. Note for the next staging session: the
+working tree's `target/` now holds the DEFAULT binary (session 11's last build) — stage
+gate-last as recorded.
