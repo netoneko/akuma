@@ -16,16 +16,16 @@
 //! `build_frame` / `install_handler_frame` — the frame Chromium, Go's
 //! `sigpanic`, V8's wasm traps and Rust's stack-overflow handler were validated
 //! against on metal; R9 precedent: `docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`).
-//! Two deliberate divergences, both recorded in
+//! Two deliberate notes, both recorded in
 //! `denver/docs/research/PHASE-3-JAVAC.md`:
 //!
-//! 1. **The `SigContext` here is the Linux/glibc ABI field order** (`rsp` at
-//!    greg 11 = byte 88, `bx` 96, `dx` 104, `ax` 112, `cx` 120, `rip` 128) —
-//!    the layout musl HotSpot indexes through the `REG_*` constants. The metal
-//!    struct carries `rbx, rdx, rax, rcx, rsp` in those slots (its `rip`/
-//!    `eflags`/`fpstate` offsets happen to match, which is why rip-only
-//!    handlers worked there); this port does not inherit that — a handler
-//!    reading `REG_RSP` must get the interrupted `%rsp`.
+//! 1. **The `SigContext` is the kernel ABI field order, byte-for-byte metal's**
+//!    (`rdi, rsi, rbp, rbx, rdx, rax, rcx, rsp` — `rsp` at greg 15 = byte 120,
+//!    `rax` at 104, `rip` at 128). Measured on real Linux (musl host, 2026-11-14,
+//!    D76 in the artifact): the kernel restores exactly these slots — the first
+//!    port attempt used a mis-remembered "glibc" order (`rsp` at 88) and a
+//!    host ucontext dump disproved it before the first boot; musl's own
+//!    `REG_*` constants name the same order metal carried.
 //! 2. **The guest already has an async frame format** (`child.rs`'s private
 //!    block + zeroed ucontext, restored by its `rt_sigreturn`), so a fault
 //!    frame must be *identifiable* at `rt_sigreturn`. Metal has one frame
@@ -90,10 +90,11 @@ const FX_BYTES: u64 = akuma_sched_amd64::FxArea::SIZE as u64;
 /// this cannot take a signal.
 const FRAME_FOOTPRINT: u64 = FX_BYTES + 64 + RT_SIGFRAME_SIZE as u64 + 16 + 8;
 
-/// `struct sigcontext_64` — the interrupted register file as Linux lays it out
-/// (`arch/x86/include/uapi/asm/sigcontext.h`). Field order is the ABI; the
-/// values are serialized by hand below, so these structs exist to be measured:
-/// the offsets a handler indexes through the `REG_*` constants.
+/// `struct sigcontext_64` — the interrupted register file, the kernel ABI
+/// field order (byte-for-byte metal's `akuma-kernel-amd64::signal::SigContext`).
+/// Field order is the ABI; the values are serialized by hand below, so these
+/// structs exist to be measured: the offsets a handler indexes through the
+/// `REG_*` constants.
 #[repr(C)]
 #[allow(dead_code)] // offsets are the ABI; the values are written as raw bytes
 #[derive(Clone, Copy, Default)]
@@ -109,13 +110,14 @@ struct SigContext {
     rdi: u64,
     rsi: u64,
     rbp: u64,
-    /// glibc `REG_RSP` = 11 — byte 88. (The metal struct carries `rbx` here;
-    /// see the module header, divergence 1.)
-    rsp: u64,
     rbx: u64,
     rdx: u64,
     rax: u64,
     rcx: u64,
+    /// greg 15 — byte 120. (A first draft carried a mis-remembered "glibc"
+    /// order with `rsp` at 88; the host ucontext dump D76 disproved it before
+    /// the first boot — see the module header, note 1.)
+    rsp: u64,
     rip: u64,
     eflags: u64,
     cs: u16,
@@ -185,10 +187,11 @@ struct RtSigFrame {
 }
 
 /// Offsets a handler and a debugger index by hand (metal's assertion block,
-/// restated for this port's Linux-order `SigContext` — the divergence that
-/// matters is `rsp` at 88, not 120).
+/// byte-for-byte: the kernel ABI order the musl `REG_*` constants name).
 const _: () = {
-    assert!(core::mem::offset_of!(SigContext, rsp) == 88);
+    assert!(core::mem::offset_of!(SigContext, rbx) == 88);
+    assert!(core::mem::offset_of!(SigContext, rax) == 104);
+    assert!(core::mem::offset_of!(SigContext, rsp) == 120);
     assert!(core::mem::offset_of!(SigContext, rip) == 128);
     assert!(core::mem::offset_of!(SigContext, eflags) == 136);
     assert!(core::mem::offset_of!(SigContext, err) == 152);
@@ -214,7 +217,8 @@ const OFF_INFO: usize = core::mem::offset_of!(RtSigFrame, info);
 const OFF_SC: usize = OFF_UC + core::mem::offset_of!(UContext, uc_mcontext);
 const OFF_SIGMASK: usize = OFF_UC + core::mem::offset_of!(UContext, uc_sigmask);
 
-/// The `gregs[]` word for `sigcontext` field `word` (glibc's `REG_*` order).
+/// The `gregs[]` word for `sigcontext` field `word` — the kernel ABI order
+/// (musl's `REG_*` constants name these same slots).
 const fn greg(word: usize) -> usize {
     OFF_SC + word * 8
 }
@@ -380,11 +384,11 @@ pub fn deliver(t: &mut akuma_trap_amd64::Trap<'_>, cr2: u64, code: u64) -> bool 
     put(&mut buf, greg(8), t.regs.rdi);
     put(&mut buf, greg(9), t.regs.rsi);
     put(&mut buf, greg(10), t.regs.rbp);
-    put(&mut buf, greg(11), interrupted_rsp);
-    put(&mut buf, greg(12), t.regs.rbx);
-    put(&mut buf, greg(13), t.regs.rdx);
-    put(&mut buf, greg(14), t.regs.rax);
-    put(&mut buf, greg(15), t.regs.rcx);
+    put(&mut buf, greg(11), t.regs.rbx);
+    put(&mut buf, greg(12), t.regs.rdx);
+    put(&mut buf, greg(13), t.regs.rax);
+    put(&mut buf, greg(14), t.regs.rcx);
+    put(&mut buf, greg(15), interrupted_rsp);
     put(&mut buf, greg(16), t.frame.rip);
     put(&mut buf, greg(17), t.frame.rflags);
     put_u16(&mut buf, greg(18), t.frame.cs as u16);
@@ -435,7 +439,11 @@ pub fn deliver(t: &mut akuma_trap_amd64::Trap<'_>, cr2: u64, code: u64) -> bool 
 /// redirect that an implicit null check IS), and any edit it makes must be what
 /// `sysret` resumes. The FPU image comes from `fpstate`, sanitized exactly like
 /// the async arm sanitizes its user-chosen image.
-pub fn sync_sigreturn(fr: &mut ring3::SyscallFrame) -> Option<u64> {
+///
+/// Returns `(rax, rsp)` — the interrupted call's own answer and the `%rsp` to
+/// hand [`crate::child::set_return_rsp`]; `None` = not one of this module's
+/// frames, the async path proceeds untouched.
+pub fn sync_sigreturn(fr: &mut ring3::SyscallFrame) -> Option<(u64, u64)> {
     let slot = crate::exec_twin::current_slot();
     if slot >= NSLOTS {
         return None;
@@ -448,13 +456,13 @@ pub fn sync_sigreturn(fr: &mut ring3::SyscallFrame) -> Option<u64> {
 
     let mut buf = [0u8; RT_SIGFRAME_SIZE];
     if !crate::user_ok(base, RT_SIGFRAME_SIZE as u64) || !crate::copy_from_user(&mut buf, base) {
-        return Some(crate::e(ring3::err::EFAULT));
+        return Some((crate::e(ring3::err::EFAULT), 0));
     }
     let rip = get(&buf, greg(16));
-    let user_rsp = get(&buf, greg(11));
+    let user_rsp = get(&buf, greg(15));
     // Never trust a user-built frame with a kernel address or odd flags.
     if rip >= crate::USER_TOP || user_rsp >= crate::USER_TOP {
-        return Some(crate::e(ring3::err::EFAULT));
+        return Some((crate::e(ring3::err::EFAULT), 0));
     }
     // The FP/SSE file the handler interrupted: a program chooses these bytes,
     // and four kinds of malformed image make `xrstor` a ring-0 #GP, so it is
@@ -464,14 +472,14 @@ pub fn sync_sigreturn(fr: &mut ring3::SyscallFrame) -> Option<u64> {
         akuma_sched_amd64::fpu_reset_live();
     } else {
         let mut img = [0u8; akuma_sched_amd64::FxArea::SIZE];
-        if fx_at % 64 != 0
+        if !fx_at.is_multiple_of(64)
             || !crate::user_ok(fx_at, img.len() as u64)
             || !crate::copy_from_user(&mut img, fx_at)
         {
-            return Some(crate::e(ring3::err::EFAULT));
+            return Some((crate::e(ring3::err::EFAULT), 0));
         }
         let Some(mut fx) = akuma_sched_amd64::FxArea::from_bytes(&img) else {
-            return Some(crate::e(ring3::err::EFAULT));
+            return Some((crate::e(ring3::err::EFAULT), 0));
         };
         fx.sanitize();
         akuma_sched_amd64::fpu_restore_live(&fx);
@@ -481,18 +489,18 @@ pub fn sync_sigreturn(fr: &mut ring3::SyscallFrame) -> Option<u64> {
     fr.r13 = get(&buf, greg(5));
     fr.r12 = get(&buf, greg(4));
     fr.rbp = get(&buf, greg(10));
-    fr.rbx = get(&buf, greg(12));
+    fr.rbx = get(&buf, greg(11));
     fr.r9 = get(&buf, greg(1));
     fr.r8 = get(&buf, greg(0));
     fr.r10 = get(&buf, greg(2));
-    fr.rdx = get(&buf, greg(13));
+    fr.rdx = get(&buf, greg(12));
     fr.rsi = get(&buf, greg(9));
     fr.rdi = get(&buf, greg(8));
-    fr.rax = get(&buf, greg(14));
+    fr.rax = get(&buf, greg(13));
     fr.user_rip = rip;
     fr.user_rflags = (get(&buf, greg(17)) & 0x0000_0CD5) | 0x202;
-    crate::child::set_return_rsp(user_rsp);
     akuma_exec::threading::set_thread_signal_mask(get(&buf, OFF_SIGMASK));
-    // The interrupted call's own result, as the async arm returns.
-    Some(fr.rax)
+    // The interrupted call's own answer, and the `%rsp` it resumes with —
+    // the caller stamps the return stack (its `set_return_rsp`).
+    Some((fr.rax, user_rsp))
 }

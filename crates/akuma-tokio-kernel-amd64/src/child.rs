@@ -229,7 +229,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
 /// restorer.
 static RETURN_RSP: [core::sync::atomic::AtomicU64; NSLOTS] = [const { core::sync::atomic::AtomicU64::new(0) }; NSLOTS];
 
-pub(crate) fn set_return_rsp(rsp: u64) {
+fn set_return_rsp(rsp: u64) {
     let me = crate::exec_twin::current_slot();
     if me < NSLOTS {
         RETURN_RSP[me].store(rsp, core::sync::atomic::Ordering::Relaxed);
@@ -406,7 +406,12 @@ pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
     // not the private block, is the restore source. Not one of the fault
     // frames? The async path below proceeds untouched.
     #[cfg(feature = "fault-signal")]
-    if let Some(rax) = crate::faultsig::sync_sigreturn(fr) {
+    if let Some((rax, rsp)) = crate::faultsig::sync_sigreturn(fr) {
+        // The error paths return `rsp = 0` (nothing was restored; the entry
+        // stash stands, as on EFAULT below) — a real `%rsp` is never 0 here.
+        if rsp != 0 {
+            set_return_rsp(rsp);
+        }
         return rax;
     }
     let at = ring3::user_rsp_stash();
