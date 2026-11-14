@@ -666,10 +666,18 @@ static int child_regpreserve(void) {
         : "rax", "r8", "r9", "r10", "rdi", "rsi", "rdx", "rcx", "r11", "memory", "cc");
     printf("REGINFO c-syscall stat returned %ld (rdx canary %s)\n", (long)kr,
            kdx == 0x7777777777777007UL ? "kept" : "LOST");
+    /* PHASE-2-NULLFIX: the truth for a preserved register is its value at the
+     * syscall ENTRY, and this asm loads rdi/rsi with the arguments itself
+     * (mov path/ buf) — so the entry truth for rdi/rsi is path/q, not the
+     * canaries those two movabs put there a moment earlier (unsatisfiable on
+     * any kernel, host included). The clobber this arm hunts shifts every
+     * slot by one fold argument (rdi=AT_FDCWD, rsi=path, rdx=buf) and zeroes
+     * r8/r9/r10 — a wrong-by-entry-value check still fails on all six. */
     struct { const char *n; unsigned long got, want; } kc[] = {
         { "r8", k8, 0x1111111111111001UL }, { "r9", k9, 0x2222222222222002UL },
         { "r10", k10, 0x3333333333333003UL },
-        { "rdi", kdi, 0x5555555555555005UL }, { "rsi", ksi, 0x6666666666666006UL },
+        { "rdi", kdi, (unsigned long)addr },   /* entry value: the asm loaded the path into rdi */
+        { "rsi", ksi, (unsigned long)qaddr },  /* entry value: the asm loaded the buf into rsi */
         { "rdx", kdx, 0x7777777777777007UL },
     };
     for (int i = 0; i < 6; i++) {

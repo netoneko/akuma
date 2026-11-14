@@ -1,0 +1,144 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-nullfix.spec (elapsed=3s)
+== rig identity: uname says denver, NOT 800e8c80, NOT f0dcacb6, NOT 3531cf69 (elapsed=4s)
+Linux denver 0.1.0-72be5c55-denver 72be5c55-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=4s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-72be5c55-denver 72be5c55-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.11s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (rides; this binary carries wx-relaxed AND vsyscall AND procfs-diag AND trace-err AND fold-regpreserve) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== procfs-diag alive: the maps arm (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+MAPS-LINE: 10000000-10001000 r--p 00000000 00:00 0 
+MAPS-LINE: 10001000-10002000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10003000-10005000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10007000-10009000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000b000-1000d000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000f000-10010000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10010000-10011000 r--p 00000000 00:00 0 
+MAPS-LINE: 10012000-10013000 r--p 00000000 00:00 0 
+MAPS-LINE: 10013000-10015000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10054000-10065000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10095000-10096000 rw-p 00000000 00:00 0 
+MAPS-LINE: 6ffffffff000-700000000000 rw-p 00000000 00:00 0 
+MAPS PASS lines=12 exec_lines=5 bytes=500
+== procfs-diag alive: the auxv arm (elapsed=6s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096 AT_SYSINFO_EHDR matches stack=18446744073699061760
+== the contract facts, java-free (D35): mmaparms (elapsed=6s)
+[ssh] connecting to 127.0.0.1:2247...
+MMARMS PASS len0 MAP_FAILED EINVAL
+MMARMS PASS oversize MAP_FAILED errno=12
+MMARMS PASS reserve base=0x600000000000 size=50331648 prot=NONE
+MMARMS PASS commit-RW write-readback off=0
+MMARMS PASS commit-RX call=42
+MMARMS RED rwx-mapped-perm-w=-1 (mmap W+X dropped W; Linux honors it) base=0x600003000000
+== sysinfo recorded (G7's feed; this gate does not judge it) (elapsed=6s)
+[ssh] connecting to 127.0.0.1:2247...
+SYSINFO INFO errno=38 (Function not implemented)
+  (recorded for the G7 pass)
+== THE FIX, java-free: regpreserve - every canary kept across all three shapes (D41 condition 7) (elapsed=6s)
+[ssh] connecting to 127.0.0.1:2247...
+REGPASS r8 kept across lazy-fault store
+REGPASS r9 kept across lazy-fault store
+REGPASS r10 kept across lazy-fault store
+REGPASS r11 kept across lazy-fault store
+REGPASS rdi kept across lazy-fault store
+REGPASS rsi kept across lazy-fault store
+REGPASS rdx kept across lazy-fault store
+REGPASS rcx kept across lazy-fault store
+REGPASS r8 kept across syscall
+REGPASS r9 kept across syscall
+REGPASS r10 kept across syscall
+REGPASS rdi kept across syscall
+REGPASS rsi kept across syscall
+REGPASS rdx kept across syscall
+REGINFO c-start
+REGINFO c-mmap q=0x600000001000
+REGINFO c-syscall stat returned -2 (rdx canary kept)
+REGPASS r8 kept across kernel-write-to-unfaulted-page
+REGPASS r9 kept across kernel-write-to-unfaulted-page
+REGPASS r10 kept across kernel-write-to-unfaulted-page
+REGPASS rdi kept across kernel-write-to-unfaulted-page
+REGPASS rsi kept across kernel-write-to-unfaulted-page
+REGPASS rdx kept across kernel-write-to-unfaulted-page
+REGINFO c-syscall stat returned -2 (rdx canary kept)
+== the payoff: the java arm - the death must MOVE (D37/D41 condition 8); sshd may starve (session 8's data) (elapsed=6s)
+[ssh] connecting to 127.0.0.1:2247...
+
+[ssh] connection lost: Timeout, server 127.0.0.1 not responding. No data received for 15s over 3 keepalive probes
+  (arm dispatched; java's output goes to /tmp/java-out.log guest-side)
+== the console window: the old death must be absent (elapsed=23s)
+-- console window: fault line:
+[Fault] ring3 PageFault rip=0x000060000067cd7a rsp=0x00006000014fe4c0 cr2=0x00006000112e9000 code=0x7 -- task killed
+-- console window: kill line:
+[Fault] slot 5 killed (SIGSEGV)
+-- console window: evidence lines:
+[ring] tkill by s5; its last syscalls:
+[ring] nr=200 a=0x4,0x22,0x300a6b28 -> 0 rip=0x30044415
+[ring] nr=13 a=0x22,0x6000014fb940,0x0 -> 0 rip=0x3005f26c
+[ring] nr=14 a=0x0,0x300a0c08,0x6000014fb9a0 -> 0 rip=0x3005ef4b
+[ring] nr=324 a=0x8,0x0,0x60000002c7a8 -> -38 rip=0x30044349
+[ring] nr=14 a=0x0,0x300a0c08,0x6000014fbb80 -> 0 rip=0x3005ef4b
+[ring] nr=10 a=0x600001526000,0x2000,0x1 -> 0 rip=0x300383e9
+[ring] nr=3 a=0x3,0x0,0x0 -> 0 rip=0x30067294
+[ring] nr=5 a=0x3,0x6000014fb5d0,0x6000014fb5d0 -> 0 rip=0x3005fb6a
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30042b2c
+[ring] nr=2 a=0x6000014fb890,0x88000,0x0 -> 3 rip=0x30067294
+[ring] nr=3 a=0x3,0x0,0x0 -> 0 rip=0x30067294
+[ring] nr=9 a=0x600001526000,0x3000,0x3 -> 105553138442240 rip=0x30057812
+[ring] nr=9 a=0x600001520000,0x6000,0x1 -> 105553138417664 rip=0x30057812
+[ring] nr=9 a=0x600001507000,0x19000,0x5 -> 105553138315264 rip=0x30057812
+[ring] nr=9 a=0x0,0x24000,0x1 -> 105553138307072 rip=0x30057812
+[ring] nr=5 a=0x3,0x6000014fb5f0,0x6000014fb5f0 -> 0 rip=0x3005fb6a
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30042b2c
+[ring] nr=2 a=0x6000014fc340,0x88000,0x0 -> 3 rip=0x30067294
+[ring] nr=11 a=0x600001505000,0x1000,0x0 -> 0 rip=0x300579e7
+[ring] nr=3 a=0x3,0xfffffffffffffe31,0x1 -> 0 rip=0x30060593
+[ring] nr=8 a=0x3,0xfffffffffffffe31,0x1 -> 680 rip=0x3006b8d6
+[ring] nr=19 a=0x3,0x6000014fbc20,0x2 -> 1079 rip=0x30060680
+[ring] nr=8 a=0x3,0x40,0x0 -> 64 rip=0x3006b8d6
+[ring] nr=19 a=0x3,0x6000014fbc20,0x2 -> 1087 rip=0x30060680
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30060208
+[ring] nr=9 a=0x0,0x1000,0x3 -> 105553138307072 rip=0x30057812
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30061863
+[ring] nr=2 a=0x6000014fc340,0x88000,0x1b6 -> 3 rip=0x30061834
+[ring] nr=4 a=0x6000014fc340,0x6000014fbc90,0x6000014fbc90 -> 0 rip=0x3005fbfa
+MOVED: the death moved - java progressed past fstatat (the old rip never appeared)
+-- a fault at a DIFFERENT rip is progress (D41): its attribution/ring above are the next gate's data
+== best-effort: recover java's output (never a pass condition) (elapsed=33s)
+[ssh] connecting to 127.0.0.1:2247...
+RC=127
+  (sshd did not answer or the file has no version line - the console window above is the verdict's evidence)
+== verdict (elapsed=33s)
+MOVEMENT: G9's NULL store is FIXED behind fold-regpreserve - regpreserve all-REGPASS and the java arm never returned to the old death
+RESULT PASS
+== wall clock: seconds=33 (t0=1794649104 end=1794649137)
+
+== post-verdict window recovery (2026-11-14, session 12): the console head -30 display cut the
+== kill-path attribution out of this log; the rig's vmrun.log held it - appended here so the
+== record is self-contained. The new death (next gate's data, D41 progress):
+[Fault] ring3 PageFault rip=0x000060000067cd7a rsp=0x00006000014fe4c0 cr2=0x00006000112e9000 code=0x7 -- task killed
+[mm] kind=2 0x6000112e9000..0x600011559000 covers fault
+[fault-code] rip=0x60000067cd7a pte=0x20dc6025 pa=0x20dc6000 refs=2 read=true bytes=[4c, 89, 26, c6, 46, 08, 01, 4c, 03, a3, 00, 01, 00, 00, 4c, 89]
+[Fault] ring3 map at rip=0x000060000067cd7a in 0x60000067b000-0x60000067d000 r-xs
+[Fault] ring3 map below rip=0x000060000067cd7a in 0x600000677000-0x600000679000 r-xs
+[Fault] ring3 map above rip=0x000060000067cd7a in 0x6000006a8000-0x6000006aa000 r-xs
+[Fault] ring3 regs rip=0x000060000067cd7a rsp=0x00006000014fe4c0 rax=0x600018db2000 rbx=0x600009da91e0 rcx=0x7 rdx=0x600018db2006
+[Fault] ring3 regs rsi=0x6000112e9000 rdi=0x600018db2000 rbp=0x6000014fe4d0 r8=0x600018db2000 r9=0x0 r10=0x0
+[Fault] ring3 regs r11=0x10007568 r12=0x6 r13=0x2 r14=0xb0 r15=0x3
+[Fault] ring3 stack [rsp+0..+64)=0000600009da91e0 0000000000000040 00006000014fe520 00006000003fe4c3 00006000014fe5b0 0000000100007fe8 00006000014fe550 00000000000000b0
+[Fault] ring3 stack [rsp+64..+128)=0000000000000040 00006000013a7b18 0000000000000000 000060000134b0d0 00006000014fe570 00006000003f3e8a 0000000000000026 0000600000fa0464
+[Fault] ring3 stack [rsp+128..+192)=0000000000000000 00006000014fe800 00006000013eb0c0 00006000013eb0c0 00006000013dcbd8 00000000300a7fa0 00006000014fe7b0 00006000006a99bc
+[Fault] ring3 stack [rsp+192..+256)=00000000000003d8 0000600000b70ca1 00006000013dc7f0 00006000013dc800 0000000000007fd8 0000000000000015 00006000014fe610 c28a103245dd00a5
+[Fault] slot 5 killed (SIGSEGV)

@@ -506,3 +506,28 @@ x86_64-unknown-none --release` with and without
 and committed source + evidence in one commit. Note for the next staging session: the
 working tree's `target/` now holds the DEFAULT binary (session 11's last build) — stage
 gate-last as recorded.
+
+INTERVENTION: kernel builds failed until `/usr/local/rust/bin` was prepended to PATH:
+the host's default `rustc` on PATH is Alpine's stable (1.96.1, no
+`x86_64-unknown-none` target — "can't find crate for `core`"), while the nightly
+cargo 1.101.0 at /usr/local/rust/bin (rustc 1.101.0-nightly, target installed) is
+LAST in PATH, so `rustc --version` and `cargo build` resolve different compilers.
+The rust-toolchain.toml pin (nightly-2026-09-19) is inert without rustup. First
+observed in this session; the autoresearch driver's own build steps presumably run
+with a PATH that has it first.
+
+INTERVENTION: the regpreserve arm's shape (c) rdi/rsi expectations were
+unsatisfiable-by-ABI — the arm's own asm loads rdi/rsi with the syscall arguments,
+so a preserved register must return its ENTRY value (path/buf), not the canaries
+those movabs put there moments earlier. The first PASS attempt failed on exactly
+those two lines while r8/r9/r10/rdx (the proof that matters) came back kept.
+jvmprobe.c now checks rdi/rsi against the entry values (D42), was rebuilt
+(`gcc -static -O2`) and re-injected into denver-jdk.img with `debugfs -w`
+(the first attempt without `-w` opened the image read-only and silently no-oped).
+
+INTERVENTION: the probe's `head -30` evidence display cut the kill-path
+attribution out of the gate log — the fault line and the `[ring]` tkill dump fit,
+but `ring3 map/regs/stack`, `[mm]` and `[fault-code]` did not. Recovered from the
+rig's `vmrun.log` (the real console capture) and appended post-verdict. Rule of
+thumb going forward: display bounds are not evidence bounds — grep the source
+file, and size window displays to the ring's cap (40) + attribution (~15), not 30.

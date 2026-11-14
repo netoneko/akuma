@@ -501,3 +501,54 @@ share a commit.
 not re-run), and the staged-but-never-dispatched arm.
 
 NEXT GATE: PHASE-2-NULLFIX
+
+### PHASE-2-NULLFIX — 2026-11-14, session 12 (~09:05–09:55 UTC) — GREEN (G9 fixed behind `fold-regpreserve`; the java arm moved, a new death is the next gate's data)
+
+**What we did.** The gate opened on D38's hypothesis — a trap-frame preservation bug
+on the syscall-internal fault-retry path — and the bisect broke it in the best way:
+shape (c)'s `stat` returned −2 ENOENT, so its copy-out never ran and no ring-0 fault
+ever fired, yet the REGRED lines stood. The clobber is the **legacy fold** in
+`dispatch_inner` (`akuma_syscalls_abi::legacy::fold(4)` →
+`[AT_FDCWD, path, buf, 0, 0, 0]` written straight into the caller's `SyscallFrame`,
+which the stub then pops back into ring 3). Every folded syscall — 19 x86-only
+numbers, `stat` included — returned the `*at` call's marshaled arguments as the
+caller's register state; musl's saved buf in r8 came back zeroed and its `rep stos`
+stored 144 bytes at NULL. A *successful* folded syscall was the killer. The fix
+(D39): snapshot the six argument registers before the fold, restore them before the
+dispatch returns — behind `fold-regpreserve`, off by default (R6), relayed 1:1
+denver → jvm-kernel → tokio-kernel → amd64, metal untouched.
+
+**What the run forced.** Two decisions the first PASS attempt didn't plan for:
+(D42) the regpreserve arm's shape (c) rdi/rsi wants were unsatisfiable-by-ABI — the
+arm's own asm loads rdi/rsi with the arguments, so a preserved register returns its
+ENTRY value, not the pre-overwrite canary; the probe lied, not the kernel ("a probe
+constant that can lie is a broken probe", measured again). And the display bound
+lied too: `head -30` cut the kill-path attribution out of the gate log — the rig's
+`vmrun.log` held it, and the window was appended post-verdict. The R6 evidence got
+measured instead of asserted: the default build's `.text` is byte-identical to
+HEAD's; the whole-file diff is `.rodata` panic-Location line numbers from the source
+growing 25 lines.
+
+**The payoff, read end-to-end.** regpreserve 20/20 REGPASS — the death-site shape's
+r8/r9/r10 come back kept (the zeros that killed the JVM are gone), rdx's canary
+kept across a fold that never touched a fault path. The java arm MOVED per D37's
+honesty rule: the old rip 3005fc41 never appeared, the previously lethal `stat` ran
+`-> 0` in the dying task's own ring, and java progressed deep into JVM init before
+dying at a new rip. **The new death (PHASE-2-HEAPRO, next gate's data): a user
+WRITE to a PRESENT, read-only page** — `pte=0x20dc6025` (P=1 W=0 U=1, refs=2), from
+an oop store `mov %r12,(%rsi)` in libjvm's `r-xs` text, into cr2=0x6000112e9000,
+and `[mm] kind=2` says the faulting range was MAP_FIXED-released earlier in this
+task's life. CoW-break-refused or a stale RO PTE after the MAP_FIXED release —
+the block is appended to the gate log in full; the re-rank owns it.
+
+**Machine facts recorded (not fought):** the host's `/usr/local/rust/bin` (the
+nightly that carries `x86_64-unknown-none`) is LAST in PATH — `rustc --version`
+prints Alpine's stable and a kernel build fails with "can't find crate for core"
+until PATH is fixed; the java arm's ssh died at ~15 s on its own keepalives, not
+the designed 180 s timeout, and the guest-side arm carried the verdict anyway;
+`debugfs -R` opens the image read-only — writes need `-w`.
+
+**Interventions:** three, in RESULT.md — the PATH fix, the jvmprobe shape-(c)
+expectation fix + mid-gate image re-injection, the window recovery.
+
+NEXT GATE: PHASE-2-HEAPRO

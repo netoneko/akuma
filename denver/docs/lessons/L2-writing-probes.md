@@ -122,3 +122,15 @@ the RED phase proves the probes themselves before any pass claims anything.
   and the restored *values* (AT_FDCWD, the buf) identified what rebuilt them. The shape
   library generalizes: any "state changes across a ring transition" question is one
   canary arm per candidate transition away from a verdict.
+- 2026-11-14 (PHASE-2-NULLFIX GREEN): the same rule, fifth limb — the *expectation* the arm
+  itself makes unsatisfiable. Shape (c)'s asm loads rdi/rsi with the syscall arguments
+  (path/buf), so a preserved register must return its ENTRY value; the arm wanted the canaries
+  those `movabs` put there a moment earlier — unsatisfiable on any kernel, host included, and
+  the first PASS attempt failed on exactly those two lines while r8/r9/r10/rdx (the proof that
+  mattered) came back kept. Rule: **a `want` must be derived from the entry state the arm
+  itself constructs, not from an earlier moment of the same asm** — write the check as
+  "entry value of reg X", computed, never a pasted constant. Sibling, capture-side: the
+  `head -30` evidence display cut the kill-path attribution out of the gate log (fault line +
+  `[ring]` fit; `ring3 map/regs/stack`, `[mm]`, `[fault-code]` did not) — display bounds are
+  not evidence bounds; size window displays to the ring's cap + attribution, and grep the
+  source console (`$W/vmrun.log`) when a record needs the full block.

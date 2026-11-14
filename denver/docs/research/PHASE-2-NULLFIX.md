@@ -133,6 +133,54 @@ None new — PHASE-2-NULLSTORE's recorded proposal (knob
 `GOOSE_TOOL_CALL_CUTOFF` at default, judged by this session's `final_ctx` in
 COST_LEDGER.md) stands for the phase; the operator owns applying it.
 
-## Outcome
+## Outcome (session 12, 2026-11-14 ~09:0x–09:5x UTC — run to PASS)
 
-*(filled after the run)*
+**Verdict: PASS** (`denver/gates/PHASE-2-NULLFIX.log`, guest `0.1.0-72be5c55-denver`,
+wall 33 s) — conditions 1–8 green: rig identity (not nullstore/procfs/vdso),
+tokioprobe, `RWX PASS rw_to_rx=42`, `MAPS PASS lines=12` / `AUXV PASS` 15 pairs,
+MMARMS (the recorded W+X→never-writable divergence rode again, still not judged),
+`SYSINFO INFO errno=38` (G7's feed unchanged), **regpreserve 20/20 REGPASS**
+(shape (c): r8/r9/r10 kept — the JVM-killing zeros are gone — rdi/rsi kept at
+their entry values, rdx canary kept, `stat returned -2 (rdx canary kept)`), and
+**the java arm MOVED**: the old rip 3005fc41 never appeared; the previously
+lethal `stat` (nr 4) shows `-> 0` in the dying task's own ring, and java died
+much later at a NEW rip with a full attribution window.
+
+**The fix, measured.** `fold-regpreserve` (D39) restored the six argument
+registers on the folded path; the regpreserve arm proves it java-free and the
+java arm proves it at the death site. R6 evidence: the default build's `.text`
+is byte-identical to HEAD's (objcopy-compared); the whole-file cmp differs only
+in `.rodata` panic-Location line numbers (the source grew 25 lines) — behavior
+identical with the feature off. Clippy: zero warnings for
+`akuma-tokio-kernel-amd64` in both the default and the gate feature set.
+
+**D42 — the probe's shape (c) expectations were unsatisfiable-by-ABI, not a
+kernel residue.** The first PASS attempt failed on two REGRED lines (rdi/rsi):
+the arm's own asm loads rdi/rsi with the syscall arguments (path/buf), so a
+*preserved* register returns its ENTRY value — path/buf, not the canaries those
+two `movabs` put there a moment earlier (unsatisfiable on the host too). The
+first run was still the fix's proof where it mattered: r8/r9/r10/rdx came back
+kept. jvmprobe.c now checks rdi/rsi against the entry values (D42); the
+clobber-hunt power is unchanged — the buggy kernel's shifted-by-one pattern
+(AT_FDCWD/path/buf, zeros) fails all six wants.
+
+**The java arm's new death (recorded, next gate's data).** rip=0x600000067cd7a
+(in libjvm's `r-xs` text), cr2=0x6000112e9000, code=0x7 — a user WRITE to a
+PRESENT, read-only page: `pte=0x20dc6025` (P=1, W=0, U=1), refs=2 (shared),
+instruction `mov %r12,(%rsi)` — an oop store + `movb $1,0x8(%rsi)` card mark.
+`[mm] kind=2` says the faulting range was **MAP_FIXED-released** earlier in this
+task's life. The next pass reads this block first (it is appended to the gate
+log in full). Working name for the ladder: PHASE-2-HEAPRO (the present-RO heap
+write), pending the REQUIREMENTS re-rank.
+
+**Machine facts recorded, not fought:** the java arm's ssh connection died at
+~15 s on ssh's own keepalives ("No data received for 15s over 3 keepalive
+probes"), not the designed 180 s timeout — the guest-side arm kept running and
+the console window carried the verdict anyway; the probe's `head -30` evidence
+display cut the kill-path attribution out of the gate log (the full console
+lives in the rig's `vmrun.log`), so the window was recovered and appended
+post-verdict — display bounds are not evidence bounds, check the source file.
+
+*(The experiment proposal from PHASE-2-NULLSTORE stands for the phase — knob
+`GOOSE_TOOL_CALL_CUTOFF`, judged by this session's `final_ctx` in
+COST_LEDGER.md.)*
