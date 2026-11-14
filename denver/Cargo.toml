@@ -30,6 +30,13 @@ procfs-diag = ["akuma-jvm-kernel/procfs-diag"]
 # into the denver gate kernel. Off by default (R6); the gate kernel is
 # `--features wx-relaxed,vsyscall,procfs-diag,trace-err` (rig: denver-nullstore).
 trace-err = ["akuma-jvm-kernel/trace-err"]
+# The legacy fold's frame restoration (PHASE-2-NULLFIX, G9): the six caller
+# argument registers a folded syscall clobbered go home before the return —
+# the NULL store at musl fstatat's copy-out was this bug (the JVM's saved buf
+# in r8 came back zeroed). Off by default (R6); the gate kernel is
+# `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve`
+# (rig: denver-nullfix).
+fold-regpreserve = ["akuma-jvm-kernel/fold-regpreserve"]
 
 [[bin]]
 name = "denver"

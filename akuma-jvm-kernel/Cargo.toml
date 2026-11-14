@@ -39,6 +39,11 @@ vsyscall = ["akuma-tokio-kernel/vsyscall"]
 # /proc/<pid>/auxv, relayed 1:1 onto akuma-tokio-kernel. Off by default (R6) - the same
 # policy-by-features pattern.
 procfs-diag = ["akuma-tokio-kernel/procfs-diag"]
+# The legacy fold's frame restoration (PHASE-2-NULLFIX, G9): relayed 1:1 down the
+# front crate. Off by default (R6); the gate kernel is
+# `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve`
+# (rig: denver-nullfix).
+fold-regpreserve = ["akuma-tokio-kernel/fold-regpreserve"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

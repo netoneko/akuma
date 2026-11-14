@@ -47,6 +47,11 @@ vsyscall = ["akuma-tokio-kernel-amd64/vsyscall"]
 # Per-pid /proc address-space diagnostics (PHASE-2-PROCFS, G4): the maps walk
 # registration and the auxv retention, relayed 1:1.
 procfs-diag = ["akuma-tokio-kernel-amd64/procfs-diag"]
+# The legacy fold's frame restoration (PHASE-2-NULLFIX, G9): the six caller
+# argument registers a folded syscall's rewrite clobbered go home before the
+# return. amd64-only (the aarch64 twin never folds — the x86-only legacy
+# spellings never arrive there). Off by default (R6).
+fold-regpreserve = ["akuma-tokio-kernel-amd64/fold-regpreserve"]
 
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.

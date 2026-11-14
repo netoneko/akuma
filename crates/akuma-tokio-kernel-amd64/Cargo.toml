@@ -34,6 +34,12 @@ vsyscall = ["akuma-tokio-kernel-core/vsyscall"]
 # Per-pid /proc address-space diagnostics (PHASE-2-PROCFS, G4), 1:1 onto the core
 # (the retention and the TaskImage pairs live there; the walk lives in akuma-exec).
 procfs-diag = ["akuma-tokio-kernel-core/procfs-diag", "akuma-runtime-tokio/procfs-diag"]
+# The legacy fold's frame restoration (PHASE-2-NULLFIX, G9): `dispatch_inner`'s fold rewrites the
+# caller's six argument registers in the SyscallFrame; the stub pops them back into ring 3, so
+# every folded syscall (stat/lstat/open/creat/unlink/rename/…) returned the `*at` call's marshaled
+# arguments as the caller's register state. Under this feature the six registers as they arrived
+# are put back before the return (D39). Off by default (R6).
+fold-regpreserve = []
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.

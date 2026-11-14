@@ -1600,16 +1600,33 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // (`get_saved_user_context` → the twin's `read_user_context`). The boot
     // task has no slot and skips; a slotted task pays one struct copy.
     crate::child::capture_user_context(fr);
-    // The x86-only legacy path spellings (rename/mkdir/rmdir/link/unlink/
-    // symlink/readlink/chmod/chown/lchown) mean the `*at` call with
-    // `AT_FDCWD`; the fold is `akuma_syscalls_abi::legacy`, the same table
-    // amd64 dispatches through. Rewritten in the frame so the one `*at` arm
-    // below serves both spellings.
+    // PHASE-2-NULLFIX (G9, `fold-regpreserve`): the fold below rewrites six
+    // registers of the CALLER's frame — and the stub pops that memory back
+    // into ring 3 — so a folded syscall returned the `*at` call's marshaled
+    // arguments as the caller's register state (measured: `stat` = nr 4 folds
+    // to `[AT_FDCWD, path, buf, 0, 0, 0]`; musl's saved buf in r8 came back
+    // zeroed and its copy-out stored to NULL — the G9 death, NULLSTORE D38).
+    // The metal never had the bug: its dispatch takes the arguments by value
+    // (`akuma-kernel-amd64/src/usermode/dispatch.rs`), so its fold never
+    // touches saved state; Linux's contract is the same (everything but
+    // rax/rcx/r11 preserved across a syscall). This restores that contract
+    // while keeping the in-frame rewrite the dispatch structure wants: the
+    // six argument registers as they ARRIVED, put back before the return —
+    // `dispatch_after_fold` still reads the folded arguments, and
+    // `deliver_at_return`'s signal-frame packing sees the caller's state.
+    // Off by default (R6); PHASE-2-NULLFIX research artifact, D39.
+    #[cfg_attr(not(feature = "fold-regpreserve"), allow(unused_mut))] // mutated only under the feature
+    #[cfg_attr(not(feature = "fold-regpreserve"), allow(unused_variables))] // read only under the feature
+    let mut folded_orig: Option<[u64; 6]> = None;
     #[allow(clippy::tuple_array_conversions)] // destructuring assignment into the frame's registers
     if let Some((call, a)) = akuma_syscalls_abi::legacy::fold(
         fr.rax,
         [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()],
     ) {
+        #[cfg(feature = "fold-regpreserve")]
+        {
+            folded_orig = Some([fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9]);
+        }
         fr.rax = call.to_x86_64();
         (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) = (a[0], a[1], a[2], a[3], a[4], a[5]);
     }
@@ -1617,15 +1634,24 @@ fn dispatch_inner(fr: &mut ring3::SyscallFrame) -> u64 {
     // number on either spelling. It gets the arguments by value and a read-only context: nothing a hook does can change
     // what the call below reads from the frame.
     #[cfg(feature = "middleware")]
-    {
+    let r = {
         let nr = fr.rax;
         let args = [fr.arg1(), fr.arg2(), fr.arg3(), fr.arg4(), fr.arg5(), fr.arg6()];
         akuma_middleware::run_kernel(nr, args, || dispatch_after_fold(fr))
-    }
+    };
     #[cfg(not(feature = "middleware"))]
-    {
-        dispatch_after_fold(fr)
+    let r = dispatch_after_fold(fr);
+    // The caller's six argument registers go home before anything reads the
+    // frame again (the signal-frame packing above the return, then the stub's
+    // pops). The result rides in the return value and the stub's own rax slot,
+    // never in these.
+    #[cfg(feature = "fold-regpreserve")]
+    #[allow(clippy::tuple_array_conversions)] // destructuring assignment into the frame's registers
+    if let Some(orig) = folded_orig {
+        (fr.rdi, fr.rsi, fr.rdx, fr.r10, fr.r8, fr.r9) =
+            (orig[0], orig[1], orig[2], orig[3], orig[4], orig[5]);
     }
+    r
 }
 
 /// `dispatch_inner` from the tokio surface on: everything after the legacy fold.
