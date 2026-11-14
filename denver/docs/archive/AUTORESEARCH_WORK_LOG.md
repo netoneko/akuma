@@ -160,3 +160,37 @@ parsed `while` body and the escalate path exits before any unparsed byte of the 
 executes; `sh -n` green. *Believed: the archive step is bookkeeping and idempotent. Measured:
 a same-key second record silently replaced the first. Lesson: every mv-into-archive in the
 machinery needs an exists-check — evidence moves must never be overwrites.*
+
+## 2026-11-14 (late) — quota deaths, the operator checkpoint, and the paperwork close-out
+
+- **Two z.ai quota deaths, no evidence lost.** The JAVACLASSLIB + fault-signal-port stretch
+  was cut off at the `38f16b2d` checkpoint ("unverified, no gate run", 17:17); session 20
+  (JAVAC) died right after `RESULT PASS` (wall 82 s, `denver/gates/PHASE-3-JAVAC.log`). The
+  driver stayed down (wifi outage — see the wifi dormancy audit, commit `29687c9c` — plus the
+  weekly quota); the operator kept the gate + attempt-1 logs (`c3541214`) and checkpointed
+  REQUIREMENTS (G13 closed, G14 SIGRAX ranked first, G15 closed), lessons L1–L4 records,
+  STATE and COST_LEDGER (`b2f4a5dc`) — whose commit message names the pieces still missing.
+- **The missing pieces, now written (paperwork session, operator-directed: records only, no
+  rust edits, no kernel builds):** RESULT.md entries for PHASE-2-NULLFIX (never written when
+  it ran), PHASE-3-JAVACLASSLIB and PHASE-3-JAVAC; the phase 2 and phase 3 summaries (the
+  transition rule's artifacts — phase 2's had also been skipped when phase 3 opened);
+  LOOP_LOG entries for sessions 18–20; the single final `NEXT GATE: PHASE-4-SIGRAX` line;
+  STATE.md regenerated from the corrected LOOP_LOG; a COST_LEDGER note untangling the
+  session-name collision (three goose sessions named `denver-PHASE-3-JAVACLASSLIB` — the
+  19:12 one is the JAVAC gate).
+- **Open work left in the tree, noted not committed.** The working tree carries uncommitted
+  G14 debug instrumentation in `crates/akuma-tokio-kernel-amd64/src/faultsig.rs`
+  (`[SIGRAX-DLV]` / `[SIGRAX-DBG]` register dumps in `deliver` / `sync_sigreturn`) —
+  diagnostic print instrumentation for the rax-restore bug, not built, not gated, committed
+  nowhere. Left uncommitted by agreement; PHASE-4-SIGRAX must build and judge it under its
+  own rules (R8: a WIP commit is never evidence) before it is anything but WIP. With G14
+  subsequently closed by the operator (`180caf82` — the rc=0-want-99 datum was the committed
+  sigprobe binary's own bug: it stored the rax edit in the rcx slot), the instrumentation's
+  target is known-moot. Untracked
+  `userspace/nca/` and two dirty vendored submodules (`rumpkernel/src-netbsd`,
+  `tcc/tinycc`) predate the denver loop and are left alone.
+- **Where the experiment stands at close:** G1–G4, G6–G13, G14, G15 GREEN (G14 closed by
+  `180caf82` — probe-binary bug, PHASE-4-SIGRAX moot); G5 deferred (perf pass); suspects
+  unranked. Capability work is
+  done (javac compiles in the guest; Clojure/Scala/Groovy run on the faultsig+shell rig per
+  the operator's measured runs); what remains is polish.

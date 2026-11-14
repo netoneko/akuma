@@ -549,6 +549,53 @@ INTERVENTION: the rwx probe arm could never PASS — it judged the mapping from
 Rewritten write-then-call; two image re-injections carried the new jvmprobe
 (attempts 2 and 3).
 
+## Gate PHASE-2-NULLFIX — session 12, 2026-11-14 ~09:05–09:55 UTC — GREEN (G9 fixed behind `fold-regpreserve`: the legacy fold no longer returns its marshaled arguments as the caller's register state — regpreserve 20/20 REGPASS; the java arm moved and died at a NEW rip, which became PHASE-2-HEAPRO's datum; entry written retroactively at experiment close — the gate's own records live in LOOP_LOG, REQUIREMENTS and commit `c588fe48`)
+
+**Goal:** G9's fix pass — D38's hypothesis: a trap-frame preservation bug on the
+syscall-internal fault-retry path. PASS = the regpreserve arm green (folded syscalls keep the
+caller's six argument registers), the java arm moved past the NULL store, and R6 evidence
+measured rather than asserted (default `.text` byte-identical).
+
+**Commands and outcomes** (full capture: `denver/gates/PHASE-2-NULLFIX.log`, kernel
+`72be5c55`; research artifact D38–D42):
+
+- The bisect broke the hypothesis open productively: shape (c)'s `stat` returned −2 ENOENT —
+  its copy-out never ran, no ring-0 fault fired, yet the REGRED lines stood. The clobber is
+  the **legacy fold** (`akuma_syscalls_abi::legacy::fold(4)` → `[AT_FDCWD, path, buf, 0, 0, 0]`
+  written into the caller's `SyscallFrame`, which the stub pops back into ring 3): every
+  folded syscall (19 x86-only numbers, `stat` included) returned the `*at` call's marshaled
+  arguments as the caller's register state — musl's saved buf in r8 came back zeroed and its
+  `rep stos` stored 144 bytes at NULL. A *successful* folded syscall was the killer, not the
+  fault retry.
+- The fix (D39): snapshot the six argument registers before the fold, restore them before
+  dispatch returns — behind `fold-regpreserve`, off by default (R6), relayed 1:1
+  denver → jvm-kernel → tokio-kernel → amd64; metal untouched.
+- Gate (wall ~1 arm window): regpreserve 20/20 REGPASS — r8/r9/r10/r11/rdi/rsi/rdx/rcx kept
+  across lazy-fault store, syscall, and kernel-write-to-unfaulted-page (the zeros that killed
+  the JVM are gone). The java arm MOVED per D37's honesty rule: the old rip `3005fc41` never
+  appeared, the previously lethal `stat` ran `-> 0` in the dying task's own ring, and java
+  progressed deep into JVM init before dying at a NEW rip — a user WRITE to a PRESENT
+  read-only page (pte=0x20dc6025, P=1 W=0 U=1, oop store `mov %r12,(%rsi)` in libjvm `r-xs`
+  text, `[mm] kind=2` MAP_FIXED-released earlier in this task's life). Riding arms green:
+  RWX/MAPS/AUXV/MMARMS.
+- R6 evidence: default `.text` byte-identical to HEAD's; the whole-file diff is `.rodata`
+  panic-Location line numbers (+25 lines).
+
+**Verdict:** `RESULT PASS` — G9 CLOSED (fix behind the feature); the new death becomes
+PHASE-2-HEAPRO's opening datum.
+
+**Interventions (3, named in the LOOP_LOG entry; carried here for the record):**
+- INTERVENTION: the host's `/usr/local/rust/bin` (the nightly that carries
+  `x86_64-unknown-none`) is LAST in PATH — kernel builds failed with "can't find crate for
+  core" until PATH was fixed; recorded as a machine fact, not fought.
+- INTERVENTION: the regpreserve arm's shape (c) rdi/rsi expectations were
+  unsatisfiable-by-ABI (the arm's own asm loads the arguments, so a preserved register
+  returns its ENTRY value, not the pre-overwrite canary) — the probe lied, not the kernel;
+  fixed mid-gate, with a mid-gate image re-injection.
+- INTERVENTION: the gate log's `head -30` display bound cut the kill-path attribution out of
+  the evidence — the rig's `vmrun.log` held it and the window was appended post-verdict; the
+  verdict now cites vmrun.log.
+
 ## PHASE-2-HEAPRO — 2026-11-14 ~09:47–10:55 UTC, session 13 (goose, glm-5.3-flash) — GREEN (the death moved; the W+X silent drop named and closed)
 
 Three gate runs, one research artifact, two kernel changes, both behind off-by-default
@@ -652,6 +699,46 @@ the gate's moment is a datum, not noise.
   attributed to sshd noise twice, costing the diagnosis several turns — per-line
   attribution (which nr, which slot, which moment) before "noise" is now the rule.
 
+## Phase 2 summary — passes (runbook transition rule)
+
+| gate | verdict | interventions |
+|---|---|---|
+| PHASE-2-WX (session 4, opens phase 2) | GREEN | in prose |
+| PHASE-2-FAULTNAME — G6 (session 5) | GREEN | 3 |
+| Operator merge verification (session 7 — NOT A GATE, driver stopped) | n/a | 1 |
+| PHASE-2-PROCFS — G4 (session 8) | GREEN | 4 |
+| PHASE-2-NULLSTORE — G9 named (sessions 9–11) | GREEN | 10 |
+| PHASE-2-NULLFIX — G9 fixed (session 12) | GREEN | 3 (entry back-filled, see below) |
+| PHASE-2-HEAPRO — G8 closed (session 13) | GREEN | 3 (in prose) |
+| PHASE-2-MEMINFO — G7 (session 14) | GREEN | 2 |
+| PHASE-2-GETCPU — G2 (session 15) | GREEN | 3 |
+
+**What phase 2 proved.** The java-free capability ladder behind a JVM-facing build: faults
+name themselves (`procfs-diag` maps + fault-name attribution — G4/G6), trap frames survive
+syscall-internal retries and legacy folds (`fold-regpreserve` — G9), the heap is writable
+(`wx-relaxed` honoring the W bit on executable mmaps, the silent W-drop named and closed —
+G8), sizing and placement are served (`sysinfo` from the guest's real counters, `getcpu`
+keyed on the number musl actually performs, 309 — G7/G2). The java arm moved gate by gate on
+java-free passes until its death was capturable — then phase 3 read it in one boot.
+
+**Decisions taken.** D38/D39 (the fold clobber + fold-regpreserve), D42 (probe-vs-ABI honesty:
+"a probe constant that can lie is a broken probe"), D44/D45 (lazy-release-sweep), D49 (the WX
+silent W-drop), D51 (recorded suspects, unranked: placer collisions, mmdbg hatch), D53
+(sysinfo real-3-GiB), D55/D58 (the getcpu number lesson: the tables disagree for getcpu; one
+row-free const).
+
+**Interventions.** 25 recorded INTERVENTION lines across the phase's gate entries, plus the
+session-7 operator merge verification (recorded NOT A GATE). Per the transition rule
+("autonomy is earned per phase, not granted once"), phase-2 autonomy was not self-earned;
+phase 3 opened on the recorded re-rank with the capture gate first (PHASE-3-JAVAVERSION).
+
+**Record-keeping note (added 2026-11-14 by the paperwork session, at experiment close):** this
+summary and the PHASE-2-NULLFIX entry below were back-filled — the NULLFIX gate was recorded
+when it ran in LOOP_LOG, REQUIREMENTS and commit `c588fe48`, but never got a RESULT.md entry;
+no gate evidence changes.
+
+---
+
 ## Gate PHASE-3-JAVAVERSION — 2026-11-14 ~14:52–15:35 UTC, session 16 (goose, glm-5.3-flash) — GREEN (the capture gate: `java -version` GREEN, exit 0, banner, <1 s; the standing "capture problem" was the probe's own poller)
 
 | record | what | outcome |
@@ -741,3 +828,186 @@ zero new kernel code (R6-perfect gate).
   path until checked.
 
 NEXT GATE: PHASE-3-JAVACLASSLIB
+## Gate PHASE-3-JAVACLASSLIB — sessions 18–19, 2026-11-14 ~15:38–17:11 UTC — GREEN (the third rung: the real-javac four-surface workload runs on d4acb339 unchanged — exit 0, all four surface markers + WORKLOAD-ALL-PASS, wall 17 s; the fault-signal port built in the same stretch; quota cutoff before records — entries written retroactively by the paperwork session)
+
+**Goal:** G12 — a compiled workload reaching exceptions (throw/catch/unwind), user threads
+(clone/join), java.io file I/O, and G1 allocation pressure. PASS = `JVM INFO exit=0` AND
+`WORKLOAD-ALL-PASS` AND all four surface markers through the pipe arm, rig identity
+d4acb339, console window clean of fault/kill/old rip.
+
+**Commands and outcomes** (full capture: `denver/gates/PHASE-3-JAVACLASSLIB.log`, 16:23 UTC;
+research artifact: `denver/docs/research/PHASE-3-JAVACLASSLIB.md`, D69–D71; attempt 1's log
+was not preserved — the attempt is described here and in the artifact):
+
+- Attempt 1 (session 18): built `denver/probes/mkworkload.py` (a Java-21 bytecode assembler,
+  the four surfaces hand-assembled) from D64's "no javac anywhere in the lineage" — a repo
+  search result mistaken for an existence claim. Its run RED'd (exit=1, markers missing). The
+  operator correction (D69): real javac exists — Homebrew OpenJDK 26 on the operator's Mac
+  (`--release 21` → major 65); sources + compiled classes staged in `/root/denver/javac/`;
+  the operator's own run of them on d4acb339 passed every marker. `denver/ESCALATE.md`
+  (`QUESTION:`) is the channel such questions go through.
+- Staging (D70): fresh `cp denver-jdk.img denver-classlib.img` — the first attempt's image
+  carried stale classes plus stray `IoV1..IoV7` stages, and a gate log must show exactly what
+  ran; debugfs write of operator `Workload.class` (md5 `477ed2ef…`) + `Worker.class`
+  (`791d69b2…`), verified by dumping the files back OUT of the image and md5-matching.
+  `vm-classlib.spec` on the proven `denver-getcpu` (d4acb339) binary.
+- Gate (session 19, 16:23, wall 17 s): source sanity (md5 match) → staging → rig identity
+  (`0.1.0-d4acb339-denver`) → tokioprobe RESULT PASS → GETCPU PASS cpu=1 (the feature set
+  rides) → guest `ls /work` names both classes → ALIVE-B0 → the pipe arm
+  (`jvmprobe java /opt/jdk/bin/java -Xms64m -Xmx1536m -cp /work Workload`, alarm-bounded):
+  `JVM INFO exit=0 signal=0 bytes=197` with `WORKLOAD-EXC-PASS`, `WORKLOAD-IO-PASS`,
+  `WORKLOAD-GC-PASS` (freeMemory 67,057,808 → 585,944,960), `WORKLOAD-THREAD-RAN`/`42`/
+  `WORKLOAD-THREAD-PASS`, `WORKLOAD-ALL-PASS` — arm wall 1 s, markers 4/4; diagnostic arm
+  skipped (clean run); console window: no fault line, no kill line; census NON-fatal
+  (readlink 89 EINVAL ×13 growing-buffer 0xfe7→0x1000, setitimer 38, membarrier 324
+  double-fire, getrlimit 97, prlimit64 302) — hypotheses still, no death named, so still not
+  rows (lesson 1).
+- Same stretch, pre-quota: the **fault-signal port** —
+  `crates/akuma-tokio-kernel-amd64/src/faultsig.rs` (498 lines, plus `child.rs` edits): the
+  amd64 metal fault-to-signal path (`akuma-kernel-amd64/src/signal.rs`) ported 1:1 with a
+  Linux-ABI SigContext, relayed behind the off-by-default `fault-signal` feature (R6: default
+  build unchanged; no crate could be reused — `akuma-syscalls-signal` is bookkeeping only and
+  the tokio kernel depends on neither it nor the metal kernel). Committed `bdf3a2b2`,
+  checkpointed as `38f16b2d` ("unverified, no gate run") at the 17:17 quota cutoff.
+
+**Verdict:** `RESULT PASS` — G12 CLOSED. The four surfaces are served by d4acb339 unchanged
+(zero new kernel code for the third rung); per the operator priority change the ladder
+re-points at the javac crash.
+
+**Interventions (3):**
+- INTERVENTION: attempt 1 built a bytecode assembler instead of asking — D64's "no javac
+  anywhere" was a question to ask (`denver/ESCALATE.md`), not a reason to build; the
+  operator's answer (real javac on the Mac, classes staged, one measured run on d4acb339)
+  closed G12 the same day. Recorded, not judged (L1 carries the lesson).
+- INTERVENTION: the first attempt's image carried stale classes and stray stages — the gate
+  re-stages fresh from a pristine copy and md5-verifies by dumping files back out of the
+  image (D70; generalized to every staged input in D80).
+- INTERVENTION: the z.ai quota cutoff (the `38f16b2d` checkpoint's own message) ended the
+  stretch before LOOP_LOG/RESULT entries were written; the operator kept the gate log and
+  checkpointed REQUIREMENTS/lessons/STATE (`b2f4a5dc`), whose message names the missing
+  entries. These records were written retroactively by the paperwork session from the gate
+  log, the research artifact and the REQUIREMENTS re-rank.
+
+NEXT GATE: PHASE-3-JAVAC
+## Gate PHASE-3-JAVAC — session 20, 2026-11-14 ~19:12–19:40 UTC — GREEN (G13 closed: on kernel 38f16b2d a synchronous fault reaches the JVM's own SIGSEGV handler with real siginfo/ucontext, javac compiles Workload.java INSIDE the guest, and the produced class runs all four surfaces to WORKLOAD-ALL-PASS — wall 82 s; the ride-along named G14 — the same restore loses the edited %rax — CLOSED post-experiment as a probe-binary bug (commit `180caf82`), PHASE-4-SIGRAX moot)
+
+**Goal:** G13, the operator's top priority — `java -m jdk.compiler/com.sun.tools.javac.Main
+-version` died on d4acb339 (`[Fault] ring3 PageFault rip=0x6000118848e3 cr2=0x8 code=0x4`,
+`mov 0x8(%rdx),%r10d` with rdx=0, JIT code cache) because the kernel killed the task instead
+of delivering the fault HotSpot's trap-and-handle expects. PASS = sigprobe delivery + rip
+edit, the datum clean (`-version` exit 0 on the JIT, old rip absent, no kill in the window),
+and DONE: javac compiles the staged real `.java` inside the guest and the produced class runs
+to `WORKLOAD-ALL-PASS` (research artifact D75 + run-section D77–D80).
+
+**Commands and outcomes** (full capture: `denver/gates/PHASE-3-JAVAC.log`; attempt 1
+preserved: `denver/gates/PHASE-3-JAVAC.attempt1-staging-worker-java-missing.log`):
+
+- Rig (D77): the operator-proven binary `/root/denver/w/denver-faultsig` (stamp
+  `38f16b2d-release`) judged as-is, no rebuild; identity arms refuse every older hash.
+  D80: own image copy `denver-javac.img` fresh each run, own spec `vm-javac.spec` (port
+  2249), own console log (the 16:23 JAVACLASSLIB console not clobbered); dump-back md5 of
+  EVERY staged input (Workload.class, Worker.class, sigprobe, Worker.java) before any boot.
+- Attempt 1 (19:19): RED in <1 s — the image staged `Workload.java` but not `Worker.java`;
+  javac answered `error: file not found`; the gate now stages the sources itself.
+- Attempts 2–3 (no logs kept): a healthy guest starved one ssh round trip mid-arm (the
+  wrapper auto-reconnected, "connection stalled during handshake"), then the verdict FAILed a
+  gate whose substantive arms had all passed because one B0 poke starved — a verdict gate
+  must not be stricter than its arms (both hardenings recorded in L2).
+- Attempt 4 (19:27, wall 82 s) — RESULT PASS:
+  - ARM 1 sigprobe (D75/D78): `SIGPROBE-DELIVERED si_signo=11 si_code=1 si_addr=0 ripdelta=3
+    rsp=0x6ffffffffcf8 rax=0 cr2=0 err=0x6 fp=0x6ffffffff900` — a synchronous fault reaches
+    the user's own SA_SIGINFO handler with real siginfo/ucontext, and the patched `%rip` is
+    honored by `rt_sigreturn`. **rc=0 (want 99): the handler's edited `%rax` did not take** —
+    recorded verbatim, carried to REQUIREMENTS as G14, NOT a gate blocker (D78 operator night
+    update: the frame-write side is proven correct because the handler READS the interrupted
+    rax right).
+  - ARM 2 (recorded observation): `javac -version` under `-Xint` — exit 0,
+    `JVM PASS javac 21.0.13.0.3`.
+  - ARM 3 THE DATUM: `javac -version` on the JIT — exit 0, banner captured, window clean,
+    the old rip `0x6000118848e3` absent.
+  - ARM 4 (D79): the staged real-javac classes pass all four surfaces + `WORKLOAD-ALL-PASS`
+    on the GATE kernel 38f16b2d (JAVACLASSLIB's closure re-proven on the featured kernel).
+  - ARM 5a COMPILE PASS: javac `-d /work/out` compiles `Workload.java` + `Worker.java`
+    inside the guest, exit 0. ARM 5b DONE PASS: the guest-compiled class runs all four
+    surfaces + `WORKLOAD-ALL-PASS` (after one auto-reconnect).
+  - Census (non-fatal): readlink(89) ×50, setitimer(38) ×15, membarrier(324) ×21,
+    getrlimit(97) ×18, prlimit64(302) ×18 — present, no death named, suspects stay suspects.
+
+**Verdict:** `RESULT PASS` — G13 CLOSED. HotSpot's trap-and-handle works on denver: implicit
+null checks and safepoint polls fault into the JVM's own handler; javac is a working compiler
+in the guest. The one open item on the signal path was G14 (the lost `%rax` edit) — **Correction, commit `180caf82` later that day: G14 CLOSED — the committed `sigprobe` binary stored its rax edit in the rcx slot (a probe bug, not a kernel bug); the rebuilt probe's register dumps show the kernel restores what is written. PHASE-4-SIGRAX moot.**
+
+**Interventions (3):**
+- INTERVENTION: attempt 1's staging gap — `Worker.java` missing from the image while
+  `Workload.java` rode along; RED <1 s; the probe was fixed to stage the sources itself with
+  dump-back md5 of every staged input (D80, D70 generalized to sources).
+- INTERVENTION: attempts 2–3 burned on channel/verdict rigidity, not kernel behavior — a
+  healthy guest can starve one ssh round trip (auto-reconnect + B0/final-poke aliveness
+  rule), and a verdict gate that fails on one starved poke when every substantive arm passed
+  is stricter than its arms (L2 carries both).
+- INTERVENTION: the z.ai weekly quota died right after `RESULT PASS` — the session wrote no
+  records; the operator kept the gate + attempt-1 logs (`c3541214`), the GLM paperwork
+  checkpoint (`b2f4a5dc`) closed the REQUIREMENTS rows (G13 closed, G15 resolved off-kernel
+  by the `shell` feature, `9ec07523`) and ranked G14 first, and these records were written
+  retroactively by the paperwork session. Session-name collision noted: the gate session is
+  `denver-PHASE-3-JAVACLASSLIB` in sessions.db (the driver names by its gate variable) — see
+  the COST_LEDGER note.
+
+NEXT GATE: PHASE-4-SIGRAX
+## Phase 3 summary — the java ladder (runbook transition rule)
+
+| gate | verdict | interventions |
+|---|---|---|
+| PHASE-3-JAVAVERSION — G10 (session 16) | GREEN | 3 |
+| PHASE-3-JAVAWORKLOAD — G11 (session 17) | GREEN | 4 |
+| PHASE-3-JAVACLASSLIB — G12 (sessions 18–19) | GREEN | 3 |
+| PHASE-3-JAVAC — G13 (session 20) | GREEN | 3 |
+
+**What phase 3 proved.** The ladder climbs: `java -version` (exit 0, full banner, <1 s — the
+standing "capture problem" was the capture probe's own 2 ms poller), a compiled class
+(hand-assembled bytecode first, then real-javac output), the four-surface workload
+(exceptions, user threads, java.io, G1 allocation pressure), and javac itself compiling
+`Workload.java` INSIDE the guest with the produced class running to `WORKLOAD-ALL-PASS`.
+Rungs 1–3 ran on d4acb339 with ZERO new kernel code — the phase-2 java-free capability ladder
+was the whole answer. Rung 4 needed exactly one port: the fault-to-signal path (`faultsig.rs`,
+Linux-ABI SigContext) behind the off-by-default `fault-signal` feature (R6 default
+unchanged), turning HotSpot's trap-and-handle from "task killed" into NullPointerException.
+Per the operator's measured runs the same rig carries Clojure 1.12.0, Scala 2.13.14 (scalac
+compiles in the guest) and Groovy 4.0.22 with zero `[Fault]` lines
+(`docs/archive/CLOJURE_AND_JAVAC_ON_DENVER.md`), and the Clojure HTTP server works with the
+`shell` feature (`9ec07523`, `bfdb2a48`, `2e502e67`) — operator runs are evidence, not gates:
+the loop's own top-rung gate (`curl localhost:PORT` → Clojure Hello World) was never run
+(quota); recorded as such.
+
+**Decisions taken.** D59 (the capture confound — the observer starved the observed; the pipe
+arm is the only java reader, L2), D64→D69 (a repo-search negative is a question, not an
+existence claim; ask the operator via `ESCALATE.md`), D65/D70/D80 (pristine-image copies;
+dump-back md5 of everything staged), D66/D71 (pipe-arm readers; markers parsed from the
+captured run), D67 (a checker sharing the author's assumptions verifies nothing — the
+receiver is the verifier), D77–D80 (judge the operator-proven binary as-is; own
+image/spec/console per run; KNOWN-OPEN verdict rules for named data), D81 (G14 becomes
+PHASE-4-SIGRAX).
+
+**Interventions.** 13 recorded across the phase's gate entries, plus two operator directions
+that moved the ladder (the G12 operator priority change pointing it at the javac crash; the
+night update's D78 verdict-rule change) and two z.ai quota deaths whose record-keeping fell
+to the operator (`c3541214`, `b2f4a5dc`). Per the transition rule, phase-4 autonomy is NOT
+earned; moot — the experiment is concluded at the operator's direction, with records closed
+by the paperwork session.
+
+**Standing state at close.** GREEN: G1–G4, G6–G13, G15. Deferred: G5 (vDSO/vvar fast path —
+a perf pass, not an init blocker). Open: none — G14 was CLOSED post-experiment (commit
+`180caf82`: the gate's rc=0-want-99 datum was the committed sigprobe binary's own
+register-map bug — it stored the rax edit in the rcx slot; the rebuilt probe shows the
+kernel restores what is written). PHASE-4-SIGRAX moot. Unranked suspects (become rows only when a capture names a death): readlink(89)
+EINVAL growing-buffer, setitimer(38), membarrier(324) double-fire, getrlimit(97),
+prlimit64(302), D51's placer collisions + mmdbg hatch. Kernel work left after G14 is polish,
+not capability. Uncommitted G14 debug instrumentation (`[SIGRAX-DLV]`/`[SIGRAX-DBG]` prints
+in `faultsig.rs`) is left in the working tree, noted in the work log; with G14 closed its
+target is known-moot — keep as reference material or discard, at the operator's discretion.
+
+**Wall clock / spend:** per-session aggregate lines for sessions 16–20 are in
+`docs/COST_LEDGER.md` (the last `denver-PHASE-3-JAVACLASSLIB` line is the JAVAC session —
+see the ledger note).
+
+NEXT GATE: (none - the autoresearch experiment concluded 2026-11-14; PHASE-4-SIGRAX is moot, see G14)

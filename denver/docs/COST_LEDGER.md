@@ -23,3 +23,8 @@ session denver-PHASE-3-JAVAVERSION wall=23 in=3.5M out=51k final_ctx=100k cache_
 session denver-PHASE-3-JAVAWORKLOAD wall=21 in=3.3M out=57k final_ctx=97k cache_read=97% tools=65
 session denver-PHASE-3-JAVACLASSLIB wall=54 in=14.8M out=113k final_ctx=178k cache_read=99% tools=237
 session denver-PHASE-3-JAVACLASSLIB wall=28 in=1.9M out=38k final_ctx=81k cache_read=96% tools=280
+# note (2026-11-14, paperwork session): the last line above — session denver-PHASE-3-JAVACLASSLIB
+# wall=28 (created 19:12, updated 19:40) — is the PHASE-3-JAVAC gate session: the driver names
+# goose sessions by its gate variable, and three sessions share the JAVACLASSLIB name
+# (15:38 assembler attempt — no ledger line, 16:17 gate + fault-signal port = the wall=54 line,
+# 19:12 the JAVAC gate = the wall=28 line). Aggregates only, per the ledger header.
