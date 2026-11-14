@@ -63,15 +63,18 @@ thread pool, which keeps the JVM alive for 60 s after the script ends unless the
 
 ## What is still open
 
-- **The standard JDK HTTP server does not start (kernel gap, to be done later).** A Clojure server on
-  `com.sun.net.httpserver` (`denver/samples/clojure/server.clj`) dies at startup with
-  `java.io.IOException: Function not implemented` from `sun.nio.ch.IOUtil.fdLimit`, reached through
-  `EPollSelectorProvider.openSelector` (the NIO selector reads the fd limit). The guest console shows `[nosys]` for
-  syscall **97 (`getrlimit`)** and **302 (`prlimit64`)** among others, once each, which is the likely cause; I did not
-  confirm that serving them fixes it. Both syscalls have implementations in the full amd64 kernel's glue
-  (`akuma-syscalls-glue`), not in the tokio kernel. A blocking `ServerSocket` server may avoid the selector and was not
-  tried. The VM spec needs a `forward=8080:8080` line to reach the guest from outside (added on the box's spec).
-
+- **(Resolved 2026-11-14, evening)** The standard JDK HTTP server did not start: a Clojure server on
+  `com.sun.net.httpserver` (`denver/samples/clojure/server.clj`) died with `java.io.IOException: Function not
+  implemented` from `sun.nio.ch.IOUtil.fdLimit` (via `EPollSelectorProvider.openSelector`). Cause: `getrlimit` (97) and
+  `prlimit64` (302) are in `akuma_runtime_tokio::shell`'s syscall set, which taoxichuan enables by default and denver
+  (`--no-default-features`) never did; glue already implemented both (`sys_prlimit64`). The same set holds `getpgid`,
+  `getppid`, `getrusage`, `clock_getres` and `membarrier`, every `[nosys]` number seen on the guest. Fix: a one-line
+  relay `shell = ["akuma-jvm-kernel/shell"]` in `denver/Cargo.toml` (`9ec07523`), off by default (R6), kernel built with
+  the gate set plus `shell` (2,523,400 B, +88 B). Verified (one run): the server prints `listening on :8080` and answers
+  `HTTP/1.1 200 OK` to `curl http://<box>:8080/` from the operator's Mac through the VM spec's `forward=8080:8080`
+  (hit counter 1, then 2; `/json` returns `{"server":"clojure 1.12.0","hits":2,"java":"21.0.13.0.3","cpus":4}`), and a
+  real pty ssh session works **without** `--shell-arg +m` (prompt, `ls`, `javac -version`, `java ...` all run), because
+  `getpgid` is served now.
 - `sigprobe` (`denver/probes/sigprobe.c`) reports **FAIL**: the SIGSEGV is delivered correctly (si_signo 11,
   si_code 1, si_addr 0, rip delta 3, cr2 0) and the saved-`rip` edit takes effect, but the saved-`rax` edit does
   not (returns 0, want 99). Unexplained; a likely cause, **not confirmed**, is `rt_sigreturn` overwriting `rax` with
@@ -80,7 +83,7 @@ thread pool, which keeps the JVM alive for 60 s after the script ends unless the
 - No LOOP_LOG entry or gate log for PHASE-3-JAVAC; the loop never reached them.
 - The guest clock is host uptime-based, so the guest's own `time` output is wrong (it printed 0.73 s for a 2 s run).
   Time from outside.
-- Interactive ssh needs `--shell-arg +m` until the kernel serves `getpgid` (nr 121).
+- Interactive ssh needed `--shell-arg +m` until the `shell` feature (above) served `getpgid`; it no longer does.
 
 ## Cost
 

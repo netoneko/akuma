@@ -25,5 +25,6 @@ run in the guest), and symlinks the JDK's launchers (`java`, `keytool`, ...) the
 `java -m jdk.compiler/com.sun.tools.javac.Main`. Tested from a bare ssh session: `javac`, `clojure -e`, `scalac` +
 `scala`, `groovy -e`.
 
-`clojure/server.clj` currently does not start in a denver guest: see "What is still open" in
-`denver/docs/archive/CLOJURE_AND_JAVAC_ON_DENVER.md` (`getrlimit`/`prlimit64` not served).
+`clojure/server.clj` serves HTTP on guest port 8080 on a kernel built with the `shell` feature (it needs `getrlimit`/`prlimit64`);
+add `forward=8080:8080` to the VM spec and `curl http://<box>:8080/` from outside. See
+`denver/docs/archive/CLOJURE_AND_JAVAC_ON_DENVER.md`.

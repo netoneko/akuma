@@ -25,7 +25,7 @@ its limits are in the last two sections. One run, one model, one box: an experim
 | Clojure 1.12.0 (runtime bytecode generation, `pmap`) | works (operator-run, on the loop's kernel, no code change) |
 | Scala 2.13.14: `scalac` compiles a program in the guest and the class runs | works (operator-run, one run, ~3 s compile) |
 | Groovy 4.0.22 runs a script in the guest | works (operator-run, one run) |
-| Standard HTTP server (JDK `com.sun.net.httpserver`, from Clojure) serving a response to a client outside the guest | **blocked**: the JDK's NIO selector needs `getrlimit`/`prlimit64` (syscalls 97/302), which the denver kernel does not serve; to be done later |
+| Standard HTTP server (JDK `com.sun.net.httpserver`, from Clojure) serving a response to a client outside the guest | works (operator-run, one run): HTTP 200 from the Mac. First blocked by `getrlimit`/`prlimit64` not served; fixed by enabling the `shell` syscall set (one-line feature relay, 88 B) |
 | `sigprobe` (does `rt_sigreturn` restore an edited `rax`?) | FAIL, unexplained; javac and Clojure do not need it |
 
 ## Where it ran: Akuma all the way down
@@ -55,7 +55,7 @@ non-blank non-comment lines of `src/` minus tests, `scripts/benchmarks/linked_lo
 Largest shared crates: `akuma-syscalls-glue` 13,272, `akuma-exec` 6,434, `akuma-tokio-kernel-amd64` 3,068 (before
 the loop's `faultsig.rs`), `akuma-ext2` 2,958, `akuma-mmu` 2,703, `akuma-threading` 2,618. Denver is taoxichuan plus a
 front crate and 18 own lines; **the loop did not write an operating system, it taught an existing one to run a JVM.**
-Gate feature set: `wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep,sysinfo,getcpu,fault-signal`.
+Gate feature set: `wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep,sysinfo,getcpu,fault-signal` (the operator later added `shell`).
 
 Built kernels (box, `--release`): denver default features 2,452,232 B, taoxichuan 2,452,512 B (text 1,578,485 vs
 1,578,986: denver default is 501 B **smaller**, the R6 "default build unchanged" claim holds); denver gate set
