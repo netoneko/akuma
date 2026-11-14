@@ -21,6 +21,11 @@ by a captured gate log or a recorded decision — nothing here is doctrine witho
 evidence. The links go to the living lesson files, which carry the full example
 and the per-gate `Record` trail.
 
+The core idea, and the plan the experiment ran from, is in
+[`docs/archive/KERNEL_HOWTO_BUILDING_CUSTOM_PLATFORM_KERNEL.md`](docs/archive/KERNEL_HOWTO_BUILDING_CUSTOM_PLATFORM_KERNEL.md).
+The experiment log — what the loop produced, measured against the kernel it was built
+on — is [`docs/archive/AUTORESEARCH_EXPERIMENT_RESULTS.md`](docs/archive/AUTORESEARCH_EXPERIMENT_RESULTS.md).
+
 ## A platform kernel as a collection of crates
 
 Denver is not a kernel written from scratch. It is a manifest: one binary crate and one
@@ -189,6 +194,8 @@ switch?"
 
 ## House pointers
 
+- The core idea and the plan: [`docs/archive/KERNEL_HOWTO_BUILDING_CUSTOM_PLATFORM_KERNEL.md`](docs/archive/KERNEL_HOWTO_BUILDING_CUSTOM_PLATFORM_KERNEL.md)
+- The experiment log (results, method, limits): [`docs/archive/AUTORESEARCH_EXPERIMENT_RESULTS.md`](docs/archive/AUTORESEARCH_EXPERIMENT_RESULTS.md)
 - Lessons index (file map): [`docs/lessons/README.md`](docs/lessons/README.md)
 - Governing runbook (the loop, R1–R9, file ownership): [`docs/runbooks/AUTORESEARCH.md`](docs/runbooks/AUTORESEARCH.md)
 - Requirements table the lessons feed: [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md)
