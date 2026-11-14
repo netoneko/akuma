@@ -45,6 +45,7 @@ Build on the ryzen Akuma box (cargo is at `/usr/local/rust/bin`, not on the defa
 | Clojure 1.12.0 `clojure.main -e "(println :hello)"` | prints `:hello 1.12.0`, ~2 s wall (Mac clock) |
 | Clojure script: `reduce`, recursive `fib 20`, `pmap` | `5050`, `6765`, `[0 1 4 9 16 25 36 49]` |
 | Scala 2.13.14: `scalac` (scala-compiler/-library/-reflect from Maven, SHA-1 checked) compiles `HelloScala.scala` inside the guest, then the class runs | scalac rc 0 in ~3 s (Mac clock), 4 classes (object, case class, companion); output `Hello from Scala 2.13.14 on Linux amd64`, `squares: List(1, 4, 9, ...)`, `sum of evens: 30`, sorted case classes; run rc 0 |
+| Groovy 4.0.22 (`groovy-4.0.22.jar`, SHA-1 checked; dynamic dispatch via `invokedynamic`, runtime class generation) runs `hello.groovy` with `groovy.ui.GroovyMain` | prints `Hello from Groovy 4.0.22 on Linux amd64`, squares, `sum of evens: 30`, sorted `[alan(41), ada(36)]`, `dynamic: CBA`; rc 0, ~1 s (Mac clock) |
 | Console `[Fault]` lines across all of it | 0 |
 
 ## Clojure details
