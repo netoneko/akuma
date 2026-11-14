@@ -60,6 +60,24 @@ Built kernels (box, `--release`): denver default features 2,452,232 B, taoxichua
 1,578,986: denver default is 501 B **smaller**, the R6 "default build unchanged" claim holds); denver gate set
 2,523,312 B (text 1,636,317, +57.8 KiB or +3.7%; bss +72 KB).
 
+### The JDK against the kernel (disk size)
+
+Measured in the guest (`du`, `ls -l` under `/opt/jdk`, JDK 21.0.13 Alpine) against the kernel binaries above:
+
+| | size | vs denver gate kernel (2,523,312 B) |
+|---|---|---|
+| denver kernel, default features | 2,452,232 B (2.34 MiB) | 0.97x |
+| denver kernel, gate feature set | 2,523,312 B (2.41 MiB) | 1x |
+| `lib/server/libjvm.so` (HotSpot) | 20,219,160 B (19.3 MiB) | 8.0x |
+| `lib/modules` (class library) | 142,774,572 B (136 MiB) | 56.6x |
+| `classes.jsa` / `classes_nocoops.jsa` (CDS) | 14.6 MB / 15.0 MB | about 6x each |
+| all of `/opt/jdk` (106 files, `bin/` 88 KiB) | 193,303 KiB by `du` (about 189 MiB) | **78x** |
+| `denver-jdk.img` (whole root filesystem) | 671,088,640 B (640 MiB) | 266x |
+
+The kernel is about 1.3% of the JDK it hosts; HotSpot alone is 8x the kernel. Caveats: `du` counts disk blocks (a
+little above the sum of file sizes; the per-file rows are exact), the kernel is a stripped static binary (text
+1.58 MB, bss about 2 MB) and the JDK is a runtime with its libraries, and the image holds more than the JDK.
+
 ### What the loop added
 
 69 commits (subject `denver...`, non-merge, through `92c55737`; includes the operator's brief edits and checkpoints):
