@@ -176,6 +176,36 @@ not read as more than it is:
 - javac and Clojure are operator runs, one each; the loop's PHASE-3-JAVAC gate and `LOOP_LOG` entry do not exist.
 - `sigprobe` FAIL and the unrun `-Xint` arm are open. Interventions are an incomplete count.
 
+## Ideas for the future
+
+Not done, not scheduled; written down so the next person (or the loop, after the quota resets) can pick them up.
+
+- **A symptom/feature matrix, generated from code.** Today a symptom (`Function not implemented` from
+  `IOUtil.fdLimit`, an ssh shell that spins, `Too small maximum heap`) leads to a `[nosys] nr=N` line, and from there
+  to a gated syscall set nobody listed in one place (lesson L5). Partial precedent: `docs/README.md`'s "I see X, what
+  do I read?" matrix points at docs, not at build features; `denver/docs/REQUIREMENTS.md` has gap and evidence but no
+  feature column. `akuma-runtime-tokio` has one function per feature (`shell(call)`, `net(call)`, ...), each a
+  `matches!` over syscall names; a script could read those sets plus the console's `[nosys]` numbers and print
+  `syscall | serving feature | enabled by denver?`, so the table cannot go stale. Not checked: how many such sets there
+  are and whether each maps cleanly to a Cargo feature. Seed rows (verified once, by the operator): `shell` for
+  97/302 (JDK HTTP server) and 121 (interactive ssh); `sysinfo` for 99; `getcpu` for 309; `fault-signal` for JIT
+  null-check faults (partly: the `rax` edit still fails).
+- **Diff sibling feature sets automatically.** A derivative kernel built with fewer defaults than its sibling
+  (denver `--no-default-features` against taoxichuan's `default = ["shell"]`) can compare the two feature lists at
+  build or gate time and print what the sibling serves that this one does not.
+- **Make the loop ask before it builds.** The loop built a 520-line class-file assembler because "no javac exists",
+  when `ESCALATE.md` was the place to ask; the brief now says so, but a gate-time check ("a missing external tool is an
+  escalation, not a build") would not depend on a human noticing.
+- **Compare the accumulated `[nosys]` list to the feature sets the loop declined**, once per phase. The loop was
+  minimal on purpose (one gated arm per measured gap); a periodic sweep would have found that seven numbers shared one
+  gate.
+- **Extract signal delivery into a crate both kernels use.** The fault-to-signal path lives inside
+  `akuma-kernel-amd64` (`signal.rs`); `akuma-syscalls-signal` is bookkeeping only. The loop had to port it 1:1 into the
+  tokio kernel (498 lines); a shared delivery crate would remove the second copy and may fix the open `sigprobe` `rax`
+  edit once.
+- **Run the loop's own PHASE-3-JAVAC gate** and close the open items: `sigprobe`'s `rax` edit, the R6 default-`.text`
+  check for the fault-signal and shell kernels, and a repeat run of every operator measurement.
+
 ## Reproduce
 
     python3 -I scripts/benchmarks/linked_loc.py denver --no-default-features \
