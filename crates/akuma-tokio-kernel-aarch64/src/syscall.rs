@@ -72,6 +72,10 @@ fn dispatch_arms(f: &Frame, n: u64, a: [u64; 6]) -> u64 {
         }
         nr::EXECVE => return crate::proc::exec(a[0], a[1], a[2]),
         nr::MREMAP => return mm::mremap_arm::<Aarch64>(a[0], a[1], a[2], a[3]),
+        // `getcpu(2)` (denver's G2, the amd64 half's arm): musl's `sched_getcpu` and the JVM's startup
+        // call it; the caller's core, node 0, the copies out and `EFAULT` are glue's. Off by default (R6).
+        #[cfg(feature = "getcpu")]
+        nr::GETCPU => return akuma_syscalls_glue::sched::sys_getcpu(a[0], a[1], crate::mm::cpu_index() as u32),
         _ => {}
     }
     if let Some(r) = akuma_runtime_tokio::serve_shared(n, a) {

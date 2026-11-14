@@ -10,13 +10,19 @@ Slides that retell the project: [`bootstrap/public/denver/`](../../bootstrap/pub
 ## Quick start
 
 ```bash
-overlays/denver/build-kernel.sh     # out/denver            (the gate feature set, ~1 min cold)
-overlays/denver/build-image.sh      # out/denver-clojure.img (JDK 21 + Clojure 1.12 + server.clj)
+overlays/denver/build-kernel.sh     # out/denver-amd64      (the gate feature set, ~1 min cold)
+overlays/denver/build-image.sh      # out/denver-clojure-amd64.img (JDK 21 + Clojure 1.12 + server.clj)
 overlays/denver/run.sh              # boots Denver; Ctrl-A X quits QEMU
 curl http://localhost:8080/         # from another terminal
 ```
 
-Expected: `Hello from Clojure 1.12.0 on Akuma/denver`, a hit counter, the JVM version and the cpu
+Both architectures build and boot (`ARCH=aarch64` or `ARCH=amd64`, default amd64): the kernel, the image and the
+runner each take it. **aarch64 boots Denver under HVF and starts the JVM, but the Clojure server runs on amd64 only for
+now**: HotSpot gets through Java initialization on aarch64 and then dies with a `ClassFormatError` reading a class
+from the memory-mapped `modules` file. `ARCH=aarch64 overlays/denver/check.sh` prints `RESULT BOOT-PASS` when the kernel
+reaches and starts init.
+
+Expected (amd64): `Hello from Clojure 1.12.0 on Akuma/denver`, a hit counter, the JVM version and the cpu
 and heap sizes; `curl http://localhost:8080/json` answers the same as JSON.
 `overlays/denver/check.sh` runs the whole boot-and-curl for you and prints `RESULT PASS` or `RESULT FAIL`.
 
@@ -25,7 +31,7 @@ and heap sizes; `curl http://localhost:8080/json` answers the same as JSON.
 | | |
 |---|---|
 | Rust | the repo's `rust-toolchain.toml` and the `x86_64-unknown-none` target |
-| QEMU | `qemu-system-x86_64` |
+| QEMU | `qemu-system-x86_64` (amd64), `qemu-system-aarch64` (aarch64; HVF on Apple Silicon) |
 | Docker | only for `build-image.sh`: the image is assembled in an Alpine amd64 container (Alpine's musl JDK, jars from Maven Central, SHA-1 checked) |
 
 ## How it works
@@ -41,8 +47,8 @@ and heap sizes; `curl http://localhost:8080/json` answers the same as JSON.
 
 ## Knobs
 
-`MEMORY` (MiB, default 3072), `SMP` (default 1), `HTTP_PORT` (default 8080), `DENVER_FEATURES` (build-kernel),
-`DENVER_DISK` (run).
+`ARCH`, `MEMORY` (MiB, default 3072), `SMP` (default 1), `HTTP_PORT` (default 8080), `DENVER_FEATURES` (build-kernel),
+`DENVER_DISK`, `DENVER_INIT`, `DENVER_INITARGS` (run).
 The disk is attached with `snapshot=on`, so a run never modifies the image.
 
 ## Verify

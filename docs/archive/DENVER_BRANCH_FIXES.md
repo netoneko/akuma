@@ -94,8 +94,17 @@ never gone through the hook. A default-workspace `cargo check` in every gate wou
 - The `9ec07523` manifest commit skipped the pre-commit hook (`--no-verify`): clippy, tests and the secret scan did not
   run on it, and nothing has re-checked it since.
 
-- A single kernel boot argument of about 110 characters (a three-jar `-cp` in `initargs=`) lost its last entry, so the
-  third jar was never found (QEMU run, `overlays/denver`); a wildcard classpath avoids it. Cause not investigated.
+- aarch64 (QEMU `virt`, HVF, 2026-11-15, `overlays/denver`): Denver boots and starts the JVM. With `wx-relaxed` and
+  `getcpu` relayed to the aarch64 half, HotSpot passes the W^X and getcpu gates, but its 1 GiB compressed-class-space
+  reservation fails (`-XX:-UseCompressedClassPointers -XX:-UseCompressedOops` gets past it, so the cause is address
+  placement), and then Java initialization dies with `ClassFormatError: Illegal constant pool index 0` on a class read
+  from the memory-mapped `modules` file: wrong bytes from a file mapping. Not investigated; the Clojure server runs on amd64 only.
+
+## Fixed after the fact (2026-11-15)
+
+- A boot argument was silently cut at 96 bytes (`akuma-tokio-kernel-core::init::ARG_LEN`), so a three-jar `-cp`
+  (108 characters) lost the end of its last jar name and the JVM reported a missing class. `ARG_LEN` is 256 now, with a
+  host test (`a_long_classpath_survives_whole`). Found by running the overlay, not by a gate.
 
 ## Background
 

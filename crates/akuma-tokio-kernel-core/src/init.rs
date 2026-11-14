@@ -1,9 +1,13 @@
 //! The init program from the command line (`init=`, `initargs=`, `initenv=`), in fixed slots:
 //! parsed before user mode exists, read again when init exits.
 
-/// argv entries beyond `argv[0]`, and each one's byte budget.
+/// argv entries beyond `argv[0]`, and each one's byte budget (the NUL included).
+///
+/// 256, not 96: a `java -cp a.jar:b.jar:c.jar` is one argument, and at 96 its tail was cut off silently
+/// (the third jar's name lost its last bytes, so the JVM reported a missing class, not a short argument).
+/// The cost is `(1 + MAX_ARGV + MAX_ENV) * ARG_LEN` = 6400 B of boot record, static on amd64.
 pub const MAX_ARGV: usize = 16;
-pub const ARG_LEN: usize = 96;
+pub const ARG_LEN: usize = 256;
 /// Environment entries (`initenv=`, comma-separated `KEY=value`, no comma or space in a value).
 pub const MAX_ENV: usize = 8;
 
@@ -110,6 +114,21 @@ mod tests {
         assert_eq!(p.path_str(), "/bin/sh");
         assert_eq!((p.n_args(), p.arg_str(0), p.arg_str(1)), (2, "sh", "/etc/guest.sh"));
         assert_eq!((p.n_env(), p.env_str(0), p.env_str(1)), (2, "A=1", "B=2"));
+    }
+
+    #[test]
+    fn a_long_classpath_survives_whole() {
+        macro_rules! cp {
+            () => {
+                "/opt/clojure/clojure-1.12.0.jar:/opt/clojure/spec.alpha-0.5.238.jar:/opt/clojure/core.specs.alpha-0.4.74.jar"
+            };
+        }
+        let cp = cp!();
+        assert!(cp.len() > 96);
+        let mut p = Prog::new();
+        p.parse(concat!("init=/opt/jdk/bin/java initargs=-cp,", cp!(), ",clojure.main,/opt/server.clj"));
+        assert_eq!((p.n_args(), p.arg_str(0), p.arg_str(1)), (4, "-cp", cp));
+        assert_eq!(p.arg_str(3), "/opt/server.clj");
     }
 
     #[test]

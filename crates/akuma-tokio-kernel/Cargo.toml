@@ -40,7 +40,7 @@ middleware = ["akuma-tokio-kernel-amd64/middleware", "akuma-tokio-kernel-aarch64
 # The JIT-permitting W^X relaxation (PHASE-2-WX, G1), 1:1 onto the machine half: the pure W^X
 # policy answers Allow (main removed the `wx=0` runtime hatch; the relaxation is a build choice
 # again). Off by default (R6).
-wx-relaxed = ["akuma-tokio-kernel-amd64/wx-relaxed"]
+wx-relaxed = ["akuma-tokio-kernel-amd64/wx-relaxed", "akuma-tokio-kernel-aarch64/wx-relaxed"]
 # The legacy vsyscall page (PHASE-2-VDSO, G3), 1:1 onto the machine half: the page HotSpot
 # hardcodes is mapped user-RX and disclosed as `AT_SYSINFO_EHDR`. Off by default (R6).
 vsyscall = ["akuma-tokio-kernel-amd64/vsyscall"]
@@ -57,7 +57,7 @@ lazy-release-sweep = ["akuma-tokio-kernel-amd64/lazy-release-sweep"]
 # sysinfo(2) through glue (PHASE-2-MEMINFO, G7), 1:1 onto the amd64 half's arm.
 sysinfo = ["akuma-tokio-kernel-amd64/sysinfo"]
 # getcpu(2) through glue (PHASE-2-GETCPU, G2), 1:1 onto the amd64 half's arm.
-getcpu = ["akuma-tokio-kernel-amd64/getcpu"]
+getcpu = ["akuma-tokio-kernel-amd64/getcpu", "akuma-tokio-kernel-aarch64/getcpu"]
 # Synchronous fault -> signal delivery (PHASE-3-JAVAC, G13), 1:1 onto the amd64
 # half: a ring-3 page fault reaches the task's own SIGSEGV handler instead of
 # `task killed` — HotSpot's trap-and-handle (implicit null checks, safepoint

@@ -71,6 +71,19 @@ line per layer, never a fork.
           '-- akuma-trap-amd64, akuma-ring3-amd64, akuma-sched-amd64, ...
 ```
 
+## Two platforms
+
+The same `denver` source builds for **aarch64 and amd64**, and the kernel boots on both:
+
+| | boots | the JVM |
+|---|---|---|
+| amd64 | Akuma's own KVM on real AMD Ryzen metal; QEMU microvm (TCG) for the local overlay | HotSpot, javac, Clojure, Scala, Groovy, a Clojure HTTP server |
+| aarch64 | QEMU `virt` with HVF on an Apple Silicon Mac | boots and starts the JVM; HotSpot runs Java initialization, then fails reading a class from the memory-mapped `modules` file (`ClassFormatError`) |
+
+The JVM features (`vsyscall`, `fold-regpreserve`, `fault-signal`, ...) live in the amd64 machine half; on aarch64
+`wx-relaxed` and `getcpu` are relayed so far. Reproduce either with [`overlays/denver`](../overlays/denver/README.md)
+(`ARCH=aarch64 overlays/denver/check.sh`).
+
 ## The lessons
 
 ### L1 — Collecting requirements

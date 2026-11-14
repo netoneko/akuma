@@ -24,6 +24,8 @@
 
 #[cfg(all(target_arch = "x86_64", target_os = "none"))]
 pub use akuma_tokio_kernel::{Kernel, boot_multiboot2};
+#[cfg(all(target_arch = "aarch64", target_os = "none"))]
+pub use akuma_tokio_kernel::{Kernel, secondary_start};
 
 /// The entry macro, re-exported so a kernel writes `akuma_jvm_kernel::entry!(main)`
 /// and names itself through its own package (`CARGO_PKG_NAME` is `uname -n`).
