@@ -478,38 +478,23 @@ static int child_mmaparms(void) {
             if (v != 42) fails++;
         }
     }
-    /* (3) RWX under wx-relaxed. Recorded, not judged: this kernel's mmap
-     * arm encodes an executable mapping as never-writable (mm.rs mmap_arm:
-     * "W^X refused W+X above, so an executable mapping is never writable"),
-     * while real Linux honors W+X — the metal run of this very arm passes
-     * the write+call. So read what the mapping BECAME from /proc/self/maps
-     * (non-crashing) and name the divergence if it shows. */
+    /* (3) RWX under wx-relaxed: the request's W bit must be HONORED — mmap W+X,
+     * write code straight into it (a fault here is this child's SIGSEGV: the
+     * silent strip, PHASE-2-HEAPRO), then call it. The old shape read the
+     * mapping's perms from /proc/self/maps, but maps shows the glue regions,
+     * not the mmap slab's - saw_w stayed -1 and the arm REDd regardless of
+     * what the kernel did (the recorded "mmap W+X dropped W" divergence was
+     * this probe gap as much as a policy; D42 again: a probe that cannot see
+     * the thing it judges reports its own blindness). The write is the test. */
     unsigned char *wx = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (wx == MAP_FAILED) { printf("MMARMS INFO rwx mmap errno=%d (%s) (policy refused)\n", errno, estr(errno)); }
     else {
-        char want[32];
-        snprintf(want, sizeof want, "%lx-", (unsigned long)wx & ~0xFFFUL);
-        int saw_w = -1;
-        FILE *m = fopen("/proc/self/maps", "r");
-        char line[256];
-        while (m && fgets(line, sizeof line, m))
-            if (!strncmp(line, want, strlen(want))) {
-                const char *p = strchr(line, ' ');
-                saw_w = p ? (p[2] == 'w') : -1; /* perms = p[1..4]: rwx */
-                break;
-            }
-        if (m) fclose(m);
-        if (saw_w == 1) {
-            memcpy(wx, code, sizeof code);
-            int (*f2)(void) = (int (*)(void))wx;
-            int v = f2();
-            printf("MMARMS %s rwx call=%d\n", v == 42 ? "PASS" : "RED", v);
-            if (v != 42) fails++;
-        } else {
-            printf("MMARMS RED rwx-mapped-perm-w=%d (mmap W+X dropped W; Linux honors it) base=%p\n", saw_w, (void *)wx);
-            fails++;
-        }
+        memcpy(wx, code, sizeof code); /* the write bit, tested not read from maps */
+        int (*f2)(void) = (int (*)(void))wx;
+        int v = f2();
+        printf("MMARMS %s rwx call=%d\n", v == 42 ? "PASS" : "RED", v);
+        if (v != 42) fails++;
     }
     munmap(base, RES);
     return fails ? 1 : 0;
