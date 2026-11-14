@@ -113,6 +113,27 @@ everything before the last day):
 3. **The cheap model is context-bound, not capability-bound.** 98% cache reads: the savings came from lean reading, not
    from fewer calls.
 
+## One-sentence summary, and how not to overstate it
+
+"About a day of elapsed time, a handful of operator interventions and most of a weekly z.ai lite quota took an
+existing kernel from 'java will not start' to javac and Clojure running in the guest." Corrections, so the sentence is
+not read as more than it is:
+
+- **24 h is elapsed time.** The agent worked about 13.7 h of it; the rest was waiting out rate-limit windows and
+  relaunching the driver.
+- **"A couple of interventions" undercounts.** The two operator corrections (real javac; javac first) mattered most,
+  but the list above is longer (merge, `improve` session, sshd fix, relaunches, staging, benching, final checks), and
+  `RESULT.md` has 31 `INTERVENTION` lines, 2 labelled operator.
+- **Quota:** about 95% of the weekly window by z.ai's count (187.1M); the denver sessions are 172.2M of that, the rest
+  is other goose use.
+- **It is not a new kernel.** Denver is taoxichuan plus 18 own lines; the loop's net change is about 1,560 Rust lines
+  (2.3% of the linked code), all behind off-by-default features. A mature stack plus a gated loop is what made this
+  possible.
+- **Clojure was an operator test, not a loop gate.** It ran on the loop's kernel with no code change; the loop's own
+  javac gate never executed (quota cutoff).
+- **The operator hint was load-bearing.** Without the real-javac correction the loop was still debugging its own
+  class-file assembler.
+
 ## Caveats
 
 - Linked-line counts are the **crate closure**, not symbols: unreachable or feature-gated code inside a linked crate
