@@ -58,6 +58,58 @@ protocol: record it, insert a diagnostic pass if one is missing, re-rank `REQUIR
   gate log before turn ~120 (the driver caps `--max-turns` at 150 by default) — a session
   cut off before its records fails the driver's bookkeeping check.
 
+## Operator correction (2026-11-14) - read before you decide how to make class files
+
+You built a bytecode assembler (`denver/probes/mkworkload.py`) because "no javac exists anywhere in the lineage".
+That was a question to **ask**, not a reason to build: `denver/ESCALATE.md` (`QUESTION:`) is for exactly this. The
+operator has since checked, and here is what exists:
+
+- A real `javac` (Homebrew OpenJDK 26.0.2, used as `javac --release 21`, class major version 65) exists on the
+  operator's Mac only. It is not on this box. Classes you need can be compiled there on request.
+- Staged for you in **`/root/denver/javac/`** (read its `README.txt`): `Workload.java` and `Worker.java` with the
+  same four surfaces and the same markers as your assembler, plus the compiled `Workload.class` / `Worker.class`.
+- The operator ran those compiled classes on the denver kernel `d4acb339`, unchanged, with your own command line
+  (`/opt/jdk/bin/java -Xms64m -Xmx1536m -cp /work Workload`): **exit 0, every marker including
+  `WORKLOAD-ALL-PASS`** - exceptions, file I/O, the 24 x 16 MiB humongous churn, and a thread that returned 42.
+  The kernel is not what failed in your first JAVACLASSLIB gate (`exit=1`, markers missing); the difference is
+  the class files. That is the operator's inference from one run, not a proof.
+- The guest runtime carries the `jdk.compiler` module, but `java -m jdk.compiler/com.sun.tools.javac.Main` dies
+  with a SIGSEGV in JIT code (a NULL read, `cr2=0x8`, in an rwx mapping). That crash is now your top priority:
+  see "Operator priority change" below.
+
+The operator suggests: use the staged real-javac classes for this gate instead of debugging the assembler -
+it should take less time. You decide; if you keep the assembler, say why in the research artifact. Either way,
+state in your LOOP_LOG entry where the gate's class files came from. Need another class? Put the Java source in
+the escalation and the operator compiles it.
+
+## Operator priority change (2026-11-14, later) - javac is your last stretch
+
+The operator will finish the rest of the project with other models. A working `javac` inside the guest is
+realistically this model's last stretch, and the weekly quota left for it is small (about one session), so spend
+it here and write your records early.
+
+1. **Update `denver/docs/REQUIREMENTS.md` yourself**: add a row for the javac crash below, rank it **first**, and
+   re-rank the rest from it. Close JAVACLASSLIB now if the staged real-javac classes (see the section above) run
+   your four surfaces clean; do not keep debugging your assembler for a gate whose class files you can have
+   today. Then point `NEXT GATE:` at the javac gate (name it by your convention).
+2. **The datum** (operator-measured, guest kernel `d4acb339`): `/opt/jdk/bin/java -m
+   jdk.compiler/com.sun.tools.javac.Main -version` dies with
+   `[Fault] ring3 PageFault rip=0x00006000118848e3 cr2=0x8 code=0x4 -- task killed`; the faulting bytes are
+   `44 8b 52 08` = `mov 0x8(%rdx),%r10d` with `rdx=0`, inside an `rwxs` mapping `0x60001187c000-0x60001188b000`
+   (the JIT code cache). Slot 5 killed (SIGSEGV). The runtime carries `jdk.compiler` (69 modules); only the
+   `bin/javac` launcher is missing, so `-m jdk.compiler/com.sun.tools.javac.Main` is the entry point.
+3. **A hypothesis, not a finding**: HotSpot compiles implicit null checks - a read through a NULL object - and
+   relies on the kernel delivering SIGSEGV to the JVM's own handler, which raises a NullPointerException. Here
+   the kernel kills the task instead. Diagnostics before fixes: first see whether the JVM installs a SIGSEGV
+   handler at all (`rt_sigaction`), whether this kernel delivers a synchronous fault to a user handler (siginfo,
+   ucontext, `rt_sigreturn`), and whether the crash is JIT-specific (the same command with `-Xint`). Name the
+   cause from the console before changing code. HotSpot also uses trap-and-handle faults for safepoint polling,
+   so a fix here may matter well beyond javac.
+4. **Done means**: inside the guest, javac compiles a real `.java` file (the staged `Workload.java` or
+   `Logo.java` are good inputs - put the source on the guest disk the way you stage other files), and the class
+   it produces runs. Staged inputs are in `/root/denver/javac/`. Kernel changes stay behind off-by-default
+   features, and the default build's `.text` stays unchanged (R6), as in your earlier gates.
+
 ## End
 
 Update `denver/docs/LOOP_LOG.md` (Record voice: what we did, what decision it forced), the living
