@@ -7,6 +7,8 @@
  *   jvmprobe getcpu    -> GETCPU PASS cpu=N node=M | GETCPU RED ENOSYS | GETCPU RED errno=N (str)
  *   jvmprobe auxv      -> AUXV PASS/RED lines (AT_SYSINFO_EHDR = the vDSO gap)
  *   jvmprobe cycles    -> CYCLES PASS getpid=N cyc/call clock_gettime=N cyc/call
+ *   jvmprobe maps      -> MAPS PASS lines=N exec_lines=N | MAPS RED errno=N (the G4 flip)
+ *   jvmprobe name RIP  -> NAME PASS rip in <range> | NAME SURPRISE | NAME MISSING (G9's owner)
  *   jvmprobe rwx       -> RWX RED mmap-RWX-refused=EINVAL/EACCES (+ RWX PASS rw_to_rx=42)
  *                          | RWX RED rw_to_rx <why>   (the ability HotSpot minimally needs)
  *   jvmprobe java CMD  -> JVM PASS firstline | JVM RED <diagnosis> (+ evidence path)
@@ -79,21 +81,50 @@ static int arm_auxv(void) {
     auxv_line("AT_CLKTCK", 17, 0);
     auxv_line("AT_HWCAP", 16, 0);
     auxv_line("AT_SYSINFO_EHDR", 33, 1); /* the vDSO: RED = hypothesis H2 confirmed */
-    /* diagnostics: can the kernel even serve /proc/self/auxv (taoxichuan precedent:
-     * /proc/<pid>/maps was empty there; maps/auxv render is akuma-procfs's gated job) */
+    /* the procfs arm (PHASE-2-PROCFS, G4): /proc/self/auxv must serve the raw
+     * Elf64_auxv_t pairs - the vector getauxval reads, as bytes. A phase-1 INFO
+     * became the verdict: errno=2 here was G4's whole evidence line. The
+     * consistency check is the point: the kernel that builds the stack vector
+     * and the kernel that renders /proc must answer identically (AT_PAGESZ and
+     * AT_SYSINFO_EHDR must match getauxval), or one of the two renders lies. */
     FILE *f = fopen("/proc/self/auxv", "rb");
     if (!f) {
-        printf("AUXV INFO /proc/self/auxv unreadable errno=%d (%s)\n", errno, estr(errno));
-    } else {
-        unsigned long buf[2];
-        size_t n = 0, got;
-        while ((got = fread(buf, 1, sizeof buf, f)) == sizeof buf) {
-            if (buf[0] == 0) break;
-            n += got;
-        }
-        fclose(f);
-        printf("AUXV INFO /proc/self/auxv bytes=%zu\n", n * 2);
+        printf("AUXV RED /proc/self/auxv unreadable errno=%d (%s)\n", errno, estr(errno));
+        return 1;
     }
+    static unsigned char aux[4096];
+    size_t n = fread(aux, 1, sizeof aux, f);
+    int ferr = ferror(f);
+    fclose(f);
+    if (ferr) {
+        printf("AUXV RED /proc/self/auxv read errno=%d (%s)\n", errno, estr(errno));
+        return 1;
+    }
+    if (n == 0 || (n & 15) != 0 || (n & 15) != 0) {
+        printf("AUXV RED /proc/self/auxv bytes=%zu not whole pairs\n", n);
+        return 1;
+    }
+    unsigned long pagesz = 0, ehdr_procfs = 0, ehdr_stack = getauxval(33);
+    int terminated = 0;
+    for (size_t i = 0; i + 16 <= n; i += 16) {
+        unsigned long k, v;
+        __builtin_memcpy(&k, aux + i, 8);
+        __builtin_memcpy(&v, aux + i + 8, 8);
+        if (k == 0) { terminated = 1; break; }
+        if (k == 6) pagesz = v;         /* AT_PAGESZ */
+        if (k == 33) ehdr_procfs = v;   /* AT_SYSINFO_EHDR */
+    }
+    int bad = 0;
+    if (pagesz != 4096) { printf("AUXV RED procfs-auxv AT_PAGESZ=%lu want 4096\n", pagesz); bad = 1; }
+    if (!terminated) { printf("AUXV RED procfs-auxv no AT_NULL terminator\n"); bad = 1; }
+    if (ehdr_stack != 0 && ehdr_procfs != ehdr_stack) {
+        printf("AUXV RED procfs-auxv AT_SYSINFO_EHDR stack=%lu procfs=%lu (one render lies)\n", ehdr_stack, ehdr_procfs);
+        bad = 1;
+    }
+    if (bad) return 1;
+    printf("AUXV PASS procfs-auxv bytes=%zu pairs=%zu pagesz=4096", n, n / 16 - 1);
+    if (ehdr_stack != 0) printf(" AT_SYSINFO_EHDR matches stack=%lu", ehdr_stack);
+    printf("\n");
     if (getauxval(33) == 0) return 1;
     return 0;
 }
@@ -256,10 +287,144 @@ static int arm_java(char **argv) {
     return 1;
 }
 
+
+/* ---------------- maps (PHASE-2-PROCFS) ---------------- */
+/* /proc/self/maps must exist, parse, and name this process's own image and
+ * stack: lines of `<start>-<end> <perms> <offset> <dev> <inode> [path]`, the
+ * format sscanf("%lx-%lx") reads. Empty would be the confident lie the glue's
+ * doc warns about ("this process has no mappings"); errno=2 was G4's other
+ * evidence. The verdict also needs an executable line - the image's text - so
+ * an arm attributing a fault rip has something executable to land in. */
+static int arm_maps(void) {
+    static char buf[262144];
+    int fd = open("/proc/self/maps", O_RDONLY);
+    if (fd < 0) {
+        printf("MAPS RED /proc/self/maps errno=%d (%s)\n", errno, estr(errno));
+        return 1;
+    }
+    size_t off = 0;
+    ssize_t g;
+    while (off < sizeof buf - 1 && (g = read(fd, buf + off, sizeof buf - 1 - off)) > 0) off += (size_t)g;
+    int rerr = errno;
+    close(fd);
+    if (g < 0) {
+        printf("MAPS RED /proc/self/maps read errno=%d (%s)\n", rerr, estr(rerr));
+        return 1;
+    }
+    buf[off] = 0;
+    size_t lines = 0, exec_lines = 0, bad = 0;
+    for (char *p = buf; *p; ) {
+        char *nl = strchr(p, '\n');
+        if (!nl) nl = p + strlen(p);
+        unsigned long s, e;
+        char perms[8] = {0};
+        if (sscanf(p, "%lx-%lx %7s", &s, &e, perms) == 3 && e > s
+            && (perms[0] == 'r' || perms[0] == '-')
+            && (perms[1] == 'w' || perms[1] == '-')
+            && (perms[2] == 'x' || perms[2] == '-')) {
+            lines++;
+            if (perms[2] == 'x') exec_lines++;
+            printf("MAPS-LINE: %.*s\n", (int)(nl - p), p);
+        } else {
+            bad++;
+        }
+        if (!*nl) break;
+        p = nl + 1;
+    }
+    if (lines == 0 || bad) {
+        printf("MAPS RED lines=%zu malformed=%zu bytes=%zu\n", lines, bad, off);
+        return 1;
+    }
+    printf("MAPS PASS lines=%zu exec_lines=%zu bytes=%zu\n", lines, exec_lines, off);
+    return 0;
+}
+
+/* ---------------- name (PHASE-2-PROCFS: the G9 rip gets an owner) ----------------
+ * fork+exec the workload, poll /proc/<pid>/maps every 2 ms until it dies, keep
+ * the LAST snapshot (the layout at death), print it whole, then attribute the
+ * expected rip from the console's fault line. This is the gate's payoff arm:
+ * a bare rip cannot be fixed (REQUIREMENTS G9); a rip inside a named range can.
+ * usage: jvmprobe name CMD EXPECTED_RIP_HEX [ARG]...  (rip as written without 0x) */
+static int arm_name(char **argv) {
+    char *cmd = argv[0];
+    unsigned long rip = strtoul(argv[1], NULL, 16);
+    char **jargs = argv + 1; /* execv wants argv[0]=cmd then args; jargs[0] is rip now - fix below */
+    char *child_argv[64];
+    size_t na = 0;
+    child_argv[na++] = cmd;
+    for (char **a = argv + 2; *a && na < 63; a++) child_argv[na++] = *a;
+    child_argv[na] = NULL;
+    (void)jargs;
+    if (access(cmd, X_OK) != 0) {
+        printf("NAME RED not-executable at=%s errno=%d (%s)\n", cmd, errno, estr(errno));
+        return 1;
+    }
+    static char snap[262144];
+    size_t snap_len = 0;
+    pid_t pid = fork();
+    if (pid == 0) {
+        execv(cmd, child_argv);
+        _exit(127);
+    }
+    char path[64];
+    int polls = 0;
+    for (;;) { /* bounded: 30 s of 2 ms polls - java -version dies long before */
+        snprintf(path, sizeof path, "/proc/%d/maps", pid);
+        int fd = open(path, O_RDONLY);
+        if (fd < 0) break; /* ENOENT: the pid dir is gone - dead (or reaped) */
+        size_t off = 0;
+        ssize_t g;
+        while (off < sizeof snap - 1 && (g = read(fd, snap + off, sizeof snap - 1 - off)) > 0) off += (size_t)g;
+        close(fd);
+        if (off > 0) { snap_len = off; snap[snap_len] = 0; }
+        if (++polls > 15000) break;
+        usleep(2000);
+    }
+    int st = 0;
+    waitpid(pid, &st, 0);
+    printf("NAME INFO exit=%d signal=%d maps_bytes=%zu polls=%d\n",
+           WIFEXITED(st) ? WEXITSTATUS(st) : -1, WIFSIGNALED(st) ? WTERMSIG(st) : 0,
+           snap_len, polls);
+    if (snap_len == 0) {
+        printf("NAME MISSING no /proc/<pid>/maps snapshot before death - the diagnostic cannot do its job\n");
+        return 1;
+    }
+    size_t lines = 0, exec_lines = 0;
+    for (char *p = snap; *p; ) {
+        char *nl = strchr(p, '\n');
+        if (!nl) nl = p + strlen(p);
+        unsigned long s, e;
+        char perms[8] = {0};
+        if (sscanf(p, "%lx-%lx %7s", &s, &e, perms) == 3) {
+            lines++;
+            if (perms[2] == 'x') exec_lines++;
+            printf("NAME-MAPS: %.*s\n", (int)(nl - p), p);
+        }
+        if (!*nl) break;
+        p = nl + 1;
+    }
+    printf("NAME INFO lines=%zu exec_lines=%zu\n", lines, exec_lines);
+    for (char *p = snap; *p; ) {
+        char *nl = strchr(p, '\n');
+        if (!nl) nl = p + strlen(p);
+        unsigned long s, e;
+        char perms[8] = {0};
+        if (sscanf(p, "%lx-%lx %7s", &s, &e, perms) == 3 && rip >= s && rip < e) {
+            printf("NAME PASS rip=0x%lx in %08lx-%08lx perms=%s off=0x%lx\n", rip, s, e, perms, rip - s);
+            return 0;
+        }
+        if (!*nl) break;
+        p = nl + 1;
+    }
+    printf("NAME SURPRISE rip=0x%lx not in any captured line (layout moved; the maps above are the record)\n", rip);
+    return 2;
+}
+
 /* ---------------- main ---------------- */
 static void usage(void) {
     fprintf(stderr,
-            "usage: jvmprobe getcpu|auxv|cycles|rwx|java CMD [ARG]...\n"
+            "usage: jvmprobe getcpu|auxv|cycles|rwx|maps|java CMD [ARG]...\n"
+            "       jvmprobe name CMD EXPECTED_RIP_HEX [ARG]...\n"
             "  one arm per invocation; NAME VERDICT detail on stdout; exit 0 iff PASS\n");
 }
 
@@ -273,6 +438,8 @@ int main(int argc, char **argv) {
     if (!strcmp(arm, "auxv")) return arm_auxv();
     if (!strcmp(arm, "cycles")) return arm_cycles();
     if (!strcmp(arm, "rwx")) return arm_rwx();
+    if (!strcmp(arm, "maps")) return arm_maps();
+    if (!strcmp(arm, "name")) return argc < 4 ? usage(), 2 : arm_name(argv + 2);
     if (!strcmp(arm, "java")) return argc < 3 ? usage(), 2 : arm_java(argv + 2);
     return usage(), 2;
 }
