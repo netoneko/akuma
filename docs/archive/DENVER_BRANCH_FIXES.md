@@ -94,6 +94,9 @@ never gone through the hook. A default-workspace `cargo check` in every gate wou
 - The `9ec07523` manifest commit skipped the pre-commit hook (`--no-verify`): clippy, tests and the secret scan did not
   run on it, and nothing has re-checked it since.
 
+- A single kernel boot argument of about 110 characters (a three-jar `-cp` in `initargs=`) lost its last entry, so the
+  third jar was never found (QEMU run, `overlays/denver`); a wildcard classpath avoids it. Cause not investigated.
+
 ## Background
 
 - `denver/docs/archive/AUTORESEARCH_EXPERIMENT_RESULTS.md`, `denver/docs/archive/CLOJURE_AND_JAVAC_ON_DENVER.md`

@@ -25,3 +25,6 @@ taoxichuan-fc.bin
 
 # dev-cycle laptop-side artifacts (bundles, reports)
 scripts/kvm/dev_cycle_out/
+
+# denver overlay build output (kernel, image, logs)
+overlays/denver/out/

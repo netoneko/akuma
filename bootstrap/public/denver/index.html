@@ -1,0 +1,204 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Denver: a platform kernel for the JVM</title>
+<meta name="description" content="An experimental platform kernel built from existing Akuma crates by GLM-5.3-flash in autoresearch mode: Java, Clojure, Scala and Groovy in about 24 hours.">
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --ink: #ececec;
+    --dim: #8d9199;
+    --rule: #3a3d44;
+    --soft: #1b1c20;
+    --neon: #ff2a6d;   /* the one accent: used for rules, cursor, marks */
+    --cyan: #2ad4e8;   /* second accent, only for the terminal prompt */
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    --pad: clamp(1.2rem, 5vw, 5rem);
+  }
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html { -webkit-text-size-adjust: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--ink); font: 1rem/1.55 var(--mono); }
+  a { color: var(--ink); text-decoration: none; border-bottom: 1px solid var(--neon); }
+  a:hover, a:focus-visible { background: var(--neon); color: #fff; outline: none; }
+
+  html { scroll-behavior: smooth; }
+  .deck { max-width: 62rem; margin: 0 auto; padding: 0 var(--pad); }
+  .slide { display: flex; flex-direction: column; gap: 1.2rem; padding: clamp(2.5rem, 8vh, 5rem) 0; border-bottom: 1px solid var(--soft); }
+  .slide:first-child { padding-top: clamp(2rem, 7vh, 4rem); }
+  .slide:last-child { border-bottom: 0; }
+  h1, h2 { margin: 0; font-weight: 700; letter-spacing: -.01em; line-height: 1.15; }
+  h1 { font-size: clamp(2rem, 6vw, 4rem); }
+  h2 { font-size: clamp(1.4rem, 3.4vw, 2.3rem); }
+  h2::after { content: ""; display: block; width: 3.5rem; height: 3px; background: var(--neon); margin-top: .7rem; }
+  p { margin: 0; max-width: 62ch; }
+  .lead { font-size: clamp(1.05rem, 1.8vw, 1.3rem); }
+  .dim { color: var(--dim); }
+  ul { margin: 0; padding-left: 1.2rem; max-width: 66ch; }
+  li { margin: .35rem 0; }
+  li::marker { color: var(--neon); content: "> "; }
+  code { background: var(--soft); padding: .05em .35em; }
+  pre {
+    margin: 0; padding: 1rem 1.2rem; overflow-x: auto; font: inherit; font-size: .85rem; line-height: 1.35;
+    border: 1px solid var(--rule); background: var(--bg); box-shadow: 5px 5px 0 #17181c;
+  }
+  .banner { font-size: clamp(.5rem, 1.5vw, .95rem); line-height: 1.15; border: 0; box-shadow: none; padding: 0; overflow: hidden; }
+  .top { display: flex; flex-wrap: wrap; gap: .6rem 1.6rem; font-size: .9rem; }
+  .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 0; border: 1px solid var(--rule); max-width: 62rem; }
+  .stats div { padding: .9rem 1rem; border-right: 1px solid var(--rule); border-bottom: 1px solid var(--rule); margin: -1px 0 0 -1px; }
+  @media (min-width: 44rem) { .stats { grid-template-columns: repeat(3, 1fr); } }
+  .stats b { display: block; font-size: 1.9rem; line-height: 1.1; }
+  .stats span { font-size: .78rem; color: var(--dim); text-transform: uppercase; letter-spacing: .08em; }
+  .tag { font-size: .72rem; letter-spacing: .14em; text-transform: uppercase; color: var(--neon); }
+  .cols { display: grid; gap: 1.5rem 3rem; grid-template-columns: 1fr; }
+  @media (min-width: 60rem) { .cols { grid-template-columns: 1fr 1fr; align-items: start; } }
+
+  /* the screencast */
+  .term { background: #000; color: #e8e8e8; border: 1px solid var(--rule); box-shadow: 5px 5px 0 var(--neon); max-width: 62rem; }
+  .term .bar { display: flex; justify-content: space-between; padding: .35rem .8rem; border-bottom: 1px solid #333; font-size: .72rem; color: #9a9a9a; letter-spacing: .1em; }
+  .term pre { border: 0; box-shadow: none; background: transparent; color: inherit; height: 22rem; overflow: hidden; font-size: clamp(.62rem, 1.35vw, .85rem); }
+  .term .p { color: var(--cyan); } .term .ok { color: #7cf29a; } .term .hl { color: var(--neon); }
+  .caret { display: inline-block; width: .55em; height: 1em; background: var(--neon); vertical-align: -.15em; animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  button { font: inherit; font-size: .8rem; background: var(--bg); color: var(--ink); border: 1px solid var(--rule); padding: .35rem .8rem; cursor: pointer; }
+  button:hover, button:focus-visible { background: var(--ink); color: var(--bg); outline: none; }
+  @media (prefers-reduced-motion: reduce) { .caret { animation: none; } html { scroll-behavior: auto; } }
+</style>
+</head>
+<body>
+<main class="deck" id="deck">
+
+<section class="slide">
+  <pre class="banner" aria-label="Denver">   /\        /\        /\        /\        /\
+  /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
+ /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
+_/                                    \_     Beans System Debauchery:
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       kernel for Clojure</pre>
+  <h1>A platform kernel,<br>assembled from crates.</h1>
+  <p class="lead">Denver runs Java, Clojure, Scala and Groovy. A cheap open-weight model built it in about 24 hours, one gate per session, from crates Akuma already had.</p>
+  <div class="top">
+    <a href="https://akuma.sh/">akuma.sh</a>
+    <a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a>
+    
+  </div>
+</section>
+
+<section class="slide">
+  <span class="tag">the idea</span>
+  <h2>A kernel is a manifest</h2>
+  <p>Denver has no kernel code of its own. One binary crate and one front crate choose, by feature name, which existing crates make up the kernel. Every feature is off by default, so the default build never changes.</p>
+  <pre>denver                  the binary: main.rs, banner, the feature list
+  |  features, 1:1
+akuma-jvm-kernel        front crate: entry!, Kernel, zero capabilities
+  |  features, 1:1
+akuma-tokio-kernel      the platform: tokio on bare metal
+  |
+  '-- akuma-tokio-kernel-amd64    machine half: the arms the features turn on
+        '-- runtime-tokio, syscalls-glue, exec, mmu, pmm, vfs, net, tty ...</pre>
+</section>
+
+<section class="slide">
+  <span class="tag">the result</span>
+  <h2>What it did, measured</h2>
+  <div class="stats">
+    <div><b>~24 h</b><span>bare kernel to a JVM</span></div>
+    <div><b>JDK 21</b><span>HotSpot, G1, C1 + C2</span></div>
+    <div><b>8</b><span>defects found and fixed</span></div>
+    <div><b>~1,750</b><span>lines of kernel Rust</span></div>
+    <div><b>66</b><span>loop commits to Hello World</span></div>
+    <div><b>+3</b><span>Clojure, Scala, Groovy on the javac kernel, no extra fix</span></div>
+  </div>
+  <p>javac compiles inside the guest and its output is identical to the host's. Clojure, Scala and Groovy compile and run. A Clojure HTTP server answers from outside, from a fresh kernel under KVM on metal.</p>
+  <p class="dim">One run, one model, one box: an experiment report, not a benchmark.</p>
+</section>
+
+<section class="slide">
+  <span class="tag">lesson 1</span>
+  <h2>The workload is the spec</h2>
+  <ul>
+    <li>Run the thing you want on your best system first. Where it fails is your gap list.</li>
+    <li>Rank gaps by the workload's own order of operations, never by taste.</li>
+    <li>Suspects stay hypotheses until something that reaches them dies naming one.</li>
+    <li>Evidence comes from captured logs, never from memory.</li>
+  </ul>
+</section>
+
+<section class="slide">
+  <span class="tag">lesson 2</span>
+  <h2>The instrument is part of the experiment</h2>
+  <ul>
+    <li>A verdict can lie: buffering, wrong constants, parsing by position.</li>
+    <li>Disassemble a surprising probe before blaming the kernel.</li>
+  </ul>
+  <p>Case in point: a probe reported that <code>rt_sigreturn</code> lost a register. The kernel was right. The committed probe binary stored its edit in the wrong slot, because it did not match its own source.</p>
+</section>
+
+<section class="slide">
+  <span class="tag">lessons 3 and 4</span>
+  <h2>Compose, then loop</h2>
+  <div class="cols">
+    <div><b>3 · The platform crate.</b><ul><li>Front crate is a pure pass-through.</li><li>One feature per measured gap, relayed 1:1, off by default.</li><li>Call existing crates; never fork them.</li></ul></div>
+    <div><b>4 · The loop.</b><ul><li>One gate per session, captured output is the only judge.</li><li>Cheap cycles, honest failures, records before polish.</li><li>The human stays in the loop.</li></ul></div>
+  </div>
+</section>
+
+<section class="slide">
+  <span class="tag">lessons 5 and 6</span>
+  <h2>Interrupt, then look for the flag</h2>
+  <div class="cols">
+    <div><b>5 · Interrupt when it matters.</b><ul><li>The first path found is not the path required.</li><li>Ask "can we go around?" before chasing. A well-aimed interruption is the cheapest tool in the box.</li></ul></div>
+    <div><b>6 · Find the feature flag.</b><ul><li>"Not implemented" is a configuration question before it is an implementation task.</li><li>The HTTP server needed one line in a manifest: <code>shell = ["akuma-jvm-kernel/shell"]</code>.</li></ul></div>
+  </div>
+</section>
+
+<section class="slide">
+  <span class="tag">screencast</span>
+  <h2>A Clojure web server on Denver</h2>
+  <div class="term" role="img" aria-label="Animated terminal: build the kernel, build the image, boot under QEMU, curl the Clojure server">
+    <div class="bar"><span id="ttitle">overlays/denver</span><span><button id="replay" type="button">replay</button></span></div>
+    <pre id="screen" aria-hidden="true"></pre>
+  </div>
+  <noscript><p>Enable JavaScript to play the screencast. The commands are in the next section.</p></noscript>
+</section>
+
+<section class="slide">
+  <span class="tag">try it</span>
+  <h2>Reproduce it locally</h2>
+  <p>You need Rust (nightly toolchain from the repo), QEMU and Docker. No KVM: QEMU runs the x86 guest under TCG, so expect it to be slow.</p>
+  <pre>git clone https://github.com/netoneko/akuma &amp;&amp; cd akuma
+overlays/denver/build-kernel.sh     # the gate feature set  -> out/denver
+overlays/denver/build-image.sh      # JDK 21 + Clojure 1.12 -> out/denver-clojure.img
+overlays/denver/run.sh              # boots; the guest's init is java itself
+curl http://localhost:8080/         # Hello from Clojure 1.12.0 on Akuma/denver</pre>
+</section>
+
+<section class="slide">
+  <span class="tag">read more</span>
+  <h2>The records</h2>
+  <ul>
+    <li><a href="https://github.com/netoneko/akuma/blob/main/denver/README.md">denver/README.md</a>: the lessons in full</li>
+    <li><a href="https://github.com/netoneko/akuma/blob/main/denver/docs/archive/KERNEL_HOWTO_BUILDING_CUSTOM_PLATFORM_KERNEL.md">the plan and the core idea</a></li>
+    <li><a href="https://github.com/netoneko/akuma/blob/main/denver/docs/archive/AUTORESEARCH_EXPERIMENT_RESULTS.md">the experiment log</a></li>
+    <li><a href="https://github.com/netoneko/akuma/blob/main/docs/archive/DENVER_BRANCH_FIXES.md">the eight defects</a></li>
+  </ul>
+</section>
+
+<section class="slide">
+  <pre class="banner" aria-hidden="true">   /\        /\        /\        /\        /\
+  /  \  /\  /  \  /\  /  \  /\  /  \
+ /    \/  \/    \/  \/    \/  \/    \
+_/                                    \_
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~</pre>
+  <h2>Denver is part of Akuma</h2>
+  <div class="top">
+    <a href="https://akuma.sh/">akuma.sh</a>
+    <a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a>
+  </div>
+</section>
+
+</main>
+<script src="anim.js"></script>
+</body>
+</html>
