@@ -126,3 +126,13 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   no fault and no exit report — progress, still unreadable. And the window's only fault
   was a PRIOR gate's designed proof arm arriving by console lag — attribute before
   alarming (D41's rule applied backwards in time).
+
+- 2026-11-14 (PHASE-3-JAVAVERSION → JAVAC, four gates in one day): the loop's cost concentrates
+  in the PORT pass; the PROOF passes are cheap once the port exists (JAVAC's gate: one probe,
+  four attempts, every failure probe-side — a missing staged source, two channel-rigidity bugs,
+  zero kernel-side — wall 82 s GREEN on a kernel binary that was hours old). Records-before-
+  polish matters at quota edges: the operator's night update reordered the session's work
+  (gate first, REQUIREMENTS edits second, lesson paperwork last) precisely so a cutoff loses
+  nothing but polish. Escalation works: the operator's correction turned the assembler premise
+  into staged real-javac classes and a closed G12; interventions are data — the JAVAC gate's
+  three probe-side interventions are exactly the hardening the next probe inherits for free.

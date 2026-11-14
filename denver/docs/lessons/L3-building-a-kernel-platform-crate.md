@@ -109,3 +109,20 @@ code.
   kernel stack that owns it; no model flag, no new hook table. Residual recorded: per-view
   locks over one root mean a sibling's fault can flip a PTE mid-walk — the staleness class
   the kernel's own reclaim sweep already walks under.
+
+- 2026-11-14 (the fault-signal port, PHASE-3-JAVAC GREEN on it unchanged): metal's complete
+  fault→signal path (`akuma-kernel-amd64/src/signal.rs`) ported 1:1 into
+  `akuma-tokio-kernel-amd64::faultsig` behind `fault-signal` (D73) — the metal module is the R9
+  precedent to port from, not a design to re-derive; `#[repr(C)]` + `offset_of!` const
+  assertions caught the first draft's layout reorder at compile time (D74). Two port divergences
+  were deliberate and recorded in the module header (Linux/glibc greg order; the LIFO frame
+  identification at `rt_sigreturn`). Known-open rider (G14): the sync restore keeps the patched
+  `%rip` but loses the patched `%rax` — the frame-write side is proven right (the handler reads
+  the interrupted rax correctly), so the suspect is `sync_sigreturn`'s restore order (sigreturn's
+  own return value overwriting the ucontext rax, or a wrong restore slot). Fix stays INSIDE the
+  existing feature — a bug in the featured path needs no new feature and must not move the
+  default build (R6).
+- 2026-11-14 (the shell set, G15 closed without a denver syscall): `akuma-runtime-tokio::shell`
+  already carried getrlimit/prlimit64/getpgid/getrusage/membarrier/... — one relay line
+  (`shell = [...]`, commit 9ec07523) served what two phases of census had catalogued as ENOSYS.
+  Before writing any syscall arm: grep the runtime for the feature that serves it (lesson L5).

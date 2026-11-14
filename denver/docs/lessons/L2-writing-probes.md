@@ -193,3 +193,17 @@ the RED phase proves the probes themselves before any pass claims anything.
   the rig (`cp denver-jdk.img denver-hello.img` + `debugfs -w write`, jvmprobe-to-`/bin`
   precedent) — never modify a proven image in place; and gate logs are gitignored, `git add -f`
   is the tracked precedent.
+- 2026-11-14 (PHASE-3-JAVAC, four attempts, zero kernel-side failures): (1) **stage-check the
+  inputs the workload actually references** — the operator-staged image carried `Worker.class`
+  but not `Worker.java`; javac RED'd `error: file not found` in <1 s and the gate now stages the
+  source itself into its own image copy (`debugfs -w -f -` + dump-back md5 of EVERY staged input,
+  D80 — the D70 practice generalized). (2) **a healthy guest can starve one ssh round trip** —
+  attempt 2's sigprobe arm hit a 30 s timeout with the console showing a ticking guest and no
+  fault; the ssh wrapper itself auto-reconnects mid-arm (`connection stalled during handshake`,
+  retried, succeeded). Probes therefore need an aliveness rule, not a single poke: B0 baseline +
+  a final poke before the verdict, and ONE retry on an arm whose first answer carries no verdict
+  line at all. (3) **the verdict gate must not be stricter than the arms** — attempt 3 passed
+  every substantive arm and still FAILed because one B0 poke starved; aliveness is "some round
+  trip answered", not "that round trip answered". (4) a java-free C probe (sigprobe) answers a
+  kernel-path question (synchronous fault → user handler → edited ucontext → `rt_sigreturn`)
+  in one 30 s arm, before any JVM boot cost is spent on it.

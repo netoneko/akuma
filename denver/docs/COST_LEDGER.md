@@ -20,3 +20,6 @@ session denver-PHASE-2-MEMINFO wall=22 in=2.8M out=58k final_ctx=105k cache_read
 session denver-PHASE-2-GETCPU wall=48 in=10.7M out=97k final_ctx=159k cache_read=98% tools=142
 session denver-PHASE-2-GETCPU wall=62 in=12.3M out=119k final_ctx=184k cache_read=98% tools=271
 session denver-PHASE-3-JAVAVERSION wall=23 in=3.5M out=51k final_ctx=100k cache_read=97% tools=63
+session denver-PHASE-3-JAVAWORKLOAD wall=21 in=3.3M out=57k final_ctx=97k cache_read=97% tools=65
+session denver-PHASE-3-JAVACLASSLIB wall=54 in=14.8M out=113k final_ctx=178k cache_read=99% tools=237
+session denver-PHASE-3-JAVACLASSLIB wall=28 in=1.9M out=38k final_ctx=81k cache_read=96% tools=280

@@ -110,6 +110,34 @@ it here and write your records early.
    it produces runs. Staged inputs are in `/root/denver/javac/`. Kernel changes stay behind off-by-default
    features, and the default build's `.text` stays unchanged (R6), as in your earlier gates.
 
+## Operator update (2026-11-14, night) - what is true now, and what to do with this session
+
+Your quota is nearly spent (weekly 95%); this is probably the last session. Facts the operator measured after your cutoff:
+
+- Your `fault-signal` port (`38f16b2d`) works: `javac -version`, javac compiling `Logo.java`/`Workload.java` inside the guest
+  and the produced classes running, all with zero `[Fault]` lines. Clojure 1.12.0, Scala 2.13.14 (`scalac`) and Groovy 4.0.22
+  run on it too. Your own `sigprobe` still FAILs: delivery works and the `rip` edit takes effect but the `rax` edit does not
+  (`rc=0`, want 99) - unexplained, and the one open item on the signal path.
+- The `shell` feature (`akuma-runtime-tokio::shell`: getrlimit/prlimit64, getpgid, getppid, getrusage, clock_getres,
+  membarrier, ...) was enabled for denver with one relay line (`shell = ["akuma-jvm-kernel/shell"]`, commit `9ec07523`). It
+  fixed the JDK HTTP server and interactive ssh without `--shell-arg +m`. Lesson: `denver/docs/lessons/L5-find-the-feature-flag.md`.
+  The gate kernel is now your denver-faultsig feature set plus `shell`.
+- Do not touch `/root/denver/w/denver-operator.img`, `vm-operator.spec`, `denver-shell` (operator's rig). Use your own images.
+  Your gates stop whatever holds `/dev/kvm0`; that is expected.
+- Operator docs to read once: `denver/docs/archive/CLOJURE_AND_JAVAC_ON_DENVER.md`, `AUTORESEARCH_EXPERIMENT_RESULTS.md` (its
+  appendix is the operator log). Samples and env files: `denver/samples/`.
+
+What to do, in this order, with records written EARLY (the quota may cut you off):
+
+1. Run your own **PHASE-3-JAVAC gate** on the gate kernel (faultsig + shell): the probe arms you designed
+   (`denver/probe-javac.sh` is designed in `denver/docs/research/PHASE-3-JAVAC.md` (D75) but NOT written yet - you were cut off first: SIGPROBE, the datum, DONE = javac compiles `Workload.java` in the guest and the class runs; `denver/probes/sigprobe.c` and its binary exist).
+   Judge it from the captured lines; the operator's runs are evidence, not your gate. Write the `### ` LOOP_LOG entry, the
+   gate log (`git add -f`), RESULT.md and the single final `NEXT GATE:` line.
+2. Close `REQUIREMENTS.md` rows now resolved (getpgid, the javac crash, getrlimit/prlimit64); keep `sigprobe` `rax` open.
+3. Paperwork (the operator will direct it): bring lessons L1-L4 in `denver/docs/lessons/` up to date with the phases after
+   phase 2 (getcpu, JAVAVERSION, JAVAWORKLOAD, JAVACLASSLIB, JAVAC, the signal port, the shell feature). Add Record passes;
+   do not rewrite their Do sections.
+
 ## End
 
 Update `denver/docs/LOOP_LOG.md` (Record voice: what we did, what decision it forced), the living
