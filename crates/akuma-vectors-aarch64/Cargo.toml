@@ -1,0 +1,11 @@
+[package]
+name = "akuma-vectors-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "The EL1 vector table of a hooked-scheduler AArch64 kernel (the tokio kernel): entry stubs that save the whole register file as a Frame, hand &mut Frame to a registered safe fn per Kind, restore and eret; and enter_user, the first crossing into EL0. The aarch64 counterpart of akuma-trap-amd64 + akuma-idt-amd64."
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+
+[lints]
+workspace = true

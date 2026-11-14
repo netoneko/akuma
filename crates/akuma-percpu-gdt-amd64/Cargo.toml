@@ -1,0 +1,12 @@
+[package]
+name = "akuma-percpu-gdt-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The per-core GDT and TSS statics of an amd64 kernel and the lgdt/ltr that load them, behind an API that cannot be pointed at another core's slot"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-gdt = { path = "../akuma-gdt" }

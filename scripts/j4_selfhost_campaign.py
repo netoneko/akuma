@@ -44,7 +44,7 @@ ENVP = ("/bin/busybox env PATH=/usr/local/bin:/usr/bin:/bin HOME=/root "
         "CARGO_TARGET_AARCH64_UNKNOWN_NONE_RUSTFLAGS=-Clink-arg=-T/root/akuma/linker.ld ")
 
 BUILD_CMD = (ENVP + "/usr/bin/cargo build -p akuma --profile release-smp-shared "
-             "--features devbox-smoltcp,no-tests --manifest-path /root/akuma/Cargo.toml -j4")
+             "--features no-tests --manifest-path /root/akuma/Cargo.toml -j4")
 
 
 def ssh_port(instance):

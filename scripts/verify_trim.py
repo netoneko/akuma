@@ -71,8 +71,8 @@ MAIN_REPO = os.path.dirname(_COMMON_GIT_DIR) or REPO
 CLIPPY_CONFIGS = [
     ("release", ["--release"]),
     ("extreme-size", ["--profile", "extreme-size", "--no-default-features",
-                      "--features", "no-tests,smoltcp,extreme,userspace-sshd"]),
-    ("devbox-smoltcp", ["--release", "--features", "devbox-smoltcp,no-tests"]),
+                      "--features", "no-tests,smoltcp"]),
+    ("devbox-smoltcp", ["--release", "--features", "no-tests"]),
     ("devbox-rump", None),  # features scraped from scripts/build_devbox.sh below
 ]
 
@@ -519,7 +519,7 @@ def boot_once(smp, instance, memory, logdir, results, run_exercises):
             # `[SGI-S FATAL] new_sp=0` is a KNOWN, timing-dependent boot-suite race,
             # not necessarily your change: several tests fabricate a bare claimed
             # thread slot into READY/WAITING, and a slot with context sp=0 that the
-            # scheduler dispatches halts the kernel (src/process_tests.rs:10489).
+            # scheduler dispatches halts the kernel (crates/akuma-kernel-tests-aarch64/src/process_tests.rs:10489).
             # Observed 2026-08-13 at BOTH SMP levels in one loaded-host run and in
             # neither of two clean re-boots of the same tree. Re-run before debugging.
             halt = re.search(r"\[(SGI-S FATAL|PANIC|Kernel panic)\][^\n]{0,80}", text)

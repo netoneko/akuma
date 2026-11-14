@@ -61,7 +61,7 @@ encode_rustflags() {
 #   <name used by this script>|<dir>|<cargo package>|<binary>|<path that must exist>
 #
 # An empty <binary> means the member's build script installs into bootstrap/bin
-# itself (llama-cpp installs llama-cli/-server/-bench, nca installs nca), so
+# itself (llama-cpp installs llama-cli/-server/-bench), so
 # there is nothing here to copy. The last field is a file from the member's
 # submodule: absent means the submodule is not checked out, and the member is
 # skipped rather than failing the whole build.
@@ -69,7 +69,6 @@ EXTERNAL_MEMBERS=(
     "meow|meow|meow|meow|meow/Cargo.toml"
     "tcc|tcc|tcc|tcc|tcc/tinycc/libtcc.c"
     "llama-cpp|llama.cpp|llama-cpp||llama.cpp/llama.cpp/CMakeLists.txt"
-    "nca|nca|native-cli-ai||nca/native-cli-ai/Cargo.toml"
 )
 
 # Print the EXTERNAL_MEMBERS row for $1; fail if $1 is an ordinary workspace member.
@@ -133,7 +132,7 @@ build_member() {
         # Opt OUT of process-per-session sshd back to the single-process
         # cooperative executor (userspace/sshd/Cargo.toml `fork-sessions`, on by
         # default). For memory-constrained images where a process per session is
-        # the wrong trade — see docs/runbooks/build-extreme-size.md.
+        # the wrong trade — see docs/archive/EXTREME_SIZE_BUILD.md.
         #
         # --no-default-features drops `akuma` too, so re-add it: it is what
         # links libakuma, and the binary cannot build without it. Re-add
@@ -226,7 +225,6 @@ MEMBERS=(
     "llama-cpp"
     "wavplay"
     "scratch"
-    "nca"
     )
 
 
@@ -251,8 +249,8 @@ done
 # Create bin directory if it doesn't exist
 mkdir -p ../bootstrap/bin
 
-# Copy binaries (only if they exist). llama-cli/-server/-bench and nca are NOT
-# listed: their build scripts install them into bootstrap/bin directly, and they
+# Copy binaries (only if they exist). llama-cli/-server/-bench are NOT
+# listed: their build script installs them into bootstrap/bin directly, and they
 # never appear under any target/ dir this script looks in.
 BINARIES=(
     "hello"
@@ -380,7 +378,7 @@ echo "Building mprotectlb + clonearg + cowstale + bssfork + madvshared + mremapm
 # lines above. `dynchild` is deliberately NOT here: it is `dynspawn`'s spawnee
 # and must be **dynamically** linked to test what it tests, so a `-static` build
 # of it would silently pass while exercising none of the loader.
-echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipewake + readback + segvchild + segvgroup + threadmax + tlsdirty (C, signal/compute/loader/pipe/thread probes)..."
+echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipewake + readback + segvchild + segvgroup + threadmax + tlsdirty + unixrw (C, signal/compute/loader/pipe/thread/socket probes)..."
 (
     cd forktest/c_stress
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o abortsig abortsig.c
@@ -394,6 +392,7 @@ echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipew
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o segvgroup segvgroup.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o threadmax threadmax.c
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -pthread -o tlsdirty tlsdirty.c
+    aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o unixrw unixrw.c
     # `dynchild`, **dynamically linked on purpose** — it is `dynspawn`'s spawnee
     # and exists to exercise the whole ld-musl startup path (self-relocation,
     # library mapping, PLT/GOT). A `-static` build of it would run and exit 42
@@ -409,10 +408,10 @@ echo "Building abortsig + computecheck + dynspawn + md5probe + neonstate + pipew
     aarch64-linux-musl-gcc -static -O2 -Wall -Wextra -o pattern2_parent pattern2_parent.c
 )
 for b in abortsig computecheck dynspawn dynchild md5probe neonstate pipewake readback \
-         segvchild segvgroup threadmax tlsdirty pattern2_parent; do
+         segvchild segvgroup threadmax tlsdirty pattern2_parent unixrw; do
     cp "forktest/c_stress/$b" ../bootstrap/bin/
 done
-echo "13 previously-unstaged c_stress probes copied to bootstrap/bin/"
+echo "14 c_stress probes copied to bootstrap/bin/"
 
 # permprobe: credentials + file permissions as uid 1000 sees them, one line per
 # check against Linux's errno (docs/archive/UNIX_PERMISSIONS.md). Run as root;

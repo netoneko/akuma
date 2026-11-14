@@ -1,5 +1,7 @@
 # Concurrent spawns from a multi-threaded process: a stale `O_NONBLOCK` bit
 
+> **nca retired 2026-11-09.** `userspace/nca` and its `native-cli-ai` submodule were removed from the tree today in favor of goose. This document is kept as history: paths under `userspace/nca/` no longer exist (they are in git history before the removal commit), and the kernel findings below stand on their own.
+
 **Date:** 2026-08-18
 **Status:** root-caused and fixed, verified by A/B
 **Symptom that started it:** `nca` self-hosting inside Akuma (`cargo build -p nca-cli` from

@@ -16,7 +16,7 @@ says otherwise.
 - `[kill] pid=1468 stale tid=20 now owned by pid=1619` is printed by
   `signal::slot_still_owned_by` **when it returns `false`** — that is
   `pend_signal_to_group` *dropping* tid 20, i.e. the guard working. On amd64 every
-  `kill(2)` goes through `pend_signal_to_group` (`amd64/src/signal.rs::sys_kill`).
+  `kill(2)` goes through `pend_signal_to_group` (`crates/akuma-kernel-amd64/src/signal.rs::sys_kill`).
 - `[signal] pid=1619 killed by signal 9` is 1619 taking its own SIGKILL;
   `pid=1622` is consistent with a thread row of 1619 (each thread is a `Process`
   here, and `fatal_default` prints `proc.pid`).
@@ -55,7 +55,7 @@ Like a Linux pid, a zombie's tid now stays its own until it is reaped.
   its `mark_thread_terminated`, so that terminate can never land on a new occupant.
   Release is by pid, so a kill path that already cleared `thread_id` cannot strand
   a hold.
-- `amd64/src/usermode.rs::run_process`: the hold is the first thing after
+- `crates/akuma-kernel-amd64/src/usermode.rs::run_process`: the hold is the first thing after
   `enter_user` returns — while the slot is still running (a slot is only claimable
   once `TERMINATED`, so the hold cannot race a claim) and before
   `spawn_record_exit` lets the parent reap (a hold set after a reap would never be

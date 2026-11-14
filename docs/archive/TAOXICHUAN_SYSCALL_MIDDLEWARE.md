@@ -1,0 +1,222 @@
+# B22: syscall middleware for the minimal kernel (design + first cut, 2026-11-05)
+
+**Status: first cut written, host-tested, and BOOTED in Shanghai on both machines (QEMU TCG, 1 and 4 cores), including a 4-thread contention check on the `own` autolock.** Code:
+[`crates/akuma-tokio-kernel-core/src/middleware.rs`](../../crates/akuma-tokio-kernel-core/src/middleware.rs); how to use it:
+[`crates/akuma-tokio-kernel-core/docs/middleware.md`](../../crates/akuma-tokio-kernel-core/docs/middleware.md) (the guide, current state);
+user-facing text: [`crates/akuma-tokio-kernel/README.md`](../../crates/akuma-tokio-kernel/README.md) § Syscall middleware.
+This is the record of the design and of what booting it found; the rules as they stand now are in the guide.
+The `middleware` cargo feature is **off by default for every kernel**; with it off none of this is compiled.
+
+## Why
+
+A kernel built on `akuma-tokio-kernel` (one `main.rs`, two machines) had no way to answer a syscall of its own, watch
+one, or refuse one, short of editing the machine halves' `dispatch`. B22 gives a kernel author one table of hooks
+around dispatch, the same on amd64 and aarch64, without making the common path pay for it.
+
+## Decisions (each was argued in the design session; the reason is the point)
+
+1. **One table, flat, no chaining.** Hooks are plain `fn`s. There is no `next`, no priority, no registration order.
+   Two entries for one call in one tier panic at arm time. A second `Kernel::middleware(..)` panics. Someone who
+   wants layers writes a function that calls their functions; nothing in the framework makes that feel supported.
+   (We are not node developers.)
+2. **Tiers, not a pipeline.** `kernel_pre` (may `Pass`, `PassAndForget`, `Return`, `Errno`),
+   `fallback` (runs only where the answer is `-ENOSYS`: add a syscall without being able to break one), `kernel_post`
+   (may replace the result), and `own_pre`/`own_post` (observe only).
+3. **No hook ever touches a lock.** `kernel_*`/`fallback` run inside the big kernel lock, which the kernel takes.
+   `own_*` run **outside** it, with the middleware's private state `S` behind an *autolock* the framework owns (a
+   spinlock held with preemption off for exactly the hook call, never while the big lock is taken, so there is no
+   lock-order question). Which mode a hook is in is its tier; there is no per-hook lock option and no "own lock".
+4. **`own` hooks get no user memory.** The software page-table walk behind a user copy races a sibling thread's
+   `munmap`/`mprotect` (which run under the big lock) and can read a frame that now belongs to another process.
+   Anything that reads the caller's memory is a `kernel` hook.
+5. **Cached by number, not by verdict.** A verdict depends on the arguments, so it is never cached. What is cached
+   is "does this tier want this number": a 512-bit mask per tier, built when the table is armed, read **once** per
+   call and latched (`Latch`) so a pre-hook that prunes itself cannot make its own post-hook vanish (the rule
+   `akuma_bkl::policy` already uses). An unhooked call costs a relaxed load and a bit test per tier. A hook may
+   return `PassAndForget` to clear its own bit. Numbers from 512 up are always asked; that is where custom calls live
+   (`CUSTOM_BASE` = 1000, above everything Linux assigns).
+6. **Some calls are observed, never replaced:** `exit`, `exit_group`, `clone`, `execve`, `rt_sigreturn` rewrite the
+   frame or do not return. A `fallback` and a changed result for them are ignored (`observe_only`). Narrowed
+   2026-11-05: a `kernel_pre` *refusal* skips the call and cannot corrupt the frame, so it is honoured for `execve`
+   (`may_refuse_before`; an environment or signature policy needs it) and still ignored for `exit`, `exit_group`,
+   `clone` and `rt_sigreturn`.
+7. **No `unsafe`, and no raw frames.** The module is `forbid(unsafe_code)` and the API needs none: a hook gets
+   `KernelCtx`/`OwnCtx` (number, `Option<Syscall>`, args, tid, pid) and checked user reads/writes
+   (`user_read`, `user_write`, `user_read_u64`, `user_str`) over the kernel's own copies. The x86 `SyscallFrame` and the
+   aarch64 `Frame` never leave the machine halves. Raw access means patching the attribute out of your own crate.
+8. **No runtime off-switch.** Same lesson as `wx=0` (removed 2026-11-05): a production kernel does not get a
+   command-line hatch to change what a syscall does.
+9. **Hooks cannot mutate the kernel context** (2026-11-05, the owner: "sets a bad precedent"). The first cut let a
+   `kernel_pre` rewrite `ctx.args` and the call then saw the new values; nothing used it (one unit test did). It is gone:
+   every `kernel` hook takes `&KernelCtx`, `run_kernel` takes the arguments by value and no longer writes them back, and
+   the machine halves lost their write-back. Why it matters beyond tidiness: rewriting arguments is how one hook defeats
+   another's check (a guard validates a path, a later hook swaps the pointer), and a policy middleware wants the guarantee
+   "a hook can only allow, refuse or answer, never change what runs". It also makes hooks pure functions of the context, so
+   combining them has no hidden order effects. `OwnCtx` keeps `&mut` for one thing only, the hook's own private `state`.
+   If a real need for rewriting appears, add it back as an explicit `Verdict::Rewrite(args)` with a use case in hand.
+
+## Where the seams are
+
+```text
+amd64  dispatch():        own_enter -> [bkl_enter] -> dispatch_locked -> dispatch_inner:
+                            fold -> kernel tier { kernel_pre -> dispatch_after_fold -> fallback -> kernel_post }
+                          -> deliver_at_return -> [bkl_leave] -> own_leave
+aarch64 trap::el0_sync(): own_enter -> [smp::enter] -> svc -> syscall::dispatch:
+                            kernel tier { kernel_pre -> dispatch_arms -> fallback -> kernel_post }
+                          -> at_return -> [smp::leave] -> own_leave
+```
+
+`Kernel::middleware(&MW)` stores the table (`&'static dyn Dispatch`, so `Middleware<S>` of any `S` fits); boot arms
+and installs it with the machine's `Machine { decode, encode, copy_in, copy_out, pid }` before the first ring-3
+entry. The amd64 `dispatch_inner` was split at the fold: everything after it is `dispatch_after_fold`, unchanged.
+
+## What was verified (and what was not)
+
+- **Host:** 11 tests in `middleware.rs` (nothing hooked runs nothing; pre answers and the call does not run; the
+  result is replaced and the call is given the original arguments; fallback serves only `-ENOSYS`; the five observe-only calls; `PassAndForget` with the
+  latch; `own` state; checked user memory and bounded strings; duplicate refusal; same call in two tiers; numbers
+  from 512 always asked). `cargo test -p akuma-tokio-kernel-core --features middleware --target $HOST`.
+- **Builds:** `akuma-tokio-kernel` with and without `--features middleware` for `x86_64-unknown-none` and
+  `aarch64-unknown-none`; `taoxichuan` with default features for both; clippy clean on the new lines.
+- **Booted (2026-11-05, QEMU TCG: amd64 `microvm`, aarch64 `virt`):** `sh shanghai/mw_gate.sh [x86_64|aarch64|all]`
+  (`SMP=N`) builds Shanghai twice per architecture (default, and `--features middleware` with the sample table in
+  `shanghai/src/middleware.rs`), boots each with `shanghai/mwprobe/mwprobe.rs` as `init`, and judges the probe's own
+  result line. The middleware kernel passes every case on both machines (13 with the original table; 26 with the no-dynamic-loading demo and its child probes below; earlier revisions of this record said 12 and 14 because the result line was counted as a case): `fallback` 1000/1001 (a value, a write
+  through a user pointer, `EFAULT` on a bad one, an unserved number still `ENOSYS`), `kernel_pre` on `openat` (reads the
+  path from user memory, refuses `/mw-deny` with `EACCES`, passes the rest), `kernel_post` on `gettid`, `own_pre`/`own_post`
+  on `getpid` (5 calls seen 5 times), and the contention case: 4 threads x 500 `getpid` at once, where the `own_pre` hook
+  does a split read-then-write on its private state; all 2000 were seen and the state equals the atomic count (no lost
+  update). The control (no middleware) answers 1000 with `ENOSYS` and every touched call is stock. Runs: amd64 at 1 core
+  (before the threaded case existed) and at 4; aarch64 at 1 and at 4 (4 CPUs online on both).
+- **Added 2026-11-05, the no-dynamic-loading demo** (`shanghai/src/nodl.rs`, three `kernel_pre` guards): `mmap` of a file with
+  `PROT_EXEC` is refused with `EACCES`, `mprotect` adding `PROT_EXEC` is refused, and an `execve` whose environment names an
+  `LD_*` variable is refused with `EPERM` (the last needed the `execve` narrowing above). `mwprobe` checks each refusal and
+  the neighbouring cases that must stay allowed (anonymous `PROT_EXEC` memory, a read-only file mapping,
+  `mprotect(PROT_READ)`, an `execve` with a clean environment, which is allowed and whose new image prints the result).
+- **Children and real dynamic programs** (same day; the first cut, with `mmap`/`mprotect` syscall guards - superseded by the exec policy below): the probe forks a child with a raw `clone` (no exec), execs a static child
+  (its own pid; the console's `[nodl]` lines carry it), execs with `LD_PRELOAD` (refused, `EPERM`), and runs two real dynamic
+  programs from Alpine (`shanghai/mw_fetch_dyn.sh`: musl loader, `busybox`, `xz` + `liblzma.so.5`). **Result, both machines
+  at SMP=4: 26 cases on the middleware kernel, 7 on the control, all passing.** `xz` runs on the control kernel and fails under
+  the guards inside `ld-musl` (`Error loading shared library liblzma.so.5: Permission denied`). A dynamic executable that needs only
+  libc (`busybox`) **still runs**: the kernel maps the interpreter and the main binary without a syscall and `ld-musl` is libc,
+  so there is no second mapping to refuse. That case is pinned in the probe as a known gap. It is a demonstration, not a wholesale
+  ban. `memfd_create` and shebang scripts were not checked.
+- **A feature, off by default** (2026-11-05, the owner): the three guards are behind Shanghai's `no-dynamic-loading` feature (implies
+  `middleware`), so the sample table alone does not carry them. The gate boots three kernels per machine (stock; `middleware`
+  alone, where the probe asserts the guards are absent; `no-dynamic-loading`, booted with `initargs=nodl`, where it asserts they are
+  on), so a build that silently lacks or wrongly has the guards fails.
+- **Closing the libc-only gap: one exec policy** (2026-11-05, the owner: "isn't it a bit duplicating of us" - the loader and the syscalls
+  each answered "may this become code?" separately). Code reaches a process in three ways, so the kernel now asks **one** hook,
+  `Hooks::exec: Option<ExecPolicy>` (`fn(&ExecEvent) -> ExecVerdict`, `Allow` / `Deny(errno)`, read-only), at each: `loader::load_task`
+  (`ExecKind::Image { path, interp, image }`, asked before the task's layout is reset, so a refusal returns `EACCES` and leaves the
+  caller untouched; `load_task` returns `Result<_, LoadError>` for this, where `None` used to be a bare `ENOMEM`), `mm::mmap_arm`
+  (`ExecKind::Map { inode }`) and `mm::mprotect_arm` (`ExecKind::Protect`). The `mmap`/`mprotect` syscall guards in `nodl.rs` are gone;
+  the policy is one `match`. The `LD_*` environment guard stays an ordinary `kernel_pre` hook (the guide's Example 2).
+- **Avenues** (`mwprobe` with `initargs=nodl`, both machines at SMP=4, identical): `execve` of a dynamic program, with an extra library
+  (`xz`) and with only libc (`busybox`: the gap, now closed): refused `EACCES`; the loader run directly (`ld-musl /bin/busybox`): cannot
+  load it ("Not a valid dynamic program"; its mapping is refused); a `#!` script with a dynamic interpreter: refused; `mmap(file,
+  PROT_EXEC)` and `mprotect(+X)` on a file mapping: refused; bytes written into anonymous memory then `mprotect(+X)`, and `mmap(RWX)`:
+  refused; forked, exec'd and `LD_PRELOAD` children: bound. `memfd_create`, `execveat`, `ptrace`, `process_vm_writev` answer `ENOSYS` and
+  `/proc/self/mem` cannot be opened for writing: closed by absence, pinned by the probe so a later implementation fails it. Static
+  programs still run. **Result: control 7, `middleware` alone 19 (no `[nodl]` line), `no-dynamic-loading` 35 with 13 refusals logged,
+  all passing, amd64 and aarch64.** Not claimed: interpreted code (a script run by a static interpreter is data), signatures
+  (the `Image` event carries the bytes; nothing checks them), and JIT (`mprotect(+X)` is refused outright).
+- **A build-time alternative in the elf crate** (2026-11-05, the owner: "a build-level feature (off by default) that simply returns EPERM for
+  dynamic loading in the elf crate instead of having any dispatch arm"): `akuma-elf-exec`'s `refuse-dynamic` feature makes `program()`
+  return `ExecErr::Dynamic` (errno `EPERM` when first written; **changed to `EACCES` the same day at the owner's request, so it matches the exec policy**, `ExecErr::errno()`) for any image that names an interpreter (the static-PIE one-NUL
+  `PT_INTERP` is still static); `loader::load_task` turns it into `LoadError::Refused(13)` before anything is touched. No hook, no table,
+  no runtime switch. Plumbed `no-dynamic-elf` (Shanghai) -> `akuma-tokio-kernel/refuse-dynamic-elf` -> the machine crates ->
+  `akuma-tokio-kernel-core/refuse-dynamic-elf` -> `akuma-elf-exec/refuse-dynamic`, independent of `middleware`; `cargo tree -e features -i
+  akuma-elf-exec` shows it on with the feature and off without. Four kernels per machine in the gate now. **Result, both machines at
+  SMP=4: `no-dynamic-elf` 6 cases passing, no `[nodl]` line (no middleware in that build)**: dynamic `xz`, dynamic `busybox` and a `#!`
+  script with a dynamic interpreter are refused with `EACCES` (first run with `EPERM`; re-run 2026-11-05 after the change, both machines at SMP=4: `MW GATE PASS`, 134 PASS lines, the same totals as before); a static child runs. It covers **images only**, and the probe pins that:
+  the loader run directly (`ld-musl /bin/busybox`) still loads and runs BusyBox, and `mmap(file, PROT_EXEC)` is still allowed, because
+  this build has no mapping policy. Closing those is the exec policy's job (`no-dynamic-loading`). Host tests in `akuma-elf-exec` for
+  both configurations (14 each; the feature adds the refusal and the static / static-PIE controls).
+- **The first test subject was wrong:** `bzip2` ran under the guards with no refusal, which looked like a failed ban. Alpine builds
+  libbz2 into the binary (`strings` shows only `libc.musl` as a dependency), so it never asked for a second library. `xz` replaced
+  it, and `mw_fetch_dyn.sh` now checks the premise (`xz` names `liblzma`, `busybox` needs nothing beyond libc).
+- **Found by booting it:** the first real user could not write `..Middleware::new(0)` (private fields), which the
+  in-module tests could not catch; the tables are now the all-public `Hooks<S>` (`Middleware::new(state, Hooks {..})`).
+  The first sample also hooked `getuid`, which this kernel does not serve without `shell`, and added 1000 to its
+  `-ENOSYS`: the sample now only adds to a non-error result.
+- **Found by booting aarch64:** `scripts/link_kernel.sh` wrote no `.bin` for any kernel (cargo's link-output path
+  changed) and Shanghai's `build.rs` was amd64-only; both fixed, see `docs/archive/LINK_KERNEL_BIN_LAYOUT.md`.
+- **NOT done:** the feature-on cost against the syscall floor (`scripts/benchmarks`, run A/B/A). With the
+  feature off, amd64's `dispatch_inner` is now two functions instead of one; the `.text` was not compared.
+
+## Deviations from the design discussion
+
+- **Overlap is refused at arm time (a boot panic), not at compile time.** `Syscall` is not comparable in a `const fn`
+  and the native number depends on the architecture, so a const assertion was not available.
+- **The `own` tier sees the raw number, before the amd64 legacy fold**, so a legacy `mkdir` (83) is not
+  `Call(Mkdirat)` there; the `kernel` tier sees the canonical call. aarch64 has no fold.
+- **`own` context has `tid`, not `pid`:** the pid lookup takes process-table state; only `KernelCtx` has `pid`.
+- **Not built yet:** a runtime `arm`/`disarm` handle for interest bits; a BKL-protected state cell for `kernel` hooks
+  (use atomics or a `BorrowCell` static; the lock serialises them); typed `UserPtr<T>` (there are byte-level reads
+  and `u64`/string helpers); a framework-provided blocking wait for `kernel` hooks (a hook that must park the
+  caller has no sanctioned way to); `Return` from an `own` hook (the epilogue, signal delivery on the way out, runs
+  under the lock, and whether a cheap lock-free "signal pending" test exists was not checked).
+- **Untouched on purpose:** rump. Its interceptor (`akuma-kernel-glue::rump_proxy::intercept_box_syscall`) is a
+  hand-written `kernel_pre` that blocks on a server and wants runtime-armed interest; B22 does not host it, and rump
+  is deferred (`docs/reference/subsystems/rump-stack.md`). It is the API's acceptance test if it returns.
+
+## Next
+
+1. A/B the feature-on cost with a table that hooks nothing, then one that hooks `getpid`.
+2. Decide whether the missing pieces above are wanted before anyone writes a second middleware.
+
+## Background
+
+`taoxichuan/docs/reference/syscalls.md` § Who answers, in order (the dispatch the table wraps);
+`crates/akuma-bkl/src/policy.rs` (the per-syscall opt-out bitmap and the latch-at-entry rule);
+`docs/archive/` W^X policy (`TAOXICHUAN_WX_POLICY.md`) for why there is no switch.
+
+- **`no-dynamic-loading` now implies `no-dynamic-elf`** (2026-11-05, the owner): the elf crate refuses a dynamic image first, with the same `EACCES`, so the policy's `ExecKind::Image` arm is no longer reached in that build. It is kept in `shanghai/src/nodl.rs` as a reference copy (commented there), so the policy stays complete if it is reused in another kernel (Taoxichuan). The gate counts did not change.
+
+- **Boot parameters for middleware** (2026-11-05, the owner: params must be immutable after init, and each middleware must see only what
+  it needs). `akuma-tokio-kernel-core::params`: the command line is captured once into a `TakeOnce` buffer (2048 bytes) and published as
+  `&'static str` (a second capture is refused); `Params` is a view narrowed to `mw.` and again per crate with `scoped`, with no way
+  back out; `ParamSource` is the trait a crate's parser reads through (a `Table` serves host tests). `Hooks::init` runs once from
+  `middleware::init()`, which both machines call after the capture and before init is spawned. amd64 reads the line with the new
+  `StartInfo::cmdline_complete`, which reports `TooLong` where `cmdline` handed back a prefix (a cut-off hex key is still hex).
+  The 512-byte cap was our own stack buffers, not PVH. Shanghai's sample table reads `mw.sample.also` and call 1006 reports what the
+  hook could see. **Result, both machines at SMP=4: `MW GATE PASS`, 152 PASS lines (134 + 18)**: the hook read the word; the kernel's
+  own `init=` and `mw.other.secret` were invisible through the view; the control kernel ignored the `mw.*` words. Not built: the
+  read-only page mapping (stronger than the software guarantee), the two crates, `compose`, the label. Design:
+  `shanghai/docs/MIDDLEWARE_COMPOSITION.md`.
+
+- **`no-dynamic-loading` is a crate** (2026-11-05, the owner: extract it, then use it as the example for how a middleware crate is built).
+  `crates/akuma-mw-no-dynamic-loading` (`no_std`, `forbid(unsafe_code)`, depends on `akuma-tokio-kernel-core` with `middleware` and on
+  `akuma-primitives`, and on no machine) holds `exec_policy` and `exec_guard`, moved out of `shanghai/src/nodl.rs` unchanged in behaviour
+  (the `Image` arm stays, commented as a reference copy, since `no-dynamic-loading` turns the elf ban on). It is **functions, not a
+  table**: one table per kernel, so the kernel's table names them and a kernel composing several crates writes that composition itself.
+  Six host tests pin the policy and the guard (fail-closed on an unreadable pointer, an unreadable envp and a list over 512 entries),
+  which only the gate covered before; they needed `KernelCtx::for_test` (hidden, builds a context over a `Machine`).
+
+- **Signing groundwork** (2026-11-05, the owner: a fresh crate for signed binaries, tackling the checksum). Two findings recorded in
+  `shanghai/docs/MIDDLEWARE_COMPOSITION.md`: lazy file-backed segment pages are read from the inode at fault time, so verifying the image
+  buffer does not cover them and the pin does not stop an in-place write (the smallest fix is a verdict that makes the loader map a
+  signed image from the verified buffer); and the crypto is RustCrypto's, reached through the new `crates/akuma-ed25519` (verify
+  only, strict, RFC 8032 vectors). Nothing is signed or checked at exec yet.
+
+- **Signed code only** (2026-11-05, the owner: hashes, with a detached `.sig` as the second path, because stock busybox and rust cannot carry a
+  trailer). `crates/akuma-mw-signed-exec` + Shanghai feature `signed-exec`: `mw.signed.allow=<sha256>:<scope>` and `mw.signed.key=<pubkey>:<scopes>`
+  on the command line; a detached `<path>.sig` read by the loader when the table asks (`Hooks::exec_sidecar`, 4 KiB cap) and passed as
+  `ExecKind::Image { sidecar }`; the verdict `ExecVerdict::AllowFromImage` makes the loader map the image from the bytes that were checked (no
+  inode, no second path lookup). The time-of-check gap found earlier (lazy file pages read at fault time; the pin does not stop writes; the path was
+  resolved twice) is closed by that verdict, and proved with a child that rewrites its own file: **SIGSEGV (status 11) on the stock kernel,
+  survives on the signed kernel, both machines**. **Result, both machines at SMP=4: `MW GATE PASS`, 172 PASS lines** (control 8, `middleware` 23,
+  `no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 10, each x2); 9 host tests in the crate. Gate-rig bugs found on the way, both mine:
+  the signed assets directory shared a name with the staged kernel (`cp` copied the kernel INTO the directory, and the kernel that booted was a
+  directory: empty console), and five 5 MB copies of the probe filled a 32 MB image so a `/tmp` write silently produced an empty file
+  (the `#!` case failed with ENOEXEC); the image is 96 MB now and `stage` replaces its target. Not built: the label, minisign/signify sidecars,
+  a hash cache by inode, compiled-in keys. Not measured: the cost of hashing on every exec. Design and limits: `shanghai/docs/MIDDLEWARE_COMPOSITION.md`.
+
+- **`ETXTBSY` and a big-lock deadlock found on the way** (2026-11-05, the owner: close the write-after-verify gap in every kernel). The
+  signing proof (a child rewriting its own file) is now answered by the filesystem: `docs/archive/ETXTBSY_TEXT_BUSY.md` (tokio kernels
+  done; the Akuma main kernels are not). Adding it exposed a rare amd64 wedge in the tokio kernels' big lock, root-caused from a wedged
+  guest's registers and a per-ticket log and fixed in `bkl::enter` (a tick landing during a wait queued its own `enter` behind the suspended
+  wait): `docs/archive/TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK.md`. **Result after both, both machines at SMP=4: `MW GATE PASS`, 206 PASS
+  lines** (control 17, `middleware` 23, `no-dynamic-loading` 39, `no-dynamic-elf` 6, `signed-exec` 18, each x2).
+

@@ -109,7 +109,7 @@ fn smoothing_can_be_set_by_the_config_file_and_by_escape_sequence() {
     assert_eq!(ConsoleConfig::parse("smooth = bgr").smooth, Some(Smooth::Bgr));
     assert_eq!(ConsoleConfig::parse("smooth = banana").smooth, None);
     let mut con = Console::new(Mem(400, 100, vec![BG; 400 * 100])).unwrap();
-    assert_eq!(con.smooth(), Smooth::Rgb, "subpixel is the default");
+    assert_eq!(con.smooth(), Smooth::Gray, "gray is the default (macOS-style)");
     con.write_str_bytes("\x1b[?9002l");
     assert_eq!(con.smooth(), Smooth::Gray);
     con.write_str_bytes("\x1b[?9002;2h");

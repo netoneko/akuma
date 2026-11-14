@@ -11,7 +11,7 @@ LOG=${1:?usage: firecracker_phase0.sh LOG [SECONDS]}
 SECS=${2:-240}
 cd "$(dirname "$0")/../.."
 E2=${E2FSPROGS:-/opt/homebrew/opt/e2fsprogs/sbin}
-KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma-amd64}
+KERNEL=${KERNEL:-target/x86_64-unknown-none/release/akuma}
 BB=${BUSYBOX:-target/x86_64-unknown-none/release/busybox-x86_64}
 T=$(mktemp -d); trap 'rm -rf "$T"' EXIT
 mkdir -p "$T/bin" "$T/etc" "$T/proc" "$T/tmp" "$T/lib" "$T/usr/bin" "$T/usr/lib" "$T/boot" "$T/dev"

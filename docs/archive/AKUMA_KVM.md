@@ -50,7 +50,7 @@ Read downwards; the sections below are the reference record.
    ▼   13 host tests pin Table B-1/B-2 offsets, exit codes, segment
    │   attributes, the §15.5.1 validator, NPT encodings. APM Vol 3
    │   rev 3.38 §E.4.9: the Fn8000_000A.EDX bits (NP=0, NRIPS=3).
-   │   amd64/src/kvm.rs: CPUID probe + trivial guest behind kvmtest
+   │   crates/akuma-kernel-amd64/src/kvm.rs: CPUID probe + trivial guest behind kvmtest
    │   (two vmmcalls, hlt, identity NPT, three unsafe sites).
    ▼
  [10-21] ═══ PHASE 0: A GUEST RUNS ON THE METAL ═══  "trivial guest: PASS"
@@ -258,7 +258,7 @@ Still pending from the spec (see §4): the NPT leaf PTE bit table; the save-area
 - `VM_CR` MSR `C001_0114`, bit 4 `SVMDIS` must be clear. If set, SVM may be
   firmware-locked: check `Fn8000_000A.EDX[SVML]` for the unlock key feature.
 - `EFER` (`C000_0080`) bit 12 = `SVME` enables VMRUN. Precedent in tree:
-  `amd64/src/usermode.rs:2922` already does a read-modify-write of EFER for
+  `crates/akuma-kernel-amd64/src/usermode.rs:2922` already does a read-modify-write of EFER for
   `SCE`.
 - `VM_HSAVE_PA` MSR (`C001_0117`) must hold a 4 KiB-aligned physical address
   of the **host save area** page; low 12 bits zero; must not be the VMCB page
@@ -410,7 +410,7 @@ and the first three bits of a third 4-Kbyte page)" — **12 contiguous
 KiB**. Bit N = port N, **1 = intercept**; the three bits past 64K name
 ports that do not exist. Same alignment and max-PA rules as the MSRPM.
 
-**Where they live** (`amd64/src/kvm.rs`): `.bss` statics,
+**Where they live** (`crates/akuma-kernel-amd64/src/kvm.rs`): `.bss` statics,
 `#[repr(C, align(4096))]`, armed at compile time through the crate's
 const builders (`msrpm::with_access`, `iopm::with_port`) — a `static`
 stays free of interior mutability. Physical contiguity is the property
@@ -442,7 +442,7 @@ and the original "3 — akuma as its own guest" stands behind it.
   (Appendix C), intercept bit constants (three dwords), `SegAttrib` builder
   (12-bit format), the §15.5.1 consistency-check validator, NPT table
   builder; host tests pinning every offset to its APM table citation.
-- Kernel module `amd64/src/kvm.rs`: CPUID probe (one serial line either
+- Kernel module `crates/akuma-kernel-amd64/src/kvm.rs`: CPUID probe (one serial line either
   way), and behind a `kvmtest` cmdline flag (the `hdatest` precedent,
   `multiboot2.rs`) the trivial-guest run.
 - Trivial guest: 32-bit flat protected mode, **no guest paging** (CR0.PE=1,
@@ -457,13 +457,13 @@ and the original "3 — akuma as its own guest" stands behind it.
   would clobber the kernel's per-cpu `%gs`) are never needed.
 - Intercepts: dword0 INTR, CPUID, HLT, IOIO_PROT, MSR_PROT; dword1 VMRUN
   (mandatory) + VMMCALL; exceptions DB/UD/GP/PF for diagnosability.
-- Unsafe budget: exactly three sites in `amd64/src/kvm.rs` — the
+- Unsafe budget: exactly three sites in `crates/akuma-kernel-amd64/src/kvm.rs` — the
   EFER.SVME write, the VM_HSAVE_PA write, the VMRUN asm block. Everything
   else is built safely on `FreshFrame::bytes_mut` before `publish()`.
   After exit, the VMCB is re-read by mapping it at a kernel VA (the
   `paging::smoke_test` 1 GiB trick) and wrapping it in the safe crate type
   again. `scripts/check_unsafe_budget.py --update` carries the increase
-  into review (the amd64/src budget was already +3 pre-existing on this
+  into review (the crates/akuma-kernel-amd64/src budget was already +3 pre-existing on this
   branch).
 
 ## 4. Open items

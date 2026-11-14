@@ -11,7 +11,7 @@ starts at step 6 / 5b.
 
 ## What this step did
 
-`amd64/src/paging.rs` served two roles and only one of them was duplicated:
+`crates/akuma-kernel-amd64/src/paging.rs` served two roles and only one of them was duplicated:
 
 1. the **kernel's own** mappings — `map_page`, `active_root`, `activate`,
    `drop_identity_map`, the MMIO windows `pci.rs`/`lapic.rs`/`blk.rs` map;
@@ -170,7 +170,7 @@ tracked set, which is the leak B3 closed by making the ledger mandatory.
 
 ### One `PteProt`, one encoder
 
-`amd64/src/paging.rs` defined its own `PteProt`, its own `MemAttr` and its own
+`crates/akuma-kernel-amd64/src/paging.rs` defined its own `PteProt`, its own `MemAttr` and its own
 `encode`, structurally identical to `akuma-mmu`'s and held in step with them by a
 host test (`x86_prot_matches_amd64_encoding`) that compared the two arm by arm.
 Two implementations, one agreement. There is one implementation now:

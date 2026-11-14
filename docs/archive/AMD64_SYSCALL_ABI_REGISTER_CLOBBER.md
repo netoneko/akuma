@@ -1,7 +1,7 @@
 # The amd64 syscall path clobbered six registers the Linux ABI preserves
 
 **Found** 2026-09-04, during Stage L of the amd64 port (the ELF loader).
-**Fixed** the same day, in `amd64/src/usermode.rs`'s `syscall_entry`.
+**Fixed** the same day, in `crates/akuma-kernel-amd64/src/usermode.rs`'s `syscall_entry`.
 **Scope:** `amd64/` only. The AArch64 kernel does not have this bug — see §5.
 
 This is the first defect the amd64 port found in kernel code rather than in its
@@ -200,4 +200,4 @@ The fix restores the six registers the ABI names. It does not:
 
 **Background:** `docs/archive/AKUMA_FIRECRACKER_AMD64.md` §3.18 is the stage this
 was found in; §3.12 is the syscall path as originally built.
-`amd64/README.md` is the current-state doc for the target.
+`crates/akuma-kernel-amd64/README.md` is the current-state doc for the target.

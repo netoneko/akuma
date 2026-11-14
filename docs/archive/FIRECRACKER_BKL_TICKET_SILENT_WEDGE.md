@@ -185,7 +185,7 @@ question, not resolved.
 Two amd64 bare-metal hangs photographed 2026-09-26 also end in silence shortly
 after `[herd] Reloading config...`, with `[BKL] stuck`/`[bkls>]` lines just before.
 Their last line is `[SWITCH NO-BKL] from=4 to=2 core=2 via=yield_now` — a context
-switch taken without the BKL through `amd64/src/sched.rs`'s `yield_now`, which that
+switch taken without the BKL through `crates/akuma-kernel-amd64/src/sched.rs`'s `yield_now`, which that
 kernel has since stopped allowing (`AKUMA_AMD64_BKL_NETWORKING.md`, 2026-09-26
 section). That mechanism is x86-only (`akuma-threading`'s `x86_yield_now`); this
 sighting is AArch64 and printed no switch report. The `herd` reload preceding both

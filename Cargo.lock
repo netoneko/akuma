@@ -20,13 +20,15 @@ checksum = "366ffbaa4442f4684d91e2cd7c5ea7c4ed8add41959a31447066e279e432b618"
 
 [[package]]
 name = "akuma"
-version = "0.0.8"
+version = "0.0.9"
 dependencies = [
  "akuma-alloc",
  "akuma-bkl",
  "akuma-boot",
  "akuma-config",
  "akuma-cpu",
+ "akuma-drivers-amd64",
+ "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
  "akuma-ext2",
@@ -36,12 +38,17 @@ dependencies = [
  "akuma-gic",
  "akuma-isolation",
  "akuma-kacho",
+ "akuma-kernel",
+ "akuma-kernel-amd64",
  "akuma-kernel-core",
  "akuma-kernel-glue",
+ "akuma-kernel-tests-aarch64",
+ "akuma-kernel-tests-amd64",
  "akuma-locks-rw",
  "akuma-net",
  "akuma-net-unix",
  "akuma-net-yarn",
+ "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-psci",
@@ -85,95 +92,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "akuma-amd64"
-version = "0.0.8"
-dependencies = [
- "akuma-affinity",
- "akuma-alloc",
- "akuma-bkl",
- "akuma-boot",
- "akuma-boot-amd64",
- "akuma-cmos-rtc",
- "akuma-config",
- "akuma-cow",
- "akuma-cpu",
- "akuma-dma",
- "akuma-dmesg",
- "akuma-dwi2c",
- "akuma-elf",
- "akuma-elf-exec",
- "akuma-exec",
- "akuma-exec-core",
- "akuma-ext2",
- "akuma-fbcon",
- "akuma-fbdev",
- "akuma-fdtable",
- "akuma-fpcache",
- "akuma-fpcache-rw",
- "akuma-fpu-amd64",
- "akuma-gdt",
- "akuma-hda",
- "akuma-hid",
- "akuma-i2c-hid",
- "akuma-idt-amd64",
- "akuma-ieee80211",
- "akuma-isolation",
- "akuma-kacho",
- "akuma-kvm-abi",
- "akuma-lapic-amd64",
- "akuma-locks-rw",
- "akuma-mmap",
- "akuma-mmu",
- "akuma-multiboot2",
- "akuma-net",
- "akuma-net-rtl8169",
- "akuma-nvme",
- "akuma-pagetable",
- "akuma-pci",
- "akuma-pipe",
- "akuma-pipes",
- "akuma-pmm",
- "akuma-port",
- "akuma-power",
- "akuma-primitives",
- "akuma-procfs",
- "akuma-pte-amd64",
- "akuma-rtw89",
- "akuma-ryzen-amd64",
- "akuma-sched-amd64",
- "akuma-selftest",
- "akuma-sntp",
- "akuma-svm-amd64",
- "akuma-syscalls",
- "akuma-syscalls-abi",
- "akuma-syscalls-glue",
- "akuma-syscalls-glue-amd64",
- "akuma-syscalls-linux",
- "akuma-syscalls-mem",
- "akuma-syscalls-net",
- "akuma-syscalls-poll",
- "akuma-syscalls-proc",
- "akuma-syscalls-sync",
- "akuma-syscalls-time",
- "akuma-threading",
- "akuma-touchpad",
- "akuma-trap-amd64",
- "akuma-tty",
- "akuma-usb",
- "akuma-usb-storage",
- "akuma-user-access",
- "akuma-user-space",
- "akuma-vfs",
- "akuma-vfs-glue",
- "akuma-virtio",
- "akuma-vm-spec",
- "akuma-wifi",
- "akuma-wpa",
- "akuma-xhci",
- "spinning_top",
-]
-
-[[package]]
 name = "akuma-bkl"
 version = "0.1.0"
 dependencies = [
@@ -190,16 +108,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-boot-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-pagetable",
+ "akuma-phys",
+ "akuma-primitives",
+]
+
+[[package]]
 name = "akuma-boot-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-alloc",
  "akuma-cpu",
+ "akuma-machine-facts",
+ "akuma-mem-policy",
+ "akuma-multiboot2",
  "akuma-pagetable",
+ "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-pte-amd64",
- "akuma-ryzen-amd64",
+ "spinning_top",
 ]
 
 [[package]]
@@ -217,6 +149,7 @@ dependencies = [
 name = "akuma-config"
 version = "0.1.0"
 dependencies = [
+ "akuma-mem-policy",
  "akuma-primitives",
 ]
 
@@ -241,8 +174,51 @@ name = "akuma-dns"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-drivers-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-boot-amd64",
+ "akuma-cpu",
+ "akuma-dma",
+ "akuma-dwi2c",
+ "akuma-fbcon",
+ "akuma-fbdev",
+ "akuma-hda",
+ "akuma-hid",
+ "akuma-i2c-hid",
+ "akuma-ieee80211",
+ "akuma-kernel-amd64",
+ "akuma-kvm-amd64",
+ "akuma-multiboot2",
+ "akuma-net",
+ "akuma-nvme",
+ "akuma-pagetable",
+ "akuma-pci",
+ "akuma-port",
+ "akuma-primitives",
+ "akuma-rtw89",
+ "akuma-ryzen-amd64",
+ "akuma-selftest",
+ "akuma-touchpad",
+ "akuma-usb",
+ "akuma-usb-storage",
+ "akuma-virtio",
+ "akuma-wifi",
+ "akuma-wpa",
+ "akuma-xhci",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-dwi2c"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-ed25519"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+]
 
 [[package]]
 name = "akuma-el0-entry"
@@ -277,14 +253,19 @@ name = "akuma-entry"
 version = "0.1.0"
 dependencies = [
  "akuma-bkl",
+ "akuma-boot-aarch64",
  "akuma-cpu",
  "akuma-exceptions",
  "akuma-exec",
  "akuma-fdt",
  "akuma-gic",
  "akuma-kernel-core",
+ "akuma-not-even-once",
+ "akuma-phys",
  "akuma-primitives",
  "akuma-psci",
+ "akuma-trap-aarch64",
+ "akuma-vectors-aarch64",
 ]
 
 [[package]]
@@ -294,13 +275,26 @@ dependencies = [
  "akuma-alloc",
  "akuma-bkl",
  "akuma-cpu",
+ "akuma-exceptions-forensics",
  "akuma-exec",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-syscalls-linux",
  "akuma-trap-aarch64",
+]
+
+[[package]]
+name = "akuma-exceptions-forensics"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-phys",
+ "akuma-pmm",
+ "akuma-primitives",
 ]
 
 [[package]]
@@ -313,6 +307,7 @@ dependencies = [
  "akuma-elf",
  "akuma-exec-core",
  "akuma-fdtable",
+ "akuma-fpcache-rw",
  "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",
@@ -380,6 +375,7 @@ version = "0.1.0"
 name = "akuma-firecracker"
 version = "0.1.0"
 dependencies = [
+ "akuma-machine-facts",
  "fdt",
 ]
 
@@ -402,6 +398,14 @@ version = "0.1.0"
 [[package]]
 name = "akuma-fpu-amd64"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-frame-raw"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-primitives",
+]
 
 [[package]]
 name = "akuma-gdt"
@@ -456,9 +460,95 @@ name = "akuma-kacho"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-kernel"
+version = "0.1.0"
+dependencies = [
+ "akuma-kernel-amd64",
+ "akuma-kernel-glue",
+]
+
+[[package]]
+name = "akuma-kernel-amd64"
+version = "0.0.9"
+dependencies = [
+ "akuma-affinity",
+ "akuma-alloc",
+ "akuma-bkl",
+ "akuma-boot",
+ "akuma-boot-amd64",
+ "akuma-cmos-rtc",
+ "akuma-config",
+ "akuma-cow",
+ "akuma-cpu",
+ "akuma-dmesg",
+ "akuma-elf",
+ "akuma-elf-exec",
+ "akuma-exec",
+ "akuma-exec-core",
+ "akuma-ext2",
+ "akuma-fbdev",
+ "akuma-fdtable",
+ "akuma-fpcache",
+ "akuma-fpcache-rw",
+ "akuma-fpu-amd64",
+ "akuma-gdt",
+ "akuma-idt-amd64",
+ "akuma-isolation",
+ "akuma-kacho",
+ "akuma-kernel-core",
+ "akuma-lapic-amd64",
+ "akuma-locks-rw",
+ "akuma-machine-facts",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-multiboot2",
+ "akuma-net",
+ "akuma-net-rtl8169",
+ "akuma-pagetable",
+ "akuma-params",
+ "akuma-pci",
+ "akuma-percpu-gdt-amd64",
+ "akuma-phys",
+ "akuma-pipe",
+ "akuma-pipes",
+ "akuma-pmm",
+ "akuma-port",
+ "akuma-power",
+ "akuma-primitives",
+ "akuma-procfs",
+ "akuma-pte-amd64",
+ "akuma-ryzen-amd64",
+ "akuma-sched-amd64",
+ "akuma-selftest",
+ "akuma-sntp",
+ "akuma-syscalls",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-glue-amd64",
+ "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
+ "akuma-syscalls-net",
+ "akuma-syscalls-poll",
+ "akuma-syscalls-proc",
+ "akuma-syscalls-time",
+ "akuma-threading",
+ "akuma-trap-amd64",
+ "akuma-tty",
+ "akuma-user-access",
+ "akuma-user-space",
+ "akuma-user-tree",
+ "akuma-usermode-amd64",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-kernel-core"
 version = "0.1.0"
 dependencies = [
+ "akuma-boot-aarch64",
  "akuma-config",
  "akuma-cpu",
  "akuma-dmesg",
@@ -468,6 +558,7 @@ dependencies = [
  "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-machine-facts",
  "akuma-net",
  "akuma-pmm",
  "akuma-primitives",
@@ -491,17 +582,24 @@ dependencies = [
  "akuma-entry",
  "akuma-exceptions",
  "akuma-exec",
+ "akuma-exec-core",
  "akuma-ext2",
  "akuma-fdt",
  "akuma-gic",
  "akuma-kernel-core",
+ "akuma-machine-facts",
+ "akuma-mem-policy",
  "akuma-net",
+ "akuma-params",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-psci",
  "akuma-rump",
+ "akuma-switch",
  "akuma-syscalls-glue",
+ "akuma-threading",
  "akuma-timer",
+ "akuma-vectors-aarch64",
  "akuma-vfs-glue",
  "akuma-virtio",
  "log",
@@ -509,8 +607,84 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-kernel-tests-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-cpu",
+ "akuma-entry",
+ "akuma-exceptions",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-isolation",
+ "akuma-kernel-core",
+ "akuma-kernel-glue",
+ "akuma-net",
+ "akuma-net-yarn",
+ "akuma-phys",
+ "akuma-primitives",
+ "akuma-syscalls",
+ "akuma-syscalls-linux",
+ "akuma-tty",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "log",
+ "smoltcp",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-kernel-tests-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-boot-amd64",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-kernel-amd64",
+ "akuma-kernel-core",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-selftest",
+ "akuma-syscalls-abi",
+ "akuma-syscalls-linux",
+ "akuma-threading",
+ "akuma-user-access",
+ "akuma-vfs-glue",
+]
+
+[[package]]
 name = "akuma-kvm-abi"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-kvm-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-affinity",
+ "akuma-bkl",
+ "akuma-cpu",
+ "akuma-dmesg",
+ "akuma-exec",
+ "akuma-exec-core",
+ "akuma-kernel-amd64",
+ "akuma-kvm-abi",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-svm-amd64",
+ "akuma-svm-switch-amd64",
+ "akuma-syscalls-glue",
+ "akuma-threading",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "akuma-vm-spec",
+ "spinning_top",
+]
 
 [[package]]
 name = "akuma-lapic-amd64"
@@ -539,6 +713,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-machine-facts"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-mem-policy"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-middleware"
+version = "0.1.0"
+dependencies = [
+ "akuma-params",
+ "akuma-primitives",
+ "akuma-syscalls-abi",
+]
+
+[[package]]
 name = "akuma-mmap"
 version = "0.1.0"
 
@@ -550,6 +741,7 @@ dependencies = [
  "akuma-cpu",
  "akuma-fdt",
  "akuma-mmap",
+ "akuma-mmu-raw",
  "akuma-pagetable",
  "akuma-pmm",
  "akuma-primitives",
@@ -560,8 +752,36 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-mmu-raw"
+version = "0.1.0"
+dependencies = [
+ "akuma-fdt",
+ "akuma-pagetable",
+ "akuma-pmm",
+ "akuma-primitives",
+]
+
+[[package]]
 name = "akuma-multiboot2"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-mw-no-dynamic-loading"
+version = "0.1.0"
+dependencies = [
+ "akuma-middleware",
+ "akuma-primitives",
+]
+
+[[package]]
+name = "akuma-mw-signed-exec"
+version = "0.1.0"
+dependencies = [
+ "akuma-ed25519",
+ "akuma-middleware",
+ "akuma-primitives",
+ "sha2",
+]
 
 [[package]]
 name = "akuma-net"
@@ -627,8 +847,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-params"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
+
+[[package]]
 name = "akuma-pci"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-percpu-gdt-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-gdt",
+]
+
+[[package]]
+name = "akuma-phys"
+version = "0.1.0"
+dependencies = [
+ "akuma-pagetable",
+ "akuma-pmm",
+ "akuma-primitives",
+]
 
 [[package]]
 name = "akuma-pipe"
@@ -645,7 +889,7 @@ dependencies = [
 name = "akuma-pmm"
 version = "0.1.0"
 dependencies = [
- "akuma-cpu",
+ "akuma-frame-raw",
  "akuma-primitives",
  "spinning_top",
 ]
@@ -679,6 +923,10 @@ name = "akuma-psci"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-pte-aarch64"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-pte-amd64"
 version = "0.1.0"
 dependencies = [
@@ -694,6 +942,7 @@ name = "akuma-ring3-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-cpu",
+ "akuma-elf-exec",
  "akuma-gdt",
 ]
 
@@ -713,7 +962,6 @@ dependencies = [
  "akuma-primitives",
  "akuma-syscalls-abi",
  "akuma-syscalls-glue",
- "akuma-syscalls-glue-amd64",
  "akuma-syscalls-linux",
  "akuma-vfs-glue",
 ]
@@ -721,6 +969,9 @@ dependencies = [
 [[package]]
 name = "akuma-ryzen-amd64"
 version = "0.1.0"
+dependencies = [
+ "akuma-machine-facts",
+]
 
 [[package]]
 name = "akuma-sched-amd64"
@@ -758,11 +1009,40 @@ name = "akuma-sntp"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-stack"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-svm-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-ryzen-amd64",
  "smoltcp",
+]
+
+[[package]]
+name = "akuma-svm-switch-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-mmu-raw",
+ "akuma-phys",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-svm-amd64",
+ "akuma-vm-spec",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-switch"
+version = "0.1.0"
+dependencies = [
+ "akuma-bkl",
+ "akuma-exec-core",
+ "akuma-primitives",
+ "akuma-stack",
+ "akuma-trap-aarch64",
 ]
 
 [[package]]
@@ -790,9 +1070,11 @@ dependencies = [
  "akuma-bkl",
  "akuma-boot",
  "akuma-config",
+ "akuma-cow",
  "akuma-cpu",
  "akuma-exec",
  "akuma-isolation",
+ "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
  "akuma-net-unix",
@@ -924,6 +1206,9 @@ dependencies = [
  "akuma-mmu",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-stack",
+ "akuma-switch",
+ "akuma-trap-aarch64",
  "spinning_top",
 ]
 
@@ -940,7 +1225,48 @@ dependencies = [
 name = "akuma-tokio-kernel"
 version = "0.1.0"
 dependencies = [
+ "akuma-middleware",
+ "akuma-tokio-kernel-aarch64",
  "akuma-tokio-kernel-amd64",
+]
+
+[[package]]
+name = "akuma-tokio-kernel-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-alloc",
+ "akuma-boot-aarch64",
+ "akuma-cpu",
+ "akuma-exec",
+ "akuma-ext2",
+ "akuma-firecracker",
+ "akuma-fpcache",
+ "akuma-gic",
+ "akuma-mem-policy",
+ "akuma-middleware",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-pagetable",
+ "akuma-params",
+ "akuma-phys",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-psci",
+ "akuma-pte-aarch64",
+ "akuma-runtime-tokio",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-linux",
+ "akuma-threading",
+ "akuma-timer",
+ "akuma-tokio-kernel-core",
+ "akuma-uart",
+ "akuma-user-access",
+ "akuma-user-tree",
+ "akuma-vectors-aarch64",
+ "akuma-vfs",
+ "akuma-vfs-glue",
+ "akuma-virtio",
+ "fdt",
 ]
 
 [[package]]
@@ -955,14 +1281,23 @@ dependencies = [
  "akuma-elf-exec",
  "akuma-exec",
  "akuma-ext2",
+ "akuma-fpcache",
+ "akuma-fpcache-rw",
  "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-idt-amd64",
  "akuma-isolation",
  "akuma-lapic-amd64",
+ "akuma-machine-facts",
+ "akuma-mem-policy",
+ "akuma-middleware",
  "akuma-mmap",
  "akuma-mmu",
  "akuma-net",
+ "akuma-pagetable",
+ "akuma-params",
+ "akuma-percpu-gdt-amd64",
+ "akuma-phys",
  "akuma-pmm",
  "akuma-port",
  "akuma-primitives",
@@ -978,6 +1313,7 @@ dependencies = [
  "akuma-syscalls-mem",
  "akuma-syscalls-proc",
  "akuma-threading",
+ "akuma-tokio-kernel-core",
  "akuma-trap-amd64",
  "akuma-tty",
  "akuma-user-access",
@@ -987,6 +1323,33 @@ dependencies = [
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",
+ "spinning_top",
+]
+
+[[package]]
+name = "akuma-tokio-kernel-core"
+version = "0.1.0"
+dependencies = [
+ "akuma-cow",
+ "akuma-elf-exec",
+ "akuma-exec",
+ "akuma-fpcache",
+ "akuma-fpcache-rw",
+ "akuma-middleware",
+ "akuma-mmap",
+ "akuma-mmu",
+ "akuma-net",
+ "akuma-pmm",
+ "akuma-primitives",
+ "akuma-syscalls-glue",
+ "akuma-syscalls-linux",
+ "akuma-syscalls-mem",
+ "akuma-syscalls-proc",
+ "akuma-threading",
+ "akuma-user-layout",
+ "akuma-user-tree",
+ "akuma-vfs",
+ "akuma-vfs-glue",
  "spinning_top",
 ]
 
@@ -1063,6 +1426,21 @@ version = "0.1.0"
 [[package]]
 name = "akuma-user-walk"
 version = "0.1.0"
+
+[[package]]
+name = "akuma-usermode-amd64"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-gdt",
+]
+
+[[package]]
+name = "akuma-vectors-aarch64"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
 
 [[package]]
 name = "akuma-vfs"
@@ -1152,6 +1530,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
+name = "block-buffer"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
+dependencies = [
+ "generic-array",
+]
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1162,6 +1549,51 @@ name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9330f8b2ff13f34540b44e946ef35111825727b38d33286ef986142615121801"
+
+[[package]]
+name = "cpufeatures"
+version = "0.2.17"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59ed5838eebb26a2bb2e58f6d5b5316989ae9d08bab10e0e6d103e656d1b0280"
+dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "crypto-common"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78c8292055d1c1df0cce5d180393dc8cce0abec0a7102adb6c7b1eef6016d60a"
+dependencies = [
+ "generic-array",
+ "typenum",
+]
+
+[[package]]
+name = "curve25519-dalek"
+version = "4.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "97fb8b7c4503de7d6ae7b42ab72a5a59857b4c937ec27a3d4539dba95b5ab2be"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "curve25519-dalek-derive",
+ "digest",
+ "fiat-crypto",
+ "rustc_version",
+ "subtle",
+]
+
+[[package]]
+name = "curve25519-dalek-derive"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f46882e17999c6cc590af592290432be3bce0428cb0d5f8b6715e4dc7b383eb3"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
 
 [[package]]
 name = "defmt"
@@ -1212,6 +1644,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "digest"
+version = "0.10.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
+dependencies = [
+ "block-buffer",
+ "crypto-common",
+]
+
+[[package]]
+name = "ed25519"
+version = "2.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115531babc129696a58c64a4fef0a8bf9e9698629fb97e9e40767d235cfbcd53"
+dependencies = [
+ "signature",
+]
+
+[[package]]
+name = "ed25519-dalek"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
+dependencies = [
+ "curve25519-dalek",
+ "ed25519",
+ "sha2",
+ "subtle",
+]
+
+[[package]]
 name = "elf"
 version = "0.7.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1250,6 +1713,22 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "784a4df722dc6267a04af36895398f59d21d07dce47232adf31ec0ff2fa45e67"
 
 [[package]]
+name = "fiat-crypto"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
+
+[[package]]
+name = "generic-array"
+version = "0.14.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85649ca51fd72272d7821adaf274ad91c288277713d9c18820d8499a7ff69e9a"
+dependencies = [
+ "typenum",
+ "version_check",
+]
+
+[[package]]
 name = "hash32"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1267,6 +1746,12 @@ dependencies = [
  "hash32",
  "stable_deref_trait",
 ]
+
+[[package]]
+name = "libc"
+version = "0.2.191"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libm"
@@ -1300,13 +1785,6 @@ name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
-
-[[package]]
-name = "osaka"
-version = "0.1.0"
-dependencies = [
- "akuma-tokio-kernel",
-]
 
 [[package]]
 name = "owned_ttf_parser"
@@ -1358,6 +1836,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustc_version"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfcb3a22ef46e85b45de6ee7e79d063319ebb6594faafcf1c225ea92ab6e9b92"
+dependencies = [
+ "semver",
+]
+
+[[package]]
 name = "safe-mmio"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1373,11 +1860,37 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
+
+[[package]]
+name = "sha2"
+version = "0.10.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
+dependencies = [
+ "cfg-if",
+ "cpufeatures",
+ "digest",
+]
+
+[[package]]
 name = "shanghai"
 version = "0.1.0"
 dependencies = [
+ "akuma-mw-no-dynamic-loading",
+ "akuma-mw-signed-exec",
+ "akuma-primitives",
  "akuma-tokio-kernel",
 ]
+
+[[package]]
+name = "signature"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "77549399552de45a898a580c1b41d445bf730df867cc44e6c0233bbc4b8329de"
 
 [[package]]
 name = "smoltcp"
@@ -1407,6 +1920,12 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "subtle"
+version = "2.6.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "syn"
@@ -1462,6 +1981,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2df906b07856748fa3f6e0ad0cbaa047052d4a7dd609e231c4f72cee8c36f31"
 
 [[package]]
+name = "typenum"
+version = "1.20.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
+
+[[package]]
 name = "unicode-ident"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1472,6 +1997,12 @@ name = "unicode-width"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
+
+[[package]]
+name = "version_check"
+version = "0.9.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "virtio-drivers"

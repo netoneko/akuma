@@ -1,7 +1,7 @@
 # amd64: a ring-3 `#UD` stopped being a whole-machine kill, `fchdir` was two gaps deep, and `execve` learned `#!`
 
 **Date:** 2026-09-20
-**Scope:** `amd64/src/idt.rs` (vector 6), `amd64/src/usermode.rs` (`sys_execve`/`sys_fchdir`
+**Scope:** `crates/akuma-kernel-amd64/src/idt.rs` (vector 6), `crates/akuma-kernel-amd64/src/usermode.rs` (`sys_execve`/`sys_fchdir`
 dispatch), `crates/akuma-syscalls-abi`.
 **Status:** `#UD` containment, `fchdir`, and `execve` shebang support all fixed
 and verified live. The workload that found the first two — the Alpine `apk`
@@ -59,7 +59,7 @@ saves the full `TrapRegs`, and an `extern "C" fn invalid_opcode_dispatch` that:
   stray flag bit like `#DB`'s story; the instruction bytes really are bad, so
   there is no "disarm and continue" here.
 
-`amd64/src/idt.rs`'s `init()` now points IDT vector 6 at `invalid_opcode_entry`
+`crates/akuma-kernel-amd64/src/idt.rs`'s `init()` now points IDT vector 6 at `invalid_opcode_entry`
 instead of the old `x86-interrupt` fn, which is deleted.
 
 ### `fchdir`: the table row was necessary but not sufficient
@@ -74,7 +74,7 @@ into glue's dispatch table; the gap was entirely upstream of it, and it was
 1. `crates/akuma-syscalls-abi`'s `syscall_table!` had no `Fchdir` row, so
    `Syscall::from_x86_64(81)` returned `None` and the call never decoded — the
    same shape [`Self::Chdir`]'s own row comment describes from 2026-09-12.
-2. Adding the row alone was **not enough**. `amd64/src/usermode.rs`'s
+2. Adding the row alone was **not enough**. `crates/akuma-kernel-amd64/src/usermode.rs`'s
    `syscall_dispatch` is not a generic forward to glue for every decodable
    `Syscall` — it is a big `match` with one arm per syscall, and anything
    without its own arm falls into the catch-all `_ => errno::ENOSYS`. `Chdir`
@@ -86,7 +86,7 @@ into glue's dispatch table; the gap was entirely upstream of it, and it was
 ### `execve` shebang support
 
 docs/README.md's symptom matrix already had this one, unfixed: "`execve` of a
-`#!` script fails with `Exec format error` … `amd64/src/usermode.rs::sys_execve`
+`#!` script fails with `Exec format error` … `crates/akuma-kernel-amd64/src/usermode.rs::sys_execve`
 has no shebang handling at all." Fixed the same session, since `apk fix`'s
 `busybox` post-install hook needed it right after `fchdir` started working.
 `sys_execve` is split the same way AArch64's `akuma-syscalls-glue::proc`

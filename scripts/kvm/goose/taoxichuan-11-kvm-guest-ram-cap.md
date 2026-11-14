@@ -7,7 +7,7 @@ Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /e
 The host Akuma kernel refuses any VM with more than 1 GiB of RAM, and the Taoxichuan self-hosting fixed point needs >= 2.5 GiB (it needs 3 GiB; 4 GiB is the target). The cap is
 structural, not a setting: `docs/reference/subsystems/kvm.md` ("Reserved memory") says guest RAM is bounded at 1 GiB "by the nested page table (one directory of 2 MiB leaves)", and the
 number is enforced in three places: `MAX_RAM_MIB = 1024` in `crates/akuma-vm-spec/src/spec.rs`, `userspace/herd/src/vm.rs` (parses through the spec; its test expects `vm_ram_mib=4096` to be `OutOfRange`), and the
-NPT builder in `amd64/src/kvm*.rs` / `crates/akuma-svm-amd64` plus the `SET_USER_MEMORY_REGION` path in the `/dev/kvm` node ("Guest RAM <= 1 GiB"). **Your job: make guest RAM up to 4096 MiB work, in code, with host tests,
+NPT builder in `crates/akuma-kernel-amd64/src/kvm*.rs` / `crates/akuma-svm-amd64` plus the `SET_USER_MEMORY_REGION` path in the `/dev/kvm` node ("Guest RAM <= 1 GiB"). **Your job: make guest RAM up to 4096 MiB work, in code, with host tests,
 and write down exactly what the supervisor must build and boot.** The supervisor builds the metal kernel **on the ryzen** (Mac-built kernels hang on metal), commits, reboots and tests; you do none of that.
 You change no file under `taoxichuan/`, and you never touch `/boot`, `/etc/herd/` or a running VM.
 
@@ -15,7 +15,7 @@ You change no file under `taoxichuan/`, and you never touch `/boot`, `/etc/herd/
 1. `docs/reference/subsystems/kvm.md` - "Reserved memory (`kvmmem=`)", "Guest RAM is a slice of the `kvmmem=` reserve", the `vm_ram_mib` row of the herd table, "Kernel parameters".
 2. `crates/akuma-svm-amd64/src/` - the NPT encodings (`grep -n 'npt\|Npt\|NPT\|2 MiB\|PDPT\|pd' ` first). Find where the single directory page of 2 MiB leaves is built and its size.
 3. `crates/akuma-vm-spec/src/{spec.rs,arena.rs}` - `MAX_RAM_MIB`, and the first-fit arena over the `kvmmem=` reserve (check it is not hard-wired to 1 GiB either).
-4. `amd64/src/kvm.rs`, `amd64/src/kvm/` - `grep -n 'npt\|NPT\|ram\|RAM\|1 << 30\|0x4000_0000' amd64/src/kvm*.rs amd64/src/kvm/*.rs`: every place that assumes guest-physical space ends at 1 GiB (the NPT root, `SET_USER_MEMORY_REGION`, the MMIO window: where do the LAPIC/IOAPIC/virtio-mmio/UART windows sit? RAM above 3 GiB must not overlap them, and RAM may have to be split around the PCI hole as a real PC does; say which you chose and why).
+4. `crates/akuma-kernel-amd64/src/kvm.rs`, `crates/akuma-kernel-amd64/src/kvm/` - `grep -n 'npt\|NPT\|ram\|RAM\|1 << 30\|0x4000_0000' crates/akuma-kernel-amd64/src/kvm*.rs crates/akuma-kernel-amd64/src/kvm/*.rs`: every place that assumes guest-physical space ends at 1 GiB (the NPT root, `SET_USER_MEMORY_REGION`, the MMIO window: where do the LAPIC/IOAPIC/virtio-mmio/UART windows sit? RAM above 3 GiB must not overlap them, and RAM may have to be split around the PCI hole as a real PC does; say which you chose and why).
 5. `crates/akuma-svm-amd64/` PVH loader / `e820` map: the guest must be told about all of its RAM (and the hole), or it will use only the first 1 GiB.
 6. `userspace/herd/src/vm.rs` (docs table + tests), `docs/reference/subsystems/kvm.md` herd row.
 
@@ -25,12 +25,12 @@ You change no file under `taoxichuan/`, and you never touch `/boot`, `/etc/herd/
 | 1 | `MAX_RAM_MIB` is 1024 | `grep -n MAX_RAM_MIB crates/akuma-vm-spec/src/spec.rs` |
 | 2 | the NPT is one directory page of 2 MiB leaves | `grep -n` in `crates/akuma-svm-amd64/src/` for the directory/leaf builder |
 | 3 | the ryzen's boot entry already reserves >= 4096 MiB (`kvmmem=`) | `grep -rn kvmmem overlays/ryzen/ docs/runbooks/ scripts/` (the entry-30 line); the supervisor will confirm on the box |
-| 4 | nothing else in `amd64/src/kvm*` assumes <= 1 GiB | the grep in step 4 above |
+| 4 | nothing else in `crates/akuma-kernel-amd64/src/kvm*` assumes <= 1 GiB | the grep in step 4 above |
 | 5 | host tests for the crates run on the Mac/box | `cargo test -p akuma-vm-spec -p akuma-svm-amd64 --target $(rustc -vV \| sed -n 's/host: //p')` |
 
 ## Composition rule
 Extend the existing crates; do not add a second NPT builder. The NPT encoding and the RAM layout (which guest-physical ranges are RAM, which are holes) are *decisions*: they belong in `akuma-svm-amd64` / `akuma-vm-spec` as pure, host-tested functions
-(`forbid(unsafe_code)` stays); `amd64/src/kvm*.rs` keeps the page allocation and the `unsafe`. If the NPT grows from one directory page to several, allocate them from the same place the single one comes from and free them with it. Report per change: *pulled / extracted / written new (why)*.
+(`forbid(unsafe_code)` stays); `crates/akuma-kernel-amd64/src/kvm*.rs` keeps the page allocation and the `unsafe`. If the NPT grows from one directory page to several, allocate them from the same place the single one comes from and free them with it. Report per change: *pulled / extracted / written new (why)*.
 
 ## Gates
 - G1: host tests pass for `akuma-vm-spec` and `akuma-svm-amd64`, including NEW tests: the NPT maps every 2 MiB leaf of a 4096 MiB layout exactly once, nothing maps inside the device windows, the e820/PVH memory map for 4096 MiB sums to the RAM size and names the hole, `ram_mib=4096` parses and `ram_mib=4097`/`ram_mib=0` are refused (`MAX_RAM_MIB` is the single source; herd's test uses it, not a literal).

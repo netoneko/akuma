@@ -9,7 +9,7 @@
 //! - [`detach_eager_regions_in_range`] — `munmap`'s clip-and-split.
 //! - [`Prot`], the **architecture-neutral** permission vocabulary a region records.
 //!   The PTE bits it encodes to live with the walker that writes them —
-//!   `akuma_mmu::types` on AArch64, `amd64/src/paging.rs` on x86_64. See
+//!   `akuma_mmu::types` on AArch64, `crates/akuma-kernel-amd64/src/paging.rs` on x86_64. See
 //!   `types.rs` for why the data had to move even though the code compiled.
 //!
 //! # What is deliberately NOT in here
@@ -25,7 +25,7 @@
 //!   region algebra. A crate that cannot lock cannot get it wrong.
 //! - `eager_region_flags_for_page_fault`, `eager_regions_containing`,
 //!   `update_eager_region_flags`, `munmap_lazy_regions_in_range`,
-//!   `record_mmap_region`, `remove_mmap_region`, `share_rw_range` — all pid-keyed:
+//!   `share_rw_range` — all pid-keyed:
 //!   they resolve a process before they can touch a region list.
 //! - `FaultAccess` / `lazy_map_flags` (`akuma_exec::mmu::types`) — demand-paging
 //!   *policy*, the seam between the data-abort and instruction-abort arms of the EL0
@@ -66,13 +66,15 @@ extern crate alloc;
 
 mod frame;
 pub mod holes;
+pub mod place;
 mod region;
 mod types;
 
 pub use frame::PhysFrame;
 pub use holes::HoleSet;
 pub use region::{
-    FileBacking, MmapRegion, SharedWriteBack, detach_eager_regions_in_range,
+    DetachedPiece, FileBacking, FilePageSpan, MmapRegion, SharedWriteBack,
+    detach_eager_regions_in_range, detach_lazy_regions_in_range, detach_regions_in_range_where,
     inherit_mmap_regions_for_cow_child, insert_region_sorted, mprotect_eager_regions_in_range,
     region_index_containing, regions_overlapping,
 };

@@ -3,8 +3,6 @@
 //! These types have no architecture-specific or runtime dependencies
 //! and can be compiled and tested on the host.
 
-#![allow(dead_code)]
-
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -245,16 +243,16 @@ pub enum FileDescriptor {
     /// there is no per-descriptor cursor state to keep.
     DevPower,
     /// The hypervisor's control device (`/dev/kvm0`): a VM spec or `stop`/`status` in, the
-    /// guest's console out (`akuma-vm-spec`, `amd64/src/kvm/ctl.rs`). Only the amd64 kernel
+    /// guest's console out (`akuma-vm-spec`, `crates/akuma-kvm-amd64/src/ctl.rs`). Only the amd64 kernel
     /// opens one, and only when the hypervisor is armed (`kvmctl`); one VM at a time. The id is 0 for
-    /// `/dev/kvm0` and `n > 0` for handle `n` of the KVM-ioctl node `/dev/kvm` (`amd64/src/kvm/api.rs`).
+    /// `/dev/kvm0` and `n > 0` for handle `n` of the KVM-ioctl node `/dev/kvm` (`crates/akuma-kvm-amd64/src/api.rs`).
     DevKvm(u32),
     /// The pointer node (`/dev/input/mouse0`): 8-byte records from the
     /// laptop's touchpad (`akuma-touchpad::ptp::encode`). Only the amd64
     /// kernel opens one, and only when a touchpad came up; reads never block.
     DevMouse,
     /// The tap clone device (`/dev/net/tun`): Ethernet frames (with a virtio-net header) to and from
-    /// the hypervisor's gateway, for a userspace VMM's network device (`amd64/src/kvm/tun.rs`).
+    /// the hypervisor's gateway, for a userspace VMM's network device (`crates/akuma-kvm-amd64/src/tun.rs`).
     /// Only the amd64 kernel opens one, with the `/dev/kvm` node armed; one at a time.
     DevTun,
     /// The master side of pseudo-terminal pair `N` (`open("/dev/ptmx")`).
@@ -303,7 +301,7 @@ pub enum FileDescriptor {
     /// advance (`dd` is sequential; `lseek` also updates it). `writable` is
     /// fixed at open time: an `O_RDONLY` fd cannot be upgraded by anything
     /// after the open-time mounted-device check
-    /// (`proposals/RAW_BLOCK_DEVICE_FD.md` §3 — a raw write to a *mounted*
+    /// (`docs/archive/RAW_BLOCK_DEVICE_FD.md` §3 — a raw write to a *mounted*
     /// device bypasses `Ext2Filesystem`'s cache, so write-open of a mounted
     /// device is refused with `EBUSY` and only ever an unmounted device like
     /// the `KERNEL_DROPOFF` drive gets a writable fd).
@@ -406,15 +404,21 @@ impl KernelFile {
 pub use akuma_syscalls_linux::flags::open as open_flags;
 
 /// Source of data for a lazy region page.
+///
+/// The region itself is an `MmapRegion` with `lazy` set, its file in a
+/// `FileBacking`. A `LazySource` is the view a lookup hands the fault path
+/// (`akuma_exec::process::lazy_source_of`) and the argument `push_lazy_region`
+/// takes; it is not stored.
 #[derive(Clone)]
 pub enum LazySource {
     Zero,
     File {
-        path: String,
+        /// Never 0: a file with no inode identity is mapped eagerly, since a
+        /// region records no path to read it by.
         inode: u32,
         /// Which mount `inode` belongs to (`akuma_vfs::ResolvedMount::id`),
-        /// captured with it at mmap time. `0` means "no identity", which
-        /// disables page-cache sharing for this region.
+        /// captured with it at mmap time; the fill reads through it. Never 0,
+        /// for the same reason as `inode`.
         ///
         /// An inode number alone does not name a file: a second `mount(2)` puts
         /// another filesystem's numbers in the same range, and the page cache is
@@ -425,38 +429,47 @@ pub enum LazySource {
         file_offset: usize,
         filesz: usize,
         segment_va: usize,
-        /// Keeps `inode`'s data alive for as long as this region exists.
+        /// Keeps `inode`'s data alive while the holder reads it.
         ///
-        /// `inode` is a raw number with no lifetime tie to the file, so without
-        /// this the filesystem was free to truncate it and reissue the number
+        /// `inode` is a raw number with no lifetime tie to the file, so without a
+        /// pin the filesystem was free to truncate it and reissue the number
         /// under a live mapping — the fill then read `Ok(0)` (zero page) or, after
         /// reuse, another file's bytes. That is root cause #2 of the self-host
         /// `rustc` ICE (`docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §14).
         ///
-        /// Nothing reads this field. It is load-bearing purely through
-        /// [`InodePin`]'s `Clone`/`Drop`, which is what makes every region path —
-        /// fork's propagate/clone, `mprotect`'s split, `munmap`'s four clip
-        /// shapes, `exec`'s clear, `Process::drop` — balanced without any of them
-        /// knowing the pin exists. Construct with [`LazySource::file`] rather
-        /// than by hand so the pin can never be forgotten.
+        /// The mapping's own claim on the file is the address space's
+        /// (`UserAddressSpace::pin_mapped_inode`), held for as long as a region
+        /// names the inode. This one covers a fill whose region is unmapped
+        /// under it. Nothing reads the field; it works through [`InodePin`]'s
+        /// `Clone`/`Drop`. Construct with [`LazySource::file`] so it is never
+        /// forgotten.
         pin: akuma_primitives::InodePin,
     },
 }
 
 impl LazySource {
+    /// The inode this source keeps alive, or 0 for an anonymous source (and for
+    /// a file read by path, which has no inode identity).
+    #[must_use]
+    pub const fn pinned_inode(&self) -> u32 {
+        match self {
+            Self::File { inode, .. } => *inode,
+            Self::Zero => 0,
+        }
+    }
+
     /// The only way to build a [`LazySource::File`]: takes the pin on `inode`
     /// as part of construction, so a caller cannot create an unpinned mapping.
     #[must_use]
     pub fn file(
-        path: String,
         mount_id: u32,
         inode: u32,
         file_offset: usize,
         filesz: usize,
         segment_va: usize,
     ) -> Self {
+        debug_assert!(inode != 0 && mount_id != 0, "a lazy file region needs a (mount, inode) identity");
         Self::File {
-            path,
             inode,
             mount_id,
             file_offset,
@@ -467,12 +480,23 @@ impl LazySource {
     }
 }
 
-/// A lazily-backed virtual memory region.
+/// A lazy region as a diagnostic snapshot describes it
+/// (`akuma_exec::process::lazy_regions_snapshot`). The live record is an
+/// `MmapRegion` with `lazy` set.
 #[derive(Clone)]
 pub struct LazyRegion {
     pub start_va: usize,
     pub size: usize,
-    pub flags: u64,
+    /// The protection this region records, in the neutral vocabulary both
+    /// kernels share, or `None` when it records none and the fault path picks
+    /// one from the access (`akuma_mmu::lazy_map_flags`).
+    ///
+    /// It was the AArch64 PTE word itself (`flags: u64`, with `0` meaning
+    /// "unrecorded") until step 1 of `proposals/AKUMA_MM_CONVERGENCE.md`, which
+    /// is what kept a lazy region from being something the amd64 kernel could
+    /// read. The word survives at the lazy API's edges only, as an exact
+    /// conversion.
+    pub prot: Option<akuma_mmap::Prot>,
     pub source: LazySource,
 }
 
@@ -705,7 +729,7 @@ impl UserContext {
 /// separate struct with the same name.
 ///
 /// **The field list is not a design choice — it is what the `syscall_entry`
-/// assembly saves**, and nothing more. `amd64/src/usermode.rs`'s `UserCtx` is
+/// assembly saves**, and nothing more. `crates/akuma-kernel-amd64/src/usermode.rs`'s `UserCtx` is
 /// where those bytes live per *task slot*, written by that assembly at fixed
 /// offsets; this is the same information as a value, so a process's first entry
 /// to ring 3 can be described the way the AArch64 side describes it.

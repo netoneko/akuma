@@ -180,13 +180,11 @@ fn is_loopback_frame(frame: &[u8]) -> bool {
 type LoopbackLease = FrameLease<'static, LOOPBACK_RING, LOOPBACK_FRAME_BUF>;
 
 /// Bytes per loopback frame slot. Loopback frames are pure L2 (no virtio
-/// header, MTU 1514 — see `capabilities()`), but this matches
-/// `virtio_rings::FRAME_BUF` and every other frame buffer in this file for
-/// the same reason: one size means one set of bounds to reason about.
+/// header, MTU 1514 — see `capabilities()`), but this matches every other
+/// frame buffer in this file: one size means one set of bounds to reason about.
 const LOOPBACK_FRAME_BUF: usize = 2048;
 
-/// Loopback frames that may be queued at once. Deliberately the same order of
-/// magnitude as `virtio_rings::RX_RING`/`TX_RING`: enough to cover one
+/// Loopback frames that may be queued at once: enough to cover one
 /// TCP-handshake-shaped burst between two `poll()` calls, not a backlog.
 const LOOPBACK_RING: usize = 32;
 
@@ -194,7 +192,6 @@ const LOOPBACK_RING: usize = 32;
 /// `NetworkState` (which owns the device) is built on the stack before being
 /// moved into the `NETWORK` static, and `LOOPBACK_RING * LOOPBACK_FRAME_BUF`
 /// (64 KiB) inline would push that far past a comfortable kernel stack frame.
-/// Same reasoning as `virtio_rings`' arenas.
 static LOOPBACK_ARENA: FrameArena<LOOPBACK_RING, LOOPBACK_FRAME_BUF> = FrameArena::new();
 
 /// Loopback frames dropped because the ring was full, or (should be
@@ -416,10 +413,9 @@ impl Device for LoopbackAwareDevice {
         let rx = match source {
             FrameSource::Loopback(frame, len) => LoopbackAwareRxToken::Loopback(frame, len),
             // SAFETY: `take_rx_frame` returned a live L2 frame of `len` bytes in
-            // storage this device owns — with `net-noalloc` a ring slot the ring
-            // has already released and will not re-post until the next
-            // `receive`, otherwise the single rx buffer. The token's lifetime is
-            // bounded by the `&mut self` borrow.
+            // storage this device owns — the single rx buffer, not re-posted
+            // until the next `receive`. The token's lifetime is bounded by the
+            // `&mut self` borrow.
             FrameSource::External(ptr, len) => LoopbackAwareRxToken::External(unsafe {
                 core::slice::from_raw_parts_mut(ptr, len)
             }),

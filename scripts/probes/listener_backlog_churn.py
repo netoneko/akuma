@@ -15,11 +15,11 @@ the competing kernel-side explanation.
                  512) for each accepted-then-RST connection. Ceiling ~512.
 
     kernel-side  Akuma's listener is a *pool of pre-listening smoltcp sockets*
-                 (`crates/akuma-net/src/socket.rs`, `MAX_BACKLOG` = 32). A
+                 (`crates/akuma-net/src/socket.rs`, `MAX_BACKLOG`, 8). A
                  handle that reaches `Established` and is then RST before
                  `accept()` claims it goes to `Closed` and is never returned to
                  `Listen` — `socket_accept` only replaces handles it actually
-                 hands out. Ceiling ~32 (or whatever `MAX_BACKLOG` is), and it
+                 hands out. Ceiling ~`MAX_BACKLOG`, and it
                  is independent of the server program.
 
 So the discriminator is simply **how many churned connections it takes**, and

@@ -17,6 +17,6 @@ regimen doesn't cover — useful to re-run after any change touching fork,
 | [`forktest_smp_matrix.py`](../../../scripts/forktest_smp_matrix.py) | Runs forktest across parameter combinations (mmap, file I/O, signals, goroutine stress) at SMP=2/4 — the fuller version of `quick_forktest.py`. |
 | [`test_memory_split.py`](../../../scripts/test_memory_split.py) | Boots at several `MEMORY=` sizes and compiles a program (tcc for small sizes, rustc for larger) at each, to characterize the kernel/user VA-split and identity-map cap. Writes `logs/split_summary.txt`. |
 | [`sshd_crash_hunt.py`](../../../scripts/sshd_crash_hunt.py) | Repro harness for the SMP=4 fork-hammer WILD-DA `FAR=0x0` crash class. |
-| [`test_sched_bklfree_ticket_fix.py`](../../../scripts/test_sched_bklfree_ticket_fix.py) | Regression check for the BKL fair-FIFO ticket-leak fix (`sched_bklfree_el0`, M5c step 2) — boots SMP=4 and confirms no ticket-accounting drift. Background: the `SMP_SHARED.md` ticket-leak entry in [`../../archive/BUG_FIX_LIST.md`](../../archive/BUG_FIX_LIST.md). |
+| [`test_sched_bklfree_ticket_fix.py`](../../../scripts/test_sched_bklfree_ticket_fix.py) | Boots SMP=4, runs a fork/exec stress and confirms no BKL ticket-accounting drift. Written for the `sched_bklfree_el0` ticket-leak fix (M5c step 2); that path is gone (2026-11-11) and the check still applies. Background: the `SMP_SHARED.md` ticket-leak entry in [`../../archive/BUG_FIX_LIST.md`](../../archive/BUG_FIX_LIST.md). |
 
 Back to [`README.md`](README.md).

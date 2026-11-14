@@ -170,7 +170,7 @@ is behind physical access to the GRUB menu now (see §6.1).
 > § "Second rig: ryzen".
 
 **There is no `[Fault]` line, and that is expected, not evidence of health.**
-`amd64/src/idt.rs:990` hands a ring-3 fault to `deliver_fault_signal` *before*
+`crates/akuma-kernel-amd64/src/idt.rs:990` hands a ring-3 fault to `deliver_fault_signal` *before*
 reaching `user_fault`, and Rust's std installs a `SIGSEGV` handler for
 stack-overflow detection — so a segfaulting `cargo`/`rustc` is killed silently by
 design. Reading "no `[Fault]` lines" as "the kernel killed nothing" sends you
@@ -218,8 +218,8 @@ experiment. LLD prints its own argv in the crash dump, so the same 30 KB command
 line was replayed with one flag changed:
 
 ```
-rust-lld -flavor gnu <174 objects> -T/root/akuma/amd64/linker.ld …              → SIGSEGV
-rust-lld -flavor gnu <174 objects> -T/root/akuma/amd64/linker.ld … --threads=1  → rc=0
+rust-lld -flavor gnu <174 objects> -T/root/akuma/crates/akuma-kernel-amd64/linker.ld …              → SIGSEGV
+rust-lld -flavor gnu <174 objects> -T/root/akuma/crates/akuma-kernel-amd64/linker.ld … --threads=1  → rc=0
 ```
 
 Same objects, same command, same machine, one variable, ~20 seconds. This is a
@@ -329,7 +329,7 @@ from, and nothing else.
 `HEAP_SIZE` was a hard-coded **512 MiB on a 16 321 MiB machine**. The ext2 block
 cache is `min(RAM/8, FSCACHE_CEILING_MB, HEAP_SIZE/4)`, so the heap quarter was
 binding at **128 MB** where the policy wanted 384 MB — on precisely the workload
-`amd64/src/fs.rs`'s own comment names: *"`rustc` reading rlibs has a working set
+`crates/akuma-kernel-amd64/src/fs.rs`'s own comment names: *"`rustc` reading rlibs has a working set
 in the hundreds of megabytes."*
 
 Sized from RAM instead (`heap_size_for`: 1 GiB at ≥ 8 GiB usable, 512 MiB
@@ -406,7 +406,7 @@ that binds, silently, on the only workload that notices.
 3. **`HEAP_SIZE` was a hard-coded 512 MiB on a 16 GiB machine.** The ext2 block
    cache is `min(RAM/8, FSCACHE_CEILING_MB, HEAP_SIZE/4)`, and the heap quarter
    was binding at **128 MB** where the policy wanted 384 MB — on the workload
-   `amd64/src/fs.rs`'s own comment names ("`rustc` reading rlibs has a working set
+   `crates/akuma-kernel-amd64/src/fs.rs`'s own comment names ("`rustc` reading rlibs has a working set
    in the hundreds of megabytes"). Now sized from RAM: 1 GiB at ≥ 8 GiB usable,
    512 MiB otherwise, as a *request* that falls back if no reachable region below
    `PHYSMAP_LIMIT` (4 GiB) can hold it. This is the lever for §2's cache-residency
@@ -573,7 +573,7 @@ that binds, silently, on the only workload that notices.
      pid. kot kept running (port 9944 still answered 4 s later, `/proc/20/stat`
      `R`, no `[signal]` line). libakuma's `kill_signal` issues Akuma-private
      `KILL` (`0x1000 + 302`) on x86_64, and amd64 dispatches that as
-     `302 => 0` (`amd64/src/usermode.rs`) — "accepted as a no-op success"
+     `302 => 0` (`crates/akuma-kernel-amd64/src/usermode.rs`) — "accepted as a no-op success"
      because sshd sends SIGHUP/SIGTERM to a session shell at teardown and,
      when that was written, "there is nothing here to deliver a signal to".
      There is now: Linux `kill` (x86_64 62, what busybox `kill` uses) delivers.

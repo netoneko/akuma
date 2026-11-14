@@ -1,6 +1,6 @@
 //! The first program the amd64 kernel loads from an ELF image.
 //!
-//! Built by `amd64/build.rs` with `rustc --target x86_64-unknown-none` and
+//! Built by `crates/akuma-kernel-amd64/build.rs` with `rustc --target x86_64-unknown-none` and
 //! linked by `userspace/amd64/user.ld` at `0x40_0000` — a genuine static ELF64 with
 //! real program headers, not a byte blob the kernel assembled for itself. That
 //! distinction is the point of the stage: a loader tested only against an image

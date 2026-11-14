@@ -19,7 +19,7 @@ glue answers `ENOSYS`.
 
 ## Fix
 
-`amd64/Cargo.toml`: glue with `features = ["smoltcp", "exec"]`. Taoxichuan has no `box` and keeps the feature off,
+`crates/akuma-kernel-amd64/Cargo.toml`: glue with `features = ["smoltcp", "exec"]`. Taoxichuan has no `box` and keeps the feature off,
 so its audit surface is unchanged.
 
 ## Verified

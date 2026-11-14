@@ -119,3 +119,12 @@ fn private_copy_is_needed_only_for_a_present_shared_frame() {
     assert!(!needs_private_copy(true, 1));
     assert!(needs_private_copy(true, 2));
 }
+
+#[test]
+fn identity_shared_pages_are_never_cow_marked() {
+    assert!(marks_cow(false, true, 2), "a forked private page is marked");
+    assert!(!marks_cow(false, true, 0), "an unshared private page is not");
+    assert!(!marks_cow(false, false, 2), "a read-only page needs no mark");
+    assert!(!marks_cow(true, true, 2), "MAP_SHARED: shared by identity, never marked");
+}
+

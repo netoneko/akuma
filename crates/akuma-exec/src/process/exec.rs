@@ -3,11 +3,10 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use alloc::sync::Arc;
 
 use crate::runtime::config;
 use crate::process::types::{Pid, YieldOnce};
-use crate::process::channel::{ProcessChannel, get_channel};
+use crate::process::channel::get_channel;
 use crate::process::children::{lookup_process_shared, read_current_pid};
 #[cfg(feature = "elf-loader")]
 use crate::process::spawn::spawn_process_with_channel_cwd;
@@ -52,8 +51,8 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
         // nothing READY (the child is RUNNING on a peer core that claimed it BKL-free via
         // the M5c step-2 path), returns without switching — so this thread would spin here
         // holding the BKL forever while the peer running the child freezes the instant the
-        // child needs EL1 (a cross-core circular deadlock; see `smp_shared.rs`
-        // SCHED_BKLFREE_EL0 and docs/runbooks/debug-smp.md §"M5c step-2"). `blocking_relax`
+        // child needs EL1 (a cross-core circular deadlock under the SGI scheduler's BKL-free
+        // path, docs/archive/M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md). `blocking_relax`
         // drops the BKL around a WFI so the peer can drive the child to exit.
         crate::threading::blocking_relax();
     }
@@ -68,20 +67,6 @@ pub fn exec_with_io_cwd(path: &str, args: Option<&[&str]>, env: Option<&[String]
     crate::threading::cleanup_terminated();
     
     Ok((channel.exit_code(), stdout_data))
-}
-
-#[cfg(feature = "elf-loader")]
-/// Execute an ELF binary from the filesystem (legacy API for backwards compatibility)
-///
-/// # Arguments
-/// * `path` - Path to the ELF binary
-///
-/// # Returns
-/// Exit code of the process, or error message
-#[allow(dead_code)]
-pub fn exec(path: &str) -> Result<i32, String> {
-    let (exit_code, _stdout) = exec_with_io(path, None, None)?;
-    Ok(exit_code)
 }
 
 #[cfg(feature = "elf-loader")]
@@ -142,13 +127,6 @@ pub async fn exec_async_cwd(path: &str, args: Option<&[&str]>, env: Option<&[Str
     crate::threading::cleanup_terminated();
 
     Ok((exit_code, output))
-}
-
-/// Get the process channel for a running process by thread ID
-///
-/// Used by the SSH shell to get a handle for interrupting a process.
-pub fn get_process_channel(thread_id: usize) -> Option<Arc<ProcessChannel>> {
-    get_channel(thread_id)
 }
 
 #[cfg(feature = "elf-loader")]

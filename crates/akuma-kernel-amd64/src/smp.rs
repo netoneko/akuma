@@ -1,0 +1,998 @@
+//! SMP: per-CPU state, the Big Kernel Lock, and application-processor bring-up.
+//!
+//! Stage U. Until this existed the amd64 target was one vCPU and every module
+//! said so in its `SAFETY` comments — "single core" — as the whole justification
+//! for a `static mut` table reached through raw pointers. This is what replaces
+//! that justification. It is the amd64 counterpart of the aarch64 kernel's
+//! shared-kernel SMP: **one shared kernel across all cores, serialised by one
+//! lock** (`docs/reference/subsystems/smp-shared.md`), chosen over fine-grained
+//! locking for the same reason it was chosen there — it turns "every `static
+//! mut` in the tree is a data race" into "kernel code runs on one core at a
+//! time", and lets user code run in parallel from day one.
+//!
+//! # The three things this module owns
+//!
+//! **Per-CPU state, reached through `%gs`.** A [`PerCpu`] block per core holds
+//! the running task, its `UserCtx` pointer, the BKL depth and the reschedule
+//! flag — everything that was a bare `static` while there was one core. Kernel
+//! code finds its own block through `IA32_GS_BASE`; user code never sees it
+//! because the `syscall`/`sysret` path brackets itself in `swapgs`, and the
+//! interrupt stubs `swapgs` when — and only when — the interrupted `CS` was ring
+//! 3. The invariant that makes `gs:[..]` safe to read anywhere in kernel Rust is
+//! therefore: **in ring 0, `GS_BASE` is this core's [`PerCpu`]; in ring 3 it is
+//! whatever the program set (`arch_prctl(ARCH_SET_GS)`, kept in
+//! `IA32_KERNEL_GS_BASE` while the kernel runs)**. Both halves are per-core
+//! registers, so a task that migrates cores finds the right block on arrival
+//! without anyone doing anything.
+//!
+//! **The Big Kernel Lock** is `akuma_bkl`'s `KernelLock` (see the BKL section
+//! below for why the private ticket lock this file used to carry is gone).
+//! Held by every core while it executes kernel code; released on the way
+//! back to ring 3 and in the idle loop's `hlt` window. A context switch
+//! does not change hands: the core keeps the lock, and the next task on that
+//! core is the one that eventually lets go. That is what makes every
+//! "single core" `SAFETY` comment in
+//! `sched.rs`, `usermode.rs`, `fd.rs` and friends true again under a different
+//! reading: single *kernel* core.
+//!
+//! A kernel path that waits for another core's progress must not spin holding
+//! it — that is a livelock, not a slow path — so every `sched::yield_now` opens
+//! a [`bkl_drop_window`] before it does anything else. Every blocking syscall in
+//! this kernel waits by yielding, which is what makes that the single point
+//! that needed it; `sched::try_switch` records the livelock that taught it.
+//!
+//! **Application-processor bring-up.** The MADT names every enabled LAPIC; the
+//! BSP sends each one INIT then STARTUP through its own LAPIC's ICR, and the AP
+//! starts in 16-bit real mode at the 4 KiB page the STARTUP vector names. The
+//! trampoline there (`boot.s`, copied to physical `0x8000` at run time because a
+//! STARTUP vector cannot name anything above 1 MiB) walks it up to long mode on
+//! a page-table root the BSP built for exactly this — the kernel's own PML4 plus
+//! an identity map of the first gigabyte, so the low code can turn paging on
+//! and the high code is already there — and jumps to [`ap_entry64`], which
+//! throws the identity map away and finishes as a Rust function.
+//!
+//! # What is deliberately missing
+//!
+//! - ~~No wake IPI~~ (2026-10-09): a wake that readies a thread kicks one
+//!   halted core with vector [`WAKE_VECTOR`] ([`kick_halted_core`]); before it
+//!   a core in `hlt` learned of new work at its next timer tick (`wakelat`'s
+//!   `futex+busy`: p90 1.9 ms on the ryzen). (TLB shootdown is *not* on this list any more: `shootdown.rs` broadcasts
+//!   vector 33 through the LAPIC and `akuma_mmu::flush_tlb_*`'s `AllCores` arms
+//!   wait for the acknowledgements — same plumbing, wired 2026-09-09.)
+//! - **No kernel-mode preemption.** The tick preempts ring 3 and the idle loop;
+//!   a kernel task yields when it chooses (see `sched::preempt_if_needed` for
+//!   why the old behaviour was a latent deadlock, not a feature).
+
+use akuma_cpu::msr::{self, Msr};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+use akuma_ryzen_amd64::acpi::Madt;
+#[cfg(not(feature = "no-tests"))]
+use akuma_selftest::Suite;
+
+use crate::usermode::UserCtx;
+use crate::{gdt, idt, lapic, paging, sched, serial, uaccess, usermode};
+
+/// Most cores this kernel will run. The MADT parser reports up to 32; the
+/// per-CPU table is sized for what a devbox is given rather than that ceiling.
+pub const MAX_CPUS: usize = 16;
+
+/// The `smp=N` command-line cap: run at most N CPUs (the BSP plus N-1 APs).
+/// `usize::MAX` — every core the MADT lists, capped by [`MAX_CPUS`] — unless
+/// [`set_cpu_cap_from_cmdline`] saw `smp=N`.
+static CPU_CAP: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Parse the `smp=N` cap out of the command line. Call before
+/// [`start_secondaries`]; `nosmp` needs no handling here (its callers never
+/// call), and a bad or zero `N` is ignored.
+pub fn set_cpu_cap_from_cmdline(cmdline: &str) {
+    for t in cmdline.split_ascii_whitespace() {
+        if let Some(n) = t.strip_prefix("smp=")
+            && let Ok(n) = n.parse::<usize>()
+            && n >= 1
+        {
+            CPU_CAP.store(n, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The effective `smp=N` cap (see [`set_cpu_cap_from_cmdline`]): how many CPUs
+/// may run, or `usize::MAX` for "every core the MADT lists".
+#[must_use]
+pub fn cpu_cap() -> usize {
+    CPU_CAP.load(Ordering::Relaxed)
+}
+
+/// "No core" — the BKL's owner when free, and a task's pin when unpinned.
+pub const NO_CPU: u32 = u32::MAX;
+
+/// One core's private state.
+///
+/// `repr(C)` with `head` first: `gs` points at the block, and everything read
+/// through `gs` lives in `akuma_usermode_amd64::PerCpuHead`, whose offsets that
+/// crate pins; [`OFFSETS_PINNED`] pins `head` at 0. Everything is an atomic so the table can be a
+/// plain `static`: a block is written by its own core, and by the BSP once
+/// before that core is started — never by two cores at once — so `Relaxed`
+/// is the right ordering everywhere except the `online` handshake.
+#[repr(C, align(64))]
+pub struct PerCpu {
+    /// `gs:[0..40]`: the self pointer, the running task's `UserCtx`, the
+    /// syscall stub's scratch word, this core's index and LAPIC id, and the
+    /// running task slot. `akuma-usermode-amd64` owns the layout because its
+    /// assembly and `akuma_cpu::percpu` read it through `gs`; first, so the
+    /// base `install_percpu` writes is this block's.
+    head: akuma_usermode_amd64::PerCpuHead,
+    /// The task slot that idles this core when nothing else is runnable. 0 (the
+    /// boot task) on the BSP; a dedicated slot on every AP.
+    idle_task: AtomicUsize,
+    /// Set by this core's timer tick, consumed by its next `yield_now`.
+    need_resched: AtomicBool,
+    /// Set by the AP once it can take interrupts; the BSP waits on it.
+    online: AtomicBool,
+    /// Timer ticks this core has taken.
+    ticks: AtomicU64,
+    /// Top of the stack the core was started on (its idle task's), so
+    /// `ap_entry64` can hand it to the TSS without deriving it from `rsp`.
+    stack_top: AtomicU64,
+}
+
+impl PerCpu {
+    const fn new() -> Self {
+        Self {
+            head: akuma_usermode_amd64::PerCpuHead::new(),
+            idle_task: AtomicUsize::new(0),
+            need_resched: AtomicBool::new(false),
+            online: AtomicBool::new(false),
+            ticks: AtomicU64::new(0),
+            stack_top: AtomicU64::new(0),
+        }
+    }
+}
+
+/// [`PerCpu`]'s head at offset 0, so the `gs` base is both. The head's own
+/// offsets (the syscall stub's `gs:[8]`/`gs:[16]`, `akuma_cpu::percpu`'s
+/// `gs:[24]`/`gs:[32]`) are pinned in `akuma-usermode-amd64`.
+const OFFSETS_PINNED: () = {
+    assert!(core::mem::offset_of!(PerCpu, head) == 0);
+};
+
+static PERCPU: [PerCpu; MAX_CPUS] = [const { PerCpu::new() }; MAX_CPUS];
+
+/// How many cores are running the kernel — the BSP plus every AP that came
+/// online. 1 until [`start_secondaries`] runs.
+static ONLINE: AtomicUsize = AtomicUsize::new(1);
+
+/// Point this core's `%gs` at `PERCPU[idx]`.
+///
+/// `IA32_KERNEL_GS_BASE` is set to 0 as well: it holds the *user's* GS base
+/// while the kernel runs, and a fresh core has no user yet. The scheduler keeps
+/// it current per task from then on (`UserCtx::gs_base`).
+fn install_percpu(idx: usize) {
+    akuma_usermode_amd64::install_percpu(&PERCPU[idx].head, idx as u32);
+}
+
+/// Has this core's `%gs` been pointed at a [`PerCpu`] yet?
+///
+/// Reads `IA32_GS_BASE` rather than `gs:[0]`: before `install_percpu` the base
+/// is 0, and a `gs:`-relative load through it would be the very fault this
+/// exists to avoid. For the one caller (`halt`) that can run at any point in
+/// the boot, including before the block exists.
+#[must_use]
+pub fn percpu_installed() -> bool {
+    msr::read(Msr::GsBase) != 0
+}
+
+/// This core's block, through `gs:[0]`.
+///
+/// Valid only in ring 0 with the invariant from the module header in force —
+/// which is every line of kernel Rust after [`init_bsp`] / [`ap_entry64`].
+#[inline]
+fn this_cpu() -> &'static PerCpu {
+    // `index` is at `gs:[24]` (`OFFSETS_PINNED`), written by `install_percpu` on
+    // this core before any code that can reach here runs; `akuma_cpu::percpu`
+    // reads it, and the block is `PERCPU[index]` — a bounds-checked index into a
+    // `static`, where this used to dereference the `self_ptr` word at `gs:[0]`.
+    &PERCPU[akuma_cpu::percpu::core_id() as usize]
+}
+
+/// This core's index: 0 for the BSP.
+#[inline]
+#[must_use]
+pub fn cpu_index() -> usize {
+    this_cpu().head.index.load(Ordering::Relaxed) as usize
+}
+
+/// [`cpu_index`] as the `u32` the networking runtime's `current_core_id` hook
+/// wants.
+#[must_use]
+pub fn cpu_index_u32() -> u32 {
+    this_cpu().head.index.load(Ordering::Relaxed)
+}
+
+/// Cores running the kernel right now.
+#[must_use]
+pub fn online_cpus() -> usize {
+    ONLINE.load(Ordering::Acquire)
+}
+
+/// Timer ticks taken by core `idx`.
+#[must_use]
+pub fn ticks_on(idx: usize) -> u64 {
+    PERCPU.get(idx).map_or(0, |c| c.ticks.load(Ordering::Relaxed))
+}
+
+/// Core `idx`'s LAPIC id — the destination a shootdown IPI to that core is
+/// addressed with. 0 for an index that never came up; a caller only asks for
+/// indices below `online_cpus()`, which the bring-up filled in.
+#[must_use]
+pub fn lapic_id_of(idx: usize) -> u32 {
+    PERCPU.get(idx).map_or(0, |c| c.head.lapic_id.load(Ordering::Relaxed))
+}
+
+/// Count one timer tick on this core. Called from the timer vector.
+pub fn this_cpu_tick() {
+    this_cpu().ticks.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The running task's `UserCtx`, or null before the scheduler is initialised.
+#[must_use]
+pub fn current_uctx() -> *mut UserCtx {
+    this_cpu().head.current_uctx.load(Ordering::Relaxed) as *mut UserCtx
+}
+
+/// Repoint this core's `UserCtx` — the scheduler, on every switch.
+pub fn set_current_uctx(p: *mut UserCtx) {
+    this_cpu().head.current_uctx.store(p as u64, Ordering::Relaxed);
+}
+
+/// The task slot running on this core.
+#[must_use]
+pub fn current_task() -> usize {
+    this_cpu().head.current_task.load(Ordering::Relaxed)
+}
+
+pub fn set_current_task(slot: usize) {
+    this_cpu().head.current_task.store(slot, Ordering::Relaxed);
+}
+
+/// The slot that idles this core.
+#[must_use]
+pub fn idle_task() -> usize {
+    this_cpu().idle_task.load(Ordering::Relaxed)
+}
+
+pub fn set_need_resched() {
+    this_cpu().need_resched.store(true, Ordering::Relaxed);
+}
+
+/// Read and clear this core's reschedule request.
+pub fn take_need_resched() -> bool {
+    this_cpu().need_resched.swap(false, Ordering::Relaxed)
+}
+
+#[must_use]
+pub fn need_resched() -> bool {
+    this_cpu().need_resched.load(Ordering::Relaxed)
+}
+
+// ---------------------------------------------------------------------------
+// The Big Kernel Lock
+// ---------------------------------------------------------------------------
+//
+// **`akuma_bkl`'s lock, not a private one, since 5b (2026-09-08).** This file
+// carried a hand-rolled ticket BKL from bring-up. Flipping `kernel_bkl_smp`
+// for the process-table step would have activated `akuma_bkl`'s `KernelLock`
+// *alongside* it — two locks answering one question, with `idle_halt`,
+// `blocking_relax` and `akuma_elf::interp`'s loader taking the crate's while
+// every ring-3 boundary took this one — so the private lock is gone and the
+// crate's is *the* BKL. Same discipline, one implementation:
+//
+// - The ownership model differs in bookkeeping, not behaviour. The old lock
+//   tracked a per-core recursion depth and transferred it between tasks on a
+//   switch; `KernelLock` is reentrant by owner core, so a nested `enter_kernel`
+//   is a no-op and there is no depth to transfer (`sched.rs`'s
+//   `Platform::transfer_lock_depth` is a no-op now, and `Machine::bkl_depth` is
+//   gone). Every `bkl_enter` on this target arrives *from ring 3* and every
+//   `bkl_leave` goes *to* it — verified site by site — so "depth > 1" never
+//   existed; what the depth simulated ("a task born in kernel code holds
+//   without entering") falls out of the owner model directly.
+// - AArch64's SGI scheduler had an eret-time `reconcile_for_spsr` (deleted with
+//   it, 2026-11-11); this target never needed one: its boundaries are explicit calls
+//   (`usermode.rs`'s `bkl_enter`/`bkl_leave`), so there is nothing to infer.
+// - The old `[BKL] stuck: cpu N waiting on owner M` diagnostic is the crate's
+//   `log_kernel_lock_stuck` now (plus a lost-ticket self-heal the private lock
+//   never had). The message text differs — `[BKL] stuck: owner=N waiter=M tag=…`
+//   — so greps keyed on the old wording move to `stuck: owner=`; the
+//   `docs/runbooks/recover-wedged-vm.md` `[BKL] stuck` prefix is unchanged.
+//
+// A build whose `akuma-bkl` lacks `bkl-smp` refuses to compile: the crate's
+// entry points are no-ops there, which would run four cores with no lock at all.
+const _: () = assert!(
+    akuma_bkl::ACTIVE,
+    "amd64 needs `akuma-bkl` built with `bkl-smp`: its Big Kernel Lock is akuma_bkl's, \
+     whose entry points are no-ops without it"
+);
+
+/// Spins a core waits with the lock dropped in [`bkl_drop_window`] before it
+/// takes the lock back. Small on purpose: the lock is FIFO, so a peer that was
+/// already spinning for it is served the moment it is released and this core
+/// queues behind it whatever the gap — the gap only matters for a peer that
+/// arrives during it. A yield pays this on every call (`sched::try_switch`), so
+/// hundreds of `pause`s here would be a visible tax on every wait loop.
+const DROP_WINDOW_SPINS: u32 = 4;
+
+/// Enter the kernel: take the BKL. Reentrant by owner core — a timer tick that
+/// lands while this core already holds the lock (kernel task code with `IF`
+/// set) nests rather than deadlocks.
+pub fn bkl_enter() {
+    akuma_bkl::bkl::enter_kernel();
+}
+
+/// Leave the kernel: release the BKL. Idempotent if this core does not hold it.
+pub fn bkl_leave() {
+    akuma_bkl::bkl::leave_kernel();
+}
+
+/// Does this core hold the BKL? For assertions and diagnostics.
+#[allow(dead_code)] // diagnostic surface for the debugger, like `percpu_installed`
+#[must_use]
+pub fn bkl_held() -> bool {
+    akuma_bkl::bkl::held_by_current()
+}
+
+/// Give the lock up for good, if this core holds it — for a core that is about
+/// to stop executing kernel code forever (`halt`, the bare-metal colour cycle).
+///
+/// Without this a BSP that finishes its boot holding the lock — a failed
+/// self-test verdict ends in `halt()`, which is `cli; hlt` with the lock held —
+/// leaves every AP spinning in its tick handler for a lock that will never be
+/// released, printing `[BKL] stuck …` once each (measured 2026-09-05 in the
+/// OVMF rig). Nothing was wrong; the diagnostic was right. A core that stops
+/// should let go. `leave_kernel` is exactly this: an owner-checked release that
+/// is a no-op from a core that never held it.
+pub fn bkl_abandon() {
+    akuma_bkl::bkl::leave_kernel();
+}
+
+/// Let the other cores in: drop the lock completely, spin briefly, take it
+/// back.
+///
+/// Called by every `sched::yield_now` — the point every kernel wait loop in
+/// this kernel passes through (a pipe read, a socket, a child exit, the boot
+/// task's drive loops). Holding the lock through such a loop is not slowness,
+/// it is a livelock: the peer's syscall spins for the lock this core is
+/// spinning inside. A no-op when the lock is not held.
+pub fn bkl_drop_window() {
+    if !akuma_bkl::bkl::held_by_current() {
+        return;
+    }
+    akuma_bkl::bkl::leave_kernel();
+    for _ in 0..DROP_WINDOW_SPINS {
+        core::hint::spin_loop();
+    }
+    akuma_bkl::bkl::enter_kernel();
+}
+
+/// Run `f` with the lock released, then take it back.
+///
+/// What ring 3 gets for free, offered to kernel code that wants to behave like
+/// it: the SMP self-test's workers spin inside this so two of them can really
+/// be executing at once.
+pub fn bkl_run_unlocked<R>(f: impl FnOnce() -> R) -> R {
+    let held = akuma_bkl::bkl::held_by_current();
+    if held {
+        akuma_bkl::bkl::leave_kernel();
+    }
+    let r = f();
+    if held {
+        akuma_bkl::bkl::enter_kernel();
+    }
+    r
+}
+
+// ---------------------------------------------------------------------------
+// Bring-up
+// ---------------------------------------------------------------------------
+
+/// Make the BSP core 0: install its per-CPU block and take the BKL.
+///
+/// Called right after `gdt::init`, before anything reads `gs:` — and before
+/// any AP exists, so the acquire cannot contend. From here on the boot task
+/// holds the lock at depth 1, which is what every kernel task is born holding.
+pub fn init_bsp() {
+    let () = OFFSETS_PINNED;
+    install_percpu(0);
+    PERCPU[0].online.store(true, Ordering::Release);
+    bkl_enter();
+}
+
+/// Record the BSP's LAPIC id once the LAPIC is mapped.
+pub fn set_bsp_lapic_id(id: u32) {
+    PERCPU[0].head.lapic_id.store(id, Ordering::Relaxed);
+}
+
+use akuma_boot_amd64::ap::{self, AP_MB_CR3, AP_MB_ENTRY, AP_MB_INDEX, AP_MB_STACK, AP_STARTUP_VECTOR, mailbox_write};
+
+/// Kernel stack for an AP's idle task, and therefore for every interrupt it
+/// takes while idle. Same size as a scheduler task's.
+const AP_STACK_SIZE: usize = 32 * 1024;
+
+/// LAPIC timer counts to wait after INIT and after a STARTUP that did not
+/// take. The architectural minimums are 10 ms and 200 µs; this is ~16 ms on
+/// QEMU's 1 GHz APIC clock at divide-by-16, and only shorter on a part whose
+/// clock is faster. Bring-up is serial and this is paid once per core.
+const AP_INIT_DELAY: u32 = 1_000_000;
+
+/// Spins to wait for an AP to report in before the STARTUP is repeated.
+const AP_ONLINE_BUDGET: u64 = 200_000_000;
+
+/// Start every AP the MADT lists. Returns how many came online.
+///
+/// Serial, one core at a time through one mailbox: simpler than an atomic
+/// stack-claiming protocol, and bring-up is not a hot path. The BSP's timer
+/// must be stopped on entry (the INIT delay borrows it) and every AP's timer is
+/// running on exit.
+pub fn start_secondaries(madt: Option<&Madt>, page: ap::TrampolinePage) -> usize {
+    let cap = CPU_CAP.load(Ordering::Relaxed);
+    let Some(madt) = madt else {
+        serial::puts("  smp:  no MADT — single core\n");
+        return 0;
+    };
+    let bsp_id = lapic::apic_id();
+    set_bsp_lapic_id(bsp_id);
+    let aps = madt.cpus().iter().filter(|&&id| u32::from(id) != bsp_id).count();
+    if aps == 0 {
+        serial::puts("  smp:  MADT lists one CPU — single core\n");
+        return 0;
+    }
+    if aps > MAX_CPUS - 1 {
+        serial::puts("  smp:  [WARN] more CPUs than MAX_CPUS; starting the first ");
+        serial::put_dec((MAX_CPUS - 1) as u64);
+        serial::puts("\n");
+    }
+
+    let ap_root = ap::ap_boot_root(sched::kernel_root());
+    // The constraint `ap_boot_root` exists to satisfy, checked rather than
+    // trusted: this is a link-time property of `.bss.pagetables`, and a boot
+    // that violated it would take the machine down with nothing on the wire.
+    if ap_root >= (4 << 30) {
+        serial::puts("  smp:  [FAIL] AP boot root is above 4 GiB; CR3 is 32-bit here\n");
+        return 0;
+    }
+    if !page.install() {
+        serial::puts("  smp:  [FAIL] trampoline does not fit its page\n");
+        return 0;
+    }
+
+    *TRAMP.lock() = Some(page);
+    let mut started = 0usize;
+    let mut idx = 0usize;
+    for &id in madt.cpus() {
+        let id = u32::from(id);
+        if id == bsp_id {
+            continue;
+        }
+        idx += 1;
+        if idx >= MAX_CPUS {
+            break;
+        }
+        // `smp=N` on the command line: N total CPUs, so at most N-1 APs. The
+        // bisect knob for the 16-core BKL wedge of 2026-10-07 (entry 13 froze
+        // with all cores while entry 12 ran clean on one) — and a way to run
+        // rio on a few cores where all sixteen will not come up.
+        if cap != usize::MAX && 1 + started >= cap {
+            // Not started now, and not touched: remembered so a VM can start it later
+            // ([`ensure_started`]). The core stays in the firmware's wait-for-startup state.
+            DEFERRED_ID[idx].store(id + 1, Ordering::Relaxed);
+            continue;
+        }
+        let cpu = &PERCPU[idx];
+        cpu.head.lapic_id.store(id, Ordering::Relaxed);
+        cpu.head.index.store(idx as u32, Ordering::Relaxed);
+
+        // The AP's stack; leaked, like every task stack — it is the idle task's
+        // for the life of the kernel. The top is offset by one word so the
+        // trampoline's `jmp` lands with `rsp ≡ 8 (mod 16)`, the state System V
+        // defines for a function entered by `call`.
+        let stack = alloc::vec![0u8; AP_STACK_SIZE].leak();
+        let stack_top = (stack.as_ptr() as usize + AP_STACK_SIZE) & !0xf;
+        cpu.stack_top.store(stack_top as u64, Ordering::Relaxed);
+
+        let Some(idle_slot) = sched::register_idle_task(idx) else {
+            serial::puts("  smp:  [FAIL] no task slot for an idle task\n");
+            break;
+        };
+        cpu.idle_task.store(idle_slot, Ordering::Relaxed);
+        cpu.head.current_task.store(idle_slot, Ordering::Relaxed);
+        cpu.head.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
+
+        mailbox_write(AP_MB_CR3, ap_root);
+        mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);
+        #[allow(function_casts_as_integer)]
+        mailbox_write(AP_MB_ENTRY, ap_entry64 as usize as u64);
+        mailbox_write(AP_MB_INDEX, idx as u64);
+        core::sync::atomic::fence(Ordering::SeqCst);
+
+        lapic::send_init(id);
+        lapic::delay_counts(AP_INIT_DELAY);
+        lapic::send_startup(id, AP_STARTUP_VECTOR);
+        if !wait_online(idx) {
+            // The second STARTUP the architecture asks for; most VMMs never
+            // need it and real parts sometimes do.
+            lapic::send_startup(id, AP_STARTUP_VECTOR);
+            lapic::delay_counts(AP_INIT_DELAY);
+            if !wait_online(idx) {
+                serial::puts("  smp:  [FAIL] cpu ");
+                serial::put_dec(idx as u64);
+                serial::puts(" (lapic id ");
+                serial::put_dec(u64::from(id));
+                serial::puts(") did not come online\n");
+                continue;
+            }
+        }
+        // The AP is spinning in `tsc_sync_ap` now; measure its clock.
+        let off = lapic::tsc_sync_bsp(idx, 0);
+        serial::puts("  smp:  cpu ");
+        serial::put_dec(idx as u64);
+        serial::puts(" tsc offset ");
+        if off < 0 {
+            serial::puts("-");
+        }
+        serial::put_dec(off.unsigned_abs());
+        serial::puts(" cycles\n");
+        started += 1;
+    }
+    ONLINE.store(1 + started, Ordering::Release);
+    serial::puts("  smp:  ");
+    serial::put_dec((1 + started) as u64);
+    serial::puts(" cpus online\n");
+    started
+}
+
+/// Per core index: the LAPIC id + 1 of an AP the MADT lists and `smp=` left unstarted; 0 for none.
+static DEFERRED_ID: [core::sync::atomic::AtomicU32; MAX_CPUS] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_CPUS];
+/// The trampoline page, once [`start_secondaries`] has claimed and used it.
+static TRAMP: spinning_top::Spinlock<Option<ap::TrampolinePage>> = spinning_top::Spinlock::new(None);
+/// One late start at a time: they share the trampoline's mailbox and the TSC-sync words.
+static LATE_START: spinning_top::Spinlock<()> = spinning_top::Spinlock::new(());
+
+/// Is core `idx` one the host did not start at boot (`smp=` cut it off) but can start on demand?
+#[must_use]
+pub fn is_deferred(idx: usize) -> bool {
+    idx < MAX_CPUS && idx >= ONLINE.load(Ordering::Acquire) && DEFERRED_ID[idx].load(Ordering::Relaxed) != 0
+}
+
+/// Busy-wait `us` microseconds on the TSC. For bring-up after boot, where the LAPIC timer
+/// (which `lapic::delay_counts` borrows) is this core's running tick and must not be touched.
+fn tsc_delay_us(us: u64) {
+    let hz = crate::lapic::tsc_hz().max(1);
+    let end = akuma_cpu::tsc::rdtsc().wrapping_add(us * hz / 1_000_000);
+    while akuma_cpu::tsc::rdtsc().wrapping_sub(end).cast_signed() < 0 {
+        core::hint::spin_loop();
+    }
+}
+
+/// Make sure core `idx` is running as a host core; true if it is up.
+///
+/// Starts it (and every deferred core below it, so the online set stays contiguous: cores are
+/// counted, not listed) if `smp=` left it out. **Called by the hypervisor when a VM is placed on a core the host never
+/// started**; until then such a core has not been woken, written to, or counted by Akuma.
+pub fn ensure_started(idx: usize) -> bool {
+    if idx < ONLINE.load(Ordering::Acquire) {
+        return true;
+    }
+    if idx >= MAX_CPUS || TRAMP.lock().is_none() {
+        return false;
+    }
+    let _guard = LATE_START.lock();
+    while ONLINE.load(Ordering::Acquire) <= idx {
+        let next = ONLINE.load(Ordering::Acquire);
+        let id = DEFERRED_ID[next].load(Ordering::Relaxed);
+        if id == 0 || !start_late(next, id - 1) {
+            return false;
+        }
+        ONLINE.store(next + 1, Ordering::Release);
+    }
+    true
+}
+
+/// [`start_secondaries`]' loop body for one core, run after boot from whichever core the caller
+/// is on, with delays on the TSC.
+fn start_late(idx: usize, id: u32) -> bool {
+    let ap_root = ap::ap_boot_root(sched::kernel_root());
+    let Some(page) = *TRAMP.lock() else { return false };
+    if ap_root >= (4 << 30) || !page.install() {
+        return false;
+    }
+    let cpu = &PERCPU[idx];
+    cpu.head.lapic_id.store(id, Ordering::Relaxed);
+    cpu.head.index.store(idx as u32, Ordering::Relaxed);
+    let stack = alloc::vec![0u8; AP_STACK_SIZE].leak();
+    let stack_top = (stack.as_ptr() as usize + AP_STACK_SIZE) & !0xf;
+    cpu.stack_top.store(stack_top as u64, Ordering::Relaxed);
+    let Some(idle_slot) = sched::register_idle_task(idx) else {
+        return false;
+    };
+    cpu.idle_task.store(idle_slot, Ordering::Relaxed);
+    cpu.head.current_task.store(idle_slot, Ordering::Relaxed);
+    cpu.head.current_uctx.store(sched::uctx_ptr(idle_slot) as u64, Ordering::Relaxed);
+    mailbox_write(AP_MB_CR3, ap_root);
+    mailbox_write(AP_MB_STACK, (stack_top - 8) as u64);
+    #[allow(function_casts_as_integer)]
+    mailbox_write(AP_MB_ENTRY, ap_entry64 as usize as u64);
+    mailbox_write(AP_MB_INDEX, idx as u64);
+    core::sync::atomic::fence(Ordering::SeqCst);
+    // `IF` off across each ICR pair: an interrupt between the writes that sent its own IPI
+    // would retarget this one.
+    let flags = akuma_cpu::daif::save_and_mask_irq();
+    lapic::send_init(id);
+    akuma_cpu::daif::restore(flags);
+    tsc_delay_us(10_000);
+    let flags = akuma_cpu::daif::save_and_mask_irq();
+    lapic::send_startup(id, AP_STARTUP_VECTOR);
+    akuma_cpu::daif::restore(flags);
+    if !wait_online(idx) {
+        let flags = akuma_cpu::daif::save_and_mask_irq();
+        lapic::send_startup(id, AP_STARTUP_VECTOR);
+        akuma_cpu::daif::restore(flags);
+        tsc_delay_us(10_000);
+        if !wait_online(idx) {
+            serial::puts("  smp:  [FAIL] late start: cpu ");
+            serial::put_dec(idx as u64);
+            serial::puts(" did not come online\n");
+            return false;
+        }
+    }
+    // The AP's clock against ours, then against the BSP's (ours has its own offset).
+    let base = crate::lapic::tsc_offset_of(cpu_index());
+    let _ = lapic::tsc_sync_bsp(idx, base);
+    serial::puts("  smp:  cpu ");
+    serial::put_dec(idx as u64);
+    serial::puts(" started on demand for a VM\n");
+    true
+}
+
+fn wait_online(idx: usize) -> bool {
+    let mut spins = 0u64;
+    while !PERCPU[idx].online.load(Ordering::Acquire) {
+        if spins >= AP_ONLINE_BUDGET {
+            return false;
+        }
+        spins += 1;
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// The wake IPI: its handler only acknowledges it. Arriving is the whole
+/// effect — it ends the target core's `hlt`, and the idle loop it returns to
+/// re-runs the picker.
+pub const WAKE_VECTOR: u8 = 34;
+
+/// Per core: in the idle loop's halt window ([`set_halted`]).
+static HALTED: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Wake IPIs sent.
+pub static WAKE_IPIS: AtomicU64 = AtomicU64::new(0);
+
+/// Mark this core as about to halt (`true`) or awake (`false`).
+///
+/// The idle loop sets it **before** its last look for runnable work and clears
+/// it after the `hlt`, and a waker publishes `READY` before it reads the flag
+/// (both `SeqCst`): either the idle core sees the thread or the waker sees the
+/// flag, so a wake cannot fall between the look and the halt. A kick that
+/// arrives before the `hlt` is latched with `IF` clear and ends it at once.
+pub fn set_halted(halted: bool) {
+    HALTED[cpu_index()].store(halted, Ordering::SeqCst);
+}
+
+/// A thread just became runnable: wake one halted core, other than this one,
+/// to run it. The CAS claims the core, so concurrent wakers do not all
+/// interrupt the same one; it re-arms itself on its next halt. Pinned threads
+/// (only the boot and idle threads are) are not steered; a core that wakes
+/// and finds nothing it may run halts again.
+pub fn kick_halted_core() {
+    let online = ONLINE.load(Ordering::Acquire);
+    if online <= 1 {
+        return;
+    }
+    let me = cpu_index();
+    for i in 0..online.min(MAX_CPUS) {
+        if i == me {
+            continue;
+        }
+        if HALTED[i].compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
+            // `IF` off across the two ICR writes: an interrupt between them
+            // that sends its own IPI would retarget this one.
+            let flags = akuma_cpu::daif::save_and_mask_irq();
+            lapic::send_fixed(PERCPU[i].head.lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
+            // IF back exactly as it was (`restore` is the inverse of the save).
+            akuma_cpu::daif::restore(flags);
+            WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// Interrupt core `cpu` (not this one) with the wake IPI, whatever it is doing.
+///
+/// It ends a `hlt`, and a core running a guest takes a `#VMEXIT` for it. For a hypervisor task that must
+/// look at something *now* — a virtual interrupt for its guest, a stop request — rather than
+/// at its next sleep or host tick. Unlike [`kick_halted_core`] it names the core and does not
+/// care whether the idle loop had announced a halt.
+pub fn kick_core(cpu: usize) {
+    if cpu == cpu_index() || cpu >= ONLINE.load(Ordering::Acquire).min(MAX_CPUS) {
+        return;
+    }
+    // `IF` off across the two ICR writes (see `kick_halted_core`).
+    let flags = akuma_cpu::daif::save_and_mask_irq();
+    lapic::send_fixed(PERCPU[cpu].head.lapic_id.load(Ordering::Relaxed), WAKE_VECTOR);
+    akuma_cpu::daif::restore(flags);
+    WAKE_IPIS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Install [`WAKE_VECTOR`] in the shared IDT. Called from `lapic::init`, next
+/// to the shootdown vector, on both boot protocols.
+pub fn install_wake_vector() {
+    akuma_trap_amd64::register(akuma_trap_amd64::Kind::Wake, wake_trap);
+    idt::set_handler(WAKE_VECTOR, akuma_trap_amd64::entry(akuma_trap_amd64::Kind::Wake));
+}
+
+/// The wake IPI's whole job is to end a `hlt`: acknowledge it and return.
+fn wake_trap(_: &mut akuma_trap_amd64::Trap<'_>) {
+    lapic::eoi();
+}
+
+/// Make SSE legal, exactly as `boot.s` does for the BSP — `CR0.EM=0`,
+/// `CR0.MP=1`, `CR4.OSFXSR`, `CR4.OSXMMEXCPT`. Ring 3 needs it; the kernel is
+/// soft-float and does not.
+fn enable_sse() {
+    akuma_cpu::ctlreg::enable_fpu();
+}
+
+/// Non-zero once `CR4.OSXSAVE` is set and `XCR0` enables x87+SSE+AVX on this
+/// machine. Set by the BSP in `early_init`, before the scheduler can switch, and
+/// read by `sched.rs` to choose `xsave64` over `fxsave64` — one flag for every
+/// core, because the parts this boots on are homogeneous.
+pub use akuma_sched_amd64::XSAVE_ON;
+
+/// `XCR0` value this kernel enables: x87 (bit 0), SSE (1), AVX (2). Its
+/// `xsave` area is 832 bytes (512 legacy + 64 header + 256 `ymm` upper
+/// halves), which `sched.rs::XsArea` is sized for. AVX-512 state is left off.
+pub use akuma_sched_amd64::XCR0_ENABLED;
+
+/// Turn on `CR4.OSXSAVE` and set `XCR0` to [`XCR0_ENABLED`], if cpuid says the
+/// part has XSAVE and AVX. Per core (CR4 and XCR0 are), so the BSP and every AP
+/// call it. Returns whether this core now runs with AVX enabled.
+///
+/// **Why this exists.** Without `OSXSAVE` the CPU still advertises AVX2 in
+/// cpuid leaf 7, and code that trusts leaf 7 alone (CPython 3.14's HACL*
+/// `_blake2` reads leaves 1 and 7 and never `xgetbv`) executes a `ymm`
+/// instruction and takes `#UD`/`#GP` — SIGILL / SIGSEGV for a program that did
+/// nothing wrong (`docs/archive/AKUMA_GENTOO_PORTAGE_CRASH.md`). Conforming
+/// code checks `XCR0` and was never affected; this makes the other kind work,
+/// as it does on Linux.
+pub fn enable_xsave() -> bool {
+    use core::arch::x86_64::{__cpuid, __cpuid_count};
+    let (l1, d0) = (__cpuid(1), __cpuid_count(0xD, 0));
+    let have_xsave = l1.ecx & (1 << 26) != 0;
+    let have_avx = l1.ecx & (1 << 28) != 0;
+    if !have_xsave || !have_avx || u64::from(d0.eax) & XCR0_ENABLED != XCR0_ENABLED {
+        return false;
+    }
+    // The CPUID facts above are the writer's preconditions, stated there:
+    // leaf 1 says XSAVE exists, leaf 0xD says every bit of `XCR0_ENABLED` is
+    // supported, and bit 0 (x87) is set. OSXSAVE goes on before `xsetbv`,
+    // which is the order the function enforces. The kernel is soft-float
+    // and never touches ymm, so no kernel code is affected; ring 3's ymm
+    // state is carried across switches by `sched.rs`.
+    akuma_cpu::ctlreg::enable_xsave(XCR0_ENABLED);
+    true
+}
+
+/// Where the trampoline jumps: an AP in long mode, on the boot tables, with
+/// its stack set and `index` in `rdi`. Finishes bringing the core up and never
+/// returns.
+///
+/// The order is the BSP's, minus what is shared: GDT and TSS are per core
+/// (`ltr` needs its own), the IDT is one table loaded on each, the syscall
+/// MSRs and `CR4.SMAP/SMEP` are per core, and the LAPIC is this core's own.
+extern "C" fn ap_entry64(index: u64) -> ! {
+    let idx = index as usize;
+    // First, off the boot tables: the identity map in slot 0 is the lower half
+    // and belongs to userspace. The kernel root maps everything this function
+    // touches — the image, the physmap this stack is in, the device window.
+    // The kernel root shares the upper half with the boot tables, so the
+    // instruction after the write is mapped (and `activate_unpublished` checks it).
+    paging::activate_unpublished(sched::kernel_root());
+    enable_sse();
+    let _ = enable_xsave();
+    // This core's own PAT, so the write-combining framebuffer is WC here too.
+    crate::drivers::pat_init_ap();
+    gdt::init_cpu(idx, PERCPU[idx].stack_top.load(Ordering::Relaxed));
+    idt::load();
+    install_percpu(idx);
+    uaccess::init_smap();
+    usermode::init_syscall();
+    lapic::init_ap();
+
+    // Report in BEFORE taking the BKL: the BSP holds the lock while it waits
+    // for this flag, and only lets go inside `yield_now`. Entering first would
+    // be a two-party deadlock with a straight face.
+    PERCPU[idx].online.store(true, Ordering::Release);
+    // Before anything here reads the clock: the BSP measures this core's TSC
+    // against its own (`lapic::tsc_sync_bsp`).
+    lapic::tsc_sync_ap(idx);
+    serial::puts("  smp:  cpu ");
+    serial::put_dec(index);
+    serial::puts(" online (lapic id ");
+    serial::put_dec(u64::from(lapic::apic_id()));
+    serial::puts(")\n");
+
+    // When the BSP's probe asked for the hypervisor rehearsal, this core
+    // gets its host save area and `EFER.SVME` too (per-core MSR state —
+    // rung 2 wants vCPUs schedulable on any core).
+    crate::drivers::hypervisor_ap_hook();
+
+    // No standing BKL hold: `idle_loop` takes the lock around its protected
+    // work and runs the halt bare (2026-09-20). The old `bkl_enter()` here was
+    // the permanent depth-1 baseline that made every idle thread a lifetime
+    // lock owner — the frozen-`serving` starvation storm's root.
+    sched::idle_loop()
+}
+
+// ---------------------------------------------------------------------------
+// Self-test
+// ---------------------------------------------------------------------------
+
+const WORKERS: usize = 4;
+const WORKER_ROUNDS: u32 = 8;
+/// Spins per round with the BKL dropped. Long enough that two workers on two
+/// cores overlap; short enough (~0.25 s each under TCG for all rounds) that the
+/// suite does not crawl.
+const WORKER_SPINS: u32 = 200_000;
+
+/// Which CPUs each worker saw itself run on, one bit per CPU.
+static WORKER_CPUS: [AtomicU32; WORKERS] = [const { AtomicU32::new(0) }; WORKERS];
+/// Workers inside their unlocked spin right now, and the most ever at once.
+static IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+static WORKERS_DONE: AtomicU32 = AtomicU32::new(0);
+
+fn worker_body(id: usize) -> ! {
+    for _ in 0..WORKER_ROUNDS {
+        WORKER_CPUS[id].fetch_or(1 << cpu_index(), Ordering::Relaxed);
+        bkl_run_unlocked(|| {
+            let now = IN_FLIGHT.fetch_add(1, Ordering::AcqRel) + 1;
+            MAX_IN_FLIGHT.fetch_max(now, Ordering::AcqRel);
+            for _ in 0..WORKER_SPINS {
+                core::hint::spin_loop();
+            }
+            IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        });
+        sched::yield_now();
+    }
+    WORKERS_DONE.fetch_add(1, Ordering::Release);
+    sched::finish();
+}
+
+extern "C" fn worker0() -> ! {
+    worker_body(0);
+}
+extern "C" fn worker1() -> ! {
+    worker_body(1);
+}
+extern "C" fn worker2() -> ! {
+    worker_body(2);
+}
+extern "C" fn worker3() -> ! {
+    worker_body(3);
+}
+
+#[cfg(not(feature = "no-tests"))]
+/// Prove the secondaries are up, ticking, and scheduling.
+///
+/// Three properties, each of which fails independently:
+///
+/// 1. Every CPU the MADT lists came online.
+/// 2. Every AP takes timer interrupts of its own — its tick counter climbs
+///    while the BSP waits.
+/// 3. Kernel tasks run on more than one core, and two of them execute *at the
+///    same time*: four workers spin with the BKL dropped, and the high-water
+///    mark of workers inside that spin must reach 2. A scheduler that merely
+///    migrated tasks between cores one at a time would pass the first half of
+///    this and fail the second.
+///
+/// On a one-CPU machine the parallelism checks are skipped and noted rather
+/// than failed: single core is a configuration, not a bug.
+pub fn smoke_test(t: &mut Suite, expected_aps: usize, started: usize) {
+    t.check_eq("smp: secondaries online", started as u64, expected_aps as u64);
+    t.check_eq("smp: online count agrees", online_cpus() as u64, (1 + started) as u64);
+    if started == 0 {
+        t.note("smp: single core, parallelism checks skipped", 1);
+        return;
+    }
+
+    // 2. Ticks on every AP. Each AP's timer has been running since it came
+    //    online and its idle loop sleeps with interrupts on, so its counter
+    //    climbs on its own; the BSP only watches. With the BKL dropped: an
+    //    idle AP's tick handler takes the lock to look for work, and this loop
+    //    holding it would turn "no ticks" into "one tick, then a core stuck in
+    //    its handler". The BSP's own interrupts are off here (they have been
+    //    since `sched::smoke_test`'s `cli`), which is why its timer is not used
+    //    to pace the wait.
+    const TICK_WAIT_BUDGET: u64 = 400_000_000;
+    let before: [u64; MAX_CPUS] = core::array::from_fn(ticks_on);
+    let all_ticked = |before: &[u64; MAX_CPUS]| {
+        before.iter().enumerate().take(started + 1).skip(1).all(|(idx, &was)| ticks_on(idx) > was)
+    };
+    let mut spins = 0u64;
+    bkl_run_unlocked(|| {
+        while !all_ticked(&before) && spins < TICK_WAIT_BUDGET {
+            spins += 1;
+            core::hint::spin_loop();
+        }
+    });
+    t.note("smp: spins until every secondary had ticked", spins);
+    let mut all_ticking = true;
+    for (idx, &was) in before.iter().enumerate().take(started + 1).skip(1) {
+        if ticks_on(idx) <= was {
+            all_ticking = false;
+            serial::puts("  smp:  cpu ");
+            serial::put_dec(idx as u64);
+            serial::puts(" took no ticks\n");
+        }
+    }
+    t.check("smp: every secondary takes timer interrupts", all_ticking);
+    // The BSP's timer, for the workers below: they yield, and a tick-driven
+    // reschedule request on the BSP is what keeps the boot task from hogging
+    // it between their rounds.
+    lapic::start_timer();
+
+    // 3. Parallel execution.
+    let spawned = [worker0 as extern "C" fn() -> !, worker1, worker2, worker3]
+        .into_iter()
+        .filter(|&f| sched::spawn(f).is_some())
+        .count();
+    if t.check_eq("smp: workers spawned", spawned as u64, WORKERS as u64) {
+        let mut spins = 0u64;
+        while WORKERS_DONE.load(Ordering::Acquire) < WORKERS as u32 && spins < 2_000_000_000 {
+            spins += 1;
+            sched::yield_now();
+        }
+        t.check_eq(
+            "smp: every worker finished",
+            u64::from(WORKERS_DONE.load(Ordering::Acquire)),
+            WORKERS as u64,
+        );
+        let seen = WORKER_CPUS
+            .iter()
+            .fold(0u32, |acc, c| acc | c.load(Ordering::Relaxed));
+        t.note("smp: cpu mask the workers ran on", u64::from(seen));
+        t.check("smp: workers ran on more than one core", seen.count_ones() >= 2);
+        t.note("smp: most workers in flight at once", u64::from(MAX_IN_FLIGHT.load(Ordering::Relaxed)));
+        t.check(
+            "smp: two workers executed simultaneously",
+            MAX_IN_FLIGHT.load(Ordering::Relaxed) >= 2,
+        );
+    }
+    lapic::stop_timer();
+    for idx in 0..=started {
+        t.note("smp: ticks on a cpu", ticks_on(idx));
+    }
+}
+
+/// A peer core's `(current_task, idle_task, halted, ticks)`, for the
+/// `[TLB] stuck` report: whether the silent core is idle, halted, or running a
+/// task (and which) is the first question that report has to answer. Relaxed
+/// reads of another core's block — a snapshot, not a synchronised view.
+#[must_use]
+pub fn peer_snapshot(idx: usize) -> (usize, usize, bool, u64) {
+    let b = &PERCPU[idx];
+    (
+        b.head.current_task.load(Ordering::Relaxed),
+        b.idle_task.load(Ordering::Relaxed),
+        HALTED[idx].load(Ordering::Relaxed),
+        b.ticks.load(Ordering::Relaxed),
+    )
+}

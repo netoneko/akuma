@@ -29,7 +29,7 @@ cd $W/akuma || exit 1
 # `--force`: a submodule dir with only `.git` and a matching SHA is otherwise
 # left unchecked-out (amd64-bare-metal-loop.md, "Four failures to expect").
 git submodule update --init --depth 1 --force \
-    crates/akuma-fbcon/vendor/spleen userspace/meow userspace/nca/native-cli-ai
+    crates/akuma-fbcon/vendor/spleen userspace/meow
 # tinycc: the pinned commit (4597a962) is gone from repo.or.cz — `mob` is a
 # force-pushable branch and was rewritten — so no fetch of the remote can
 # produce it. It comes from a bundle made on a checkout that still has it:
@@ -48,10 +48,10 @@ if [ -f $W/local.tar ]; then
 fi
 rustup target add x86_64-unknown-none
 
-K=target/x86_64-unknown-none/release/akuma-amd64
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release || exit 1
+K=target/x86_64-unknown-none/release/akuma
+cargo build -p akuma --target x86_64-unknown-none --release || exit 1
 cp $K $OUT/akuma-amd64.tests
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests || exit 1
+cargo build -p akuma --target x86_64-unknown-none --release --features no-tests || exit 1
 cp $K $OUT/akuma-amd64
 ls -la $OUT
 

@@ -30,7 +30,7 @@ fi
 
 echo "console-print rule: no format!/alloc::format! feeding a console print call"
 VIOLATIONS="$(grep -rnE '(print_str|safe_print!|tprint!|console::print)[!(].*(format!|alloc::format!)' src/ crates/*/src/ --include='*.rs' \
-    | grep -vE '^src/(tests|process_tests|shell_tests)\.rs:')"
+    | grep -vE '^(src|crates/akuma-kernel-tests-aarch64/src)/(tests|process_tests|shell_tests)\.rs:')"
 if [ -n "$VIOLATIONS" ]; then
     echo "$VIOLATIONS"
     echo "ERROR: format!/alloc::format! result passed into a console print call — heap allocation on a console path."
@@ -40,16 +40,25 @@ fi
 
 for crate in crates/*/; do
     name="$(basename "$crate")"
+    # The amd64 machine half is x86_64-only by design (a `compile_error!` on any
+    # other arch); it is linted below for its own target instead.
+    case "$name" in akuma-kernel-amd64) continue ;; esac
     echo "clippy: $name"
     cargo clippy -p "$name" --target "$HOST_TARGET" -- -D warnings || exit 1
 done
 
+echo "clippy: akuma (amd64, headless)"
+cargo clippy -p akuma --target x86_64-unknown-none --release \
+    --no-default-features --features headless -- -D warnings || exit 1
+
 echo "clippy: akuma (release)"
 cargo clippy --release -- -D warnings || exit 1
 
-echo "clippy: akuma (extreme-size)"
+# A build without the default features (no syscall families, no sound), under
+# the size-optimised profile: the configuration the default set never compiles.
+echo "clippy: akuma (extreme-size profile, --no-default-features)"
 cargo clippy --profile extreme-size --no-default-features \
-    --features no-tests,smoltcp,extreme,userspace-sshd -- -D warnings || exit 1
+    --features no-tests,smoltcp -- -D warnings || exit 1
 
 echo "tests"
 cargo test --target "$HOST_TARGET" || exit 1

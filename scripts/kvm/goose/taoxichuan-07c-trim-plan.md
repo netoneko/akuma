@@ -14,9 +14,9 @@ host-side `cargo test` of a crate are fine. Every shell command starts with
 ## The composition rule (the lens for the whole plan)
 Before writing any syscall arm, subsystem or helper over ~20 lines: (1) look for it in `crates/` (101 crates: `akuma-syscalls-glue`
 and the `akuma-syscalls-*` family, `akuma-fdtable`, `akuma-vfs`, `akuma-ext2`, `akuma-net`, `akuma-exec`, `akuma-ring3-amd64`,
-`akuma-svm-amd64`, ...) and in `amd64/src/` (the full amd64 kernel: `usermode.rs` is the syscall dispatch, `fd.rs` the fd layer,
+`akuma-svm-amd64`, ...) and in `crates/akuma-kernel-amd64/src/` (the full amd64 kernel: `usermode.rs` is the syscall dispatch, `fd.rs` the fd layer,
 `fs.rs` the filesystem arms, `kvm/` the hypervisor); (2) if it is in a crate, depend on it and call it; (3) if it is only in
-`amd64/src/`, extract it into a crate first (`akuma-<thing>`, named for what it owns; `#![forbid(unsafe_code)]` where it can;
+`crates/akuma-kernel-amd64/src/`, extract it into a crate first (`akuma-<thing>`, named for what it owns; `#![forbid(unsafe_code)]` where it can;
 `scripts/check_unsafe_budget.py` gates new `unsafe`) so both kernels consume ONE implementation; (4) only if it exists nowhere, write it,
 in a crate with host tests. Naming and crate rules: `CLAUDE.md` § Layout / Crate naming.
 
@@ -29,12 +29,12 @@ in a crate with host tests. Naming and crate rules: `CLAUDE.md` § Layout / Crat
    the shared glue (the same fold is what `taoxichuan/` needs).
 4. `docs/archive/TAOXICHUAN_STAGE6_PLAN.md` (the previous plan, for the format) and your own `RESULT-A.md`.
 5. The code: `taoxichuan/src/{main,child,sock,net}.rs` (`grep -n "^fn \|^pub fn \|^enum \|^struct \|^impl "` first), `taoxichuan/Cargo.toml`
-   (what is already a dependency), and `amd64/src/{usermode,fd,fs}.rs` for the same functions.
+   (what is already a dependency), and `crates/akuma-kernel-amd64/src/{usermode,fd,fs}.rs` for the same functions.
 
 ## What the plan must contain (write it to `/root/dev-cycle/taoxichuan-s7/PLAN-trim.md`, copy to `docs/archive/TAOXICHUAN_STAGE7_TRIM_PLAN.md`)
 1. **Inventory table**: every syscall arm and subsystem in `taoxichuan/src/*.rs` (group them: fd table, open/close/dup, read/write/
    writev/lseek, stat family, dirs, sockets/connect/poll, exec/spawn/argv, mmap/brk, time, misc). Per row: lines it occupies in
-   `taoxichuan/src`, the existing implementation that does the same job (crate + function, or `amd64/src/<file>:<fn>`), and a verdict:
+   `taoxichuan/src`, the existing implementation that does the same job (crate + function, or `crates/akuma-kernel-amd64/src/<file>:<fn>`), and a verdict:
    **replace by dependency** / **extract then depend** / **keep (say why it exists nowhere)**. Give the total lines the plan would
    remove and the lines it would add. Be honest where the existing implementation is welded to `akuma-exec` or `Process` and cannot
    be called as is.
@@ -47,7 +47,7 @@ in a crate with host tests. Naming and crate rules: `CLAUDE.md` § Layout / Crat
    - H2: `dd if=/etc/hostname of=/dev/null` exits 0 (opening `/dev/null` was EACCES; an `OpenFile::Null` arm exists in `b7646dd9`, ungated).
      Which existing crate/device layer owns `/dev/null` and the other standard devices, and does the trim make the hand-written arm unnecessary?
    - H3: `sh -c 'echo x > /tmp/f; cat /tmp/f; wc -c /tmp/f'` prints `x` then 2. Today `/tmp/f` is created but stays empty. Read the
-     create/write path against the ext2 write path the full kernel uses (`akuma-ext2`, `amd64/src/fs.rs`, `akuma-vfs`) and say what the correct
+     create/write path against the ext2 write path the full kernel uses (`akuma-ext2`, `crates/akuma-kernel-amd64/src/fs.rs`, `akuma-vfs`) and say what the correct
      path is, whether `taoxichuan/` calls it, and the exact change (by rewiring, not a new arm if at all avoidable). You may reason about it from the
      code; do not boot.
    - Name the existing userspace probes that verify each (`userspace/ext2probe/c`, `userspace/abiprobe/c`, `userspace/forktest/c_stress/`; the

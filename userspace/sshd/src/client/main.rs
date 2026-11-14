@@ -23,20 +23,26 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 mod crypto;
+mod keygen;
 mod keys;
 mod protocol;
 
 use libakuma::*;
 
 fn print_usage() {
-    println("Usage: ssh [-p port] [-l user] [-i identity_file] [-t term] [user@]host [command...]");
+    println("Usage: ssh [-p port] [-l user] [-i identity_file] [-t term] [-y] [user@]host [command...]");
     println("");
     println("  -p port           Port to connect to (default 22)");
     println("  -l user           Remote login name (default: root, or from user@host)");
-    println("  -i identity_file  Ed25519 identity file, Akuma's raw 32-byte format");
+    println("  -i identity_file  Ed25519 identity file: an unencrypted OpenSSH private key");
+    println("                    (ssh-keygen -t ed25519 -N '') or Akuma's raw 32-byte format");
     println("                    (default: $HOME/.ssh/id_ed25519, falling back to");
     println("                    /etc/sshd/id_ed25519, i.e. sshd's own host key)");
+    println("  -y                Accept a host key never seen before without asking (also");
+    println("                    SSH_ACCEPT_NEW_HOSTKEY=1). A CHANGED key is always refused.");
     println("  -t term           TERM to advertise to the remote pty (default xterm-256color)");
+    println("");
+    println("      ssh --keygen ...   make or show a key (also installed as ssh-keygen)");
     println("");
     println("With no command, opens an interactive shell over a pty.");
     println("With a command, runs it non-interactively (no pty) and exits with its status.");
@@ -45,7 +51,18 @@ fn print_usage() {
 #[unsafe(no_mangle)]
 pub extern "C" fn main() {
     let mut args_iter = args();
-    args_iter.next(); // argv[0]
+    let argv0 = args_iter.next().unwrap_or("ssh");
+
+    // Multicall: the same binary is `ssh-keygen` when invoked under that name (a symlink), and
+    // `ssh --keygen ...` otherwise. Either way everything after the name / the flag is keygen's.
+    let invoked_as = argv0.rsplit('/').next().unwrap_or(argv0);
+    let keygen_first = invoked_as != "ssh-keygen" && args().nth(1) == Some("--keygen");
+    if invoked_as == "ssh-keygen" || keygen_first {
+        let skip = if keygen_first { 2 } else { 1 };
+        let rest: Vec<String> = args().skip(skip).map(String::from).collect();
+        keygen::run(rest);
+        return;
+    }
 
     let mut port: u16 = 22;
     let mut login: Option<String> = None;
@@ -53,6 +70,7 @@ pub extern "C" fn main() {
     let mut term = String::from("xterm-256color");
     let mut host_arg: Option<String> = None;
     let mut command_parts: Vec<String> = Vec::new();
+    let mut accept_new = false;
 
     while let Some(a) = args_iter.next() {
         match a {
@@ -82,6 +100,7 @@ pub extern "C" fn main() {
                     term = String::from(v);
                 }
             }
+            "-y" => accept_new = true,
             "-h" | "--help" => {
                 print_usage();
                 return;
@@ -107,7 +126,7 @@ pub extern "C" fn main() {
         Some(command_parts.join(" "))
     };
 
-    let cfg = protocol::ClientConfig { host, port, username, identity, command, term };
+    let cfg = protocol::ClientConfig { host, port, username, identity, command, term, accept_new_hostkey: accept_new };
 
     match protocol::run(cfg) {
         Ok(code) => exit(code),

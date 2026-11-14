@@ -42,13 +42,12 @@ default = ["akuma"]
 # The guest half — libakuma defines #[panic_handler]/#[global_allocator], so it
 # can never link a std target. `--no-default-features` drops it for the host bin.
 akuma = ["dep:libakuma"]
-# The host half — pulls in akuma-ext2 (+ its `fs-cache`, matching the kernel
-# default) and std.
+# The host half — pulls in akuma-ext2 and std.
 host-probe = ["dep:akuma-ext2", "dep:akuma-vfs"]
 # std::fs workload runner — std only, no akuma-ext2.
 std-probe = []
 
 [dependencies]
 libakuma = { path = "../libakuma", optional = true }
-akuma-ext2 = { path = "../../crates/akuma-ext2", features = ["fs-cache"], optional = true }
+akuma-ext2 = { path = "../../crates/akuma-ext2", optional = true }
 akuma-vfs = { path = "../../crates/akuma-vfs", optional = true }

@@ -69,12 +69,13 @@ Precedence, first match wins:
 4. Generate a new key and persist it to `$HOME/.ssh/id_ed25519` (plus a
    `.pub` file in the usual `ssh-ed25519 BASE64` format).
 
-**Format note:** identity files are Akuma's raw 32-byte secret-key format —
-the same one `sshd` writes to `/etc/sshd/id_ed25519` — not OpenSSH's PEM
-`-----BEGIN OPENSSH PRIVATE KEY-----` container. A key from real
-`ssh-keygen` will not load here. Supporting that format (plus its optional
-bcrypt-KDF encryption) was judged out of scope for a minimal client; point
-`-i` at a raw key instead, or let the client generate its own.
+**Format.** An identity file is Akuma's raw 32-byte secret key (the format `sshd` writes to
+`/etc/sshd/id_ed25519`) **or an unencrypted OpenSSH private key**
+(`-----BEGIN OPENSSH PRIVATE KEY-----`, i.e. `ssh-keygen -t ed25519 -N ''` output), so a key from
+another machine works with `-i` unchanged. Passphrase-protected keys (bcrypt KDF + AES) and other key
+types are not supported and are refused with a message that says which; the client then tries the next
+default identity. `ssh --keygen` / `ssh-keygen` makes such keys (see the README); the scope is one key
+type and no passphrase on purpose — use OpenSSH for more.
 
 ## `known_hosts`
 

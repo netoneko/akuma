@@ -33,8 +33,6 @@ pub use akuma_primitives::safe_print;
 //
 // Re-exported at the old paths so the kernel's call sites did not move.
 pub use akuma_net_nic::{frames, ifstats, nic, nicstat, queued};
-#[cfg(feature = "net-noalloc")]
-pub use akuma_net_nic::virtio_rings;
 
 // The native smoltcp stack + the smoltcp-coupled protocol modules. Optional so a
 // rump-only build (devbox) compiles them out; the rump path below is smoltcp-free.

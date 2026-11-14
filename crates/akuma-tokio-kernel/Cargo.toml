@@ -13,21 +13,33 @@ workspace = true
 # Every default device. A kernel that wants fewer turns `default-features` off and names its own.
 default = ["console", "disk", "net", "smp"]
 # COM1 (`Kernel::console`).
-console = ["akuma-tokio-kernel-amd64/console"]
+console = ["akuma-tokio-kernel-amd64/console", "akuma-tokio-kernel-aarch64/console"]
 # ext2 on the first virtio-blk device as the root filesystem (`Kernel::disk`).
-disk = ["akuma-tokio-kernel-amd64/disk"]
+disk = ["akuma-tokio-kernel-amd64/disk", "akuma-tokio-kernel-aarch64/disk"]
 # The first virtio-net device with DHCP (`Kernel::net`); without it, loopback only.
-net = ["akuma-tokio-kernel-amd64/net"]
+net = ["akuma-tokio-kernel-amd64/net", "akuma-tokio-kernel-aarch64/net"]
 # Application processors from `smp=N` (`Kernel::smp`).
-smp = ["akuma-tokio-kernel-amd64/smp"]
+smp = ["akuma-tokio-kernel-amd64/smp", "akuma-tokio-kernel-aarch64/smp"]
 # What busybox and bash call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
-shell = ["akuma-tokio-kernel-amd64/shell"]
+shell = ["akuma-tokio-kernel-amd64/shell", "akuma-tokio-kernel-aarch64/shell"]
+# aarch64 under Firecracker (its memory map differs from QEMU virt's; the binary must also link at
+# 0x8030_0000). amd64 boots Firecracker through PVH and needs nothing.
+platform-firecracker = ["akuma-tokio-kernel-aarch64/platform-firecracker"]
 # Compile the boot self-tests of the shared crates out.
-no-tests = ["akuma-tokio-kernel-amd64/no-tests"]
+no-tests = ["akuma-tokio-kernel-amd64/no-tests", "akuma-tokio-kernel-aarch64/no-tests"]
 # Name every syscall that answers a negative errno on the console.
-trace-err = ["akuma-tokio-kernel-amd64/trace-err"]
-# The JIT-permitting W^X relaxation (PHASE-2-WX, G1), 1:1 onto the machine half: `WX_ENFORCE`
-# boots off and the pure policy answers Allow. Off by default (R6).
+trace-err = ["akuma-tokio-kernel-amd64/trace-err", "akuma-tokio-kernel-aarch64/trace-err"]
+# The PMM's use-after-free instruments: quarantine, premature-free check, CoW ledger (amd64).
+pmm-forensics = ["akuma-tokio-kernel-amd64/pmm-forensics"]
+
+# Refuse every dynamically linked image at build time, with EPERM: the elf crate says no, so there is no hook and no dispatch arm.
+# Independent of `middleware`. Images only (execve, a `#!` interpreter, init); off by default.
+refuse-dynamic-elf = ["akuma-tokio-kernel-amd64/refuse-dynamic-elf", "akuma-tokio-kernel-aarch64/refuse-dynamic-elf"]
+# Syscall middleware (`Kernel::middleware`, `akuma_tokio_kernel::middleware`, B22). Off by default.
+middleware = ["akuma-tokio-kernel-amd64/middleware", "akuma-tokio-kernel-aarch64/middleware", "dep:akuma-middleware"]
+# The JIT-permitting W^X relaxation (PHASE-2-WX, G1), 1:1 onto the machine half: the pure W^X
+# policy answers Allow (main removed the `wx=0` runtime hatch; the relaxation is a build choice
+# again). Off by default (R6).
 wx-relaxed = ["akuma-tokio-kernel-amd64/wx-relaxed"]
 # The legacy vsyscall page (PHASE-2-VDSO, G3), 1:1 onto the machine half: the page HotSpot
 # hardcodes is mapped user-RX and disclosed as `AT_SYSINFO_EHDR`. Off by default (R6).
@@ -37,3 +49,9 @@ vsyscall = ["akuma-tokio-kernel-amd64/vsyscall"]
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
 akuma-tokio-kernel-amd64 = { path = "../akuma-tokio-kernel-amd64" }
+
+[target.'cfg(all(target_arch = "aarch64", target_os = "none"))'.dependencies]
+akuma-tokio-kernel-aarch64 = { path = "../akuma-tokio-kernel-aarch64" }
+
+[dependencies]
+akuma-middleware = { path = "../akuma-middleware", optional = true }

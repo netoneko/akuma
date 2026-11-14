@@ -32,16 +32,13 @@
     clippy::redundant_pub_crate,
 )]
 
-#[cfg(any(ext2_fs_cache, test))]
 use alloc::collections::BTreeMap;
-#[cfg(any(ext2_fs_cache, test))]
 use core::cell::Cell;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::mem::{offset_of, size_of};
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-#[cfg(not(kernel_profile_extreme))]
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
 use akuma_locks_rw_cell::RecoverableCell;
@@ -52,178 +49,19 @@ use crate::BlockDevice;
 mod audit;
 pub use audit::AuditReport;
 
-/// Number of block slots in the ring cache. One contiguous backing allocation;
-/// linear-scan lookup is fine at this size (fits in L1).
-#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
-const BLOCK_CACHE_ENTRIES: usize = 64;
-
-/// Flat ring-buffer block cache. A single contiguous Vec<u8> holds all cached
-/// block data; a parallel tag array records which block number occupies each
-/// slot (u32::MAX = empty). Eviction is pure ring — no LRU bookkeeping.
-///
-/// Compared to the old BTreeMap<u32, Vec<u8>>: one heap allocation instead of
-/// N, so when the cache is dropped or pressure forces reclaim, the whole backing
-/// buffer frees in one shot rather than leaving N scattered Vec headers across
-/// the PMM-claimed heap span.
-///
-/// **Write-back**: slots carry a dirty bit; `write`/`patch` update the slot and
-/// defer the device write to `flush_dirty` (called from `flush_meta`/`sync`,
-/// see `docs/archive/EXT2_WRITEBACK_DESIGN.md`). Evicting a dirty victim
-/// flushes it first via the caller-supplied device callback. `remove` drops a
-/// block *without* flushing — the invalidate-on-free rule (D-3): a freed
-/// block's stale bytes must never reach a disk block that may have been
-/// reallocated.
-#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
-struct BlockRingCache {
-    backing: Vec<u8>,
-    tags: [u32; BLOCK_CACHE_ENTRIES],
-    dirty: [bool; BLOCK_CACHE_ENTRIES],
-    head: usize,
-    block_size: usize,
-}
-
 /// Device-write callback for cache flushes (eviction and `flush_dirty`).
 /// `FnMut(block_num, bytes) -> device write result` — callers pass a closure
 /// over `&self.dev`, which is field-disjoint from the `block_cache` lock.
-#[cfg(not(kernel_profile_extreme))]
 pub(crate) type DevFlush<'a> = &'a mut dyn FnMut(u32, &[u8]) -> Result<(), FsError>;
 
-#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
-impl BlockRingCache {
-    fn new(block_size: usize) -> Self {
-        Self {
-            backing: vec![0u8; BLOCK_CACHE_ENTRIES * block_size],
-            tags: [u32::MAX; BLOCK_CACHE_ENTRIES],
-            dirty: [false; BLOCK_CACHE_ENTRIES],
-            head: 0,
-            block_size,
-        }
-    }
-
-    fn get(&self, block_num: u32) -> Option<&[u8]> {
-        for (i, &tag) in self.tags.iter().enumerate() {
-            if tag == block_num {
-                let s = i * self.block_size;
-                return Some(&self.backing[s..s + self.block_size]);
-            }
-        }
-        None
-    }
-
-    fn slot_of(&self, block_num: u32) -> Option<usize> {
-        self.tags.iter().position(|&tag| tag == block_num)
-    }
-
-    /// Write a block into the cache, marking it dirty (device write deferred).
-    /// If the ring slot it lands in holds a dirty victim, that victim is
-    /// flushed first — a dirty block must never be silently overwritten.
-    fn write(&mut self, block_num: u32, data: &[u8], flush: DevFlush<'_>) -> Result<(), FsError> {
-        if let Some(i) = self.slot_of(block_num) {
-            let s = i * self.block_size;
-            self.backing[s..s + self.block_size].copy_from_slice(data);
-            self.dirty[i] = true;
-            return Ok(());
-        }
-        let slot = self.head;
-        self.evict_into(slot, flush)?;
-        let s = slot * self.block_size;
-        self.backing[s..s + self.block_size].copy_from_slice(data);
-        self.tags[slot] = block_num;
-        self.dirty[slot] = true;
-        self.head = (self.head + 1) % BLOCK_CACHE_ENTRIES;
-        Ok(())
-    }
-
-    /// Overwrite a sub-block range of a resident block, marking it dirty.
-    /// Returns `false` (no-op) when the block is not cached — the caller
-    /// falls back to fill-then-patch.
-    fn patch(&mut self, block_num: u32, off: usize, data: &[u8]) -> bool {
-        match self.slot_of(block_num) {
-            Some(i) => {
-                let s = i * self.block_size + off;
-                self.backing[s..s + data.len()].copy_from_slice(data);
-                self.dirty[i] = true;
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Prepare `slot` for a new occupant, flushing its dirty predecessor.
-    fn evict_into(&mut self, slot: usize, flush: DevFlush<'_>) -> Result<(), FsError> {
-        let victim = self.tags[slot];
-        if victim != u32::MAX && self.dirty[slot] {
-            let s = slot * self.block_size;
-            flush(victim, &self.backing[s..s + self.block_size])?;
-        }
-        self.dirty[slot] = false;
-        Ok(())
-    }
-
-    /// Insert a clean block (device read fill). Same duplicate and dirty-victim
-    /// rules as [`Self::write`].
-    fn insert(&mut self, block_num: u32, data: &[u8], flush: DevFlush<'_>) -> Result<(), FsError> {
-        // If already cached (another thread beat us to it), don't add a duplicate.
-        // Duplicates would let a stale copy survive a remove() that only clears
-        // the first match, which would poison later reads after a write.
-        if self.tags.contains(&block_num) {
-            return Ok(());
-        }
-        let slot = self.head;
-        self.evict_into(slot, flush)?;
-        let s = slot * self.block_size;
-        self.backing[s..s + self.block_size].copy_from_slice(data);
-        self.tags[slot] = block_num;
-        self.dirty[slot] = false;
-        self.head = (self.head + 1) % BLOCK_CACHE_ENTRIES;
-        Ok(())
-    }
-
-    /// Drop a block without flushing, dirty or not (invalidate-on-free, D-3).
-    fn remove(&mut self, block_num: u32) {
-        for (i, tag) in self.tags.iter_mut().enumerate() {
-            if *tag == block_num {
-                *tag = u32::MAX;
-                self.dirty[i] = false;
-                return;
-            }
-        }
-    }
-
-    /// Is `block_num` resident with unflushed bytes? The `[E2C-BAD]` oracle
-    /// skips dirty blocks: cache-ahead-of-disk is the write-back invariant,
-    /// not a coherence failure.
-    fn is_dirty(&self, block_num: u32) -> bool {
-        match self.slot_of(block_num) {
-            Some(i) => self.dirty[i],
-            None => false,
-        }
-    }
-
-    /// Write every dirty block whose number passes `keep` out to the device
-    /// (via `flush`), clearing the bits as they land. `keep` implements the
-    /// flush ordering (D-2): data/inode blocks first, allocation metadata
-    /// (bitmaps, BGD table) only after.
-    fn flush_dirty(&mut self, keep: &dyn Fn(u32) -> bool, flush: DevFlush<'_>) -> Result<(), FsError> {
-        for i in 0..BLOCK_CACHE_ENTRIES {
-            let tag = self.tags[i];
-            if tag != u32::MAX && self.dirty[i] && keep(tag) {
-                let s = i * self.block_size;
-                flush(tag, &self.backing[s..s + self.block_size])?;
-                self.dirty[i] = false;
-            }
-        }
-        Ok(())
-    }
-}
 
 // ============================================================================
-// Large clock-eviction block cache (feature `fs-cache` / cfg `ext2_fs_cache`)
+// Clock-eviction block cache
 // ============================================================================
 //
-// The 64-slot ring above is ~256 KB — far smaller than a self-host build's
-// working set (the toolchain `.so`s + rlibs are a few hundred MB), so it gives
-// no reuse: every rustc/cc/ld spawn re-streams the toolchain off virtio-blk
+// It replaced a 64-slot (~256 KB) ring, far smaller than a self-host build's
+// working set (the toolchain `.so`s + rlibs are a few hundred MB), which gave
+// no reuse: every rustc/cc/ld spawn re-streamed the toolchain off virtio-blk
 // (docs/AKUMA_SELF_HOSTING.md §7a — measured warm/cold ratio = 1.00x).
 //
 // This cache is sized from detected RAM (capped, set by the kernel before mount)
@@ -235,68 +73,53 @@ impl BlockRingCache {
 
 /// Default cap if the kernel never calls [`set_cache_cap_bytes`] (host tests):
 /// 16 MB — large enough to exercise eviction, small enough for `cargo test`.
-#[cfg(any(ext2_fs_cache, test))]
 const DEFAULT_CACHE_CAP_BYTES: usize = 16 * 1024 * 1024;
 
-#[cfg(any(ext2_fs_cache, test))]
 static CACHE_CAP_BYTES: AtomicUsize = AtomicUsize::new(DEFAULT_CACHE_CAP_BYTES);
 
 /// Cache instrumentation for the boot self-test (cache_hit_test) and PSTATS.
-#[cfg(any(ext2_fs_cache, test))]
 static CACHE_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(any(ext2_fs_cache, test))]
 static CACHE_MISSES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Slots currently allocated / total slots the cap allows. Occupancy is what
 /// distinguishes "the cache is too small and thrashing" from "the working set
 /// fits and misses are just cold-start": a cache that never fills cannot be
 /// improved by raising the cap, whatever the miss count says.
-#[cfg(any(ext2_fs_cache, test))]
 static CACHE_SLOTS_USED: AtomicUsize = AtomicUsize::new(0);
-#[cfg(any(ext2_fs_cache, test))]
 static CACHE_SLOTS_CAP: AtomicUsize = AtomicUsize::new(0);
+
+/// `ETXTBSY`: a file that some process is executing may not have its data changed (`akuma_primitives::text_busy`). Asked at every
+/// place this filesystem writes a regular file's data or size, by inode, so a descriptor opened for writing before the `execve`
+/// is stopped as well as a fresh `open`. Unlinking and renaming over the file stay allowed; the running image keeps its inode.
+fn deny_if_text_busy(fs: u32, inode_num: u32) -> Result<(), FsError> {
+    if akuma_primitives::text_busy::is_busy(fs, inode_num) { Err(FsError::TextBusy) } else { Ok(()) }
+}
+
+/// The next [`Filesystem::identity`]: starts at 1 so `0` stays "no identity".
+static NEXT_FS_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
 /// Set the upper bound (bytes) on the ext2 block cache backing store.
 ///
 /// The kernel derives this from detected RAM — `min(RAM/8, 128 MB)` as of
-/// `src/fs.rs` — and calls it once before mounting the filesystem. No-op unless
-/// built with the `fs-cache` feature (which is in the kernel's `default` set).
-#[allow(unused_variables)]
+/// `src/fs.rs` — and calls it once before mounting the filesystem.
 pub fn set_cache_cap_bytes(bytes: usize) {
-    #[cfg(any(ext2_fs_cache, test))]
     CACHE_CAP_BYTES.store(bytes, Ordering::Relaxed);
 }
 
-/// `(hits, misses)` since boot for the large block cache. `(0, 0)` unless the
-/// `fs-cache` feature is built in.
+/// `(hits, misses)` since boot for the block cache.
 #[must_use]
 pub fn cache_stats() -> (u64, u64) {
-    #[cfg(any(ext2_fs_cache, test))]
-    {
-        (CACHE_HITS.load(Ordering::Relaxed), CACHE_MISSES.load(Ordering::Relaxed))
-    }
-    #[cfg(not(any(ext2_fs_cache, test)))]
-    {
-        (0, 0)
-    }
+    (CACHE_HITS.load(Ordering::Relaxed), CACHE_MISSES.load(Ordering::Relaxed))
 }
 
 /// `(slots_in_use, slot_capacity)` for the large block cache.
 ///
 /// Equal values mean the cache is full and the clock is evicting;
 /// `slots_in_use` well under capacity means the whole touched working set is
-/// resident and a larger cap would buy nothing. `(0, 0)` unless built with
-/// `fs-cache`.
+/// resident and a larger cap would buy nothing.
 #[must_use]
 pub fn cache_occupancy() -> (usize, usize) {
-    #[cfg(any(ext2_fs_cache, test))]
-    {
-        (CACHE_SLOTS_USED.load(Ordering::Relaxed), CACHE_SLOTS_CAP.load(Ordering::Relaxed))
-    }
-    #[cfg(not(any(ext2_fs_cache, test)))]
-    {
-        (0, 0)
-    }
+    (CACHE_SLOTS_USED.load(Ordering::Relaxed), CACHE_SLOTS_CAP.load(Ordering::Relaxed))
 }
 
 /// Target size of one backing chunk. The backing grows a whole chunk at a time,
@@ -319,7 +142,6 @@ pub fn cache_occupancy() -> (usize, usize) {
 /// total=1152MB ... claimed=131074 pages`, PMM 908 518 -> 678 073 free pages
 /// (~900 MB, never returned), after which sshd accepted connections but reset at
 /// key exchange. Chunking bounds the allocation and never copies existing slots.
-#[cfg(any(ext2_fs_cache, test))]
 const CACHE_CHUNK_BYTES: usize = 1 << 16; // 64 KB
 
 /// Clock (second-chance) block cache. Slots are allocated lazily (one backing
@@ -328,7 +150,6 @@ const CACHE_CHUNK_BYTES: usize = 1 << 16; // 64 KB
 ///
 /// **Write-back**: same dirty-bit contract as [`BlockRingCache`] — see the
 /// struct docs there and `docs/archive/EXT2_WRITEBACK_DESIGN.md`.
-#[cfg(any(ext2_fs_cache, test))]
 pub(crate) struct ClockBlockCache {
     /// Slot data, split into fixed-size chunks of `chunk_blocks` slots each.
     /// Slot `i` lives in `chunks[i / chunk_blocks]` at byte offset
@@ -352,7 +173,6 @@ pub(crate) struct ClockBlockCache {
     capacity_blocks: usize,
 }
 
-#[cfg(any(ext2_fs_cache, test))]
 impl ClockBlockCache {
     pub(crate) fn new(block_size: usize) -> Self {
         let cap_bytes = CACHE_CAP_BYTES.load(Ordering::Relaxed);
@@ -529,9 +349,6 @@ impl ClockBlockCache {
 /// Diagnostic (2026-08-15 zero-page hunt): cache hits whose bytes did not match
 /// a direct disk re-read (`[E2C-BAD]`). Non-zero means this layer is serving
 /// stale data — the "wrong bytes" half of the self-host ICE residue.
-/// Gated with its only consumer (`verify_cached_block`): `extreme` has no block
-/// cache at all, so there is nothing to verify and the counter is dead there.
-#[cfg(not(kernel_profile_extreme))]
 pub static E2_CACHE_VERIFY_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 
 /// Runtime gate for the `[E2C-BAD]` verification — **default off**, and that is
@@ -540,7 +357,6 @@ pub static E2_CACHE_VERIFY_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 /// interleavings a coherence race needs. The first instrumented arm went 4/4
 /// green with it on and proved nothing (hunt §13, handoff rule 10). Turn it on
 /// only when actively chasing T4, and never trust a rate scored with it on.
-#[cfg(not(kernel_profile_extreme))]
 pub static E2_VERIFY_HITS: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
 
@@ -597,11 +413,18 @@ const DEFERRED_FREE_SLOTS: usize = 4096;
 /// exactly that way against the test suite's parallel mounts.)
 struct DeferredFrees {
     slots: [AtomicU32; DEFERRED_FREE_SLOTS],
+    /// `inode_pin::unpin_epoch()` when this list was last drained. A queued
+    /// inode becomes freeable the moment its last pin goes - an `munmap`, a
+    /// `close`, a process exit - and none of those is a filesystem call, so
+    /// [`Ext2Filesystem::write_state`] drains whenever the epoch has moved.
+    /// Draining only on unlink, as before, left the blocks allocated until some
+    /// unrelated file was deleted, and on disk across a crash.
+    drained_at: AtomicU64,
 }
 
 impl DeferredFrees {
     const fn new() -> Self {
-        Self { slots: [const { AtomicU32::new(0) }; DEFERRED_FREE_SLOTS] }
+        Self { slots: [const { AtomicU32::new(0) }; DEFERRED_FREE_SLOTS], drained_at: AtomicU64::new(0) }
     }
 
     /// Record `inode` for a later free. `false` means there was no room.
@@ -769,6 +592,18 @@ const FT_DIR: u8 = 2;
 const FT_SOCK: u8 = 6;
 const FT_SYMLINK: u8 = 7;
 
+/// `EXT2_FEATURE_INCOMPAT_FILETYPE`: directory entries carry a file type in byte 7.
+/// Without it that byte is the high half of a 16-bit `name_len`: it must be written
+/// 0 (e2fsck clears anything else, 42,815 entries on one guest disk) and read as
+/// "unknown", never as a type.
+const INCOMPAT_FILETYPE: u32 = 0x0002;
+
+/// The type byte a new directory entry gets: `ft` on a filesystem with
+/// [`INCOMPAT_FILETYPE`], else 0.
+fn stored_dirent_type(state: &Ext2State, ft: u8) -> u8 {
+    if state.superblock.feature_incompat & INCOMPAT_FILETYPE != 0 { ft } else { 0 }
+}
+
 /// `EXT2_LINK_MAX`: Linux refuses a link past this with `EMLINK`.
 const LINK_MAX: u16 = 65_000;
 
@@ -814,7 +649,7 @@ enum Scan {
 //    prove — any accidental padding changes the size and fails the build).
 // 2. The `parse`/`serialize` impls under "On-disk layout codec" restate each
 //    offset as an explicit little-endian read/write, bounds-checked and
-//    host-endian-independent. Round-trip tests in `src/tests.rs` prove the two
+//    host-endian-independent. Round-trip tests in `crates/akuma-kernel-tests-aarch64/src/tests.rs` prove the two
 //    statements agree; a misplaced offset fails a test instead of a live disk.
 //
 // Nothing reinterprets these structs as bytes any more — every read from a
@@ -1185,6 +1020,22 @@ impl Inode {
         self.os_specific_2[Self::GID_HIGH..Self::GID_HIGH + 2].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
     }
 
+    /// The size in bytes. A regular file's high word is `i_size_high`
+    /// (`RO_COMPAT_LARGE_FILE`); in anything else the field is `i_dir_acl`, and
+    /// the size is the low word alone.
+    pub(crate) fn file_size(&self) -> u64 {
+        let lo = u64::from(self.size_lower);
+        if self.type_perms & 0xF000 == S_IFREG { lo | (u64::from(self.size_upper) << 32) } else { lo }
+    }
+
+    /// Set [`Self::file_size`]: the high word only in a regular file.
+    pub(crate) fn set_file_size(&mut self, size: u64) {
+        self.size_lower = size as u32;
+        if self.type_perms & 0xF000 == S_IFREG {
+            self.size_upper = (size >> 32) as u32;
+        }
+    }
+
     /// The `i`-th pointer word (0..[`INODE_POINTER_WORDS`]) as a plain field
     /// access. This is what lets the fast-symlink window be read and written
     /// byte-exactly without ever taking a reference into a packed struct or
@@ -1374,34 +1225,34 @@ pub(crate) struct Ext2State {
 }
 
 /// Non-preemption/IRQ guard held for the lifetime of an [`Ext2State`] lock hold under
-/// `no-bkl-vfs`; a zero-sized no-op otherwise.
+/// `smp-shared`; a zero-sized no-op otherwise.
 ///
 /// Every ext2 lock hold does real block I/O (see [`Ext2Filesystem::read_block`]), so it
 /// must never be descheduled mid-hold: the Big Kernel Lock is released on an EL1→EL0
 /// return, and a stranded `state` guard means any other core that then spins for it does
 /// so *while holding the BKL* — the holder can never be rescheduled to release it, and
-/// every core piles into the BKL wait. With `no-bkl-vfs` the same guard additionally
+/// every core piles into the BKL wait. Under `smp-shared` the same guard additionally
 /// masks local IRQs, so a core inside an ext2 critical section without the BKL can't take
 /// a nested IRQ whose `enter_kernel()` hard-spins for the BKL while this core holds the
 /// inner lock (AB-BA — the SMP=4 wedge `no-bkl-network` closed the same way).
 ///
 /// **IRQs are masked around the non-blocking `try_*` and the resulting hold only, never
 /// across the acquisition backoff** — see [`Ext2Filesystem::read_state`].
-#[cfg(feature = "no-bkl-vfs")]
+#[cfg(feature = "bkl-smp")]
 type StateHoldGuard = akuma_primitives::PreemptGuard;
-#[cfg(not(feature = "no-bkl-vfs"))]
+#[cfg(not(feature = "bkl-smp"))]
 type StateHoldGuard = NoStateHold;
 
-/// The `StateHoldGuard` stand-in when `no-bkl-vfs` is off: a ZST that compiles to nothing.
+/// The `StateHoldGuard` stand-in when `smp-shared` is off: a ZST that compiles to nothing.
 ///
 /// Deliberately **not** `Copy`, and carrying an empty `Drop`, so that the explicit
 /// `drop(hold)` before each backoff spin type-checks identically in both configurations —
 /// without it, the same source line is a real release in one build and a lint
 /// (`dropping_copy_types` / `drop_non_drop`) in the other.
-#[cfg(not(feature = "no-bkl-vfs"))]
+#[cfg(not(feature = "bkl-smp"))]
 struct NoStateHold;
 
-#[cfg(not(feature = "no-bkl-vfs"))]
+#[cfg(not(feature = "bkl-smp"))]
 impl Drop for NoStateHold {
     fn drop(&mut self) {}
 }
@@ -1409,9 +1260,9 @@ impl Drop for NoStateHold {
 /// Take a [`StateHoldGuard`] for one `try_*` attempt (and, on success, the hold).
 #[inline]
 fn state_hold_guard() -> StateHoldGuard {
-    #[cfg(feature = "no-bkl-vfs")]
+    #[cfg(feature = "bkl-smp")]
     return akuma_primitives::PreemptGuard::new();
-    #[cfg(not(feature = "no-bkl-vfs"))]
+    #[cfg(not(feature = "bkl-smp"))]
     NoStateHold
 }
 
@@ -1473,10 +1324,11 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     /// [`Self::abandon_tid`] rather than by this crate inferring liveness.
     /// `pub(crate)` for `mod tests`; not reachable outside the crate.
     pub(crate) state: RecoverableCell<Ext2State>,
-    #[cfg(not(kernel_profile_extreme))]
     block_cache: Spinlock<BlockCache>,
     /// Inodes unlinked while a mapping still pinned them — see [`DeferredFrees`].
     deferred: DeferredFrees,
+    /// This instance's [`Filesystem::identity`]: unique, non-zero, assigned at construction.
+    id: u32,
     /// Directory-tree walks and block-cache accesses this instance has done, for
     /// [`Self::work_counters`].
     ///
@@ -1501,17 +1353,12 @@ struct WorkCounters {
     block_accesses: core::sync::atomic::AtomicU64,
 }
 
-/// The active block cache type: the large clock cache under the `fs-cache`
-/// feature, otherwise the tiny 64-slot ring. (`extreme` has neither.)
-#[cfg(all(not(kernel_profile_extreme), ext2_fs_cache))]
+/// The block cache type.
 type BlockCache = ClockBlockCache;
-#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
-type BlockCache = BlockRingCache;
 
 /// Build the block cache for a new filesystem instance. `cap` is the
 /// per-instance override from [`Ext2Filesystem::new_with_cache_cap`]; `None`
 /// sizes from the crate-global cap as before.
-#[cfg(all(not(kernel_profile_extreme), ext2_fs_cache))]
 fn make_block_cache(block_size: usize, cap: Option<usize>) -> BlockCache {
     match cap {
         Some(bytes) => {
@@ -1522,10 +1369,6 @@ fn make_block_cache(block_size: usize, cap: Option<usize>) -> BlockCache {
     }
 }
 
-#[cfg(all(not(kernel_profile_extreme), not(ext2_fs_cache)))]
-fn make_block_cache(block_size: usize, _cap: Option<usize>) -> BlockCache {
-    BlockRingCache::new(block_size)
-}
 
 impl<B: BlockDevice> Ext2Filesystem<B> {
     /// Create a new Ext2 filesystem backed by `dev`, with the block cache
@@ -1542,8 +1385,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// global cap is a budget for the root filesystem alone, and applying it
     /// per-instance again would double the committed heap (the cache never
     /// shrinks — see `src/fs.rs`). `None` means "use the global cap".
-    /// Ignored on profiles without the large cache (`extreme`, no `fs-cache`).
-    #[allow(unused_variables)]
     pub fn new_with_cache_cap(
         dev: B,
         utc_time_us: fn() -> u64,
@@ -1629,9 +1470,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             dev,
             time_fn: utc_time_us,
             state: RecoverableCell::new(state),
-            #[cfg(not(kernel_profile_extreme))]
             block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
             deferred: DeferredFrees::new(),
+            id: NEXT_FS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             #[cfg(test)]
             counters: WorkCounters::default(),
         })
@@ -1663,7 +1504,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// The [`StateHoldGuard`] is taken *per attempt*, immediately before the
     /// non-blocking try, and either kept (success — it now covers the hold) or
     /// dropped before the backoff spin. It deliberately does **not** wrap the whole
-    /// wait: under `no-bkl-vfs` that guard masks local IRQs, and this wait is
+    /// wait: under `smp-shared` that guard masks local IRQs, and this wait is
     /// unbounded, so masking across it would starve this core's timer for the whole
     /// contended window — and if the current holder were a thread on this core,
     /// nothing could ever run to release it. Masking only the try + hold gives the
@@ -1687,9 +1528,23 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     /// Acquire a write lock, blocking until available. Same per-attempt
     /// [`StateHoldGuard`] discipline as [`Self::read_state`] — see there.
+    ///
+    /// Every write hold first finishes the deferred frees whose last pin has
+    /// gone since the previous drain (see [`DeferredFrees::drained_at`]); a
+    /// drain that freed something flushes the free counts it staged.
     fn write_state(&self) -> Ext2WriteGuard<'_> {
         let (inner, hold) = self.state.write_holding(state_hold_guard);
-        Ext2WriteGuard { inner, hold }
+        let mut guard = Ext2WriteGuard { inner, hold };
+        let epoch = akuma_primitives::inode_pin::unpin_epoch();
+        if self.deferred.drained_at.load(Ordering::Acquire) != epoch {
+            // Recorded before the drain: a pin that goes during it moves the
+            // epoch again, and the next hold drains again.
+            self.deferred.drained_at.store(epoch, Ordering::Release);
+            if self.drain_deferred_frees(&mut guard) > 0 {
+                let _ = self.flush_meta(&mut guard);
+            }
+        }
+        guard
     }
 
     /// Recover everything the dead thread `tid` held on this mount.
@@ -1741,12 +1596,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     ) -> Result<R, FsError> {
         #[cfg(test)]
         self.counters.block_accesses.fetch_add(1, Ordering::Relaxed);
-        #[cfg(not(kernel_profile_extreme))]
         {
             {
                 let cache = self.block_cache.lock();
                 if let Some(data) = cache.get(block_num) {
-                    #[cfg(any(ext2_fs_cache, test))]
                     CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                     // The E2C coherence oracle needs a snapshot to compare
                     // against the device, and `verify_cached_block` re-locks
@@ -1762,7 +1615,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     return Ok(f(data));
                 }
             }
-            #[cfg(any(ext2_fs_cache, test))]
             CACHE_MISSES.fetch_add(1, Ordering::Relaxed);
 
             let mut buf = vec![0u8; state.block_size];
@@ -1773,13 +1625,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 let mut flush = self.dev_flush(state);
                 cache.insert(block_num, &buf, &mut flush)?;
             }
-            Ok(f(&buf))
-        }
-        #[cfg(kernel_profile_extreme)]
-        {
-            let mut buf = vec![0u8; state.block_size];
-            let offset = block_num as u64 * state.block_size as u64;
-            self.dev.read_bytes(offset, &mut buf).map_err(|_| FsError::IoError)?;
             Ok(f(&buf))
         }
     }
@@ -1795,7 +1640,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// The device-write closure cache flushes use — borrows `self.dev`, which
     /// is field-disjoint from `self.block_cache`, so it coexists with a held
     /// cache-lock guard.
-    #[cfg(not(kernel_profile_extreme))]
     fn dev_flush<'s>(&'s self, state: &'s Ext2State) -> impl FnMut(u32, &[u8]) -> Result<(), FsError> + 's {
         let bs = state.block_size as u64;
         move |bn: u32, bytes: &[u8]| {
@@ -1811,7 +1655,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// Bypasses the cache entirely (`self.dev.read_bytes`), so it cannot be
     /// fooled by the entry it is checking. Rate-limited to the first 32 prints;
     /// the counter keeps counting.
-    #[cfg(not(kernel_profile_extreme))]
     fn verify_cached_block(&self, state: &Ext2State, block_num: u32, cached: &[u8]) {
         if !E2_VERIFY_HITS.load(Ordering::Relaxed) {
             return;
@@ -1839,29 +1682,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     /// Write a block: mark it dirty in the cache (device write deferred to
-    /// `flush_meta`/`sync`/eviction — write-back). `extreme` has no cache and
-    /// writes through to the device, preserving its old durability model.
+    /// `flush_meta`/`sync`/eviction — write-back).
     fn write_block(&self, state: &Ext2State, block_num: u32, data: &[u8]) -> Result<(), FsError> {
         if data.len() != state.block_size {
             return Err(FsError::Internal);
         }
-        #[cfg(not(kernel_profile_extreme))]
         {
             let mut cache = self.block_cache.lock();
             let mut flush = self.dev_flush(state);
             cache.write(block_num, data, &mut flush)
-        }
-        #[cfg(kernel_profile_extreme)]
-        {
-            let offset = block_num as u64 * state.block_size as u64;
-            self.dev.write_bytes(offset, data).map_err(|_| FsError::IoError)
         }
     }
 
     /// Drop any cached copy of `block_num` **without** flushing it — the
     /// invalidate-on-free rule (design doc D-3): a freed block's stale bytes
     /// must never be written back over a block the allocator may hand out again.
-    #[cfg(not(kernel_profile_extreme))]
     fn invalidate_block(&self, block_num: u32) {
         self.block_cache.lock().remove(block_num);
     }
@@ -1879,14 +1714,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             + group as u64 * size_of::<BlockGroupDescriptor>() as u64
     }
 
-    /// Read a sub-block byte range. With a block cache this goes through it
-    /// (the cached copy is authoritative under write-back); `extreme` reads
-    /// the device. Caller guarantees the range lies within a single block —
+    /// Read a sub-block byte range through the block cache (the cached copy
+    /// is authoritative under write-back). Caller guarantees the range lies within a single block —
     /// true for inode-table and BGD-table entries (entry size divides the
     /// block size and the tables start block-aligned, so neither ever
     /// straddles a block boundary).
     fn read_range(&self, state: &Ext2State, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
-        #[cfg(not(kernel_profile_extreme))]
         {
             let bs = state.block_size as u64;
             let block_num = (offset / bs) as u32;
@@ -1896,19 +1729,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 buf.copy_from_slice(&block[off..off + len]);
             })
         }
-        #[cfg(kernel_profile_extreme)]
-        {
-            let _ = state; // no cache to consult on this profile
-            self.dev.read_bytes(offset, buf).map_err(|_| FsError::IoError)
-        }
     }
 
-    /// Write a sub-block byte range. Cache builds: patch the cached block in
-    /// place when resident (no read-back, no allocation — design doc D-5);
-    /// otherwise fill-then-patch through the cache. `extreme` writes the
-    /// device directly. Same single-block invariant as [`Self::read_range`].
+    /// Write a sub-block byte range: patch the cached block in place when
+    /// resident (no read-back, no allocation — design doc D-5); otherwise
+    /// fill-then-patch through the cache. Same single-block invariant as [`Self::read_range`].
     fn write_range(&self, state: &Ext2State, offset: u64, data: &[u8]) -> Result<(), FsError> {
-        #[cfg(not(kernel_profile_extreme))]
         {
             let bs = state.block_size as u64;
             let block_num = (offset / bs) as u32;
@@ -1920,11 +1746,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             block[off..off + data.len()].copy_from_slice(data);
             self.write_block(state, block_num, &block)?;
             Ok(())
-        }
-        #[cfg(kernel_profile_extreme)]
-        {
-            let _ = state; // no cache to patch on this profile
-            self.dev.write_bytes(offset, data).map_err(|_| FsError::IoError)
         }
     }
 
@@ -1984,6 +1805,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         state.sb_dirty = true;
     }
 
+    /// A regular file reached `size`: past 2 GiB, `i_size_high` is part of its
+    /// size, which a filesystem without `RO_COMPAT_LARGE_FILE` says nothing
+    /// reads. Set the bit (as Linux's ext2 does) so `e2fsck` and a mount
+    /// elsewhere read the size whole. Revision 0 has no feature words.
+    fn note_large_file(state: &mut Ext2State, size: u64) {
+        const RO_COMPAT_LARGE_FILE: u32 = 0x2;
+        if size > 0x7FFF_FFFF
+            && state.superblock.version_major >= 1
+            && state.superblock.feature_ro_compat & RO_COMPAT_LARGE_FILE == 0
+        {
+            state.superblock.feature_ro_compat |= RO_COMPAT_LARGE_FILE;
+            Self::stage_sb(state);
+        }
+    }
+
     /// Index of bitmap block `block_num` in `state.bitmap_cache`, loading it from
     /// disk on first touch. The allocators mutate `bitmap_cache[idx].1` in place
     /// and set `.2 = true`; `flush_meta` writes it back.
@@ -2003,7 +1839,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// (journal-less ordering, design doc D-2). The superblock's block is
     /// included defensively although nothing ever caches it (it is reserved,
     /// so no read/insert path names it).
-    #[cfg(not(kernel_profile_extreme))]
     fn is_alloc_meta(state: &Ext2State, bn: u32) -> bool {
         if state.bitmap_cache.iter().any(|(b, _, _)| *b == bn) {
             return true;
@@ -2021,7 +1856,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     /// Push every dirty cache block passing `keep` out to the device.
-    #[cfg(not(kernel_profile_extreme))]
     fn flush_dirty_blocks(
         &self,
         state: &Ext2State,
@@ -2043,7 +1877,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// blocks whose contents never landed.
     fn flush_meta(&self, state: &mut Ext2State) -> Result<(), FsError> {
         // Phase 1 — everything dirty except allocation metadata.
-        #[cfg(not(kernel_profile_extreme))]
         self.flush_dirty_blocks(state, &|bn| !Self::is_alloc_meta(state, bn))?;
 
         // Phase 2 — allocation metadata, staged by the allocators. Bitmap
@@ -2080,7 +1913,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         // Phase 3 — the metadata writes above went through the cache; push
         // them (and anything else left dirty) to the device.
-        #[cfg(not(kernel_profile_extreme))]
         self.flush_dirty_blocks(state, &|_| true)?;
 
         Ok(())
@@ -2258,7 +2090,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         // onto a block the allocator may hand out again before the flush
         // lands; dropping them is always safe (disk keeps the old contents
         // until reallocation, which always rewrites).
-        #[cfg(not(kernel_profile_extreme))]
         self.invalidate_block(block_num);
 
         bgd.free_blocks_count += 1;
@@ -2352,9 +2183,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// time: a mapping created *after* the unlink still names this inode, and
     /// freeing it would reintroduce exactly the defect the deferral exists to
     /// prevent.
-    fn drain_deferred_frees(&self, state: &mut Ext2State) {
+    fn drain_deferred_frees(&self, state: &mut Ext2State) -> usize {
         #[cfg(feature = "pmm-instr")]
         DEFERRED_DRAIN_CALLS.fetch_add(1, Ordering::Relaxed);
+        let mut freed = 0;
         for slot in &self.deferred.slots {
             let inode_num = slot.load(Ordering::Acquire);
             if inode_num == 0 {
@@ -2385,7 +2217,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 let _ = self.write_inode(state, inode_num, &inode);
             }
             let _ = self.free_inode(state, inode_num, false);
+            freed += 1;
         }
+        freed
     }
 
     /// Whether a directory holds anything but `.` and `..`.
@@ -2602,6 +2436,19 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Ok(if block == 0 { None } else { Some(block) });
         }
 
+        // Triply indirect: a 4 KiB-block file past 4 GiB.
+        let (ppb, lb) = (u64::from(ptrs_per_block), u64::from(logical_block - ptrs_per_block * ptrs_per_block));
+        if lb < ppb * ppb * ppb {
+            let mut block = inode.triple_indirect_block;
+            for idx in [lb / (ppb * ppb), (lb / ppb) % ppb, lb % ppb] {
+                if block == 0 {
+                    return Ok(None);
+                }
+                block = self.with_block(state, block, |b| Self::read_block_ptr(b, idx as usize))?;
+            }
+            return Ok(if block == 0 { None } else { Some(block) });
+        }
+
         Err(FsError::NotSupported)
     }
 
@@ -2701,6 +2548,30 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Ok(block);
         }
 
+        // Triply indirect: three pointer blocks deep, each allocated (zeroed)
+        // the first time a block under it is.
+        let (ppb, lb) = (u64::from(ptrs_per_block), u64::from(lb - ptrs_per_block * ptrs_per_block));
+        if lb < ppb * ppb * ppb {
+            if inode.triple_indirect_block == 0 {
+                inode.triple_indirect_block = self.allocate_block(state)?;
+                inode.sectors_used += (state.block_size / 512) as u32;
+            }
+            let mut parent = inode.triple_indirect_block;
+            let idx = [lb / (ppb * ppb), (lb / ppb) % ppb, lb % ppb];
+            for (level, &i) in idx.iter().enumerate() {
+                let mut ptrs = self.read_block(state, parent)?;
+                let mut child = Self::read_block_ptr(&ptrs, i as usize);
+                if child == 0 {
+                    child = if level == 2 { self.allocate_block_inner(state, zero_leaf)? } else { self.allocate_block(state)? };
+                    Self::write_block_ptr(&mut ptrs, i as usize, child);
+                    self.write_block(state, parent, &ptrs)?;
+                    inode.sectors_used += (state.block_size / 512) as u32;
+                }
+                parent = child;
+            }
+            return Ok(parent);
+        }
+
         Err(FsError::NotSupported)
     }
 
@@ -2708,8 +2579,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Inode Data Operations
     // ========================================================================
 
-    fn read_inode_data(&self, state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
-        let size = inode.size_lower as usize;
+    /// `pub(crate)` for `mod tests`, which reads a directory's raw entries back.
+    pub(crate) fn read_inode_data(&self, state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
+        let size = inode.file_size() as usize;
 
         // Safety: Limit maximum kernel-side file allocation to 16MB to prevent OOM/panic.
         // Large files should be accessed via read_at() instead of read_file().
@@ -2764,7 +2636,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             }
         }
 
-        inode.size_lower = data.len() as u32;
+        inode.set_file_size(data.len() as u64);
         let now = self.current_time();
         inode.modification_time = now;
         self.write_inode(state, inode_num, inode)?;
@@ -2853,7 +2725,58 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 self.write_block(state, inode.double_indirect_block, &dbl)?;
             }
         }
+
+        if inode.triple_indirect_block != 0 {
+            let ppb = u64::from(ppb);
+            let rel = u64::from(first).saturating_sub(12 + ppb + ppb * ppb);
+            let triple = inode.triple_indirect_block;
+            if self.free_tree_from(state, inode, triple, 3, rel)? {
+                inode.triple_indirect_block = 0;
+            }
+        }
         Ok(())
+    }
+
+    /// Free every data block at relative index `>= first` under the pointer
+    /// block `block`, which sits `level` levels above the data (1: it points at
+    /// data blocks), zeroing the pointers that named them; `sectors_used`
+    /// follows each free. `true` when `block` itself went too (`first == 0`),
+    /// and the caller must zero the pointer to it.
+    fn free_tree_from(&self, state: &mut Ext2State, inode: &mut Inode, block: u32, level: u32, first: u64) -> Result<bool, FsError> {
+        let sect = (state.block_size / 512) as u32;
+        let ppb = (state.block_size / 4) as u64;
+        // Data blocks under each pointer of this block.
+        let span = ppb.pow(level - 1);
+        let first_i = (first / span).min(ppb) as usize;
+        let mut ptrs = self.read_block(state, block)?;
+        let mut changed = false;
+        for i in first_i..ppb as usize {
+            let child = Self::read_block_ptr(&ptrs, i);
+            if child == 0 {
+                continue;
+            }
+            let freed = if level == 1 {
+                self.free_block(state, child)?;
+                inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+                true
+            } else {
+                let child_first = if i == first_i { first % span } else { 0 };
+                self.free_tree_from(state, inode, child, level - 1, child_first)?
+            };
+            if freed {
+                Self::write_block_ptr(&mut ptrs, i, 0);
+                changed = true;
+            }
+        }
+        if first == 0 {
+            self.free_block(state, block)?;
+            inode.sectors_used = inode.sectors_used.saturating_sub(sect);
+            return Ok(true);
+        }
+        if changed {
+            self.write_block(state, block, &ptrs)?;
+        }
+        Ok(false)
     }
 
     fn truncate_inode(&self, state: &mut Ext2State, inode: &mut Inode) -> Result<(), FsError> {
@@ -2906,7 +2829,13 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             inode.double_indirect_block = 0;
         }
 
-        inode.size_lower = 0;
+        if inode.triple_indirect_block != 0 {
+            let triple = inode.triple_indirect_block;
+            self.free_tree_from(state, inode, triple, 3, 0)?;
+            inode.triple_indirect_block = 0;
+        }
+
+        inode.set_file_size(0);
         inode.sectors_used = 0;
 
         Ok(())
@@ -2916,7 +2845,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Directory Operations
     // ========================================================================
 
-    fn parse_directory(&self, data: &[u8]) -> Vec<(u32, String, u8)> {
+    /// `pub(crate)` for `mod tests`, which checks the stored type bytes.
+    pub(crate) fn parse_directory(&self, data: &[u8]) -> Vec<(u32, String, u8)> {
         let mut entries = Vec::new();
         let mut offset = 0;
 
@@ -2986,6 +2916,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         inode_num: u32,
         file_type: u8,
     ) -> Result<(), FsError> {
+        let file_type = stored_dirent_type(state, file_type);
         let mut dir_inode = self.read_inode(state, dir_inode_num)?;
         let mut dir_data = self.read_inode_data(state, &dir_inode)?;
 
@@ -3355,6 +3286,15 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             parent_path
         };
         let parent_inode = self.lookup_path_internal(state, parent_path)?;
+        // `lookup_path_internal` proves every component it walks *through* is a
+        // directory, but never the last one: for `f/x` with `f` a regular file it
+        // returns `f` happily. Every caller then writes a directory entry into the
+        // parent, so a file parent was silently turned into a (corrupt) directory
+        // (`docs/archive/MKDIR_UNDER_REGULAR_FILE.md`). Linux answers ENOTDIR.
+        let parent = self.read_inode(state, parent_inode)?;
+        if (parent.type_perms & 0xF000) != S_IFDIR {
+            return Err(FsError::NotADirectory);
+        }
         Ok((parent_inode, name.to_string()))
     }
 
@@ -3374,7 +3314,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let inode = self.read_inode(state, inode_num)?;
         Ok(Metadata {
             is_dir: (inode.type_perms & 0xF000) == S_IFDIR,
-            size: inode.size_lower as u64,
+            size: inode.file_size(),
             inode: inode_num as u64,
             mode: inode.type_perms as u32,
             created: Some(inode.creation_time as u64),
@@ -3409,7 +3349,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(FsError::NotAFile);
         }
 
-        let file_size = inode.size_lower as usize;
+        let file_size = inode.file_size() as usize;
         if offset >= file_size {
             // Diagnostic (2026-08-15 hunt): a demand-fill clamps to `filesz`
             // resolved at mmap time, so `offset > file_size` here means this
@@ -3461,7 +3401,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
             // Cache hit: copy this block straight from the cache (the warm self-host
             // path — the toolchain stays resident, so this is a memcpy, no disk I/O).
-            #[cfg(not(kernel_profile_extreme))]
             {
                 let cache = self.block_cache.lock();
                 if let Some(data) = cache.get(run_start_phys) {
@@ -3480,7 +3419,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                     if let Some(snap) = &hit_snapshot {
                         self.verify_cached_block(&state, run_start_phys, snap);
                     }
-                    #[cfg(any(ext2_fs_cache, test))]
                     CACHE_HITS.fetch_add(1, Ordering::Relaxed);
                     pos += chunk;
                     total_read += chunk;
@@ -3497,7 +3435,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             while block_idx + run_len < num_blocks {
                 match phys_blocks[block_idx + run_len] {
                     Some(next_phys) if next_phys == run_start_phys + run_len as u32 => {
-                        #[cfg(not(kernel_profile_extreme))]
                         {
                             if self.block_cache.lock().get(next_phys).is_some() {
                                 break;
@@ -3514,7 +3451,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let run_bytes = run_len * block_size;
             let mut run_buf = alloc::vec![0u8; run_bytes];
             self.dev.read_bytes(disk_offset, &mut run_buf).map_err(|_| FsError::IoError)?;
-            #[cfg(any(ext2_fs_cache, test))]
             CACHE_MISSES.fetch_add(run_len as u64, Ordering::Relaxed);
 
             // Copy relevant data from the run into output and populate the cache.
@@ -3524,7 +3460,6 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 let chunk = core::cmp::min(block_size - off, end - pos);
                 buf[total_read..total_read + chunk]
                     .copy_from_slice(&run_buf[run_pos + off..run_pos + off + chunk]);
-                #[cfg(not(kernel_profile_extreme))]
                 {
                     let bn = run_start_phys + (run_pos / block_size) as u32;
                     let mut cache = self.block_cache.lock();
@@ -3635,8 +3570,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if inode.type_perms & 0x8000 == 0 {
             return Err(FsError::NotAFile);
         }
+        deny_if_text_busy(self.id, inode_num)?;
 
-        let current_size = inode.size_lower as u64 | ((inode.size_upper as u64) << 32);
+        let current_size = inode.file_size();
         let block_size = state.block_size as u64;
 
         // A failure partway leaves the inode describing exactly the blocks the
@@ -3706,8 +3642,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(e);
         }
 
-        inode.size_lower = length as u32;
-        inode.size_upper = (length >> 32) as u32;
+        inode.set_file_size(length);
+        Self::note_large_file(state, length);
         inode.modification_time = self.current_time();
         self.write_inode(state, inode_num, &inode)?;
         // A shrink stages bitmap, group-descriptor and superblock edits that
@@ -3724,6 +3660,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if (inode.type_perms & 0xF000) != S_IFREG {
             return Err(FsError::NotAFile);
         }
+        deny_if_text_busy(self.id, inode_num)?;
 
         let block_size = state.block_size as u64;
         let first_block = offset / block_size;
@@ -3735,10 +3672,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         let end = offset + len;
-        let current_size = inode.size_lower as u64 | ((inode.size_upper as u64) << 32);
-        if end > current_size {
-            inode.size_lower = end as u32;
-            inode.size_upper = (end >> 32) as u32;
+        if end > inode.file_size() {
+            inode.set_file_size(end);
+            Self::note_large_file(state, end);
         }
         inode.modification_time = self.current_time();
         self.write_inode(state, inode_num, &inode)?;
@@ -3761,9 +3697,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if (inode.type_perms & 0xF000) == S_IFDIR {
             return Err(FsError::NotAFile);
         }
+        deny_if_text_busy(self.id, inode_num)?;
 
         // `None` is `O_APPEND`: the offset is the size *as of this lock hold*.
-        let offset = offset.unwrap_or(inode.size_lower as usize);
+        let offset = offset.unwrap_or_else(|| inode.file_size() as usize);
 
         let block_size = state.block_size;
         let end = offset + data.len();
@@ -3800,8 +3737,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         // Update size if we extended the file
-        if end > inode.size_lower as usize {
-            inode.size_lower = end as u32;
+        if end as u64 > inode.file_size() {
+            inode.set_file_size(end as u64);
+            Self::note_large_file(state, end as u64);
         }
         inode.modification_time = self.current_time();
         self.write_inode(state, inode_num, &inode)?;
@@ -3817,6 +3755,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 // ============================================================================
 
 impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
+    fn identity(&self) -> u32 {
+        self.id
+    }
+
     fn name(&self) -> &str {
         "ext2"
     }
@@ -3848,19 +3790,24 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 
         let dir_data = self.read_inode_data(&state, &inode)?;
         let raw_entries = self.parse_directory(&dir_data);
+        let typed = state.superblock.feature_incompat & INCOMPAT_FILETYPE != 0;
 
         let entries = raw_entries
             .into_iter()
             .filter(|(inode, name, _)| *inode != 0 && name != "." && name != "..")
             .map(|(inode_num, name, file_type)| {
-                let is_dir = file_type == FT_DIR;
-                let is_symlink = file_type == FT_SYMLINK;
-                let size = if is_dir {
-                    0
-                } else {
-                    self.read_inode(&state, inode_num)
-                        .map_or(0, |i| i.size_lower as u64)
+                // The type byte is a type only on a filesystem with INCOMPAT_FILETYPE, and
+                // 0 there is "unknown": either way the inode decides. `DirEntry` has no
+                // unknown, so reading 0 as "not a directory" made getdents64 report
+                // `.git/refs/heads` as a regular file and git saw no refs at all.
+                let ft = if typed { file_type } else { 0 };
+                let node = if ft == FT_DIR { None } else { self.read_inode(&state, inode_num).ok() };
+                let kind = node.as_ref().map(|i| i.type_perms & 0xF000);
+                let (is_dir, is_symlink) = match ft {
+                    0 => (kind == Some(S_IFDIR), kind == Some(S_IFLNK)),
+                    ft => (ft == FT_DIR, ft == FT_SYMLINK),
                 };
+                let size = if is_dir { 0 } else { node.map_or(0, |i| i.file_size()) };
                 DirEntry { name, is_dir, is_symlink, size }
             })
             .collect();
@@ -3891,6 +3838,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                 if (inode.type_perms & 0xF000) == S_IFDIR {
                     return Err(FsError::NotAFile);
                 }
+                deny_if_text_busy(self.id, inode_num)?;
 
                 self.truncate_inode(&mut state, &mut inode)?;
                 self.write_inode_data(&mut state, inode_num, &mut inode, data)?;
@@ -3944,7 +3892,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             return Err(FsError::NotAFile);
         }
 
-        let file_size = inode.size_lower as usize;
+        let file_size = inode.file_size() as usize;
         if offset >= file_size {
             return Ok(0);
         }
@@ -4027,7 +3975,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             inode: inode_num,
             rec_len: 12,
             name_len: 1,
-            file_type: FT_DIR,
+            file_type: stored_dirent_type(&state, FT_DIR),
         };
         dot_entry.serialize(&mut dir_data[0..DIR_ENTRY_HEADER_SIZE]);
         dir_data[DIR_ENTRY_HEADER_SIZE] = b'.';
@@ -4037,7 +3985,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
             inode: parent_inode_num,
             rec_len: (state.block_size - 12) as u16,
             name_len: 2,
-            file_type: FT_DIR,
+            file_type: stored_dirent_type(&state, FT_DIR),
         };
         dotdot_entry.serialize(&mut dir_data[12..12 + DIR_ENTRY_HEADER_SIZE]);
         dir_data[12 + DIR_ENTRY_HEADER_SIZE] = b'.';
@@ -4391,6 +4339,11 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn stats(&self) -> Result<FsStats, FsError> {
+        // A deferred free whose last pin has gone is free space: finish it
+        // first, so `df` after the last `munmap`/`close` shows it.
+        if akuma_primitives::inode_pin::unpinned_since(self.deferred.drained_at.load(Ordering::Acquire)) {
+            drop(self.write_state());
+        }
         let state = self.read_state();
         let total_blocks = state.superblock.total_blocks;
         let unallocated_blocks = state.superblock.unallocated_blocks;

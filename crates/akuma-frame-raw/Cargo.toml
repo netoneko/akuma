@@ -1,0 +1,14 @@
+[package]
+name = "akuma-frame-raw"
+version = "0.1.0"
+edition = "2024"
+description = "The three raw physical-frame operations the PMM performs on frames it owns: zero-and-clean, poison fill, poison check. Split out so akuma-pmm can forbid unsafe_code."
+
+[lints]
+workspace = true
+
+# Sits BELOW `akuma-pmm`. `akuma-primitives` for `phys_to_virt`/`physmap_contains`, `akuma-cpu` for the
+# cache-clean instructions.
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-cpu = { path = "../akuma-cpu" }

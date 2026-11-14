@@ -54,9 +54,7 @@ ssh -o StrictHostKeyChecking=no -p 2222 root@localhost
 Port derives from `INSTANCE` (host `2222` → guest `:22` for INSTANCE=0). For
 the devbox/rump, use `-p 2223` (`RUMP_SSH_PORT`).
 
-> **`-p 2222` is correct on every profile**, but two different servers answer
-> it. On `extreme-size` it is the built-in (in-kernel) server; on every other
-> profile the built-in server is compiled out and the userspace `/bin/sshd`
+> **`-p 2222` is correct on every profile.** The userspace `/bin/sshd`
 > takes guest `:22`, started by herd from
 > `bootstrap/etc/herd/enabled/sshd.conf`. A disk populated before 2026-08-10
 > still has that config on `--port 23` and answers on `-p 2323` instead —
@@ -67,7 +65,7 @@ After a disk rebuild (new host key): `ssh-keygen -R "[localhost]:2222"`.
 
 ## Verify
 
-- `[Main] sshd started (tid=N)` (extreme: kernel spawns it) or `[herd] Started sshd`
+- `[herd] Started sshd`
   (herd-managed images) in the log — boot-to-SSH readiness. The old
   `[SSH Server] Listening` marker belonged to the in-kernel server, deleted
   2026-08-10; nothing prints it any more.

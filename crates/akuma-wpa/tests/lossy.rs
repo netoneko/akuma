@@ -4,7 +4,7 @@
 //! that three beacons miss a network, the access point resends message 3
 //! two or three times, and the link drops every so often (ryzen boots
 //! 16–47, `docs/reference/subsystems/wifi.md`). This file puts
-//! [`Supplicant`] and the kernel station's EAPOL policy (`amd64/src/
+//! [`Supplicant`] and the kernel station's EAPOL policy (`crates/akuma-kernel-amd64/src/
 //! rtw89_sta.rs`, `attempt` and `idle`) through the same conditions on the
 //! host, many thousands of times, with the knobs turned past what the real
 //! link does:

@@ -164,7 +164,7 @@ negative-control build produced.
 - **`close` cannot fold at all yet: the pipe tables are different.** Glue's
   `sys_close` closes a `PipeRead`/`PipeWrite` through
   `akuma_syscalls_glue::pipe`, whose table is its own `static`. This target has
-  its own — `amd64/src/pipe.rs`, a `PipeTable<()>` in its own `static`, with
+  its own — `crates/akuma-kernel-amd64/src/pipe.rs`, a `PipeTable<()>` in its own `static`, with
   its own ids. A folded `close` would hand this kernel's pipe id to the other
   kernel's table: not an error, a **wrong pipe**. Sharing the pipe table is its
   own extraction and its own batch.

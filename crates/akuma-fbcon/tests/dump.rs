@@ -36,10 +36,14 @@ fn console(w: usize, h: usize) -> Console<Mem> {
     con.set_bg(Rgb::new(0x08, 0x0C, 0x14));
     con.clear();
     con.set_margin(0, 0);
+    // AKUMA_FBCON_CONF="smooth = gray" etc.: render a config variant.
+    if let Ok(conf) = std::env::var("AKUMA_FBCON_CONF") {
+        con.apply_config(&akuma_fbcon::config::ConsoleConfig::parse(&conf));
+    }
     con
 }
 
-const ART: &str = include_str!("../../../amd64/src/akuma_40.txt");
+const ART: &str = include_str!("../../../crates/akuma-kernel-amd64/src/akuma_40.txt");
 
 #[test]
 #[ignore = "writes images; run on demand"]
@@ -62,7 +66,8 @@ fn dump_frames() {
     }
 
     // Text: scripts, symbols, emoji, boxes.
-    let mut con = console(1920, 1080);
+    for (name, w, h) in [("text", 1920, 1080), ("text-4k", 3840, 2160)] {
+    let mut con = console(w, h);
     con.write_str_bytes(
         "\x1b[1;36mUnicode on the TV\x1b[0m\r\n\r\n\
          Latin     : café naïve Łódź Žluťoučký Việt\r\n\
@@ -78,5 +83,6 @@ fn dump_frames() {
                      └──┴──┘ ╚══╩══╝\r\n\
          \x1b[7m reverse \x1b[0m \x1b[1mbold\x1b[0m \x1b[4munder\x1b[0m \x1b[31mred\x1b[32mgreen\x1b[34mblue\x1b[0m\r\n",
     );
-    ppm(&dir, "text", &con.into_surface());
+    ppm(&dir, name, &con.into_surface());
+    }
 }

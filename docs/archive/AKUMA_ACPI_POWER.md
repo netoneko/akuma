@@ -27,7 +27,7 @@ the kernel exposes. This is the kernel half. Prior art, all of it used here:
 | ACPI table walk (RSDP, XSDT, MADT) | `crates/akuma-ryzen-amd64/src/acpi.rs` | existed |
 | **DSDT lookup** through the FADT | same file, `acpi::dsdt` | new — no root table lists the DSDT, and it is where the battery's AML lives |
 | **`akuma-power`** crate: AML `OperationRegion` finder, EC block decode, `/proc/power` text, simulator | `crates/akuma-power/` | new, 13 host tests, `forbid(unsafe_code)`, no allocation |
-| kernel glue: scan tables, map the window, register the file | `amd64/src/power.rs` | new |
+| kernel glue: scan tables, map the window, register the file | `crates/akuma-kernel-amd64/src/power.rs` | new |
 | **`/proc/power`** | `akuma-vfs-glue` `set_power_renderer` + five sites in `proc.rs` | new; absent on kernels that never register a renderer (every AArch64 target) |
 | `KCMDLINE="…" sh amd64/run.sh` | `amd64/run.sh` | new — appends bare flags to the QEMU command line |
 

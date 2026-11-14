@@ -2,7 +2,7 @@
 
 **Rule.** No page is both writable and executable, and a page that has been written since it was mapped can never be made
 executable. Both refusals answer `EACCES`. Stricter than Linux on purpose (Linux allows both); a JIT (V8, a JVM, LuaJIT) cannot run
-under it. Escape hatch: `wx=0` on the kernel command line restores the old behaviour (`PROT_EXEC` widens a mapping to RWX).
+under it. Escape hatch: `wx=0` on the kernel command line restored the old behaviour (`PROT_EXEC` widens a mapping to RWX). **Removed 2026-11-05** - production kernels, no JIT; W^X is now unconditional and `wx=0` is ignored.
 
 **Correction to the request that asked for it.** "taoxichuan accepts and ignores `mprotect`" was out of date: `mprotect` re-maps the PTEs
 (only `PROT_NONE` stays a no-op) and has since the CoW work. What was missing was a *policy*: `mmap` widened any `PROT_EXEC` request to
@@ -24,7 +24,7 @@ RWX, and nothing looked at what a page had been used for.
 `scripts/kvm/goose/wx_probe.c` (compile with the guest's `tcc`, run it NOT as the last command of `sh -c`: a crash in the shell's own
 process halts the machine, an old documented rule). 11 checks, all PASS on TCG: RWX mmap refused; untouched RW -> RX allowed; user-written -> RX
 refused (and still fine as data); kernel-written (`read`) -> RX refused; written -> R allowed then RX refused; mprotect RWX refused;
-anonymous RX mmap allowed; a range containing one written page is refused and the other page stays writable. With `wx=0` the RWX mmap succeeds.
+anonymous RX mmap allowed; a range containing one written page is refused and the other page stays writable. (With the since-removed `wx=0` the RWX mmap succeeded.)
 Battery (dynamic `git`, `apk`, shells under musl's loader) and `cow_leak_gate.py` (delta 0) green with the policy on.
 
 ## What it costs / what it breaks

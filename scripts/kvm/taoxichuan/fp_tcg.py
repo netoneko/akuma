@@ -37,7 +37,7 @@ GEN_TIMEOUT = int(os.environ.get("FP_GEN_TIMEOUT", "21600"))
 GUEST_K = "/tmp/tgt/x86_64-unknown-none/release/taoxichuan"
 STAGE_TAR = "/root/fp-stage.tar"
 SPARSE = ["Cargo.toml", "Cargo.lock", "build.rs", "linker.ld", ".cargo", "rust-toolchain.toml", "src", "amd64",
-          "taoxichuan", "osaka", "crates"]
+          "taoxichuan", "crates"]
 E2BIN = "/opt/homebrew/opt/e2fsprogs/sbin"
 
 

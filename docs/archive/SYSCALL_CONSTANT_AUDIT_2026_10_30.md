@@ -30,7 +30,7 @@ Checked (657 constants):
 | libakuma `aarch64_nr` (sshd's syscall layer) | AArch64 | 76 |
 | libakuma `x86_64_nr` | x86_64 | 53 |
 
-Plus literal dispatch arms in `amd64/src/usermode.rs` and `taoxichuan/src/*.rs` against the call
+Plus literal dispatch arms in `crates/akuma-kernel-amd64/src/usermode.rs` and `taoxichuan/src/*.rs` against the call
 their comment names, and explicit `name = N` / `name (N)` / `x86_64 N` claims in comments of those
 files and of the two x86_64 tables. Other userspace (probes, `paws`, `klogd`) is out of scope;
 sshd reaches the kernel through libakuma, which is in.
@@ -80,7 +80,7 @@ shared name is how the next wrong number gets written.
 ### 5. NOTE — literal arms outside any table
 
 `taoxichuan/src/main.rs`: `26 =>` (`msync`), `40 =>` (`sendfile`), `326 =>` (`copy_file_range`);
-`amd64/src/usermode.rs`: 31 native literal arms (`arch_prctl` 158, `stat`/`lstat`, `msync` 26,
+`crates/akuma-kernel-amd64/src/usermode.rs`: 31 native literal arms (`arch_prctl` 158, `stat`/`lstat`, `msync` 26,
 `settimeofday` 164, `pidfd_*` …). All numbers are correct; they are invisible to the abi table's
 round-trip tests, which is the gap finding 1 fell through.
 

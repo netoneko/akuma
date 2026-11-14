@@ -121,9 +121,70 @@ pub fn classify_spawn_failure(policy: Policy, restart_count: u32) -> Outcome {
     }
 }
 
+/// A run at least this long was healthy: the next failure starts the backoff over.
+pub const HEALTHY_RUN_MS: u64 = 30_000;
+
+/// The longest a quick-failing service waits between tries.
+pub const MAX_BACKOFF_MS: u64 = 60_000;
+
+/// Quick failures in a row, after a service that ran for `ran_ms` ended (a spawn
+/// that failed ran for 0). A healthy run clears the streak; a quick one adds to it.
+#[must_use]
+pub const fn next_streak(streak: u32, ran_ms: u64) -> u32 {
+    if ran_ms >= HEALTHY_RUN_MS { 0 } else { streak.saturating_add(1) }
+}
+
+/// How long to wait before the restart that follows `streak` quick failures in a
+/// row: `base_ms` for the first, doubling for each one after it, never more than
+/// [`MAX_BACKOFF_MS`] (or `base_ms`, if that is configured longer).
+///
+/// Without it a service that cannot start was retried every `restart_delay_ms`
+/// (1 s by default) for as long as herd ran: 69 tries a minute for a service the
+/// kernel refuses outright, each one a spawn, a log line and a reap.
+#[must_use]
+pub fn restart_delay_ms(base_ms: u64, streak: u32) -> u64 {
+    let doublings = if streak == 0 { 0 } else { (streak - 1).min(16) };
+    base_ms.saturating_mul(1u64 << doublings).min(MAX_BACKOFF_MS.max(base_ms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_first_quick_failure_waits_the_configured_delay() {
+        assert_eq!(restart_delay_ms(1000, next_streak(0, 0)), 1000);
+    }
+
+    #[test]
+    fn quick_failures_in_a_row_double_up_to_the_cap() {
+        let mut streak = 0;
+        let mut delays = [0u64; 9];
+        for d in &mut delays {
+            streak = next_streak(streak, 5);
+            *d = restart_delay_ms(1000, streak);
+        }
+        assert_eq!(delays, [1000, 2000, 4000, 8000, 16_000, 32_000, 60_000, 60_000, 60_000]);
+    }
+
+    #[test]
+    fn a_healthy_run_starts_the_backoff_over() {
+        assert_eq!(next_streak(7, HEALTHY_RUN_MS), 0);
+        assert_eq!(restart_delay_ms(1000, next_streak(7, HEALTHY_RUN_MS)), 1000);
+        assert_eq!(next_streak(7, HEALTHY_RUN_MS - 1), 8);
+    }
+
+    #[test]
+    fn a_configured_delay_longer_than_the_cap_is_kept() {
+        assert_eq!(restart_delay_ms(120_000, 5), 120_000);
+    }
+
+    #[test]
+    fn a_long_streak_does_not_overflow() {
+        assert_eq!(restart_delay_ms(1000, u32::MAX), MAX_BACKOFF_MS);
+        assert_eq!(restart_delay_ms(u64::MAX, 40), u64::MAX);
+        assert_eq!(next_streak(u32::MAX, 0), u32::MAX);
+    }
 
     const SUPERVISED: Policy = Policy { oneshot: false, restart: true, max_retries: 0 };
 

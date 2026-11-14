@@ -24,6 +24,9 @@ that currently work:
   smapsdirty            /proc/self/smaps dirty accounting; prints PASS/FAIL
   mmaplazy              demand-paged file mappings: late pages, unlink-while-
                         mapped, mprotect splits, fork; prints [OK]/[FAIL]
+  mapfixed              MAP_FIXED over a live mapping: zero-filled, gone after
+                        munmap, and no frames held per replace; prints ok/FAIL
+  brkgrow               brk grow/shrink/refusal; prints PASS/FAIL
 
 So the verdict is layered rather than one regex:
 
@@ -44,7 +47,7 @@ can be diffed against each other, which is the comparison that actually means
 something.
 
 Usage:
-  scripts/mem_suite.py --port 2322                 # build, push, run all ten
+  scripts/mem_suite.py --port 2322                 # build, push, run them all
   scripts/mem_suite.py --port 2322 --no-build      # reuse what is in the tree
   scripts/mem_suite.py --port 2322 --only mmapsum,cowstale
   scripts/mem_suite.py --port 2322 --json out.json # save digests for an A/B diff
@@ -110,6 +113,15 @@ PROBES = {
     # so it takes a path rather than reading `mem_suite_data` — the unlink arm
     # has to be free to delete what it mapped.
     "mmaplazy":             ("/tmp", 300),
+    # MAP_FIXED over a live mapping: the replaced pages must be freed, not held
+    # until exit (`docs/archive/AKUMA_MAP_FIXED_EAGER_LEAK.md`).
+    "mapfixed":             ("", 300),
+    # mprotect after fork: a private page re-granted write stays copy-on-write,
+    # a MAP_SHARED one stays shared (`docs/archive/AKUMA_MPROTECT_CONVERGENCE.md`).
+    "cowprotect":           ("", 300),
+    # brk: grow, shrink-then-regrow zeroed, refused over a mapping and when huge
+    # (`docs/archive/AKUMA_ONE_BRK.md`).
+    "brkgrow":              ("", 120),
 }
 
 SSH_BASE = ["ssh", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",

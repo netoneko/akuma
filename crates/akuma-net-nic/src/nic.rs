@@ -30,7 +30,7 @@
 //! | untouched by the driver until completion | the [`FrameLease`] the NIC holds for the device's whole ownership window |
 //! | same buffer at completion | the lease *is* the buffer; completion consumes it |
 //!
-//! So `post_rx`/`complete_rx`/`submit_tx`/`complete_tx` have safe signatures
+//! So `post_rx`/`complete_rx` have safe signatures
 //! that are not lies, and the raw `unsafe` calls appear exactly once each, in
 //! this file. Everything else in the crate calls them safely.
 //!
@@ -67,33 +67,18 @@ impl Nic {
         self.inner.mac_address()
     }
 
-    /// Write the virtio net header into `buf`, returning its length.
-    ///
-    /// Needed by the ring transmit path: `transmit_begin` sends the buffer
-    /// verbatim, unlike `send`, which prepends its own header.
-    pub fn fill_buffer_header(&self, buf: &mut [u8]) -> usize {
-        self.inner.fill_buffer_header(buf).unwrap_or(0)
-    }
-
     /// The token of a receive the device has finished, if any. Does not consume
     /// it — `complete_rx` does.
     pub fn poll_receive(&mut self) -> Option<u16> {
         self.inner.poll_receive()
     }
 
-    /// The token of a transmit the device has finished, if any.
-    pub fn poll_transmit(&mut self) -> Option<u16> {
-        self.inner.poll_transmit()
-    }
-
     /// Blocking transmit: `add_notify_wait_pop`, which spins until the host has
     /// consumed the descriptor.
     ///
     /// Safe upstream because the buffer is released before it returns — that is
-    /// exactly what makes it blocking, and why the ring path exists. Must never
-    /// be interleaved with `submit_tx` on the same device: `send` pops the used
-    /// ring by head token and fails with `WrongToken` when anything else is in
-    /// flight, leaking the descriptor chain (`virtio_rings::TxRing::claim`).
+    /// exactly what makes it blocking. The asynchronous transmit ring
+    /// (`net-noalloc`) measured worse end to end and was removed 2026-11-11.
     pub fn send_blocking(&mut self, frame: &[u8]) -> bool {
         self.inner.send(frame).is_ok()
     }
@@ -147,53 +132,5 @@ impl Nic {
             return None;
         }
         Some((hdr_len, pkt_len))
-    }
-
-    /// Submit `len` bytes (virtio header included) from a leased arena slot.
-    ///
-    /// On success the lease is handed back alongside the token and must be kept
-    /// until [`Self::complete_tx`]. On refusal the lease comes back unconsumed
-    /// so the caller can reuse the slot immediately.
-    #[allow(clippy::type_complexity)]
-    pub fn submit_tx<const S: usize, const L: usize>(
-        &mut self,
-        lease: FrameLease<'static, S, L>,
-        len: usize,
-    ) -> Result<(u16, FrameLease<'static, S, L>), FrameLease<'static, S, L>> {
-        let len = len.min(lease.len());
-        // SAFETY: as `post_rx` — a `static` arena slot whose exclusive borrow
-        // the returned lease holds for the device's ownership window, handed
-        // back verbatim to `complete_tx`.
-        match unsafe { self.inner.transmit_begin(&lease[..len]) } {
-            Ok(token) => Ok((token, lease)),
-            Err(_) => Err(lease),
-        }
-    }
-
-    /// Complete a transmit started with `submit_tx`.
-    ///
-    /// `len` must be the length that was submitted: `pop_used` walks the
-    /// descriptor chain to unshare it, so a different length unshares the wrong
-    /// range.
-    ///
-    /// On failure the lease comes **back** rather than being dropped, and that
-    /// is deliberate. A refused completion means the token/descriptor map has
-    /// desynchronised, so the device may still own the buffer; releasing the
-    /// slot would hand it to the next transmit while DMA is potentially live.
-    /// Holding the lease leaks one slot instead, which is what the ring did
-    /// before this wrapper existed and is the safe direction.
-    pub fn complete_tx<const S: usize, const L: usize>(
-        &mut self,
-        token: u16,
-        lease: FrameLease<'static, S, L>,
-        len: usize,
-    ) -> Result<(), FrameLease<'static, S, L>> {
-        let len = len.min(lease.len());
-        // SAFETY: same buffer and same length as the matching `submit_tx`.
-        if unsafe { self.inner.transmit_complete(token, &lease[..len]) }.is_ok() {
-            Ok(())
-        } else {
-            Err(lease)
-        }
     }
 }

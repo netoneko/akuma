@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Taoxichuan: the kernel the minimal-self-hosting experiment built (self-hosting fixed point 2026-10-31), now one main.rs over akuma-tokio-kernel."
 
-# Not in `default-members`: like `akuma-amd64`, this is an x86_64-only bin the
-# default (aarch64) build must never reach.
+# Not in `default-members`: a kernel bin built per target (`--target x86_64-unknown-none` or,
+# since B21 A5.2, `aarch64-unknown-none`), which the default build must never reach.
 [lints]
 workspace = true
 
@@ -14,11 +14,15 @@ workspace = true
 no-tests = ["akuma-tokio-kernel/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`).
 trace-err = ["akuma-tokio-kernel/trace-err"]
+# The PMM's use-after-free instruments (quarantine, premature-free check, CoW ledger).
+pmm-forensics = ["akuma-tokio-kernel/pmm-forensics"]
 default = ["shell"]
 # The calls a shell and its tools make and no tokio program does: the images run busybox and bash.
 # Without it the kernel serves the tokio surface B10's census measured
 # (`docs/archive/TAOXICHUAN_B10_SYSCALL_CENSUS.md`).
 shell = ["akuma-tokio-kernel/shell"]
+# aarch64 under Firecracker: the memory map, and the link base build.rs passes.
+platform-firecracker = ["akuma-tokio-kernel/platform-firecracker"]
 
 [dependencies]
 # Everything: boot, traps, memory, processes, signals, SMP, and the default devices.

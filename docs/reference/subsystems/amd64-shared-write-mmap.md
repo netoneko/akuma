@@ -1,17 +1,17 @@
-# Writable `MAP_SHARED` file mappings (amd64)
+# Writable `MAP_SHARED` file mappings (both kernels)
 
 **Grade: C** — landed 2026-09-22, verified on bare metal the same day, one
 caller (ParityDB via akuma-miot's `storeprobe`) exercised end to end. Made
 coherent across processes 2026-10-03 (§ "Shared between mappers"); SQLite's
 multi-process WAL and concurrent goose sessions verified on the metal.
 
-> **aarch64, same day:** the `mmap::plan` change below is *shared*, and it
-> silently broke aarch64. Its lazy-file path never registered shared-writable
-> mappings for write-back, so a clean close lost every write. aarch64 now has
-> the same present-page write-back contract on its own `SharedFileMapping`
-> record (`akuma-syscalls-glue/src/mem.rs`), plus the missing `fadvise64`
-> arm. See [`../../archive/MIOT_MESH_ON_AKUMA.md`](../../archive/MIOT_MESH_ON_AKUMA.md)
-> §1. A change to `mmap::plan` must be checked against **both** dispatchers.
+> **Both kernels since 2026-11-12.** The design below began on amd64; step 6 of
+> `proposals/AKUMA_MM_CONVERGENCE.md` made it AArch64's too and deleted AArch64's
+> `SharedFileMapping` record (private frames, eager, single-mapper write-back). The table is
+> `crates/akuma-exec/src/shm.rs`, `mmap`/`munmap`/`msync`/`madvise` are glue's, and the two
+> fault paths each call `shm::fault_page`/`shm::map_existing`
+> ([`../../archive/AKUMA_ONE_SHARED_WRITABLE_TABLE.md`](../../archive/AKUMA_ONE_SHARED_WRITABLE_TABLE.md)).
+> A change to `mmap::plan` must still be checked against **both** fault paths.
 
 `mmap(MAP_SHARED, PROT_WRITE)` on a regular file used to be `ENOSYS` on this
 target: coherence needs either a page cache or write-back, and neither
@@ -25,37 +25,42 @@ since 2026-10-03 the demand-paged pages are **shared between every mapper**
   back") and was wrong in the other direction: parity-db maps
   `len + ~1 GiB` of **reserve address space** per file, and an eager fill of
   that is a gigabyte of zero frames.
-- `amd64/src/mm.rs::sys_mmap` refuses a shared-writable request whose fd is
-  not opened for writing (`EACCES`) or has no write identity — a `/dev` node,
+- glue's `sys_mmap` refuses a shared-writable request whose fd is
+  not opened for writing (`EACCES`) or has no inode — a `/dev` node,
   or no path. The region then carries **both** records: `file` (the
   `FileBacking` the demand-fill reads from, per fault, with the file's
   *current* bytes) and `shared_write` (a `MmapRegion::SharedWriteBack`:
   mount, inode, offset, path).
 - Write-back runs on **`munmap`** (`unmap_range`, which snapshots the
   overlapping shared-writable regions *before* detaching anything), on
-  **`msync`** (`mm::sys_msync`, x86_64 nr 26, routed before the shared table
-  because asm-generic has no msync number and the abi table's invariant is
-  "a variant only exists if it has a number on both architectures"), and on
-  **`madvise(MADV_DONTNEED)`** (`dontneed_range` flushes a page before
-  zeroing it). The flush walks the region's **present leaves** — not the
+  **`msync`** (glue `sys_msync`), and on
+  **`madvise(MADV_DONTNEED)`** (`release_shared_write` flushes and drops the
+  caller's table pages, never zeroing them). The flush walks the region's **present leaves** — not the
   region's frame list, which an eager fill does not populate and a CoW break
   does not update — and writes each page whose offset is below the file's
   size *queried at flush time* through `akuma_vfs_glue::write_at`. No dirty
   tracking: whole pages, I/O spent, never bytes miswritten.
-- `madvise`/`msync` flushing does ext2 I/O with no region or address-space
+- Write-back reads the file's size through the fd's inode (`metadata_open_file`), and
+  flushing does ext2 I/O with no region or address-space
   lock held: the walk collects, the locks drop, then the writes run.
 
 ## Shared between mappers (since 2026-10-03)
 
 A lazy shared-writable region (both `file` and `shared_write` set; the normal case) is served from
 the **shared writable page table**: `crates/akuma-fpcache-rw` holds the decisions (host-tested)
-and `amd64/src/shmpages.rs` the lock, the refcounts and the copies. Every process that maps page
+and `akuma_exec::shm` the lock, the refcounts and the copies, for both kernels. Every process that maps page
 `p` of a file maps **one frame**, writable and never CoW-marked, for as long as any of them maps
 it. That is the coherence SQLite's WAL index (`-shm`) depends on.
 
 - **Lifetime.** An entry exists exactly while some address space maps its frame. The count is the
-  PMM's CoW refcount (`1 + mappers`). `munmap`, exit and `execve` write back, then `reap` the
-  entry once its last mapping goes. Nothing evicts it for capacity.
+  PMM's CoW refcount (`1 + mappers`). `munmap`, exit and `execve` write back, then reap the
+  entries whose frames the unmap released (`shm::reap_released`), never by a blanket sweep: an
+  entry nobody maps may hold a killed mapper's unflushed stores. Nothing evicts it for capacity.
+- **Readers.** A page of a read-only (or private read-only) mapping of the same file maps the
+  table's frame while an entry exists (`shm::map_existing`), the page straddling EOF included, as
+  Linux's one page cache would give it. A private *writable* mapping never does: its stores would
+  land in every mapper. On AArch64 `PROT_READ` is EL0-executable, so an executable mapping takes
+  this path too and the fault does the I-cache maintenance.
 - **Fill.** A miss reads the file's *current* page, so a mapping made before the file grew still
   sees the new bytes, and publishes it. A lost publish race adopts the winner's frame. A
   `write(2)` that races the fill is caught by per-inode-bucket generations and the page is re-read.
@@ -94,21 +99,19 @@ before being sized, mapped untouched in one process, and written by another that
 
 - **`read(2)` does not see a mapping's unflushed stores.** Writes flow file → frames, never
   frames → file, except by write-back (`munmap`, `msync`, `MADV_DONTNEED`, exit, `execve`).
-- **Read-only and private mappings are not part of the table.** A `PROT_READ` `MAP_SHARED` and
-  any `MAP_PRIVATE` mapping of the same file are served by `akuma-fpcache` or by private fills,
-  and can hold a page older than a peer's shared-writable frame. SQLite with `mmap_size > 0` maps
-  its main database this way. goose's build cannot (`MAX_MMAP_SIZE=0`).
+- ~~**Read-only and private mappings are not part of the table.**~~ **Corrected 2026-11-12:**
+  a read-only fault maps the table's frame while a writer has one (§ "Readers"). What remains: a
+  reader that faulted its page *before* the writer's first fault keeps the file's older bytes
+  until it faults again.
 - ~~**A rename under a live mapping** makes its write-backs skip.~~ **Corrected 2026-10-08:**
   write-back goes by inode once the path no longer names it (above). What remains: an
   **overlay** box writes by inode to its upper layer only, so a write-back to a file that lives
   in a lower layer and has lost its name is refused rather than written into the shared image.
 - **Stores past the file's current EOF** are dropped by the write-back. The caller extends with
   `ftruncate` or `write`, as parity-db and SQLite both do.
-- **A mapping whose fd has no inode identity** stays eager and private, with the single-mapper
-  write-back contract this doc originally described.
-- **AArch64 is a different implementation**: its own `SharedFileMapping` record in
-  `akuma-syscalls-glue/src/mem.rs`, private frames, and its copying fork. None of the above
-  applies there.
+- **A mapping whose fd has no inode identity** is refused (`EACCES`).
+- **A process killed with unflushed table pages** leaves them in the table, unflushed, until
+  another mapper flushes or the inode is freed.
 
 ## The three bugs this uncovered (all fixed same day)
 

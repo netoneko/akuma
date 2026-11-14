@@ -472,9 +472,10 @@ fn the_hd_cut_has_the_same_shapes_as_the_default() {
             f.cell_cp(c).iter().map(|&v| f64::from(v)).sum::<f64>() / 255.0 / (f.width() * f.height()) as f64
         };
         let (a, b) = (mass(sd), mass(hd));
-        // Ink fraction of the cell agrees to within ~35%: the HD cut carries the
-        // coverage boost, so it is a little heavier on edges, never lighter.
-        assert!(b >= a * 0.95 && b <= a * 1.35, "{c:#x}: ink {a:.3} vs {b:.3}");
+        // Ink fraction of the cell agrees to within ~15%: both cuts carry the same
+        // coverage curve (`HD_COVERAGE_GAMMA`, the macOS-style stem darkening), and
+        // the finer cut has proportionally fewer partial-coverage edge pixels to boost.
+        assert!(b >= a * 0.85 && b <= a * 1.15, "{c:#x}: ink {a:.3} vs {b:.3}");
     }
 }
 

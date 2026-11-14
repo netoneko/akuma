@@ -247,7 +247,7 @@ Two gaps explain it, and neither is ext2's write-back logic (`rename` ends in
 * **`sync(2)` is not dispatched on amd64** — x86_64 162 has no
   `syscall_table!` row, so `busybox sync` gets `ENOSYS` silently.
 * **Nothing ever sends SCSI `SYNCHRONIZE CACHE`** to the USB disk
-  (`akuma-usb-storage`, `amd64/src/xhci.rs`), and `amd64/src/reboot.rs`
+  (`akuma-usb-storage`, `crates/akuma-kernel-amd64/src/xhci.rs`), and `crates/akuma-kernel-amd64/src/reboot.rs`
   flushes nothing before resetting. A USB bridge/drive with a volatile write
   cache acknowledges a `WRITE(10)` before the data is on the media; a reset
   (which can cut port power) loses whatever it had not written yet, in its own

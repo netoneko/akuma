@@ -1,7 +1,7 @@
 //! `struct sockaddr_in` as it crosses the user boundary, and the errno convention of the
 //! socket arms - the rules, not the copy.
 //!
-//! Both kernels' `sock.rs` (`amd64/src/sock.rs`, `taoxichuan/src/sock.rs`) carried the same three
+//! Both kernels' `sock.rs` (`crates/akuma-kernel-amd64/src/sock.rs`, `taoxichuan/src/sock.rs`) carried the same three
 //! functions: decode a user `sockaddr_in`, encode one, and turn `akuma-net`'s positive errno
 //! into the kernel's negative return. The first two did it with `unsafe`
 //! (`read_unaligned` of a `repr(C)` struct, `from_raw_parts` over one) for sixteen bytes of

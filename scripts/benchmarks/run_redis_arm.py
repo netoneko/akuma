@@ -3,7 +3,7 @@
 
 Sibling of `run_nic_ab.py` (HTTP round trips); this one drives the **pipelined**
 workload, which is the shape `AKUMA_NET_ISSUES.md` §7 says the static rings
-(`net-noalloc`) should suit and which was never measured.
+(`net-noalloc`, since removed) should suit.
 
 Redis comes from apk (`apk add redis`), not `box pull` — that is Issue 18 in
 DEVBOX_ISSUES and is still open. The server runs on guest port 4444, which the
@@ -31,7 +31,7 @@ def ssh(cmd, timeout=120):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--label", required=True)
-    ap.add_argument("--features", default="devbox-smoltcp,no-tests,net-profile")
+    ap.add_argument("--features", default="no-tests,net-profile")
     ap.add_argument("--requests", type=int, default=20000)
     ap.add_argument("--clients", type=int, default=20)
     ap.add_argument("--pipelines", default="1,16")

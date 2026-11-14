@@ -55,7 +55,7 @@ walker here.
 `SHOOTDOWN_SEND`/`SHOOTDOWN_WAIT` (pre-edit lib.rs:910/924) were
 `AtomicUsize` + `transmute::<usize, fn(…)>` on read. They are now
 `akuma_primitives::OnceCopy<ShootdownSend>` / `<ShootdownWait>` (lib.rs:887-889);
-`set_shootdown_hooks` (lib.rs:895) fills them once per boot from `amd64/src/boot.rs:220`, and
+`set_shootdown_hooks` (lib.rs:895) fills them once per boot from `crates/akuma-kernel-amd64/src/boot.rs:220`, and
 readers use `let Some(send) = SHOOTDOWN_SEND.get() else …`. `OnceCopy::set` is first-wins,
 which matches the once-per-boot contract that was already in force. Two transmutes, zero new
 mechanism — `akuma_primitives` was already a dependency.
@@ -95,7 +95,7 @@ Budget (`docs/reference/unsafe-budget.json`, ratcheted with one `--update` run):
   transmutes, one TTBR0 block from the merge, the free `shatter` header, the free `demote`
   header; nothing added).
 - `crates/akuma-exceptions`: **38 → 29** (the nine call-site blocks).
-- `amd64/src`: 79 → 81 in the same `--update`. **Disclosed, not mine:** that +2 came in with
+- `crates/akuma-kernel-amd64/src`: 79 → 81 in the same `--update`. **Disclosed, not mine:** that +2 came in with
   the kvm-ladder commits already on this branch (`bbaa81d1` et seq.) and predates this work;
   the single `--update` run required by the audit absorbs it into the budget file. The
   increase itself is unreviewed here and remains the kvm branch's to justify.

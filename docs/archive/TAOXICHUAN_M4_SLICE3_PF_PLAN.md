@@ -145,7 +145,7 @@ Composition rule accounting (say which for each piece): Fix B decisions = **pull
 glue + stand-in = **written new** (composition root's job; amd64 has no twin of these
 arms); grandfork = **pulled as-is** (existing userspace probe); devroot-ensure bake
 env var = **written new** ~10 lines in an existing host tool. Nothing is extracted
-from `amd64/src/` (nothing needed lives only there — park/wake are already
+from `crates/akuma-kernel-amd64/src/` (nothing needed lives only there — park/wake are already
 `akuma-threading` API). `amd64/` untouched ⇒ its check stays green; run once to
 confirm. `wc -l taoxichuan/src/*.rs` at start (**7618**) and end.
 

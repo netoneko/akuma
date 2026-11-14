@@ -4,7 +4,7 @@
 //! The same split as every other control surface in the tree (`akuma-wifi`'s
 //! command verbs, `akuma-kacho`'s policy decode): the *decision* — which lines
 //! are well-formed, what each clamps to, what is refused — is pure and
-//! host-tested here; the kernel side (`amd64/src/power.rs`) only applies what
+//! host-tested here; the kernel side (`crates/akuma-kernel-amd64/src/power.rs`) only applies what
 //! this module accepted. One line is `key=value`, newline-terminated, in the
 //! shape `wifi` and the heredoc-ish `/proc` knobs established.
 //!

@@ -8,7 +8,6 @@ edition = "2024"
 # native stack. The kernel disables it for the devbox (rump-only) by depending on
 # this crate with `default-features = false` and NOT re-enabling `smoltcp`.
 default = ["smoltcp"]
-small-sockets = ["akuma-net-nic/small-sockets"]
 # Device-level NIC instrumentation (`nicstat`): per-packet RX/TX/poll timing and
 # byte counts, plus how long blocking socket waits park in `blocking_relax`.
 # MEASUREMENT BUILDS ONLY — never ship it. Off by default and every recorder is
@@ -16,63 +15,18 @@ small-sockets = ["akuma-net-nic/small-sockets"]
 # (same discipline as the kernel's `bkl-profile`). Forwarded from the kernel's
 # feature of the same name; the kernel prints the windowed delta as `[NICSTAT]`.
 net-profile = ["akuma-net-nic/net-profile"]
-# Static RX/TX frame rings + a non-blocking transmit path (`virtio_rings`).
-# OFF by default; forwarded from the kernel feature of the same name, which is
-# NOT in the kernel's `default` set either.
-#
-# Without it the device has ONE 2 KB receive buffer and ONE 2 KB transmit
-# buffer, which forces `VirtIONetRaw::send` — a spin until the host consumes the
-# descriptor, executed with `NETWORK` held and local IRQs masked. With it,
-# frames are staged in a BSS-resident ring and submitted with `transmit_begin`,
-# whose completion is reaped on a later pass.
-#
-# That halves the time the network stack holds its lock (measured: 472 ms ->
-# 211 ms of poll per 5 s window, tx wait 27.8 -> 9.2 us/pkt) but end-to-end HTTP
-# p90 got 2.9x WORSE, so it stays off pending the wake-latency work. Full
-# numbers and the hypothesis: the kernel's `net-noalloc` entry in the root
-# Cargo.toml, and docs/archive/AKUMA_NET_ISSUES.md §7.
-#
-# Costs ~32 KB of BSS (8 + 8 slots of 2 KB).
-net-noalloc = ["akuma-net-nic/net-noalloc"]
-# Park blocking socket waiters with a registered waker (`schedule_blocking`)
-# instead of `blocking_relax`. OFF — it MEASURED WORSE. See the kernel feature
-# of the same name in the root Cargo.toml for the numbers and why.
-net-waker-park = []
-# Register the waiter's waker on the SMOLTCP socket instead of the kernel
-# socket's drained list, so a state change wakes it from inside process_tcp.
-# Supersedes net-waker-park when both are on. See akuma-net-yarn's ParkKind.
-net-direct-waker = []
-# Raise the per-listener backlog (socket.rs `MAX_BACKLOG`) and, on the
-# size-constrained profiles, the total socket budget (smoltcp_net.rs
-# `MAX_SOCKETS`), so a server can absorb more simultaneous *arrivals* than the
-# default 8. Costs ~1 MB of heap per listening socket, so it is opt-in.
-# Paired with `userspace/sshd`'s `fork-sessions` feature — see that crate's
-# `[features]` for why the two are turned on together.
-many-sessions = ["akuma-net-nic/many-sessions"]
-# Real shared-kernel SMP. Gates the `PreemptGuard` critical-section preemption
+# Akuma's shared-kernel SMP (`bkl-smp`). Gates the `PreemptGuard` critical-section preemption
 # guards (runtime.rs): under the Big Kernel Lock the base NETWORK/SOCKET_TABLE
 # spinlocks must never be held across a context switch. A no-op otherwise, so
-# non-SMP builds are byte-for-byte unchanged. Forwarded from the kernel's
-# `smp-shared` feature. See docs/reference/subsystems/smp-shared.md.
-smp-shared = []
-# Run native net syscalls without the Big Kernel Lock (Phase 2 of
-# docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), forwarded from the bin crate.
-# Upgrades PreemptGuard to also mask local IRQs for NETWORK/SOCKET_TABLE holds,
-# so a BKL-free core can never be caught holding an inner spinlock while a
-# nested IRQ hard-spins on the BKL (AB-BA wedge). Only meaningful with
-# `smp-shared`.
-no-bkl-network = []
-# Run the VFS paths without the Big Kernel Lock (Phase 4 of the BKL fine-grained
-# locking plan), forwarded from the bin crate so the `kernel_no_bkl_vfs` cfg
-# reaches akuma-net's `PreemptGuard` (the IRQ-masking arm fires under
-# `any(no-bkl-network, no-bkl-vfs)`). No akuma-net code is itself cfg-gated on
-# this — VFS lives in the kernel crate; only the guard's cfg union needs it.
-no-bkl-vfs = []
+# builds without it are byte-for-byte unchanged. See
+# docs/reference/subsystems/smp-shared.md.
+bkl-smp = []
 # The native smoltcp TCP/IP stack: the smoltcp_net/socket/dns/http modules and
 # everything with smoltcp types in its signatures. Optional so a rump-only build
 # (devbox) can compile it out entirely. The rump path (rump_tap + the kernel
-# sysproxy client) is smoltcp-free and stays available without this.
-smoltcp = ["dep:smoltcp"]
+# sysproxy client) is smoltcp-free and stays available without this. The DNS
+# client, the wait loop and the async stream trait are used only by those modules.
+smoltcp = ["dep:smoltcp", "dep:akuma-dns", "dep:akuma-net-yarn", "dep:embedded-io-async"]
 # Raw L2 packet path (a second virtio-net NIC exposed as /dev/net/tap0) for the
 # kernel's `rump` feature. Adds crate::rump_tap (the hardware half); the
 # device-independent orchestration lives in the host-tested `akuma-rump` crate.
@@ -94,23 +48,27 @@ akuma-rump = { path = "../akuma-rump", optional = true }
 akuma-primitives = { path = "../akuma-primitives" }
 # The DNS A-record client: wire format and the resolver-walk loop, over effects
 # this crate wires to its UDP sockets (`dns::resolve_ipv4`).
-akuma-dns = { path = "../akuma-dns" }
+akuma-dns = { path = "../akuma-dns", optional = true }
 # The virtio-net device: DMA buffers, the NIC wrapper, and smoltcp's `Device`
 # impls. Every `unsafe` in networking lives there, which is why it is a crate.
 akuma-net-nic = { path = "../akuma-net-nic" }
 # The `wait_until` readiness state machine, extracted so its five
 # incident-driven rules have host tests instead of only a devbox boot.
 # See crates/akuma-net-yarn/src/lib.rs.
-akuma-net-yarn = { path = "../akuma-net-yarn" }
+akuma-net-yarn = { path = "../akuma-net-yarn", optional = true }
 # The virtio-net driver and the MMIO probe (`smoltcp_net::init` finds NIC0).
 akuma-virtio = { path = "../akuma-virtio" }
 smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv4", "socket-tcp", "socket-udp", "medium-ethernet", "alloc", "async", "socket-dhcpv4"], optional = true }
-embedded-io-async = { version = "0.6", default-features = false }
+embedded-io-async = { version = "0.6", default-features = false, optional = true }
 spinning_top = "0.3"
 # NOT `max_level_off`: that feature elides every `log::` macro at COMPILE time,
 # which made `smoltcp_net::init` silent and a hang inside it invisible (see
 # src/klog.rs and docs/archive/AKUMA_FIRECRACKER_KVM.md §5.1). Filtering is done
 # at runtime by the sink instead. `release_max_level_info` still drops
 # debug!/trace! statically, so smoltcp's per-packet tracing costs nothing.
+# This crate's own code calls no `log::` macro: the dependency is here for that
+# feature, which cargo unifies onto every crate's `log` (it is the only crate in
+# the tree that sets it). A build in which cargo reports it as an unused
+# dependency is right about the code and wrong about the purpose; keep it.
 log = { version = "0.4", default-features = false, features = ["release_max_level_info"] }
 

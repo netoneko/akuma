@@ -1,5 +1,5 @@
 /* Link script for the guest programs the amd64 kernel loads
- * (the per-program directories under `userspace/amd64`, built by `amd64/build.rs`).
+ * (the per-program directories under `userspace/amd64`, built by `crates/akuma-kernel-amd64/build.rs`).
  *
  * 0x40_0000 is where a static Linux x86_64 binary is linked, and since Stage K
  * the kernel is in the upper half — so the program is mapped where it expects
@@ -9,7 +9,7 @@
  * .text/.rodata/.data+.bss in its own PT_LOAD *and* its own page. Without it
  * lld packs them into one page, and then a single page has to carry the union
  * of three permission sets — an executable, writable page. The kernel's loader
- * refuses that mapping (see `amd64/src/loader.rs`), so the alignment here is
+ * refuses that mapping (see `crates/akuma-kernel-amd64/src/loader.rs`), so the alignment here is
  * load-bearing rather than cosmetic: it is what real static binaries do, and
  * what makes W^X expressible at all.
  *

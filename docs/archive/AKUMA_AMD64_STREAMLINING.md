@@ -1,7 +1,7 @@
 # amd64: streamlining candidates, and the road to self-hosting
 
 **Date:** 2026-09-06
-**Scope:** a read of all 18,458 lines of `amd64/src/` plus `amd64/Cargo.toml`,
+**Scope:** a read of all 18,458 lines of `crates/akuma-kernel-amd64/src/` plus `crates/akuma-kernel-amd64/Cargo.toml`,
 taken at the point where the USB/xHCI disk work is nearly done
 (`docs/archive/AKUMA_AMD64_USB_XHCI.md`, memory note *amd64 persistent disk =
 USB/xHCI*).
@@ -49,8 +49,8 @@ they gave has expired.
 
 ## 1. The two boot paths have already diverged
 
-`kmain` (`amd64/src/main.rs:143-439`, ~296 lines) and `kmain_mb2`
-(`amd64/src/multiboot2.rs:207-582`, ~375 lines). The second one's own header
+`kmain` (`crates/akuma-kernel-amd64/src/main.rs:143-439`, ~296 lines) and `kmain_mb2`
+(`crates/akuma-kernel-amd64/src/multiboot2.rs:207-582`, ~375 lines). The second one's own header
 says:
 
 > Deliberately parallel to [`crate::kmain`], and in the same order, because that
@@ -83,7 +83,7 @@ The disk makes it worse, because root-on-`sda1` is the *bare-metal* path and
 root-on-`vda` is the *VMM* path, so the two mount sequences stop being
 cosmetically different and start being the thing under test.
 
-**Fix.** One `boot::sequence(facts: &MachineFacts) -> !` in `amd64/src/`, with
+**Fix.** One `boot::sequence(facts: &MachineFacts) -> !` in `crates/akuma-kernel-amd64/src/`, with
 the two entry points reduced to "collect the facts, call it". One
 `selftest::register_all(&mut suite, caps: Caps)` where `Caps` says what this
 machine has (disk / net / framebuffer / SMP), so a test is skipped by a
@@ -99,10 +99,10 @@ silent property of two functions into one `Caps` value.
 
 ## 2. `fd.rs` caches whole files — the disk is what invalidates that
 
-`Entry.data: Vec<u8>` (`amd64/src/fd.rs:135`) holds the **entire file** in
+`Entry.data: Vec<u8>` (`crates/akuma-kernel-amd64/src/fd.rs:135`) holds the **entire file** in
 kernel heap for the life of the descriptor. `sys_read`/`sys_lseek` work on that
 buffer; `sys_write_file` appends to it and `sys_close` is what finally persists
-it (`amd64/src/fs.rs` header, 2026-09-04).
+it (`crates/akuma-kernel-amd64/src/fs.rs` header, 2026-09-04).
 
 The module header states this as a considered divergence, and it was right at
 the time:
@@ -145,7 +145,7 @@ data-loss window that only exists because the disk was never real.
 
 ## 3. `encode_stat` hand-rolls 144 bytes of offsets with no test
 
-`amd64/src/fd.rs:1358-1390` builds `struct stat` from nine named offset
+`crates/akuma-kernel-amd64/src/fd.rs:1358-1390` builds `struct stat` from nine named offset
 constants and `copy_from_slice`. `crates/akuma-syscalls-linux/src/stat.rs`
 exists for exactly this and opens with:
 
@@ -170,7 +170,7 @@ where a `struct stat` offset is a bare literal.
 
 ## 4. The `dmesg` ring is a `static mut` with untested arithmetic — **done on amd64**
 
-`amd64/src/serial.rs:62`:
+`crates/akuma-kernel-amd64/src/serial.rs:62`:
 
 ```rust
 const KLOG_CAP: usize = 64 * 1024;
@@ -394,7 +394,7 @@ gap.
 
 ## 5. `syscall_dispatch` is two-tier: 47 raw numbers, ~30 named
 
-`amd64/src/usermode.rs:619-1140`, one function, 520 lines.
+`crates/akuma-kernel-amd64/src/usermode.rs:619-1140`, one function, 520 lines.
 
 - Lines 735-1055: **47 arms matched on the raw x86_64 number** — `158`
   (`arch_prctl`), `99` (`sysinfo`), `103` (`syslog`), `169` (`reboot`), `13`/`14`
@@ -420,7 +420,7 @@ not the other becomes a missing match arm instead of a silent `ENOSYS`.
 
 ## 6. `xhci.rs` is four layers in one 1323-line file
 
-`amd64/src/xhci.rs` currently holds:
+`crates/akuma-kernel-amd64/src/xhci.rs` currently holds:
 
 - MMIO register access (`r32`/`w32`/`w64`, the `Xhci` struct, DMA arenas)
 - controller bring-up (`init`, `bios_handoff`, `halt_controller`,
@@ -431,7 +431,7 @@ not the other becomes a missing match arm instead of a silent `ENOSYS`.
 - a block-device facade (`read_bytes`, `write_bytes`, `capacity_sectors`,
   `is_initialized`, `mbr_looks_right`)
 
-`amd64/Cargo.toml` already refers to a file that does not exist:
+`crates/akuma-kernel-amd64/Cargo.toml` already refers to a file that does not exist:
 
 > USB Mass Storage Bulk-Only Transport wire format (CBW/CSW + minimal SCSI),
 > driven over `akuma-xhci` by **`src/usb_storage.rs`**'s BOT helpers in
@@ -448,12 +448,12 @@ virtio, a data structure rather than a rewrite.
 
 ## 7. `dns.rs` is a fork of shared code carrying a live bug report
 
-`amd64/src/dns.rs`, 295 lines, header:
+`crates/akuma-kernel-amd64/src/dns.rs`, 295 lines, header:
 
 > `akuma_net::dns::resolve_host_blocking` … hung: measured 2026-09-05, a call to
 > `resolve_host_blocking` never returned even after 90 real seconds, with no
 > timeout firing. … Nothing on amd64 had ever called `smoltcp_net::dns_query`
-> before this feature (checked: zero prior call sites in `amd64/src/`), which
+> before this feature (checked: zero prior call sites in `crates/akuma-kernel-amd64/src/`), which
 > makes "this specific code path has a real, unexercised bug on this target" a
 > live possibility, not fixed here.
 
@@ -462,15 +462,15 @@ second DNS client in a tree that has one. The bug is in `akuma-net`, which
 AArch64 also uses; nobody has hit it there because that path is exercised
 differently.
 
-**Fix.** Root-cause the `dns_query` hang. Deleting `amd64/src/dns.rs` is the
+**Fix.** Root-cause the `dns_query` hang. Deleting `crates/akuma-kernel-amd64/src/dns.rs` is the
 by-product; fixing a real hang in the shared stack is the point.
 
 ---
 
 ## 8. `ramdisk.rs` and `RootDevice::Ram` are about to be dead weight
 
-`amd64/src/ramdisk.rs` (91 lines), `fs::RootDevice::Ram`
-(`amd64/src/fs.rs:102`), `kmain_mb2`'s whole "an ext2 image the boot loader left
+`crates/akuma-kernel-amd64/src/ramdisk.rs` (91 lines), `fs::RootDevice::Ram`
+(`crates/akuma-kernel-amd64/src/fs.rs:102`), `kmain_mb2`'s whole "an ext2 image the boot loader left
 in RAM" premise, and the `amd64/mkdisk.sh` machinery that bakes that image into
 the boot media, all exist for one reason: *the bare-metal box had no storage
 driver*. Once `sda1` mounts, they are a fallback for a case that no longer
@@ -497,7 +497,7 @@ file has become hard to move around in.
 (fork/exec/spawn/wait/`Spawn` table), `usermode/tests.rs`. Pure mechanics, no
 behaviour change.
 
-Also: `amd64/src/fd.rs:1684` is a rustfmt-mangled line —
+Also: `crates/akuma-kernel-amd64/src/fd.rs:1684` is a rustfmt-mangled line —
 `fn poll_ready(fd: u64) -> (bool, bool) {    if fd == 0 {`.
 
 ---
@@ -510,7 +510,7 @@ Also: `amd64/src/fd.rs:1684` is a rustfmt-mangled line —
   them means an abstraction over "how a byte reaches a register", which is the
   `trait Arch` shape the tree rejects. Only the `KLOG` ring inside it is shared
   material (§4).
-- **`net.rs`'s `has_rdrand`/`weak_fill`/`rng_fill`** (`amd64/src/net.rs:109-218`)
+- **`net.rs`'s `has_rdrand`/`weak_fill`/`rng_fill`** (`crates/akuma-kernel-amd64/src/net.rs:109-218`)
   is a local entropy source. Worth checking against `src/`'s RNG subsystem before
   it grows further, but not obviously duplicated today.
 - **`clock.rs`** is correctly scoped and says so: sync-once SNTP, explicitly not
@@ -534,12 +534,12 @@ PTE bit 9; three teardown sites moved to `cow_ref_dec`. 2000 forks, 0 KiB drift.
 Needs a TLB shootdown before SMP>1. See `docs/archive/AKUMA_AMD64_COW.md`.
 
 
-`Process::fork_from` (`amd64/src/usermode.rs:1767`):
+`Process::fork_from` (`crates/akuma-kernel-amd64/src/usermode.rs:1767`):
 
 > A `fork` child: a full eager copy of `parent`'s address space (every user page
 > in fresh frames — **no CoW on this target**)
 
-`amd64/src/paging.rs:387` confirms there is no per-page refcount to build one on.
+`crates/akuma-kernel-amd64/src/paging.rs:387` confirms there is no per-page refcount to build one on.
 
 `cargo` forks `rustc`; `rustc` forks the linker; every build script forks. A full
 frame-by-frame copy of a `rustc` address space, per fork, fails on time and on
@@ -558,7 +558,7 @@ and breaking CoW on the wrong one silently defeats `mprotect`
 **Closed.** A real Rust `std` binary spawns and joins a thread on this kernel
 and exits with the status Linux gives it, from the same bytes. `clone`,
 `futex`, `gettid` and a real `exit`/`exit_group` split are wired;
-`akuma-syscalls-sync` supplies the decisions and `amd64/src/{thread,futex}.rs`
+`akuma-syscalls-sync` supplies the decisions and `crates/akuma-kernel-amd64/src/{thread,futex}.rs`
 the effects. Boot suite 240 → 245 (`usermode::thread_test` +
 `userspace/amd64/threadprobe`). See `docs/archive/AKUMA_AMD64_RUST_STD.md`.
 
@@ -650,7 +650,7 @@ descriptors 0/1/2 could be *bound*, which is what `dup2` needs — see §11.8.
 
 ### 4. `mmap` is a global monotonic bump with no VA reuse
 
-`amd64/src/mm.rs:69`:
+`crates/akuma-kernel-amd64/src/mm.rs:69`:
 
 ```rust
 static NEXT_VA: AtomicU64 = AtomicU64::new(MMAP_BASE);   // MMAP_BASE = 0x1_0000_0000
@@ -666,7 +666,7 @@ refused outright. A long `rustc` run walks off the end of the window.
 `akuma_mmap::Prot` instead of a raw AArch64 PTE `u64`, and the bit tables moved
 down to `akuma_mmu::types`. `akuma-mmap` keeps its empty `[dependencies]` table
 and `#![forbid(unsafe_code)]`, builds for `x86_64-unknown-none`, and amd64
-already depends on it (`amd64/Cargo.toml:125`), so adoption needs no new edge.
+already depends on it (`crates/akuma-kernel-amd64/Cargo.toml:125`), so adoption needs no new edge.
 
 Two notes for whoever does the adoption:
 
@@ -677,7 +677,7 @@ Two notes for whoever does the adoption:
   is why they were not merged; rename the amd64 one to `PteProt` when adopting,
   or the collision will read as an oversight.
 - amd64's half of the encoding is the mirror of `akuma_mmu::user_flags::to_pte`:
-  a total match from `Prot` to x86 bits, living in `amd64/src/paging.rs`. The
+  a total match from `Prot` to x86 bits, living in `crates/akuma-kernel-amd64/src/paging.rs`. The
   AArch64 side is pinned by `prot_roundtrips_to_todays_bits`; write the
   equivalent, because a permission table is exactly the thing that looks right
   and is not.
@@ -694,7 +694,7 @@ the file's size and read all of it".
 See `docs/archive/AKUMA_AMD64_DYNAMIC_LINKING.md`.
 
 
-`amd64/src/loader.rs:404`:
+`crates/akuma-kernel-amd64/src/loader.rs:404`:
 
 ```rust
 return Err("PT_INTERP present — this kernel has no dynamic linker, only static-PIE");

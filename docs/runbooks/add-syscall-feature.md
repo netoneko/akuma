@@ -3,7 +3,7 @@
 How to add a new kernel syscall family behind a `sc-*` feature gate and keep
 all build configs in sync.
 
-> The devbox + size/extreme builds use `--no-default-features` and re-add
+> The rump devbox build uses `--no-default-features` and re-adds
 **specific** `sc-*` features. If you add a new family and forget one build
 script, that build silently drops it.
 
@@ -15,7 +15,9 @@ script, that build silently drops it.
    sc-<name> = []
    ```
    Tier 1 (pure dead weight when off) vs Tier 2 (needs an ExecRuntime stub —
-   see step 3). Default-on via the `default` list (`Cargo.toml:118-127`).
+   see step 3). Default-on by adding it to the `linux-extra-syscalls` group (in `default`) —
+   on **both** kernels: root `Cargo.toml` (which also forwards the amd64 half's feature) and
+   `crates/akuma-kernel-amd64/Cargo.toml`, so the group keeps one meaning.
 
 2. **Add the submodule** `src/syscall/<name>.rs`, gated:
    ```rust
@@ -29,13 +31,9 @@ script, that build silently drops it.
    at :451 like `eventfd_close: noop_u32`). The stub runs when the feature is
    off so callers don't link-fail.
 
-4. **Keep the build scripts in sync.** Add `sc-<name>` to the feature list in
-   **both**:
-   - `scripts/build_devbox.sh:16` (`DEVBOX_FEATURES`)
-   - `overlays/devbox/run.sh:33` (`DEVBOX_FEATURES`)
-
-   The two must match. Omitting it from the devbox means the devbox build
-   drops that syscall family.
+4. **The build scripts need nothing.** `scripts/build_devbox.sh` and
+   `overlays/devbox/run.sh` select `linux-extra-syscalls`, so a family in the
+   group reaches the devbox with no script change.
 
 5. **Verify in every profile:**
    ```bash

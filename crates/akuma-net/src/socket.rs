@@ -50,32 +50,20 @@ pub const MAX_SOCKETS: usize = 128;
 /// peer gets a RST, which a client reports as
 /// `kex_exchange_identification: read: Connection reset by peer`.
 ///
-/// It is 8 unless the `many-sessions` feature is on, which caps simultaneous
-/// arrivals at 8 regardless of how fast the server accepts — measured directly
-/// against `userspace/sshd`: clean at 8 concurrent connections, dropping 2-4 of
-/// 16. That is the binding limit on sshd's concurrency, and it sits well below
-/// sshd's `max_sessions` default of 24, so the process-per-session sshd
-/// (`userspace/sshd`'s `fork-sessions` feature) cannot reach its own limit
-/// without this raised to match.
+/// It is 8 on every build, which caps simultaneous arrivals at 8 regardless of
+/// how fast the server accepts. Measured against the process-per-session
+/// `userspace/sshd`: 8/8 connections clean, 12/16 and 17/24 at higher
+/// concurrency, so sshd's `max_sessions` default of 24 is not reachable by a
+/// burst. Lower `max_sessions`, or raise this and rebuild, if a server needs
+/// more (`userspace/sshd/docs/PROCESS_PER_SESSION.md`). The `many-sessions`
+/// feature that set it to 32 was removed 2026-11-11.
 ///
 /// Each entry costs one smoltcp socket, i.e. `TCP_RX_BUFFER_SIZE +
-/// TCP_TX_BUFFER_SIZE` = 32 KB of heap held for the listener's whole life, so
-/// 32 entries is ~1 MB per listening socket, paid by every listener in the image
-/// (`httpd` included), plus ~44 KB of BSS for the larger socket table.
-/// `many-sessions` raises `smoltcp_net::MAX_SOCKETS` alongside it — a 32-deep
-/// backlog is meaningless if the total socket budget is 32.
-///
-/// `kernel_profile_extreme` overrides the feature and keeps 8. That profile
-/// builds `--no-default-features` so it cannot pick `many-sessions` up by
-/// accident today, but the override is written explicitly so that adding the
-/// feature to its list later cannot quietly cost it a megabyte per listener
-/// against a 4 MB floor.
-#[cfg(all(feature = "smoltcp", feature = "many-sessions", not(kernel_profile_extreme)))]
-const MAX_BACKLOG: usize = 32;
-#[cfg(all(
-    feature = "smoltcp",
-    any(not(feature = "many-sessions"), kernel_profile_extreme)
-))]
+/// TCP_TX_BUFFER_SIZE` = 32 KB of heap held for the listener's whole life, paid
+/// by every listener in the image; at 32 entries that is ~1 MB per listener.
+/// Raising it also needs `smoltcp_net::MAX_SOCKETS` to cover a full backlog plus
+/// the accepted connections.
+#[cfg(feature = "smoltcp")]
 const MAX_BACKLOG: usize = 8;
 
 /// Ephemeral port range start
@@ -341,16 +329,6 @@ impl KernelSocket {
         }
     }
 
-    /// How many wakers are registered on this socket right now.
-    ///
-    /// Diagnostic, and the boot suite's evidence that a blocking waiter actually
-    /// announced itself before parking: this read zero for `accept`/`recv` until
-    /// `wait_until` started registering (docs/archive/AKUMA_NET_ISSUES.md §8).
-    #[must_use]
-    pub fn waker_count(&self) -> usize {
-        self.wakers.lock().len()
-    }
-
     /// Wake all threads waiting for I/O on this socket.
     pub fn wake_all(&self) {
         let mut wakers = self.wakers.lock();
@@ -435,18 +413,13 @@ where F: FnOnce(&KernelSocket) -> R
 /// Boot-suite hook: run [`wait_until`]'s exact wait discipline against a
 /// caller-supplied predicate.
 ///
-/// Exists because the properties that matter — a parked waiter registers itself
-/// so `wake_all` can reach it, and a waiter nothing ever wakes still returns on
-/// the backstop instead of hanging — are not reachable through the public socket
-/// API without a live TCP peer. Used by `src/process_tests.rs`.
+/// Exists because the property that matters — a waiter nothing ever wakes still
+/// returns on the backstop instead of hanging — is not reachable through the
+/// public socket API without a live TCP peer. Used by `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
 #[cfg(feature = "smoltcp")]
 #[doc(hidden)]
-pub fn wait_until_for_boot_test(
-    idx: usize,
-    condition: impl FnMut() -> bool,
-    timeout_us: Option<u64>,
-) -> Result<(), i32> {
-    wait_until(idx, condition, timeout_us)
+pub fn wait_until_for_boot_test(condition: impl FnMut() -> bool, timeout_us: Option<u64>) -> Result<(), i32> {
+    wait_until(condition, timeout_us)
 }
 
 /// Park a waker on a native (smoltcp) socket, so `wake_all` can reach it.
@@ -706,18 +679,12 @@ pub fn socket_timeout(idx: usize, is_recv: bool) -> Option<u64> {
 /// calling thread is about to block anyway. This ensures TCP ACKs, window
 /// updates, and retransmissions are processed promptly.
 ///
-/// `idx` is the socket the caller is waiting on: before parking we register the
-/// current thread's waker there, so `smoltcp_net::poll()`'s `wake_all()` can
-/// wake us directly instead of leaving us to notice on a timer.
-///
-/// **Ordering is load-bearing.** Register, THEN re-check, THEN park. A wake that
-/// lands between a check and the park is lost if the waker is not in the list
-/// yet, and a lost wake here is a hang, not a delay — the same trap
-/// `pipe_check_set_reader` (`src/syscall/pipe.rs`) was written to close.
-/// `schedule_blocking` adds a second layer: it consults the sticky
-/// `WOKEN_STATES` flag and returns without parking if a wake already landed.
+/// It parks with the promiscuous halt, which no socket can target: a wake is any
+/// interrupt, and the wake epoch below catches a state change that landed while
+/// it polled. The targeted parks that registered a waker on the socket first
+/// were removed 2026-11-11 (`akuma-net-yarn`'s `ParkKind` docs).
 #[cfg(feature = "smoltcp")]
-fn wait_until<F>(idx: usize, mut condition: F, timeout_us: Option<u64>) -> Result<(), i32>
+fn wait_until<F>(mut condition: F, timeout_us: Option<u64>) -> Result<(), i32>
 where F: FnMut() -> bool
 {
     let start = (runtime().uptime_us)();
@@ -771,92 +738,46 @@ where F: FnMut() -> bool
             WaitStep::Relap(RelapReason::FruitlessProgress) => {}
             WaitStep::Park { kind, deadline_us } => {
                 let relax_t = crate::nicstat::start();
-                wait_park(idx, &mut condition, kind, deadline_us);
+                wait_park(kind, deadline_us);
                 crate::nicstat::record_relax(relax_t);
             }
         }
     }
 }
 
-/// Which park policy this build selects.
+/// The park policy `wait_until` uses: the promiscuous halt.
 ///
-/// The three arms are mutually exclusive and ordered by specificity, so a build
-/// that somehow enables both features gets the newer one rather than a compile
-/// error in a cfg thicket. [`ParkKind::LightSleep`] is deliberately
-/// unreachable: it has no kernel implementation (see [`wait_park`]).
+/// The two targeted alternatives (`net-waker-park`, `net-direct-waker`) measured
+/// worse or no better and were removed 2026-11-11 (`akuma-net-yarn`'s
+/// [`ParkKind`] docs). [`ParkKind::LightSleep`] is deliberately unreachable: it
+/// has no kernel implementation (see [`wait_park`]).
 #[cfg(feature = "smoltcp")]
 const fn active_wait_policy() -> WaitPolicy {
-    #[cfg(feature = "net-direct-waker")]
-    {
-        WaitPolicy::direct_waker()
-    }
-    #[cfg(all(not(feature = "net-direct-waker"), feature = "net-waker-park"))]
-    {
-        WaitPolicy::targeted()
-    }
-    #[cfg(all(not(feature = "net-direct-waker"), not(feature = "net-waker-park")))]
-    {
-        WaitPolicy::promiscuous()
-    }
+    WaitPolicy::promiscuous()
 }
 
-/// Register, re-check, park. The tail of both [`wait_until`] wait arms.
+/// Park. The tail of both [`wait_until`] wait arms.
 ///
-/// Returns nothing: the caller loops and re-evaluates `condition` immediately,
-/// so the re-check here exists only to close the lost-wake window, not to report
-/// a result.
-/// The three park mechanisms, one arm each. `deadline_us` is absolute and has
-/// already been clamped to the caller's own timeout by [`WaitMachine`].
+/// Returns nothing: the caller loops and re-evaluates its condition
+/// immediately. No kind `wait_until` selects registers a waker, so there is no
+/// register-then-re-check step here; the targeted kinds that needed one were
+/// removed 2026-11-11. `deadline_us` is absolute and has already been clamped
+/// to the caller's own timeout by [`WaitMachine`].
 #[cfg(feature = "smoltcp")]
-fn wait_park<F>(idx: usize, condition: &mut F, kind: ParkKind, deadline_us: u64)
-where F: FnMut() -> bool
-{
+fn wait_park(kind: ParkKind, deadline_us: u64) {
     match kind {
         ParkKind::Promiscuous => {
             // Yield, then halt until ANY interrupt. Imprecise — nothing can
             // target this thread, because it never enters WAITING — but under
             // load the NIC raises ~6,300 interrupts per 5 s window, so the wake
-            // is plentiful. It measured FASTER than the targeted park; see the
-            // `net-waker-park` feature notes in the root Cargo.toml.
+            // is plentiful. It measured FASTER than the targeted parks that were
+            // removed 2026-11-11 (`akuma-net-yarn`'s `ParkKind` docs).
             //
             // Under shared-kernel SMP this DROPS the Big Kernel Lock across the
             // wait (a plain `yield_now` would spin holding it, freezing every
             // peer core — the meow->LLM `connect`+recv wedge), so a peer's
             // async-main poller can drive the RX that satisfies `condition`.
             (runtime().blocking_relax)();
-        }
-
-        // Register, re-check, park. The ordering is the correctness argument,
-        // not an optimisation — see this module's `wait_until` header. Both
-        // targeted kinds share it and differ only in WHERE the waker is parked.
-        ParkKind::Targeted | ParkKind::DirectWaker => {
-            // 1. Announce ourselves BEFORE the final check.
-            if matches!(kind, ParkKind::DirectWaker) {
-                // On the smoltcp socket itself, so the wake fires at the state
-                // transition instead of from a list `poll()` walks after it has
-                // released NETWORK.
-                // A listener has a pool of handles rather than one, so there is
-                // nothing to hang a waker on; that waiter rides the backstop.
-                if let Some((handle, is_udp)) = smoltcp_handle_for(idx) {
-                    let _registered = smoltcp_net::register_socket_waker(
-                        handle,
-                        is_udp,
-                        &(runtime().current_waker)(),
-                    );
-                }
-            } else {
-                socket_add_waker(idx, (runtime().current_waker)());
-            }
-
-            // 2. Re-check. A state change that landed during the poll loop is
-            //    caught here; anything later is caught by the waker we just
-            //    registered.
-            if (*condition)() {
-                return;
-            }
-
-            // 3. Park. The deadline is the backstop; the waker is the mechanism.
-            (runtime().park_until)(deadline_us);
         }
 
         // The epoll family's kind: the waker was registered during the
@@ -1109,41 +1030,6 @@ pub struct DebugStream {
     pub completed: bool,
     /// `Closed` — after a dial, a refusal or a local reset.
     pub dead: bool,
-}
-
-/// Read-only peek at the stream socket behind a kernel socket index.
-///
-/// For a kernel-side connect wait that wants to trace what the stack is doing
-/// (TAOXICHUAN's stage-7 connect trace). Nothing here mutates, prints, or
-/// allocates: one `NETWORK` read.
-#[cfg(feature = "smoltcp")]
-#[must_use]
-pub fn debug_stream_peek(idx: usize) -> Option<DebugStream> {
-    let h = with_table(|table| {
-        if let Some(Some(sock)) = table.get(idx)
-            && let SocketType::Stream(handle) = sock.inner
-        {
-            return Some(handle);
-        }
-        None
-    })?;
-    with_network(|net| {
-        smoltcp_net::tcp_get(&net.sockets, h, |s: &smoltcp::socket::tcp::Socket| {
-            let st = s.state();
-            DebugStream {
-                state: state_name(st),
-                remote: s.remote_endpoint().map(|ep| {
-                    let smoltcp::wire::IpAddress::Ipv4(a) = ep.addr;
-                    (a.octets(), ep.port)
-                }),
-                send_q: s.send_queue(),
-                recv_q: s.recv_queue(),
-                completed: connect_completed(st),
-                dead: st == tcp::State::Closed,
-            }
-        })
-    })
-    .flatten()
 }
 
 /// `smoltcp::socket::tcp::State` as the name the state machine's docs use.
@@ -1415,7 +1301,7 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
             return Err(libc_errno::EAGAIN);
         }
     } else {
-        wait_until(idx, || has_pending_connection(idx), None)?;
+        wait_until(|| has_pending_connection(idx), None)?;
     }
 
     let (handle, addr) = with_table(|table| {
@@ -1587,7 +1473,7 @@ pub fn socket_connect(idx: usize, addr: SocketAddrV4, nonblock: bool) -> Result<
 /// the first call.
 #[cfg(feature = "smoltcp")]
 fn finish_connect_wait(idx: usize, h: SocketHandle) -> Result<(), i32> {
-    let waited = wait_until(idx, || {
+    let waited = wait_until(|| {
         with_network(|net| {
             // A sibling sharing the fd table can close this socket while we
             // park; once the GC removes the handle the raw `get` below would
@@ -1675,6 +1561,19 @@ pub fn socket_shutdown(idx: usize, how: i32) -> Result<(), i32> {
     Ok(())
 }
 
+/// A blocking send/recv whose `SO_SNDTIMEO`/`SO_RCVTIMEO` ran out reports
+/// `EAGAIN`, as Linux does. [`wait_until`] says `ETIMEDOUT`, which is right for
+/// the connect wait that shares it and wrong here.
+/// How long a blocking UDP receive with no `SO_RCVTIMEO` waits before
+/// `ETIMEDOUT` — see [`socket_recv_udp`].
+#[cfg(feature = "smoltcp")]
+const UDP_RECV_CAP_US: u64 = 10_000_000;
+
+#[cfg(feature = "smoltcp")]
+fn timeout_is_eagain(r: Result<(), i32>) -> Result<(), i32> {
+    r.map_err(|e| if e == libc_errno::ETIMEDOUT { libc_errno::EAGAIN } else { e })
+}
+
 #[cfg(feature = "smoltcp")]
 pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32> {
     let (handle, sndtimeo) = with_table(|table| {
@@ -1695,7 +1594,7 @@ pub fn socket_send(idx: usize, buf: &[u8], nonblock: bool) -> Result<usize, i32>
         // 5 s cap. A blocking write that cannot make room in the transmit
         // buffer must block, not invent an `ETIMEDOUT` the caller never asked
         // for — see `KernelSocket::sndtimeo_us`.
-        wait_until(idx, || with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::can_send)).flatten().unwrap_or(true), sndtimeo)?;
+        timeout_is_eagain(wait_until(|| with_network(|net| smoltcp_net::tcp_get(&net.sockets, handle, smoltcp::socket::tcp::Socket::can_send)).flatten().unwrap_or(true), sndtimeo))?;
     }
 
     let res = with_network(|net| {
@@ -1771,11 +1670,11 @@ pub fn socket_recv(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<usize, 
         // the one that made a 2 s `SO_RCVTIMEO` fire at 30041 ms. POSIX: a
         // blocking read with no `SO_RCVTIMEO` blocks until data, EOF or a
         // signal.
-        wait_until(idx, || with_network(|net| {
+        timeout_is_eagain(wait_until(|| with_network(|net| {
             smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
                 tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected)
             }).unwrap_or(true)
-        }).unwrap_or(true), rcvtimeo)?;
+        }).unwrap_or(true), rcvtimeo))?;
     }
 
     let res = with_network(|net| {
@@ -1855,9 +1754,9 @@ pub fn socket_send_udp(idx: usize, buf: &[u8], dest: SocketAddrV4) -> Result<usi
 
 #[cfg(feature = "smoltcp")]
 pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(usize, SocketAddrV4), i32> {
-    let handle = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Datagram { handle, .. }, .. })) = table.get(idx) {
-            Some(*handle)
+    let (handle, rcvtimeo) = with_table(|table| {
+        if let Some(Some(sock @ KernelSocket { inner: SocketType::Datagram { handle, .. }, .. })) = table.get(idx) {
+            Some((*handle, sock.rcvtimeo_us))
         } else {
             None
         }
@@ -1869,10 +1768,21 @@ pub fn socket_recv_udp(idx: usize, buf: &mut [u8], nonblock: bool) -> Result<(us
             return Err(libc_errno::EAGAIN);
         }
     } else {
-        wait_until(idx, || {
+        // `SO_RCVTIMEO` when set, as the TCP path has, expiring as `EAGAIN`.
+        // This ignored the option, so a 200 ms timeout waited 10 s and failed
+        // with `ETIMEDOUT`, an errno no `recv(2)` gives.
+        //
+        // **Unset, it is still the 10 s `ETIMEDOUT` cap — a pinned divergence:
+        // Linux blocks forever.** It was kept so that lifting it would not be
+        // mistaken for the cause of the amd64 "freeze" after an unanswered
+        // `nslookup`; that turned out to be QEMU livelocked by the LAPIC timer,
+        // unrelated to this wait (`docs/archive/AMD64_LAPIC_PERIODIC_SWITCH_QEMU_LIVELOCK.md`).
+        // Lifting it is now a separate, ordinary change.
+        let waited = wait_until(|| {
             smoltcp_net::poll();
             smoltcp_net::udp_can_recv(handle)
-        }, Some(10_000_000))?;
+        }, Some(rcvtimeo.unwrap_or(UDP_RECV_CAP_US)));
+        if rcvtimeo.is_some() { timeout_is_eagain(waited) } else { waited }?;
     }
 
     let (len, endpoint) = smoltcp_net::udp_socket_recv(handle, buf).map_err(|()| libc_errno::EIO)?;
@@ -1898,39 +1808,6 @@ pub fn is_udp_socket(idx: usize) -> bool {
             false
         }
     })
-}
-
-/// Does a UDP socket have a datagram queued to read?
-///
-/// A thin, `idx`-addressed wrapper around [`smoltcp_handle_for`] +
-/// [`smoltcp_net::udp_can_recv`], for a caller that has no smoltcp handle of
-/// its own and no epoll/readiness-map machinery to route through — the amd64
-/// target's `poll(2)`, whose own doc used to say "nothing on this target
-/// polls a socket". That stopped being true the day a UDP client showed up:
-/// musl's stub DNS resolver `sendto`s a query and then `poll`s the same socket
-/// waiting for the reply, so a `poll` that always reports a socket "not ready"
-/// makes every hostname lookup read as a timeout no matter how fast the
-/// network answers.
-#[must_use]
-/// The connected UDP socket's `connect(2)` peer, if any. A `send(2)`/`write(2)`
-/// (and a `sendto(2)` with a null address) on a datagram socket goes to this;
-/// with none, the caller answers `ENOTCONN` the way Linux does.
-#[cfg(feature = "smoltcp")]
-pub fn socket_udp_peer(idx: usize) -> Option<SocketAddrV4> {
-    with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Datagram { peer, .. }, .. })) = table.get(idx) {
-            *peer
-        } else {
-            None
-        }
-    })
-}
-
-#[cfg(feature = "smoltcp")]
-#[must_use]
-pub fn socket_udp_recv_ready(idx: usize) -> bool {
-    smoltcp_net::poll();
-    matches!(smoltcp_handle_for(idx), Some((handle, true)) if smoltcp_net::udp_can_recv(handle))
 }
 
 /// `(recv_ready, send_ready)` for a stream socket, right now — the readiness
@@ -1970,51 +1847,6 @@ pub fn socket_tcp_ready(idx: usize) -> (bool, bool) {
             (
                 tcp_recv_ready(socket.can_recv(), socket.may_recv(), socket.state(), was_connected),
                 socket.can_send(),
-            )
-        })
-    })
-    .flatten()
-    .unwrap_or((false, false))
-}
-
-/// The two EOF facts the epoll readiness map needs for a TCP socket (stage
-/// 12, taoxichuan's `FdState::Tcp`): `(dead, peer_closed)`.
-///
-/// `dead` is the socket fully closed **after** having been connected
-/// (`was_connected && !is_active()`) — the HUP-only answer that keeps a
-/// waiter from parking forever on a connection that will never progress.
-/// `peer_closed` is the peer's FIN seen (`!may_recv()` after the handshake
-/// completed — the guard that keeps `SynSent` from announcing a half-close,
-/// `docs/archive/SOCKET_DELAYED_FIRST_BYTE_HANG.md`). Mirrors
-/// `akuma-syscalls-glue/src/net.rs`'s `socket_is_dead_tcp` /
-/// `socket_peer_closed_tcp`; lives here because the smoltcp handles and the
-/// `was_connected` latch are this crate's private state.
-#[cfg(feature = "smoltcp")]
-#[must_use]
-pub fn socket_tcp_eof(idx: usize) -> (bool, bool) {
-    smoltcp_net::poll();
-    let Some((handle, false)) = smoltcp_handle_for(idx) else {
-        return (false, false);
-    };
-    let was_connected = with_table(|table| {
-        let sock = table.get_mut(idx)?.as_mut()?;
-        if !sock.was_connected
-            && with_network(|net| {
-                smoltcp_net::tcp_get(&net.sockets, handle, |s| tcp_reached_established(s.state()))
-            })
-            .flatten()
-            .unwrap_or(false)
-        {
-            sock.was_connected = true;
-        }
-        Some(sock.was_connected)
-    })
-    .unwrap_or(false);
-    with_network(|net| {
-        smoltcp_net::tcp_get(&net.sockets, handle, |socket| {
-            (
-                (was_connected && !socket.is_active()),
-                (!socket.may_recv() && tcp_reached_established(socket.state())),
             )
         })
     })
@@ -2108,26 +1940,6 @@ pub fn tcp_recv_snapshot(idx: usize) -> Option<TcpRecvSnapshot> {
         })
     });
     Some(snap)
-}
-
-/// The table facts a `getsockname(2)` arm reports.
-///
-/// This socket's bound (or allocated ephemeral) port and its recorded bind
-/// address — `0.0.0.0` when nothing was bound. The caller decides what an unbound address
-/// means (taoxichuan substitutes the interface's address, the way Linux's
-/// connected-socket getsockname shows the routed source). Session Q:
-/// c-ares calls getsockname on its DNS socket and "Could not contact DNS
-/// servers" without an answer.
-#[must_use]
-#[cfg(feature = "smoltcp")]
-pub fn socket_local_addr(idx: usize) -> Option<([u8; 4], u16)> {
-    with_table(|table| {
-        if let Some(Some(sock)) = table.get(idx) {
-            sock.bind_port.map(|p| (sock.bind_ip, p))
-        } else {
-            None
-        }
-    })
 }
 
 /// Get the default peer for a connected UDP socket

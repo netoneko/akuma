@@ -2,7 +2,7 @@
 
 **Stability: C** - slice 1 (amd64) and slice 2 (Taoxichuan's switch, FP state and `can_run`) are done; the process model and init are not.
 
-`amd64/src/sched.rs`'s hook section is now a crate both amd64 kernels can run. `akuma-threading` stays the scheduler
+`crates/akuma-kernel-amd64/src/sched.rs`'s hook section is now a crate both amd64 kernels can run. `akuma-threading` stays the scheduler
 (state machine, picker, park/wake); the crate is what a switch performs on the CPU: the per-slot `Machine` table
 (page-table root, trap stack, user context, FP state, pin, affinity), `FxArea` and the `fpu_*_live` instructions, and the
 `switch_to` / `can_run` / `prepare_task_slot` hook bodies, generic over a `Platform` each kernel implements.

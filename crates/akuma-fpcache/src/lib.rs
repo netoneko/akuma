@@ -188,9 +188,11 @@ pub static INVALIDATIONS: AtomicUsize = AtomicUsize::new(0);
 /// exist anyway. Only entries with zero mappers hold memory that would otherwise
 /// be free, which is why the cap can be generous relative to the ext2 block cache.
 pub fn init(total_ram_bytes: usize) {
-    if !akuma_config::SHARED_FILE_PAGES_ENABLED {
-        return;
-    }
+    // `akuma_config::SHARED_FILE_PAGES_ENABLED` (config flag sweep, 2026-11-11):
+    // removed. It was a global kill switch read by every kernel's `fs::init`
+    // (AArch64, amd64, both tokio kernels) through this one call, born `true`
+    // 2026-08-05 and never flipped since. The cache always arms now.
+    //
     // `ENABLED` is still an atomic, and still armed here rather than being a
     // `const`: it means "the kill switch is on **and** the caps below are set",
     // and every `enabled()` reader goes on to use them. The two tunables it used

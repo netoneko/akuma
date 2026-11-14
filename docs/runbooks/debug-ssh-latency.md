@@ -16,7 +16,7 @@ network-level connection issues, see [`debug-network.md`](debug-network.md).
 
 | Symptom | Cause | Status | Fix |
 |---|---|---|---|
-| Keystroke echo delayed; typing again makes both appear ("stagger"). `[SSH-ECHO] read gap=800ms–1.8s` | Network-thread boost was hardcoded to **slot 0** (idle); real poller competed round-robin → ~80 ms between poller slots | FIXED | `NETWORK_THREAD_ID: AtomicUsize` registered by `run_async_main`; boost targets the registered thread |
+| Keystroke echo delayed; typing again makes both appear ("stagger"). `[SSH-ECHO] read gap=800ms–1.8s` | Network-thread boost was hardcoded to **slot 0** (idle); real poller competed round-robin → ~80 ms between poller slots | FIXED; the boost itself is gone since 2026-11-11 (`archive/SGI_SCHEDULER_RESIDUE.md`) | `NETWORK_THREAD_ID` now only names the thread in dumps |
 | 800 ms–1.4 s spikes after the above | `block_on`'s no-op waker meant smoltcp's `register_recv_waker` did nothing; SSH thread only noticed data on its next slot (~100 ms) | FIXED | Real `current_thread_waker()`; `block_on` re-polls immediately when `poll()` returns true |
 | `block_on` deadlock on single-core | `schedule_blocking()` flips to WAITING; wake fires an SGI; if SGI fires while network thread holds `NETWORK` spinlock → SSH thread re-acquires → deadlock | FIXED (design constraint) | `block_on` **must** use `yield_now()` (stays READY, skips SGI). Regression guard: `test_block_on_uses_yield_now` |
 | Input lag in interactive sessions | `SshChannelStream::write` didn't auto-flush; `execute_external_interactive` had artificial `for _ in 0..20 { yield_now() }` throttling | FIXED | Auto-flush in `write` (10 ms timeout); remove the 20× yield loop |

@@ -10,12 +10,12 @@ the tested one at baseline (QEMU/TCG 515/0 `SMP=1`, 524/0 `SMP=4`), host tests
 ## The problem, in one measurement
 
 ```
-$ scripts/cloc_akuma.py amd64/src
+$ scripts/cloc_akuma.py crates/akuma-kernel-amd64/src
 Production                    38      1754     11494     13871    100.0%
 Tests                          0         0         0         0      0.0%
 ```
 
-`amd64/src` reported **0.0% test** — against a boot suite of 56 functions and
+`crates/akuma-kernel-amd64/src` reported **0.0% test** — against a boot suite of 56 functions and
 ~3 300 lines. Not because the counter is wrong: `scripts/cloc_akuma.py` files a
 line under *tests* when its file is a test file, when it sits under `#[test]`,
 or when its item's `cfg` **cannot hold in a `no-tests` world**. This target had
@@ -23,7 +23,7 @@ no `no-tests` feature, so no item could satisfy the third rule and none of the
 first two applied — every self-test read as kernel code.
 
 That is not a cosmetic complaint. `LINE_COUNT_ANALYSIS.md` is a living document
-used for comparison against other kernels, and `amd64/src` was inflating the
+used for comparison against other kernels, and `crates/akuma-kernel-amd64/src` was inflating the
 production side by ~3 300 lines while contributing nothing to the test side.
 
 ## What landed
@@ -32,7 +32,7 @@ production side by ~3 300 lines while contributing nothing to the test side.
   kernel's, where it is not hypothetical: `build_devbox.sh`,
   `build_devbox_smoltcp.sh` and `build_extreme_size.sh` all pass it. So this one
   is held to the same standard — it has to *boot*, not merely compile.
-- **56 functions gated** — every `fn …(t: &mut Suite)` in `amd64/src` — plus
+- **56 functions gated** — every `fn …(t: &mut Suite)` in `crates/akuma-kernel-amd64/src` — plus
   their `use akuma_selftest::Suite;` imports, `boot::{self_tests, SuiteCtx,
   Verdict}`, and the scaffolding that exists only for them: the embedded probe
   ELFs (`HELLO_ELF`, `THREADPROBE_ELF`), the hand-assembled ring-3 program

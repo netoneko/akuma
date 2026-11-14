@@ -27,3 +27,7 @@ unicode-width = { version = "0.2", default-features = false }
 # linked into the kernel.
 ab_glyph = "0.2"
 
+
+[dev-dependencies]
+# tests/bake_hires.rs (an ignored, on-demand baker) rasterizes with the same crate build.rs does.
+ab_glyph = "0.2"

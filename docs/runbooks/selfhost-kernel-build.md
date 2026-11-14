@@ -69,7 +69,7 @@ boot behind a watchdog storm — impersonates a kernel regression.
 > Config: the devbox image's own tree at
 > `/src/github.com/netoneko/akuma` (`52ba7d4c`), SMP=4, MEMORY=4096, HVF, and
 > the exact `build_devbox_smoltcp.sh` line:
-> `cargo clean && cargo build --release --features devbox-smoltcp,no-tests -j4 --offline`.
+> `cargo clean && cargo build --release --features no-tests -j4 --offline`.
 > Three consecutive trials: **44.51 / 44.63 / 44.75 s** (±0.12 s), each clean
 > removing 543 files / 79 MiB and rebuilding it — real work, not a cache resume;
 > ELF 2,690,480 B. A same-day run on the identical configuration reported 41.66 s,
@@ -93,7 +93,7 @@ Timing is a property of the **configuration**, so record it alongside the
 number. This one is:
 
 ```bash
-DISK=devbox.img MEMORY=8192 SMP=4 cargo run --release --features devbox-smoltcp,no-tests
+DISK=devbox.img MEMORY=8192 SMP=4 cargo run --release --features no-tests
 # in-guest, per trial:
 cargo clean && cargo build --release -p akuma -j4 --offline
 ```
@@ -145,7 +145,7 @@ Two fixes, and use both:
    | build | files in `deps/` |
    |---|---|
    | in-guest `cargo build -p akuma` (default features) | **86** |
-   | host `--features devbox-smoltcp,no-tests` | **95** (32 `.d` + 31 `.rmeta` + 31 `.rlib` + 1 binary) |
+   | host `--features no-tests` | **95** (32 `.d` + 31 `.rmeta` + 31 `.rlib` + 1 binary) |
 
    Both are "one complete clean kernel build", and they differ — which is the
    whole reason to calibrate against *your* configuration rather than inherit a
@@ -208,9 +208,9 @@ path and not the network.
 
 ```sh
 cargo build -p akuma --profile release-smp-shared \
-    --features devbox-smoltcp,no-tests -j4      # deps
+    --features no-tests -j4      # deps
 cargo build -p akuma --profile release-smp-shared \
-    --features devbox-smoltcp,no-tests -j1      # final crate — see §5
+    --features no-tests -j1      # final crate — see §5
 ```
 
 Result, verified end to end:
@@ -539,14 +539,14 @@ VM and triggers a pointless reboot every time.
 
 #### 5.2a Boot the **`devbox-smoltcp`** kernel, or you get the in-kernel shell
 
-The host kernel that runs the self-host VM must be built with the userspace-sshd
+The host kernel that runs the self-host VM must be built with the devbox
 feature set — the same one §5 builds *inside* the guest:
 
 ```bash
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests
+cargo build --release --features no-tests
 ```
 
-`--features smp-shared` alone builds the same SMP kernel but serves port 22 from
+A kernel from before 2026-08-10 built without these features serves port 22 from
 the **in-kernel** SSH server, whose shell is a builtin dispatcher, not a login
 shell. It is not a smaller shell, it is a different thing, and the failures it
 produces all look like guest or kernel bugs:
@@ -730,7 +730,7 @@ whole buffer — `busybox nproc`/cargo then saw 0 CPUs and fell back to 1. (Linu
 returns the byte count placed in the mask.) **FIXED (2026-08-06):** the handler
 now returns `(1 << nr_cpus) - 1` in the mask and the byte count written as the
 return value, where `nr_cpus` is `smp_shared::probed_core_count()` under
-`kernel_smp_shared` (BSP + secondaries, all online after
+`kernel_bkl_smp` (BSP + secondaries, all online after
 `bringup_secondaries`) and `1` on single-core and multikernel builds (a
 multikernel core runs only its own kernel). `busybox nproc` and cargo's `-j`
 default now reflect the actual SMP count.
@@ -964,8 +964,8 @@ same tree.
   > actually prompted this warning was
   > [`../archive/SELFHOST_ZERO_PAGE_HUNT.md`](../archive/SELFHOST_ZERO_PAGE_HUNT.md),
   > which has nothing to do with LTO, and chasing `lto` first cost real time.
-- **`fs-cache` feature** is already **on** — it is in `default`, so
-  `--features devbox-smoltcp,no-tests` includes it. Nothing to add. The lever is
+- **The ext2 block cache** is already **on** — every build has it. Nothing
+  to add. The lever is
   its *size*: `src/fs.rs` caps it at `min(RAM/8, 384 MB)` at mount. The ceiling
   was 128 MB until 2026-08-05, which was sized against `rustc --version` rather
   than a real compile and left the cache pegged full and evicting; 384 MB cut

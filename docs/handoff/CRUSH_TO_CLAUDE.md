@@ -18,7 +18,7 @@ not origin**; origin does not have either commit:
 - `51d0169c` — the new phase: *"amd64/kvm: long-mode guest phase (paged 64-bit
   guest under kvmtest)"*.
 
-Files touched: `amd64/src/kvm.rs` (new `longmode_guest`, ~270 lines, trivial
+Files touched: `crates/akuma-kernel-amd64/src/kvm.rs` (new `longmode_guest`, ~270 lines, trivial
 guest untouched) and `crates/akuma-svm-amd64/src/lib.rs` (`SegAttr::CODE64_DPL0`,
 a `long_mode_page` test helper, legality tests). Verified on this box: crate
 tests 19/19 (`cargo test -p akuma-svm-amd64`), `cargo check` clean for

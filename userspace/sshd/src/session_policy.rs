@@ -169,6 +169,45 @@ impl SessionWatch {
     }
 }
 
+/// Parent pid out of a `/proc/<pid>/stat` line: field 4, after the `(comm)` that may itself
+/// contain spaces and parentheses, so the split is at the LAST `)`.
+pub fn parse_ppid(stat: &[u8]) -> Option<u32> {
+    let close = stat.iter().rposition(|&b| b == b')')?;
+    let rest = core::str::from_utf8(&stat[close + 1..]).ok()?;
+    let mut it = rest.split_ascii_whitespace();
+    let _state = it.next()?;
+    it.next()?.parse().ok()
+}
+
+/// Every transitive descendant of `root` among `procs` (`(pid, ppid)` pairs), written to
+/// `out`; returns how many. Cycle- and overflow-safe: a pid is taken once, and `out` is a cap.
+pub fn descendants(root: u32, procs: &[(u32, u32)], out: &mut [u32]) -> usize {
+    let mut n = 0;
+    let mut frontier = 0; // next entry of `out` whose children are still to be found
+    let mut parent = root;
+    loop {
+        for &(pid, ppid) in procs {
+            if ppid == parent && pid != root && !out[..n].contains(&pid) && n < out.len() {
+                out[n] = pid;
+                n += 1;
+            }
+        }
+        if frontier >= n {
+            return n;
+        }
+        parent = out[frontier];
+        frontier += 1;
+    }
+}
+
+/// The `pid` argument that makes `kill(2)` address the process group led by
+/// `pid` (`kill(-pgid, sig)`), as the 32-bit two's complement the syscall
+/// ABI carries. `0` and `1` would mean "own group" / init, so they map to
+/// themselves' unreachable neighbour: `u32::MAX`-free, and callers never pass them.
+pub fn group_signal_target(pid: u32) -> u32 {
+    (-(pid as i32)) as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -301,5 +340,39 @@ mod tests {
         assert_eq!(watch.connected_ms, 42);
         assert_eq!(watch.last_activity_ms, 42);
         assert!(!watch.probe_outstanding);
+    }
+
+    #[test]
+    fn group_target_is_negated_pid() {
+        assert_eq!((group_signal_target(53) as i32), -53);
+        assert_eq!(group_signal_target(53), 0xffff_ffcb);
+        // The amd64 kernel recovers the sign by truncating the register to 32 bits.
+        assert_eq!((u64::from(group_signal_target(53)) as u32) as i32, -53);
+    }
+
+    #[test]
+    fn ppid_parses_past_a_hostile_comm() {
+        assert_eq!(parse_ppid(b"43279 (bash) R 33934 43279 43279 0 -1"), Some(33934));
+        assert_eq!(parse_ppid(b"7 (a) b (c)) S 12 7 7 0"), Some(12));
+        assert_eq!(parse_ppid(b"7 (x"), None);
+        assert_eq!(parse_ppid(b"7 (x) S"), None);
+    }
+
+    #[test]
+    fn descendants_walks_the_whole_tree_once() {
+        // 10 -> 11 -> 13 ; 10 -> 12 ; 99 unrelated ; 13 -> 10 would be a cycle
+        let procs = [(11, 10), (12, 10), (13, 11), (99, 1), (10, 13)];
+        let mut out = [0u32; 8];
+        let n = descendants(10, &procs, &mut out);
+        let mut got = out[..n].to_vec();
+        got.sort();
+        assert_eq!(got, [11, 12, 13]);
+    }
+
+    #[test]
+    fn descendants_respects_the_cap() {
+        let procs = [(2, 1), (3, 1), (4, 1)];
+        let mut out = [0u32; 2];
+        assert_eq!(descendants(1, &procs, &mut out), 2);
     }
 }

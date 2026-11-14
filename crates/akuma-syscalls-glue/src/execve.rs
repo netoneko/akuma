@@ -1,16 +1,23 @@
-//! `execve`'s two halves that are not the loader, shared by the x86 kernels.
-//!
-//! amd64 and Taoxichuan each load ELF images into their own address spaces, so
-//! the loader stays in each kernel. What surrounds it was written twice and had
-//! drifted (amd64 let a bad `argv` pointer end the list where Taoxichuan answered
-//! `EFAULT`; they charged a string differently against the stack):
+//! `execve`, every part of it that is not the loader.
 //!
 //! - [`read_request`] (before the load): the path, resolved against the
-//!   process's `cwd`, and argv/envp read out of ring 3 under an
+//!   process's `cwd`, and argv/envp read out of user memory under an
 //!   `akuma_syscalls_proc::exec::Budget`.
-//! - [`commit`] (after the load, before entering the new image): the process's
-//!   `/proc` identity, the close-on-exec sweep, and caught signal handlers back
-//!   to the default.
+//! - [`run`]: the whole call for the Akuma kernels (AArch64 and amd64) —
+//!   execute permission, the `ETXTBSY` pin, `#!` scripts, stopping the other
+//!   threads, the shared-mapping write-back, [`commit`], the `vfork` wake —
+//!   around an [`ExecArch`] that reads, loads, installs and enters the image.
+//! - [`commit`] (after the install, before entering the new image): the
+//!   process's `/proc` identity, the close-on-exec sweep, and caught signal
+//!   handlers back to the default. Taoxichuan calls it directly; its loader
+//!   and process model are its own.
+//!
+//! The two Akuma kernels each had the whole of `execve` until 2026-11-12, and
+//! the copies had drifted (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`,
+//! "One execve"). What still differs is what [`ExecArch`] carries: AArch64 reads
+//! a small binary whole and demand-pages a large one, then `eret`s from inside
+//! the syscall; amd64 reads a head, maps every segment as it loads, and returns
+//! into the new image through its syscall exit path.
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -133,3 +140,119 @@ pub fn commit(proc: &akuma_exec::process::Process, exe: &str, argv: &[Vec<u8>]) 
         }
     }
 }
+
+/// What `execve` does differently per kernel.
+///
+/// [`run`] calls these in order: `read`, then (for an ELF image) `load`, `stop_siblings`, and inside
+/// `with_target`, `install` and `enter`. Everything before `stop_siblings` may
+/// fail and leaves the caller's image untouched.
+pub trait ExecArch {
+    /// What [`Self::read`] produced: enough of the file to see a `#!` line.
+    type Image;
+    /// A loaded program, not yet installed.
+    type Loaded;
+
+    /// Read the executable at `path` (symlinks already resolved). `Err` is the
+    /// syscall's errno.
+    fn read(&self, path: &str) -> Result<Self::Image, u64>;
+    /// The file's first bytes, for the `#!` check; empty when the kernel does
+    /// not have them (AArch64's path load of a file it could not read whole).
+    fn head<'a>(&self, image: &'a Self::Image) -> &'a [u8];
+    /// Build the new image and its initial stack. Consumes `image`, so a
+    /// whole-file buffer is freed here, before an `eret` abandons this frame.
+    fn load(&self, image: Self::Image, path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Self::Loaded, u64>;
+    /// POSIX: every other thread of the group dies. Past the point of no return.
+    fn stop_siblings(&self);
+    /// Run `f` on the process the new image goes to; `ESRCH` without one.
+    fn with_target(&self, f: impl FnOnce(&akuma_exec::process::Process) -> u64) -> u64;
+    /// Put `loaded` on `proc`, dropping the old image.
+    fn install(&self, proc: &akuma_exec::process::Process, loaded: Self::Loaded) -> Result<(), u64>;
+    /// Start the installed image. AArch64's never returns; amd64's arms its
+    /// syscall return and returns 0. Nothing in [`run`]'s frames owns heap by
+    /// the time this is called, because a call that does not return leaks it.
+    fn enter(&self, proc: &akuma_exec::process::Process) -> u64;
+}
+
+/// `execve` on an Akuma kernel, after [`read_request`]. Returns only on failure,
+/// or with 0 where [`ExecArch::enter`] returns.
+pub fn run<A: ExecArch>(arch: &A, req: Request) -> u64 {
+    let Request { path, argv, envp } = req;
+    // The file is read, permission-checked, pinned and reported as
+    // `/proc/<pid>/exe` through its symlinks; `path` itself is what a script's
+    // interpreter is handed.
+    let resolved = akuma_vfs_glue::resolve_symlinks(&path);
+    // Execute permission (`EACCES`). Root passes on any file with some x bit;
+    // see `akuma_isolation::dac::may`. Set-user-ID bits are never honoured.
+    if let Err(e) = crate::perm::check(&resolved, akuma_isolation::dac::MAY_EXEC) {
+        return e;
+    }
+    // Mark the file as being executed BEFORE its bytes are read, so it cannot
+    // be rewritten between the read and the mark (`ETXTBSY`,
+    // `docs/archive/ETXTBSY_TEXT_BUSY.md`). It reaches `Process::set_text` or
+    // is dropped before `enter`.
+    let Ok(text) = akuma_vfs_glue::text_pin(&resolved) else {
+        return ENOMEM;
+    };
+    let image = match arch.read(&resolved) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+
+    let head = arch.head(&image);
+    if head.len() >= 2 && head[0] == b'#' && head[1] == b'!' {
+        // One parser and one argv rule with `spawn`, host-tested in
+        // `akuma-exec`'s `shebang_tests`.
+        let line = &head[..head.len().min(akuma_exec::process::SHEBANG_MAX)];
+        let Some((interpreter, arg)) = akuma_exec::process::parse_shebang(line) else {
+            return ENOENT;
+        };
+        // `interp_argv0` is the interpreter as written, and is argv[0]: busybox
+        // dispatches on it, so the symlink-resolved name would lose a
+        // `#!/bin/sh`'s identity (`docs/archive/DEVBOX_ISSUES.md` Issue 14).
+        let mut hop: Vec<Vec<u8>> = akuma_exec::process::shebang_hop(interpreter, arg, &path, &[])
+            .into_iter()
+            .map(String::into_bytes)
+            .collect();
+        let interp = String::from(interpreter);
+        // The recursion may not return (AArch64 `eret`s), so nothing large may
+        // still be owned here: the script, its pin and the old argv go first.
+        drop(image);
+        drop(text);
+        hop.extend(argv.into_iter().skip(1));
+        drop(path);
+        drop(resolved);
+        return run(arch, Request { path: interp, argv: hop, envp });
+    }
+
+    let loaded = match arch.load(image, &resolved, &argv, &envp) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
+    drop(envp);
+    arch.stop_siblings();
+    // The old image's writable `MAP_SHARED` file mappings die with it: written
+    // back and released from the shared table now, while its address space is
+    // still the current one — the install's teardown would do neither.
+    if let Some(p) = crate::mem::current_owner() {
+        crate::mem::release_shared_write_mappings(p);
+    }
+    arch.with_target(move |proc| {
+        if let Err(e) = arch.install(proc, loaded) {
+            return e;
+        }
+        // The new image's executable is busy for as long as it runs (the old
+        // image's mark is released).
+        proc.set_text(text);
+        // The point of no return: close-on-exec descriptors close only now, so
+        // a failed exec (every return above) leaves the fd table as it was.
+        commit(proc, &resolved, &argv);
+        drop(argv);
+        drop(resolved);
+        drop(path);
+        // A `CLONE_VFORK` parent waits for exactly this.
+        crate::proc::vfork_complete(proc.pid);
+        arch.enter(proc)
+    })
+}
+
+const ENOMEM: u64 = (-12i64) as u64;

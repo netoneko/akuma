@@ -5,7 +5,7 @@
 //!
 //! # Why this exists
 //!
-//! `src/tests.rs` and `src/process_tests.rs` are 36k lines of boot self-tests
+//! `crates/akuma-kernel-tests-aarch64/src/tests.rs` and `crates/akuma-kernel-tests-aarch64/src/process_tests.rs` are 36k lines of boot self-tests
 //! written as `fn test_*() -> bool` with ad-hoc printing at each site, and the
 //! `amd64/` target had started reproducing the same shape — seven smoke tests
 //! each hand-rolling `if ok { "[OK]" } else { "[FAIL]" }`. Neither side had a

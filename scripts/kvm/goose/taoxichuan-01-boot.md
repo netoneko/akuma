@@ -28,7 +28,7 @@ Stage 1 is only "reaches init spawn" — userspace actually *running* is stage
 ## How to compose (the experiment's pinned rule)
 
 Each stage is a new line in the composition root that pulls a crate. Pull as
-few crates as possible. Where the logic you need still lives in `amd64/src/`
+few crates as possible. Where the logic you need still lives in `crates/akuma-kernel-amd64/src/`
 and is not in a crate yet, extract it into a crate first, then pull it.
 Composition and refactoring are one loop. The composition root is your choice
 per the experiment doc ("new bin crate (or feature set)"), but the artifact

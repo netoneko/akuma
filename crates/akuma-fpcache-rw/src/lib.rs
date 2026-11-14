@@ -196,6 +196,26 @@ impl Table {
         true
     }
 
+    /// Drop every entry nobody maps, handing each frame to `f` so the caller
+    /// can release the table's reference. Returns how many went.
+    ///
+    /// For a kernel whose teardown cannot name keys: Taoxichuan frees an
+    /// address space from its page table alone, after the records that said
+    /// which file each page came from are gone, so it cannot [`reap`](Self::reap)
+    /// page by page and sweeps instead. `reap`'s rule holds for every entry this
+    /// drops: the file must already have what the frame holds.
+    pub fn reap_unmapped(&mut self, refs: &impl Refs, mut f: impl FnMut(usize)) -> usize {
+        let before = self.map.len();
+        self.map.retain(|_, pa| {
+            if refs.get(*pa) > 1 {
+                return true;
+            }
+            f(*pa);
+            false
+        });
+        before - self.map.len()
+    }
+
     /// Visit every cached page of `(mount_id, inode)` that overlaps the byte
     /// range `[from, to)`, as `(page_offset, pa)`, ascending.
     pub fn for_each_in(&self, mount_id: u32, inode: u32, from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
@@ -317,22 +337,6 @@ impl Generations {
     }
 }
 
-/// Should a present page be mapped **copy-on-write-marked** (read-only until a
-/// write breaks the sharing)?
-///
-/// `amd64/src/mm.rs::pte_prot_for`'s rule — a writable page whose frame is
-/// shared (`refs > 0`) is marked, so the first write copies — plus the exception
-/// it was missing: a page that is shared **by identity** (`MAP_SHARED`,
-/// anonymous or file) must never be marked, because "copy on write" is then
-/// precisely "stop sharing", the opposite of the flag. Before this, an
-/// `mprotect(PROT_READ)` then `mprotect(PROT_READ|PROT_WRITE)` over a forked
-/// `MAP_SHARED|MAP_ANONYMOUS` page re-marked it, and the next write split the
-/// parent from the child.
-#[must_use]
-pub const fn marks_cow(shared_by_identity: bool, writable: bool, refs: u16) -> bool {
-    !shared_by_identity && writable && refs > 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -409,6 +413,27 @@ mod tests {
         assert_eq!(t.publish(K, 0x2000, &r), Publish::Existing(0x1000));
         assert_eq!(r.get(0x1000), 3, "winner's mapping + table + loser's mapping");
         assert_eq!(r.get(0x2000), 0, "the loser's frame was never referenced: it frees outright");
+    }
+
+    /// Two published pages, one still mapped by a second process: the sweep
+    /// takes only the one whose last mapping went, and hands its frame back.
+    #[test]
+    fn the_sweep_drops_only_entries_nobody_maps() {
+        let (mut t, r) = (Table::new(), FakeRefs::default());
+        let k2 = Key::new(1, 12, 0x9000);
+        t.publish(K, 0x1000, &r);
+        t.publish(k2, 0x2000, &r);
+        assert_eq!(t.lookup_and_ref(k2, &r), Some(0x2000));
+        // The filler of both unmaps them; `k2` keeps its second mapper.
+        r.dec(0x1000);
+        r.dec(0x2000);
+        let mut freed = Vec::new();
+        assert_eq!(t.reap_unmapped(&r, |pa| freed.push(pa)), 1);
+        assert_eq!(freed, [0x1000]);
+        assert_eq!(t.lookup_and_ref(K, &r), None);
+        assert_eq!(t.lookup_and_ref(k2, &r), Some(0x2000));
+        // Nothing left that nobody maps: a second sweep is a no-op.
+        assert_eq!(t.reap_unmapped(&r, |_| unreachable!()), 0);
     }
 
     #[test]
@@ -542,13 +567,5 @@ mod tests {
         let before = g.read(12);
         g.bump(13);
         assert_eq!(g.read(12), before, "another bucket does not disturb this one");
-    }
-
-    #[test]
-    fn identity_shared_pages_are_never_cow_marked() {
-        assert!(marks_cow(false, true, 2), "a forked private page is marked");
-        assert!(!marks_cow(false, true, 0), "an unshared private page is not");
-        assert!(!marks_cow(false, false, 2), "a read-only page needs no mark");
-        assert!(!marks_cow(true, true, 2), "MAP_SHARED: shared by identity, never marked");
     }
 }

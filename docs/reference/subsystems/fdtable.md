@@ -8,8 +8,17 @@ characterization test.
 dependencies** and nothing in it locks. The kernel keeps the acting half:
 `akuma-exec`'s `SharedFdTable` (the three spinlocks and the reference
 effects), `akuma-syscalls-glue/src/fs.rs` (the dup/fcntl/close_range syscall
-bodies, user copies, kernel-object release), `amd64/src/fd.rs` (the `MAX_FDS`
-ceiling, the boot task's `KERNEL_TABLE`).
+bodies, user copies, kernel-object release), `crates/akuma-kernel-amd64/src/fd.rs` (the boot
+task's `KERNEL_TABLE`).
+
+**The descriptor syscalls are one implementation.** The AArch64 kernel calls glue
+directly; amd64's dispatcher calls `fd::call`, which is glue-amd64's
+`dispatch_call` (the x86 ABI translation Taoxichuan also runs) after
+`fd::kernel_task`, the by-number console of a task with no process. A rule about
+descriptors goes in glue (or glue-amd64, for an x86 ABI difference), never in
+`crates/akuma-kernel-amd64/src/fd.rs`; that file's `sys_*` functions are `fd::call` by name for the
+self-tests ([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md),
+"fd: the policies are glue's").
 
 | item | what | who calls it |
 |---|---|---|
@@ -38,7 +47,7 @@ after dropping the locks.
 
 Both are glue's adopted `dup` model, pinned at three layers: the crate's
 tests, `akuma-exec`'s `fdtable_characterization_tests`, and the amd64 boot
-suite (`amd64/src/fd.rs`: "a dup's cursor is independent", "a dup keeps
+suite (`crates/akuma-kernel-amd64/src/fd.rs`: "a dup's cursor is independent", "a dup keeps
 nonblock"):
 
 1. **`dup` copies the payload by value** — two descriptors on one file carry
@@ -61,8 +70,10 @@ nonblock"):
   computes a lowest-free fd, sweeps cloexec, or copies a table for fork; the
   read-side `Deref` borrows (`get`/`contains_key`/`range`/`keys`) are the only
   sanctioned direct pokes, always under a lock held by the caller.
-- **The ceiling is policy.** `FdTable` is ceiling-free; `MAX_FDS = 1024` is
-  enforced at `amd64/src/fd.rs` (`install`, `sys_dup2`) and mirrored by
+- **The ceiling is policy.** `FdTable` is ceiling-free; `RLIMIT_NOFILE`
+  (`akuma_syscalls_linux::rlimit::NOFILE_LIMIT`, 1024) is enforced by glue for
+  both kernels (`openat`, `dup`, `dup3`, `F_DUPFD`; glue-amd64's `dup2`), see
+  [`syscalls/fs.md`](syscalls/fs.md), and mirrored by
   `free_below(min, ceiling)` for callers that want the bounded question
   answered where the crate can see it.
 - **Allocation:** three collection nodes per occupied fd, `const`-constructible

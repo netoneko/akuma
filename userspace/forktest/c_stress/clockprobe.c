@@ -1,6 +1,6 @@
 /* clockprobe — does this kernel have one clock, and does it move?
  *
- * Background: the amd64 kernel kept two. `amd64/src/clock.rs` held a private
+ * Background: the amd64 kernel kept two. `crates/akuma-kernel-amd64/src/clock.rs` held a private
  * `(anchor_unix, anchor_uptime)` pair that its own `gettimeofday`/`time`/
  * `clock_gettime` arms read, while `akuma-syscalls-time` — the implementation
  * the AArch64 kernel serves the same syscalls from — read `akuma_timer`'s,

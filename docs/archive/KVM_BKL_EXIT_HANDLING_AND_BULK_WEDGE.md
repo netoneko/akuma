@@ -5,7 +5,7 @@ task per vCPU core).
 
 ## 1. The BKL is out of a service guest's exit handling (`61e8d96b`)
 
-**Change.** `serve` (`amd64/src/kvm/linux/machine.rs`) runs inside one dropped-BKL window (`Unlocked`)
+**Change.** `serve` (`crates/akuma-kernel-amd64/src/kvm/linux/machine.rs`) runs inside one dropped-BKL window (`Unlocked`)
 when the guest is a service. Two vCPU groups' exits therefore contend on the device lock alone.
 The BKL is taken, always *after* the device lock and never before it, for:
 

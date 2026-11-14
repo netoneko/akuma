@@ -1,6 +1,6 @@
 # amd64: Claude Code `/login` stops taking input — paste, Esc and Enter (2026-10-17)
 
-**Status: OPEN — reliably reproduced, root cause not found.** Read **§ Handoff**
+**Status: ROOT CAUSE FOUND 2026-11-09 — [`CHILD_OF_EXITED_THREAD_UNREAPABLE.md`](CHILD_OF_EXITED_THREAD_UNREAPABLE.md)** (a child forked by a pool thread that later exits could never be reaped: `wait4` said `ECHILD`, the pidfd stayed readable, Bun's loop spun). Fix verified on the trashcan, 3 of 3 runs. The text below is the investigation record. Read **§ Handoff**
 at the end first: two of the mechanisms proposed below were later ruled out, and
 the section headed "Mechanism (confirmed)" is only partly right.
 
@@ -199,6 +199,92 @@ thread's `Process.channel` (or left it `None`).
   browser tab ready, and do not leave the code prompt idle.
 - Or log in on another machine and copy `~/.claude/.credentials.json` (Linux
   stores it as a file; macOS uses the Keychain).
+
+### 2026-11-09: reproduced in the Firecracker-on-p3 rig; what was ruled out
+
+The stall reproduces in `fc-p3.sh` (so no metal needed) with the handoff's `ssh_pty_steps.py`
+script, `HOME=/root`, kernel `d60ce6e4`. The rig now lives in `/mnt/akuma-selfhost` (the old
+`/home/netoneko/akuma-selfhost` is gone; run a copy of `fc-p3.sh` with `W=` changed).
+
+| variation (45 s idle, then paste) | result |
+|---|---|
+| control, `xterm-ghostty`, default PATH | stuck, every run |
+| `TERM=dumb` | 1 of 2 passed: flaky, not a fix |
+| plain `TERM=xterm` | stuck |
+| `xdg-open` replaced by `#!/bin/sh; exit 0` | stuck (so `gio` is not needed) |
+| `/usr/bin/xdg-open` renamed away | stuck 2 of 2 |
+| `BROWSER=/bin/true` | stuck |
+| `PATH` without `/usr/bin` (single runs) | passed: **do not trust**, one sample each, and the same shape as the flaky `TERM=dumb` |
+| `nopidfd` boot flag (`pidfd_open` -> ENOSYS, branch `nopidfd-exp`, `00227e1d`) | stuck: **pidfd is not the cause** |
+
+With `strace_nr=61,247,60,231,58,59` every `vfork` child was reaped by a `wait4` that returned
+its pid; no exit was lost. Four early children `execve` then `exit_group(128)`.
+
+Do not count the single-run passes as fixes. Anything claimed from this rig needs 3+ runs per arm.
+
+Build note: `claude-fixes` HEAD does not link for amd64 (`duplicate symbol: shootdown_entry`,
+defined in both `crates/akuma-kernel-amd64/src/shootdown.rs` and `akuma-boot-amd64`, from `c2f58d79`); the
+experiment was built on `d60ce6e4`.
+
+### 2026-11-09 (later): the metal hang, and what the klog showed
+
+First metal retry of the day froze the whole box (no ping) with claude running on the **console**.
+`/var/log/ryzen/klog-272.dmesg` (klogd keeps the last ~5 s on p3) shows the box healthy to the
+end: `ps` listed claude pid 50 (26 s CPU, `git`/`dpkg -S` helpers alive, 18 Bun threads), the console
+echoed `kill -9 ` as it was typed, and the log stops there. Heavy `[bkls>]` BKL-spin warnings
+(85 lines, rotating owners, tickets advancing: contention, not one stuck owner).
+
+Not reproduced: Firecracker 8 vCPU, `kill -9` of the whole claude process set (3 of 3 alive), of the
+leader pid only (3 of 3 alive); metal over ssh, leader `kill -9` (alive). So the hang needs something the
+rig lacks: the framebuffer console, the USB keyboard, wifi, or the metal's real 8 cores.
+(An earlier "hang reproduced in the rig" note of mine was a probe bug, `tail -1` of a blank line.)
+
+`claude-fixes` linked again at `1e2fbdf0` (shootdown stub now the crate's). Metal kernel `e64d3fa`
+installed as p3 `/boot/akuma-amd64.verify` (entry 26); the previous `.verify` is `.verify.pre-e64d3fa`.
+Quick paste of the `/login` code works on metal (10 s).
+
+### 2026-11-09 (evening): the trashcan on metal, z.ai, and an input-lag harness
+
+Kernel `e1ff650a` (claude-fixes, `no-tests`), **built on the trashcan itself** (`kbuild -j4 --online
+--features no-tests` in a clean worktree, 9 min; the guest's offline crate cache was older than the lockfile),
+installed with `kinstall`. Claude 2.1.301 (`linux-x64-musl`, sha256 from the release manifest) on the box's
+persistent root, run through a `claude-glm` wrapper that points it at z.ai's Anthropic endpoint
+(`glm-5.3-flash`, key read from the box's existing `/root/kot/zai.token`), so there is no `/login` screen.
+The trashcan answers at **192.168.1.120** now (the `akuma` ssh alias), not `.123`.
+
+`scripts/benchmarks/claude_input_lag.py` drives it over an ssh PTY into a pyte screen and times
+keystroke -> echo (`lag:N`), with `paste:`, `resize` and `dump` steps; `--lima NAME` runs the same probe in
+a Lima VM. All numbers below are from the Mac over wifi.
+
+| run | result |
+|---|---|
+| 1. 15 keys right after the prompt appears | first key **1873 ms**, then 470, 308, then 113-214 (median 167) |
+| 1. then 45 s idle at the **main prompt**, 5 more keys | **none shown in 30 s each** (an older claude was still alive) |
+| 2. clean box (all claudes killed first), 5 keys; 50 s idle; 5 keys | 1260, 648, 100-138 (median 138); then 140-286 (median 265), **nothing lost** |
+| 3. an orphaned claude alive in its first minute | trust screen after **69.6 s** (19 s clean); keys median 336 (p90 1576); after idle median 215; nothing lost |
+| control: raw-mode `cat` through the same PTY, idle 10/40/60/90 s | median 49-91 ms, min 12-14, nothing lost at any idle |
+| Linux A/B: same claude 2.1.301 (`linux-arm64`), same z.ai setup, Lima VM | median **12.6 ms**, first key 25 ms, nothing lost after 45 s idle |
+
+**The Linux number is not a fair baseline.** The VM has no network in the path. The Mac's own LAN path is
+noisy: a bare TCP connect to the trashcan's sshd port has median 48 ms (p90 128, max 193), and to the *router*
+median 43-75 ms (max 487). So about 50 ms of any figure above is wifi. Compare only runs over the same path:
+claude runs 2-3 sit at 2-5x the `cat` control, and the 1.3-1.9 s first key plus the 69 s start are well outside
+that noise. A fair Linux comparison needs the probe on the same path (or the timing taken inside the box).
+
+What this adds to the ledger:
+
+- **Not the input path.** `cat` through the identical sshd/PTY path never stalls and never loses a key.
+- **Not output volume/drain.** The stall is after idle, when claude prints nothing, and the harness drains the PTY every 20 ms.
+- **Kernel sleep granularity is fine**: a 1 ms sleep takes ~1.1 ms (so sshd's `sleep_ms(1)` poll is not a 60 ms tick).
+- The total loss (run 1) was seen **once** and did not reproduce in runs 2-3 (one clean, one with an orphan), so it is
+  intermittent. State when seen: main process `R`, utime unchanged over 5 s, `/proc/<pid>/syscalls` showing only repeated
+  `113`s. The `[stdin-starved]` diagnostic (ae3a91c5/34e1f405) *is* on this branch (my earlier "not on this branch" was wrong); it never fired because the stall was not an unscanned stdin epoll at all.
+- Idle orphaned claudes use no CPU (counters flat over 10 s); an orphan's *own* start-up burst slows a second
+  claude's start. `kill -9` of the leader can leave a zombie (`Z`, parent pid 7 never reaps it).
+
+**Superseded the same evening:** the in-box probe reproduced the loss with no ssh in the path and found the cause (see the link at the top). The plan that was written here: timestamps for sshd receiving the byte, claude's
+`read(0)`, its `write(1)`, and sshd sending (the per-process syscall ring already has timestamps), and repeat the idle
+probe 5+ times per arm until the total loss reproduces or does not.
 
 ## Background
 

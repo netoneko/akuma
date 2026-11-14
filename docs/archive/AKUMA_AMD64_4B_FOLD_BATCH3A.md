@@ -8,7 +8,7 @@ the line this batch is: *"`read`, `pread64`, `write`, `lseek` and `getdents64`
 are the cluster that reads what `openat` now produces, and they are the natural
 next fold."*
 
-Five arms moved. `amd64/src/fd.rs`: **+324 / −589**, 3 846 → 3 581 lines.
+Five arms moved. `crates/akuma-kernel-amd64/src/fd.rs`: **+324 / −589**, 3 846 → 3 581 lines.
 
 What is left of each on this side is a preamble, and every one of them is a
 divergence stated rather than assumed:
@@ -34,7 +34,7 @@ single arm could move, and both were invisible until something broke.
 
 ### 1a. The untimed park had no backstop in the shared crate
 
-`amd64/src/sched.rs` gives every park with **no deadline of its own** a 1 s
+`crates/akuma-kernel-amd64/src/sched.rs` gives every park with **no deadline of its own** a 1 s
 tripwire (`BACKSTOP_US`), and its comment says exactly why:
 
 > *AArch64 parks untimed all the time and has an interrupt-driven scheduler to
@@ -68,7 +68,7 @@ deadline in the past, with the same result).
 
 ### 1b. amd64 had no prefault hook — and `apk` said the database was corrupt
 
-**This is the batch's real finding.** `amd64/src/uaccess.rs`'s header said, and
+**This is the batch's real finding.** `crates/akuma-kernel-amd64/src/uaccess.rs`'s header said, and
 it was true when written:
 
 > *There is no "is it mapped" walk here and no prefault: this target has no lazy
@@ -236,7 +236,7 @@ from about the 44th onward — permanently, on QEMU and on the metal.
 Measured, not inferred. A temporary `[spawn] DIAG live-before=` print of
 `akuma_syscalls_glue::pipe::pipe_live_count()` at each `sys_spawn` reads
 **15, 16, 17, … one more per session**, monotonic from boot, and the failing
-allocation reports `pipe::alloc failed, live=64` — `amd64/src/pipe.rs`'s
+allocation reports `pipe::alloc failed, live=64` — `crates/akuma-kernel-amd64/src/pipe.rs`'s
 `MAX_PIPES`, a machine-wide policy.
 
 **It is not this batch.** The identical 150-session run against `02b9166f` — the
@@ -273,7 +273,7 @@ numbers (C1 step 1) and `open(2)`'s flag word (4b prerequisites):
 | `sizeof` | **144** | **128** |
 
 `akuma_syscalls_linux::Stat` is the aarch64 layout — its own header says so —
-and `amd64/src/fd.rs`'s `encode_stat` writes the x86_64 offsets, under a comment
+and `crates/akuma-kernel-amd64/src/fd.rs`'s `encode_stat` writes the x86_64 offsets, under a comment
 that already calls this "proposal item 5 territory". Folding the `stat` family
 therefore needs a converter in `akuma-syscalls-abi` (the vocabulary crate, where
 `open_flags` lives) with `offset_of!` assertions, **and** a split of glue's

@@ -1,5 +1,5 @@
 //! x86_64 4-level page tables **for the kernel's own mappings**: map, unmap,
-//! translate — the machine half of `amd64/src/paging.rs`, extracted so a
+//! translate — the machine half of `crates/akuma-kernel-amd64/src/paging.rs`, extracted so a
 //! composed kernel can make kernel mappings without inheriting the module.
 //!
 //! `boot.s` (in this crate) leaves the machine on a fixed identity map of the
@@ -125,6 +125,27 @@ pub fn map_page_in(root: u64, va: usize, pa: u64, prot: PteProt, attr: MemAttr) 
     mapped
 }
 
+/// Write `entry`, as it is, into the 4 KiB user leaf for `va` in `root`,
+/// building user-accessible tables on the way down.
+///
+/// For entries that are not built from a protection: a demand-paging record
+/// (`akuma_tokio_kernel_core::lazy_record`, not present), or a leaf moved whole from another
+/// slot of the same root (`mremap`), which carries its frame, its CoW marker and
+/// its dirty bit with it. A new present page goes through [`map_page_in`].
+///
+/// Whatever the slot held is overwritten: a caller replacing a present page
+/// unmaps it (and settles its frame) first, or that frame leaks. `false` when a
+/// table frame cannot be had or the path meets a large page.
+pub fn set_leaf_in(root: u64, va: usize, entry: u64) -> bool {
+    assert_eq!(va % PAGE_SIZE, 0, "va must be page aligned");
+    let set = walk::map_leaf::<Physmap>(root, va, entry, true, || akuma_pmm::alloc_page().map(|f| f as u64));
+    if set {
+        // The slot may have held a translation a TLB still caches.
+        invlpg(va);
+    }
+    set
+}
+
 /// Remove the mapping for `va` in the active address space.
 pub fn unmap_page(va: usize) -> Option<u64> {
     unmap_page_in(read_cr3(), va)
@@ -161,4 +182,27 @@ pub fn translate_in(root: u64, va: usize) -> Option<u64> {
 pub fn clear_identity_slot() {
     let root = read_cr3();
     walk::clear_root_slot::<Physmap>(root, 0);
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    /// `boot.s`'s page directories, one per GiB, contiguous: entry `i` maps `[i * 2 MiB, (i + 1) * 2 MiB)`. In
+    /// `.bootbss`, whose VMA is its LMA, so the symbol's address is physical. Shared by the identity map and the
+    /// physmap, and by every kernel root and every AP, which copy only the PML4.
+    static __pd0: u8;
+}
+
+/// The page directory covering 2 MiB-region `i` of `boot.s`'s identity/physmap map, and the entry's index in it.
+/// One directory per GiB, contiguous.
+///
+/// # Panics
+/// If `i` is not one of the `PHYSMAP_PDS` directories.
+#[cfg(target_arch = "x86_64")]
+#[must_use]
+pub fn boot_pd(i: usize) -> (&'static akuma_pagetable::Table, usize) {
+    assert!(i < 512 * crate::phys::PHYSMAP_PDS, "2 MiB region outside the boot page directories");
+    let pd0 = phys_to_virt((&raw const __pd0) as u64) as usize;
+    // SAFETY: `__pd0..` is `PHYSMAP_PDS` contiguous 4 KiB-aligned page directories in `.bootbss`, live for the
+    // whole boot and never freed; `i` was checked to name one of them.
+    (unsafe { akuma_pagetable::Table::at(pd0 + (i / 512) * 4096) }, i % 512)
 }

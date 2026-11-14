@@ -8,7 +8,7 @@ whose § "What is left in `fd.rs`" names these two as the arms that "need care
 rather than a forward".
 **Prompt:** `proposals/NEXT_AGENT_AMD64_4B_POLL_IOCTL.md`.
 
-Five arms, and unlike batch 3c none of them is a forward. `amd64/src/fd.rs`:
+Five arms, and unlike batch 3c none of them is a forward. `crates/akuma-kernel-amd64/src/fd.rs`:
 **3 083 → 3 008** at the fold, then 3 192 with the boot checks and the console
 fix that shares this session (`AMD64_CONSOLE_NONBLOCK_READ.md`). Diff:
 `+560 / −399` across nine files, most of it doc comments stating divergences.

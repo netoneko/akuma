@@ -4,7 +4,7 @@ The bring-up of ryzen's wifi card, the Realtek **RTL8852CE** (`10ec:c852`,
 Linux `rtw89_8852ce`), from powered off to running firmware: wifi stage W1
 (`docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md` § 5). `no_std`,
 `forbid(unsafe_code)`, no allocation, no dependencies. The MMIO and DMA half is
-`amd64/src/rtw89.rs`; the boot token is `rtw89`.
+`crates/akuma-kernel-amd64/src/rtw89.rs`; the boot token is `rtw89`.
 
 | module | decides |
 |---|---|
@@ -73,7 +73,7 @@ and tries to join (it joins the home network as of 2026-10-06 — survey doc § 
 The one thing the crate cannot do for its caller: **Bus Master Enable on the
 root port above the card.** Firmware leaves it off on ryzen, and without it
 the download stalls at "header accepted" with `HAXI_IDCT = TXMDA_STUCK`.
-`amd64/src/pci.rs`'s `enable_bridges_above` does it.
+`crates/akuma-kernel-amd64/src/pci.rs`'s `enable_bridges_above` does it.
 
 ## Licence of the source it follows
 

@@ -1,7 +1,7 @@
 //! A NIC that is two frame queues: [`ExternalDevice::Queued`](crate::ExternalDevice).
 //!
 //! For a link whose driver runs on its own schedule rather than inside
-//! `iface.poll()` — the amd64 wifi station (`amd64/src/rtw89_sta.rs`) is the
+//! `iface.poll()` — the amd64 wifi station (`crates/akuma-kernel-amd64/src/rtw89_sta.rs`) is the
 //! first: it owns the radio from its own daemon, joins, handshakes, and only
 //! then has Ethernet frames to give. Coupling that driver to this crate would
 //! drag the card into the network stack; instead the two meet at a

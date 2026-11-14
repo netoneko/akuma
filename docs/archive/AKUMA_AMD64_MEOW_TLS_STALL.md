@@ -87,7 +87,7 @@ request was written returned zero — no `WouldBlock` first, no waiting.
 > plain `yield_now` would spin holding it, freezing every peer core — **the
 > meow->LLM `connect`+recv wedge**)
 
-and `amd64/src/net.rs` supplied exactly that plain `yield_now`. `yield_now`
+and `crates/akuma-kernel-amd64/src/net.rs` supplied exactly that plain `yield_now`. `yield_now`
 opens a 4-`pause` window, **re-takes the lock**, and switches with it held —
 correct for a yield, useless for a wait. So a waiter with nothing to do sat on
 the lock while the netpoll daemon, which needed it, could not run.
@@ -183,7 +183,7 @@ Note the family resemblance to
 the dominant bug on AArch64 was a socket in `SynSent` reporting read-closed —
 four separate defects wearing one symptom. This is the same shape on a target
 that shares the socket crate but not the wait wiring, so **check whether each of
-those four fixes is reachable from `amd64/src/sock.rs`** before assuming this is
+those four fixes is reachable from `crates/akuma-kernel-amd64/src/sock.rs`** before assuming this is
 new.
 
 ## 6. State of the box at the end of this session

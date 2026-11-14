@@ -1,7 +1,7 @@
 # amd64 C1 step 4a: the private mount table is gone
 
 **Date:** 2026-09-07
-**Scope:** `amd64/src/fs.rs`'s own `MountTable` and its twelve `with_fs`
+**Scope:** `crates/akuma-kernel-amd64/src/fs.rs`'s own `MountTable` and its twelve `with_fs`
 wrappers, replaced by `akuma-vfs-glue` — the crate the AArch64 kernel's VFS
 already is, and the one `akuma-syscalls-glue::fs` resolves through.
 **Status:** landed and verified on four rigs.
@@ -19,7 +19,7 @@ for what a folded arm actually touches gives two dependencies, not one:
 | glue `fs.rs` names | count | amd64 had |
 |---|---|---|
 | `akuma_exec::process::current_process_shared` | 41 | nothing — no `akuma-exec` process is registered on this target |
-| `akuma_vfs_glue::…` | 94 | a **different** mount table, private to `amd64/src/fs.rs` |
+| `akuma_vfs_glue::…` | 94 | a **different** mount table, private to `crates/akuma-kernel-amd64/src/fs.rs` |
 
 The first is the process table and is genuinely large (it is what step 5 builds).
 The second is not large at all — and it is the one that fails *silently*. A
@@ -35,7 +35,7 @@ table was **195 lines of code** and all of it had a counterpart.
 
 ## 2. What was deleted
 
-`amd64/src/fs.rs` carried:
+`crates/akuma-kernel-amd64/src/fs.rs` carried:
 
 - `static MOUNTS: Spinlock<Option<MountTable>>`
 - `fn with_fs<R>(path, f)` — resolve, then call the filesystem **with the lock
@@ -201,7 +201,7 @@ stays green.
 
 ## 8. What did not move, and what is next
 
-`amd64/src/fd.rs` is untouched apart from the call-site conversions and the
+`crates/akuma-kernel-amd64/src/fd.rs` is untouched apart from the call-site conversions and the
 symlink follow. Its 3,512 lines are the in-memory file cache and the syscall
 arms, and both wait on the process table: glue's `fs.rs` reaches
 `current_process_shared()` 41 times, for the fd table, the CWD and the

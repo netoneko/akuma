@@ -36,7 +36,7 @@ pub mod config;
 // crate root forbids, so the module attribute is gone as redundant.
 // `target_os = "none"` for the same reason as `timer` below: it reaches the
 // PL011 through `akuma-uart`, which does not exist for a host build.
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub mod console;
 pub mod file_page_cache;
 pub mod fs;
@@ -44,8 +44,11 @@ pub mod irq;
 pub mod klog;
 #[cfg(feature = "net-profile")]
 pub mod nic_profile;
+// The boot-time SNTP bootstrap over the CNTV uptime. amd64 runs the same
+// `akuma_sntp` loop from its own `clock.rs` over the LAPIC clock.
+#[cfg(target_arch = "aarch64")]
 pub mod ntp_boot;
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub mod platform;
 pub mod pmm;
 // `timer.rs` is the ISR + hardware-probe half of `akuma-timer`'s API (the IRQ
@@ -54,5 +57,5 @@ pub mod pmm;
 // same cfg (`crates/akuma-timer/src/lib.rs`), so a host `cargo check`/`cargo
 // test` of this crate needs the same gate, matching `akuma-exec`'s
 // `kernel_tests` module (`crates/akuma-exec/src/lib.rs`).
-#[cfg(target_os = "none")]
+#[cfg(all(target_os = "none", target_arch = "aarch64"))]
 pub mod timer;

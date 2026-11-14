@@ -7,7 +7,7 @@ This is the failure
 [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
 §8.5 recorded as *"ssh sessions die instantly on the extreme-size profile — a
 degradation of unknown origin, not bisected, owned by no phase"*, and which made
-`acceptance/05_meow_tcc_extreme_4mb.md` unrunnable.
+`acceptance/archive/05_meow_tcc_extreme_4mb.md` unrunnable.
 
 ## Symptom
 
@@ -162,7 +162,7 @@ See [`PAWS_DUPLICATED_ARGV0.md`](PAWS_DUPLICATED_ARGV0.md). With both fixed,
 - [`TRIM_FAT_EMBARASSING_DUPLICATIONS.md`](TRIM_FAT_EMBARASSING_DUPLICATIONS.md)
   §8.5 — where this was logged as an unowned, unbisected degradation, with the
   A/B that (correctly) cleared the Phase 2a ELF-parser merge of causing it.
-- `acceptance/05_meow_tcc_extreme_4mb.md` — the playbook this unblocks.
+- `acceptance/archive/05_meow_tcc_extreme_4mb.md` — the playbook this unblocks.
 - [`BUILTIN_SSH_REMOVAL.md`](BUILTIN_SSH_REMOVAL.md) — the move to userspace
   sshd that shifted the deep path from a system thread to a user thread.
 - `userspace/sshd/docs/OPTIONAL_PARALLELISM.md` — the process-per-session design.

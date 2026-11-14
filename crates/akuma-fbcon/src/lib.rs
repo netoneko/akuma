@@ -62,6 +62,7 @@ pub mod console;
 pub mod emoji;
 pub mod font;
 pub mod glyph;
+pub mod hires;
 pub mod format;
 pub mod splash;
 pub mod unifont;
@@ -201,8 +202,8 @@ impl Rgb {
 /// of every stem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Smooth {
-    Gray,
     #[default]
+    Gray,
     Rgb,
     Bgr,
 }

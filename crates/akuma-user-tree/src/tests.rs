@@ -207,11 +207,20 @@ fn shared_span_policy_is_a_named_choice_with_a_test_per_value() {
     assert_eq!(L.plan_clone(0, e, true, SharedSpans::Copy), ClonePlan::CopyLeaf { old: 0xA000 });
     // ShareFrames (amd64): the same leaf is an ordinary share.
     assert!(matches!(L.plan_clone(0, e, true, SharedSpans::ShareFrames), ClonePlan::ShareLeaf { demoted: true, .. }));
-    // Outside a shared span the policy is irrelevant.
+    // ShareWritable (taoxichuan): shared, and the entry is stored back exactly as it was - still writable, no marker.
     assert_eq!(
-        L.plan_clone(0, e, false, SharedSpans::Copy),
-        L.plan_clone(0, e, false, SharedSpans::ShareFrames)
+        L.plan_clone(0, e, true, SharedSpans::ShareWritable),
+        ClonePlan::ShareLeaf { frame: 0xA000, parent_entry: e, child_entry: e, demoted: false }
     );
+    let ro = 0xA000 | P | 4;
+    assert_eq!(
+        L.plan_clone(0, ro, true, SharedSpans::ShareWritable),
+        ClonePlan::ShareLeaf { frame: 0xA000, parent_entry: ro, child_entry: ro, demoted: false }
+    );
+    // Outside a shared span the policy is irrelevant.
+    for policy in [SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
+        assert_eq!(L.plan_clone(0, e, false, SharedSpans::Copy), L.plan_clone(0, e, false, policy));
+    }
 }
 
 #[test]
@@ -231,7 +240,7 @@ fn relink_keeps_flags_and_replaces_the_frame() {
 #[test]
 fn clone_is_zero_sum_and_demotes_exactly_the_writable_leaves() {
     for seed in 0..60 {
-        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames] {
+        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
             let mut m = Mem::new();
             let parent = build(&mut m, seed);
             let before = live_refs(&m);
@@ -260,7 +269,7 @@ fn clone_is_zero_sum_and_demotes_exactly_the_writable_leaves() {
 #[test]
 fn freeing_clone_and_parent_returns_every_reference_and_table() {
     for seed in 0..60 {
-        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames] {
+        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
             let mut m = Mem::new();
             let parent = build(&mut m, seed);
             let child = clone_table(&mut m, parent, 2, 0, &no_span, policy).unwrap();
@@ -280,7 +289,7 @@ fn a_failed_clone_leaves_every_reference_as_it_was() {
     for seed in 0..20 {
         // A shared span in the middle so the Copy policy allocates leaf frames too.
         let span = |va: u64| va & 0x1000 != 0;
-        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames] {
+        for policy in [SharedSpans::Copy, SharedSpans::ShareFrames, SharedSpans::ShareWritable] {
             let mut probe = Mem::new();
             let parent = build(&mut probe, seed);
             let _ = clone_table(&mut probe, parent, 2, 0, &span, policy).unwrap();
@@ -339,4 +348,129 @@ fn shared_span_copy_creates_a_distinct_frame_and_share_frames_does_not() {
     free_table(&mut b, shared_child, 2);
     free_table(&mut b, pb, 2);
     assert!(b.refs.is_empty() && b.tables.is_empty());
+    let mut c = Mem::new();
+    let pc = build(&mut c, 3);
+    let before = leaves(&c, pc);
+    let writable_child = clone_table(&mut c, pc, 2, 0, &all, SharedSpans::ShareWritable).unwrap();
+    assert_eq!(c.refs.len(), n, "ShareWritable: no new leaf frame");
+    assert!(c.refs.values().all(|&r| r == 2), "ShareWritable: every leaf is held twice");
+    assert_eq!(leaves(&c, pc), before, "ShareWritable: the parent keeps its writable entries");
+    assert_eq!(leaves(&c, writable_child), before, "ShareWritable: the child's entries are the parent's");
+    free_table(&mut c, writable_child, 2);
+    free_table(&mut c, pc, 2);
+    assert!(c.refs.is_empty() && c.tables.is_empty());
+}
+
+/// AArch64's two inverted bits: a table-level descriptor with the table bit clear is a block, and a
+/// leaf with `AP[2]` clear is writable. Demoting sets `AP[2]` and the marker; a read-only leaf (text)
+/// is shared unchanged, so a write to it is still a kill.
+#[test]
+fn aarch64_layout_reads_its_inverted_bits() {
+    use crate::AARCH64 as A;
+    const VALID: u64 = 1;
+    const TABLE: u64 = 1 << 1;
+    const AP_RO: u64 = 1 << 7;
+    const AP_EL0: u64 = 1 << 6;
+    const COW: u64 = 1 << 55;
+    const UXN: u64 = 1 << 54;
+    // A block at L1/L2 refuses the fork; a table descends.
+    assert_eq!(A.plan_clone(1, 0x4000_0000 | VALID, false, SharedSpans::ShareWritable), ClonePlan::Refuse);
+    assert_eq!(
+        A.plan_clone(1, 0x5000 | VALID | TABLE, false, SharedSpans::ShareWritable),
+        ClonePlan::Descend { table: 0x5000 }
+    );
+    // A writable user page: shared read-only + marked in both trees.
+    let rw = 0x7000 | VALID | TABLE | AP_EL0 | UXN;
+    let ClonePlan::ShareLeaf { frame, parent_entry, child_entry, demoted } =
+        A.plan_clone(0, rw, false, SharedSpans::ShareWritable)
+    else {
+        panic!("a valid leaf is shared");
+    };
+    assert_eq!((frame, demoted), (0x7000, true));
+    assert_eq!(parent_entry, rw | AP_RO | COW);
+    assert_eq!(child_entry, parent_entry);
+    assert!(!A.is_writable(parent_entry));
+    // Text: read-only, unmarked, unchanged.
+    let rx = 0x8000 | VALID | TABLE | AP_EL0 | AP_RO;
+    assert_eq!(
+        A.plan_clone(0, rx, false, SharedSpans::ShareWritable),
+        ClonePlan::ShareLeaf { frame: 0x8000, parent_entry: rx, child_entry: rx, demoted: false }
+    );
+    // Not valid: skipped, and nothing to free.
+    assert_eq!(A.plan_clone(0, 0x9000 | TABLE, false, SharedSpans::ShareWritable), ClonePlan::Skip);
+    assert_eq!(A.plan_free(0, 0x9000), None);
+    // The x86 layout is unchanged by the polarity flags.
+    assert!(X86_64.is_writable(0x7000 | 1 | 2));
+    assert!(X86_64.is_huge(1 | (1 << 7)));
+}
+
+// ---------------------------------------------------------------------------
+// `fork_leaf`: the decoded-leaf table amd64's fork walk uses, against `plan_clone`
+// ---------------------------------------------------------------------------
+
+/// A raw x86 leaf entry for the decoded inputs `(writable, cow)`.
+fn entry_for(writable: bool, cow: bool) -> u64 {
+    0x1234_5000 | P | if writable { W } else { 0 } | if cow { COW } else { 0 }
+}
+
+#[test]
+fn fork_leaf_truth_table() {
+    use Backing::{Device as Dev, Ram};
+    use ForkLeaf::*;
+    use Span::{Private as Pv, Shared as Sh};
+    // (backing, span, writable, cow) -> class
+    for (b, sp, w, c, want) in [
+        (Dev, Pv, false, false, Device),
+        (Dev, Sh, true, true, Device), // a device page in a shared span is still just a device page
+        (Ram, Sh, false, false, ShareWritable),
+        (Ram, Sh, true, true, ShareWritable),
+        (Ram, Pv, true, false, DemoteBoth),
+        (Ram, Pv, false, true, DemoteBoth), // already CoW: demoted again, which is a no-op on the entry
+        (Ram, Pv, true, true, DemoteBoth),
+        (Ram, Pv, false, false, ShareReadOnly),
+    ] {
+        assert_eq!(fork_leaf(b, sp, w, c), want, "{b:?} {sp:?} writable={w} cow={c}");
+    }
+}
+
+/// For every non-device input, amd64's decoded-leaf decision and `plan_clone`'s raw-entry decision must leave the
+/// same entries behind: that is the whole claim of "one decision table, two walkers".
+///
+/// Pinned: amd64's bin treats a `MAP_SHARED` span as `SharedSpans::ShareWritable` (writable in both, no CoW
+/// marker), which is **not** what the `SharedSpans::ShareFrames` doc comment says of amd64.
+#[test]
+fn fork_leaf_agrees_with_plan_clone() {
+    for in_shared in [false, true] {
+        for writable in [false, true] {
+            for cow in [false, true] {
+                let entry = entry_for(writable, cow);
+                let plan = L.plan_clone(0, entry, in_shared, SharedSpans::ShareWritable);
+                let ClonePlan::ShareLeaf { parent_entry, child_entry, demoted, .. } = plan else {
+                    panic!("a present leaf shares under ShareWritable, got {plan:?}");
+                };
+                let tag = std::format!("shared={in_shared} writable={writable} cow={cow}");
+                // The decoded outcome the walk produces, as entry properties.
+                let (parent_w, parent_cow, child_w, child_cow, changed) = match fork_leaf(Backing::Ram, if in_shared { Span::Shared } else { Span::Private }, writable, cow) {
+                    ForkLeaf::ShareWritable => (true, cow, true, cow, false),
+                    // the walk's `demoted = prot with write=false`, `cow = true`, for both sides
+                    ForkLeaf::DemoteBoth => (false, true, false, true, writable),
+                    ForkLeaf::ShareReadOnly => (false, cow, false, cow, false),
+                    ForkLeaf::Device => unreachable!(),
+                };
+                if in_shared {
+                    // shared: the entry is untouched on both sides, whatever it was
+                    assert_eq!((parent_entry, child_entry), (entry, entry), "{tag}");
+                    assert!(!demoted, "{tag}");
+                    assert_eq!(L.is_writable(entry), writable, "{tag}");
+                    continue;
+                }
+                assert_eq!(L.is_writable(parent_entry), parent_w, "{tag}: parent writable");
+                assert_eq!(L.is_writable(child_entry), child_w, "{tag}: child writable");
+                assert_eq!(parent_entry & COW != 0, parent_cow, "{tag}: parent cow");
+                assert_eq!(child_entry & COW != 0, child_cow, "{tag}: child cow");
+                assert_eq!(demoted, changed, "{tag}: the parent's entry changes exactly when it was writable");
+                assert_eq!(parent_entry, child_entry, "{tag}: both sides end identical");
+            }
+        }
+    }
 }

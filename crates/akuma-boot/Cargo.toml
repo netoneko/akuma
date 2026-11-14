@@ -16,7 +16,7 @@ akuma-psci = { path = "../akuma-psci", optional = true }
 [features]
 default = ["psci"]
 # The PSCI `SYSTEM_RESET`/`SYSTEM_OFF` performers. Off for non-AArch64 targets,
-# which supply their own reset (`amd64/src/reboot.rs`).
+# which supply their own reset (`crates/akuma-kernel-amd64/src/reboot.rs`).
 psci = ["dep:akuma-psci"]
 
 [lints]

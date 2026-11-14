@@ -122,7 +122,7 @@ So the writer is shared rather than duplicated:
   `akuma-exec-core`'s x86_64 arm is exactly what `syscall_entry` saves — and
   taking it as one value is what lets the two callers be one function.
 - It is registered as a new `X86ArchHooks::write_user_context`, because the
-  slot table lives in `amd64/src/sched.rs` and `akuma-threading` cannot name it.
+  slot table lives in `crates/akuma-kernel-amd64/src/sched.rs` and `akuma-threading` cannot name it.
   That is the same kind of effect as `switch_to`.
 - `sys_fork` calls it directly, with a `UserContext` it now builds from the
   parent's capture (`usermode::current_user_context`) instead of unpacking a

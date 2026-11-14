@@ -17,7 +17,7 @@ metal run"); the remaining work is the rio-side consumer.
 | `akuma-dwi2c` — DesignWare I²C decisions (regs, timings, aborts) | **done**: 9 host tests |
 | `akuma-touchpad` — clickpad policy (click/right/scroll state machine) | **done**: 20 host tests |
 | M0: measure this unit's I²C controller + touchpad constants on Linux | **done 2026-10-16** — §4a below; rdesc pinned as `akuma-hid` fixture |
-| kernel glue: `amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **WORKS ON METAL 2026-10-16** (ryzen, entry 12): bring-up, 1- and 2-finger contacts, scroll and click records — §5 "First metal run" — and the pointer in herdr on the framebuffer console (relative motion, click, natural scroll; "The console bridge"). Not yet: `poll`/`epoll` on the node, the pad's IRQ |
+| kernel glue: `crates/akuma-kernel-amd64/src/i2c.rs` + `touchpad.rs`, `/dev/input/mouse0` | **WORKS ON METAL 2026-10-16** (ryzen, entry 12): bring-up, 1- and 2-finger contacts, scroll and click records — §5 "First metal run" — and the pointer in herdr on the framebuffer console (relative motion, click, natural scroll; "The console bridge"). Not yet: `poll`/`epoll` on the node, the pad's IRQ |
 | rio fork: read the node, winit pointer events, cursor sprite | **open, lower priority** — the console bridge (below) covers terminal programs without it |
 
 Full host suite at commit time: **2076 passed, 0 failed** (50 of them new);
@@ -141,9 +141,9 @@ fixture** in `akuma-hid`'s tests, replacing the synthetic one for the
 policy tests' geometry.
 
 Then the kernel glue follows the wifi playbook (§6.3 of the proposal):
-`amd64/src/i2c.rs` (MMIO, the polled transaction — `writel`-shaped like
+`crates/akuma-kernel-amd64/src/i2c.rs` (MMIO, the polled transaction — `writel`-shaped like
 `pci.rs`'s BAR mapping, `dwi2c=0x<pa>` cmdline override beside `ecram=`),
-`amd64/src/touchpad.rs` (probe gates M1–M3 in dmesg), the pump hookup beside
+`crates/akuma-kernel-amd64/src/touchpad.rs` (probe gates M1–M3 in dmesg), the pump hookup beside
 `xhci::keyboard_poll`, and a `/dev/input/mouse0`-style node beside
 `/dev/fb0` for the rio fork to read. QEMU cannot see any of this
 (`microvm` has no I²C); every gate is verified over ssh via menu entry 12,
@@ -200,8 +200,8 @@ finger identity, which is why the decoder keys slots by contact id.
 
 | file | what |
 |---|---|
-| `amd64/src/i2c.rs` | `wake` (AOAC D0, bounded), `map_mmio`, `Dw`: init keeping the firmware's divide counts, `xfer(write, read)` with FIFO-bounded command feeding and abort decode. All waits are TSC-bounded; no IRQs, no allocation |
-| `amd64/src/touchpad.rs` | `discover` (DSDT contains `GXTP5100`, or `touchpad=0x<mmio>:0x<addr>`) → `init` (wake, DW init, HID descriptor @0x0001, `SET_POWER`, 60 ms, `RESET`, reset-ack, report descriptor, PTP layout, **Input Mode = 3 / Surface / Button switches** as `hid-multitouch` does, pointer geometry from the boot framebuffer) → `poll` from the console pump → `dev_read` |
+| `crates/akuma-kernel-amd64/src/i2c.rs` | `wake` (AOAC D0, bounded), `map_mmio`, `Dw`: init keeping the firmware's divide counts, `xfer(write, read)` with FIFO-bounded command feeding and abort decode. All waits are TSC-bounded; no IRQs, no allocation |
+| `crates/akuma-kernel-amd64/src/touchpad.rs` | `discover` (DSDT contains `GXTP5100`, or `touchpad=0x<mmio>:0x<addr>`) → `init` (wake, DW init, HID descriptor @0x0001, `SET_POWER`, 60 ms, `RESET`, reset-ack, report descriptor, PTP layout, **Input Mode = 3 / Surface / Button switches** as `hid-multitouch` does, pointer geometry from the boot framebuffer) → `poll` from the console pump → `dev_read` |
 | `FileDescriptor::DevMouse` | `open("/dev/input/mouse0")` → `ENOENT` unless the pad came up; `fstat` says char device (13,32) |
 
 **Stream format** (8-byte records, `akuma_touchpad::ptp::encode`): byte 0 kind
@@ -267,7 +267,7 @@ all in `dmesg`, and in `klog-N.all` on p3.
 
 ### The console bridge (2026-10-16) — pointer in herdr on the framebuffer
 
-`amd64/src/touchpad.rs::console_bridge`, called by the console pump, turns pointer
+`crates/akuma-kernel-amd64/src/touchpad.rs::console_bridge`, called by the console pump, turns pointer
 events into xterm mouse reports (`akuma_touchpad::tty`, 14 host tests) for a
 program that asked: `CSI ? 1000/1002/1003 h`, SGR with `1006` (fbcon records the
 modes; `Console::mouse_mode`). They are typed into the tty queue beside the

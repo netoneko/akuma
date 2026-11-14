@@ -1,8 +1,8 @@
 # Line-count statistics, post-amd64 edition
 
 **Measurement: 2026-10-23**, working tree (branch `kvm-part-1`, HEAD `e0f77ceb`).
-`scripts/cloc_akuma.py src crates amd64/src` — the script's default paths now
-include `amd64/src`, which the 2026-08-23 measurement
+`scripts/cloc_akuma.py src crates crates/akuma-kernel-amd64/src` — the script's default paths now
+include `crates/akuma-kernel-amd64/src`, which the 2026-08-23 measurement
 ([`LINE_COUNT_ANALYSIS.md`](LINE_COUNT_ANALYSIS.md)) did not count. That doc
 stays the living document for the `src` + `crates` series; this one is a dated
 snapshot for the whole tree after the amd64 bare-metal self-hosting milestone,
@@ -20,11 +20,11 @@ doc's public-source figures and should be re-checked before external citation.
 |---|---:|---:|---:|
 | production code (`src` + `crates`) | 43,700 | **87,778** | **+101%** |
 | test code (`src` + `crates`) | 29,302 | **61,523** | +110% |
-| production code (`amd64/src`) | — (not counted) | **27,126** | new |
+| production code (`crates/akuma-kernel-amd64/src`) | — (not counted) | **27,126** | new |
 | production code, tree total | 43,700 | **114,904** | +163% |
 | test-to-production ratio | 0.67× | 0.70× (`src`+`crates`) | flat |
 | production `unsafe` sites (`src` + `crates`) | 535 | **261** | **−51%** |
-| production `unsafe` sites (`amd64/src`) | — | 58 | new |
+| production `unsafe` sites (`crates/akuma-kernel-amd64/src`) | — | 58 | new |
 | production `unsafe` / kLoC, tree total | 10.5 | **2.8** | −73% |
 | crates | 22 | **98** | +76 |
 | crates with `#![forbid(unsafe_code)]` | 13 of 22 | **72 of 98** | — |
@@ -57,7 +57,7 @@ at all, because `x86_64-unknown-none` cannot compile the glue and never had to.
 ## Stat 2: production `unsafe` halved while code doubled
 
 535 → 261 sites in `src`+`crates` (−51%) on +101% more production code; with
-`amd64/src` included, 319 sites over 114,904 lines, **2.8 per kLoC where the
+`crates/akuma-kernel-amd64/src` included, 319 sites over 114,904 lines, **2.8 per kLoC where the
 prior measurement read 10.5**.
 
 The decomposition matters more than the headline:
@@ -66,7 +66,7 @@ The decomposition matters more than the headline:
   attrition: the inline-asm migration (218 → 35 `asm!` sites,
   `INLINE_ASM_CLEANUP.md`), the syscall subtree ban (`SYSCALL_UNSAFE_CLEANUP.md`),
   `akuma-exec` reaching forbid at 9,311 lines (`AKUMA_EXEC_FORBID_UNSAFE.md`),
-  the trap/MSR round that took `amd64/src/idt.rs` from 38 sites to 4
+  the trap/MSR round that took `crates/akuma-kernel-amd64/src/idt.rs` from 38 sites to 4
   (`AMD64_UNSAFE_REDUCTION_TRAP_MSR.md`), and the MMU safe facade
   (`AKUMA_MMU_SAFE_FACADE.md`).
 - **The ratchet holds.** `docs/reference/unsafe-budget.json` +
@@ -144,7 +144,7 @@ Two readings, both honest:
 ## Stat 5: comment density went *up* — 67.5% on production
 
 Production comments / production code, tree total: 77,609 / 114,904 =
-**67.5%** (2026-08-29: 47.7%). The rise is not style drift. `amd64/src` alone
+**67.5%** (2026-08-29: 47.7%). The rise is not style drift. `crates/akuma-kernel-amd64/src` alone
 carries 23,188 comments on 27,126 production lines (85%) — a second kernel
 written *after* the lessons of the first, with the contracts stated at the seam
 rather than re-learned from incidents. `LINE_COUNT_ANALYSIS.md` Reading B said
@@ -174,7 +174,7 @@ every crate in `crates/` whether or not a given kernel links it.
 | kernel | own code (links) | external code | external / own | external crates | external `unsafe` sites |
 |---|---:|---:|---:|---:|---:|
 | AArch64 (`src` + linked crates) | 66,554 | 67,781 | **1.02x** | 25 | 1,407 |
-| amd64 (`amd64/src` + linked crates) | 107,750 | 80,201 | **0.74x** | 29 | 1,795 |
+| amd64 (`crates/akuma-kernel-amd64/src` + linked crates) | 107,750 | 80,201 | **0.74x** | 29 | 1,795 |
 | Taoxichuan (stage 3, `taoxichuan/src` + 23 crates) | 14,892 | 27,312 | **1.83x** | 10 | 1,096 |
 
 **Superseded in part (2026-10-24, later the same day).** The table above was computed with the first
@@ -232,11 +232,11 @@ them for both, and are not additive):
 | self-build | reliable in-VM (`-j4`, 20/20 first-try, `AKUMA_SELF_HOSTING.md`) | unchanged |
 | hosts | QEMU, AWS Graviton2 (`m6g.metal`, Firecracker/KVM) | unchanged |
 
-**amd64 kernel** (`amd64/src` + the shared crates):
+**amd64 kernel** (`crates/akuma-kernel-amd64/src` + the shared crates):
 
 | | 2026-08-23 | 2026-10-23 |
 |---|---|---|
-| production code, own tree (`amd64/src/`) | — (not counted) | 27,126 |
+| production code, own tree (`crates/akuma-kernel-amd64/src/`) | — (not counted) | 27,126 |
 | production code, shared crates | 35,121 | 87,778 |
 | **production code, platform total** | — | **114,904** |
 | production `unsafe` sites | — | 58 |
@@ -259,7 +259,7 @@ one maintainer behind.
 ## Caveats
 
 - **Comparability.** The cloc script gained features between measurements
-  (unsafe counting matured, path defaults now include `amd64/src`). The
+  (unsafe counting matured, path defaults now include `crates/akuma-kernel-amd64/src`). The
   `src`+`crates` series above is computed with the same path arguments for both
   dates and should be comparable; the tree-total row has no prior. When in
   doubt, re-run with `--rev`.
@@ -278,7 +278,7 @@ one maintainer behind.
 ```bash
 python3 scripts/cloc_akuma.py --json                      # tree total (default paths)
 python3 scripts/cloc_akuma.py --json src crates           # continuity series
-python3 scripts/cloc_akuma.py --json amd64/src            # the amd64 kernel
+python3 scripts/cloc_akuma.py --json crates/akuma-kernel-amd64/src            # the amd64 kernel
 python3 scripts/cloc_akuma.py --vs v0.0.7-akuma-on-aws    # delta vs the prior snapshot
 python3 scripts/cloc_akuma.py --top 0 --external          # Stat 6: linked crates.io libraries per kernel
 git rev-list --count HEAD

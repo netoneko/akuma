@@ -34,7 +34,7 @@ import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PATHS = ["src", "crates", "amd64", os.path.join("taoxichuan", "src")]
+PATHS = ["src", "crates", os.path.join("taoxichuan", "src")]
 #: measure -> (JSON field from `cloc_akuma.py --json`, budget file, what it counts)
 MEASURES = {
     "copy": ("copy_sites", os.path.join(ROOT, "docs", "reference", "copy-budget.json"), "copying calls"),

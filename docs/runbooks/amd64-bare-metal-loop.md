@@ -43,7 +43,7 @@ Two things make this worth doing *before* forming a theory:
 `GRUB_DEFAULT="Akuma/amd64"`'s entry in `/etc/grub.d/45_akuma` carries
 ` netprobe` on its `multiboot2` line. Keep it there.
 
-It turns on `amd64/src/net.rs`'s `print_probe_line` plus the NIC's DMA layout,
+It turns on `crates/akuma-kernel-amd64/src/net.rs`'s `print_probe_line` plus the NIC's DMA layout,
 and `enable_probe()` prints them **immediately before `run_init`** so they land
 at the bottom of the log rather than scrolling off — written for exactly the
 case where the console is a television being photographed.
@@ -323,7 +323,7 @@ export LD_LIBRARY_PATH=/mnt/ak/usr/local/rust/lib:/mnt/ak/usr/lib:/mnt/ak/lib
 export PATH=/mnt/ak/usr/local/rust/bin:$PATH
 export HOME=/mnt/ak/root CARGO_HOME=/mnt/ak/root/.cargo CARGO_TARGET_DIR=/root/prime-target
 cd /mnt/ak/src/github.com/netoneko/akuma && cargo fetch --locked   # prime the cache
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release --offline -j8
+cargo build -p akuma --target x86_64-unknown-none --release --offline -j8
 ```
 
 That is the *exact* cargo, rustc and cache the box will use, at Ubuntu's speed
@@ -354,7 +354,7 @@ Staged and verified this way on 2026-09-19, all `--offline`: the kernel in
 ```
 ssh akuma "reboot -f"          # NOTE: now returns to Akuma, not Ubuntu
    ... hpbox.deploy()                       # box lands on a commit + your patch
-   ... cargo build -p akuma-amd64 --target x86_64-unknown-none --release
+   ... cargo build -p akuma --target x86_64-unknown-none --release
    ... sh amd64/mkdisk.sh
    ... cp to /boot/akuma/{akuma-amd64,root.img}; grub-reboot "Akuma/amd64"
 ssh -F /dev/null -p 22 root@192.168.1.123 "reboot"   # -> Akuma
@@ -599,7 +599,7 @@ caller reading only stdout sees an empty success.
 - **Staging the bare-metal root for a self-host build: source from git,
   `vendor/` from `cargo vendor`, toolchain from the Firecracker image.** Two
   things bite here. The toolchain on `sdb1` shipped only
-  `x86_64-unknown-linux-musl`, so `cargo build -p akuma-amd64` died at the second
+  `x86_64-unknown-linux-musl`, so `cargo build -p akuma` died at the second
   crate with `E0463: can't find crate for core` — and the rlibs must come from
   the *same* rustc build, so a laptop's nightly will not do. And **`vendor/` and
   the `replace-with = "vendored-sources"` block are not in git**: copy a tree out
@@ -621,7 +621,7 @@ caller reading only stdout sees an empty success.
   ```
 
 - **Build the kernel on the metal with `nosmp`.** A clean 95-crate
-  `cargo build -p akuma-amd64 -j1` completes in **22 m 54 s** at one core
+  `cargo build -p akuma -j1` completes in **22 m 54 s** at one core
   (`kbuild -c`). At SMP=4 it does not complete at all — see the next rule. For
   reference the same build is **3 m 43 s** in the Firecracker guest at SMP=1;
   that gap is storage, not the CPU (it is the same machine — the guest's root is
@@ -772,8 +772,8 @@ multiboot2 /boot/akuma/akuma-amd64 init=/bin/herd netprobe
 | `fbverbose` | (also turns the quiet-boot splash **off**) keep kernel and service diagnostics (`[herd]`, `[BKL]`, `[PSTATS]`, `[probe]`) **on the TV** even with a console shell running. Off by default since 2026-10-01: once `herd`'s `console` service spawns, `serial::set_fb_quiet` keeps the framebuffer for the shell and its echo, and a panic or fatal exception reopens it. `dmesg` always has everything. Use this when the TV is the only way to see a hang — [`amd64-console-shell.md`](amd64-console-shell.md) |
 | `pci` + `usbroot` | **PVH/QEMU only** (`-M q35`): scan PCI, and mount `/dev/sda1` from the xHCI USB disk the way `root=/dev/sda1` does on the metal. With `-device qemu-xhci -device usb-storage -device usb-kbd` this is the only off-metal rig for the USB stack and keyboard — `scripts/utils/amd64_console_probe.py --usb` |
 | `fbtrace` | PVH only: send what the framebuffer *would* show to QEMU's port-`0xE9` debug console (`FBTRACE=<file> sh amd64/run.sh`), because that machine has no framebuffer and the quiet policy is otherwise unobservable |
-| `root=/dev/nvme0n1pN` | **multiboot2 only** (2026-10-06): drive the NVMe SSD (`amd64/src/nvme.rs`) and mount GPT partition N as the root. Only that partition's LBA range is ever read or written, and both GPT CRCs must check. A partition without ext2 is refused before any write, and the boot falls back to the RAM image. Built for ryzen (`overlays/ryzen/`, p3); the trashcan has no NVMe |
-| `wdt` / `wdt=<s>` | arm the **AMD FCH hardware watchdog** (`amd64/src/watchdog.rs`, default 60 s, 10–65535): reset the machine if the BSP takes no timer interrupt for that long. Gated on the chipset (`1022:790b` rev ≥ `0x51`), so the trashcan's Intel board logs "not armed". Stopped before an orderly reset |
+| `root=/dev/nvme0n1pN` | **multiboot2 only** (2026-10-06): drive the NVMe SSD (`crates/akuma-drivers-amd64/src/nvme.rs`) and mount GPT partition N as the root. Only that partition's LBA range is ever read or written, and both GPT CRCs must check. A partition without ext2 is refused before any write, and the boot falls back to the RAM image. Built for ryzen (`overlays/ryzen/`, p3); the trashcan has no NVMe |
+| `wdt` / `wdt=<s>` | arm the **AMD FCH hardware watchdog** (`crates/akuma-kernel-amd64/src/watchdog.rs`, default 60 s, 10–65535): reset the machine if the BSP takes no timer interrupt for that long. Gated on the chipset (`1022:790b` rev ≥ `0x51`), so the trashcan's Intel board logs "not armed". Stopped before an orderly reset |
 | `wdttest` | arm the watchdog, then wedge with interrupts off instead of starting `init`, to prove the reset fires. **Refuses** (and boots normally) if the watchdog did not arm |
 | `nofb` | do not touch the framebuffer: boot headless, everything to `dmesg`. A framebuffer that cannot be used (none, not direct-colour, unmapped) now also means headless rather than a halt |
 | `rtw89` | (multiboot2, after the root mount) bring ryzen's **RTL8852CE** up to running firmware and shut it down again — wifi stage W1; `[rtw]` lines say how far it got — [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md) |
@@ -918,7 +918,7 @@ regression gate and an eliminator, not a reproducer.
 ### The PMM forensics build
 
 ```bash
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+cargo build -p akuma --target x86_64-unknown-none --release \
       --features pmm-forensics
 ```
 
@@ -1097,7 +1097,7 @@ is **ext2, label `AKUMA`** — formatted from Ubuntu 2026-09-06. Keep the enclos
 **off the USB hub** — straight into a rear port it does 134 MB/s and enumerates on
 xHCI; behind the hub sustained writes drop it off the bus.
 
-Driver: `akuma-xhci` + `akuma-usb-storage` (pure, host-tested) + `amd64/src/xhci.rs`
+Driver: `akuma-xhci` + `akuma-usb-storage` (pure, host-tested) + `crates/akuma-drivers-amd64/src/xhci.rs`
 (MMIO/DMA). Two command-line tokens, and the difference matters on a machine
 that crash-loops when this goes wrong:
 

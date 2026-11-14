@@ -43,31 +43,31 @@ ssh -o StrictHostKeyChecking=no -p 2223 root@localhost
 ## How it works
 
 The devbox differs from a normal Akuma boot in exactly two ways, and both are selected
-together by the **`devbox` profile + `devbox` feature** (mirroring how `size`/`extreme`
-are a `[profile.*]` plus a feature set):
+together by its feature set (`rump-default` + `userspace-sshd`, on a
+`--no-default-features` release build):
 
 ```
-cargo run --profile devbox --features devbox      # what overlays/devbox/run.sh does
+overlays/devbox/run.sh                             # rump-default,userspace-sshd,... --no-default-features
 scripts/build_devbox.sh                            # build-only equivalent
 ```
 
 ```
 [features]
-devbox         = ["rump-default", "userspace-sshd"]   # the meta-feature
 rump-default   = ["rump"]                             # rump is the DEFAULT stack for box 0
 userspace-sshd = []                                   # no built-in (smoltcp) SSH server
 ```
 
-`[profile.devbox]` inherits `release`, so it carries `rump` + `sound` codegen; the
-behavioural difference is entirely in those two features.
+It is a plain `--release` build; the behavioural difference is entirely in those
+two features. (The `devbox` feature that bundled them was removed 2026-11-11.)
 
 ### devbox-smoltcp (the default) — the inverse
 
 The recommended image is the **`devbox-smoltcp`** meta-feature on the
-**`release`** profile (the `smp-shared` feature does the work):
+**`release`** profile (every Akuma build is shared-kernel SMP; the feature is an
+empty alias kept for the scripts):
 
 ```
-cargo run --release --features devbox-smoltcp,no-tests   # run-smoltcp.sh
+cargo run --release --features no-tests   # run-smoltcp.sh
 scripts/build_devbox_smoltcp.sh                                             # build-only
 
 [features]
@@ -167,7 +167,7 @@ starts. **Phase 2** will build the devbox with `--no-default-features` to compil
 ```
 overlays/devbox/
   bootstrap.sh   # host build: build herd+sshd → create image → base binaries → wipe /etc → overlay
-  run.sh         # boot QEMU: cargo run --profile devbox --features devbox, RUMP_NIC=1, MEMORY=4096
+  run.sh         # boot QEMU: cargo run --release --no-default-features --features rump-default,..., RUMP_NIC=1, MEMORY=4096
   README.md      # this file
   NOTICE         # pointer to the third-party notices
   rootfs/        # the SOLE source of the image's /etc

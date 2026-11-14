@@ -16,7 +16,7 @@ and it used to live only inside the aarch64 kernel's `akuma-syscalls-glue`,
 which does not build for `x86_64-unknown-none`.
 
 Both kernels now consume this crate — `akuma-syscalls-glue::net` and
-`amd64/src/fd.rs` — so they cannot drift. It does not read or write user
+`crates/akuma-kernel-amd64/src/fd.rs` — so they cannot drift. It does not read or write user
 memory, look up an interface, or know what a socket is: the caller supplies the
 `Interface` list (from `akuma_net::smoltcp_net::interface_snapshot()`) and does
 the copies; this decides the bytes.

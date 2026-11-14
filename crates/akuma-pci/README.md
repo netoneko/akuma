@@ -7,7 +7,7 @@ Pure PCI / PCIe configuration-space parsing — no port I/O, no MMIO, no
 
 The amd64 bare-metal target has no device enumeration: under a VMM every device
 is announced (virtio-MMIO on the command line), and on real hardware nothing
-is. `amd64/src/pci.rs` does the `0xCF8`/`0xCFC` port I/O and the write-1s BAR
+is. `crates/akuma-kernel-amd64/src/pci.rs` does the `0xCF8`/`0xCFC` port I/O and the write-1s BAR
 size probe; this crate is everything that can be decided without touching the
 bus:
 

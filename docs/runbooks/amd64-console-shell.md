@@ -7,7 +7,7 @@ the shell on the TV (the boot log shows the real key reports decoding). `^C` and
 
 The HP box's only console is the framebuffer GRUB hands the kernel, and its only
 local input is a USB keyboard that **the kernel drives natively over xHCI**
-(`amd64/src/xhci.rs`). Since 2026-10-01 a login shell runs on that console
+(`crates/akuma-kernel-amd64/src/xhci.rs`). Since 2026-10-01 a login shell runs on that console
 beside `sshd`.
 
 > **Do not rely on the firmware's PS/2 emulation (`kbd.rs`).** It was the first
@@ -35,12 +35,12 @@ and the TV showed the boot log and then nothing. The fix is one more service:
 | piece | where | what it does |
 |---|---|---|
 | `console = true` | `userspace/herd/src/main.rs` | spawns the service with `SPAWN_FLAG_CONSOLE` and a full environment (`PATH`, `HOME`, `TERM`) |
-| `SPAWN_FLAG_CONSOLE` (2) | `amd64/src/usermode.rs` `sys_spawn` | the child gets **no** channel of its own, so `register_exec_process` attaches it to the console channel and the shared `TerminalState` — exactly what `init` gets. Refused (`EPERM`) unless the **caller** is itself console-attached, so an ssh session cannot take the keyboard |
-| the pump | `amd64/src/console.rs` | keyboard -> line discipline (`^C` -> `SIGINT`) -> the shell; the shell's echo -> screen |
-| native USB keyboard | `amd64/src/xhci.rs` `init_keyboard` / `keyboard_poll` | a **second xHCI slot** beside the disk's: enumerate the boot-keyboard interface, `SET_CONFIGURATION`, Configure Endpoint (interrupt IN), `SET_PROTOCOL(boot)`, keep one 8-byte report in flight; decode with `akuma-usb`'s `BootKeyboardDecoder` into a key FIFO that `input::getb` drains. Reports are taken in `Xhci::next_event`, the one place events are consumed, so a disk read cannot swallow one |
-| Backspace = `0x7f` | `amd64/src/kbd.rs`, `akuma-usb` keymap | was `0x08`, which cooked-mode `read(0)` does not treat as erase |
+| `SPAWN_FLAG_CONSOLE` (2) | `crates/akuma-kernel-amd64/src/usermode.rs` `sys_spawn` | the child is made by the shared spawn with `Attach` = the console channel and the shared `TerminalState` — exactly what `init` gets. Refused (`EPERM`) unless the **caller** is itself console-attached, so an ssh session cannot take the keyboard |
+| the pump | `crates/akuma-kernel-amd64/src/console.rs` | keyboard -> line discipline (`^C` -> `SIGINT`) -> the shell; the shell's echo -> screen |
+| native USB keyboard | `crates/akuma-kernel-amd64/src/xhci.rs` `init_keyboard` / `keyboard_poll` | a **second xHCI slot** beside the disk's: enumerate the boot-keyboard interface, `SET_CONFIGURATION`, Configure Endpoint (interrupt IN), `SET_PROTOCOL(boot)`, keep one 8-byte report in flight; decode with `akuma-usb`'s `BootKeyboardDecoder` into a key FIFO that `input::getb` drains. Reports are taken in `Xhci::next_event`, the one place events are consumed, so a disk read cannot swallow one |
+| Backspace = `0x7f` | `crates/akuma-kernel-amd64/src/kbd.rs`, `akuma-usb` keymap | was `0x08`, which cooked-mode `read(0)` does not treat as erase |
 | arrows + key repeat | `crates/akuma-usb` keymap/decoder, `xhci::keyboard_poll` | navigation keys emit Linux-console escape sequences; a USB boot keyboard never repeats a held key, so the decoder remembers the held key and the pump re-emits it after 400 ms every 35 ms. Backspace is `0x7f` here too (the USB keymap still said `0x08` until 2026-10-01) |
-| quiet framebuffer | `amd64/src/serial.rs` `set_fb_quiet` | once the console shell is spawned the TV shows the shell and its echo only; `[probe]`/`[herd]`/`[BKL]`/`[PSTATS]` stay in `dmesg`; a panic or fatal exception reopens it; boot flag `fbverbose` disables it. Console traffic uses `putb_tty`; pid 1's (`herd`'s) writes do not |
+| quiet framebuffer | `crates/akuma-kernel-amd64/src/serial.rs` `set_fb_quiet` | once the console shell is spawned the TV shows the shell and its echo only; `[probe]`/`[herd]`/`[BKL]`/`[PSTATS]` stay in `dmesg`; a panic or fatal exception reopens it; boot flag `fbverbose` disables it. Console traffic uses `putb_tty`; pid 1's (`herd`'s) writes do not |
 | ANSI subset | `crates/akuma-fbcon/src/console.rs` | busybox's line editor emits `\b`, `ESC[nD`, `ESC[J`, `ESC[K`; they used to be drawn as glyphs |
 | cursor | same, + `multiboot2::cursor_idle` | a block, drawn when output goes quiet, removed by the next byte |
 
@@ -206,6 +206,24 @@ ignores memory types, so only KVM or the metal can show the speedup).
 present 2 MiB entry, or more than two ragged ends. The console works at the old UC speed and
 the splash backs off to 150 ms by itself. Rollback of the whole change:
 `cp -f /boot/akuma-amd64.prev /boot/akuma-amd64` (the pre-WC kernel).
+
+## macOS-style text (2026-11-09)
+
+Text edges default to **gray** anti-aliasing (`smooth = gray`), not subpixel, and every Plex cut
+(10x20 to 24x48) is baked with coverage exponent 0.6 (`HD_COVERAGE_GAMMA` in
+`crates/akuma-fbcon/build.rs`), which thickens stems the way macOS's stem darkening does. Subpixel
+is one line away: `smooth = rgb` (or `bgr`) in `/etc/console.conf`, or `CSI ? 9002 h`.
+Look at it without a VM: `AKUMA_FBCON_CONF="smooth = gray" AKUMA_FBCON_DUMP=<dir> cargo test
+-p akuma-fbcon --test dump -- --ignored`, then `sips -s format png <dir>/text.ppm --out text.png`.
+**Not verified on glass.**
+
+CJK, Greek, Latin Extended-B/IPA and the symbol blocks are anti-aliased too (`src/hires.rs`):
+Noto Sans CJK SC for the ~12.5k common CJK glyphs (GB2312 + JIS X 0208 + KS X 1001 Hangul, kana,
+fullwidth) baked at 22 and 40 px and 4-bit, DejaVu Sans Mono for symbols and Greek at 24x48, 8-bit;
+both area-resampled to the cell (1:1 on the 11x22 and 20x40 defaults). Unifont stays the fallback
+for everything outside the set. **Image cost: +14.9 MB** (`vendor/hires/`: CJK 13.0, symbols 1.9),
+all of it `static` data in the kernel image whether or not it is drawn. Rebake:
+header of `crates/akuma-fbcon/tests/bake_hires.rs`.
 
 ## Font crispness: the HD cut (2026-10-01, verified on the trashcan)
 

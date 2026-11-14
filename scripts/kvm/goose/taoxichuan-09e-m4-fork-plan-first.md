@@ -41,7 +41,7 @@ One core. No procfs, no `/dev` (no `dd`). The host forward degrades near ~30 con
 Ticks: PIT-calibrated LAPIC, vector 32, about 10 ms. `vm-dev.log` keeps older boots' lines: compare line numbers against your boot's `loading akuma-vm guest` line.
 
 ## Composition rule (mandatory)
-Look first (`grep -rn <name> crates/ amd64/src/`), pull by path dependency, extract from `amd64/src/` into a crate only if it lives only there (new crates `forbid(unsafe_code)`, unsafe budget 0), write new only when it exists nowhere, and say which for each piece. `amd64/` must keep building (`cargo check -p akuma-amd64 --target x86_64-unknown-none --features no-tests`).
+Look first (`grep -rn <name> crates/ crates/akuma-kernel-amd64/src/`), pull by path dependency, extract from `crates/akuma-kernel-amd64/src/` into a crate only if it lives only there (new crates `forbid(unsafe_code)`, unsafe budget 0), write new only when it exists nowhere, and say which for each piece. `amd64/` must keep building (`cargo check -p akuma-amd64 --target x86_64-unknown-none --features no-tests`).
 `wc -l taoxichuan/src/*.rs` at start and end. Decisions already made (do not reopen): timer preemption is the NEXT slice (switch only where a task parks, never in ring 0); SMP-ready (no new `static` current task, go through the slot accessors); pull crates, do not copy code; keep M2's scaffold compiled and selectable until the new path passes every gate, then flip the default and leave deleting for the next session.
 
 ## Gates (extend `scripts/kvm/goose/run_pipes.sh` with a trailing group or add `run_fork.sh` beside it; NOT `run_gates.sh`; at most 8 execs per boot)

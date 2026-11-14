@@ -1,0 +1,20 @@
+Smooth glyph tables baked by tests/bake_hires.rs (2026-11-09). The source fonts are not vendored
+(Noto Sans CJK is 16 MB); only the tables below are, MODIFIED in that they are rasterized, gamma-boosted
+(coverage exponent 0.6) and repacked.
+
+sym-24x48.{idx,bin}  DejaVu Sans Mono 2.37 (DejaVuSansMono.ttf,
+                     https://github.com/dejavu-fonts/dejavu-fonts/releases/download/version_2_37/dejavu-fonts-ttf-2.37.tar.bz2).
+                     1637 glyphs of Latin Extended-B, IPA, Greek, Cyrillic, Latin Extended Additional and the
+                     symbol blocks of unifont::SYMBOLS, 24x48 cells of 8-bit coverage.
+                     Licence: Bitstream Vera / DejaVu (permissive, free to embed and redistribute modified
+                     with the name changed): LICENSE-DEJAVU.txt.
+
+cjk.idx, cjk-22.bin, cjk-40.bin
+                     Noto Sans CJK SC Regular (NotoSansCJKsc-Regular.otf,
+                     https://github.com/notofonts/noto-cjk/raw/main/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf).
+                     12,480 glyphs: GB2312 U JIS X 0208 U KS X 1001 Hangul U kana/CJK punctuation U fullwidth
+                     forms (scripts/cjk_common_set.py), em square in a 22x22 and a 40x40 box, 4-bit coverage.
+                     Han characters use the Simplified Chinese forms for every language.
+                     Licence: SIL Open Font License 1.1: LICENSE-NOTO-OFL-1.1.txt.
+
+Regenerate: see the header of tests/bake_hires.rs.

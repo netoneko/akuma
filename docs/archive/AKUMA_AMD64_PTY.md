@@ -49,7 +49,7 @@ Glue serves it on **both** kernels: amd64's `read`/`write`/`ioctl`/`poll`/
   `getpgid`/`getpgrp`/`getsid`/`setpgid` are real **only for a process whose
   session a pty controls** and keep their old answers (1 / accepted no-op) for
   the console world, whose `^C` routing depends on them (the `Getpgid` arm in
-  `amd64/src/usermode.rs` says why).
+  `crates/akuma-kernel-amd64/src/usermode.rs` says why).
 
 ## 3. Allocations
 

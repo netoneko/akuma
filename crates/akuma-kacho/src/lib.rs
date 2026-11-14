@@ -204,7 +204,7 @@ pub const fn rate_per_sec(events: u64, elapsed_us: u64) -> u64 {
 /// come back with nothing to do.
 ///
 /// The kernel call site is the amd64 idle loop's long one-shot
-/// (`amd64/src/lapic.rs` `arm_idle_shot`): a halted core wakes every tick, and
+/// (`crates/akuma-kernel-amd64/src/lapic.rs` `arm_idle_shot`): a halted core wakes every tick, and
 /// each wake costs power for no work. When the wakes keep coming back empty,
 /// the next sleep may lengthen toward a ceiling; one wake that found work puts
 /// the budget back at the floor. The unit is the caller's — ticks,

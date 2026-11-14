@@ -1,0 +1,13 @@
+[package]
+name = "akuma-ed25519"
+version = "0.1.0"
+edition = "2024"
+description = "Ed25519 signature verification for the kernel: one function over RustCrypto's ed25519-dalek (verify only, strict, no allocation), pinned against RFC 8032 vectors"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Verify only: no `alloc`, no `rand_core`, no precomputed tables (`fast`), no `zeroize` (there is no secret here). Written by others and
+# audited by others; this crate is the narrow door to it, not a reimplementation.
+ed25519-dalek = { version = "2", default-features = false }

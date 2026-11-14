@@ -79,22 +79,13 @@ impl MmioDevices {
 
     /// The slot geometry these devices describe: `(base, stride, count)`.
     ///
-    /// Drivers address virtio slots as `base + i * stride`, so a machine whose
-    /// transports are not evenly spaced cannot be described that way. Both
-    /// machines *are* — Firecracker 0x1000 apart, microvm 0x200 — but that is
-    /// measured, not guaranteed, so it is checked here and the count falls back
-    /// to 1. Believing a stride that does not hold would point slot 1 at nothing
-    /// and hand a driver a page of zeroes.
+    /// The rule (evenly spaced at the first window's size, else one slot) is
+    /// [`akuma_machine_facts::virtio_geometry`], the one copy both this view and
+    /// `Facts::virtio_geometry` use.
     #[must_use]
     pub fn geometry(&self) -> Option<(u64, u64, usize)> {
-        let first = self.as_slice().first()?;
-        let stride = first.len;
-        let dense = self
-            .as_slice()
-            .iter()
-            .enumerate()
-            .all(|(i, d)| d.base == first.base + (i as u64) * stride && d.len == stride);
-        Some((first.base, stride, if dense { self.len } else { 1 }))
+        let windows = self.as_slice().iter().map(|d| akuma_machine_facts::Range::new(d.base, d.len));
+        akuma_machine_facts::virtio_geometry(windows).map(|g| (g.base, g.stride, g.slots))
     }
 
     fn push(&mut self, dev: MmioDevice) {

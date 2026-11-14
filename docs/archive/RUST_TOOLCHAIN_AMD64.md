@@ -47,10 +47,10 @@ image, `apk add gcc musl-dev binutils` (190.6 MiB, 16 packages) installed and:**
 
 | symptom | mechanism | status |
 |---|---|---|
-| `git clone` → `chmod on .git/config.lock failed: Function not implemented` | **dispatch, not VFS.** `chmod`(x86_64 90), `chdir`(80), `fchmod`(91) and `fchmodat`(268) had no row in `akuma-syscalls-abi`'s `syscall_table!`, so `Syscall::from_x86_64` answered `None` and `syscall_dispatch` returned `ENOSYS` (`amd64/src/usermode.rs`, the `let Some(call) = Syscall::from_x86_64(nr) else` arm). The implementations were not missing: `akuma-syscalls-glue` has `sys_chdir`/`sys_fchdir`/`sys_fchmod`/`sys_fchmodat` (`crates/akuma-syscalls-glue/src/fs.rs`) and the AArch64 kernel dispatches them by `nr`. Glue's `chdir`/`getcwd` read and write `Process::cwd`, `resolve_path_at` resolves `AT_FDCWD` against it, and `Process::inherit_from` copies the parent's cwd on `fork` — the per-process cwd plumbing was wired; only the numbers were absent | **fixed + verified 2026-09-12** — three rows added (80↔49, 91↔52, 268↔53), `Chdir`/`Fchmod`/`Fchmodat` routed through `to_glue`, `getcwd` folded to glue, `chmod`(90) shimmed to `fchmodat(AT_FDCWD, …)`. Boot suite 654/0 with six new probes; `cd /proc && pwd`, fork-inherited `pwd` and a `chmod`/`stat` mode round-trip confirmed over ssh in the Firecracker guest |
+| `git clone` → `chmod on .git/config.lock failed: Function not implemented` | **dispatch, not VFS.** `chmod`(x86_64 90), `chdir`(80), `fchmod`(91) and `fchmodat`(268) had no row in `akuma-syscalls-abi`'s `syscall_table!`, so `Syscall::from_x86_64` answered `None` and `syscall_dispatch` returned `ENOSYS` (`crates/akuma-kernel-amd64/src/usermode.rs`, the `let Some(call) = Syscall::from_x86_64(nr) else` arm). The implementations were not missing: `akuma-syscalls-glue` has `sys_chdir`/`sys_fchdir`/`sys_fchmod`/`sys_fchmodat` (`crates/akuma-syscalls-glue/src/fs.rs`) and the AArch64 kernel dispatches them by `nr`. Glue's `chdir`/`getcwd` read and write `Process::cwd`, `resolve_path_at` resolves `AT_FDCWD` against it, and `Process::inherit_from` copies the parent's cwd on `fork` — the per-process cwd plumbing was wired; only the numbers were absent | **fixed + verified 2026-09-12** — three rows added (80↔49, 91↔52, 268↔53), `Chdir`/`Fchmod`/`Fchmodat` routed through `to_glue`, `getcwd` folded to glue, `chmod`(90) shimmed to `fchmodat(AT_FDCWD, …)`. Boot suite 654/0 with six new probes; `cd /proc && pwd`, fork-inherited `pwd` and a `chmod`/`stat` mode round-trip confirmed over ssh in the Firecracker guest |
 | `top` → `can't change directory to '/proc': Function not implemented` | same gap — busybox `top` `chdir`s into `/proc` to scan | **fixed** — same change; `chdir("/proc")` now succeeds (self-test probe runs exactly that) |
-| `rustc`/`gcc`/`clang` → `posix_spawnp: Function not implemented` / `posix_spawn failed: Function not implemented` / `os error 38` | **`clone`, not `execve`.** This doc first blamed `sys_execve`'s non-slotted-task guard — wrong. musl's `posix_spawn` issues `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`, no `CLONE_THREAD`, and `sys_clone_thread` refused any `CLONE_VM` without `CLONE_THREAD` with `ENOSYS` (`amd64/src/thread.rs`). The spawn never happened; the drivers reported it at exec | **fixed + verified 2026-09-12** — the `Syscall::Clone` arm routes `CLONE_VM` without `CLONE_THREAD` to `sys_spawn_clone`: `fork_process(child_pid, child_stack)` — a **CoW copy, not a shared address space** (this target does not implement `CLONE_VFORK`'s parent suspension, so sharing would race; musl's spawn child only execs or exits, so the copy buys correctness for one fork per spawn), entering at `rsp = child_stack`, return `0` — exactly musl `__clone`'s entry convention (`[rsp]=fn, [rsp+8]=arg`). `cc1`, `as` and `ld` all spawn now. Two carried notes: spawn children start cwd `/` (they do not inherit the spawner's), and CoW fork is SMP=1-only on this target, so keep Firecracker at 1 vCPU |
-| shell: `cc` → `Out of memory`; serial: `[execve] load failed: Read past end of image`; **nested symlinks fail too** | **resolved — symlinks.** `cc` is a *symlink* (`/usr/bin/cc -> gcc`). `sys_execve` read the image with raw `fs::read_file`, which never runs `resolve_symlinks` (only `sys_openat`'s path does), so the loader was handed the *link text* — 3 bytes of `"gcc"` — as the image | **fixed** — `fs::read_image` (new, `amd64/src/fs.rs`): symlink-resolves first, then chunks through `read_at`, which also lifts `read_inode_data`'s 16 MiB kernel-side allocation cap — a cap `cc1` (42 MB) died on as `ENOENT`. The chunk buffer lives on the **heap** (`try_reserve_exact`); the first draft used a 64 KiB stack array against a 32 KiB kernel stack (`sched::STACK_SIZE`) and the boot died as a ring-0 `#PF` inside `ClockBlockCache::get` several frames after the overflowing write — the lesson is now in `read_image`'s doc comment |
+| `rustc`/`gcc`/`clang` → `posix_spawnp: Function not implemented` / `posix_spawn failed: Function not implemented` / `os error 38` | **`clone`, not `execve`.** This doc first blamed `sys_execve`'s non-slotted-task guard — wrong. musl's `posix_spawn` issues `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`, no `CLONE_THREAD`, and `sys_clone_thread` refused any `CLONE_VM` without `CLONE_THREAD` with `ENOSYS` (`crates/akuma-kernel-amd64/src/thread.rs`). The spawn never happened; the drivers reported it at exec | **fixed + verified 2026-09-12** — the `Syscall::Clone` arm routes `CLONE_VM` without `CLONE_THREAD` to `sys_spawn_clone`: `fork_process(child_pid, child_stack)` — a **CoW copy, not a shared address space** (this target does not implement `CLONE_VFORK`'s parent suspension, so sharing would race; musl's spawn child only execs or exits, so the copy buys correctness for one fork per spawn), entering at `rsp = child_stack`, return `0` — exactly musl `__clone`'s entry convention (`[rsp]=fn, [rsp+8]=arg`). `cc1`, `as` and `ld` all spawn now. Two carried notes: spawn children start cwd `/` (they do not inherit the spawner's), and CoW fork is SMP=1-only on this target, so keep Firecracker at 1 vCPU |
+| shell: `cc` → `Out of memory`; serial: `[execve] load failed: Read past end of image`; **nested symlinks fail too** | **resolved — symlinks.** `cc` is a *symlink* (`/usr/bin/cc -> gcc`). `sys_execve` read the image with raw `fs::read_file`, which never runs `resolve_symlinks` (only `sys_openat`'s path does), so the loader was handed the *link text* — 3 bytes of `"gcc"` — as the image | **fixed** — `fs::read_image` (new, `crates/akuma-kernel-amd64/src/fs.rs`): symlink-resolves first, then chunks through `read_at`, which also lifts `read_inode_data`'s 16 MiB kernel-side allocation cap — a cap `cc1` (42 MB) died on as `ENOENT`. The chunk buffer lives on the **heap** (`try_reserve_exact`); the first draft used a 64 KiB stack array against a 32 KiB kernel stack (`sched::STACK_SIZE`) and the boot died as a ring-0 `#PF` inside `ClockBlockCache::get` several frames after the overflowing write — the lesson is now in `read_image`'s doc comment |
 | shell: bare `gcc` and `gcc --version` → work (`gcc (Alpine 15.2.0)`) | the control group: `/usr/bin/gcc` is a **real 2.18 MB ELF**, and the shell's own `fork`+`exec` of it loads and runs — so the loader handles a binary this size, dynamic linking and all, and neither "eager mapping is too slow" nor "driver binaries are too big" is a live cause. The failures split exactly along the two mechanisms above: direct exec works, symlinked exec dies on the link, spawned exec dies on the shape | — |
 | `cc1` → `not found` from the shell | not a kernel issue: `cc1` lives under `/usr/libexec/gcc/…`, which is not in `PATH`. gcc reaches it by absolute path through `posix_spawnp` — row one | environmental |
 | **ELF loads are slow — virtio-blk `[BLK] stuck on tag 9`-shaped stalls** during image reads | hypothesis from the same session: `read_file` pulls the whole image block-by-block through the virtio-blk rings, and a request that wedges on a tag stalls the load for the tag timeout. If the `[execve] load failed:` line is preceded by a long silent gap, time the load of `/usr/bin/gcc` (2.18 MB, known-good) against `gcc --version`'s wall clock — if seconds go by before the banner, the block path, not the ELF parser, is the cost. Candidate second consumer for whatever the xHCI timeout-recovery work builds | open — needs a timing probe |
@@ -281,15 +281,15 @@ This is **not** the same shape as `ftruncate`, and the difference is the work:
 
 * `akuma-syscalls-glue` *has* `eventfd` (`crates/akuma-syscalls-glue/src/eventfd.rs`,
   `eventfd_create`/`eventfd_read`/`eventfd_write`), but behind the
-  `sc-eventfd` feature, and `amd64/Cargo.toml` takes glue with
+  `sc-eventfd` feature, and `crates/akuma-kernel-amd64/Cargo.toml` takes glue with
   `default-features = false, features = ["smoltcp"]` — so it is **compiled
   out**, not merely undispatched.
 * An eventfd is an **fd**, and amd64 keeps its own descriptor table
-  (`amd64/src/fd.rs`, `FIRST_FILE_FD = 3`). Turning the feature on gives an
+  (`crates/akuma-kernel-amd64/src/fd.rs`, `FIRST_FILE_FD = 3`). Turning the feature on gives an
   `eventfd_create` whose id nothing on this target can `read`, `write`, `close`
   or poll. The row is the last step, not the first.
 
-So the fix is: enable `sc-eventfd`, give `amd64/src/fd.rs` an `Eventfd` variant
+So the fix is: enable `sc-eventfd`, give `crates/akuma-kernel-amd64/src/fd.rs` an `Eventfd` variant
 routed to glue's three entry points, then add the `Eventfd2 => 290, nr::EVENTFD2`
 row. `epoll` is the same shape behind `sc-epoll` and is what libcurl wants next.
 
@@ -655,7 +655,7 @@ stays resident in the cache after the four exit, which is why the *next*
 
 `mapbig` also names the crossover: with 16-page readahead, an access stride
 above ~16 pages wins and a dense one does not. If a future workload sits on the
-wrong side of that line, `READAHEAD_PAGES` in `amd64/src/mm.rs` is the knob, and
+wrong side of that line, `READAHEAD_PAGES` in `crates/akuma-kernel-amd64/src/mm.rs` is the knob, and
 the measurement above is the method — not a guess at a better default.
 
 #### `cargo` builds a crate graph, a build script, and a proc macro
@@ -695,14 +695,14 @@ the exec **silently ran the wrong program**:
 hello from akuma gcc                      ← /hi, left over from an earlier session
 ```
 
-Fixed in `amd64/src/usermode.rs` (`process_relative_path`, on both the `execve`
+Fixed in `crates/akuma-kernel-amd64/src/usermode.rs` (`process_relative_path`, on both the `execve`
 and `sys_spawn` paths), which is glue's rule restated where this kernel can
 reach it. Boot self-test: `cd /bin && ./busybox echo RELEXEC`, guarded by an
 assertion that no `/busybox` exists, so the check cannot pass vacuously.
 
 ##### Defect 9 — the envp cap was 64, and a cargo build script needs ~62
 
-**This is the proc-macro wall.** `amd64/src/loader.rs`'s `MAX_ENVP` was 64, and
+**This is the proc-macro wall.** `crates/akuma-kernel-amd64/src/loader.rs`'s `MAX_ENVP` was 64, and
 its note said that covered "a login shell's `PATH`/`HOME`/`TERM`/… and the dozen
 `CARGO_*`/`RUST*` variables a build adds". A dozen is what a *rustc* invocation
 adds. A **build script** gets the whole `CARGO_CFG_*` / `CARGO_PKG_*` /

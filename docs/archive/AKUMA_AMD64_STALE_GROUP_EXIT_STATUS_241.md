@@ -29,7 +29,7 @@ stale tid=…` line, and no allocation failure.
 ## 2. What 241 is
 
 A signal death on amd64 carries exit code `-(sig)`: `kill_current_from_fault`
-(`amd64/src/usermode.rs`) and `exit_current_from_signal` both use it, as does
+(`crates/akuma-kernel-amd64/src/usermode.rs`) and `exit_current_from_signal` both use it, as does
 the AArch64 fatal path (`akuma-exec/src/process/signal.rs`). For SIGTERM that
 is `-15`, and **`-15 & 0xff` = 241**. So every one of those execs was a process
 **killed by SIGTERM**, not a failed spawn.
@@ -44,7 +44,7 @@ encoded every status as `(code & 0xff) << 8`, a normal exit, where glue's
 
 ## 3. Mechanism
 
-`amd64/src/thread.rs` keeps two flags **per process slot**:
+`crates/akuma-kernel-amd64/src/thread.rs` keeps two flags **per process slot**:
 
 | flag | set by | read by |
 |---|---|---|
@@ -105,7 +105,7 @@ keyed by it, reset on only some of the paths that reissue it. See §8.
 
 ## 5. Fix
 
-`amd64/src/usermode.rs`:
+`crates/akuma-kernel-amd64/src/usermode.rs`:
 
 - **`spawn_process_task`** now calls `clear_group_exiting(proc_slot)` and
   `clear_group_exit_status(proc_slot)`. It is the one slot claim every
@@ -125,7 +125,7 @@ when a group exit is in progress.
 
 ## 6. Verification
 
-Boot self-test **`spawn_stale_group_state_test`** (`amd64/src/usermode.rs`,
+Boot self-test **`spawn_stale_group_state_test`** (`crates/akuma-kernel-amd64/src/usermode.rs`,
 registered in `boot.rs` right after `spawn_test`):
 
 1. Runs `sys_spawn`'s own free-slot search.

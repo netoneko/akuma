@@ -1,6 +1,6 @@
 //! HID Keyboard/Keypad usage codes (usage page `0x07`) to ASCII.
 //!
-//! This is the USB counterpart of `amd64/src/kbd.rs`'s `PLAIN`/`SHIFTED`
+//! This is the USB counterpart of `crates/akuma-drivers-amd64/src/kbd.rs`'s `PLAIN`/`SHIFTED`
 //! set-1 scancode tables, and it makes the same choices on purpose so a shell
 //! behaves identically whichever keyboard the bytes came from:
 //!

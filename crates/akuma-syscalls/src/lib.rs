@@ -73,9 +73,9 @@ pub mod slot;
 /// The kernel passes `src/config.rs`'s consts in; the tests pass whatever they
 /// like. Taking them as a parameter rather than reading them is what makes the
 /// gate combinations enumerable on the host — `PROCESS_SYSCALL_STATS` and
-/// `PROC_SYSCALL_LOG_ENABLED` are `true` in every profile except
-/// `kernel_profile_extreme`, so the off-arm is otherwise only reachable by
-/// building a different kernel.
+/// `PROC_SYSCALL_LOG_ENABLED` are `true` in every build, so the off-arm is
+/// otherwise only reachable by editing the consts and building a different
+/// kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[expect(
     clippy::struct_excessive_bools,
@@ -100,8 +100,8 @@ pub struct HookConfig {
 }
 
 impl HookConfig {
-    /// What every profile except `kernel_profile_extreme` ships: stats on, log
-    /// on, debug-IO off, errno diag on, audit off.
+    /// What every build ships: stats on, log on, debug-IO off, errno diag on,
+    /// audit off.
     ///
     /// `identity` is left to the caller precisely because it is the open
     /// question — there is no "the default" to hide it behind.
@@ -117,9 +117,10 @@ impl HookConfig {
         }
     }
 
-    /// `kernel_profile_extreme`: both recording hooks compiled out.
+    /// Every hook off: both recording hooks compiled out. (Was what the removed
+    /// `extreme-size` build shipped; kept as the no-clock end of the matrix.)
     #[must_use]
-    pub const fn extreme(identity: IdentitySource) -> Self {
+    pub const fn quiet(identity: IdentitySource) -> Self {
         Self {
             process_stats: false,
             proc_log: false,

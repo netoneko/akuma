@@ -1,0 +1,30 @@
+========================================================================
+ Akuma simple-kernel-devbox — cheat sheet
+========================================================================
+
+You are inside Akuma (https://github.com/netoneko/akuma) booted with the
+minimal developer rootfs from overlays/simple-kernel-devbox/.
+
+What is installed here:
+  /bin/busybox  + full applet symlinks (sh, vi, ps, ls, ...)
+  /bin/herd     supervisor (it started the sshd you are connected through)
+  /bin/sshd     the userspace SSH server
+  /bin/apk      Alpine package manager (installs into THIS rootfs)
+  /usr/local    nightly rustc + cargo (+ rust-std, rust-src) — first on PATH
+  /usr/bin      clang/lld/gcc/binutils/make/musl-dev — the C toolchain
+                cargo needs to link
+
+Quick checks:
+  uname -a                 # the kernel you just built
+  rustc --version          # nightly, /usr/local/bin/rustc
+  cargo new hello && cargo run --release     # real build, in the guest
+
+Notes:
+  - Networking is Akuma's native smoltcp stack (box 0). No rump, no tap.
+  - apk works in-guest:  apk add git   (keys already in /etc/apk)
+  - Anything you write is on the VM disk (ext2) and DISCARDED on host reboot
+    unless the image was mounted snapshot=off (INSTANCE=0 keeps writes).
+
+Full guide: bootstrap/public/kernel-bootstrap-with-local-ai/index.md
+Overlay:    overlays/simple-kernel-devbox/README.md
+========================================================================

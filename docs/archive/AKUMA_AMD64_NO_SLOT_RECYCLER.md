@@ -35,9 +35,9 @@ reached through three public wrappers:
 
 Neither of those two callers is on an amd64 path. `akuma-kernel-glue` is the
 AArch64 kernel. `akuma-vfs-glue` **is** a dependency of `amd64`
-(`amd64/Cargo.toml:303`), but the registrations live in `fs::init()`
+(`crates/akuma-kernel-amd64/Cargo.toml:303`), but the registrations live in `fs::init()`
 (`fs.rs:40`) and **amd64 calls `fs::mark_initialized()` instead**
-(`amd64/src/fs.rs:510`; the comments at `:340`, `:348` and `:364` say so in as
+(`crates/akuma-kernel-amd64/src/fs.rs:510`; the comments at `:340`, `:348` and `:364` say so in as
 many words).
 
 amd64's side is `x86_claim_slot` (`lib.rs:3009`). Its death paths write the
@@ -82,7 +82,7 @@ registered by `akuma_exec::process::init()` (`mod.rs:430`), whose only caller is
 `akuma-kernel-glue:1109` — so on amd64 it is **neither registered nor
 invocable**.
 
-amd64 knows this and hand-rolled the same work in `amd64/src/thread.rs:454`
+amd64 knows this and hand-rolled the same work in `crates/akuma-kernel-amd64/src/thread.rs:454`
 (`thread_pid_map_remove` + `unregister_process`), with a comment at `:436–448`
 that states the divergence exactly and names the symptom of getting it wrong: a
 `Process` leaked per `pthread_create`, a `ps` row that never goes away, and
@@ -132,7 +132,7 @@ site in the tree** (`lib.rs:2429`, inside the recycler). amd64 therefore never
 calls it.
 
 That would be harmless if this target never opened a dropped window. It does:
-`amd64/src/net.rs:571` and `amd64/src/exec_runtime.rs:138` both
+`crates/akuma-kernel-amd64/src/net.rs:571` and `crates/akuma-kernel-amd64/src/exec_runtime.rs:138` both
 `dropped_window_open()` / `dropped_window_close()`.
 
 The ledger is **tid-indexed**. A thread killed between the open and the close
@@ -141,7 +141,7 @@ recycler's own comment (`lib.rs:2422–2427`) spells out the consequence on the
 other kernel: the new occupant "runs its EL1 excursions BKL-free until the
 EL0-entry tripwire healed it". **Whether amd64 has any equivalent healing
 tripwire is not established** — that is a question to answer before deciding how
-much this one matters, and it is cheap to answer by reading `amd64/src/usermode.rs`'s
+much this one matters, and it is cheap to answer by reading `crates/akuma-kernel-amd64/src/usermode.rs`'s
 syscall entry.
 
 This is the gap most likely to be a real, currently-unexplained bug, because
@@ -206,7 +206,7 @@ the wrong shape.
    `TERMINATED && !ON_CPU` as *reusable*, so a collector and a spawn genuinely
    contend for the same slots, where on AArch64 the collector always wins first.
 4. **Do not regress the UAF fix.** `slot_can_install`
-   (`amd64/src/sched.rs`) assumes every route out of TERMINATED/FREE rewrites
+   (`crates/akuma-kernel-amd64/src/sched.rs`) assumes every route out of TERMINATED/FREE rewrites
    `space_root` before the slot can run. A recycler that moves slots to `FREE`
    keeps that true (FREE is still covered), but one that *zeroes* `space_root`
    at death makes the carve-out redundant rather than wrong — if you do that,
@@ -386,7 +386,7 @@ is `FREE` with nothing left to release.
   a type error to work around; it is a different set**, and registering into it
   would have left this kernel with an empty sweep while every hook looked wired.
 
-  The first fix here was a second registry in `amd64/src/fs.rs`. That was the
+  The first fix here was a second registry in `crates/akuma-kernel-amd64/src/fs.rs`. That was the
   wrong answer, and §8.6 says why. The registry now lives in
   `akuma_vfs_glue::lib.rs`, holds `Weak<dyn Filesystem>`, and is populated by
   `mount_with` — the one call both kernels already mount through. Two defaulted

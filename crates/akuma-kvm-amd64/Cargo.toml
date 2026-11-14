@@ -1,0 +1,32 @@
+[package]
+name = "akuma-kvm-amd64"
+version = "0.1.0"
+edition = "2024"
+description = "The AMD SVM hypervisor's wiring: /dev/kvm0 services, the /dev/kvm ioctl surface, the /dev/net/tun gateway and the guest loops. The amd64 kernel's one driver that enters guests, and so its one driver that keeps unsafe (the akuma-svm-switch-amd64 run contract)"
+
+[lints]
+workspace = true
+
+# Kernel-only (the `akuma-drivers-amd64` precedent). Specs are copied from that crate exactly,
+# default features included, so moving here turned no feature on for the kernel.
+[target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]
+akuma-kernel-amd64 = { path = "../akuma-kernel-amd64", default-features = false }
+akuma-affinity = { path = "../akuma-affinity" }
+akuma-bkl = { path = "../akuma-bkl" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-dmesg = { path = "../akuma-dmesg" }
+akuma-exec = { path = "../akuma-exec", features = ["bkl-smp"] }
+akuma-exec-core = { path = "../akuma-exec-core" }
+akuma-kvm-abi = { path = "../akuma-kvm-abi" }
+akuma-mmu = { path = "../akuma-mmu" }
+akuma-net = { path = "../akuma-net", features = ["rtl8169"] }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-svm-amd64 = { path = "../akuma-svm-amd64" }
+akuma-svm-switch-amd64 = { path = "../akuma-svm-switch-amd64" }
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "exec", "akuma-native", "bkl-smp"] }
+akuma-threading = { path = "../akuma-threading" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue", features = ["bkl-smp"] }
+akuma-virtio = { path = "../akuma-virtio" }
+akuma-vm-spec = { path = "../akuma-vm-spec" }
+spinning_top = { version = "0.3" }

@@ -60,7 +60,7 @@
 /// and watching `uname -r` follow, not by reading the two and agreeing they
 /// look alike.
 ///
-/// The amd64 kernel is its own package (`amd64/Cargo.toml`) carrying the same
+/// The amd64 kernel is its own package (`crates/akuma-kernel-amd64/Cargo.toml`) carrying the same
 /// number; this reads the root either way, so the two cannot report different
 /// releases — and if they are ever meant to, that is a decision to make here
 /// rather than a drift to discover.

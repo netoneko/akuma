@@ -1,6 +1,6 @@
 //! The `akuma-exec` / `akuma-threading` runtime twin — taoxichuan's
 //! registration of the hook tables the shared scheduler crates read, the twin
-//! of `amd64/src/exec_runtime.rs::init` + `amd64/src/sched.rs`'s registration
+//! of `crates/akuma-kernel-amd64/src/exec_runtime.rs::init` + `crates/akuma-kernel-amd64/src/sched.rs`'s registration
 //! block (plan `docs/archive/TAOXICHUAN_M4_SCHED_LITE_PLAN.md` § 1, slice 1).
 //!
 //! **Written new, not extracted**: this file is taoxichuan's own glue (the
@@ -17,7 +17,7 @@
 //! subsystems this kernel serves from its own modules). It registers the four
 //! tables it needs: `ExecRuntime` + `ExecConfig` through
 //! `akuma_exec::runtime::register`, and `ThreadRuntime` + `ThreadConfig` +
-//! `ProcessHooks` + `X86ArchHooks` through `akuma_threading`'s register fns.
+//! `ProcessHooks` + `ArchHooks` through `akuma_threading`'s register fns.
 //!
 //! The one-clock rule: both tables get `crate::net::uptime_us` (the
 //! calibrated TSC), so the scheduler, `akuma-exec`, `akuma_primitives::clock`
@@ -57,7 +57,7 @@ pub fn set_current_slot(slot: usize) {
     akuma_ring3_amd64::set_cpu_slot(slot as u64);
 }
 
-// ── the X86ArchHooks bodies (the per-core machine effects) ──────────────────
+// ── the ArchHooks bodies (the per-core machine effects) ──────────────────
 
 /// The idle thread's tid: outside the spawn ring (children claim 1..NSLOTS,
 /// the boot thread is 0), so no array index collides. Its stack is leaked once,
@@ -99,12 +99,12 @@ pub extern "C" fn idle_main() -> ! {
         crate::smp::bkl_leave();
         crate::exec_twin::tick_window();
         // A sleeper whose deadline has passed is still WAITING: only the wake
-        // pass inside `x86_yield` readies it. So a due deadline is a reason to
+        // pass inside `try_yield` readies it. So a due deadline is a reason to
         // yield too, or a timed park (glue's `nanosleep`, a `poll`/`epoll`
         // timeout) on an otherwise idle core never expires. amd64's wait
-        // loops ask the same question (`amd64/src/net.rs`).
-        let due = akuma_threading::wake_is_due(akuma_threading::x86_earliest_wake_time(), crate::net::uptime_us());
-        if due || akuma_threading::x86_runnable_exists() {
+        // loops ask the same question (`crates/akuma-kernel-amd64/src/net.rs`).
+        let due = akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), crate::net::uptime_us());
+        if due || akuma_threading::runnable_exists() {
             #[cfg(feature = "trace-err")]
             {
                 idle_laps = 0;
@@ -113,7 +113,7 @@ pub extern "C" fn idle_main() -> ! {
             // task tables: they run under the kernel lock (the switch hands
             // the depth to whichever thread runs next, and back).
             crate::smp::bkl_enter();
-            akuma_threading::x86_yield();
+            akuma_threading::try_yield();
             crate::smp::bkl_leave();
         } else {
             crate::net::wait_lap();
@@ -139,12 +139,12 @@ fn seed_idle() {
     let stack: &'static mut [u64; 2048] = alloc::boxed::Box::leak(alloc::boxed::Box::new([0u64; 2048]));
     let top = ((core::ptr::from_mut(stack) as *const u64 as usize) + 2048 * 8) & !0xf;
     crate::sched::mark_idle(IDLE_TID, 0);
-    akuma_threading::x86_seed_entry(IDLE_TID, top, idle_main);
-    akuma_threading::x86_publish(IDLE_TID);
+    akuma_threading::seed_entry(IDLE_TID, top, idle_main);
+    akuma_threading::publish_slot(IDLE_TID);
 }
 
 /// The idle loop's clock feeder — the same one-instruction window
-/// `X86ArchHooks::allow_tick` opens (`sched::Tx`), under a name the idle
+/// `ArchHooks::allow_tick` opens (`sched::Tx`), under a name the idle
 /// thread can reach.
 pub fn tick_window() {
     // One instruction wide, and the tick handler is bounded, so the worst a
@@ -181,8 +181,12 @@ pub fn init() {
     // state arms landed in slice 2. The idle thread is seeded last: READY
     // from the first registration, it only ever gets the core when every
     // real task is parked (its loop feeds the tick and yields on wakeups).
-    akuma_threading::register_x86_arch_hooks(akuma_sched_amd64::hooks::<crate::sched::Tx>());
+    akuma_threading::register_arch_hooks(akuma_sched_amd64::hooks::<crate::sched::Tx>());
     seed_idle();
+    // Glue's arms validate a user buffer before touching it and, when a page is
+    // not present, ask this hook to fill it: without it a lazy `mmap` buffer is
+    // `EFAULT` to every shared syscall (`lazy.rs`).
+    akuma_user_access::set_prefault_hook(crate::lazy::prefault);
     akuma_exec::process::reserve_pid_floor(2);
 }
 
@@ -216,8 +220,6 @@ fn thread_config() -> ThreadConfig {
         enable_stack_canaries: false,
         stack_canary: 0,
         canary_words: 0,
-        network_thread_ratio: 0,
-        prioritize_never_scheduled: false,
         deferred_thread_cleanup: false,
         thread_cleanup_cooldown_us: 0,
         syscall_debug_info_enabled: false,
@@ -267,7 +269,7 @@ fn exec_runtime() -> ExecRuntime {
                 .and_then(|ino| crate::root_fs().read_at_by_inode(ino, off, buf))
                 .map_err(|_| -1)
         },
-        read_at_by_inode: |_path, ino, off, buf| {
+        read_at_by_inode: |_mount_id, ino, off, buf| {
             crate::root_fs().read_at_by_inode(ino, off, buf).map_err(|_| -1)
         },
         // Symlinks: this target resolves inside its own path walk
@@ -332,6 +334,8 @@ fn exec_runtime() -> ExecRuntime {
         // No mount table yet: no `(mount id, inode)` pair to give. A stub, as
         // the plan's table says — reached only by `ElfSource::Path` (slice 3).
         resolve_file_id: |_path| Err(-1),
+        // The tokio kernels keep the executable's mark in the task record (`loader::read_image_pinned`), not in `Process`.
+        text_pin: |_| Ok(akuma_primitives::TextPin::none()),
         // stat sizes live in this kernel's own stat arms, not behind a
         // one-path helper; unwired until a consumer exists (slice 3).
         file_size: |_path| Err("taoxichuan: file_size not wired (unreachable until fork_process)"),
@@ -434,17 +438,11 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
 /// child ([`twin_enter_user`]) and an `execve`'s new image.
 pub fn enter_user_on(root: u64, ef: &akuma_ring3_amd64::EntryFrame) -> ! {
     if root != 0 {
-        // SAFETY: `root` is a PMM-resident page-table frame naming the task's
-        // image and the shared kernel half this code runs on.
-        unsafe {
-            core::arch::asm!("mov cr3, {}", in(reg) root, options(nostack, preserves_flags));
-        };
+        akuma_pagetable::amd64::activate::<akuma_phys::Physmap>(root);
     }
     // Ring 3 runs without the kernel lock.
     let _ = crate::smp::bkl_leave_all();
-    // SAFETY: ring3's contract — an enterable ring-3 state for the address
-    // space just loaded, kernel IF clear. `enter_user` is `!`.
-    unsafe { akuma_ring3_amd64::enter_user(ef) }
+    akuma_ring3_amd64::enter_user_checked(ef)
 }
 
 /// Enter ring 3 for the thread running now from a captured context: [`twin_enter_user`] for the init thread, which has no
@@ -468,13 +466,14 @@ fn exec_config() -> ExecConfig {
         system_thread_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         user_thread_stack_size: akuma_ring3_amd64::SYSCALL_STACK_SIZE,
         // What glue's `prlimit64(RLIMIT_STACK)` reports (nothing else reads it on
-        // this kernel: the loader is its own): the 8 MiB the main stack may grow to.
-        user_stack_size: crate::STACK_MAX as usize,
+        // this kernel: the loader is its own). Was the flat `STACK_MAX` (8 MiB) regardless of
+        // RAM; now the same RAM-proportional policy every other kernel uses (config flag sweep,
+        // 2026-11-11) — `akuma_pmm::total_count() * 4096` is the same RAM-size proxy
+        // `akuma_fpcache::init` already reads elsewhere in this kernel.
+        user_stack_size: akuma_mem_policy::compute_user_stack_size(akuma_pmm::total_count() * 4096, 0),
         enable_stack_canaries: false,
         stack_canary: 0,
         canary_words: 0,
-        network_thread_ratio: 0,
-        prioritize_never_scheduled: false,
         deferred_thread_cleanup: false,
         thread_cleanup_cooldown_us: 0,
         process_reclaim_cooldown_us: 0,

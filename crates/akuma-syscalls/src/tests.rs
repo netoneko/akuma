@@ -564,11 +564,11 @@ fn timing_is_needed_exactly_when_a_hook_consumes_it() {
     }
 }
 
-/// `kernel_profile_extreme` drops both recorders, and the timing read with
-/// them — the one config where the excursion touches no clock at all.
+/// Dropping both recorders drops the timing read with them — the one config
+/// where the excursion touches no clock at all.
 #[test]
-fn extreme_profile_reads_no_clock() {
-    let ex = Excursion::new(nr::READ, HookConfig::extreme(IdentitySource::Reresolve));
+fn quiet_config_reads_no_clock() {
+    let ex = Excursion::new(nr::READ, HookConfig::quiet(IdentitySource::Reresolve));
     assert!(!ex.prologue().need_timing);
     let epi = ex.epilogue(7, true);
     assert!(!epi.record_time);

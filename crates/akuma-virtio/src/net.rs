@@ -107,26 +107,11 @@ impl NetRaw {
         &self.transport
     }
 
-    /// Zero the header at the front of a transmit buffer; returns its length,
-    /// where the frame starts.
-    pub fn fill_buffer_header(&self, buf: &mut [u8]) -> Result<usize, NetError> {
-        let hdr = buf.get_mut(..HEADER_LEN).ok_or(NetError::Buffer)?;
-        hdr.fill(0);
-        Ok(HEADER_LEN)
-    }
-
     /// The token of the next completed receive, if any, without consuming it.
     #[must_use]
     #[allow(clippy::cast_possible_truncation)] // a junk id fails `receive_complete`'s token match
     pub fn poll_receive(&self) -> Option<u16> {
         self.rx.sq.peek_used(self.rx.mem).map(|id| id as u16)
-    }
-
-    /// The token of the next completed transmit, if any, without consuming it.
-    #[must_use]
-    #[allow(clippy::cast_possible_truncation)]
-    pub fn poll_transmit(&self) -> Option<u16> {
-        self.tx.sq.peek_used(self.tx.mem).map(|id| id as u16)
     }
 
     /// Transmit one bare frame (no header: a zeroed one is chained in front of
@@ -187,25 +172,6 @@ impl NetRaw {
         Ok((HEADER_LEN, len - HEADER_LEN))
     }
 
-    /// Hand `buf` (header included) to the device to transmit. Returns its token.
-    ///
-    /// # Safety
-    /// `buf` is read by the device from this call until [`Self::transmit_complete`]
-    /// returns `Ok` for the returned token: it must stay allocated, at the same
-    /// address, and unmodified until then.
-    pub unsafe fn transmit_begin(&mut self, buf: &[u8]) -> Result<u16, NetError> {
-        let len = buf_len(buf.len())?;
-        let b = Buf { addr: phys_of(buf.as_ptr()), len, device_writes: false };
-        self.tx.submit(&self.transport, &[b]).map_err(|_| NetError::Full)
-    }
-
-    /// Finish transmit `token`.
-    ///
-    /// # Safety
-    /// `buf` is the buffer [`Self::transmit_begin`] returned `token` for.
-    pub unsafe fn transmit_complete(&mut self, token: u16, _buf: &[u8]) -> Result<(), NetError> {
-        complete(&mut self.tx, token).map(|_| ())
-    }
 }
 
 /// A buffer length a descriptor can carry, and long enough for the header.

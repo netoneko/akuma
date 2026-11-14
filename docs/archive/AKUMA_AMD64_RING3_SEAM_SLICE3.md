@@ -12,7 +12,7 @@ on the other kernel, and `wait4` is served by `akuma-syscalls-glue`. This
 target's own `wait4` loop, its global waiter bitmap and its private wake path
 are gone.
 
-**One file changed** (`amd64/src/usermode.rs`, +184/−72). The AArch64 kernel is
+**One file changed** (`crates/akuma-kernel-amd64/src/usermode.rs`, +184/−72). The AArch64 kernel is
 not in this diff at all.
 
 ## 1. The scoping correction: what actually blocks `fork_process`

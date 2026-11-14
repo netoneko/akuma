@@ -95,13 +95,13 @@ The decode is `akuma_mmu::user_flags::from_pte`, new here:
 
 ## 2. Three pins, so the two x86 walkers cannot drift
 
-`amd64/src/paging.rs` already has a working x86 walker with its own
+`crates/akuma-kernel-amd64/src/paging.rs` already has a working x86 walker with its own
 `PteProt`/`encode` pair, and its boot self-test asserts each of six encodings.
 The widened `akuma-mmu` type is a *second* x86 walker — the one the shared crates
 reach through, and the one C1 folds this kernel onto. Two walkers that disagree
 about what `Prot::RO` means is a bug nothing would catch until a page mapped
 through `akuma-exec` behaved differently from one mapped through
-`amd64/src/mm.rs`.
+`crates/akuma-kernel-amd64/src/mm.rs`.
 
 So `PteProt::from_region` here is a byte-for-byte port of that file's, and three
 host tests pin it:
@@ -153,7 +153,7 @@ either definition — only at a use site, in the build that resolves differently
 
 The widened type had no runtime caller — `amd64/` drives its own
 `paging::AddressSpace`, and Phase 4's live test is gone. A compile-only proof of
-thirty methods proves that they *type-check*, so `amd64/src/uas.rs` drives the
+thirty methods proves that they *type-check*, so `crates/akuma-kernel-amd64/src/uas.rs` drives the
 whole surface at boot: map, translate, write-through-physmap, the permission
 bits, the CoW marker, eviction, zeroing, unmap-and-free, and a shared view.
 
@@ -250,15 +250,15 @@ build path is in the binary. Compare sections.
 - `crates/akuma-elf/src/pages.rs` — the `UserPages` impl's `cfg` widened to both
   architectures. One body, not two: nothing in those three methods is
   architecture-specific once the surface matches.
-- `amd64/src/uas.rs` — new. 48 boot checks.
-- `amd64/src/main.rs`, `amd64/src/boot.rs` — wire it in, right after
+- `crates/akuma-kernel-amd64/src/uas.rs` — new. 48 boot checks.
+- `crates/akuma-kernel-amd64/src/main.rs`, `crates/akuma-kernel-amd64/src/boot.rs` — wire it in, right after
   `paging::smoke_test`, because the two are the same job done twice and a
   divergence is easiest to read when their results are adjacent.
-- `amd64/Cargo.toml` — `akuma-mmu` becomes a direct dependency. It arrived
+- `crates/akuma-kernel-amd64/Cargo.toml` — `akuma-mmu` becomes a direct dependency. It arrived
   transitively through `akuma-user-access` already; naming it is what lets the
   boot test drive it.
 
-798 insertions, 34 deletions, plus `amd64/src/uas.rs`.
+798 insertions, 34 deletions, plus `crates/akuma-kernel-amd64/src/uas.rs`.
 
 ## Background
 

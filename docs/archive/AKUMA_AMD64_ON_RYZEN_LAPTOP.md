@@ -30,7 +30,7 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | Windows | **gone**: p3 reformatted at the user's request |
 | FCH watchdog (`wdt`) | **done**: a deliberate wedge was reset by the chipset in 60 s (`FIRED=1`), `overlays/ryzen/README.md` § The watchdog |
 | wifi W0 (§5.1) | **done**: mmiotrace of probe and of interface-up through `fw ready`, `overlays/ryzen/w0-trace.sh` |
-| wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `amd64/src/rtw89.rs`, menu entry 8) |
+| wifi W1 (§5.2) | **done**: `[rtw] fw ready v0.27.122`, 166 packets in 50 ms, card shut down again (`crates/akuma-rtw89`, `crates/akuma-kernel-amd64/src/rtw89.rs`, menu entry 8) |
 | wifi W2 (§5.3) | **done**: the recorded start replayed, 17 networks' beacons on channel 1 (menu entry 9) |
 | wifi W3/W4 (§5.4) | **done**: `rtw89wifi` (menu entry 10) scans, authenticates, associates and completes the WPA2 4-way handshake in the kernel; keys installed, link held (boot 16) |
 | p3 self-host environment (§5.7) | **staged**: toolchain, clone, rig, goose+Kimi, rio; not yet booted |
@@ -85,11 +85,11 @@ run unattended:** boot 2 took 184 s outside Linux (140 s `autoreboot` delay +
 | Wifi | **Realtek RTL8852CE** `10ec:c852` sub `17aa:5852`, BAR 1 MiB @ `0x80b00000`, firmware `rtw89/rtw8852c_fw-1.bin` v0.27.122.0, `rfe_type 1`. Bluetooth is the same chip's USB function (`0bda:5852`) |
 | Ethernet | **none**. Wifi is the box's only network today, which is why a Linux-side capture that unloads `rtw89` drops ssh |
 | USB | 4 xHCI controllers, all AMD: `04:00.3` (`15b9`, bus 1/2: 5×USB2 + 2×SS), `04:00.4` (`15ba`, bus 3/4: internal camera), `06:00.3`/`06:00.4` (`15c0`/`15c1`, buses 5–8, USB4-side). 64-bit BARs, all below 4 GiB. Two Type-C ports (`/sys/class/typec/port{0,1}`) |
-| Keyboard | **real i8042** (`AT Translated Set 2 keyboard` on `isa0060/serio0`). The internal keyboard is PS/2 behind the EC, not USB, so `amd64/src/kbd.rs` should work natively. The trashcan never had that |
+| Keyboard | **real i8042** (`AT Translated Set 2 keyboard` on `isa0060/serio0`). The internal keyboard is PS/2 behind the EC, not USB, so `crates/akuma-kernel-amd64/src/kbd.rs` should work natively. The trashcan never had that |
 | Touch | I2C HID (Goodix touchpad, Wacom pen). Not needed |
 | Display | eDP 1920×1200. The GRUB GOP framebuffer is all `akuma-fbcon` needs; the Radeon 780M is never touched |
 | Serial | **none** (8250 probed `uart:unknown` at all four legacy ports). Same situation as the trashcan |
-| IOMMU | AMD-Vi present (IVRS), Linux uses translated default domain. Whether firmware leaves it on at handoff is **unmeasured**; `amd64/src/xhci.rs` assumes "no IOMMU on this target" |
+| IOMMU | AMD-Vi present (IVRS), Linux uses translated default domain. Whether firmware leaves it on at handoff is **unmeasured**; `crates/akuma-kernel-amd64/src/xhci.rs` assumes "no IOMMU on this target" |
 
 Also live on this box, and **down for every Akuma cycle**: the Firecracker
 guest (`akuma-vm.json`, tap0, kot), `llama-server`, docker, and the user's own
@@ -100,8 +100,8 @@ sessions.
 From the trashcan port (`AKUMA_AMD64_ON_HP_500_502NJ.md`,
 `docs/runbooks/amd64-bare-metal-loop.md`): multiboot2 boot from GRUB, GOP
 framebuffer console, ACPI/MADT, LAPIC timer, SMP, a ramdisk root from a
-multiboot2 module (`amd64/src/ramdisk.rs`), polled xHCI with USB mass storage
-and a HID keyboard, `0xCF9`/i8042/triple-fault reboot (`amd64/src/reboot.rs`).
+multiboot2 module (`crates/akuma-kernel-amd64/src/ramdisk.rs`), polled xHCI with USB mass storage
+and a HID keyboard, `0xCF9`/i8042/triple-fault reboot (`crates/akuma-kernel-amd64/src/reboot.rs`).
 On an AMD FCH, `0xCF9` is the standard reset port, so reboot should work as-is.
 
 Unknowns that only a first boot will settle:
@@ -161,7 +161,7 @@ Windows entry before relying on it.
   power button. Arm the **AMD FCH watchdog** (the device Linux binds
   `sp5100_tco` to; `sp5100_tco` is in this box's module list) early in boot,
   and pet it from the timer tick. Akuma has no watchdog today (no hits in
-  `amd64/src`). Cost: **~1 session**, mostly the FCH register sequence and
+  `crates/akuma-kernel-amd64/src`). Cost: **~1 session**, mostly the FCH register sequence and
   checking it fires. Until it exists, every cycle needs someone near the
   machine.
 
@@ -249,7 +249,7 @@ bookkeeping; decoding them against `rtw89/pci.c` is the first job of W1.
 ### 5.2 W1 results, 2026-10-06
 
 `crates/akuma-rtw89` holds the sequence — every function the 8852C arm of its
-Linux namesake, `forbid(unsafe_code)` — and `amd64/src/rtw89.rs` the PCI,
+Linux namesake, `forbid(unsafe_code)` — and `crates/akuma-kernel-amd64/src/rtw89.rs` the PCI,
 BAR, DMA memory and firmware file. Before any metal boot the bring-up already
 **replayed access-for-access against the W0 trace** (`tests/golden_trace.rs`:
 651 register accesses, power-on through `0xe2`, ring base addresses the only
@@ -336,7 +336,7 @@ does not contain. That is W3's first recording.
 connected 20 s later. The way there is below; the cause that took four boots
 to find was the address CAM's **address hashes**. Token
 `rtw89wifi` (ryzen menu entry 10, herd service `wifijoin`) keeps the card up
-after the firmware download and hands it to `amd64/src/rtw89_sta.rs`, the
+after the firmware download and hands it to `crates/akuma-kernel-amd64/src/rtw89_sta.rs`, the
 `/dev/wifi0` backend: a daemon that replays the recorded join
 (`script::JOIN1..4`) around the frames it sends itself — scan, auth, assoc,
 `JOIN3`, the 4-way handshake (`akuma_wpa::eapol::Supplicant`), msg 4, `JOIN4`.
@@ -470,8 +470,8 @@ the later BA_CAM/ADDBA exchange.
 | `crates/akuma-ieee80211::sta` | auth/assoc request builders (the assoc elements are Linux's own from this card, RSN capabilities 0), auth/assoc/deauth parsers, QoS data frames with LLC/SNAP and room for the CCMP header, the RX data parser |
 | `crates/akuma-rtw89::tx` | the WD page and TX rings, the three frame classes (§ 5.4) |
 | `crates/akuma-rtw89::script` | `Vars`, op `0x41`, `JOIN1..4`, `fix_addr_cam` |
-| `amd64/src/rtw89.rs` | `Card`: the kept card (`restart`, `replay`, `send`, `poll_rx`, filter open/close), `shutdown_for_reset` |
-| `amd64/src/rtw89_sta.rs` | the station daemon, `/dev/wifi0`'s backend: scan, join with retries, rejoin on loss (below) |
+| `crates/akuma-kernel-amd64/src/rtw89.rs` | `Card`: the kept card (`restart`, `replay`, `send`, `poll_rx`, filter open/close), `shutdown_for_reset` |
+| `crates/akuma-kernel-amd64/src/rtw89_sta.rs` | the station daemon, `/dev/wifi0`'s backend: scan, join with retries, rejoin on loss (below) |
 | `overlays/ryzen` | menu entry 10 (`rtw89wifi` + `wifijoin`), `cycle.py --log dmesg --transcript wifijoin` |
 
 **Staying joined.** The station keeps the network it was told to join until
@@ -742,10 +742,10 @@ came out of it.
 
 **Arrow keys (and Home/End/Delete/PgUp/PgDn) did nothing; fixed.** This box's
 internal keyboard is real PS/2 behind the EC (§ "Hardware"), so keys reach the
-kernel through `amd64/src/kbd.rs` — not the native-USB path the trashcan uses.
+kernel through `crates/akuma-kernel-amd64/src/kbd.rs` — not the native-USB path the trashcan uses.
 That driver decoded letters, modifiers and Alt fine, but **dropped every
 0xE0-extended key on purpose** ("Arrows, Home/End, Delete and the like are
-dropped"). Fix (2026-10-07, uncommitted in `amd64/src/kbd.rs`): extended keys
+dropped"). Fix (2026-10-07, uncommitted in `crates/akuma-kernel-amd64/src/kbd.rs`): extended keys
 now emit the same terminal escape sequences the USB keymap does (`akuma_usb::
 keymap` — arrows `ESC [ A..D`, Home/End `ESC [ H`/`F`, `ESC [ 2~/3~/5~/6~` for
 Insert/Delete/PgUp/PgDn; Alt+extended-key keeps the "meta sends escape" rule),
@@ -806,7 +806,7 @@ dropped-BKL-window machinery exists for exactly this), or both. Until then
 **entry 13 stays unusable; rio runs on entry 12 (`nosmp`)**.
 
 **Bisected by core count (2026-10-07, late): the wedge needs all 16.** The
-kernel gained an `smp=N` command-line option (`amd64/src/smp.rs`:
+kernel gained an `smp=N` command-line option (`crates/akuma-kernel-amd64/src/smp.rs`:
 `set_cpu_cap_from_cmdline`; N total CPUs, BSP + N-1 APs), and entry 13 was
 booted at each width on the metal:
 
@@ -921,7 +921,7 @@ handled in `build.sh`.
 ## 9. The NVMe root on the metal, 2026-10-06
 
 `crates/akuma-nvme` (pure, `forbid(unsafe_code)`, 21 host tests plus an ignored
-test that parses a real GPT dump) and `amd64/src/nvme.rs` (MMIO/DMA, polled),
+test that parses a real GPT dump) and `crates/akuma-kernel-amd64/src/nvme.rs` (MMIO/DMA, polled),
 selected with `root=/dev/nvme0n1pN`. What the driver guarantees, and how each
 guarantee was checked:
 
@@ -984,7 +984,7 @@ unmeasured.
 
 1. ~~Boot path, one attended boot~~ (done, §8).
 2. ~~Log sink~~ (done: the NVMe root, §9).
-3. ~~FCH watchdog~~ (done: `amd64/src/watchdog.rs`, verified by a deliberate wedge).
+3. ~~FCH watchdog~~ (done: `crates/akuma-kernel-amd64/src/watchdog.rs`, verified by a deliberate wedge).
 4. W0 → W2 on the loop.
 5. Decide on §6 (USB ethernet) and/or a USB wifi dongle before W3.
 

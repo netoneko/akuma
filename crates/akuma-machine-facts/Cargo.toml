@@ -1,0 +1,10 @@
+[package]
+name = "akuma-machine-facts"
+version = "0.1.0"
+edition = "2024"
+description = "The neutral machine description both kernels' discovery paths fill: RAM, CPUs, virtio-MMIO devices, interrupt controller, and where each fact came from."
+
+[lints]
+workspace = true
+
+[dependencies]

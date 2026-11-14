@@ -7,7 +7,7 @@
 //! Stage W1 of the wifi plan (`docs/archive/AKUMA_AMD64_ON_RYZEN_LAPTOP.md`
 //! § 5): power the card on, push its firmware, and see the firmware report
 //! itself ready. The split is the one `akuma-nvme` and `akuma-xhci` made: the
-//! `unsafe` register file and DMA memory stay in `amd64/src/rtw89.rs`, and the
+//! `unsafe` register file and DMA memory stay in `crates/akuma-kernel-amd64/src/rtw89.rs`, and the
 //! sequence itself lives here, under `forbid(unsafe_code)`, behind the [`Bus`]
 //! trait, with host tests.
 //!

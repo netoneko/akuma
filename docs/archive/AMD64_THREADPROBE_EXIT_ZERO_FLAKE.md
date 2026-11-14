@@ -4,7 +4,7 @@
 
 ## Symptom
 
-`amd64/run.sh` (QEMU TCG, `SMP=1`), the boot self-tests, `thread_test` (`amd64/src/usermode.rs`):
+`amd64/run.sh` (QEMU TCG, `SMP=1`), the boot self-tests, `thread_test` (`crates/akuma-kernel-amd64/src/usermode.rs`):
 
 ```
   thread: probe loaded   [OK]
@@ -53,7 +53,7 @@ the next occurrence can be caught with the instrumentation below.
 
 ## Next time it appears
 
-Re-add, in `amd64/src/usermode.rs`, one `safe_print!` each in the `Syscall::Exit` arm (`a1`, `current_proc_slot()`,
+Re-add, in `crates/akuma-kernel-amd64/src/usermode.rs`, one `safe_print!` each in the `Syscall::Exit` arm (`a1`, `current_proc_slot()`,
 `crate::thread::current_thread_slot()`, `crate::sched::current_task()`, the scope), the `Syscall::ExitGroup` arm, at
 the top of `unwind_to_kernel` and after `run_process`'s `enter_user`. Then loop `amd64/run.sh` until a failure and keep that
 log. Expect to need more runs than without the prints. The question to answer is whether a child thread's `exit` saw

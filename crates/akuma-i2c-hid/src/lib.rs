@@ -8,7 +8,7 @@
 //! Linux `drivers/hid/i2c-hid/i2c-hid-core.c` + `i2c-hid-acpi.c`, FreeBSD
 //! `sys/dev/iicbus/iichid.c`, OpenBSD `ihidev(4)`.
 //!
-//! The kernel-side half (`amd64/src/touchpad.rs`) owns the I²C bus
+//! The kernel-side half (`crates/akuma-kernel-amd64/src/touchpad.rs`) owns the I²C bus
 //! transaction itself; everything here is bytes in, decisions out, so a
 //! device that is absent costs one failed bus turn and nothing else.
 //!

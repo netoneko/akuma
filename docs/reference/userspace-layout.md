@@ -37,7 +37,7 @@ the pattern to copy.
 | `wifi` | Wifi manager (amd64): known networks in `/etc/wifi/<network>`, the kernel's `/dev/wifi0`, `wifi auto` as a herd service. No supplicant — the kernel does WPA2. [`../userspace/wifi.md`](../userspace/wifi.md) |
 | `box` | Container manager: `box run` (Docker images on an overlay root), `box pull`, `box build` (Dockerfiles; `commit`/`save`/`tag`/`rmi`), `box open/close/ps/inspect` |
 | `meow` | AI coding assistant — LLM chat client with filesystem/network tool calling |
-| `nca` | Build wrapper for [native-cli-ai](https://github.com/netoneko/native-cli-ai) (submodule); no binary in `/bin` — build.rs deploys to `bootstrap/bin/nca` |
+| ~~`nca`~~ | **Retired 2026-11-09** in favor of goose: `userspace/nca` and the `native-cli-ai` submodule are gone. History: `docs/archive/NCA_*.md` |
 | `tcc` | Tiny C Compiler port — compile and run C programs on-target |
 | `sshd` | Userspace SSH server, plus a companion SSH client (`ssh`, a second `[[bin]]` in the same package) |
 | `paws` | **EXPERIMENTAL — `extreme-size` demo only.** Minimal first-party shell (598 lines, pure `libakuma`): 8 RO-mapped pages vs busybox's 265, which is what makes it usable as the login shell on a 4 MB box whose file-page dedup cache holds 128. **Not busybox/ash compatible** — hand-rolled parser, fixed builtin list, no `exec`/`printf`/`test`, unreliable pipes and redirection. Fine for `sshd --shell /bin/paws` execing one binary (that is how `acceptance/05`, and formerly `acceptance/archive/08`, pass at 4.0 MB); do not point real shell scripts at it. Originally removed at `c0af6c7`, revived 2026-08-10. The page-count measurements behind that comparison (busybox = 265 RO pages, and why the file-page cache cannot hold one below ~8 MB of RAM) are in [`../archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md`](../archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md) — a `BUSYBOX_TOYBOX_SIZING.md` was referenced here and in that doc but never written |
@@ -70,7 +70,7 @@ the pattern to copy.
 Not in the table above and not a workspace member. `userspace/amd64/<name>/<name>.rs`
 holds single-file guest programs for the **amd64** bring-up target: `#![no_std]`,
 raw Linux x86_64 syscalls, no `libakuma`, no musl, no `Cargo.toml`. Each is
-compiled straight by `rustc --target x86_64-unknown-none` from `amd64/build.rs`,
+compiled straight by `rustc --target x86_64-unknown-none` from `crates/akuma-kernel-amd64/build.rs`,
 linked with `userspace/amd64/user.ld` at `0x40_0000`, and embedded in the amd64
 kernel image with `include_bytes!` — that target has no disk driver, so there is
 nowhere to put a file it could open by path.

@@ -34,13 +34,13 @@ table never had an arm for it, so every `no_std` TLS fetch failed at
 `DNS resolution failed` while `busybox wget http://…` (musl, its own UDP
 resolver) resolved the same name fine.
 
-**Fixed:** `amd64/src/usermode.rs` syscall 300 → `crate::dns::resolve_a`, the
+**Fixed:** `crates/akuma-kernel-amd64/src/usermode.rs` syscall 300 → `crate::dns::resolve_a`, the
 same resolver `clock.rs` uses. Reads the hostname by `(ptr, len)` — it is not
 NUL-terminated.
 
 ### 2. The kernel DNS client hardcoded the VMM proxy address
 
-`amd64/src/dns.rs` sent every query to `10.0.2.3` — QEMU usermode's fixed DNS
+`crates/akuma-kernel-amd64/src/dns.rs` sent every query to `10.0.2.3` — QEMU usermode's fixed DNS
 proxy, the address `mkdisk.sh` also writes into the guest's `/etc/resolv.conf`.
 Correct for every VMM. **A black hole on bare metal**, where nothing answers on
 `10.0.2.3` — `BARE_METAL_STATIC_V4` seeds the resolver as `1.1.1.1` instead, and
@@ -117,7 +117,7 @@ happens to also perform (LAPIC, console fd, syscall MSRs, secondary cores).
 ### 8. Sign-on banner
 
 `run_init` now prints Akuma's cat and the version line
-(`amd64/src/banner.rs`, shared with `usermode::UTSNAME` so `uname` cannot
+(`crates/akuma-kernel-amd64/src/banner.rs`, shared with `usermode::UTSNAME` so `uname` cannot
 disagree) as the last thing before the init program starts — so on the
 television, that is what is on screen when sshd comes up.
 
@@ -159,13 +159,13 @@ be power-cycled.
 
 Two hard limits, neither a tuning knob today:
 
-- **`HEAP_SIZE` was 64 MiB** (`amd64/src/mem.rs`). The kernel heap is a single
+- **`HEAP_SIZE` was 64 MiB** (`crates/akuma-kernel-amd64/src/mem.rs`). The kernel heap is a single
   fixed slab, and `sys_openat` caches whole files in `Vec`s that are never
   evicted (`busybox` 1.1 MiB, `apk` 5.4 MiB, one per package payload). A couple
   of installs exhaust it. **Raised to 512 MiB 2026-09-06** — the sub-4 GiB
   region it is carved from has gigabytes free. A file-cache eviction policy
   (the AArch64 kernel's `akuma-fpcache`) is the real fix; the bump buys time.
-- **`PHYSMAP_LIMIT` is 4 GiB** (`amd64/src/phys.rs`). `boot.s` builds four
+- **`PHYSMAP_LIMIT` is 4 GiB** (`crates/akuma-kernel-amd64/src/phys.rs`). `boot.s` builds four
   2-MiB-page directories, so the kernel can address only the first 4 GiB of
   physical RAM. On the HP box the usable RAM below 4 GiB is ~3.2 GiB
   (`MemTotal: 3354104 kB`), of which ~2.6 GiB is free — the other ~13 GiB is
@@ -258,10 +258,10 @@ keyboard comes back.
 Plan: a `akuma-xhci` crate (register/TRB/context layout, host-tested against
 register values captured off `00:14.0`), an `akuma-usb-storage` crate (CBW/CSW +
 minimal SCSI: `INQUIRY`, `TEST UNIT READY`, `READ CAPACITY(10)`, `READ(10)`,
-`WRITE(10)`, `REQUEST SENSE`), the MMIO/DMA half in `amd64/src/xhci.rs` (`.bss`
+`WRITE(10)`, `REQUEST SENSE`), the MMIO/DMA half in `crates/akuma-kernel-amd64/src/xhci.rs` (`.bss`
 rings, `virt_to_phys`, `compiler_fence` before ownership words — the
 `akuma-net-nic/src/rtl8169.rs` pattern), a `RootDevice::Usb` arm in
-`amd64/src/fs.rs`, and a `root=/dev/sda1` cmdline token on the `multiboot2.rs`
+`crates/akuma-kernel-amd64/src/fs.rs`, and a `root=/dev/sda1` cmdline token on the `multiboot2.rs`
 path that falls back to the RAM image on any probe failure. `sda1`'s 1 MiB offset
 is a hardcoded constant with a `0x55AA` + start-dword sanity check, not an
 MBR-parsing crate. Full plan in `proposals/` and the plan file for the session
@@ -328,7 +328,7 @@ is measured rather than guessed.
 - **`apk` past the certificate error: `Read-only file system` (EROFS).** Noted in
   the handoff prompt, not reproduced this round (blocked behind the degradation
   above on the metal, and `apk update` alone succeeds on QEMU). `EROFS` is **not
-  in `amd64/src/fd.rs`'s errno table at all**, so something else is producing the
+  in `crates/akuma-kernel-amd64/src/fd.rs`'s errno table at all**, so something else is producing the
   string — worth finding where. The next step after this is mounting a real
   writable disk on the box.
 

@@ -12,7 +12,7 @@ that mattered: every other file syscall here reads a descriptor `openat`
 produced, so until it folded, `read`, `lseek`, `fstat` and `getdents64` were
 folding against a descriptor built by a second implementation.
 
-`amd64/src/fd.rs`: **+248 / −297**. The body that went is the `AT_FDCWD` ladder,
+`crates/akuma-kernel-amd64/src/fd.rs`: **+248 / −297**. The body that went is the `AT_FDCWD` ladder,
 symlink resolution, the `/dev` character nodes, the existence and
 parent-directory probes, `O_CREAT`/`O_TRUNC` through `write_file`, the
 `O_APPEND` seed, and the descriptor allocation. What replaced it is a preamble
@@ -32,7 +32,7 @@ of four parts and one call.
 3. **Three flags and a directory guard glue does not enforce** — `O_DIRECTORY`,
    `O_EXCL`, `O_NOFOLLOW`, `O_CREAT`-on-a-directory. See below.
 4. **A block node is `ENODEV`.** Glue serves `/dev/vdX` as a `BlockDev`
-   descriptor (`proposals/RAW_BLOCK_DEVICE_FD.md`); nothing here reads one, and
+   descriptor (`docs/archive/RAW_BLOCK_DEVICE_FD.md`); nothing here reads one, and
    `akuma_virtio::block` *does* have `vda` registered on this target, so a
    folded `open("/dev/vda")` would have handed back a descriptor whose first
    `read` answers `EBADF` — a failure at the wrong syscall, which is the

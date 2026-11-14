@@ -186,7 +186,7 @@ mem.rs 917 · unixsock.rs 794 · lib.rs 786 · pty.rs 550 · sync.rs 523 · term
 
 Two of these are AArch64 hardware crates compiled into an x86_64 kernel: `fdt` and `arm_pl031`. smoltcp's `socket-dns`
 feature is on in four manifests (`akuma-net`, `akuma-net-nic`, `akuma-syscalls-glue`, `akuma-kernel-core`), but no code in
-`crates/`, `src/`, `amd64/src` or `taoxichuan/src` names `smoltcp::socket::dns`. DNS goes through `akuma-dns` over UDP
+`crates/`, `src/`, `crates/akuma-kernel-amd64/src` or `taoxichuan/src` names `smoltcp::socket::dns`. DNS goes through `akuma-dns` over UDP
 sockets (`crates/akuma-net/src/dns.rs:6`). Its files are 831 live lines: `socket/dns.rs` 495 + `wire/dns.rs` 336.
 
 ## 4. Leanness options

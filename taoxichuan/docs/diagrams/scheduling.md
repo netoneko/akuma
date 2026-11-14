@@ -10,7 +10,7 @@ flowchart LR
     LVT -->|tick| TT["timer_trap (lib.rs)"]
     CAL --> CLK["net::calibrate → net::uptime_us (TSC)<br/>one clock: ExecRuntime, ThreadRuntime, primitives::clock"]
     TT --> G{"from ring 3 AND slot<br/>slotted (not NO_SLOT)<br/>AND PREEMPT_ARMED?"}
-    G -->|yes| Y["akuma_threading::x86_yield()<br/>→ switch_to on the per-slot trap stack"]
+    G -->|yes| Y["akuma_threading::try_yield()<br/>→ switch_to on the per-slot trap stack"]
     G -->|no| R["return to the same instruction"]
     TT --> NP["netpoll backstop: one drained lap per tick<br/>(NET_UP / IN_LAP guarded)"]
     Y --> NP

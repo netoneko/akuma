@@ -108,7 +108,7 @@ Two problems:
    wake on *every* transition a sleeper can only observe by re-polling).
    Interactive console channels can keep drop-oldest if that behaviour is
    wanted there — but not `ChildStdout` bridges. Kernel change ⇒ boot
-   self-test in `src/process_tests.rs` (writer faster than reader across the
+   self-test in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs` (writer faster than reader across the
    1 MiB cap; assert byte-exact delivery).
 2. **sshd**: gate the `\n` → `\r\n` translation on the session actually having
    requested a PTY, and make the live loop and the exit drain agree (both
@@ -159,7 +159,7 @@ failure if you don't know to check `busybox --list` first.
    loop `write_bounded` → `check_set_writer` → `schedule_blocking`, exactly
    the pipe-write blocking idiom already used for `PipeWrite`/`UnixSocket`.
    Regression test: `test_process_channel_write_bounded_backpressure` in
-   `src/process_tests.rs`.
+   `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
 2. **A second, previously-latent deadlock, found while verifying #1**:
    `ProcessChannel` keeps `buffer` and `pollers` as two *independent*
    spinlocks (unlike `KernelPipe`, which protects both under one lock).

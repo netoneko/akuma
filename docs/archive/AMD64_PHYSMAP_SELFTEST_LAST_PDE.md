@@ -88,7 +88,7 @@ The commit's boot-path surface is small: `fbdev::register` (a new static),
 tables.
 
 The failure's shape is what pins the mechanism. The boot region is laid out
-(`amd64/src/boot.s`):
+(`crates/akuma-kernel-amd64/src/boot.s`):
 
 ```
 0x202000 __pml4 / pdpts

@@ -33,7 +33,7 @@ flowchart TD
     G --> H["akuma-ryzen-amd64::describe<br/>hvm_start_info, memmap, virtio-mmio slots"]
     H --> I["mem::init — heap (akuma-alloc) + PMM (akuma-pmm)<br/>no-op reaper hooks"]
     I --> J["lapic_init — mask PICs (akuma-port), enable xAPIC,<br/>calibrate vs PIT, arm periodic timer (akuma-lapic-amd64)"]
-    J --> K["exec_twin::init — register ExecRuntime / ThreadRuntime /<br/>ProcessHooks / X86ArchHooks (akuma-exec, akuma-threading)"]
+    J --> K["exec_twin::init — register ExecRuntime / ThreadRuntime /<br/>ProcessHooks / ArchHooks (akuma-exec, akuma-threading)"]
     K --> K2["install_surface — akuma-runtime-tokio::install, uname,<br/>vfs-glue mount table"]
     K2 --> L["map_virtio — virtio-mmio window (disk and NIC)"]
     L --> M["root: .root(make) if given, else .disk() — ext2 on device 0<br/>(akuma-ext2, BlockDevice = Vda); mounted at / and as ROOT_FS"]
@@ -87,7 +87,6 @@ stage greps it). Tokens this kernel reads:
 | `epoch=` | wall-clock anchor: unix seconds → `akuma_primitives::clock::set_utc_time_us`, anchored at the uptime sampled at banner time. Written new (guest-cmdline policy): the metal's anchors are RTC/NTP mechanisms this guest cannot reach |
 | `initenv=` | init's environment, comma-separated |
 | `smp=N` | application processors to start, with `.smp()`; absent or 1 is one core |
-| `wx=0` | turn off the W^X refusal in `mmap`/`mprotect` |
 | `mmdbg=N` | the mmap-slab bisect mask (default 7) |
 
 ## Background

@@ -21,7 +21,7 @@ Line spans are `taoxichuan/src/main.rs` unless noted (±3 lines each, from the a
 |---|---|---|---|
 | fd table | `DUP` 2194-2208, `DUP2\|DUP3` 2209-2245, `CLOSE` 1790-1811, `FCNTL` 1753-1789, `fd_table()` 756-762, `clone_desc` 1119-1135 | `akuma-fdtable` (`alloc_fd_from`, `dup_to`, `free_below`, `set_cloexec`) — **already a dependency and already the only writer** | **already composed — keep** |
 | open/close | `OPENAT` 1812-1827, `OPEN` 1828-1836, `open_common` 793-874, `resolve_at` 977-1009, `read_link_target` 712-732 | symlink chase **already** `akuma_vfs::resolve_symlink_chain` (`main.rs:733-735` — verified). The rest: glue's `sys_openat` is welded to `Process`+mount table; `read_link_target` is the ext2 provider closure | **keep** (the shared half is already called) |
-| read/write/writev/lseek | `WRITE` 1278-1316, `WRITEV` 1317-1407, `READ` 1550-1628, `LSEEK` 2006-2046, `write_file_arm{_inner}` 875-933, `writev_file_arm` 934-976, `emit` 763-792 | amd64's `sys_read`/`sys_write_file` (`amd64/src/fd.rs:1184,1548`) do the same job but go through `SharedFdTable`/`FileDescriptor` — welded, not callable. The ext2 write (`write_at_by_inode`) **is** the shared path and is already called. The **routing order** is the bug — see §3 H3 | **rewire** (fd-table-first routing, §3); merge `write_file_arm_inner`+`writev_file_arm` into one gather-then-write helper (−35, guess); optional: parse iovecs via `akuma_syscalls_linux::io::IoVec` (−10, guess) |
+| read/write/writev/lseek | `WRITE` 1278-1316, `WRITEV` 1317-1407, `READ` 1550-1628, `LSEEK` 2006-2046, `write_file_arm{_inner}` 875-933, `writev_file_arm` 934-976, `emit` 763-792 | amd64's `sys_read`/`sys_write_file` (`crates/akuma-kernel-amd64/src/fd.rs:1184,1548`) do the same job but go through `SharedFdTable`/`FileDescriptor` — welded, not callable. The ext2 write (`write_at_by_inode`) **is** the shared path and is already called. The **routing order** is the bug — see §3 H3 | **rewire** (fd-table-first routing, §3); merge `write_file_arm_inner`+`writev_file_arm` into one gather-then-write helper (−35, guess); optional: parse iovecs via `akuma_syscalls_linux::io::IoVec` (−10, guess) |
 | stat family | `STAT` 1672-1704, `LSTAT` 1705-1752, `FSTAT` 1979 + `fstat_fd` 1087-1118, `NEWFSTATAT` 1980-2005, `stat_path`/`lstat_path` 1010-1060, `fill_stat64` 1253-1275 | `akuma_syscalls_abi::stat::{AsmGeneric (akuma_syscalls_linux::Stat), X8664, to_x86_64}` — the x86_64 144-byte layout with `offset_of!` assertions (`akuma-syscalls-abi/src/lib.rs:822-897`); amd64's `sys_fstat` (`fd.rs:1800`) fills asm-generic then converts through exactly this. taoxichuan's `fill_stat64` hand-spells those same offsets as raw bytes | **replace by dependency**: build `Stat{..}` → `to_x86_64` → `copy_to_user` (−11). Keep `lstat_path`'s parent-dir walk (glue's is welded). Keep `fstat_fd`'s inode re-stat (per-kernel table) |
 | statfs | `STATFS`/`FSTATFS` 2072-2082 + `fill_statfs` 1061-1086 | `akuma_syscalls_linux::stat::Statfs` — asm-generic == x86_64 for statfs (pinned by amd64 `fd.rs:1896` comment) | **replace by dependency** (−8) |
 | dirs | `GETDENTS64` 1837-1904, `MKDIRAT`/`UNLINKAT`/`RENAMEAT`/`SYMLINKAT`/`LINKAT` 2114-2176 | `akuma_syscalls_linux::dirent::{encode, fill}` (amd64's `sys_getdents64` consumes it via glue). The C-phase arms are thin ext2 trait calls already | **GETDENTS64: replace** record encoding by `dirent::encode` (−22). Rest **keep** |
@@ -73,7 +73,7 @@ change is caught by G1/G2 in the same boot (sshd's own fds 1/2 are unbound → c
 - **Who owns /dev/null in the full kernels**: *what exists* = `akuma_vfs::dev`
   (`crates/akuma-vfs/src/dev.rs::lookup/list`, pure, host-tested; vfs.md § /dev). *What open does*
   = per-device arms welded to each kernel's process model (`src/syscall/fs.rs` aarch64;
-  `amd64/src/fd.rs:861 sys_openat` + the DevNull-style descriptor `fd.rs:522-543`). Neither open
+  `crates/akuma-kernel-amd64/src/fd.rs:861 sys_openat` + the DevNull-style descriptor `fd.rs:522-543`). Neither open
   side is callable from taoxichuan.
 - **Does the trim make the hand-written arm unnecessary? No.** The arm is 6 lines
   (`main.rs:799-803`, `path == "/dev/null"` → `OpenFile::Null`) — it *is* the minimal shape of
@@ -178,7 +178,7 @@ dumps across contexts.
    Settle: read `scripts/check_unsafe_budget.py`'s counting rule and the 5 lines (host-only, 15
    min). If they are irreducible (naked-entry asm), `--update` with the reason is the honest move.
 
-— goose-glm, stage 7 session C. Verified by reading `taoxichuan/src`, `amd64/src/{usermode,fd,fs}.rs`,
+— goose-glm, stage 7 session C. Verified by reading `taoxichuan/src`, `crates/akuma-kernel-amd64/src/{usermode,fd,fs}.rs`,
 `crates/{akuma-syscalls-abi,akuma-syscalls-linux,akuma-syscalls-time,akuma-syscalls-glue,akuma-syscalls-mem,
 akuma-vfs,akuma-ext2,akuma-user-access,akuma-port,akuma-primitives,akuma-cpu}`, and the stage-6/7
 docs + RESULT-A. No kernel code, no boots, no /boot writes in this commit.

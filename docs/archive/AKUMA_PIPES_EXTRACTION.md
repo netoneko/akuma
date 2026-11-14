@@ -12,7 +12,7 @@ nothing else.
 
 | | aarch64 | amd64 |
 |---|---|---|
-| where | `crates/akuma-syscalls-glue/src/pipe.rs`, 499 lines | `amd64/src/pipe.rs`, 175 lines |
+| where | `crates/akuma-syscalls-glue/src/pipe.rs`, 499 lines | `crates/akuma-kernel-amd64/src/pipe.rs`, 175 lines |
 | buffer | its own `VecDeque<u8>` + `PIPE_CAPACITY: usize = 65536` | `akuma_pipe::Pipe` (`DEFAULT_CAPACITY = 64 * 1024`) |
 | ends | `read_count` **and** `write_count`, both refcounted | one `write_closed` flag |
 | waiters | `pollers: BTreeMap<tid, WakeHandle>`, woken on every event | none — callers poll |
@@ -115,7 +115,7 @@ Both modules kept their public API, so their callers did not move.
   called `wake_by_handle` *inside* the locked, IRQ-masked section. Returning the
   set is what makes firing it outside the only option a caller has.
 
-- **amd64** — `amd64/src/pipe.rs` is a shim over `PipeTable<()>` whose `fire` is
+- **amd64** — `crates/akuma-kernel-amd64/src/pipe.rs` is a shim over `PipeTable<()>` whose `fire` is
   an empty function, called on every path that produces wakes so that giving
   that scheduler a blocked state (item 3) is a change to one body. The
   `Slot::ends` stopgap is gone, and with it `alloc_pair`/`drop_end`: a `pipe(2)`
@@ -198,16 +198,16 @@ plain function-call switch that can switch out directly.
 1. `akuma-threading`, AArch64 — SGI / fake-IRQ-frame.
 2. `akuma-threading`, x86_64 — `akuma_threading_x86_switch_context`, cooperative,
    added 2026-09-05.
-3. `amd64/src/sched.rs` — `switch_context`, cooperative. **The one amd64 runs.**
+3. `crates/akuma-kernel-amd64/src/sched.rs` — `switch_context`, cooperative. **The one amd64 runs.**
 
 2 is a port of 3, and the port dropped a fix:
 
 ```
-amd64/src/sched.rs:        pushfq   push rbp rbx r12-r15  ...  popfq  ret
+crates/akuma-kernel-amd64/src/sched.rs:        pushfq   push rbp rbx r12-r15  ...  popfq  ret
 akuma-threading (x86):              push rbp rbx r12-r15  ...         ret
 ```
 
-`amd64/src/sched.rs`'s own comment says why the flags are saved: *"a syscall
+`crates/akuma-kernel-amd64/src/sched.rs`'s own comment says why the flags are saved: *"a syscall
 (interrupts off) that yields to a kernel task (interrupts on) must come back with
 them off, and it did not until Stage U — the resumer's state leaked into the
 resumed."* The copy silently reintroduces that. **Fix `akuma-threading`'s switch

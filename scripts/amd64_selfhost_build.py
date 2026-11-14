@@ -26,7 +26,7 @@ build streams — and keeps watching. A stall that resolves is reported as a
 stall that resolved, with how long it lasted.
 
 Usage:
-    scripts/amd64_selfhost_build.py                 # build akuma-amd64, watch
+    scripts/amd64_selfhost_build.py                 # build the amd64 kernel (package akuma), watch
     scripts/amd64_selfhost_build.py --package akuma-mmap --stall 120
     scripts/amd64_selfhost_build.py --attach        # watch a build already running
     scripts/amd64_selfhost_build.py --status        # one snapshot, then exit
@@ -234,7 +234,7 @@ def watch(poll, stall_after, budget):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--package", default="akuma-amd64")
+    ap.add_argument("--package", default="akuma")
     ap.add_argument("--jobs", type=int, default=1)
     ap.add_argument("--poll", type=int, default=30, help="seconds between samples")
     ap.add_argument("--stall", type=int, default=300,

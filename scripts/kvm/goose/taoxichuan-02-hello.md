@@ -56,7 +56,7 @@ Your stage-1 RESULT.md already sketched the work; it is the plan, quoted:
 Keep the pinned exclusions: single vCPU, no pty layer, no users machinery, no
 scheduler (one task that only exits does not need one), no herd in the minimal image —
 init stays kernel-spawned. Per the experiment's composition rule: pull as few crates
-as possible; where the logic you need still lives in `amd64/src/` (or in `taoxichuan/`
+as possible; where the logic you need still lives in `crates/akuma-kernel-amd64/src/` (or in `taoxichuan/`
 as inline code that the main kernel also has), extract into a crate first, then pull.
 Do not regress the stage-1 gate: the banner, the spawn line, and the zero-fault grep
 must all still hold.

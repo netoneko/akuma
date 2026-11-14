@@ -1,7 +1,7 @@
 # amd64: a non-blocking `read(0)` on the console parked forever — the `ssh`-client typing freeze
 
 **Date:** 2026-09-10
-**Status:** FIXED (`amd64/src/fd.rs`, `read_console`).
+**Status:** FIXED (`crates/akuma-kernel-amd64/src/fd.rs`, `read_console`).
 **Symptom:** typing into the `ssh` **client** on amd64 does nothing. The remote
 prompt and remote echo freeze; the session looks alive (it connected, the banner
 arrived) but nothing the user types reaches the far end and nothing comes back.

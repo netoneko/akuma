@@ -74,18 +74,14 @@ pub fn init() -> Result<(), FsError> {
         akuma_exec::threading::reclaim_terminated_slots();
     });
 
-    // Drop `file_page_cache` entries when an inode number is reissued. The cache
-    // is keyed on `(inode, file_offset)`, so without this a new file silently
-    // inherits the cached pages of whatever last held its number — see
-    // `akuma_ext2`'s `InodeFreedHook` and
-    // `docs/archive/SELFHOST_ZERO_PAGE_HUNT.md` §15.
-    akuma_ext2::init_inode_freed_hook(akuma_fpcache::invalidate_inode);
+    // The file-page caches' inode-freed hook and the shared writable table's
+    // write observers — see `init_shared_write`.
+    crate::init_shared_write();
 
     // Size the ext2 block cache from detected RAM before mounting (the cache is
     // allocated in Ext2Filesystem::new). Cap at min(12.5% RAM, 384 MB): enough to
     // keep the read-only toolchain's hot pages resident across the many
     // rustc/cc/ld spawns, bounded so it can't starve user pages.
-    // No-op unless the kernel is built with the `fs-cache` feature.
     //
     // The ceiling was 128 MB from 2026-08-02 to 2026-08-05. That was too small:
     // it was sized against `rustc --version` (~71 distinct 1 MB windows), which

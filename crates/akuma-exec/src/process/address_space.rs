@@ -34,7 +34,7 @@
 //! changes them for a live `Process` is `execve`, which calls [`replace`] to
 //! swap the inner value and refresh the mirror together. Every *other*
 //! `UserAddressSpace` operation goes through [`lock`], which is `as_lock` held
-//! with IRQs masked on `kernel_smp_shared` (a plain spinlock hold elsewhere).
+//! with IRQs masked on `kernel_bkl_smp` (a plain spinlock hold elsewhere).
 //!
 //! [`replace`]: ProcAddressSpace::replace
 //! [`lock`]: ProcAddressSpace::lock
@@ -119,7 +119,7 @@ impl ProcAddressSpace {
 
     // ── locked access to the address space itself ──────────────────────────
 
-    /// Take `as_lock` (with IRQs masked on `kernel_smp_shared`) and return a
+    /// Take `as_lock` (with IRQs masked on `kernel_bkl_smp`) and return a
     /// guard that derefs to the [`UserAddressSpace`].
     ///
     /// This is what `Process::with_address_space` / the old `AsLockHold` handed
@@ -128,11 +128,11 @@ impl ProcAddressSpace {
     /// or yield while it is held.
     #[inline]
     pub fn lock(&self) -> AddressSpaceGuard<'_> {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         let irq = crate::runtime::IrqGuard::new();
         AddressSpaceGuard {
             guard: self.lock_inner(),
-            #[cfg(kernel_smp_shared)]
+            #[cfg(kernel_bkl_smp)]
             _irq: irq,
         }
     }
@@ -243,7 +243,7 @@ impl ProcAddressSpace {
     ///
     /// `&self` since `AKUMA_EXEC_AUDIT.md` §6.E group 2b — `replace_image` no
     /// longer holds `&mut Process`. The swap is done under `inner`'s lock (with
-    /// IRQs masked on `kernel_smp_shared`); a lock-free `l0_phys()` reader can
+    /// IRQs masked on `kernel_bkl_smp`); a lock-free `l0_phys()` reader can
     /// briefly see the new inner paired with the old `ttbr0` mirror between the
     /// two stores, but that window existed for `&mut self` too (the mirror and
     /// the inner were never updated atomically) and `execve` runs BKL-held with
@@ -252,7 +252,7 @@ impl ProcAddressSpace {
         let ttbr0 = uas.ttbr0();
         let shared = uas.is_shared();
         let old = {
-            #[cfg(kernel_smp_shared)]
+            #[cfg(kernel_bkl_smp)]
             let _irq = crate::runtime::IrqGuard::new();
             core::mem::replace(&mut *self.lock_inner(), uas)
         };
@@ -267,7 +267,7 @@ impl ProcAddressSpace {
 /// discipline the old `AsLockHold` documented.
 pub struct AddressSpaceGuard<'a> {
     guard: SpinlockGuard<'a, UserAddressSpace>,
-    #[cfg(kernel_smp_shared)]
+    #[cfg(kernel_bkl_smp)]
     _irq: crate::runtime::IrqGuard,
 }
 

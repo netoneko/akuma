@@ -141,7 +141,7 @@ const PLEX_HD_HEIGHT: usize = 48;
 /// thin (the edge pixel is darker than the true linear mix would be). A mild boost to
 /// partial coverage compensates, without touching solid (255) or empty (0) pixels.
 /// 1.0 turns it off.
-const HD_COVERAGE_GAMMA: f32 = 0.8;
+const HD_COVERAGE_GAMMA: f32 = 0.6;
 /// Pixels down one IBM Plex Mono cell.
 ///
 /// Shorter than the face's own line height, which is 1.32 em and would spend
@@ -200,7 +200,7 @@ const PLEX_SD: PlexSize = PlexSize {
     name: "IBM Plex Mono",
     width: PLEX_WIDTH,
     height: PLEX_HEIGHT,
-    gamma: 1.0,
+    gamma: HD_COVERAGE_GAMMA,
     lcd: true,
 };
 

@@ -32,7 +32,7 @@ herd ─ "wifi" service (/bin/wifi auto)
          │ reads /etc/wifi/*  (0600)
          │ write "scan wlan0" → read results → choose → write "connect wlan0 <ssid> <psk>"
          ▼
-/dev/wifi0 ── amd64/src/wifi.rs ── backend: simulated radio (`wifisim`) │ rtw89 (W2: receives; not yet a backend)
+/dev/wifi0 ── crates/akuma-kernel-amd64/src/wifi.rs ── backend: simulated radio (`wifisim`) │ rtw89 (W2: receives; not yet a backend)
 ```
 
 ## Where the code is
@@ -40,7 +40,7 @@ herd ─ "wifi" service (/bin/wifi auto)
 | | |
 |---|---|
 | [`crates/akuma-wifi`](../../../crates/akuma-wifi/src/lib.rs) | the protocol: command grammar (`cmd`), status text writer + parser (`status`), hex (`hex`), the simulated radio (`sim`). `no_std`, no allocation, `forbid(unsafe_code)`, 16 host tests. Shared by kernel and tool, so they cannot drift |
-| [`amd64/src/wifi.rs`](../../../amd64/src/wifi.rs) | the device: backend selection, per-descriptor read cursors, command dispatch. `openat`/`read`/`fstat` hooks in `amd64/src/fd.rs`, `write`/`close` in `amd64/src/usermode.rs` |
+| [`crates/akuma-kernel-amd64/src/wifi.rs`](../../../crates/akuma-kernel-amd64/src/wifi.rs) | the device: backend selection, per-descriptor read cursors, command dispatch. `openat`/`read`/`fstat` hooks in `crates/akuma-kernel-amd64/src/fd.rs`, `write`/`close` in `crates/akuma-kernel-amd64/src/usermode.rs` |
 | [`userspace/wifi`](../../../userspace/wifi/README.md) | the tool. Library half (config files, PBKDF2, network choice, the `auto` policy) has 10 host tests |
 | `crates/akuma-vfs/src/dev.rs` | the `wifi0` devfs node, present when a backend registered (`akuma_vfs_glue::set_wifi_present`) |
 | `crates/akuma-exec-core` | `FileDescriptor::DevWifi` |
@@ -99,7 +99,7 @@ gets its own cursor. `close` frees it.
 |---|---|---|
 | none | default | **no `/dev/wifi0` node at all** (`open` is `ENOENT`, `ls /dev` omits it) |
 | simulated | `wifisim` on the kernel command line (PVH and multiboot2 paths) | `akuma_wifi::sim`, below. **`wifisim=lossy`** (2026-10-12) adds a seeded fault model — scans that miss a network 1 in 4, joins that sit in `associating` for a few reads 1 in 3 (and 1 in 8 of those end `timeout`), a `connected` link that drops to `associating` 1 in 25 reads and comes back `connected` or `failed`, a signal that wanders — so `wifi auto` can be soaked against a radio that behaves like the real one (ryzen entry 15) |
-| rtw89 | `rtw89wifi` (multiboot2 path, after the root mount) | ryzen's RTL8852CE, kept up after its bring-up; `amd64/src/rtw89_sta.rs` is the backend. **Joins a WPA2-PSK network and carries IP** (2026-10-06): scan, auth, assoc, the 4-way handshake in the kernel, keys installed (survey doc § 5.4), then DHCP, SNTP, DNS and **ssh into Akuma over wifi** (§ 5.6) — the stack runs on `ExternalDevice::Queued`. Outbound TCP works since the station is yielded to by blocking socket waits (§ 5.6). W1 (`rtw89`, firmware) and W2 (`rtw89rx`, receive) are the earlier stages, below |
+| rtw89 | `rtw89wifi` (multiboot2 path, after the root mount) | ryzen's RTL8852CE, kept up after its bring-up; `crates/akuma-kernel-amd64/src/rtw89_sta.rs` is the backend. **Joins a WPA2-PSK network and carries IP** (2026-10-06): scan, auth, assoc, the 4-way handshake in the kernel, keys installed (survey doc § 5.4), then DHCP, SNTP, DNS and **ssh into Akuma over wifi** (§ 5.6) — the stack runs on `ExternalDevice::Queued`. Outbound TCP works since the station is yielded to by blocking socket waits (§ 5.6). W1 (`rtw89`, firmware) and W2 (`rtw89rx`, receive) are the earlier stages, below |
 
 **The simulated radio** is deterministic: the same networks every boot, scans
 complete at once, and fixed rules for `connect`. A test that passes against it
@@ -124,11 +124,11 @@ Stage W1 of the wifi plan: from a powered-off card to running firmware.
 | piece | where | does |
 |---|---|---|
 | the sequence | `crates/akuma-rtw89` (`forbid(unsafe_code)`, host-tested) | power-on (`rtw8852c_pwr_on_func`), the DMA engine's download-mode setup (`dle_init(DLFW)`, H2C flow control, `rtw89_pci_ops_mac_pre_init_ax`), the firmware CPU reset, the download on CH12, the wait for `fw ready`; the firmware container and header parser |
-| the hardware | `amd64/src/rtw89.rs` | finds `10ec:c852`, D0, maps BAR2, **Bus Master on the root port** as well as the card, `.bss` DMA memory, streams the firmware file through `fs::read_at` (never loaded whole), logs `[rtw]` lines, always shuts the card down |
+| the hardware | `crates/akuma-kernel-amd64/src/rtw89.rs` | finds `10ec:c852`, D0, maps BAR2, **Bus Master on the root port** as well as the card, `.bss` DMA memory, streams the firmware file through `fs::read_at` (never loaded whole), logs `[rtw]` lines, always shuts the card down |
 | the boot token | `rtw89` (multiboot2 path, after the root mount) | ryzen menu entry 8 |
 | W2: the start | `akuma_rtw89::script` + `seq/up.seq` | the rest of Linux's `rtw89_core_start` after `fw ready`, **replayed from a recording** of Linux on this card (writes, checked reads, polls, delays, 45 H2Cs); reports where the chip departs from it |
 | W2: receive | `akuma_rtw89::rx`, `akuma-ieee80211` | RXQ entries with their own buffers, the RX descriptor, beacons and probe responses (SSID, channel, RSN); token `rtw89rx`, ryzen menu entry 9 |
-| W3/W4: the station | `amd64/src/rtw89_sta.rs` over `rtw89::Card`, `akuma_rtw89::{tx, script::JOIN1..4}`, `akuma_ieee80211::sta`, `akuma_wpa` | `/dev/wifi0`'s radio: `JOIN1` at start, scan with the RX filter opened, then `JOIN2` → auth → assoc → `JOIN3` → 4-way handshake → msg 4 → `JOIN4` (keys). WPA2-PSK only; open networks answer `unsupported`. Station address `02:41:4b:55:4d:41`. Token `rtw89wifi`, ryzen menu entry 10 |
+| W3/W4: the station | `crates/akuma-kernel-amd64/src/rtw89_sta.rs` over `rtw89::Card`, `akuma_rtw89::{tx, script::JOIN1..4}`, `akuma_ieee80211::sta`, `akuma_wpa` | `/dev/wifi0`'s radio: `JOIN1` at start, scan with the RX filter opened, then `JOIN2` → auth → assoc → `JOIN3` → 4-way handshake → msg 4 → `JOIN4` (keys). WPA2-PSK only; open networks answer `unsupported`. Station address `02:41:4b:55:4d:41`. Token `rtw89wifi`, ryzen menu entry 10 |
 
 **What a good boot logs** (`boot-N.early` on p3):
 

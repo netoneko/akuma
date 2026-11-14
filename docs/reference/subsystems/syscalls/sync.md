@@ -12,7 +12,7 @@ duplicated here.
 The family is in two halves, and knowing which half a question belongs to is
 the fastest way to answer it:
 
-| in the crate (`crates/akuma-syscalls-sync`, host-tested) | in the kernel (`src/syscall/sync.rs`) |
+| in the crate (`crates/akuma-syscalls-sync`, host-tested) | in the kernel (`crates/akuma-syscalls-glue/src/sync.rs`, both kernels) |
 |---|---|
 | op decode, alignment/mapping rules, `Action` | `validate_user_ptr`, the user reads and writes |
 | the `(tgid, uaddr)` waiter table and every queue operation | the `Spinlock`, the IRQ masking, the `Prefault::No` in-hold read |
@@ -221,8 +221,23 @@ forever — with a perfectly ordinary, correctly-queued waiter in `[FUTEX-DUMP]`
   - *queued at another key* → moved by `FUTEX_REQUEUE`; stay parked at the
     requeue target (a `FUTEX_WAKE` there will drain us and read as genuine
     next iteration), leaving cleanly on timeout/signal via
-    `futex_remove_tid_anywhere` (`src/syscall/sync.rs:229`) so no dead tid
-    is left behind to absorb a future wake.
+    `futex_remove_tid_anywhere` so no dead tid is left behind to absorb a
+    future wake.
+- **What ends a wait early (`EINTR`)** is any of three: a pending signal the
+  thread has **not blocked** (a blocked one must not, or musl's retry spins),
+  a deferred kill (`PENDING_KILL`, which `exit_group` posts to every sibling on
+  both kernels), or the thread's interrupt flag (`is_current_interrupted`,
+  consumed), which is how a thread-group leader leaves an untimed wait when a
+  sibling's fault ends the group. Drop any of the three and some exit path parks
+  forever.
+
+**One implementation.** The amd64 kernel serves `futex(2)` from this code too
+(x86_64 202 → `to_glue`), and its `clear_child_tid` wake, slot-purge callback and
+`akuma-exec` `futex_wake` hook are glue's `futex_wake`/`futex_purge_tid`. Do not
+add a second waiter table: a kernel-internal wake only reaches waiters in the
+table it publishes to. Background:
+[`../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md),
+"Slice 2: futex".
 
 ## FUTEX_WAKE / FUTEX_REQUEUE / FUTEX_CMP_REQUEUE / FUTEX_WAKE_OP
 

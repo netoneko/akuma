@@ -1,27 +1,25 @@
 # Process-per-session sshd (`fork-sessions`)
 
-**Stability: B — verify behaviour.** Landed 2026-08-10, **off by default**.
-Serves each SSH connection from its own forked process instead of as one future
-in a single-process cooperative executor.
+**Stability: B — verify behaviour.** Landed 2026-08-10, **on by default** (the
+`fork-sessions` feature). Serves each SSH connection from its own forked process
+instead of as one future in a single-process cooperative executor.
 
-## Turning it on
-
-Both halves, or neither:
+## Turning it off
 
 ```bash
-SSHD_FORK_SESSIONS=1 userspace/build.sh --sshd-only          # userspace half
-SSHD_FORK_SESSIONS=1 scripts/build_devbox_smoltcp.sh          # kernel half
-SSHD_FORK_SESSIONS=1 overlays/devbox/run-smoltcp.sh           # and to run it
+SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only    # cooperative single process
 ```
 
-`run-smoltcp.sh` issues its own `cargo run`, so it needs the variable too —
-without it the run rebuilds the kernel *without* `many-sessions` and silently
-replaces the image `build_devbox_smoltcp.sh` just produced.
+## The kernel's listener backlog
 
-The kernel half is the `many-sessions` feature: it raises the per-listener
-backlog from 8 to 32 and, on the size-constrained profiles, the smoltcp socket
-budget from 32 to 128. Without it the stack RSTs past 8 simultaneous arrivals
-and sshd cannot reach its own `max_sessions` of 24 no matter how it is built.
+There is no kernel half. The kernel's listener backlog is **8** on every build
+(`MAX_BACKLOG`, `crates/akuma-net/src/socket.rs`), so the stack RSTs past 8
+simultaneous *arrivals* and a burst cannot reach `max_sessions` (24). The
+kernel's `many-sessions` feature raised it to 32 until it was removed
+2026-11-11; the kernel no longer carries a mode for sshd. Size sshd for the
+image: lower `max_sessions`, connect in smaller bursts, or raise `MAX_BACKLOG`
+and rebuild the kernel (32 KB of heap per entry per listener;
+`docs/reference/build-profiles.md` § Listener backlog).
 
 ## What it does
 
@@ -82,8 +80,8 @@ the refcount), and 24 concurrent children.
 | C. cap — 32 simultaneous vs `max_sessions=24` | exactly 24 served, 8 refused, server healthy after |
 | D. fault isolation — SIGKILL one session | exactly 1 peer cut short, 3/4 unaffected, server serving |
 
-Backlog sweep, same VM: 8/8, 16/16, 24/24 with `many-sessions`; **8/8, 12/16,
-17/24 without it** — which is what pins the RST failures on the backlog rather
+Backlog sweep, same VM: 8/8, 16/16, 24/24 with the 32-deep backlog `many-sessions` gave; **8/8, 12/16,
+17/24 with 8**, today's backlog — which is what pins the RST failures on the backlog rather
 than on forking.
 
 ## Known open item

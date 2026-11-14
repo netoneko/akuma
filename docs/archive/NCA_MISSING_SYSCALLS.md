@@ -1,5 +1,7 @@
 # NCA (native-cli-ai) — Missing Kernel Pieces for a Rust AI CLI
 
+> **nca retired 2026-11-09.** `userspace/nca` and its `native-cli-ai` submodule were removed from the tree today in favor of goose. This document is kept as history: paths under `userspace/nca/` no longer exist (they are in git history before the removal commit), and the kernel findings below stand on their own.
+
 **Date:** 2026-08-17. **Scope:** getting `nca` (upstream
 `madebyaris/native-cli-ai`) to build and run on Akuma (devbox-smoltcp, nightly
 rustc 1.99.0 in the guest).

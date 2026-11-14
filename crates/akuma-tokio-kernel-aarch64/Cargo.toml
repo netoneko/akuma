@@ -1,0 +1,68 @@
+[package]
+name = "akuma-tokio-kernel-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "The aarch64 machine half of akuma-tokio-kernel: boot through akuma-boot-aarch64's _boot, the PL011 console, and (as B21 lands) the traps, memory and devices the amd64 half has."
+
+[lints]
+workspace = true
+
+# The kernel's own target only; on a host the crate is empty (`#![cfg]` in lib.rs).
+[target.'cfg(target_os = "none")'.dependencies]
+akuma-alloc = { path = "../akuma-alloc" }
+akuma-boot-aarch64 = { path = "../akuma-boot-aarch64" }
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-firecracker = { path = "../akuma-firecracker" }
+akuma-gic = { path = "../akuma-gic" }
+akuma-mmu = { path = "../akuma-mmu" }
+akuma-pmm = { path = "../akuma-pmm" }
+# user_stack_size's policy (config flag sweep, 2026-11-11), shared with every other kernel.
+akuma-mem-policy = { path = "../akuma-mem-policy" }
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-psci = { path = "../akuma-psci" }
+akuma-timer = { path = "../akuma-timer" }
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["process", "net"] }
+akuma-params = { path = "../akuma-params" }
+akuma-middleware = { path = "../akuma-middleware", optional = true }
+akuma-uart = { path = "../akuma-uart", optional = true }
+akuma-vectors-aarch64 = { path = "../akuma-vectors-aarch64" }
+fdt = "0.1"
+# virtio-mmio block: the root disk's transport and driver, polled.
+akuma-virtio = { path = "../akuma-virtio" }
+# ext2 on it, mounted at `/` in the shared mount table (`akuma-vfs-glue`).
+akuma-ext2 = { path = "../akuma-ext2", optional = true }
+akuma-vfs = { path = "../akuma-vfs" }
+akuma-vfs-glue = { path = "../akuma-vfs-glue" }
+akuma-fpcache = { path = "../akuma-fpcache" }
+# The tokio surface over glue (the amd64 half's feature set, so the two build glue alike).
+akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = false, features = ["smoltcp", "sc-epoll", "sc-eventfd"] }
+akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
+akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
+akuma-threading = { path = "../akuma-threading" }
+akuma-exec = { path = "../akuma-exec" }
+# The task's page tables: frames, the AArch64 walker and leaf encoding, the fork plans.
+akuma-phys = { path = "../akuma-phys" }
+akuma-pagetable = { path = "../akuma-pagetable" }
+akuma-pte-aarch64 = { path = "../akuma-pte-aarch64" }
+akuma-user-tree = { path = "../akuma-user-tree" }
+akuma-net = { path = "../akuma-net" }
+akuma-user-access = { path = "../akuma-user-access" }
+
+[features]
+# The same switches as the amd64 half, so one main.rs builds for both. Only
+# `console` does anything yet; the rest arrive with B21 A5.3 onward.
+console = ["dep:akuma-uart"]
+disk = ["dep:akuma-ext2", "akuma-tokio-kernel-core/disk"]
+net = []
+smp = ["akuma-boot-aarch64/secondary", "akuma-gic/secondary"]
+shell = []
+# Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.
+middleware = ["dep:akuma-middleware", "akuma-tokio-kernel-core/middleware"]
+# Refuse every dynamically linked image at build time, EPERM (`akuma-elf-exec`'s `refuse-dynamic`). Off by default.
+refuse-dynamic-elf = ["akuma-tokio-kernel-core/refuse-dynamic-elf"]
+no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
+trace-err = ["akuma-tokio-kernel-core/trace-err"]
+# Firecracker's memory map: boot treats 0x4000_0000..0x8000_0000 as device memory (the serial
+# port and the virtio slots live there) and maps the UART at 0x4000_2000. The link base
+# (0x8030_0000) is the binary's, set by its build script. Everything else comes from the tree.
+platform-firecracker = ["akuma-boot-aarch64/platform-firecracker"]

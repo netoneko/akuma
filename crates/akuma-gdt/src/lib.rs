@@ -2,7 +2,7 @@
 #![no_std]
 //! The GDT and TSS, as data.
 //!
-//! `amd64/src/gdt.rs` owns the per-core `static`s and the two instructions that
+//! `crates/akuma-kernel-amd64/src/gdt.rs` owns the per-core `static`s and the two instructions that
 //! load them (`lgdt`, `ltr`) — the only genuinely `unsafe` content. Everything
 //! else in that file was arithmetic: which selector is which, how a 16-byte TSS
 //! descriptor packs a 64-bit base into three scattered fields, and the constraint

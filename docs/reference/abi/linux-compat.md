@@ -119,6 +119,32 @@ Two loaders, picked by size (`src/elf_loader.rs` +
 `spawn_process_with_channel_ext` and `do_execve` try `read_file()` first; on
 `FsError` they fall back to the on-demand path via `file_size(path)`.
 
+### Two segments on one page
+
+`lld` packs segments without page alignment: a static libakuma binary can end
+`.text` and start its read-only segment on the same page (the disk's `sshd`:
+text to `0x416D00`, rodata from there). Every loader builds such a page
+**once**, holding the file bytes of every segment that overlaps it, with the
+permissions of the first segment to reach it; a later segment leaves a present
+page alone. The main kernel (`akuma-elf`'s `map_segment_eager`, first mapping
+wins, later bytes copied in) and Taoxichuan (`akuma-tokio-kernel-core::loader::
+place_segment`, which builds the page from all overlapping segments) agree.
+Replacing the page with the later segment's frame drops the earlier segment's
+bytes and its exec bit (`docs/archive/TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE.md`).
+
+### The main thread's stack grows
+
+An image starts with 64 KiB of stack under `USER_STACK_TOP`. A not-present fault
+from user mode just below that region grows it, up to 8 MiB (Linux's default
+`ulimit -s`). On Taoxichuan that is `akuma-tokio-kernel-core::loader::grow_user_stack`,
+called by **both** machines' user fault paths. LLVM's stack probe (`sub sp, #4096;
+str xzr, [sp]`) grows it one page per fault; `Runtime::block_on` of a large
+`async main` is a 46 KB frame and probes past 64 KiB at start. A machine without
+this kills such programs before `main` runs (`docs/archive/INFINITY_ON_TAOXICHUAN.md`,
+Update 2026-11-04). Growth is from user faults only: a syscall that is the first to
+touch a new stack page gets `EFAULT`. That needs a raw syscall from a leaf frame,
+since any libc call touches the lower stack first.
+
 ### Dynamic linking (PT_INTERP)
 
 - A `PT_INTERP` program header names the interpreter; the loader reads it via
@@ -129,11 +155,19 @@ Two loaders, picked by size (`src/elf_loader.rs` +
 
 ### auxv
 
-Built in `crates/akuma-exec/src/elf/mod.rs` (`setup_linux_stack`). Entries:
+Built by `akuma_elf::attach_stack` (`crates/akuma-elf/src/stack.rs`) on both kernels. Entries:
 `AT_PHDR`, `AT_PHNUM`, `AT_PHENT`, `AT_PAGESZ` (4096), `AT_ENTRY`,
-`AT_CLKTCK` (100), `AT_RANDOM` (16 random bytes), `AT_UID`/`AT_EUID`/
-`AT_GID`/`AT_EGID` (all 0 — single-user), `AT_HWCAP` (`AARCH64_HWCAP`),
-`AT_HWCAP2` (0), and `AT_BASE` when an interpreter was loaded.
+`AT_CLKTCK` (100), `AT_RANDOM` (16 bytes from the kernel RNG hook; a fixed
+`0xA5` pattern when there is none), `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID`
+(all 0 — single-user), `AT_SECURE` (0), `AT_HWCAP` (`AARCH64_HWCAP` on
+AArch64, 0 on amd64), `AT_HWCAP2` (0) and `AT_BASE` (the interpreter's base,
+0 for a static image, as on Linux).
+
+The stack top is the caller's: AArch64 lets `compute_stack_top` place it above
+the image, amd64 passes `ELF_STACK_TOP` (the top of the lower half). An argv
+and envp that do not fit the eagerly mapped stack are refused with `E2BIG`
+before anything is written. Probe: `userspace/forktest/c_stress/auxvprobe.c`
+(passes on Linux); limits: `envmax.c`.
 
 ## execve
 

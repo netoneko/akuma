@@ -225,7 +225,7 @@ install's output before rebooting.
 `userspace/nca/build.rs`, `amd64/mkdisk.sh`, `crates/akuma-syscalls-linux/src/{flags,time,lib}.rs`,
 `crates/akuma-syscalls-glue/src/{fs,proc}.rs`, `crates/akuma-syscalls-time/src/lib.rs`,
 `crates/akuma-exec/src/process/{channel,children,table}.rs`, `crates/akuma-threading/src/lib.rs`,
-`amd64/src/sched.rs`, `crates/akuma-syscalls-glue/build.rs`. Docs updated alongside:
+`crates/akuma-kernel-amd64/src/sched.rs`, `crates/akuma-syscalls-glue/build.rs`. Docs updated alongside:
 `syscalls/fs.md`, `syscalls/time.md`, `subsystems/vfs.md`, `runbooks/amd64-console-shell.md`,
 `runbooks/amd64-bare-metal-loop.md`, `userspace/nca/README.md`.
 
@@ -335,7 +335,7 @@ spawned thread (`goose-cli-main`) and joins it; `std::process::exit` from that t
 (`drain`, fd sweep, `SPAWN` row), and `should_leave_now()` is false for the leader by construction, so nothing ever told it.
 The same bug is why `nca run` ended in exit 134 / hung and why `timeout … goose --version` never returned.
 
-**Fix** (`amd64/src/thread.rs` `exit_group_from_thread`, `signal.rs` `deliver_pending`, `usermode.rs`
+**Fix** (`crates/akuma-kernel-amd64/src/thread.rs` `exit_group_from_thread`, `signal.rs` `deliver_pending`, `usermode.rs`
 `exit_current_with_code`): a non-main `exit_group` records the code in `GROUP_EXIT_STATUS` (new `GROUP_EXIT_CODE_FLAG`
 bit, so code 0 is distinguishable from "none" and a signal death `-(sig)` stays negative), then
 `request_thread_kill` + `sched::wake` on the leader — resolved through `thread_for_pid`, never `Process::thread_id`. The
@@ -433,7 +433,7 @@ open the session DB was not established — it is the question that decides whet
 
 **Resolved 2026-10-03 (later still): option 1, plus a second bug it exposed.** Full record:
 [`AKUMA_AMD64_SHARED_WRITABLE_PAGES.md`](AKUMA_AMD64_SHARED_WRITABLE_PAGES.md).
-- **Coherence.** A shared writable page table (`crates/akuma-fpcache-rw` + `amd64/src/shmpages.rs`):
+- **Coherence.** A shared writable page table (`crates/akuma-fpcache-rw` + `crates/akuma-kernel-amd64/src/shmpages.rs`):
   every mapper of a file page maps one frame, writable and un-marked, for as long as any maps it.
   `write(2)`/`ftruncate` are copied into or zeroed in mapped frames; exit and `execve` now write
   back (they used to drop writes). `shmcoh` prints `YES`/`YES`, and the new 13-rung `shmwrite.c`

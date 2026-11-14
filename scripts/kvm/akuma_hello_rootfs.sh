@@ -5,7 +5,7 @@
 #   scripts/kvm/akuma_hello_rootfs.sh OUT.img
 #
 # Needs rustc with the x86_64-unknown-none target, and e2fsprogs (mke2fs). The program is
-# built with the same flags as amd64/build.rs's guest programs. See
+# built with the same flags as crates/akuma-kernel-amd64/build.rs's guest programs. See
 # docs/archive/AKUMA_KVM_AKUMA_GUEST.md.
 set -eu
 OUT=${1:?usage: akuma_hello_rootfs.sh OUT.img}

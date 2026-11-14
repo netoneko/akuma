@@ -70,7 +70,7 @@ concrete bugs in a code path nothing on this target had ever run.
 ## What was wired
 
 Six Akuma-private syscall numbers (300-series, dispatched through
-`amd64/src/usermode.rs`'s `AKUMA_PRIVATE_BASE` match — `nr - 0x1000`), all
+`crates/akuma-kernel-amd64/src/usermode.rs`'s `AKUMA_PRIVATE_BASE` match — `nr - 0x1000`), all
 forwarding raw arguments straight to already-implemented, arch-neutral
 `akuma-syscalls-glue` functions:
 
@@ -98,7 +98,7 @@ matters in practice, rather than a silent accept.
 
 Confirmed against `nr.rs`'s own comment, checking rather than assuming: 316-318
 and 325 land in the same Akuma-private block the mount work's own doc
-already covered; `amd64/src/usermode.rs`'s `AKUMA_PRIVATE_BASE` match had no
+already covered; `crates/akuma-kernel-amd64/src/usermode.rs`'s `AKUMA_PRIVATE_BASE` match had no
 arms for any of these six before this session.
 
 ## Bug 1: `run_registered_process` bypassed the `enter_user` hook entirely
@@ -158,7 +158,7 @@ hung (QEMU still alive, ssh session stuck):
   [proc] ring-3 entry with no slot
 ```
 
-`amd64/src/usermode.rs`'s `enter_ring3` — the concrete function registered as
+`crates/akuma-kernel-amd64/src/usermode.rs`'s `enter_ring3` — the concrete function registered as
 `ExecRuntime::enter_user` on this target — reads `current_proc_slot()` from
 the running task's own per-CPU `UserCtx` and refuses to proceed if it is
 unset. That field is seeded by `ExecRuntime::bind_child_task`
@@ -194,7 +194,7 @@ let bound = crate::process::table::with_process(pid, |p| {
 
 Verified this is safe to call from the *child itself* rather than a parent by
 reading amd64's own `bind_child_task` implementation
-(`amd64/src/usermode.rs:4683`): it is keyed purely on `task_slot`/`child.pid`
+(`crates/akuma-kernel-amd64/src/usermode.rs:4683`): it is keyed purely on `task_slot`/`child.pid`
 via global tables (`spawn_table()`, `crate::sched::set_task_space_root`,
 `crate::sched::seed_proc_slot`) and never reads "who is calling" — `kind ==
 ChildKind::Thread` is the only branch that would (`current_proc_slot()`, the
@@ -441,7 +441,7 @@ box run: overlay mount failed: errno 22
 
 Diagnosed by temporarily making every `SYSCALL_DEBUG_INFO_ENABLED`-gated print
 in `container.rs` unconditional (that feature needs `akuma-syscalls`'s
-`debug-info` forwarded too, and neither is wired into `amd64/Cargo.toml`, so
+`debug-info` forwarded too, and neither is wired into `crates/akuma-kernel-amd64/Cargo.toml`, so
 this was faster than plumbing a new feature through for one debug session)
 and rebuilding. The kernel printed:
 
@@ -565,11 +565,11 @@ pull busybox && box run --rm busybox /bin/busybox echo hello`) both now reach
 actual ELF execution and then hit:
 
 ```
-[PANIC] amd64/src/exec_runtime.rs:421
+[PANIC] crates/akuma-kernel-amd64/src/exec_runtime.rs:421
         amd64: ExecRuntime::resolve_file_id was called but is not wired yet
         (no mount table to give an id from). A syscall folded into
         akuma-syscalls-glue has reached a subsystem this target still serves
-        from amd64/src. See amd64/src/exec_runtime.rs.
+        from crates/akuma-kernel-amd64/src. See crates/akuma-kernel-amd64/src/exec_runtime.rs.
 ```
 
 This is **not new** — it is one of the three `not_wired!` stubs the
@@ -595,7 +595,7 @@ further could be tried in that boot anyway.
 
 ## `resolve_file_id`/`read_at_by_inode`: fixed, and the real wall behind it
 
-Wired for real (`amd64/src/exec_runtime.rs`, `bind_child_task`'s neighbours):
+Wired for real (`crates/akuma-kernel-amd64/src/exec_runtime.rs`, `bind_child_task`'s neighbours):
 
 ```rust
 resolve_file_id: |path| bkl_free_io(|| akuma_vfs_glue::resolve_file_id(path).ok_or(-1)),
@@ -612,7 +612,7 @@ stopped being true that day, and nothing had exercised the panic to notice
 until `box run` did). Also corrected the module header's stub count (three →
 one: only `rump_socket_clone_ref` is left, and it never will be wired — rump
 isn't built for this target at all) and a doubly-stale comment in
-`amd64/src/loader.rs` that still called both hooks stubs and used their
+`crates/akuma-kernel-amd64/src/loader.rs` that still called both hooks stubs and used their
 absence to justify this target's eager-only ELF loading strategy — `read_at`
 had already been real since C2 slice 7, before this session touched anything.
 
@@ -653,8 +653,8 @@ Root-caused with certainty by reading, not guessed:
    `LazyRegionMap`, a **different, separate table** from
    `akuma-mmap::MmapRegion`/`Process::regions`, which is what this target's
    *native* mmap (`crate::mm`) and its own `#PF` handler
-   (`amd64/src/idt.rs::page_fault_dispatch` → `crate::mm::fault_in`) actually
-   consult. Confirmed directly: `amd64/src/usermode.rs:3917`
+   (`crates/akuma-kernel-amd64/src/idt.rs::page_fault_dispatch` → `crate::mm::fault_in`) actually
+   consult. Confirmed directly: `crates/akuma-kernel-amd64/src/usermode.rs:3917`
    (`register_exec_process`, the path plain `fork`/`sys_spawn` use) sets
    `lazy_regions: Spinlock::new(LazyRegionMap::new())` — **always empty, by
    documented design** (`// lazy_regions empty — demand paging here comes
@@ -723,7 +723,7 @@ quietly stopping without saying why.
 - **`page_fault_dispatch` needs to serve `akuma-exec`'s `LazyRegionMap`.**
   `resolve_file_id`/`read_at_by_inode` are fixed (see the section above) —
   that was necessary but not sufficient. The actual remaining wall is
-  `amd64/src/idt.rs`'s `page_fault_dispatch` (via `crate::mm::fault_in`)
+  `crates/akuma-kernel-amd64/src/idt.rs`'s `page_fault_dispatch` (via `crate::mm::fault_in`)
   only ever consulting `Process::regions`/`akuma-mmap`, never
   `akuma-exec::Process::lazy_regions` — the table `akuma-elf`'s
   `MapStrategy::Deferred` populates for any `spawn_ext`-loaded binary over

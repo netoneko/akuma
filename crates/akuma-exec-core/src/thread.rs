@@ -3,8 +3,6 @@
 //! These types have no architecture-specific dependencies and can be
 //! compiled and tested on the host.
 
-#![allow(dead_code)]
-
 use alloc::string::String;
 
 /// Compile-time constant for static array sizes, and the ceiling
@@ -72,6 +70,7 @@ pub mod thread_state {
 
 /// User trap frame saved by the EL0 sync/IRQ handler.
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct UserTrapFrame {
     pub x0: u64, pub x1: u64, pub x2: u64, pub x3: u64,
     pub x4: u64, pub x5: u64, pub x6: u64, pub x7: u64,
@@ -159,7 +158,7 @@ impl Context {
 
 /// x86_64's `Context`: one saved stack pointer, nothing else.
 ///
-/// Ported from `amd64/src/sched.rs`'s own `Context` (proven — that file's
+/// Ported from `crates/akuma-kernel-amd64/src/sched.rs`'s own `Context` (proven — that file's
 /// `smoke_test` runs real cooperative+preemptive round-robin scheduling
 /// today). Everything the AArch64 struct carries as named fields — the
 /// callee-saved registers, the return address — lives on the task's own

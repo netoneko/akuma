@@ -23,7 +23,7 @@ The investigation behind every number here is
 ## The one command
 
 ```bash
-scripts/benchmarks/amd64_fc_build_matrix.py --crate akuma-amd64 --clean-all --cells 4x4
+scripts/benchmarks/amd64_fc_build_matrix.py --crate akuma --clean-all --cells 4x4
 ```
 
 `--clean-all` is what makes this the self-host gate rather than a one-crate
@@ -42,7 +42,7 @@ python3 -c "import sys; sys.path.insert(0,'scripts/utils'); import hpbox; print(
 
 # 3. sync your sources into the image (this is what the guest COMPILES) — see below
 # 4. run the gate
-scripts/benchmarks/amd64_fc_build_matrix.py --crate akuma-amd64 --clean-all --cells 4x4
+scripts/benchmarks/amd64_fc_build_matrix.py --crate akuma --clean-all --cells 4x4
 ```
 
 Mid-iteration, with a fix still uncommitted, `hpbox.send_files([...],
@@ -78,7 +78,7 @@ image's vendor directory.
 
 ## How long it takes
 
-Clean 137-crate `cargo build -p akuma-amd64 --target x86_64-unknown-none
+Clean 137-crate `cargo build -p akuma --target x86_64-unknown-none
 --release --offline`, in the guest at `vcpu_count=4`, host-timed, 2026-09-18:
 
 | jobs | wall | vs `-j1` |
@@ -112,12 +112,12 @@ Three levels, cheapest first.
 ```sh
 # 1. the build itself
 #    PASS + rc=0 from the harness, and an ELF where cargo says it put one
-$SSH "ls -la /src/akuma/target/x86_64-unknown-none/release/akuma-amd64"
+$SSH "ls -la /src/akuma/target/x86_64-unknown-none/release/akuma"
 
 # 2. the kernel it produced actually boots — copy it out (no pty! verify md5),
 #    point a Firecracker config at it, and read the boot suite
-$SSH "cat /src/akuma/target/x86_64-unknown-none/release/akuma-amd64" > /root/akuma-selfbuilt-fc
-$SSH "md5sum /src/akuma/target/…/akuma-amd64"; md5sum /root/akuma-selfbuilt-fc   # must match
+$SSH "cat /src/akuma/target/x86_64-unknown-none/release/akuma" > /root/akuma-selfbuilt-fc
+$SSH "md5sum /src/akuma/target/…/akuma"; md5sum /root/akuma-selfbuilt-fc   # must match
 #    then boot it with its own config/log and expect:  NNN passed, 0 failed
 
 # 3. the fixed point — build the kernel again INSIDE the self-built kernel

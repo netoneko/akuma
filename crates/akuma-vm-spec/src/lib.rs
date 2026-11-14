@@ -2,7 +2,7 @@
 //!
 //! One vocabulary for the three parties that must agree on it: **herd** builds a [`Spec`]
 //! from a service config (`vm_kernel = …`), **the kernel** parses the same text off
-//! `/dev/kvm0` (`amd64/src/kvm/ctl.rs`) and runs it, and a future **Firecracker** backend
+//! `/dev/kvm0` (`crates/akuma-kvm-amd64/src/ctl.rs`) and runs it, and a future **Firecracker** backend
 //! reads the same fields from a Firecracker JSON config. The keys are Firecracker's own
 //! words where it has them ([`Spec::set`] accepts `kernel_image_path`, `boot_args`,
 //! `vcpu_count`, `mem_size_mib`, `path_on_host` as aliases), so a config written for one

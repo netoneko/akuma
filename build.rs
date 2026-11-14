@@ -1,116 +1,33 @@
+//! One build script for the one kernel package. The target decides which half runs: the amd64
+//! kernel needs only its linker script, the AArch64 one its cfgs and `--defsym`s.
+
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(kernel_profile_extreme)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_smp_shared)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_network)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_vfs)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_process)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_mm)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_drivers)");
-    println!("cargo::rustc-check-cfg=cfg(kernel_no_bkl_irq)");
     println!("cargo::rustc-check-cfg=cfg(kernel_bkl_profile)");
     println!("cargo::rustc-check-cfg=cfg(kernel_tests)");
     println!("cargo::rustc-check-cfg=cfg(kernel_console_lock)");
     println!("cargo::rustc-check-cfg=cfg(kernel_audio)");
 
-    // Real (shared-kernel) SMP gate: ONE shared kernel — one set of statics, one
-    // page-table set, one PMM/heap, one global run queue — across all cores under
-    // real cross-core locking. All of it lives behind `cfg(kernel_smp_shared)`,
-    // emitted only when the `smp-shared` feature is set (exposed as
-    // CARGO_FEATURE_SMP_SHARED). Paired with the `release-smp-shared` profile. See
-    // docs/reference/subsystems/smp-shared.md. The experimental one-kernel-per-core
-    // multikernel (`smp`/`kernel_smp`) was removed 2026-08-10 —
-    // docs/archive/TRIM_FAT_MULTIKERNEL.md.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SMP_SHARED");
-    let smp_shared = std::env::var("CARGO_FEATURE_SMP_SHARED").is_ok();
-    if smp_shared {
-        println!("cargo:rustc-cfg=kernel_smp_shared");
+    match std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() {
+        Ok("x86_64") => amd64(),
+        Ok("aarch64") => aarch64(),
+        // A host build (`cargo test` at the root never builds this bin, but `cargo check`
+        // for the host may): neither kernel links, so there is nothing to pass.
+        _ => {}
     }
+}
 
-    // BKL-free network path (Phase 2 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md).
-    // `cfg(kernel_no_bkl_network)` makes the smoltcp net syscalls drop the BKL for their
-    // duration; only meaningful under shared-kernel SMP (nothing to drop otherwise). The
-    // gate is emitted independently of `smp_shared` so the net.rs guard can compile-check
-    // in either combination — its body is additionally `cfg(kernel_smp_shared)`-gated so
-    // it stays a no-op without real SMP.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_NETWORK");
-    let no_bkl_network = std::env::var("CARGO_FEATURE_NO_BKL_NETWORK").is_ok();
-    if no_bkl_network {
-        println!("cargo:rustc-cfg=kernel_no_bkl_network");
-    }
+/// Hand the kernel binary its linker script.
+///
+/// `akuma-kernel-amd64` owns `crates/akuma-kernel-amd64/linker.ld` and exports its path as `links` metadata
+/// (`DEP_AKUMA_KERNEL_AMD64_LINKER_SCRIPT`), because a dependency's `rustc-link-arg` never
+/// reaches the binary that depends on it. `rustc-link-arg-bins` scopes it to this package's bin.
+fn amd64() {
+    let script = std::env::var("DEP_AKUMA_KERNEL_AMD64_LINKER_SCRIPT")
+        .expect("akuma-kernel-amd64 exports its linker script");
+    println!("cargo:rustc-link-arg-bins=-T{script}");
+}
 
-    // BKL-free VFS path (Phase 4 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md),
-    // mirroring `kernel_no_bkl_network`. `cfg(kernel_no_bkl_vfs)` makes the fs
-    // syscalls drop the BKL for their duration; only meaningful under shared-kernel
-    // SMP. Emitted independently of `smp_shared` so the VFS guard body (gated on
-    // `all(kernel_smp_shared, kernel_no_bkl_vfs)`) can compile-check in either
-    // combination — its body is additionally `cfg(kernel_smp_shared)`-gated so it
-    // stays a no-op without real SMP, exactly like the net guard.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_VFS");
-    let no_bkl_vfs = std::env::var("CARGO_FEATURE_NO_BKL_VFS").is_ok();
-    if no_bkl_vfs {
-        println!("cargo:rustc-cfg=kernel_no_bkl_vfs");
-    }
-
-    // BKL-free fork page-copy (Phase 3 of docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md),
-    // mirroring `kernel_no_bkl_network` / `kernel_no_bkl_vfs`. `cfg(kernel_no_bkl_process)`
-    // makes `fork_process` drop the BKL for its CoW share/demote pass, relying on the
-    // address space's own `as_lock` (the same lock the CoW fault handler already takes
-    // BKL-free) plus `COW_REFCOUNTS`. Only meaningful under shared-kernel SMP, and
-    // included in the `smp-shared` feature set since 2026-07-31 (same as net and vfs).
-    // Emitted independently of `smp_shared` so the guard body (gated on
-    // `all(kernel_smp_shared, kernel_no_bkl_process)`) can compile-check in either
-    // combination.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_PROCESS");
-    if std::env::var("CARGO_FEATURE_NO_BKL_PROCESS").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_process");
-    }
-
-    // BKL-free memory-management syscalls (Phase 5 of
-    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), mirroring `kernel_no_bkl_vfs`.
-    // `cfg(kernel_no_bkl_mm)` makes `sys_mprotect`/`sys_madvise`/`sys_munmap`/
-    // `sys_mremap`/`sys_mmap` drop the BKL for their duration, relying on
-    // `Process::as_lock` (page tables), `Process::vm_lock` (mmap_regions AND the
-    // mmap free-list — extended to cover the latter as part of this carve, see
-    // `Process::vm_alloc_mmap`/`vm_free_mmap`), `LAZY_REGION_TABLE`, PMM/
-    // FRAME_TRACKER, and `SHARED_FILE_MAPPINGS` — all already independent of the
-    // BKL. Only meaningful under shared-kernel SMP. Emitted independently of
-    // `smp_shared` so the guard body (gated on `all(kernel_smp_shared,
-    // kernel_no_bkl_mm)`) can compile-check in either combination.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_MM");
-    if std::env::var("CARGO_FEATURE_NO_BKL_MM").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_mm");
-    }
-
-    // BKL-free device-driver syscalls (Phase 6 of
-    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md), mirroring `kernel_no_bkl_mm`.
-    // `cfg(kernel_no_bkl_drivers)` makes the device-driver syscall paths
-    // (`sys_getrandom`, `sys_read`/`sys_pread64` on `/dev/urandom`, and
-    // `sys_write` on `/dev/dsp`) drop the BKL for their duration, relying on each
-    // driver's own fine-grained Spinlock — `RNG_DEVICE`, `SOUND_DEVICE` — for
-    // cross-core mutual exclusion instead. Only
-    // meaningful under shared-kernel SMP. Emitted independently of `smp_shared` so
-    // the guard body (gated on `all(kernel_smp_shared, kernel_no_bkl_drivers)`)
-    // can compile-check in either combination. The block device (`BLOCK_DEVICE`)
-    // and network device (`NETWORK`) are already BKL-free via `no-bkl-vfs` and
-    // `no-bkl-network` respectively; this phase covers the remaining drivers.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_DRIVERS");
-    if std::env::var("CARGO_FEATURE_NO_BKL_DRIVERS").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_drivers");
-    }
-
-    // BKL-free timer-IRQ dispatch (Phase 7a of
-    // docs/archive/BKL_FINE_GRAINED_LOCKING_PLAN.md §7, docs/archive/BKL_PHASE7_AUDIT.md
-    // §2.3/§5). `cfg(kernel_no_bkl_irq)` makes `rust_irq_handler_with_sp` dispatch the
-    // timer IRQ (27, the only device IRQ registered) without ever calling
-    // `enter_kernel`/`reconcile_for_spsr` — the handler's state (the alarm queue's own
-    // Spinlock, per-thread preemption-watchdog atomics, raw GIC MMIO) no longer needs the
-    // BKL. Only meaningful under shared-kernel SMP. Emitted independently of `smp_shared`
-    // so the guard body (gated on `all(kernel_smp_shared, kernel_no_bkl_irq)`) can
-    // compile-check in either combination, exactly like the other `no-bkl-*` gates.
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_BKL_IRQ");
-    if std::env::var("CARGO_FEATURE_NO_BKL_IRQ").is_ok() {
-        println!("cargo:rustc-cfg=kernel_no_bkl_irq");
-    }
+fn aarch64() {
 
     // BKL-hold attribution build. Turns on the per-tag profiler in
     // `akuma_exec::sync` for the whole boot and has the async-main loop dump a
@@ -129,10 +46,7 @@ fn main() {
     // Verified safe under `SMP=4` + `cargo build -j4` self-host load on
     // 2026-08-11 (see docs/archive/UART_SMP_INTERLEAVE_FIX.md).
     //
-    // Default ON for the `release` profile (anything with OPT_LEVEL != "z").
-    // The size/extreme profiles are single-core targets where the lock is pure
-    // overhead, so they stay off unless `CONSOLE_LOCK=1` forces it on for an
-    // opt-in test. `CONSOLE_LOCK=0` is an explicit opt-out for `release`.
+    // Default ON; `CONSOLE_LOCK=0` is an explicit opt-out.
     //
     // `platform-firecracker` used to be excluded here, and that exclusion was a
     // correctness matter rather than an optimization: the lock is acquired inside
@@ -152,18 +66,10 @@ fn main() {
     // Single-vCPU keeps the deadlock-free behaviour, multi-vCPU gets serialized
     // output, and neither depends on a build-time guess about `vcpu_count`.
     //
-    // Still off for the size/extreme profiles: those are single-core targets where
-    // even the compiled-in atomic load is pure overhead. `CONSOLE_LOCK=1` forces it
-    // on there, `CONSOLE_LOCK=0` opts out of `release`. Background on why the lock
-    // exists at all: docs/archive/UART_SMP_INTERLEAVE_FIX.md.
+    // Background on why the lock exists at all:
+    // docs/archive/UART_SMP_INTERLEAVE_FIX.md.
     println!("cargo:rerun-if-env-changed=CONSOLE_LOCK");
-    let size_opt_for_console = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
-    let console_lock_default_on = !size_opt_for_console;
-    let console_lock = match std::env::var("CONSOLE_LOCK").as_deref() {
-        Ok("0") => false,                       // explicit opt-out
-        Ok("1") => true,                        // explicit opt-in (size/extreme)
-        _      => console_lock_default_on,      // release default-on
-    };
+    let console_lock = std::env::var("CONSOLE_LOCK").as_deref() != Ok("0");
     if console_lock {
         println!("cargo:rustc-cfg=kernel_console_lock");
     }
@@ -207,27 +113,13 @@ fn main() {
         println!("cargo:rustc-cfg=kernel_audio");
     }
 
-    // Boot self-test suite present. Mirrors the `not(any(feature = "no-tests",
-    // kernel_profile_extreme))` condition main.rs used to repeat a dozen times, so
-    // kernel APIs whose only other caller was the in-kernel shell can say "keep me
-    // where either the shell or the tests need me" in one cfg.
-    let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err()
-        && std::env::var("OPT_LEVEL").as_deref() != Ok("z");
+    // Boot self-test suite present unless `no-tests`.
+    let kernel_tests = std::env::var("CARGO_FEATURE_NO_TESTS").is_err();
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_NO_TESTS");
     if kernel_tests {
         println!("cargo:rustc-cfg=kernel_tests");
     }
 
-    // OPT_LEVEL is "z" only for profile.extreme-size (the one size-optimised
-    // profile). PROFILE is always "release" for inherited profiles, so we
-    // cannot use that.
-    let size_opt = std::env::var("OPT_LEVEL").as_deref() == Ok("z");
-
-    // `extreme-size` and `size` are indistinguishable via OPT_LEVEL (both "z"), so
-    // the `extreme` Cargo feature (set only by build_extreme_size.sh) is the
-    // discriminator. Cargo exposes it to build scripts as CARGO_FEATURE_EXTREME.
-    let extreme_profile = size_opt && std::env::var("CARGO_FEATURE_EXTREME").is_ok();
-    println!("cargo:rerun-if-env-changed=CARGO_FEATURE_EXTREME");
     // linker.ld now derives the boot-stack reservation (STACK_BOTTOM / STACK_TOP /
     // IMAGE_RESERVE) from the actual linked image size, so there is no longer a
     // per-profile IMAGE_SIZE here nor a --defsym=STACK_BOTTOM to inject. Still
@@ -235,21 +127,12 @@ fn main() {
     // cache hit.
     println!("cargo:rerun-if-changed=linker.ld");
 
-    if extreme_profile {
-        println!("cargo:rustc-cfg=kernel_profile_extreme");
-    }
-
     // Boot-stack size, injected into linker.ld as the BOOT_STACK_SIZE symbol.
     // ALWAYS passed (linker.ld has no PROVIDE default — a PROVIDE would override
-    // the defsym under LLD, the historical STACK_BOTTOM no-op bug).
-    //   release/size: 1 MB — the boot test suite runs deep on thread 0.
-    //   extreme:      32 KB — no test suite (no-tests); thread 0's measured stack
-    //                 high-water is ~10 KB (docs/EXTREME_STACK_TRIMMING.md), and
-    //                 its exception stack is a separate PMM allocation. Reclaims
-    //                 ~992 KB to the user-page pool (≈17% of RAM at the 4.5 MB
-    //                 floor). config::KERNEL_STACK_SIZE is NOT used for the boot
-    //                 stack bounds (main.rs derives them from STACK_TOP/BOTTOM).
-    let boot_stack_size: usize = if extreme_profile { 32 * 1024 } else { 1024 * 1024 };
+    // the defsym under LLD, the historical STACK_BOTTOM no-op bug). 1 MB: the boot
+    // test suite runs deep on thread 0. config::KERNEL_STACK_SIZE is NOT used for
+    // the boot stack bounds (main.rs derives them from STACK_TOP/BOTTOM).
+    let boot_stack_size: usize = 1024 * 1024;
     println!("cargo:rustc-link-arg=--defsym=BOOT_STACK_SIZE={boot_stack_size}");
     // The build identity (`AKUMA_GIT_SHA`, `AKUMA_BUILD_PROFILE`) moved to
     // `crates/akuma-syscalls-glue/build.rs` on 2026-09-01, with `src/syscall/`.

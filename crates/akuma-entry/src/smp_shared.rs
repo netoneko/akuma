@@ -30,9 +30,8 @@
 //! cross-core locks. A `static` in this build is genuinely shared across cores — not
 //! replicated — which is the whole point.
 //!
-//! Everything here is behind `cfg(kernel_smp_shared)` (the `smp-shared` feature);
-//! the default and multikernel (`smp`) builds compile none of it, and build.rs makes
-//! `smp` and `smp-shared` mutually exclusive.
+//! Every Akuma kernel build compiles this (the `smp-shared` feature that gated it,
+//! and the single-core build without it, were removed 2026-11-11).
 //!
 //! **Milestone M0 (this file):** bring N cores up on the shared boot page tables and
 //! the single shared PMM/heap — no isolation, no partitions. Each secondary sets up
@@ -52,16 +51,11 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering
 // The syscall number table (crate 1). The BKL opt-out seed below names its
 // entries rather than spelling their numbers — see the note above the seed.
 
-/// Maximum cores we bring up. Comfortably under the `aff0 < 16` single-cluster limit
-/// on QEMU `virt`.
-const MAX_CORES: usize = 8;
+/// Maximum cores we bring up: the trampoline's (`akuma_boot_aarch64::secondary`).
+const MAX_CORES: usize = akuma_boot_aarch64::secondary::MAX_CORES;
 
-/// Per-core boot/idle stack size shift (64 KiB). This stack backs the secondary's
-/// idle thread, so it must hold the full IRQ excursion — the 832-byte trap frame plus
-/// the shared `timer_irq_handler` (kernel-timer alarm processing, preemption watchdog,
-/// logging) and the scheduler — which is far deeper than M0's WFE park. 16 KiB
-/// overflowed here (fault-in-fault while holding the BKL); 64 KiB is ample.
-const STACK_SHIFT: usize = 16;
+/// Per-core boot/idle stack size shift: the trampoline's.
+const STACK_SHIFT: usize = akuma_boot_aarch64::secondary::STACK_SHIFT;
 
 // PSCI (matches crate::smp — QEMU `virt` exposes PSCI over the DTB-declared conduit).
 // SYSTEM_OFF/SYSTEM_RESET function IDs live in akuma_boot alongside the rest of
@@ -92,6 +86,28 @@ static ONLINE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// The runtime image brings secondaries up after the gate would be open, so the
 /// wait there is a single load.
 static BSP_IRQ_READY: AtomicBool = AtomicBool::new(false);
+
+/// The hooked scheduler's half of a secondary's start (`hooked-sched`, M6).
+///
+/// Which slot becomes the core's idle thread and what that thread runs. The kernel's glue
+/// owns both (its idle loop and its record of which slots are idle), and this crate sits
+/// below it, so it registers them here before [`bringup_secondaries`].
+#[derive(Clone, Copy)]
+pub struct HookedSecondary {
+    /// Make the running context core `core`'s idle thread on its boot stack (`base`,
+    /// `size` bytes), returning the slot; `None` parks the core. Interrupts are masked.
+    pub adopt: fn(core: usize, base: akuma_primitives::addr::VirtAddr, size: usize) -> Option<usize>,
+    /// The core's idle loop: entered with interrupts open and the lock not held.
+    pub idle: fn() -> !,
+}
+
+static HOOKED_SECONDARY: akuma_not_even_once::Registered<HookedSecondary> =
+    akuma_not_even_once::Registered::new("akuma-entry: HookedSecondary not registered");
+
+/// Register [`HookedSecondary`]. Once, before [`bringup_secondaries`].
+pub fn register_hooked_secondary(h: HookedSecondary) {
+    HOOKED_SECONDARY.register(h);
+}
 
 /// Let the secondaries start taking interrupts. Called by `kernel_main` once the
 /// exception hooks are registered, the BSP's vectors are installed and the timer
@@ -126,17 +142,16 @@ pub use akuma_bkl::policy::{
     drivers_bkl_drop_enabled, exec_bkl_drop_enabled, mm_bkl_drop_enabled,
     vfs_bkl_drop_enabled,
 };
-// The A/B setters, and the three getters whose last production reader was the
+// The A/B setters, and the getter whose last production reader was the
 // exception path (which reads `akuma_bkl::policy::` directly since 2026-09-01),
 // are now touched only by the boot self-tests — `process_tests.rs`, which
-// `no-tests` builds (`devbox-smoltcp`, extreme-size) compile out while denying
+// `no-tests` builds (`devbox-smoltcp`, the rump devbox) compile out while denying
 // unused imports. Same shape as `pmm.rs`'s tests-only re-exports.
 #[allow(unused_imports)]
 pub use akuma_bkl::policy::{
-    irq_bkl_drop_enabled, sched_bklfree_el0_enabled, set_drivers_bkl_drop_enabled,
-    set_exec_bkl_drop_enabled, set_fault_bkl_drop_enabled, set_irq_bkl_drop_enabled,
-    set_mm_bkl_drop_enabled, set_sched_bklfree_el0_enabled, set_syscall_bkl_optout,
-    set_vfs_bkl_drop_enabled, syscall_bkl_optout,
+    set_drivers_bkl_drop_enabled, set_exec_bkl_drop_enabled, set_fault_bkl_drop_enabled,
+    set_mm_bkl_drop_enabled, set_syscall_bkl_optout, set_vfs_bkl_drop_enabled,
+    syscall_bkl_optout,
 };
 
 /// Runtime toggle (default **on**) for `no-bkl-process`.
@@ -214,17 +229,6 @@ pub fn wake_core(core_id: u8) {
     akuma_gic::trigger_sgi_core(u32::from(core_id), akuma_gic::SGI_SCHEDULER);
 }
 
-unsafe extern "C" {
-    /// The secondary trampoline (asm, `.text.boot`, defined below). Taking its
-    /// address gives the identity-mapped PA to hand PSCI `CPU_ON` as the entry point.
-    fn secondary_entry_shared();
-
-    /// The per-core boot/idle stacks (`.bss.smp_shared`, defined in the same
-    /// `global_asm!` block below). Declared with its true type so the size the
-    /// trampoline's `add x0, x0, x20, lsl #STACK_SHIFT` walks is stated to the
-    /// compiler rather than only to the reader; see [`secondary_stack_base`].
-    static secondary_boot_stacks_shared: [u8; MAX_CORES << STACK_SHIFT];
-}
 
 #[inline]
 fn read_mpidr() -> u64 {
@@ -298,7 +302,7 @@ pub fn bringup_secondaries() {
     // See `console::set_multicore`.
     akuma_kernel_core::console::set_multicore();
 
-    let entry_pa = secondary_entry_shared as *const () as u64;
+    let entry_pa = akuma_boot_aarch64::secondary::entry_pa();
     // Publish everything the secondaries read (this module's statics, their stacks)
     // before any of them starts executing.
     dsb_sy();
@@ -338,13 +342,11 @@ pub fn bringup_secondaries() {
 ///
 /// Consumed by the boot self-test in `process_tests.rs` (compiled out under `no-tests`,
 /// e.g. the devbox-smoltcp runtime image — hence `allow(dead_code)`).
-#[allow(dead_code)]
 pub fn online_secondary_count() -> usize {
     ONLINE_COUNT.load(Ordering::Acquire)
 }
 
 /// Number of cores the DTB reported (including the BSP). See `online_secondary_count`.
-#[allow(dead_code)]
 pub fn probed_core_count() -> usize {
     NUM_CORES.load(Ordering::Relaxed)
 }
@@ -368,7 +370,6 @@ fn dsb_sy() {
 /// `gic_v3::init`'s CPU-interface sequence — was **three `unsafe` blocks that
 /// already existed elsewhere**, so consolidating removed them rather than
 /// relocating them (`docs/archive/AKUMA_GIC_CONSOLIDATION.md`).
-#[cfg(kernel_smp_shared)]
 fn redistributor_layout() -> akuma_gic::RedistributorLayout {
     akuma_gic::RedistributorLayout {
         base_pa: akuma_kernel_core::platform::gicr_base_pa(),
@@ -387,19 +388,9 @@ fn redistributor_layout() -> akuma_gic::RedistributorLayout {
 /// version could only state in a comment.
 #[must_use]
 pub fn secondary_stack_base(core: usize) -> usize {
-    (&raw const secondary_boot_stacks_shared) as usize + (core << STACK_SHIFT)
+    akuma_boot_aarch64::secondary::stack_base(core)
 }
 
-/// Set `VBAR_EL1` to the shared exception vector table (the BSP's) so this core takes
-/// syscalls/IRQs/faults through the same handlers.
-///
-/// This had its own `adrp`/`add`/`msr` sequence until 2026-09-01. It is the same
-/// install `exceptions::init` does on the BSP — and "the same" is the whole
-/// point of shared-kernel SMP — so it now calls the one implementation instead
-/// of carrying a second copy that could drift from it.
-fn set_shared_vbar() {
-    akuma_exceptions::install_vbar();
-}
 
 /// Per-core counter of scheduler ticks each core has serviced a worker on — the M2c
 /// proof that threads execute across cores. Genuinely shared (not replicated).
@@ -599,8 +590,12 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
 
     // Adopt the current (boot) context as this core's idle thread so the shared
     // scheduler can switch away from it and back. Sets TPIDRRO_EL0.
-    let idle =
-        akuma_exec::threading::adopt_current_as_core_idle(core, exc_top, stack_base, stack_size);
+    // The hooked path's adoption is the kernel's (it owns which slots are idle); the
+    // exception stack is the SGI path's and has no counterpart there.
+    let _ = exc_top;
+    let idle = HOOKED_SECONDARY
+        .get()
+        .and_then(|h| (h.adopt)(core, akuma_primitives::addr::VirtAddr::new(stack_base), stack_size));
 
     ONLINE_COUNT.fetch_add(1, Ordering::AcqRel);
     let Some(slot) = idle else {
@@ -620,7 +615,7 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
 
     // Bring up this PE's interrupt receive path, install shared vectors, arm the tick.
     akuma_gic::secondary_init(core, redistributor_layout());
-    set_shared_vbar();
+    crate::hooked::install_on_this_core();
     // Arm this core's periodic tick from the shared choice (BSP's probe /
     // override result, published via akuma-timer's registry).
     akuma_kernel_core::timer::enable_timer_interrupts(akuma_kernel_core::timer::current_tick_us());
@@ -630,6 +625,12 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
     // interrupts, so a tick already pending must be taken before the idle loop is
     // entered rather than at some later synchronization point.
     akuma_primitives::irq::unmask_irqs_sync();
+
+    // The hooked path's idle loop is the kernel's: it yields to whatever is runnable,
+    // since nothing preempts a kernel thread there, and halts without the lock.
+    if let Some(h) = HOOKED_SECONDARY.get() {
+        (h.idle)();
+    }
 
     // Idle loop. Two requirements pull against each other: (1) don't hammer the BKL
     // when there's nothing to run (a `yield_now()` every iteration livelocks SMP=4 as
@@ -665,109 +666,3 @@ pub extern "C" fn secondary_shared_start(_context_id: u64, core_idx: u64) -> ! {
         akuma_exec::process::reclaim::drain_retired_if_requested();
     }
 }
-
-// Secondary trampoline. Mirrors boot.rs's MMU setup, but loads the SHARED boot
-// TTBR0/TTBR1 (never a restricted per-core table) and tail-calls
-// `secondary_shared_start`. Lives in `.text.boot` so it is identity-reachable with
-// the MMU still off at entry. `boot_ttbr0_addr`/`boot_ttbr1_addr` are the BSP's
-// boot-table roots, published MMU-off into `.data.boot` by boot.rs.
-core::arch::global_asm!(
-    r#"
-.section .text.boot
-.global secondary_entry_shared
-secondary_entry_shared:
-    mov     x19, x0                 // x19 = context_id (a3 from PSCI CPU_ON; unused M0)
-
-    // 0. Zero TPIDRRO_EL0 before anything can call `current_tid()`.
-    //
-    // Same reason as the BSP path in `boot.rs`: the register's reset value is
-    // architecturally UNKNOWN, and KVM stamps UNKNOWN-reset registers with
-    // 0x1de7ec7edbadc0de, which `current_tid()` treats as fatal. Each PSCI-woken
-    // secondary gets its own freshly-reset register, so zeroing it on the BSP is
-    // not enough.
-    msr     tpidrro_el0, xzr
-
-    // 1. Enable FPU/SIMD (FPEN = 0b11).
-    mov     x0, #(3 << 20)
-    msr     cpacr_el1, x0
-    isb
-
-    // 2. core idx = MPIDR aff0; bail to park if it exceeds MAX_CORES.
-    mrs     x20, mpidr_el1
-    and     x20, x20, #0xff
-    cmp     x20, #{max_cores}
-    b.ge    .Lsh_park
-    // SP = &secondary_boot_stacks_shared[idx] + STACK_SIZE (top of this core's stack)
-    adrp    x0, secondary_boot_stacks_shared
-    add     x0, x0, :lo12:secondary_boot_stacks_shared
-    add     x0, x0, x20, lsl #{stack_shift}
-    mov     x1, #1
-    add     x0, x0, x1, lsl #{stack_shift}
-    mov     sp, x0
-
-    // 3. MMU registers (mirror boot.rs configure_mmu_regs).
-    // CNTKCTL_EL1.EL0VCTEN — EL0 reads CNTVCT/CNTFRQ directly (see boot.rs).
-    mov     x0, #0x2
-    msr     cntkctl_el1, x0
-    // MAIR_EL1 = 0xFFBB4400
-    mov     x0, #0x4400
-    movk    x0, #0xFFBB, lsl #16
-    msr     mair_el1, x0
-    // TCR_EL1 = 0x0000_0005_B510_3510
-    mov     x0, #0x3510
-    movk    x0, #0xB510, lsl #16
-    movk    x0, #0x5, lsl #32
-    msr     tcr_el1, x0
-    // TTBR0_EL1 <- *boot_ttbr0_addr (the BSP's SHARED boot table; read MMU-off)
-    adrp    x0, boot_ttbr0_addr
-    add     x0, x0, :lo12:boot_ttbr0_addr
-    ldr     x0, [x0]
-    msr     ttbr0_el1, x0
-    // TTBR1_EL1 <- *boot_ttbr1_addr
-    adrp    x0, boot_ttbr1_addr
-    add     x0, x0, :lo12:boot_ttbr1_addr
-    ldr     x0, [x0]
-    msr     ttbr1_el1, x0
-    tlbi    vmalle1
-    dsb     sy
-    isb
-    // Enable MMU + caches (same SCTLR bits as boot.rs _boot_code).
-    //
-    // Including the two `bic`s: each PSCI-woken core gets its own SCTLR_EL1 with
-    // its own reset value, and KVM's has SA/SA0 set while QEMU's does not. Clearing
-    // them on the BSP alone would leave every secondary enforcing EL0 SP-alignment
-    // checks that this kernel's userspace has never satisfied. See boot.rs.
-    mrs     x0, sctlr_el1
-    orr     x0, x0, #1              // M  = MMU enable
-    orr     x0, x0, #(1 << 2)      // C  = data cache
-    orr     x0, x0, #(1 << 12)     // I  = instruction cache
-    orr     x0, x0, #(1 << 14)     // DZE
-    orr     x0, x0, #(1 << 15)     // UCT
-    orr     x0, x0, #(1 << 26)     // UCI
-    bic     x0, x0, #(1 << 3)      // SA  = 0: no SP alignment check at EL1
-    bic     x0, x0, #(1 << 4)      // SA0 = 0: no SP alignment check at EL0
-    msr     sctlr_el1, x0
-    isb
-
-    // 4. secondary_shared_start(context_id, core_idx)
-    mov     x0, x19
-    mov     x1, x20
-    bl      secondary_shared_start
-
-.Lsh_park:
-    wfe
-    b       .Lsh_park
-
-.section .bss.smp_shared
-.balign 16
-// `.global` because `secondary_stack_base` is pub and gets inlined into callers in
-// other codegen units (the boot self-test). Without it the symbol is local to this
-// global_asm! block and any out-of-CGU `adrp` reference fails to link.
-.global secondary_boot_stacks_shared
-secondary_boot_stacks_shared:
-    .space  {stacks_bytes}
-"#,
-    max_cores = const MAX_CORES,
-    stack_shift = const STACK_SHIFT,
-    stacks_bytes = const (MAX_CORES << STACK_SHIFT),
-);

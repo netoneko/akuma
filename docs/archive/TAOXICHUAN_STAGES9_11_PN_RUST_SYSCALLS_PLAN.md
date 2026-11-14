@@ -8,9 +8,9 @@ every needed syscall/behaviour into one route — **A** already a family crate u
 `crates/akuma-syscalls-*` (call the pure decision, keep effects local), **B** in
 `akuma-syscalls-glue`/`src/syscall/` but not yet a family crate (extract pure part to a
 new `akuma-syscalls-<family>` crate with host tests; effects stay with each caller),
-**C** only in `amd64/src/` (extract into a crate first, then pull), **D** nowhere (write
+**C** only in `crates/akuma-kernel-amd64/src/` (extract into a crate first, then pull), **D** nowhere (write
 new, in a crate, with the reason no existing crate fits). The standing rule holds: pull
-from a crate; extract from `amd64/src/` only what lives only there; write new only when
+from a crate; extract from `crates/akuma-kernel-amd64/src/` only what lives only there; write new only when
 it exists nowhere. Planning only — no kernel code, no boots. Branch
 `rust-org-il-experiment`, push `litter` only.
 
@@ -26,12 +26,12 @@ already a crate call), the `akuma-syscalls-sync` futex family, thread groups and
 `MAP_SHARED` + `msync` writeback (glue `mem.rs`) — is **AFTER-PM**, because every one of
 those glue/futex/thread arms looks processes up by pid/tid and parks through the
 threading slots. The repo has already done the extractions the ladder needs: the futex
-decision is host-tested in `akuma-syscalls-sync` (amd64/src/futex.rs is effects only),
+decision is host-tested in `akuma-syscalls-sync` (crates/akuma-kernel-amd64/src/futex.rs is effects only),
 the memory decisions in `akuma-syscalls-mem` + `akuma-mmap`, the wire shapes in
 `akuma-syscalls-linux`. New code is needed only for: the x86_64 signal frame
-(amd64/src/signal.rs — extract, route C), `sched_getaffinity` (amd64-only, route C),
+(crates/akuma-kernel-amd64/src/signal.rs — extract, route C), `sched_getaffinity` (amd64-only, route C),
 `getpriority`/`setpriority`/`getrusage`/`rseq` (nowhere, route D), the legacy x86_64
-`AT_FDCWD` fold table (amd64/src/usermode.rs:1503-1530 — extract to
+`AT_FDCWD` fold table (crates/akuma-kernel-amd64/src/usermode.rs:1503-1530 — extract to
 `akuma-syscalls-abi`, route C), an ext2 `linkat` arm (cargo hardlinks artifacts), and
 Taoxichuan-side effects (dirty-PTE writeback walk; park/wake for futex waits).
 
@@ -60,12 +60,12 @@ half fits: S1–S4 is the thesis — `rustc --version` and a running `hello` —
 | P8 | `rust-toolchain.md`'s two lists are an inventory scored against the old table; it omits the startup census (threads!) and its headline needs correcting | HOLDS | read this session (98 lines) |
 | P9 | pm's real fork (`akuma_exec::process::fork_process`, mod.rs:3194) has landed with parked wait4; init is still the boot task (fork from init EPERM); pm S1–S3 pending | HOLDS | processes.md; switch-to-crates.md "the slices are not yet executed" |
 | P10 | The syscall-family crates exist and are host-tested: `-abi` (numbers), `-linux` (wire), `-sync` (futex decode/key/table/deadline/WAKE_OP/waitloop), `-mem` (mmap/mremap/madvise/membarrier plan+decode), `-poll`, `-time`, `-eventfd`, `-ipc` | HOLDS | `ls crates/akuma-syscalls-*`; CLAUDE.md:89–116; AKUMA_EXTRACT_MMAP.md §10 |
-| P11 | The futex *decisions* live in `akuma-syscalls-sync`; `amd64/src/futex.rs` (502 L) is effects only — user-word reads, the park, the wake | HOLDS | futex.rs:8–11 module header; sync/src/{op,key,deadline,wakeop,waitloop,table}.rs |
+| P11 | The futex *decisions* live in `akuma-syscalls-sync`; `crates/akuma-kernel-amd64/src/futex.rs` (502 L) is effects only — user-word reads, the park, the wake | HOLDS | futex.rs:8–11 module header; sync/src/{op,key,deadline,wakeop,waitloop,table}.rs |
 | P12 | The glue is comprehensive (`fs,mem,signal,sync,proc,net,unixsock,poll,eventfd,…`) and every arm looks the process up (`owner_pid`, `akuma_exec::threading::…`) — glue rows are AFTER-PM | HOLDS | glue/src file list; mem.rs sys_mprotect:1359; signal.rs sys_sigaltstack:208 (uses `akuma_exec::threading::get/set_sigaltstack`) |
 | P13 | Writable `MAP_SHARED` file mappings + writeback already exist as glue decisions: `writeback_shared_pages` (mem.rs:210), the page-table dirty walk `writeback_present_pages` (:251), `sys_msync` (:323); `MmapRegion`+`FileBacking` live in `akuma-mmap/src/region.rs:203` and `akuma-exec` process state | HOLDS | read this session |
 | P14 | The spawn handshake exists in glue: `sys_socketpair` (lib.rs:775) + `unixsock.rs` with SCM_RIGHTS (`scm_take/install/release` :339–383) | HOLDS | read this session |
-| P15 | Threads are a crate call: `akuma_exec::process::clone_thread(stack, tls, parent_tid_ptr, child_tid_ptr, flags)` (mod.rs:3546); amd64's wiring example is `amd64/src/thread.rs:296 sys_clone_thread`; the clear_child_tid futex wake at thread exit is thread.rs:469 | HOLDS | read this session |
-| P16 | The legacy x86_64 → `*at` fold lives only in amd64/src/usermode.rs:1503–1530 (`to_glue(Syscall::Mkdirat, [AT_FDCWD,…])`), guarded by the X86_ONLY disjointness smoke test (:7506–7530, the `ln -s`→utimensat bug) | HOLDS | read this session |
+| P15 | Threads are a crate call: `akuma_exec::process::clone_thread(stack, tls, parent_tid_ptr, child_tid_ptr, flags)` (mod.rs:3546); amd64's wiring example is `crates/akuma-kernel-amd64/src/thread.rs:296 sys_clone_thread`; the clear_child_tid futex wake at thread exit is thread.rs:469 | HOLDS | read this session |
+| P16 | The legacy x86_64 → `*at` fold lives only in crates/akuma-kernel-amd64/src/usermode.rs:1503–1530 (`to_glue(Syscall::Mkdirat, [AT_FDCWD,…])`), guarded by the X86_ONLY disjointness smoke test (:7506–7530, the `ln -s`→utimensat bug) | HOLDS | read this session |
 | P17 | `sched_getaffinity` is amd64-only (usermode.rs:2745); `set_robust_list` is glue proc.rs:313; `prlimit64` is glue proc.rs:1400; `getpriority`/`setpriority`/`getrusage`/`rseq` exist nowhere | HOLDS | grep this session |
 | P18 | `rustc` needs ≥2 GB RAM for `hello.rs` (archive); amd64 got demand-paged file mappings + `akuma-fpcache` shared frames to stop the 311 MB eager mmap (RUST_TOOLCHAIN_AMD64.md session 5) | HOLDS | AKUMA_SELF_HOSTING.md:125,206; RUST_TOOLCHAIN_AMD64.md:604–640 |
 | P19 | cargo's number batch (x86_64): 18 `pwrite64`, 328 `pwritev2`, 74/75 `fsync`/`fdatasync`, 265 `linkat`, 204 `sched_getaffinity` (rustc sizes its codegen pool from it), 157 `prctl`, 95 `umask`, 324 `membarrier` | HOLDS | RUST_TOOLCHAIN_AMD64.md:480–560 |
@@ -120,7 +120,7 @@ calls (rough; a call ≈ one tool round-trip incl. build/boot loops).
 | `mprotect` real (incl. PROT_EXEC) | rustc start (5 calls), tcc -run, JIT guards | glue mem.rs `sys_mprotect`:1359 (decision); amd64 mm.rs effects | accepted no-op | local effects arm: flip PTE bits in the task's own root via `akuma-boot-amd64` paging types (already imported, main.rs:103) → **B** (decision already in glue; extract the pure prot/region-split part to `akuma-syscalls-mem` only if glue's is entangled with `owner_pid` — read at extraction time) | no (local arm; fold to glue at pm S6) | 8 |
 | `sigaltstack` | rustc start (musl pthread prep) | glue signal.rs:208 (decode) + `akuma_exec::threading::get/set_sigaltstack` (state) | ENOSYS | **A/B**: call glue's decode with the slot's stored triple; the state setter already takes a slot number taoxichuan has | no (slot exists; pid lookup at S6) | 3 |
 | `membarrier` | rustc start (1 call; cargo batch 324) | `akuma-syscalls-mem::membarrier` (decode, `SUPPORTED=0x18`) | ENOSYS | **A**: decode from the crate; effect is `mfence`+`sfence` on amd64 (the crate's Barrier effect is aarch64 asm, deliberately kernel-side) | no | 2 |
-| `readlink` legacy (89) + the legacy fs set 82/83/84/87/88/90/92/94 (git clone) | rustc start (89), ldso/git | amd64/src/usermode.rs:1503–1530 fold table only | ENOSYS | **C**: extract the fold into `akuma-syscalls-abi` (new `legacy` module: `(x86_64 nr) -> (Syscall, folded AT_FDCWD args)`, `forbid(unsafe_code)`), host test pins the `ln -s`(88)≠utimensat bug and the X86_ONLY disjointness; taoxichuan dispatcher folds into its existing local `*at` arms | no | 6 |
+| `readlink` legacy (89) + the legacy fs set 82/83/84/87/88/90/92/94 (git clone) | rustc start (89), ldso/git | crates/akuma-kernel-amd64/src/usermode.rs:1503–1530 fold table only | ENOSYS | **C**: extract the fold into `akuma-syscalls-abi` (new `legacy` module: `(x86_64 nr) -> (Syscall, folded AT_FDCWD args)`, `forbid(unsafe_code)`), host test pins the `ln -s`(88)≠utimensat bug and the X86_ONLY disjointness; taoxichuan dispatcher folds into its existing local `*at` arms | no | 6 |
 | `madvise` | rustc (thread-stack hints) | `akuma-syscalls-mem::madvise` (decode; the `dontneed_zero_range` divergence is documented, unpinned) | no arm (ENOSYS) | **A**: decode from the crate; effect = no-op for most advice, zero-range for DONTNEED if the slab walks regions | no | 3 |
 | `ioctl` ENOTTY, probing ENOENTs | rustc start | local arm | ENOTTY (correct for a serial console) | none — benign, recorded | no | 0 |
 | long argv/env + `E2BIG` | every spawn (build scripts pass ~5 KB args) | amd64 fixed defect 1 (argv capped 16, silently — RUST_TOOLCHAIN_AMD64.md:170); the caps+errno decision has no crate | child.rs 16×256 B caps, silent cut | **D**: new `akuma-syscalls-linux`-adjacent pure decision (count/len caps → `E2BIG`) inside the spawn path; raise taoxichuan caps to amd64's (128 KB argv strings) | no | 4 |
@@ -130,16 +130,16 @@ calls (rough; a call ≈ one tool round-trip incl. build/boot loops).
 
 | syscall / behaviour | needed by | today | Taoxichuan today | gap → route | pm? | cost |
 |---|---|---|---|---|---|---|
-| thread `clone` (CLONE_VM\|CLONE_THREAD\|…, child stack, TLS, set_tid params) | rustc's rayon codegen workers; musl pthread_create (the ctrlc handler is the *first* one) | `akuma_exec::process::clone_thread` (mod.rs:3546); amd64 wiring `amd64/src/thread.rs:296`; clear_child_tid wake thread.rs:469 | M2 blocking arm, EINVAL on thread flags | **A**: replace the arm with `clone_thread`; effects = fresh syscall band + slot (exists since M4 s3), CR3 shared by construction (CLONE_VM must skip the copy — thread.rs:31–35 is the why) | **yes (S1: init must be a registered Process; S3: clone→fork_process)** | 40 |
-| futex — WAIT/WAKE, `FUTEX_WAIT_BITSET` absolute deadlines, `WAKE_OP`, REQUEUE, private vs shared | how every parked thread waits | `akuma-syscalls-sync` (op/key/table/deadline/wakeop/waitloop — host-tested); effects amd64/src/futex.rs | no arm (ENOSYS) | **A**: effects shim in taoxichuan calling the crate — read/write the user word via `copy_from_user`/`copy_to_user`, park = slot WAITING with `prepare_block`-before-membership-test (futex.rs:17–34 is the ordering argument), wake = crate `wake` + threading waker. Do **not** reimplement the table — every archived futex bug was a table/deadline bug the crate now pins | **yes** (parks + pids) | 30 |
+| thread `clone` (CLONE_VM\|CLONE_THREAD\|…, child stack, TLS, set_tid params) | rustc's rayon codegen workers; musl pthread_create (the ctrlc handler is the *first* one) | `akuma_exec::process::clone_thread` (mod.rs:3546); amd64 wiring `crates/akuma-kernel-amd64/src/thread.rs:296`; clear_child_tid wake thread.rs:469 | M2 blocking arm, EINVAL on thread flags | **A**: replace the arm with `clone_thread`; effects = fresh syscall band + slot (exists since M4 s3), CR3 shared by construction (CLONE_VM must skip the copy — thread.rs:31–35 is the why) | **yes (S1: init must be a registered Process; S3: clone→fork_process)** | 40 |
+| futex — WAIT/WAKE, `FUTEX_WAIT_BITSET` absolute deadlines, `WAKE_OP`, REQUEUE, private vs shared | how every parked thread waits | `akuma-syscalls-sync` (op/key/table/deadline/wakeop/waitloop — host-tested); effects crates/akuma-kernel-amd64/src/futex.rs | no arm (ENOSYS) | **A**: effects shim in taoxichuan calling the crate — read/write the user word via `copy_from_user`/`copy_to_user`, park = slot WAITING with `prepare_block`-before-membership-test (futex.rs:17–34 is the ordering argument), wake = crate `wake` + threading waker. Do **not** reimplement the table — every archived futex bug was a table/deadline bug the crate now pins | **yes** (parks + pids) | 30 |
 | thread groups: tgid vs tid, `exit_group` reaping workers *before* notifying the parent | rayon leader exit; the proc-macro2 wedge (AKUMA_SELF_HOSTING.md §7h) | `akuma-exec` table/children/lifecycle; `futex_wake` hook exec_runtime.rs:474 | one task; exit_group = exit | **A**: comes with clone_thread; the ordering rule is the crate's; gate = a `-j2` compile finishing | **yes** | 12 |
 | `set_robust_list` (+ get) | glibc/musl robust futexes (rustc std) | glue proc.rs:313 | ENOSYS | **B→A**: glue's record; the effect is the thread-exit futex wake (row above) | **yes** | 3 |
 | `rseq` | libstd probes it | nowhere | ENOSYS | **D**: honest ENOSYS is tolerated by musl guests (amd64 has no arm either); only add if a probe shows a caller dereferencing the answer → probe P1 reads the trace | **yes** | 1 (as ENOSYS) |
 | `getpriority`/`setpriority` | rustc threadpool calls opportunistically; **an ENOSYS return was used as a pointer and SIGSEGV'd the build** (AKUMA_SELF_HOSTING.md §7j) | nowhere | ENOSYS | **D**: new pure decision + arm in glue `proc.rs` shape (which=PRIO_PROCESS, who=0 → a fixed nice value); the *return-value* convention (0, not −1-with-errno-0) is what the host test pins | **yes** (pid) | 4 |
-| `sched_getaffinity` | rustc sizes its codegen thread pool from it (ENOSYS ⇒ silent −j1) | amd64/src/usermode.rs:2745 only | ENOSYS | **C**: extract the mask decision (single-cpu mask, len clamp) into glue `proc.rs` (or a new `akuma-syscalls-sched` if more of the family arrives: rseq, sched_*); host test pins the clamp errno | no (serves 0/1 mask without a process table — but glue needs one) | 4 |
+| `sched_getaffinity` | rustc sizes its codegen thread pool from it (ENOSYS ⇒ silent −j1) | crates/akuma-kernel-amd64/src/usermode.rs:2745 only | ENOSYS | **C**: extract the mask decision (single-cpu mask, len clamp) into glue `proc.rs` (or a new `akuma-syscalls-sched` if more of the family arrives: rseq, sched_*); host test pins the clamp errno | no (serves 0/1 mask without a process table — but glue needs one) | 4 |
 | `prlimit64` | rustc/cargo stack/limit probes | glue proc.rs:1400 | ENOSYS | **A/B**: pull glue's arm | **yes** | 2 |
 | `getrusage` | wait4 rusage, cargo timing | nowhere (taoxichuan wait4 ignores rusage) | ENOSYS | **D**: zeros-payload decision; low priority | **yes** | 3 |
-| `tkill`/`tgkill` + dispositions + delivery + `rt_sigreturn` | musl pthread cancellation, cargo's ~10,400 `tkill(SIGUSR1)` storm, ctrlc | glue signal.rs sys_tkill:334 / sys_tgkill:407 / rt_sigaction:10 / rt_sigprocmask:88; frame: amd64/src/signal.rs (x86), `akuma-threading::sigframe.rs` (aarch64 shape only) | no-op sigaction/procmask; no delivery | **B** for the disposition/setdecode arms (glue, after S6) + **C** for the x86 frame: extract amd64/src/signal.rs's frame build/`rt_sigreturn` sanitise into `akuma-threading` as a second repr(C) module beside the aarch64 one (the offset_of!/const-assert pattern, budget 0 unsafe) | **yes** | 80 |
+| `tkill`/`tgkill` + dispositions + delivery + `rt_sigreturn` | musl pthread cancellation, cargo's ~10,400 `tkill(SIGUSR1)` storm, ctrlc | glue signal.rs sys_tkill:334 / sys_tgkill:407 / rt_sigaction:10 / rt_sigprocmask:88; frame: crates/akuma-kernel-amd64/src/signal.rs (x86), `akuma-threading::sigframe.rs` (aarch64 shape only) | no-op sigaction/procmask; no delivery | **B** for the disposition/setdecode arms (glue, after S6) + **C** for the x86 frame: extract crates/akuma-kernel-amd64/src/signal.rs's frame build/`rt_sigreturn` sanitise into `akuma-threading` as a second repr(C) module beside the aarch64 one (the offset_of!/const-assert pattern, budget 0 unsafe) | **yes** | 80 |
 
 ### 2c. The linker wall — `rustc hello.rs`, then cargo (AFTER-PM unless marked)
 
@@ -248,7 +248,7 @@ sources `akuma-syscalls-sync/src` (module list), `akuma-syscalls-mem/src` (incl.
 membarrier.rs header), `akuma-syscalls-glue/src/{mem,signal,proc,fs,unixsock,lib}.rs`
 (arm lines cited in §2), `akuma-mmap/src/region.rs` (FileBacking:203),
 `akuma-exec/src/process/mod.rs` (fork_process:3194, clone_thread:3546, set_cwd:1192,
-mmap_regions:797), `amd64/src/{futex,thread,signal,usermode,mm}.rs` (the wiring
+mmap_regions:797), `crates/akuma-kernel-amd64/src/{futex,thread,signal,usermode,mm}.rs` (the wiring
 examples cited in §2), `scripts/kvm/akuma_rehearse.sh:61` (RAM).
 
 ### Questions for the user the docs cannot answer

@@ -4,15 +4,20 @@
 #![no_std]
 #![no_main]
 
+#[cfg(feature = "middleware")]
+mod middleware;
+
 akuma_tokio_kernel::entry!(main);
 
 fn main(kernel: akuma_tokio_kernel::Kernel) -> ! {
-    kernel
+    let kernel = kernel
         .name("Shanghai")
         .banner(include_str!("banner.txt"))
         .console()
         .disk()
         .net()
-        .smp()
-        .run_init()
+        .smp();
+    #[cfg(feature = "middleware")]
+    let kernel = kernel.middleware(&middleware::MW);
+    kernel.run_init()
 }

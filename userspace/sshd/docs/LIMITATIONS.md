@@ -14,7 +14,7 @@ This document outlines the known technical limitations of the current userspace 
 >
 > Everything in §1-§2 still applies verbatim if you build with
 > `SSHD_FORK_SESSIONS=0`, which memory-constrained images should
-> ([`docs/runbooks/build-extreme-size.md`](../../../docs/runbooks/build-extreme-size.md)).
+> ([`docs/archive/EXTREME_SIZE_BUILD.md`](../../../docs/archive/EXTREME_SIZE_BUILD.md)).
 > §3-§6 apply to both builds — and §3 is *more* pressing under the default now
 > that each session is a process against a global `MAX_PROCESSES = 64`.
 

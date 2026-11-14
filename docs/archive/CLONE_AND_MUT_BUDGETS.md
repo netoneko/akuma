@@ -31,7 +31,7 @@ gets wrong.
 ## The gate
 
 `scripts/check_budgets.py [copy|mut] [--update]`; budgets `docs/reference/copy-budget.json` and
-`docs/reference/mut-budget.json`, per component (`src`, `amd64/src`, `taoxichuan/src`, `crates/<name>`). Same rules
+`docs/reference/mut-budget.json`, per component (`src`, `crates/akuma-kernel-amd64/src`, `taoxichuan/src`, `crates/<name>`). Same rules
 as the `unsafe` gate: no entry is a budget of 0, growth fails until `--update` puts it in the diff, a decrease is a
 note that `--update` ratchets in.
 

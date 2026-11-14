@@ -8,6 +8,7 @@ description = "Ring 3 for the minimal amd64 composition: ET_EXEC parsing, the in
 workspace = true
 
 [dependencies]
+akuma-elf-exec = { path = "../akuma-elf-exec" }
 # `Msr::{Efer, Star, Lstar, Fmask}` — `akuma_cpu::msr` is the closed MSR set;
 # this crate adds no `wrmsr` of its own.
 akuma-cpu = { path = "../akuma-cpu" }
@@ -15,8 +16,3 @@ akuma-cpu = { path = "../akuma-cpu" }
 # derives user CS/SS from `STAR` in turn, so the transitions and the table
 # cannot drift apart.
 akuma-gdt = { path = "../akuma-gdt" }
-
-[features]
-# The legacy vsyscall page (PHASE-2-VDSO, D25): gates `AT_SYSINFO_EHDR`, the
-# auxv key the kernel-provided code page is disclosed under. Off by default.
-vsyscall = []

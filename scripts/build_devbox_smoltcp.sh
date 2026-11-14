@@ -10,28 +10,19 @@ set -e
 # via scripts/build_devbox.sh, but this smoltcp image is the recommended devbox.
 #
 # Unlike build_devbox.sh we do NOT pass --no-default-features: smoltcp must stay IN
-# (the userspace sshd routes over it). We layer the
-# `devbox-smoltcp` meta-feature (userspace-sshd + smp-shared) plus `no-tests` (this is
-# a runtime target; skip the boot self-test suite) on top of the default set. Built
-# with plain `--release`: the `smp-shared` FEATURE gates the code, and the profile
-# that used to pair with it added no codegen of its own (removed 2026-08-10).
+# (the userspace sshd routes over it). The devbox is the default set plus `no-tests`
+# (a runtime target; skip the boot self-test suite), built with plain `--release`.
+# There is no devbox feature of its own: `devbox-smoltcp` was an empty alias and was
+# removed 2026-11-11.
 #
 # Run with overlays/devbox/run-smoltcp.sh (SMP=N, no RUMP_NIC, host :2222 -> :22).
 # Extra args are forwarded (e.g. scripts/build_devbox_smoltcp.sh --quiet).
 #
-# `many-sessions` (deeper listener backlog + larger socket budget) rides in on
-# the default feature set — this build does NOT pass --no-default-features. It
-# is the kernel half of the process-per-session sshd; the userspace half is
-# `userspace/build.sh --sshd-only`, also on by default. SSHD_FORK_SESSIONS=0
-# drops both, for memory-constrained images.
-DEVBOX_SMOLTCP_FEATURES="devbox-smoltcp,no-tests"
-if [ "${SSHD_FORK_SESSIONS:-1}" = "0" ]; then
-    echo "SSHD_FORK_SESSIONS=0: NOT implemented for the kernel half here —"
-    echo "  many-sessions is a default feature, so dropping it needs an explicit"
-    echo "  --no-default-features build. Build sshd with SSHD_FORK_SESSIONS=0 and"
-    echo "  leave the kernel as-is: a cooperative sshd on a deep backlog is"
-    echo "  correct, just slightly wasteful. See docs/runbooks/build-extreme-size.md."
-fi
+# The kernel has no sshd-specific feature: the listener backlog is 8 on every
+# build. How sshd serves sessions is sshd's own build/config
+# (SSHD_FORK_SESSIONS=0 userspace/build.sh --sshd-only for the cooperative one;
+# docs/reference/build-profiles.md § Listener backlog).
+DEVBOX_SMOLTCP_FEATURES="no-tests"
 cargo build \
     --release \
     --features "$DEVBOX_SMOLTCP_FEATURES" \

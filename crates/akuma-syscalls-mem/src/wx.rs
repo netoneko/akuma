@@ -16,14 +16,15 @@
 //!
 //! Both refusals answer `EACCES`, which is what OpenBSD's W^X and PaX's MPROTECT answer for the same
 //! requests; Linux itself allows both, so this is deliberately *stricter than Linux*. Programs that need a
-//! JIT (V8, a JVM, LuaJIT, `libffi` closures on some targets) cannot run under it; the kernel keeps a switch
-//! (`wx=0` on the command line) rather than a per-program exemption.
+//! JIT (V8, a JVM, LuaJIT, `libffi` closures on some targets) cannot run under it, and there is no runtime
+//! switch or per-program exemption: the `wx=0` command-line hatch was removed 2026-11-05 (production kernels).
 //!
-//! The compile-time statement of that switch is the `wx-relaxed` feature (off by default, R6): a kernel that
-//! builds with it has chosen to permit JITs, and every check here answers [`Wx::Allow`] - exactly what `wx=0`
-//! gives at runtime, no per-program exemption either way (R7). Sibling kernels already chose opposite
-//! policies (the metal grants W|X for V8, `AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`; taoxichuan made W^X
-//! unconditional, git `0dcc33e7`), so the choice belongs to the kernel build, not to this crate.
+//! The compile-time statement of that choice is the `wx-relaxed` feature (denver's PHASE-2-WX, G1; off by
+//! default, R6): a kernel that builds with it has chosen to permit JITs, and every check here answers
+//! [`Wx::Allow`] - what `wx=0` gave at runtime, no per-program exemption either way (R7). Sibling kernels
+//! already chose opposite policies (the metal grants W|X for V8, `AKUMA_AMD64_CHROMIUM_KERNEL_WORK.md`;
+//! taoxichuan made W^X unconditional, git `0dcc33e7`), so the choice belongs to the kernel build, not to
+//! this crate - and this crate's default build stays strict.
 
 use akuma_syscalls_linux::flags::prot;
 

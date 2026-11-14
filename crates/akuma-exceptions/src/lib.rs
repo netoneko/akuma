@@ -68,6 +68,9 @@
 //! applying to the exception path.
 
 #![no_std]
+// No `unsafe` in this crate: the vector table, the `#[no_mangle]` shims and the control-flow
+// register writes live in `akuma-entry::exceptions`. See `EntryServices`.
+#![forbid(unsafe_code)]
 
 // Kernel-specific lints, mirroring the bin crate's allow list (this code was
 // lint-clean inside the bin under the same allowances; the casts are MMIO/PTE
@@ -90,13 +93,7 @@
 
 extern crate alloc;
 
-// Only the two `global_asm!` blobs use it, and both are bare-metal gated: the
-// vector table's `.section .text.exceptions` does not assemble for a Mach-O
-// host, and the GPR-transparency probe deliberately takes an EL1 data abort.
-#[cfg(target_os = "none")]
-use core::arch::global_asm;
-
-use akuma_trap_aarch64::FrameHandle;
+use akuma_trap_aarch64::{FrameHandle, irq_frame::IrqFrame};
 
 // `safe_print!` resolves unqualified throughout this crate — the same move
 // `akuma-exec` and `akuma-fpcache` make, and what let the moved call sites
@@ -105,631 +102,6 @@ use akuma_trap_aarch64::FrameHandle;
 // `src/console.rs`'s and did not travel; the timestamp prefix it added is the
 // only thing those call sites lost.
 pub use akuma_primitives::safe_print;
-
-// Exception vector table with EL0 support
-#[cfg(target_os = "none")]
-global_asm!(
-    r#"
-.section .text.exceptions
-.balign 0x800
-
-.global exception_vector_table
-exception_vector_table:
-    // Current EL with SP0 (shouldn't happen normally)
-    .balign 0x80
-    b sync_el1_handler              // Synchronous
-    .balign 0x80
-    b irq_handler                   // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-    // Current EL with SPx (kernel exceptions)
-    .balign 0x80
-    b sync_el1_handler              // Synchronous
-    .balign 0x80
-    b irq_handler                   // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-    // Lower EL using AArch64 (EL0 -> EL1, user mode exceptions)
-    .balign 0x80
-    b sync_el0_handler              // Synchronous (SVC syscalls, faults)
-    .balign 0x80
-    b irq_el0_handler               // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-    // Lower EL using AArch32 (not supported)
-    .balign 0x80
-    b default_exception_handler     // Synchronous
-    .balign 0x80
-    b irq_handler                   // IRQ
-    .balign 0x80
-    b default_exception_handler     // FIQ
-    .balign 0x80
-    b default_exception_handler     // SError
-
-// Default exception handler - calls Rust handler then returns
-default_exception_handler:
-    stp     x0, x1, [sp, #-16]!
-    stp     x29, x30, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
-    bl      rust_default_exception_handler
-    // Clear IL bit in SPSR before ERET to prevent EC=0xe
-    mrs     x2, spsr_el1
-    bic     x2, x2, #0x100000       // Clear IL bit (bit 20)
-    msr     spsr_el1, x2
-    ldp     x2, x3, [sp], #16
-    ldp     x29, x30, [sp], #16
-    ldp     x0, x1, [sp], #16
-    eret
-
-// Synchronous exception from EL1 (kernel fault)
-//
-// THIS HANDLER MUST BE TRANSPARENT TO EVERY GPR. It is not just a crash
-// reporter: `try_resolve_el1_cow_fault` and `try_resolve_el1_user_copy_lazy_fault`
-// both *resolve* the fault and return, and the `eret` below then re-executes the
-// faulting instruction. A retry is only correct if that instruction's input
-// registers still hold what they held when it aborted — so anything
-// `rust_sync_el1_handler` clobbers is silently written into memory by the retry.
-//
-// Saving x0-x3/x29/x30 was enough only by accident: the pre-2026-08-27
-// `__arch_copy_user_memory` byte loop kept its one live datum in x3. The
-// 64/16/8-byte widening put live data in x3-x10, and x4-x10 were destroyed
-// across the fault — so a `read(2)` whose destination page was faulted in
-// mid-copy stored leftover handler state instead of file bytes, 24 bytes per
-// page, while reporting the full byte count
-// (docs/archive/BUSYBOX_HASH_MISCOMPUTE.md).
-//
-// x19-x28 need no save here: `rust_sync_el1_handler` is `extern "C"`, so AAPCS64
-// obliges it to preserve them. x18 does, because Rust treats the platform
-// register as a temporary on this target unless told otherwise. FP/SIMD state is
-// still NOT saved — no kernel copy path holds live NEON across a store, and the
-// EL0/IRQ vectors that do save it are the ones that need it.
-sync_el1_handler:
-    // Save the volatile registers a retried instruction may still need. FIRST,
-    // so the block handed to Rust below keeps its documented layout.
-    stp     x4, x5, [sp, #-16]!
-    stp     x6, x7, [sp, #-16]!
-    stp     x8, x9, [sp, #-16]!
-    stp     x10, x11, [sp, #-16]!
-    stp     x12, x13, [sp, #-16]!
-    stp     x14, x15, [sp, #-16]!
-    stp     x16, x17, [sp, #-16]!
-    str     x18, [sp, #-16]!        // 8 bytes + 8 padding: keep sp 16-byte aligned
-
-    stp     x29, x30, [sp, #-16]!
-    stp     x0, x1, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!     // Save extra regs for IL bit fix
-    
-    // Call Rust handler with a pointer to the saved-register block
-    // (layout from the pushes above: +0 x2, +8 x3, +16 x0, +24 x1, +32 x29, +40 x30)
-    mov     x0, sp
-    bl      rust_sync_el1_handler
-    
-    // Clear IL bit in SPSR before ERET to prevent EC=0xe
-    mrs     x2, spsr_el1
-    bic     x2, x2, #0x100000       // Clear IL bit (bit 20)
-    msr     spsr_el1, x2
-    
-    // Restore and return
-    ldp     x2, x3, [sp], #16
-    ldp     x0, x1, [sp], #16
-    ldp     x29, x30, [sp], #16
-
-    ldr     x18, [sp], #16
-    ldp     x16, x17, [sp], #16
-    ldp     x14, x15, [sp], #16
-    ldp     x12, x13, [sp], #16
-    ldp     x10, x11, [sp], #16
-    ldp     x8, x9, [sp], #16
-    ldp     x6, x7, [sp], #16
-    ldp     x4, x5, [sp], #16
-    eret
-
-// Synchronous exception from EL0 (user mode)
-// Handles SVC syscalls and user faults
-//
-// Frame layout (832 bytes):
-//   [sp+0..287]:   UserTrapFrame (GPRs, SP_EL0, ELR, SPSR, TPIDR)
-//   [sp+288..303]: kernel SP + padding
-//   [sp+304..831]: NEON/FP state (Q0-Q31, FPCR, FPSR)
-sync_el0_handler:
-    // Allocate full frame: 304 GPR + 528 NEON = 832 bytes
-    sub     sp, sp, #832
-    
-    // Save x8-x11 first (we'll clobber these for stack/NEON operations)
-    stp     x8, x9, [sp, #64]
-    stp     x10, x11, [sp, #80]
-    
-    // Save kernel SP at offset 288 (sp + 832 = original SP)
-    add     x9, sp, #832
-    str     x9, [sp, #288]
-    
-    // Save NEON/FP state at [sp+304..831]
-    stp     q0,  q1,  [sp, #304]
-    stp     q2,  q3,  [sp, #336]
-    stp     q4,  q5,  [sp, #368]
-    stp     q6,  q7,  [sp, #400]
-    stp     q8,  q9,  [sp, #432]
-    stp     q10, q11, [sp, #464]
-    stp     q12, q13, [sp, #496]
-    stp     q14, q15, [sp, #528]
-    stp     q16, q17, [sp, #560]
-    stp     q18, q19, [sp, #592]
-    stp     q20, q21, [sp, #624]
-    stp     q22, q23, [sp, #656]
-    stp     q24, q25, [sp, #688]
-    stp     q26, q27, [sp, #720]
-    stp     q28, q29, [sp, #752]
-    stp     q30, q31, [sp, #784]
-    mrs     x10, fpcr
-    mrs     x11, fpsr
-    str     x10, [sp, #816]
-    str     x11, [sp, #824]
-    
-    // Save x0-x7
-    stp     x0, x1, [sp, #0]
-    stp     x2, x3, [sp, #16]
-    stp     x4, x5, [sp, #32]
-    stp     x6, x7, [sp, #48]
-    stp     x12, x13, [sp, #96]
-    stp     x14, x15, [sp, #112]
-    stp     x16, x17, [sp, #128]
-    stp     x18, x19, [sp, #144]
-    stp     x20, x21, [sp, #160]
-    stp     x22, x23, [sp, #176]
-    stp     x24, x25, [sp, #192]
-    stp     x26, x27, [sp, #208]
-    stp     x28, x29, [sp, #224]
-    str     x30, [sp, #240]
-    
-    // Save SP_EL0
-    mrs     x0, sp_el0
-    str     x0, [sp, #248]
-    
-    // Save ELR_EL1 (user PC)
-    mrs     x0, elr_el1
-    str     x0, [sp, #256]
-    
-    // Save SPSR_EL1
-    mrs     x0, spsr_el1
-    str     x0, [sp, #264]
-
-    // Save TPIDR_EL0 (TLS)
-    mrs     x0, tpidr_el0
-    str     x0, [sp, #272]
-    
-    // Pass pointer to saved context as first arg
-    mov     x0, sp
-
-    // Snapshot the trap syndrome (x1=ESR_EL1, x2=FAR_EL1) as handler args
-    // while PSTATE.I is still masked from the trap. The syndrome registers
-    // are per-PE and only hold THIS trap's values until the next trap on
-    // this PE; IRQs are enabled just below, so any later `mrs esr_el1` /
-    // `mrs far_el1` in the handler can observe a different trap's syndrome
-    // (SMP phantom-SVC: an EL0 data abort classified as EC_SVC64 after the
-    // BKL spin was preempted by other threads' traps).
-    mrs     x1, esr_el1
-    mrs     x2, far_el1
-
-    // Enable IRQs during syscall handling to allow preemption
-    msr     daifclr, #2
-    isb
-
-    // Call Rust handler - returns syscall result in x0
-    bl      rust_sync_el0_handler
-    
-    // Disable IRQs before restoring registers
-    msr     daifset, #2
-    isb
-    
-    // x0 now has the syscall return value
-    // Save it to scratch area while we restore other registers
-    str     x0, [sp, #280]
-    
-    // Restore NEON/FP state from [sp+304..831]
-    ldr     x0, [sp, #816]
-    ldr     x1, [sp, #824]
-    msr     fpcr, x0
-    msr     fpsr, x1
-    ldp     q0,  q1,  [sp, #304]
-    ldp     q2,  q3,  [sp, #336]
-    ldp     q4,  q5,  [sp, #368]
-    ldp     q6,  q7,  [sp, #400]
-    ldp     q8,  q9,  [sp, #432]
-    ldp     q10, q11, [sp, #464]
-    ldp     q12, q13, [sp, #496]
-    ldp     q14, q15, [sp, #528]
-    ldp     q16, q17, [sp, #560]
-    ldp     q18, q19, [sp, #592]
-    ldp     q20, q21, [sp, #624]
-    ldp     q22, q23, [sp, #656]
-    ldp     q24, q25, [sp, #688]
-    ldp     q26, q27, [sp, #720]
-    ldp     q28, q29, [sp, #752]
-    ldp     q30, q31, [sp, #784]
-    
-    // Restore SPSR_EL1 (clear IL bit to prevent EC=0xe)
-    ldr     x0, [sp, #264]
-    bic     x0, x0, #0x100000
-    msr     spsr_el1, x0
-    
-    // Restore ELR_EL1
-    ldr     x0, [sp, #256]
-    msr     elr_el1, x0
-    
-    // Restore SP_EL0
-    ldr     x0, [sp, #248]
-    msr     sp_el0, x0
-
-    // Restore TPIDR_EL0 (TLS)
-    ldr     x0, [sp, #272]
-    msr     tpidr_el0, x0
-    
-    // Restore x30
-    ldr     x30, [sp, #240]
-    ldp     x28, x29, [sp, #224]
-    ldp     x26, x27, [sp, #208]
-    ldp     x24, x25, [sp, #192]
-    ldp     x22, x23, [sp, #176]
-    ldp     x20, x21, [sp, #160]
-    ldp     x18, x19, [sp, #144]
-    ldp     x16, x17, [sp, #128]
-    ldp     x14, x15, [sp, #112]
-    ldp     x12, x13, [sp, #96]
-    ldp     x10, x11, [sp, #80]
-    ldp     x8, x9, [sp, #64]
-    ldp     x6, x7, [sp, #48]
-    ldp     x4, x5, [sp, #32]
-    ldp     x2, x3, [sp, #16]
-    ldr     x1, [sp, #8]
-    
-    // Load syscall return value into x0
-    ldr     x0, [sp, #280]
-    
-    // Cleanup stack frame (832 bytes)
-    add     sp, sp, #832
-    
-    // Return to user mode
-    eret
-
-// IRQ from EL0 (user mode)
-// UNIFIED: Stack-based save/restore, same mechanism as EL1 IRQ handler.
-// Context switch: Rust handler returns new SP, assembly does the actual switch.
-// 
-// EL0 IRQ frame layout (832 bytes total) — full field list in
-// `threading::setup_fake_irq_frame`, which writes this exact layout:
-//   [sp+0..287]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
-//   [sp+288..815]: NEON block (Q0-Q31 at +288, FPCR at +800, FPSR at +808)
-//   [sp+816..831]: x10, x11 (scratch, pushed first / popped last)
-//
-// NOT interchangeable with the EL0 *sync* frame (`UserTrapFrame`), which is also
-// 832 bytes but orders its GPRs differently and starts NEON at +304.
-irq_el0_handler:
-    // ============================================================
-    // SAVE PHASE: Push all registers to stack in fixed layout
-    // EL0 IRQ frame: 832 bytes (GPR + NEON/FP)
-    // ============================================================
-    
-    // First save x10, x11 (need them for system registers)
-    stp     x10, x11, [sp, #-16]!
-
-    // Save NEON/FP state (528 bytes: 32 Q-regs + FPCR + FPSR)
-    sub     sp, sp, #528
-    stp     q0,  q1,  [sp, #0]
-    stp     q2,  q3,  [sp, #32]
-    stp     q4,  q5,  [sp, #64]
-    stp     q6,  q7,  [sp, #96]
-    stp     q8,  q9,  [sp, #128]
-    stp     q10, q11, [sp, #160]
-    stp     q12, q13, [sp, #192]
-    stp     q14, q15, [sp, #224]
-    stp     q16, q17, [sp, #256]
-    stp     q18, q19, [sp, #288]
-    stp     q20, q21, [sp, #320]
-    stp     q22, q23, [sp, #352]
-    stp     q24, q25, [sp, #384]
-    stp     q26, q27, [sp, #416]
-    stp     q28, q29, [sp, #448]
-    stp     q30, q31, [sp, #480]
-    mrs     x10, fpcr
-    mrs     x11, fpsr
-    str     x10, [sp, #512]
-    str     x11, [sp, #520]
-
-    // Save TPIDR_EL0 (TLS thread pointer)
-    mrs     x10, tpidr_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save SP_EL0 (user stack pointer) - unique to EL0 handler
-    mrs     x10, sp_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save ELR_EL1 and SPSR_EL1 to stack
-    mrs     x10, elr_el1
-    mrs     x11, spsr_el1
-    stp     x10, x11, [sp, #-16]!
-    
-    // Save all other registers
-    stp     x0, x1, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!
-    stp     x4, x5, [sp, #-16]!
-    stp     x6, x7, [sp, #-16]!
-    stp     x8, x9, [sp, #-16]!
-    stp     x12, x13, [sp, #-16]!
-    stp     x14, x15, [sp, #-16]!
-    stp     x16, x17, [sp, #-16]!
-    stp     x18, x19, [sp, #-16]!
-    stp     x20, x21, [sp, #-16]!
-    stp     x22, x23, [sp, #-16]!
-    stp     x24, x25, [sp, #-16]!
-    stp     x26, x27, [sp, #-16]!
-    stp     x28, x29, [sp, #-16]!
-    str     x30, [sp, #-16]!
-    
-    // Pass current SP as argument (x0)
-    mov     x0, sp
-    
-    // Call rust handler - returns new SP in x0 (or 0 if no switch needed)
-    bl      rust_irq_handler_with_sp
-    
-    // Check if context switch needed (x0 != 0)
-    cbz     x0, 4f
-    mov     sp, x0              // Switch SP in assembly!
-    // This core is now OFF the outgoing thread's stack — clear its off-CPU
-    // gate so peers may pick it up. Clobbers only caller-saved regs + x30,
-    // all of which the restore below overwrites. Uses the incoming thread's
-    // free stack space below its frame.
-    bl      rust_switch_finished
-4:
-    
-    // ============================================================
-    // RESTORE PHASE: Pop all registers from (possibly new) stack
-    // ============================================================
-    
-    // Restore general registers (reverse order of save)
-    ldr     x30, [sp], #16
-    ldp     x28, x29, [sp], #16
-    ldp     x26, x27, [sp], #16
-    ldp     x24, x25, [sp], #16
-    ldp     x22, x23, [sp], #16
-    ldp     x20, x21, [sp], #16
-    ldp     x18, x19, [sp], #16
-    ldp     x16, x17, [sp], #16
-    ldp     x14, x15, [sp], #16
-    ldp     x12, x13, [sp], #16
-    ldp     x8, x9, [sp], #16
-    ldp     x6, x7, [sp], #16
-    ldp     x4, x5, [sp], #16
-    ldp     x2, x3, [sp], #16
-    ldp     x0, x1, [sp], #16
-    
-    // Restore ELR and SPSR FROM STACK
-    ldp     x10, x11, [sp], #16      // x10 = ELR, x11 = SPSR
-    
-    // Clear IL bit in SPSR to prevent EC=0xe
-    bic     x11, x11, #0x100000
-    
-    // Write to system registers
-    msr     elr_el1, x10
-    msr     spsr_el1, x11
-    
-    // CRITICAL: Check for ELR=0 bug before ERET
-    cbnz    x10, 5f
-    mov     x0, #0xDEAD
-    movk    x0, #0xBEEF, lsl #16
-6:  wfi
-    b       6b
-5:
-    
-    // Restore SP_EL0 (user stack pointer)
-    ldr     x10, [sp], #16           // Load SP_EL0 from stack
-    msr     sp_el0, x10
-
-    // Restore TPIDR_EL0 (TLS thread pointer)
-    ldr     x10, [sp], #16
-    msr     tpidr_el0, x10
-
-    // Restore NEON/FP state
-    ldr     x10, [sp, #512]
-    ldr     x11, [sp, #520]
-    msr     fpcr, x10
-    msr     fpsr, x11
-    ldp     q0,  q1,  [sp, #0]
-    ldp     q2,  q3,  [sp, #32]
-    ldp     q4,  q5,  [sp, #64]
-    ldp     q6,  q7,  [sp, #96]
-    ldp     q8,  q9,  [sp, #128]
-    ldp     q10, q11, [sp, #160]
-    ldp     q12, q13, [sp, #192]
-    ldp     q14, q15, [sp, #224]
-    ldp     q16, q17, [sp, #256]
-    ldp     q18, q19, [sp, #288]
-    ldp     q20, q21, [sp, #320]
-    ldp     q22, q23, [sp, #352]
-    ldp     q24, q25, [sp, #384]
-    ldp     q26, q27, [sp, #416]
-    ldp     q28, q29, [sp, #448]
-    ldp     q30, q31, [sp, #480]
-    add     sp, sp, #528
-    
-    // Restore original x10, x11
-    ldp     x10, x11, [sp], #16
-    
-    eret
-
-// IRQ from EL1 (kernel mode)
-// UNIFIED: Stack-based save/restore, same frame layout as EL0 IRQ handler.
-// Context switch: Rust handler returns new SP, assembly does the actual switch.
-//
-// UNIFIED IRQ frame layout (832 bytes total) - same as EL0:
-//   [sp+0..287]:   GPR block (x30, x28-x29, ..., x0-x1, ELR, SPSR, SP_EL0, TPIDR)
-//   [sp+288..815]: NEON block (Q0-Q31 at +288, FPCR at +800, FPSR at +808)
-//   [sp+816..831]: x10, x11 (scratch, outermost — inside the frame, not past it)
-irq_handler:
-    // ============================================================
-    // SAVE PHASE: Push all registers to stack in fixed layout
-    // IRQ frame: 832 bytes total (unified with EL0 handler)
-    // ============================================================
-    
-    // First save x10, x11 (need them for system registers)
-    stp     x10, x11, [sp, #-16]!
-
-    // Save NEON/FP state (528 bytes: 32 Q-regs + FPCR + FPSR)
-    sub     sp, sp, #528
-    stp     q0,  q1,  [sp, #0]
-    stp     q2,  q3,  [sp, #32]
-    stp     q4,  q5,  [sp, #64]
-    stp     q6,  q7,  [sp, #96]
-    stp     q8,  q9,  [sp, #128]
-    stp     q10, q11, [sp, #160]
-    stp     q12, q13, [sp, #192]
-    stp     q14, q15, [sp, #224]
-    stp     q16, q17, [sp, #256]
-    stp     q18, q19, [sp, #288]
-    stp     q20, q21, [sp, #320]
-    stp     q22, q23, [sp, #352]
-    stp     q24, q25, [sp, #384]
-    stp     q26, q27, [sp, #416]
-    stp     q28, q29, [sp, #448]
-    stp     q30, q31, [sp, #480]
-    mrs     x10, fpcr
-    mrs     x11, fpsr
-    str     x10, [sp, #512]
-    str     x11, [sp, #520]
-
-    // Save TPIDR_EL0 (TLS thread pointer)
-    mrs     x10, tpidr_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save SP_EL0 - preserves user stack during syscalls and enables
-    // unified frame layout between EL0 and EL1 handlers
-    mrs     x10, sp_el0
-    str     x10, [sp, #-16]!        // 8 bytes + 8 padding
-    
-    // Save ELR_EL1 and SPSR_EL1 to stack
-    mrs     x10, elr_el1
-    mrs     x11, spsr_el1
-    stp     x10, x11, [sp, #-16]!
-    
-    // Save all other registers
-    stp     x0, x1, [sp, #-16]!
-    stp     x2, x3, [sp, #-16]!
-    stp     x4, x5, [sp, #-16]!
-    stp     x6, x7, [sp, #-16]!
-    stp     x8, x9, [sp, #-16]!
-    stp     x12, x13, [sp, #-16]!
-    stp     x14, x15, [sp, #-16]!
-    stp     x16, x17, [sp, #-16]!
-    stp     x18, x19, [sp, #-16]!
-    stp     x20, x21, [sp, #-16]!
-    stp     x22, x23, [sp, #-16]!
-    stp     x24, x25, [sp, #-16]!
-    stp     x26, x27, [sp, #-16]!
-    stp     x28, x29, [sp, #-16]!
-    str     x30, [sp, #-16]!
-    
-    // Pass current SP as argument (x0)
-    mov     x0, sp
-    
-    // Call rust handler - returns new SP in x0 (or 0 if no switch needed)
-    bl      rust_irq_handler_with_sp
-    
-    // Check if context switch needed (x0 != 0)
-    cbz     x0, 3f
-    mov     sp, x0              // Switch SP in assembly!
-    // Same off-CPU gate clear as the EL0 IRQ path — see there.
-    bl      rust_switch_finished
-3:
-    
-    // ============================================================
-    // RESTORE PHASE: Pop all registers from (possibly new) stack
-    // ============================================================
-    
-    // Restore general registers (reverse order of save)
-    ldr     x30, [sp], #16
-    ldp     x28, x29, [sp], #16
-    ldp     x26, x27, [sp], #16
-    ldp     x24, x25, [sp], #16
-    ldp     x22, x23, [sp], #16
-    ldp     x20, x21, [sp], #16
-    ldp     x18, x19, [sp], #16
-    ldp     x16, x17, [sp], #16
-    ldp     x14, x15, [sp], #16
-    ldp     x12, x13, [sp], #16
-    ldp     x8, x9, [sp], #16
-    ldp     x6, x7, [sp], #16
-    ldp     x4, x5, [sp], #16
-    ldp     x2, x3, [sp], #16
-    ldp     x0, x1, [sp], #16
-    
-    // Restore ELR and SPSR FROM STACK
-    ldp     x10, x11, [sp], #16      // x10 = ELR, x11 = SPSR
-    
-    // Clear IL bit in SPSR to prevent EC=0xe
-    bic     x11, x11, #0x100000
-    
-    // Write to system registers
-    msr     elr_el1, x10
-    msr     spsr_el1, x11
-    
-    // CRITICAL: Check for ELR=0 bug
-    cbnz    x10, 1f
-    mov     x0, #0xDEAD
-    movk    x0, #0xBEEF, lsl #16
-2:  wfi
-    b       2b
-1:
-    
-    // Restore SP_EL0 (user stack pointer) - matches EL0 handler frame layout
-    ldr     x10, [sp], #16
-    msr     sp_el0, x10
-
-    // Restore TPIDR_EL0 (TLS thread pointer)
-    ldr     x10, [sp], #16
-    msr     tpidr_el0, x10
-
-    // Restore NEON/FP state
-    ldr     x10, [sp, #512]
-    ldr     x11, [sp, #520]
-    msr     fpcr, x10
-    msr     fpsr, x11
-    ldp     q0,  q1,  [sp, #0]
-    ldp     q2,  q3,  [sp, #32]
-    ldp     q4,  q5,  [sp, #64]
-    ldp     q6,  q7,  [sp, #96]
-    ldp     q8,  q9,  [sp, #128]
-    ldp     q10, q11, [sp, #160]
-    ldp     q12, q13, [sp, #192]
-    ldp     q14, q15, [sp, #224]
-    ldp     q16, q17, [sp, #256]
-    ldp     q18, q19, [sp, #288]
-    ldp     q20, q21, [sp, #320]
-    ldp     q22, q23, [sp, #352]
-    ldp     q24, q25, [sp, #384]
-    ldp     q26, q27, [sp, #416]
-    ldp     q28, q29, [sp, #448]
-    ldp     q30, q31, [sp, #480]
-    add     sp, sp, #528
-    
-    // Restore original x10, x11
-    ldp     x10, x11, [sp], #16
-    
-    eret
-"#
-);
-
-#[cfg(target_os = "none")]
-unsafe extern "C" {
-    static exception_vector_table: u8;
-}
 
 // ============================================================================
 // Per-Thread Exception Stacks
@@ -758,47 +130,6 @@ unsafe extern "C" {
 //
 // See docs/WAIT_QUEUES.md for detailed documentation.
 // ============================================================================
-
-/// Set the current exception stack for the running thread
-/// Called during context switch to update TPIDR_EL1
-#[inline]
-pub fn set_current_exception_stack(stack_top: u64) {
-    // Bare metal only: `msr tpidr_el1` is an EL1 instruction. It *assembles* on
-    // the aarch64 development host, so an ungated body would build under
-    // `cargo test` and die with `SIGILL` the first time a host test reached it —
-    // the trap `akuma-cpu`'s "Host builds" note records. See this crate's own
-    // note of the same name.
-    #[cfg(target_os = "none")]
-    unsafe {
-        core::arch::asm!("msr tpidr_el1, {}", in(reg) stack_top);
-    }
-    #[cfg(not(target_os = "none"))]
-    let _ = stack_top;
-}
-
-/// Get the current exception stack pointer from TPIDR_EL1
-#[inline]
-#[allow(dead_code)]
-pub fn get_current_exception_stack() -> u64 {
-    akuma_cpu::sysreg::tpidr_el1()
-}
-
-/// Initialize the exception stack pointer for the boot thread
-/// Must be called before any user mode code runs
-pub fn init_exception_stack() {
-    // Boot thread (thread 0) uses the boot stack; its early exception stack is at
-    // the very top of that region. Read the STACK_TOP linker symbol (derived from
-    // the linked image size in linker.ld, the same one boot.rs loads as the initial
-    // SP and main.rs reads) so this can never go stale. Hardcoding the old
-    // 0x40800000 once pointed the early exception stack into the kernel heap at low
-    // RAM after the boot stack was relocated — see docs/LOW_MEMORY_ENVIRONMENT.md
-    // "Known bug".
-    unsafe extern "C" {
-        static STACK_TOP: u8;
-    }
-    let boot_stack_top = &raw const STACK_TOP as u64;
-    set_current_exception_stack(boot_stack_top);
-}
 
 pub use akuma_exec::threading::UserTrapFrame;
 
@@ -1035,76 +366,11 @@ fn syscall_stub_elr_in_diag_window(elr: u64) -> bool {
     elr >= min && elr <= max
 }
 
-/// Forensics for the `N × INTERP_BASE + offset` instruction-abort class
-/// (`docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md`, class 2).
-///
-/// The branch target is read from a slot in the interpreter's writable data that
-/// musl's **RELR** apply loop mutates with `*slot += base`. A slot that already
-/// carried a relocated value gets `base` added a second time, so `FAR` reads
-/// `N*base + link_time_offset` with `N` = how many times the slot was relocated.
-/// That only happens if two processes' startup code ran over the **same physical
-/// frame**, so the one fact worth capturing is the slot's **PA**: two faults
-/// reporting the same PA means a shared frame, different PAs mean the poisoned
-/// value travelled by copy (a CoW/page-cache fill from an already-bumped source).
-///
-/// Fires only on a `FAR` of that exact shape, and only walks the interpreter's
-/// own VA window, so it costs nothing on any other abort.
-fn interp_relr_forensics(far: usize, pid: u32) {
-    const BASE: usize = akuma_exec::elf_loader::INTERP_BASE;
-    // N >= 2 (N == 1 is a correctly relocated pointer) and a plausible in-image offset.
-    let n = far / BASE;
-    let off = far % BASE;
-    if n < 2 || off >= 0x0010_0000 {
-        return;
-    }
-    let ttbr0 = akuma_exec::mmu::get_current_ttbr0();
-    if ttbr0 == 0 {
-        return;
-    }
-    let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
-    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
-    let tid = akuma_exec::threading::current_thread_id();
-    let (cur_pid, ttbr0_proc, ppid) = akuma_exec::process::current_process_shared()
-        .map_or((0, 0, 0), |p| (p.pid, p.address_space.ttbr0(), p.parent_pid));
-    const L0_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-    let base_differs = ttbr0_proc != 0 && (ttbr0 as u64 & L0_MASK) != (ttbr0_proc & L0_MASK);
-    crate::safe_print!(224,
-        "[RELR] fault_pid={} cur_pid={} ppid={} tid={} N={} off={:#x}\n",
-        pid, cur_pid, ppid, tid, n, off);
-    crate::safe_print!(224,
-        "[RELR] ttbr0_live={:#x} ttbr0_proc={:#x}{} expected_l0={:#x} switch_ins={} gen={}\n",
-        ttbr0, ttbr0_proc,
-        if base_differs { "  *** AS MISMATCH (foreign page tables) ***" } else { "" },
-        akuma_exec::threading::thread_expected_l0(tid),
-        akuma_exec::threading::thread_switch_ins(tid),
-        akuma_exec::threading::thread_generation(tid));
-
-    // The writable PT_LOAD of a musl interpreter sits at the top of its image;
-    // 1 MB of VA covers it with room to spare and bounds the scan at 256 pages.
-    let mut found = 0usize;
-    for page in 0..256usize {
-        let page_va = BASE + 0x0010_0000 - (page + 1) * 0x1000;
-        let Some(pa) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va) else {
-            continue;
-        };
-        let kva = akuma_exec::mmu::phys_to_virt(pa & !0xFFF).cast::<u64>();
-        for i in 0..512usize {
-            let v = unsafe { kva.add(i).read_volatile() } as usize;
-            if v == far {
-                crate::safe_print!(160,
-                    "[RELR] slot va={:#x} pa={:#x} val={:#x}\n",
-                    page_va + i * 8, (pa & !0xFFF) + i * 8, v);
-                found += 1;
-                if found >= 4 {
-                    return;
-                }
-            }
-        }
-    }
-    if found == 0 {
-        crate::safe_print!(128, "[RELR] no slot in interp window holds {:#x}\n", far);
-    }
-}
+#[cfg(feature = "forensics")]
+use akuma_exceptions_forensics::interp_relr_forensics;
+/// Forensics are compiled out without the `forensics` feature.
+#[cfg(not(feature = "forensics"))]
+fn interp_relr_forensics(_far: usize, _pid: u32) {}
 
 /// Log syscall number (**`x8`**), **FAR**, **pid/tid** when SIGSEGV hits the configured syscall-stub VA window.
 fn maybe_print_sigsegv_syscall_diag(elr: u64, far: u64, frame: &UserTrapFrame) {
@@ -1168,11 +434,11 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
     let ttbr0_proc = akuma_exec::process::current_process_shared()
         .map_or(0, |p| p.address_space.ttbr0());
     // Compare the L0 base (bits 47:0) and the ASID (bits 63:48) separately —
-    // they mean very different things here. A CLONE_THREAD child is *supposed*
-    // to run under a ttbr0 whose ASID differs from its own `Process`: it is
-    // handed the parent's ttbr0 verbatim (`shared_ttbr0` in `clone_thread`)
-    // while `new_shared` gives its Process a fresh ASID over the same L0. So
-    // "ASID differs" is routine and must not be flagged. A differing **L0
+    // they mean very different things here. A CLONE_THREAD child runs under
+    // the parent's ttbr0 verbatim (`shared_ttbr0` in `clone_thread`), and its
+    // `Process` holds that same ASID (`new_thread_view`); a vfork child's
+    // `Process` has an ASID of its own over the same L0. So "ASID differs" is
+    // not a defect and must not be flagged. A differing **L0
     // base** is the real defect: the core is executing in a third party's page
     // tables, which is the cross-address-space aliasing theory (T1) in
     // docs/archive/THREAD_SPAWN_SEGV_INVESTIGATION.md §3c.
@@ -1184,7 +450,7 @@ fn print_spawn_fault_diag(far: u64, frame: &UserTrapFrame) {
         if base_differs {
             "  *** AS MISMATCH: L0 BASE DIFFERS (foreign page tables) ***"
         } else if asid_differs {
-            "  (asid differs only — normal for a cloned thread)"
+            "  (asid differs only — not a defect)"
         } else { "" });
     // Discriminators for the AS MISMATCH stories (see thread_expected_l0 /
     // thread_switch_ins docs): expected==0 ⇒ the thread ran with the tripwire
@@ -1317,6 +583,36 @@ fn demand_page_lazy_region(
     let _fault_guard = fault_slot_hold(pid, as_owner, page_va);
 
     let file_backed = matches!(source, akuma_exec::process::LazySource::File { .. });
+
+    // A writable `MAP_SHARED` file page is the shared writable table's frame,
+    // the same one every mapper maps; and a page of a read-only mapping of that
+    // file is that frame too while a writer has it, as Linux's one page cache
+    // would give it (`shmregionprobe`). `PROT_READ` is EL0-executable here
+    // (`Prot::RO` has no `UXN`), so an executable mapping takes this path too and
+    // gets the I-cache maintenance the private path below would have given it.
+    if file_backed
+        && let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner)
+        && let Some((key, shared_write)) = akuma_exec::shm::region_key(owner, page_va)
+    {
+        let mapped = if shared_write {
+            Some(akuma_exec::shm::fault_page(owner, page_va, flags, key))
+        } else if akuma_exec::mmu::user_flags::is_write(flags) {
+            // A private writable mapping must never be handed the writer's
+            // frame, or its stores would land in every mapper.
+            None
+        } else {
+            akuma_exec::shm::map_existing(owner, page_va, flags, key).filter(|ok| *ok)
+        };
+        if let Some(ok) = mapped {
+            if ok && akuma_exec::mmu::user_flags::is_exec(flags)
+                && let Some(pa) = owner.with_address_space(|a| a.translate(page_va))
+            {
+                let kva = akuma_exec::mmu::phys_to_virt(pa & !0xFFF) as usize;
+                akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
+            }
+            return ok;
+        }
+    }
     let map_flags = akuma_exec::mmu::lazy_map_flags(access, flags, file_backed);
     // I-cache maintenance is a property of the *mapping* this fault installs, not of
     // the arm the fault arrived through: a page mapped non-exec cannot be fetched
@@ -1339,7 +635,7 @@ fn demand_page_lazy_region(
     let shareable_mapping = akuma_fpcache::is_shareable_mapping(map_flags);
 
     if let akuma_exec::process::LazySource::File {
-        ref path, inode, mount_id, file_offset, filesz, segment_va, ..
+        inode, mount_id, file_offset, filesz, segment_va, ..
     } = *source
     {
         if demand_page_log_enabled() {
@@ -1407,19 +703,22 @@ fn demand_page_lazy_region(
         let needed = needed.min(akuma_pmm::user_readahead_budget(akuma_pmm::free_count()));
 
         // Batch-allocate all needed frames in one lock acquisition
-        let frame_pool = if needed > 0 {
-            alloc_pages_zeroed(needed).unwrap_or_else(|| {
+        let mut frame_pool: alloc::vec::Vec<Option<akuma_phys::FreshFrame>> = if needed > 0 {
+            akuma_phys::FreshFrame::alloc_batch_zeroed(needed).unwrap_or_else(|| {
                 // Fallback: allocate what we can one at a time, still honouring the
                 // reserve so we can't starve the kernel.
                 let mut v = alloc::vec::Vec::new();
                 for _ in 0..needed {
-                    match alloc_page_zeroed_user() {
+                    match akuma_phys::FreshFrame::alloc_zeroed_user() {
                         Some(f) => v.push(f),
                         None => break,
                     }
                 }
                 v
             })
+            .into_iter()
+            .map(Some)
+            .collect()
         } else {
             alloc::vec::Vec::new()
         };
@@ -1442,9 +741,7 @@ fn demand_page_lazy_region(
         // Concurrent munmap clears PTEs but never frees the intermediate tables this
         // loop's page-table reads walk (freed only at teardown, which can't run while
         // this thread faults).
-        #[cfg(kernel_smp_shared)]
         let fault_dropped_bkl = akuma_bkl::policy::fault_bkl_drop_enabled();
-        #[cfg(kernel_smp_shared)]
         if fault_dropped_bkl { akuma_exec::bkl::dropped_window_open(); }
         let mut cur_va = page_va;
         while cur_va < ra_end {
@@ -1467,13 +764,10 @@ fn demand_page_lazy_region(
                 if fpcache_verify_hits() {
                     let file_off = file_offset + (cur_va - segment_va);
                     let mut disk = alloc::vec![0u8; 0x1000];
-                    let got = if inode != 0 {
-                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, &mut disk)
-                    } else {
-                        (akuma_exec::runtime::runtime().read_at)(path, file_off, &mut disk)
-                    };
-                    let kva = akuma_exec::mmu::phys_to_virt(pf.addr).cast::<u8>();
-                    let cached = unsafe { core::slice::from_raw_parts(kva, 0x1000) };
+                    let got = (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, &mut disk);
+                    let mut cached_page = alloc::vec![0u8; 0x1000];
+                    (services().read_frame_bytes)(pf.addr, &mut cached_page);
+                    let cached = cached_page.as_slice();
                     if got == Ok(0x1000) && cached != disk.as_slice() {
                         let at = cached.iter().zip(disk.iter()).position(|(a, b)| a != b).unwrap_or(0);
                         akuma_pmm::dp_count(&akuma_pmm::DP_FILE_CACHE_MISMATCH, 1);
@@ -1502,7 +796,9 @@ fn demand_page_lazy_region(
             if pool_idx >= frame_pool.len() {
                 break;
             }
-            let pf = frame_pool[pool_idx];
+            // Staged until the fill below is done; `publish` hands it on as the address
+            // vocabulary type the install pass and the file cache work in.
+            let mut staged = frame_pool[pool_idx].take().expect("pool slot consumed once");
             pool_idx += 1;
 
             // `true` unless the fill below came up short. A page with no file data to
@@ -1516,15 +812,9 @@ fn demand_page_lazy_region(
                     let dst_off = pg_data_start - cur_va;
                     let file_off = file_offset + (pg_data_start - segment_va);
                     let len = pg_data_end - pg_data_start;
-                    let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                    let page_buf = unsafe {
-                        core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                    };
-                    let got = if inode != 0 {
-                        (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                    } else {
-                        (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                    };
+                    let got = staged.fill_with(dst_off, len, |page_buf| {
+                        (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, page_buf)
+                    });
                     // The range is already clamped to `filesz`, so anything less than
                     // `len` is a defect, not EOF. The frame came from
                     // `alloc_pages_zeroed`, so whatever was not read reads back as
@@ -1534,11 +824,15 @@ fn demand_page_lazy_region(
                     if !fill_complete {
                         akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
                         safe_print!(288,
-                            "[FILL-SHORT] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={} — page left zero-filled\n",
-                            pid, inode, file_off, len, got, cur_va, path);
+                            "[FILL-SHORT] pid={} mount={} inode={} file_off={:#x} want={} got={:?} va={:#x} — page left zero-filled\n",
+                            pid, mount_id, inode, file_off, len, got, cur_va);
                     }
                 }
             }
+
+            // Filled. From here the frame is the install pass's and the file cache's, in the
+            // address vocabulary (`PhysFrame`), exactly as before.
+            let pf = akuma_exec::PhysFrame::new(staged.publish());
 
             if is_exec {
                 // By the kernel VA (kva), not the user VA: the user page is not mapped
@@ -1583,7 +877,6 @@ fn demand_page_lazy_region(
         }
         // Close the window: re-takes the BKL for the install pass (unless a
         // still-open outer window means it must stay dropped).
-        #[cfg(kernel_smp_shared)]
         if fault_dropped_bkl { akuma_exec::bkl::dropped_window_close(); }
 
         // Pass C — INSTALL (under `as_lock`): atomically map each filled frame +
@@ -1640,7 +933,12 @@ fn demand_page_lazy_region(
         // Free race-lost frames + unused pool frames (outside the hold).
         for pf in race_free { free_page_at(pf, akuma_pmm::FreeSite::FaultRaceLost); }
         while pool_idx < frame_pool.len() {
-            free_page_at(frame_pool[pool_idx], akuma_pmm::FreeSite::FaultPoolSurplus);
+            if let Some(surplus) = frame_pool[pool_idx].take() {
+                surplus.free_at(
+                    akuma_primitives::preempt::current_tid() as u32,
+                    akuma_pmm::FreeSite::FaultPoolSurplus,
+                );
+            }
             pool_idx += 1;
         }
 
@@ -1670,7 +968,7 @@ fn demand_page_lazy_region(
         let (_, _, free) = akuma_pmm::stats();
         safe_print!(160, "[{}] pid={} va=0x{:x} readahead pool exhausted, {} free pages — retrying single page\n",
             access.tag(), pid, far_usize, free);
-        if let Some(pf) = alloc_page_zeroed_user() {
+        if let Some(mut staged) = akuma_phys::FreshFrame::alloc_zeroed_user() {
             // Re-read file data for this single page
             let pg_data_start = core::cmp::max(page_va, segment_va);
             let pg_data_end = core::cmp::min(page_va + 0x1000, segment_va + filesz);
@@ -1678,15 +976,9 @@ fn demand_page_lazy_region(
                 let dst_off = pg_data_start - page_va;
                 let file_off = file_offset + (pg_data_start - segment_va);
                 let len = pg_data_end - pg_data_start;
-                let page_ptr = akuma_exec::mmu::phys_to_virt(pf.addr);
-                let page_buf = unsafe {
-                    core::slice::from_raw_parts_mut(page_ptr.cast::<u8>().add(dst_off), len)
-                };
-                let got = if inode != 0 {
-                    (akuma_exec::runtime::runtime().read_at_by_inode)(path, inode, file_off, page_buf)
-                } else {
-                    (akuma_exec::runtime::runtime().read_at)(path, file_off, page_buf)
-                };
+                let got = staged.fill_with(dst_off, len, |page_buf| {
+                    (akuma_exec::runtime::runtime().read_at_by_inode)(mount_id, inode, file_off, page_buf)
+                });
                 // This arm never publishes to `file_page_cache`, so a short read here
                 // poisons only the faulting process — but it is the same defect and
                 // shares the counter, so a build that trips one can be told from a
@@ -1694,10 +986,12 @@ fn demand_page_lazy_region(
                 if got != Ok(len) {
                     akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_SHORT, 1);
                     safe_print!(288,
-                        "[FILL-SHORT/single] pid={} inode={} file_off={:#x} want={} got={:?} va={:#x} path={}\n",
-                        pid, inode, file_off, len, got, page_va, path);
+                        "[FILL-SHORT/single] pid={} mount={} inode={} file_off={:#x} want={} got={:?} va={:#x}\n",
+                        pid, mount_id, inode, file_off, len, got, page_va);
                 }
             }
+            // Filled; from here the frame is mapped-or-freed by hand below.
+            let pf = akuma_exec::PhysFrame::new(staged.publish());
             if is_exec {
                 // By the kernel VA (kva), not the user VA: the user page is not mapped
                 // yet at this point (the map happens below), so `ic ivau` on page_va
@@ -1813,15 +1107,10 @@ pub enum CowRemap<'a> {
 /// It is a function so the requirement has one statement instead of three, and so the
 /// two `CowRemap` arms cannot drift on it silently.
 #[inline]
-fn copy_page_under_as_lock(old_pa: usize, new_frame: akuma_exec::PhysFrame) {
-    // SAFETY: `old_pa` came from a valid user PTE and `new_frame` from the PMM, so
-    // both are identity-mapped, page-aligned and 4 KiB wide; the regions cannot
-    // overlap because `new_frame` was just allocated and is not mapped anywhere yet.
-    unsafe {
-        let src = akuma_exec::mmu::phys_to_virt(old_pa).cast_const();
-        let dst = akuma_exec::mmu::phys_to_virt(new_frame.addr);
-        core::ptr::copy_nonoverlapping::<u8>(src, dst, 0x1000);
-    }
+fn copy_page_under_as_lock(old_pa: usize, new_frame: &mut akuma_phys::FreshFrame) {
+    // `new_frame` is exclusively ours and unmapped, so the copy cannot overlap or race
+    // a reader; `old_pa` stays valid because the callers hold `as_lock`.
+    new_frame.copy_from_frame(akuma_phys::PhysAddr::from_usize(old_pa));
 }
 
 /// Finish a CoW break: private copy of `old_pa` into `new_frame`, the faulting VA
@@ -1857,9 +1146,10 @@ pub fn complete_cow_break(
     remap: CowRemap<'_>,
     page_va: usize,
     old_pa: usize,
-    new_frame: akuma_exec::PhysFrame,
+    mut new_frame: akuma_phys::FreshFrame,
 ) {
-    akuma_pmm::track_frame(new_frame.addr, akuma_pmm::FrameSource::UserData);
+    let new_pf = akuma_exec::PhysFrame::new(new_frame.pa().as_usize());
+    akuma_pmm::track_frame(new_pf.addr, akuma_pmm::FrameSource::UserData);
 
     let released_last_va = match remap {
         CowRemap::TakingAsLock(owner) => {
@@ -1882,12 +1172,12 @@ pub fn complete_cow_break(
                 // 2026-08-14 because it amplified the F8 wedge (§10.2); with the
                 // saved-context free gate landed, 10/10 amplified suite runs were
                 // clean and this is safe.
-                copy_page_under_as_lock(old_pa, new_frame);
+                copy_page_under_as_lock(old_pa, &mut new_frame);
                 let _ = aspace.map_page(
-                    page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                    page_va, new_pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
                 );
                 let _ = akuma_exec::mmu::flush_tlb_page(page_va, akuma_exec::mmu::TlbTarget::AllCores);
-                aspace.track_user_frame(new_frame);
+                aspace.track_user_frame(new_pf);
                 // CoW: the old page is freed via the global CoW refcount, never here.
                 Some(aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa)))
             });
@@ -1898,24 +1188,27 @@ pub fn complete_cow_break(
                 // frame. Callers proceed/retry: a completed sibling break means
                 // the retried access succeeds; a genuine unmap re-faults with a
                 // translation (not permission) code and takes its normal path.
-                free_page(new_frame);
+                new_frame.free_by(akuma_primitives::preempt::current_tid() as u32);
                 return;
             };
             released
         }
         CowRemap::CallerHoldsAsLock(aspace) => {
             // The caller's AS-lock guard already covers this copy.
-            copy_page_under_as_lock(old_pa, new_frame);
+            copy_page_under_as_lock(old_pa, &mut new_frame);
             // Overwrite PTE: same VA, new PA, RW (free fn → live TTBR0;
             // `map_user_page` would refuse the valid PTE).
             akuma_exec::mmu::remap_current_user_page(
-                page_va, new_frame.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
+                page_va, new_pf.addr, akuma_exec::mmu::user_flags::RW_NO_EXEC,
             );
-            aspace.track_user_frame(new_frame);
+            aspace.track_user_frame(new_pf);
             // CoW: the old page is freed via the global CoW refcount, never here.
             aspace.remove_user_frame(akuma_exec::runtime::PhysFrame::new(old_pa))
         }
     };
+
+    // Mapped and tracked: the frame is the address space's now, not ours to free.
+    let _ = new_frame.publish();
 
     // Only this address space's LAST VA on the frame gives up its global reference.
     //
@@ -1949,9 +1242,8 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
     if akuma_pmm::cow_ref_get(old_pa) == 0 { return true; } // not CoW, already writable
 
     // CoW page: allocate a private copy and remap as RW.
-    let new_frame = match alloc_page_zeroed() {
-        Some(f) => f,
-        None => return false, // OOM
+    let Some(new_frame) = akuma_phys::FreshFrame::alloc_zeroed_clean() else {
+        return false; // OOM
     };
     // Owner resolution is the call site's business (F2): this path resolves the
     // *address-space owner*, which is the correct pid for a `CLONE_VM` sibling.
@@ -1963,7 +1255,7 @@ fn ensure_cow_page_writable(pid: u32, page_va: usize) -> bool {
         complete_cow_break(CowRemap::TakingAsLock(owner), page_va, old_pa, new_frame);
         true
     } else {
-        free_page(new_frame); // no owner — free to avoid leak
+        new_frame.free_by(akuma_primitives::preempt::current_tid() as u32); // no owner — free to avoid leak
         false
     }
 }
@@ -2053,11 +1345,10 @@ fn ensure_sigreturn_trampoline(pid: u32) -> Option<usize> {
         return Some(SIGRETURN_TRAMPOLINE_ADDR);
     }
 
-    let frame = alloc_page_zeroed()?;
-    unsafe {
-        let ptr = akuma_exec::mmu::phys_to_virt(frame.addr).cast::<u8>();
-        core::ptr::copy_nonoverlapping(TRAMPOLINE.as_ptr(), ptr, TRAMPOLINE.len());
-    }
+    let mut staged = akuma_phys::FreshFrame::alloc_zeroed_clean()?;
+    staged.fill_with(0, TRAMPOLINE.len(), |buf| buf.copy_from_slice(&TRAMPOLINE));
+    // Mapped and tracked or freed by hand below, so it leaves the staging type here.
+    let frame = akuma_exec::PhysFrame::new(staged.publish());
 
     let (table_frames, installed) = akuma_exec::mmu::map_user_page(
         SIGRETURN_TRAMPOLINE_ADDR,
@@ -2369,10 +1660,9 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
     // FPSIMD extension record. The kernel never uses FP, so what `sync_el0_handler`
     // saved in this trap frame's NEON area is still the user's.
     //
-    // SAFETY: every `try_deliver_signal` caller is in the EL0 **sync** handler, whose
-    // 832-byte frame is the layout `sync_frame_neon` names. (The EL0 *IRQ* frame is
-    // also 832 bytes and puts its NEON block 16 bytes earlier.)
-    let neon = unsafe { &*sigframe::sync_frame_neon(frame.as_ptr()) };
+    // `frame` is the EL0 sync handler's frame (that is what a `FrameHandle` names), the
+    // only frame the NEON locator is defined for.
+    let neon = sigframe::SyncFrameNeon::read(frame);
     sf.fpsimd.magic = FPSIMD_MAGIC;
     sf.fpsimd.size = 528;
     // FPSR/FPCR are 32-bit registers stored in 64-bit slots on the kernel stack.
@@ -2469,9 +1759,8 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
 /// `a_crash()` (`strb wzr, [x0]`) and the process died reporting *SIGSEGV at
 /// FAR=0* instead of SIGABRT. Repro: `userspace/forktest/c_stress/abortsig.c`.
 ///
-/// Fatality uses `signal_is_fatal_default`, which is deliberately conservative
-/// (no SIGUSR1/2, no RT signals — see its doc comment); this path must not turn
-/// the self-host build's SIGUSR1 storm into a kill.
+/// Fatality uses `signal_is_fatal_default` (Linux's table). This path reads the
+/// *current* process's own disposition, so a signal only reaches it attributed.
 ///
 /// Diverges when the signal is fatal; returns normally otherwise.
 fn apply_default_signal_action(signal: u32) {
@@ -2630,63 +1919,53 @@ fn do_rt_sigreturn(frame: FrameHandle) -> Option<u64> {
     // Restore FPSIMD state from the signal frame into the trap frame's NEON save area;
     // sync_el0_handler restores the registers from there after this returns.
     if sf.fpsimd.magic == FPSIMD_MAGIC {
-        // SAFETY: `do_rt_sigreturn` is called only from the EL0 sync handler, so `frame`
-        // is the 832-byte sync frame whose layout `sync_frame_neon` names. The `&mut f`
-        // borrow above covers only the GPR block, which this area sits past.
-        let neon = unsafe { &mut *sigframe::sync_frame_neon(frame.as_ptr()) };
+        // `do_rt_sigreturn` is called only from the EL0 sync handler; this writes the
+        // NEON area, which sits past the GPR block `f` covers.
+        let mut neon = sigframe::SyncFrameNeon::read(frame);
         neon.fpsr = u64::from(sf.fpsimd.fpsr);
         neon.fpcr = u64::from(sf.fpsimd.fpcr);
         neon.vregs = sf.fpsimd.vregs;
+        neon.store(frame);
     }
 
     Some(sf.uc.uc_mcontext.regs[0])
 }
 
-/// Point this PE's `VBAR_EL1` at the kernel's exception vector table, and `isb`
-/// so it is in effect before anything can take an exception.
-///
-/// Called once per core: by [`init`] on the BSP, and by
-/// `smp_shared::secondary_shared_start` on every PSCI-woken secondary — cores
-/// share one kernel image, so they share one vector table. Those were two
-/// independently written copies of this `msr` until 2026-09-01 (the secondary's
-/// resolved the symbol with its own `adrp`/`add` pair); a vector-table install
-/// that exists twice is a vector-table install that can drift.
-///
-/// `msr vbar_el1` is deliberately absent from `akuma-cpu` — installing a vector
-/// table is a change of control flow, so the obligation is real and stays here,
-/// discharged once.
-pub fn install_vbar() {
-    // Bare metal only, for two independent reasons: the vector table itself is a
-    // `global_asm!` blob that only assembles for the kernel target, and
-    // `msr vbar_el1` is an EL1 instruction. See this crate's "Host builds" note.
-    //
-    // SAFETY: installs the address of this kernel's own vector table, a linker
-    // symbol in `.text`. `&raw const` resolves the symbol without reading
-    // through it; the `isb` makes the new base effective before the next
-    // exception can be taken.
-    #[cfg(target_os = "none")]
-    unsafe {
-        let vbar = &raw const exception_vector_table as u64;
+// ============================================================================
+// Entry services
+// ============================================================================
+//
+// The few things this crate needs that are unsafe to do and so are done by
+// `akuma-entry`, which owns the vector table and the `#[no_mangle]` shims: the IRQ
+// frame at a given stack pointer, two display-only reads of kernel memory for the fatal
+// EL1 crash dump, and a physical-frame read for the file-cache verify diagnostic.
+// Handed over as plain `fn` pointers so this crate can `forbid(unsafe_code)`.
 
-        // Set VBAR_EL1 (Vector Base Address Register)
-        core::arch::asm!(
-            "msr vbar_el1, {vbar}",
-            "isb",
-            vbar = in(reg) vbar
-        );
-    }
+/// See the section header.
+#[derive(Clone, Copy)]
+pub struct EntryServices {
+    /// The live IRQ trap frame whose base is `sp`.
+    pub irq_frame_at: fn(u64) -> IrqFrame,
+    /// Read a `u32` at a kernel address (crash dump only).
+    pub peek_u32: fn(u64) -> u32,
+    /// Read a `u64` at a kernel address (crash dump only).
+    pub peek_u64: fn(u64) -> u64,
+    /// Copy the start of physical frame `pa` into the buffer.
+    pub read_frame_bytes: fn(usize, &mut [u8]),
 }
 
-/// Install exception vector table
-pub fn init() {
-    // Initialize exception stack before enabling exceptions
-    init_exception_stack();
+static SERVICES: akuma_primitives::Registered<EntryServices> = akuma_primitives::Registered::new(
+    "exceptions: EntryServices not registered - akuma_entry::exceptions::init() registers them",
+);
 
-    install_vbar();
+/// Register the entry services. Called once, by `akuma-entry`, before the vector table is installed.
+pub fn register_entry_services(s: EntryServices) {
+    SERVICES.register(s);
+}
 
-    // Enable IRQs by clearing DAIF.I, now that VBAR_EL1 is installed and
-    // synchronized above — the ordering that makes taking an interrupt safe.
-    akuma_primitives::irq::unmask_irqs();
+#[inline]
+fn services() -> EntryServices {
+    SERVICES.require()
 }
 
 // ============================================================================
@@ -2709,8 +1988,7 @@ pub struct ExceptionHooks {
     pub dispatch_irq: fn(u32),
     /// `src/smp_shared.rs` `record_el0_trap` — the per-core "this core serviced
     /// a user trap" diagnostic counter (M3 cross-core-userspace proof). Only
-    /// exists under `kernel_smp_shared`, like the module that owns it.
-    #[cfg(kernel_smp_shared)]
+    /// exists under `kernel_bkl_smp`, like the module that owns it.
     pub record_el0_trap: fn(),
     /// `akuma_exec::process::reclaim::report_poison_value` — quarantine-poison
     /// decode for the wild-data-abort dump. Lives in akuma-exec's reclaim
@@ -2924,240 +2202,120 @@ fn alloc_page_zeroed_user() -> Option<akuma_exec::PhysFrame> {
     akuma_pmm::alloc_page_zeroed_user().map(akuma_exec::PhysFrame::new)
 }
 
-/// Contiguous-free batch allocation of `count` zeroed pages.
-#[inline]
-fn alloc_pages_zeroed(count: usize) -> Option<alloc::vec::Vec<akuma_exec::PhysFrame>> {
-    Some(
-        akuma_pmm::alloc_pages_zeroed(count)?
-            .into_iter()
-            .map(akuma_exec::PhysFrame::new)
-            .collect(),
-    )
-}
-
-/// Default exception handler - logs unexpected exceptions
-/// CRITICAL: Must NOT return if ELR/SPSR are invalid, or ERET will crash!
-#[unsafe(no_mangle)]
-extern "C" fn rust_default_exception_handler() {
-    note_exception_entry();
-    note_exc_class(3);
-    let esr = akuma_cpu::sysreg::esr_el1();
-    let elr = akuma_cpu::sysreg::elr_el1();
-    let spsr = akuma_cpu::sysreg::spsr_el1();
-    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
-    let sp = akuma_cpu::reg::sp() as u64;
-    let ec = (esr >> 26) & 0x3F;
-    let tid = akuma_exec::threading::current_thread_id();
-    
-    // Use stack-only print to avoid heap allocation in exception context
-    crate::safe_print!(128, "[Exception] Default handler: EC={:#x}, ELR={:#x}, SPSR={:#x}\n",
-        ec, elr, spsr);
-    crate::safe_print!(96, "  Thread={}, TTBR0={:#x}, SP={:#x}\n", tid, ttbr0, sp);
-    
-    // Check for dangerous ERET conditions
-    let target_el = spsr & 0xF;
-    if target_el == 0 {
-        crate::safe_print!(128, "  WARNING: SPSR indicates EL0 - ERET would go to user mode!\n");
-    }
-    if elr == 0 {
-        crate::safe_print!(128, "  WARNING: ELR=0 - ERET would jump to address 0!\n");
-    }
-    if elr < 0x4000_0000 && target_el != 0 {
-        crate::safe_print!(96, "  WARNING: ELR={:#x} looks like user address but SPSR is EL1!\n", elr);
-    }
-    
-    // If ERET would be dangerous, halt instead of returning
-    if elr == 0 || (target_el == 0 && elr < 0x4000_0000) {
-        crate::safe_print!(64, "  HALTING to prevent invalid ERET\n");
-        loop {
-            akuma_cpu::park::wfe();
-        }
-    }
-}
-
-/// UNIFIED IRQ handler for stack-based context switching
-/// 
-/// Used by both irq_el0_handler (user mode IRQs) and irq_handler (kernel mode IRQs).
-/// 
-/// Takes current SP, returns new SP if context switch needed (or 0 if no switch).
-/// The assembly does the actual SP switch AFTER this returns.
-/// Byte offset of the saved `SPSR_EL1` within the 832-byte IRQ trap frame (the frame
-/// `sp` points at when the vector calls `rust_irq_handler_with_sp`). Derived from the
-/// save order in `irq_el0_handler`/`irq_handler`: x30(0), x28/29..x0/1 (240), then
-/// ELR(240)/SPSR(248). Synthetic frames written by `setup_fake_irq_frame` place SPSR
-/// at the same slot (`frame.add(31)` = byte 248). The BKL reads it to learn the EL the
-/// `eret` will target. If the frame layout ever changes, update this constant.
-#[cfg(kernel_smp_shared)]
-const IRQ_FRAME_SPSR_OFFSET: usize = 248;
-
-/// Tripwire for the SMP=4 mixed-EL corruption (BKL_RUSTC_SCALING_BASELINE.md §5.1):
-/// inspect the IRQ frame the asm epilogue is about to restore (ELR at +240, SPSR at
-/// +248 — see `IRQ_FRAME_SPSR_OFFSET`). An EL0-target frame whose ELR sits in kernel
-/// text would eret userspace into kernel text. Covers BOTH epilogue outcomes (switch
-/// and no-switch); complements `[SGI-S POISON]`, which only sees the switch branch.
-#[inline]
-#[allow(clippy::verbose_bit_mask)]
-fn irq_eret_poison_check(final_sp: u64, switched: bool) {
-    // SAFETY: `final_sp` is the live IRQ trap frame the asm restores next.
-    let elr = unsafe { core::ptr::read_volatile((final_sp as usize + 240) as *const u64) };
-    let spsr = unsafe { core::ptr::read_volatile((final_sp as usize + 248) as *const u64) };
-    let kernel_text = akuma_exec::mmu::is_kernel_text(elr as usize);
-    // EL0-target frames must not eret into kernel text; EL1-target frames must
-    // eret INTO kernel text (an EL1 ELR like 0x8 is the boot-storm crash shape).
-    let poison = if (spsr & 0xF) == 0 { kernel_text } else { !kernel_text };
-    if poison {
-        crate::safe_print!(160,
-            "[IRQ POISON] eret elr={:#x} spsr={:#x} switched={} tid={} core={}\n",
-            elr, spsr, u64::from(switched),
-            akuma_exec::threading::current_thread_id(),
-            akuma_exec::bkl::current_core_id());
-    }
-}
-
-/// IRQ / SGI entry from the vector asm. Under real shared-kernel SMP this runs the
-/// scheduler and device handlers holding the Big Kernel Lock, then reconciles the BKL
-/// to the EL the pending `eret` will enter (release when returning to EL0, keep for
-/// EL1) using the SPSR of the frame we're about to restore — which, after a context
-/// switch, is the *incoming* thread's frame. No-op unless `cfg(kernel_smp_shared)`.
-#[unsafe(no_mangle)]
-extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
+/// IRQ / SGI entry: the root kernel's `akuma-vectors-aarch64` front end calls this from its
+/// `El0Irq`/`El1Irq` handlers.
+///
+/// The switch is an ordinary call ([`akuma_exec::threading::yield_now`]) made on the interrupted
+/// thread's own kernel stack, where the vector stub saved its frame, so there is no frame to
+/// hand back and nothing to reconcile against an SPSR. The BKL is taken for the dispatch
+/// unless this core already holds it (an EL1 window opened by code that holds it), and
+/// released at the end only if this entry took it — after a switch that is the resumed
+/// thread releasing the lock its core holds on its behalf, which is the return to EL0.
+///
+/// The tick and the scheduler SGI preempt EL0 always and EL1 when
+/// [`akuma_exec::threading::el1_preemptible`] says so (preemption not disabled, `POOL` free,
+/// the thread `RUNNING`). A kernel thread that holds the BKL gives up the core's hold for as
+/// long as it is switched out, and takes it again when it resumes.
+///
+/// An interrupt from EL0 is also a **return to user mode**, and it is the only one a thread
+/// in a pure compute loop ever makes. So, as Linux does on every return to user mode, the
+/// thread resuming into `el0` first takes a deferred kill and then one pending signal (see
+/// [`deliver_on_irq_return`]). Without it `kill -TERM` of a spinner did nothing and its
+/// handlers never ran (`userspace/forktest/c_stress/sigspin.c`,
+/// `docs/archive/HOOKED_IRQ_SIGNAL_DELIVERY.md`).
+pub fn irq_hooked(el0: Option<FrameHandle>) {
+    let from_el0 = el0.is_some();
     note_exception_entry();
     note_exc_class(2);
-    // Under shared SMP, read the interrupted frame's SPSR up front: SPSR.M[3:0]==0 means
-    // we preempted EL0 (userspace), where this core holds NO BKL (the invariant is "held
-    // iff in EL1"). That is exactly the case where the scheduler SGI can run BKL-FREE
-    // (M5c) — the switch is made atomic by POOL alone, so peer cores' timer ticks no
-    // longer serialize on the BKL. A scheduler SGI that preempted EL1 (a syscall/fault
-    // holding the BKL) must keep it — releasing would expose the interrupted excursion's
-    // shared state to peers.
-    #[cfg(kernel_smp_shared)]
-    #[allow(clippy::verbose_bit_mask)]
-    let interrupted_el0 = {
-        // SAFETY: `current_sp` is the live interrupted IRQ trap frame; SPSR at fixed off.
-        let cur_spsr = unsafe {
-            core::ptr::read_volatile((current_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
-        };
-        // SPSR.M[3:0] == 0 ⇒ interrupted context was EL0t (userspace).
-        (cur_spsr & 0xf) == 0
-    };
-    // If this IRQ interrupted EL0, userspace was running on this core — count it (captures
-    // pure compute loops that only get timer-preempted, not just syscalls).
-    #[cfg(kernel_smp_shared)]
-    if interrupted_el0 {
+    let held = akuma_exec::bkl::held_by_current();
+    if !held {
+        akuma_exec::bkl::enter_kernel();
+    }
+    // BKL-hold profiler only (one relaxed load unless `bkl-profile` turned it on): this
+    // excursion is the interrupt's, not the interrupted thread's.
+    akuma_exec::sync::set_core_tag_transient(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
+    if from_el0 {
         (hooks().record_el0_trap)();
     }
-
-    // Acknowledge the IRQ once, up front (the GIC IAR read needs no BKL).
-    let irq_opt = akuma_gic::acknowledge_irq();
-    match irq_opt {
-        Some(intid) => note_irq_intid(intid),
-        // IAR said "spurious" (1023): the vector fired but the interrupt was
-        // already consumed (peer core, or a de-asserted level source). These
-        // entries are invisible to the per-INTID counters yet still count in
-        // EXCEPTION_ENTRIES — exactly the gap the ~140K/s/core unattributed
-        // exception storm hid in (CROSS_CORE_THREAD_COLLAPSE.md §3).
+    let mut preempt = false;
+    match akuma_gic::acknowledge_irq() {
+        Some(irq) => {
+            note_irq_intid(irq);
+            if irq != akuma_gic::SGI_SCHEDULER {
+                (hooks().dispatch_irq)(irq);
+            }
+            akuma_gic::end_of_interrupt(irq);
+            // The tick preempts EL1 code as well as EL0, under `el1_preemptible`: kernel
+            // threads need not yield to share a core. The timer interrupt is a preemption
+            // point by itself; the tick rings no self-SGI (`timer_irq_handler`).
+            preempt = (irq == akuma_gic::SGI_SCHEDULER || irq == akuma_gic::TIMER_PPI)
+                && (from_el0 || akuma_exec::threading::el1_preemptible());
+        }
         None => {
             SPURIOUS_IRQS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
     }
-
-    // BKL-free fast path (M5c): a scheduler SGI that preempted EL0. This core held no BKL,
-    // and `sgi_scheduler_handler_with_sp` makes the switch atomic on POOL. Reconcile at
-    // the end (re)acquires the BKL only if the thread we resume into is EL1.
-    // IMPORTANT: use reconcile_for_spsr_no_ticket here because we never called
-    // enter_kernel — a normal reconcile would leak a ticket.
-    #[cfg(kernel_smp_shared)]
-    if interrupted_el0
-        && akuma_bkl::policy::sched_bklfree_el0_enabled()
-        && matches!(irq_opt, Some(i) if i == akuma_gic::SGI_SCHEDULER)
-    {
-        let new_sp =
-            akuma_exec::threading::sgi_scheduler_handler_with_sp(akuma_gic::SGI_SCHEDULER, current_sp);
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is a live IRQ trap frame; SPSR sits at a fixed offset.
-        let spsr = unsafe {
-            core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
-        };
-        akuma_exec::bkl::reconcile_for_spsr_no_ticket(spsr);
-        irq_eret_poison_check(final_sp, new_sp != 0);
-        return new_sp;
+    if preempt {
+        akuma_exec::threading::yield_now();
+        // The thread resumed here is finishing its own interrupt return, whatever its tag
+        // says it was last doing; and the core may be another one now.
+        akuma_exec::sync::set_core_tag_transient(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_IRQ);
     }
-
-    // BKL-free device-IRQ dispatch (Phase 7a, docs/archive/BKL_PHASE7_AUDIT.md §2.3/§5).
-    // The timer is the only device IRQ this kernel registers
-    // (`irq::register_handler(27, timer::timer_irq_handler)`), and its handler
-    // (`akuma_exec::alarms::on_timer_interrupt`'s alarm queue, the preemption watchdog, the
-    // scheduler-SGI trigger) no longer touches anything the BKL alone protects: the
-    // alarm queue has its own `Spinlock`, the watchdog reads are per-thread atomics, and
-    // `trigger_sgi_self`/GIC ack/EOI are raw MMIO. Unlike the M5c fast path above, this
-    // has no context switch and never calls `enter_kernel`, so there is nothing to
-    // reconcile — the interrupted thread's BKL hold state (held or not, EL0 or EL1) is
-    // left completely untouched by this excursion.
-    #[cfg(all(kernel_smp_shared, kernel_no_bkl_irq))]
-    if akuma_bkl::policy::irq_bkl_drop_enabled()
-        && let Some(irq) = irq_opt
-        && irq != akuma_gic::SGI_SCHEDULER
-    {
-        (hooks().dispatch_irq)(irq);
-        akuma_gic::end_of_interrupt(irq);
-        return 0;
+    if let Some(frame) = el0 {
+        deliver_on_irq_return(frame);
     }
-
-    // Device IRQ, or a scheduler SGI that preempted EL1 (BKL held): run holding the BKL.
-    akuma_exec::bkl::enter_kernel();
-    // Profiler bookkeeping only (no-op unless `bkl-profile` is on): the IRQ dispatch is a
-    // TRANSIENT excursion that does not belong to the interrupted thread, so it stamps the
-    // per-core sampling cache alone and leaves the interrupted thread's own per-thread tag
-    // intact. Without this the core would stay mislabeled "irq/sched" for the rest of the
-    // syscall it interrupted, attributing peer contention against the *remainder* of a long
-    // syscall to the brief IRQ instead.
-    #[cfg(kernel_smp_shared)]
-    akuma_exec::sync::set_core_tag_transient(
-        akuma_exec::bkl::current_core_id(),
-        akuma_exec::sync::HOLD_TAG_IRQ,
-    );
-
-    let new_sp = if let Some(irq) = irq_opt {
-        if irq == akuma_gic::SGI_SCHEDULER {
-            akuma_exec::threading::sgi_scheduler_handler_with_sp(irq, current_sp)
-        } else {
-            // Normal device IRQ: dispatch then EOI.
-            (hooks().dispatch_irq)(irq);
-            akuma_gic::end_of_interrupt(irq);
-            0
-        }
-    } else {
-        0
-    };
-
-    // End of the transient excursion: point the sampling cache back at whichever thread
-    // this core is about to run. ONE rule covers both outcomes, which is why the old
-    // `if new_sp == 0 { restore saved tag }` special case is gone — after a switch
-    // (`new_sp != 0`) `current_thread_id()` is the INCOMING thread and we install its own
-    // tag (previously it inherited `irq/sched` and kept it for the rest of its syscall);
-    // with no switch it is the interrupted thread and we reinstall the tag it never lost.
-    #[cfg(kernel_smp_shared)]
     akuma_exec::sync::load_thread_tag_to_core(
         akuma_exec::bkl::current_core_id(),
         akuma_exec::threading::current_thread_id(),
     );
+    if !held {
+        akuma_exec::bkl::leave_kernel();
+    }
+}
 
-    #[cfg(kernel_smp_shared)]
-    {
-        // The asm erets into `new_sp`'s frame after a switch, else the interrupted
-        // `current_sp` frame. Reconcile the BKL to that frame's target EL.
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        // SAFETY: `final_sp` is a live IRQ trap frame; SPSR sits at a fixed offset.
-        let spsr = unsafe {
-            core::ptr::read_volatile((final_sp as usize + IRQ_FRAME_SPSR_OFFSET) as *const u64)
-        };
-        akuma_exec::bkl::reconcile_for_spsr(spsr);
+/// The return-to-user-mode work of an interrupt from EL0 under the hooked scheduler, run
+/// by the thread that is about to resume into `frame` (after any switch), BKL held.
+///
+/// 1. A **deferred kill** posted by a peer's `kill_thread_group` ends the thread here, as
+///    it does at the syscall boundary in [`sync_el0`]: nothing is held below this frame but
+///    the BKL, which the terminal mark+yield reconciles.
+/// 2. One **pending signal** is delivered into `frame`, exactly as on syscall return, with
+///    two differences that both follow from there being no syscall: the ESR passed is 0, so
+///    `SA_RESTART` never backs `ELR` up onto an `svc` that was not there; and `x0` is the
+///    interrupted code's live register, which the signal frame saves as it stands, so it is
+///    replaced only by the handler's argument. There is no [`akuma_exec::threading::sigframe_active`]
+///    bound either: that bound protects a syscall return the program has not observed yet,
+///    and an interrupt carries none.
+///
+/// Interrupts are open for the delivery: building the frame may fault in the user stack,
+/// and the sync path does that work with them open too. The interrupt that brought us here
+/// has had its EOI, so a nested one is an ordinary EL1 interrupt window.
+fn deliver_on_irq_return(frame: FrameHandle) {
+    if akuma_exec::threading::take_thread_kill_request() {
+        let tid = akuma_exec::threading::current_thread_id();
+        akuma_exec::threading::mark_thread_terminated(tid);
+        loop {
+            akuma_exec::threading::yield_now();
+        }
     }
-    {
-        let final_sp = if new_sp != 0 { new_sp } else { current_sp };
-        irq_eret_poison_check(final_sp, new_sp != 0);
+    let sig_mask = akuma_exec::threading::thread_signal_mask();
+    let Some(sig) = akuma_exec::threading::take_pending_signal(sig_mask) else {
+        return;
+    };
+    let thread_slot = akuma_exec::threading::current_thread_id();
+    // Go's SIGURG before its thread has a sigaltstack: not ready yet, keep it pending —
+    // the same rule as the syscall-return path.
+    if sig == 23 && akuma_exec::threading::get_sigaltstack(thread_slot).0 == 0 {
+        akuma_exec::threading::pend_signal_for_thread(thread_slot, sig);
+        return;
     }
-    new_sp
+    akuma_primitives::irq::unmask_irqs_sync();
+    if try_deliver_signal(frame, sig, 0, false, 0) {
+        frame.set_x0(u64::from(sig));
+    } else {
+        apply_default_signal_action(sig); // diverges if fatal
+    }
+    akuma_primitives::irq::mask_irqs_sync();
 }
 
 /// Landing pad for EL1 fault recovery.
@@ -3174,8 +2332,7 @@ extern "C" fn rust_irq_handler_with_sp(current_sp: u64) -> u64 {
 ///
 /// Safety: ERET from an EL1 exception restores SPSR_EL1 which had EL1 mode
 /// bits, so this function runs at EL1 and can safely call kernel functions.
-#[unsafe(no_mangle)]
-extern "C" fn el1_fault_recovery_pad() {
+pub fn el1_fault_recovery() {
     akuma_exec::process::return_to_kernel_from_fault(-14);
 }
 
@@ -3493,82 +2650,11 @@ fn write_allowed_by_record(pid: u32, va: usize) -> bool {
     recorded_protection(pid, va).is_none_or(akuma_exec::mmu::user_flags::is_write)
 }
 
-/// Runs only on anomaly paths (`EAGER-UPGRADE`, `WILD-DA`), never per-fault.
-fn print_page_forensics(tag: &str, pid: u32, va: usize) {
-    let page_va = va & !0xFFF;
-    let ttbr0 = akuma_cpu::sysreg::ttbr0_el1();
-    let l0_addr = (ttbr0 & 0x0000_FFFF_FFFF_F000) as usize;
-    let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr) as *const u64;
-    let Some(pa) = akuma_exec::mmu::translate_user_va(l0_ptr, page_va).map(|p| p & !0xFFF) else {
-        crate::safe_print!(128, "[{}] pid={} va={:#x} UNMAPPED\n", tag, pid, page_va);
-        return;
-    };
-
-    // Read through the kernel identity map, not the user VA: the point is to
-    // inspect the frame regardless of what the user PTE currently permits.
-    let words = unsafe {
-        let p = akuma_exec::mmu::phys_to_virt(pa).cast::<u64>();
-        [p.read_volatile(), p.add(1).read_volatile(),
-         p.add(2).read_volatile(), p.add(3).read_volatile()]
-    };
-    // Distance, not the raw seq: "freed 40 frees ago" and "freed 300 000 frees
-    // ago" are different findings, and only the first implicates this frame. With
-    // no record at all there IS no distance — printing one computed against a
-    // default seq of 0 yields a large number that reads exactly like a real
-    // (innocent) age, so report the absence instead.
-    let (tid_freed, free_age) = match akuma_pmm::last_free_record(pa) {
-        Some((tid, seq)) => (i64::from(tid), i64::from(akuma_pmm::free_ledger_seq().wrapping_sub(seq))),
-        None => (-1, -1),
-    };
-    let tracked = akuma_exec::process::lookup_process_shared(pid)
-        .is_some_and(|p| p.address_space.tracks_user_frame(pa));
-    crate::safe_print!(255,
-        "[{}] pid={} va={:#x} pa={:#x} FREE={} cow_ref={} tracked={} \
-         last_free=(tid={} age={}) [-1 = never freed] head={:#x},{:#x},{:#x},{:#x}\n",
-        tag, pid, page_va, pa,
-        akuma_pmm::is_page_free(pa),
-        akuma_pmm::cow_ref_get(pa),
-        tracked, tid_freed, free_age,
-        words[0], words[1], words[2], words[3]);
-    // The reference history is what separates "this page's count was legitimately
-    // 0" from "someone decremented it once too often".
-    akuma_pmm::print_cow_history(pa);
-
-    // How many eager regions claim this VA? The fault handler answers from the
-    // first `Vec` match, so two overlapping regions mean the record it consulted
-    // may describe a mapping that no longer exists — the current leading theory
-    // for this anomaly. One region refutes it; more than one convicts.
-    let regions = akuma_exec::process::eager_regions_containing(pid, page_va);
-    crate::safe_print!(96, "  [REGIONS] va={:#x} claimed_by={}\n", page_va, regions.len());
-    for (start, pages, flags) in regions.iter().take(4) {
-        crate::safe_print!(128, "    start={:#x} pages={} flags={:#x}\n", start, pages, flags);
-    }
-
-    // What the PTE actually says. A write can permission-fault on a read-only page,
-    // on a `PROT_NONE` guard page, and on a kernel-only page — three different
-    // defects that a PA alone cannot tell apart, and the repair above grants the
-    // write in all three cases.
-    if let Some(pte) = akuma_exec::mmu::user_pte_raw(l0_ptr, page_va) {
-        crate::safe_print!(160, "  [PTE] va={:#x} raw={:#x} ap={}\n",
-            page_va, pte, akuma_exec::mmu::ap_name(pte));
-    } else {
-        crate::safe_print!(96, "  [PTE] va={:#x} no valid descriptor\n", page_va);
-    }
-
-    // A lazy region covering the same VA as an eager one is invisible to
-    // `[REGIONS]` but decisive here: a `PROT_NONE` lazy region makes the fault
-    // handler skip its own lazy arm and fall through to the eager repair, which
-    // then promotes a page userspace asked to be unmapped.
-    if let Some((flags, _src, start, size)) =
-        akuma_exec::process::lazy_region_lookup_for_page_fault(pid, page_va)
-    {
-        crate::safe_print!(192,
-            "  [LAZY] va={:#x} ALSO covered by lazy region start={:#x} size={:#x} flags={:#x} prot_none={}\n",
-            page_va, start, size, flags, akuma_exec::mmu::user_flags::is_none(flags));
-    } else {
-        crate::safe_print!(96, "  [LAZY] va={:#x} no lazy region\n", page_va);
-    }
-}
+#[cfg(feature = "forensics")]
+use akuma_exceptions_forensics::print_page_forensics;
+/// Forensics are compiled out without the `forensics` feature.
+#[cfg(not(feature = "forensics"))]
+fn print_page_forensics(_tag: &str, _pid: u32, _va: usize) {}
 
 /// Returns true if the fault was a CoW write permission fault, the CoW page was
 /// successfully resolved (new frame allocated, old PA remapped), and the caller
@@ -3605,9 +2691,8 @@ fn try_resolve_el1_cow_fault() -> bool {
 
     if akuma_pmm::cow_ref_get(old_pa) == 0 { return false; }
 
-    let new_frame = match alloc_page_zeroed() {
-        Some(f) => f,
-        None => return false, // OOM — fall through to kill-process path
+    let Some(new_frame) = akuma_phys::FreshFrame::alloc_zeroed_clean() else {
+        return false; // OOM — fall through to kill-process path
     };
 
     // F2 FIXED 2026-08-13: resolve the **address-space owner**, not the current pid —
@@ -3646,7 +2731,7 @@ fn try_resolve_el1_cow_fault() -> bool {
         // No process owner found: cannot remap — free the new frame to avoid a leak.
         // Do NOT cow_ref_dec: the page is still mapped RO with the original refcount.
         // Returning false lets the EL1 handler kill the process via the normal path.
-        free_page(new_frame);
+        new_frame.free_by(akuma_primitives::preempt::current_tid() as u32);
         false
     }
 }
@@ -3708,8 +2793,24 @@ fn try_resolve_el1_user_copy_lazy_fault() -> bool {
 /// `[x2, x3, x0, x1, x29, x30]` (see `sync_el1_handler` asm). x30 in particular
 /// names the CALLER when the fault is a wild branch (`blr` through a corrupt
 /// pointer leaves the call site + 4 in LR).
-#[unsafe(no_mangle)]
-extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
+pub fn sync_el1(saved_regs: Option<[u64; 6]>) -> El1Resume {
+    let mut resume = El1Resume::Retry;
+    sync_el1_body(saved_regs, &mut resume);
+    resume
+}
+
+/// Where the `eret` that ends an EL1 sync exception should go.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum El1Resume {
+    /// `ELR_EL1` as the vector saved it: retry the faulting instruction (a resolved fault).
+    Retry,
+    /// A registered user-copy recovery trampoline, so the copy returns `EFAULT`.
+    At(u64),
+    /// The landing pad for a dying process's unrecoverable kernel-code fault.
+    RecoveryPad,
+}
+
+fn sync_el1_body(saved_regs: Option<[u64; 6]>, resume: &mut El1Resume) {
     note_exception_entry();
     note_exc_class(1);
     {
@@ -3762,11 +2863,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
     // Saved-register block from the vector: [x2, x3, x0, x1, x29, x30].
     // x30 names the caller when ELR is a wild branch target (blr through a
     // corrupt pointer leaves call site + 4 in LR).
-    if !saved_regs.is_null() {
-        let (r_x2, r_x3, r_x0, r_x1, r_x29, r_x30) = unsafe {
-            (saved_regs.read(), saved_regs.add(1).read(), saved_regs.add(2).read(),
-             saved_regs.add(3).read(), saved_regs.add(4).read(), saved_regs.add(5).read())
-        };
+    if let Some([r_x2, r_x3, r_x0, r_x1, r_x29, r_x30]) = saved_regs {
         safe_print!(256, "  x0={r_x0:#x} x1={r_x1:#x} x2={r_x2:#x} x3={r_x3:#x}\n");
         safe_print!(256, "  x29={r_x29:#x} x30(LR)={r_x30:#x} core={}\n",
             akuma_exec::bkl::current_core_id());
@@ -3774,7 +2871,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 
     // Try to read the faulting instruction (if ELR is in kernel range)
     if (0x4000_0000..0x8000_0000).contains(&elr) {
-        let instr = unsafe { *(elr as *const u32) };
+        let instr = (services().peek_u32)(elr);
         safe_print!(256, "  Instruction at ELR: {instr:#010x}\n");
 
         // Decode ARM64 load/store instruction to find base register
@@ -3803,15 +2900,8 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             if fault_handler != 0 {
                 // Redirect ELR to the recovery handler
                 // This allows copy_from_user/copy_to_user to return EFAULT safely.
-                // Bare metal only: `msr elr_el1` is an EL1 instruction, and off
-                // the kernel target there is no exception to return from. See the
-                // crate's "Host builds" note.
-                // SAFETY: `fault_handler` is the trampoline the in-progress user
-                // copy registered on this thread, in kernel text.
-                #[cfg(target_os = "none")]
-                unsafe {
-                    core::arch::asm!("msr elr_el1, {}", in(reg) fault_handler);
-                }
+                // The entry shim performs the `msr elr_el1` (bare metal only).
+                *resume = El1Resume::At(fault_handler);
                 // Clear the handler to prevent infinite loops if the recovery code itself faults
                 akuma_exec::threading::set_user_copy_fault_handler(0);
                 return;
@@ -3845,13 +2935,8 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
             // The landing pad yields in a loop; the scheduler stops dispatching
             // this thread once cleanup_terminated() recycles the slot.
             // Bare metal only, as above.
-            // SAFETY: `el1_fault_recovery_pad` is this crate's own landing pad,
-            // in kernel text and mapped in every address space.
-            #[cfg(target_os = "none")]
-            unsafe {
-                let pad = el1_fault_recovery_pad as *const () as usize as u64;
-                core::arch::asm!("msr elr_el1, {}", in(reg) pad);
-            }
+            // The entry shim points ELR at `el1_fault_recovery_pad`.
+            *resume = El1Resume::RecoveryPad;
             return;
         }
     }
@@ -3873,7 +2958,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 
         // Read L0[0] entry to check if it points to valid L1
         let l0_base = ttbr0 & !0xFFF; // Mask off ASID etc
-        let l0_entry = unsafe { *(l0_base as *const u64) };
+        let l0_entry = (services().peek_u64)(l0_base);
         safe_print!(256, "    L0[0] entry: {l0_entry:#018x}\n");
 
         // Check if L0[0] looks valid (should be table descriptor)
@@ -3892,7 +2977,7 @@ extern "C" fn rust_sync_el1_handler(saved_regs: *const u64) {
 
         // Now read L1[0] to check the device memory block entry
         if is_valid && is_table && (0x4000_0000..0x8000_0000).contains(&l1_addr) {
-            let l1_entry = unsafe { *(l1_addr as *const u64) };
+            let l1_entry = (services().peek_u64)(l1_addr);
             safe_print!(256, "    L1[0] entry: {l1_entry:#018x}\n");
 
             // L1[0] should be a 1GB block descriptor for device memory
@@ -4075,12 +3160,11 @@ pub fn spurious_svc_count() -> u64 {
 
 /// Synchronous exception handler from EL0 (user mode)
 /// Returns the syscall return value, or doesn't return if process exits
-#[unsafe(no_mangle)]
 /// Syscall / EL0-fault entry from the vector asm. Wraps the real handler with the
 /// Big Kernel Lock (real shared-kernel SMP): a thread executing kernel code on behalf
 /// of an EL0 trap holds the BKL for the whole excursion, so its shared-state access
 /// (process table, VFS, net, page tables) is serialized against other cores. No-op
-/// unless `cfg(kernel_smp_shared)` (see `akuma_exec::bkl`). The IRQ/scheduler path's
+/// unless `cfg(kernel_bkl_smp)` (see `akuma_exec::bkl`). The IRQ/scheduler path's
 /// BKL reconciliation is added in M2; here the syscall thread may still be preempted
 /// mid-excursion, which is correct on the single active core of M0/M1.
 /// `esr`/`far` are the trap syndrome snapshotted by the vector asm at exception
@@ -4089,11 +3173,7 @@ pub fn spurious_svc_count() -> u64 {
 /// below runs with IRQs enabled, so this thread can be preempted (or even resume
 /// on another core) and the live syndrome registers then belong to someone
 /// else's trap. Same for ELR_EL1 — use the frame's saved copy.
-extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u64) -> u64 {
-    // SAFETY: `frame` is what the vector asm just pushed for this handler on this
-    // thread's kernel stack, exclusively ours until the epilogue `eret`s - the
-    // handle's one contract.
-    let frame = unsafe { FrameHandle::new(frame) };
+pub fn sync_el0(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     // Outermost span for `read-profile` (ZST otherwise): started before the BKL
     // acquire and the entry tripwires, so `exc - hs` names everything this
     // wrapper does around the dispatch. See `crate::syscall::utils::read_profile`.
@@ -4117,11 +3197,8 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // the body's now-redundant carve-out guard nests as an inner (depth-2) window.
     // Faults (EC != SVC64) always take the lock. `frame` is this thread's own
     // kernel stack — reading x8 pre-acquire touches no shared state.
-    #[cfg(kernel_smp_shared)]
     let bkl_optout = ((esr >> 26) & 0x3F) == esr::EC_SVC64
         && akuma_bkl::policy::syscall_bkl_optout(frame.x8());
-    #[cfg(not(kernel_smp_shared))]
-    let bkl_optout = false;
     if !bkl_optout {
         akuma_exec::bkl::enter_kernel();
     }
@@ -4131,7 +3208,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // left in place it would make this excursion's IRQ epilogues silently RELEASE the
     // BKL mid-syscall. Heal it and say so. Must stay AHEAD of the opt-out window open
     // below so it can never mistake this excursion's own legitimate window for a leak.
-    #[cfg(kernel_smp_shared)]
     if akuma_exec::bkl::in_dropped_window() {
         let leaked = akuma_exec::bkl::reset_dropped_windows();
         if leaked != 0 {
@@ -4156,7 +3232,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     }
     // Record that this core serviced a user (EL0) trap — the M3 cross-core-userspace
     // proof (an EL0 trap only comes from userspace running on this core).
-    #[cfg(kernel_smp_shared)]
     (hooks.record_el0_trap)();
     let ret = rust_sync_el0_handler_inner(frame, esr, far);
     // Deferred thread-kill (real shared-kernel SMP): if a peer core's
@@ -4171,7 +3246,6 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
     // its window and takes the lock — it never returns to EL0, so this is the
     // window's real end, and the terminal mark+yield must run in the same
     // BKL-held state every other path gives it.
-    #[cfg(kernel_smp_shared)]
     if akuma_exec::threading::take_thread_kill_request() {
         if bkl_optout {
             akuma_exec::bkl::dropped_window_close_no_reacquire();
@@ -4213,11 +3287,9 @@ extern "C" fn rust_sync_el0_handler(frame: *mut UserTrapFrame, esr: u64, far: u6
 /// window leaked past an excursion's end (abnormal unwind skipping a guard destructor,
 /// or a recycled thread slot inheriting depth) and is part of every phase's pass
 /// criterion; the boot suite asserts it stays 0 (see `process_tests`).
-#[cfg(kernel_smp_shared)]
 static STALE_WINDOW_HEALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// Read the stale-window heal counter (see [`STALE_WINDOW_HEALS`]).
-#[cfg(kernel_smp_shared)]
 #[cfg_attr(not(kernel_tests), allow(dead_code))]
 pub fn stale_window_heal_count() -> u64 {
     STALE_WINDOW_HEALS.load(core::sync::atomic::Ordering::Relaxed)
@@ -4234,7 +3306,6 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
             let syscall_num = frame_ref.x8;
             // BKL-hold profiler: tag this core's excursion with the syscall number so a
             // waiting peer can attribute its BKL wait to this syscall (shared-kernel SMP).
-            #[cfg(kernel_smp_shared)]
             akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), syscall_num);
 
             // Stale-I-cache spurious-SVC guard (§7k.4 root cause). At an EC_SVC64
@@ -4650,7 +3721,6 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
             // Thread-group leader: mmap_regions and fault_mutex live on the leader Process
             // (CLONE_VM worker threads have their own Process slot but empty mmap_regions).
             let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
-            #[cfg(kernel_smp_shared)]
             akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_FAULT);
 
             // Translation/permission fault (ISS bits [5:2]) — try demand paging
@@ -4701,7 +3771,7 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                     // Allocate the CoW destination BEFORE taking `as_lock` — alloc must
                     // stay outside the hold (the PMM OOM/reclaim path can re-enter
                     // `as_lock`). Freed below if the page didn't actually need CoW.
-                    if let Some(new_frame) = alloc_page_zeroed() {
+                    if let Some(new_frame) = akuma_phys::FreshFrame::alloc_zeroed_clean() {
                         let mut did_cow = false;
                         if let Some(owner) = akuma_exec::process::lookup_process_shared(as_owner) {
                             // PTE overwrite + 4 KiB copy under the AS lock (shared-kernel
@@ -4756,7 +3826,7 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                             return frame.x0();
                         }
                         // Not a CoW page (or no owner): return the unused frame.
-                        free_page(new_frame);
+                        // (If the break ran, `complete_cow_break` consumed it.)
                     }
                     } // end write_allowed_by_record
                     // OOM or not-CoW: fall through to the lazy permission upgrade / SIGSEGV.
@@ -5132,7 +4202,6 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
             // `far` is the entry snapshot (see rust_sync_el0_handler).
             let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
             let as_owner = akuma_exec::process::address_space_owner_pid_for_fault().unwrap_or(pid);
-            #[cfg(kernel_smp_shared)]
             akuma_exec::sync::set_holder_tag(akuma_exec::bkl::current_core_id(), akuma_exec::sync::HOLD_TAG_FAULT);
 
             let fault_type = iss & 0x3C;
@@ -5438,131 +4507,3 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Regression probe: is the EL1 sync exception transparent to x4-x18?
-//
-// Gated on `kernel_tests` like `src/process_tests.rs`, its only caller: the
-// extreme-size profile drops the boot suite, and a probe that provokes a data
-// abort has no business in a build that will never assert on it.
-// ---------------------------------------------------------------------------
-
-#[cfg(all(kernel_tests, target_os = "none"))]
-unsafe extern "C" {
-    fn __el1_gpr_transparency_probe(out: *mut u64, base: u64) -> u64;
-}
-
-#[cfg(all(kernel_tests, target_os = "none"))]
-global_asm!(
-    r#"
-.text
-.global __el1_gpr_transparency_probe
-.global __el1_gpr_transparency_landing
-
-// x0 = out (15 u64 slots), x1 = pattern base.
-// Loads `base + N` into xN for N in 4..=18, takes ONE EL1 data abort, and writes
-// what those registers hold *after* the exception into `out`. The caller compares.
-//
-// Leaf and stackless on purpose, for the same reason __arch_copy_user_memory is:
-// the recovery rewrites ELR_EL1 to the landing label below, so anything this
-// function pushed would never be popped. It also keeps the live pattern out of
-// x0-x3/x29/x30, which the vector has always saved — those would pass even with
-// the bug.
-__el1_gpr_transparency_probe:
-    add     x4,  x1, #4
-    add     x5,  x1, #5
-    add     x6,  x1, #6
-    add     x7,  x1, #7
-    add     x8,  x1, #8
-    add     x9,  x1, #9
-    add     x10, x1, #10
-    add     x11, x1, #11
-    add     x12, x1, #12
-    add     x13, x1, #13
-    add     x14, x1, #14
-    add     x15, x1, #15
-    add     x16, x1, #16
-    add     x17, x1, #17
-    add     x18, x1, #18
-
-    mov     x2, x0                  // out pointer: x2 is saved by the vector
-    // A high user VA nothing maps or lazily backs. NOT a low one like 0x1000:
-    // measured 2026-08-28, a store there did not fault during the boot suite, so
-    // the first version of this test passed vacuously on a kernel with the bug.
-    movz    x3, #0x6000, lsl #32    // 0x0000_6000_0000_0000
-    str     x4, [x3]                // <-- the abort. ELR is rewritten to 1f, or
-                                    //     a resolved fault retries this store.
-__el1_gpr_transparency_landing:
-1:  stp     x4,  x5,  [x2, #0]
-    stp     x6,  x7,  [x2, #16]
-    stp     x8,  x9,  [x2, #32]
-    stp     x10, x11, [x2, #48]
-    stp     x12, x13, [x2, #64]
-    stp     x14, x15, [x2, #80]
-    stp     x16, x17, [x2, #96]
-    str     x18,      [x2, #112]
-    mov     x0, #0
-    ret
-    "#
-);
-
-/// Which of x4..x18 an EL1 sync exception failed to preserve — a bitmask where
-/// bit `n - 4` means register `xn` came back wrong. `0` is the healthy answer.
-///
-/// The property under test is that `sync_el1_handler` is transparent to every
-/// GPR, because `try_resolve_el1_cow_fault` and
-/// `try_resolve_el1_user_copy_lazy_fault` resolve the fault and `eret` back to
-/// **re-execute the faulting instruction**. A retry is only correct if that
-/// instruction's inputs survived, so a register the handler clobbers is stored
-/// into memory by the retry as if it were data.
-///
-/// The vector used to save x0-x3/x29/x30 only. That was enough while
-/// `__arch_copy_user_memory` was a byte loop holding its one live datum in x3;
-/// the 2026-08-27 widening put live data in x3-x10, and a `read(2)` whose
-/// destination page faulted in mid-copy then stored leftover handler state —
-/// 24 bytes per page, with `read` reporting the full count
-/// (`docs/archive/BUSYBOX_HASH_MISCOMPUTE.md`).
-///
-/// Runs on whichever recovery arm the fault takes: the resolve-and-retry paths if
-/// the VA turns out to be lazily mappable, otherwise the registered user-copy
-/// trampoline. Both return through this same vector, so either pins the fix.
-///
-/// Returns `(clobber_mask, aborts_taken)`. **`aborts_taken` is not decoration** —
-/// if VA `0x1000` were mapped in the current address space the store would simply
-/// succeed, no exception would fire, and the mask would read `0` for a kernel with
-/// the bug wide open. A test that cannot fail is worse than no test
-/// (`docs/archive/SMP_ADOPTED_IDLE_STACK_CLOBBER.md` is the local precedent), so
-/// the caller must require that the count moved.
-#[must_use]
-#[cfg(all(kernel_tests, target_os = "none"))]
-pub fn el1_sync_gpr_clobber_mask() -> (u32, u64) {
-    const BASE: u64 = 0x5A5A_0000;
-    const EC_DATA_ABORT_EL1: usize = 0x25;
-    let mut out = [0u64; 15];
-
-    let before = SYNC_EC_EL1[EC_DATA_ABORT_EL1].load(core::sync::atomic::Ordering::Relaxed);
-
-    // The trampoline arm needs a registered handler, or an unrecoverable EL1
-    // abort would kill the current process instead of landing at the label.
-    akuma_exec::threading::set_user_copy_fault_handler(
-        __el1_gpr_transparency_landing as *const () as usize as u64,
-    );
-    // SAFETY: `out` has the 15 slots the probe writes, and the abort it takes is
-    // recovered by the handler registered just above.
-    unsafe { __el1_gpr_transparency_probe(out.as_mut_ptr(), BASE) };
-    akuma_exec::threading::set_user_copy_fault_handler(0);
-
-    let after = SYNC_EC_EL1[EC_DATA_ABORT_EL1].load(core::sync::atomic::Ordering::Relaxed);
-
-    let mut mask = 0u32;
-    for (i, got) in out.iter().enumerate() {
-        if *got != BASE + (i as u64 + 4) {
-            mask |= 1 << i;
-        }
-    }
-    (mask, after.wrapping_sub(before))
-}
-
-#[cfg(all(kernel_tests, target_os = "none"))]
-unsafe extern "C" {
-    fn __el1_gpr_transparency_landing();
-}

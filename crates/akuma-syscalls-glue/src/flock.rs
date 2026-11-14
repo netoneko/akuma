@@ -1,8 +1,9 @@
 //! `flock(2)` — whole-file BSD advisory locking.
 //!
 //! Added 2026-08-22: not implemented at all before this (`grep -rn "fn
-//! sys_flock" src/syscall/` was empty), found while chasing an nca hang —
-//! see `userspace/nca/docs/ISSUES.md`.
+//! sys_flock" src/syscall/` was empty), found while chasing an nca hang
+//! (nca, since retired, kept its notes in `userspace/nca/docs/ISSUES.md`; see
+//! `docs/archive/NCA_MISSING_SYSCALLS.md`).
 //!
 //! Simplification versus real Linux: a lock's holder identity is the calling
 //! process's `SharedFdTable` (its `Arc` pointer) plus the fd number, not a

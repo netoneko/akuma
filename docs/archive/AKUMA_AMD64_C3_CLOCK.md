@@ -28,8 +28,8 @@ It was the **second anchor**.
 | | amd64 before C3 | AArch64 |
 |---|---|---|
 | monotonic uptime | `net::uptime_us` = `lapic::ticks() * 10_000` | `akuma_timer::uptime_us` = CNTVCT/CNTFRQ |
-| wall clock | `amd64/src/clock.rs`'s `(ANCHOR_UNIX_US, ANCHOR_UPTIME_US)` | `akuma_timer`'s `UTC_OFFSET_US` |
-| who serves `clock_gettime` | an arm in `amd64/src/usermode.rs` | `akuma_syscalls_time::sys_clock_gettime` |
+| wall clock | `crates/akuma-kernel-amd64/src/clock.rs`'s `(ANCHOR_UNIX_US, ANCHOR_UPTIME_US)` | `akuma_timer`'s `UTC_OFFSET_US` |
+| who serves `clock_gettime` | an arm in `crates/akuma-kernel-amd64/src/usermode.rs` | `akuma_syscalls_time::sys_clock_gettime` |
 
 `akuma-syscalls-time` is shared: `akuma-syscalls-glue` depends on it and glue
 builds for `x86_64-unknown-none` (that was B3's gate, passed 2026-09-07). So
@@ -79,7 +79,7 @@ Three moves, in order:
    `ntp_boot.rs`) name the new home directly rather than going through a
    forwarder: one spelling, so a reader cannot find the offset in two places
    again. `akuma-syscalls-time` no longer depends on `akuma-timer` at all.
-3. **`amd64/src/clock.rs` deletes its pair** and anchors there. `now_us()`,
+3. **`crates/akuma-kernel-amd64/src/clock.rs` deletes its pair** and anchors there. `now_us()`,
    `is_synced()` and `set_unix_us()` survive as three-line forwarders because
    `fs.rs` and `boot.rs` register them as the `utc_time_us` hook and the
    x86-only `gettimeofday`/`time`/`settimeofday` shims call them.
@@ -93,7 +93,7 @@ machine know what time it is" with no timestamp in hand.
 
 ## 3. What folded, and what did not
 
-Folded into glue (`amd64/src/usermode.rs`):
+Folded into glue (`crates/akuma-kernel-amd64/src/usermode.rs`):
 
 | syscall | x86_64 | asm-generic | note |
 |---|---|---|---|

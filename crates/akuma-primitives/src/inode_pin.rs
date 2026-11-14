@@ -83,6 +83,25 @@ static TABLE: [AtomicU64; SLOTS] = [const { AtomicU64::new(0) }; SLOTS];
 /// `true` for every inode — see the module header.
 static OVERFLOW: [AtomicUsize; REGIONS] = [const { AtomicUsize::new(0) }; REGIONS];
 
+/// Times an inode's last pin went (its count reached zero, or a lost pin was
+/// balanced). The filesystem compares it against the value at its last drain
+/// ([`unpinned_since`]): an inode unlinked while pinned is freed by the next
+/// filesystem operation after its last pin goes, not by the next unlink.
+static UNPINS: AtomicU64 = AtomicU64::new(0);
+
+/// The current [`UNPINS`] count. A filesystem that deferred frees keeps the
+/// value it last drained at, and drains again when this differs.
+#[must_use]
+pub fn unpin_epoch() -> u64 {
+    UNPINS.load(Ordering::Acquire)
+}
+
+/// Has any inode's last pin gone since `epoch` (a value of [`unpin_epoch`])?
+#[must_use]
+pub fn unpinned_since(epoch: u64) -> bool {
+    unpin_epoch() != epoch
+}
+
 /// Regions the table is divided into for overflow accounting. An unrecorded pin
 /// makes only its **own** region answer conservatively, instead of the whole
 /// table.
@@ -139,6 +158,11 @@ const fn unpack(v: u64) -> (u32, u32) {
 const fn slot_of(inode: u32) -> usize {
     (inode.wrapping_mul(0x9E37_79B9) >> 16) as usize & MASK
 }
+
+/// Serializes every unit test that touches the process-wide pin table: this module's and `text_busy`'s (a `TextPin` holds an `InodePin`, so
+/// a test that fills the `text_busy` table also fills this one, and `inode_pin`'s fixtures assume an otherwise empty table).
+#[cfg(test)]
+pub(crate) static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// A reference that keeps `inode`'s data alive. Clone to share, drop to release.
 ///
@@ -290,6 +314,7 @@ fn release(inode: u32) {
                         // can, because unbounded tombstone growth is what breaks
                         // this table — see `compact_tail`.
                         compact_tail(pos);
+                        UNPINS.fetch_add(1, Ordering::AcqRel);
                     }
                     return;
                 }
@@ -307,7 +332,10 @@ fn release(inode: u32) {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
-                Ok(_) => return,
+                Ok(_) => {
+                    UNPINS.fetch_add(1, Ordering::AcqRel);
+                    return;
+                }
                 Err(v) => cur = v,
             }
         }
@@ -332,7 +360,10 @@ fn release(inode: u32) {
 ///   with zero live pins and no overflow, which stops `akuma_ext2`'s
 ///   `drain_deferred_frees` from freeing anything at all. Measured: 4567 drain
 ///   calls, **0 inodes freed**, `slots=1015/1024` occupied against `pin=0` live
-///   (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.6).
+///   (`EXT2_UNLINK_INODE_BLOCK_LEAK.md` §2.6). Compaction alone did not close
+///   that: a run it cannot clear (a live entry after the tombstones) still
+///   filled windows, so `is_pinned` now answers `false` for a full window
+///   without the key (`INODE_PIN_CONGESTED_WINDOW.md`).
 ///
 /// # Why it is sound
 ///
@@ -402,9 +433,15 @@ pub fn is_pinned(inode: u32) -> bool {
             return cnt > 0;
         }
     }
-    // The chain ran to the probe limit without an empty slot, so the table is
-    // congested and absence cannot be proven. Say pinned.
-    true
+    // The window holds no empty slot and no entry for `inode`. That proves
+    // absence: `acquire` records a pin only inside this same window
+    // (`home .. home + PROBE_LIMIT`), and when it cannot, it counts the pin in
+    // `OVERFLOW`, which was checked above. Answering `true` here instead made
+    // every inode homed in a congested window read pinned forever - a run of
+    // live entries and tombstones `compact_tail` cannot clear - so ext2 deferred
+    // each such unlink and never drained it
+    // (`docs/archive/INODE_PIN_CONGESTED_WINDOW.md`).
+    false
 }
 
 /// Slots holding anything at all — live pins **and tombstones** — out of
@@ -469,7 +506,7 @@ mod tests {
     // `true` for *every* inode by design, so a peer test asserting "not pinned"
     // would fail if it ran alongside. Serialize them rather than weaken the
     // assertions, since the conservative answer is the property under test.
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::TEST_LOCK;
 
     fn serial() -> std::sync::MutexGuard<'static, ()> {
         TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -702,6 +739,55 @@ mod tests {
         assert_eq!(pin_count(fresh), 1, "the new pin must be recorded");
         assert!(is_pinned(fresh));
         drop(pin);
+    }
+
+    /// A window with no empty slot, made of tombstones and one live entry, must
+    /// not read `pinned` for an inode it does not hold. Releases mid-run are not
+    /// compacted (the next slot is occupied), so this state outlives the build
+    /// that made it. `is_pinned` used to say `true` here, for every inode homed
+    /// in the window, and ext2 deferred their unlinks forever: 65 inodes and
+    /// 4,327 blocks on the Taoxichuan guest after one `cargo clean`
+    /// (`docs/archive/INODE_PIN_CONGESTED_WINDOW.md`).
+    #[test]
+    fn a_full_window_without_the_key_is_not_pinned() {
+        let _g = serial();
+        let home_seed = 110_001;
+        let home = slot_of(home_seed);
+        let mut colliders = Vec::new();
+        let mut cand = home_seed;
+        while colliders.len() < PROBE_LIMIT + 1 {
+            if slot_of(cand) == home {
+                colliders.push(cand);
+            }
+            cand += 1;
+            assert!(cand < home_seed + 100_000_000, "not enough colliders");
+        }
+        let never = colliders.pop().expect("one spare collider");
+        let before = overflow_count();
+
+        // Fill the window exactly, then drop all but the last: the first
+        // PROBE_LIMIT - 1 slots become tombstones that `compact_tail` must keep,
+        // because the slot after each is occupied.
+        let mut fill: Vec<InodePin> = colliders.iter().map(|i| InodePin::new(*i)).collect();
+        assert_eq!(overflow_count(), before, "fixture: the window must hold them all");
+        let last = fill.pop().expect("the live entry");
+        drop(fill);
+        assert_eq!(pin_count(last.inode()), 1);
+        assert_eq!(pin_count(colliders[0]), 0);
+
+        assert!(
+            !is_pinned(never),
+            "an inode absent from a full window and with no overflow must read unpinned",
+        );
+        assert!(!is_pinned(colliders[0]), "a tombstone is not a pin");
+        assert!(is_pinned(last.inode()));
+
+        drop(last);
+        assert!(
+            slots_occupied() < PROBE_LIMIT,
+            "the last release must compact the run; {} slots still occupied",
+            slots_occupied(),
+        );
     }
 
     #[test]

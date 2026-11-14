@@ -1,6 +1,6 @@
 # amd64: a Go process that spawns children dies in `memmove`/`copystack` — "fork vs. threads"
 
-**Status: FIXED 2026-10-20 in the signal return path (`amd64/src/signal.rs`, `.Lsig_return`),
+**Status: FIXED 2026-10-20 in the signal return path (`crates/akuma-kernel-amd64/src/signal.rs`, `.Lsig_return`),
 verified locally — the 60-run sweep and the metal run are the open items (§ E).** Found 2026-10-19/20 on the ryzen metal (kernel `7d4d22d6-release-smp-shared`,
 GRUB entry 20, `smp=8`) when `crush` died at startup; reproduced locally under QEMU at SMP=2
 the same day (harness below).
@@ -33,7 +33,7 @@ system prompt at startup by running `git status` & friends through `os/exec`: th
 four goroutines parked in `wait4` while goroutine 1 grows its stack to ~1.5 MB.
 
 Go's `os/exec` starts children with `clone(CLONE_VM|CLONE_VFORK|SIGCHLD)`, which this kernel
-serves as a copy-on-write `fork` (`amd64/src/usermode.rs`, the `Syscall::Clone` arm →
+serves as a copy-on-write `fork` (`crates/akuma-kernel-amd64/src/usermode.rs`, the `Syscall::Clone` arm →
 `sys_spawn_clone` → `akuma_exec::process::fork_process`) and does not suspend the parent. **Each
 child's exit raises `SIGCHLD` on the parent** — that is the part that turned out to matter.
 
@@ -67,7 +67,7 @@ the rate scales with the number of child *exits*, which is the number of `SIGCHL
 
 ## Root cause
 
-### The three defects, in `amd64/src/signal.rs` and `.Lsig_return` (`amd64/src/usermode.rs`)
+### The three defects, in `crates/akuma-kernel-amd64/src/signal.rs` and `.Lsig_return` (`crates/akuma-kernel-amd64/src/usermode.rs`)
 
 A pending signal is acted on at one of three boundaries: a `syscall` return (`deliver_pending`,
 register file in `UserCtx`), a ring-3 `#PF`/`#GP` (`deliver_fault_signal`, register file in
@@ -172,11 +172,11 @@ the complete ring-3 machine state of the interrupted instruction.** Parts A–D 
 designed, with three differences: on a plain syscall-return delivery `Regs::load` reports
 `rcx`/`r11` as what the `syscall` instruction left in them (the return address and the flags),
 which is what Linux's `sigcontext` shows there; the probe is a raw `#![no_std]` program under
-`userspace/amd64/sigregs/` (built by `amd64/build.rs` and embedded like `killprobe`, not a musl
+`userspace/amd64/sigregs/` (built by `crates/akuma-kernel-amd64/build.rs` and embedded like `killprobe`, not a musl
 binary), with a `fork`ed child as the sender; and its fault check is every eighth window of the
 same loop rather than a second mode.
 
-### A. Carry `rcx` and `r11` (`amd64/src/signal.rs`, `amd64/src/usermode.rs`)
+### A. Carry `rcx` and `r11` (`crates/akuma-kernel-amd64/src/signal.rs`, `crates/akuma-kernel-amd64/src/usermode.rs`)
 
 - `Regs` gains `rcx: u64, r11: u64`. `from_trap` reads them from `TrapRegs::{rcx, r11}`;
   `to_sigcontext` writes them (the frame stops reporting 0); `from_sigcontext` reads them back;
@@ -280,7 +280,7 @@ In progress / not yet done:
 
 ### F. Docs updated with the fix
 
-- `amd64/src/signal.rs` module header: the "no FP state" divergence is retired; the return path
+- `crates/akuma-kernel-amd64/src/signal.rs` module header: the "no FP state" divergence is retired; the return path
   paragraph says `iretq` and why.
 - `docs/archive/AKUMA_AMD64_COW.md` § Known limits rewritten (CoW fork runs at `SMP>1` behind the
   2026-09-09 shootdown; threads exist and the share pass / break serialize on the leader's lock;
@@ -364,7 +364,7 @@ downstream of a runaway `REP MOVS` with `RCX = RIP`.
 
 ### Stale CoW doc text found on the way
 
-- `amd64/src/thread.rs` (module doc): since 2026-09-09 the target has a shootdown, so CoW `fork` is
+- `crates/akuma-kernel-amd64/src/thread.rs` (module doc): since 2026-09-09 the target has a shootdown, so CoW `fork` is
   no longer SMP=1 only. `docs/archive/AKUMA_AMD64_COW.md` § Known limits, the `Syscall::Clone`
   comment and `docs/reference/subsystems/memory.md` still say "SMP=1 only" and "no threads"; CoW
   fork has run at `SMP>1` for weeks (self-host builds at `-j4`) and threads exist. Dated corrections
@@ -372,10 +372,10 @@ downstream of a runaway `REP MOVS` with `RCX = RIP`.
 
 ### Instrumentation landed 2026-10-20 (behaviour unchanged; keep — a healthy kernel prints nothing)
 
-- `amd64/src/mm.rs`: `FAULT_REFUSALS` + `note_fault_refusal(va, why)` naming the refusing arm
+- `crates/akuma-kernel-amd64/src/mm.rs`: `FAULT_REFUSALS` + `note_fault_refusal(va, why)` naming the refusing arm
   (`no-region`, `prot-none`, `oom`, `install`, `populate`); `REGION_TRACE` toggle (default off) with
   `MAP_FIXED`/detach/insert lines carrying the editing pid; `usermode::current_mm_pid()`.
-- `amd64/src/idt.rs`: `cow_write_fault`'s `CowAction::Fault` arm prints through
+- `crates/akuma-kernel-amd64/src/idt.rs`: `cow_write_fault`'s `CowAction::Fault` arm prints through
   `note_fault_refusal(addr, "cow-fault (ro, unmarked)")`.
 
 ## Related

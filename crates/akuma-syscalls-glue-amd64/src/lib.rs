@@ -6,12 +6,13 @@
 //! and the rest that the AArch64 kernel runs. An x86_64 caller differs from an
 //! asm-generic one in exactly the places this crate handles:
 //!
-//! - **Numbers.** Eleven fd calls exist only on x86_64 (`open` 2, `stat` 4, `lstat` 6,
-//!   `poll` 7, `access` 21, `pipe` 22, `select` 23, `dup2` 33, `creat` 85,
-//!   `epoll_create` 213, `epoll_wait` 232); each is its `*at`/`p*` successor
-//!   with fixed arguments. Two time calls do too (`gettimeofday` 96, `time` 201),
-//!   served here from the wall clock glue's `clock_gettime` reads. The path-only legacy calls are
-//!   `akuma_syscalls_abi::legacy::fold`'s, applied by the caller first.
+//! - **Numbers.** The x86-only spellings that are a modern call with fixed
+//!   arguments (`open`, `creat`, `stat`, `lstat`, `access`, `pipe`, the
+//!   `epoll` pair and the path calls) are `akuma_syscalls_abi::legacy::fold`'s,
+//!   applied by the caller first. The ones that are not a fixed rewrite are
+//!   here: `poll` 7, `select` 23, `dup2` 33, and two time calls
+//!   (`gettimeofday` 96, `time` 201) served from the wall clock glue's
+//!   `clock_gettime` reads.
 //! - **Open flags.** Four `open(2)` bits are permuted between the ABIs
 //!   (`akuma_syscalls_abi::open_flags`); handing glue the x86_64 bits opens a
 //!   directory as `O_DIRECT` and so on.
@@ -21,7 +22,7 @@
 //!   `poll`/`select`'s millisecond and `timeval` timeouts, and chunked large
 //!   reads (glue serves at most [`MAX_IO`] bytes per call).
 //!
-//! Moved out of `amd64/src/fd.rs` for Taoxichuan's adoption of glue
+//! Moved out of `crates/akuma-kernel-amd64/src/fd.rs` for Taoxichuan's adoption of glue
 //! (`docs/archive/TAOXICHUAN_CLEANUP_PLAN.md` step 2c-B): the alternative was a
 //! third copy. A kernel's own devices (amd64's kvm, tun, wifi, framebuffer, its
 //! console ends) are intercepted by the kernel *before* it calls in here; this
@@ -34,24 +35,15 @@
 
 extern crate alloc;
 
-pub mod kill;
-
 use akuma_exec::process::FileDescriptor;
 use akuma_syscalls_abi::Syscall;
 use akuma_syscalls_glue as glue;
-use akuma_syscalls_linux::flags::open as o;
 
 const EBADF: u64 = (-9i64) as u64;
 const EFAULT: u64 = (-14i64) as u64;
-const EEXIST: u64 = (-17i64) as u64;
-const ENOTDIR: u64 = (-20i64) as u64;
-const EISDIR: u64 = (-21i64) as u64;
 const EINVAL: u64 = (-22i64) as u64;
 const ENOENT: u64 = (-2i64) as u64;
-const ELOOP: u64 = (-40i64) as u64;
 
-const AT_FDCWD: u64 = (-100i64) as u64;
-const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 const AT_EMPTY_PATH: u64 = 0x1000;
 
 /// The most one glue `read`/`pread64` call moves.
@@ -77,32 +69,32 @@ const fn is_err(r: u64) -> bool {
 pub fn dispatch(nr: u64, a: [u64; 6]) -> Option<u64> {
     // The legacy x86-only numbers first: none has a `Syscall` row.
     let legacy = match nr {
-        2 => Some(openat(AT_FDCWD, a[0], a[1], a[2])),
-        4 => Some(newfstatat(AT_FDCWD, a[0], a[1], 0)),
-        6 => Some(newfstatat(AT_FDCWD, a[0], a[1], AT_SYMLINK_NOFOLLOW)),
         7 => Some(poll(a[0], a[1], a[2])),
-        21 => Some(to_glue(Syscall::Faccessat, [AT_FDCWD, a[0], a[1], 0, 0, 0])),
-        22 => Some(glue::pipe::sys_pipe2(a[0], 0)),
         23 => Some(select(a[0], a[1], a[2], a[3], a[4])),
         33 => Some(dup2(a[0], a[1])),
-        // creat(path, mode) = open(path, O_CREAT | O_WRONLY | O_TRUNC, mode), x86_64 bits.
-        85 => Some(openat(AT_FDCWD, a[0], 0o100 | 0o1 | 0o1000, a[1])),
         96 => Some(gettimeofday(a[0])),
         201 => Some(time(a[0])),
-        213 => Some(to_glue(Syscall::EpollCreate1, [0; 6])),
-        232 => Some(to_glue(Syscall::EpollPwait, [a[0], a[1], a[2], a[3], 0, 0])),
         _ => None,
     };
     if legacy.is_some() {
         return legacy;
     }
-    let call = Syscall::from_x86_64(nr)?;
+    dispatch_call(Syscall::from_x86_64(nr)?, a)
+}
+
+/// [`dispatch`] for a call the caller has already decoded: `None` when `call`
+/// is not in the fd family. amd64's dispatcher reaches its fd arms this way.
+#[must_use]
+pub fn dispatch_call(call: Syscall, a: [u64; 6]) -> Option<u64> {
     Some(match call {
         Syscall::Openat => openat(a[0], a[1], a[2], a[3]),
         Syscall::Read => read(a[0], a[1], a[2]),
         Syscall::Write => write(a[0], a[1], a[2]),
-        Syscall::Readv => vectored(a[0], a[1], a[2], read),
-        Syscall::Writev => vectored(a[0], a[1], a[2], write),
+        // A device that takes the call whole (`glue::chardev::vectored`), else the loop.
+        Syscall::Readv => glue::chardev::vectored(a[0] as u32, false, a[1], a[2])
+            .unwrap_or_else(|| vectored(a[0], a[1], a[2], read)),
+        Syscall::Writev => glue::chardev::vectored(a[0] as u32, true, a[1], a[2])
+            .unwrap_or_else(|| vectored(a[0], a[1], a[2], write)),
         Syscall::Pread64 => pread64(a[0], a[1], a[2], a[3]),
         Syscall::Fstat => fstat(a[0], a[1]),
         Syscall::Newfstatat => newfstatat(a[0], a[1], a[2], a[3]),
@@ -161,39 +153,12 @@ pub fn to_glue(call: Syscall, a: [u64; 6]) -> u64 {
 }
 
 /// `openat(dirfd, path, flags, mode)` with the x86_64 flags permuted to glue's.
-///
-/// Also the four checks glue's `openat_path` leaves to its caller
-/// (`O_NOFOLLOW` on a symlink, `O_CREAT` on a directory, `O_DIRECTORY` on a
-/// file, `O_EXCL` on anything present): amd64's preamble, minus its devices.
+/// The flag refusals (`O_NOFOLLOW`, `O_CREAT` on a directory, `O_DIRECTORY` on a
+/// file, `O_EXCL`) are glue's, for every kernel.
 #[must_use]
 pub fn openat(dirfd: u64, path: u64, flags_x86: u64, mode: u64) -> u64 {
     let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_x86 as u32);
-    let Ok(raw) = glue::copy_from_user_str(path, 1024) else {
-        return EFAULT;
-    };
-    let Ok(resolved) = glue::fs::resolve_path_at(dirfd as i32, &raw) else {
-        return EBADF;
-    };
-    if flags & o::O_NOFOLLOW != 0 && akuma_vfs_glue::is_symlink(&resolved) {
-        return ELOOP;
-    }
-    let creating = flags & o::O_CREAT != 0;
-    let wants_dir = flags & o::O_DIRECTORY != 0;
-    if creating || wants_dir {
-        let md = akuma_vfs_glue::metadata(&resolved);
-        let is_dir = md.as_ref().is_ok_and(|m| m.is_dir);
-        let present = md.is_ok();
-        if creating && is_dir {
-            return EISDIR;
-        }
-        if wants_dir && present && !is_dir {
-            return ENOTDIR;
-        }
-        if creating && flags & o::O_EXCL != 0 && present {
-            return EEXIST;
-        }
-    }
-    glue::flat(glue::fs::openat_path(dirfd as i32, &resolved, flags, mode as u32))
+    glue::flat(glue::fs::sys_openat(dirfd as i32, path, flags, mode as u32))
 }
 
 /// Whether `fd` names a regular file in the caller's table (not a directory,
@@ -255,23 +220,20 @@ pub fn pread64(fd: u64, buf: u64, len: u64, off: u64) -> u64 {
     glue::fs::sys_pread64(fd as u32, buf, len.min(MAX_IO) as usize, off.cast_signed())
 }
 
-/// `write(fd, buf, len)`: glue's arm, after the one check it leaves to its
-/// caller — a file opened `O_RDONLY` refuses writes with `EBADF`.
+/// `write(fd, buf, len)`: glue's arm, in the shape [`vectored`] takes.
 #[must_use]
 pub fn write(fd: u64, buf: u64, len: u64) -> u64 {
-    let read_only = akuma_exec::process::current_process_shared().and_then(|p| {
-        p.with_fd(fd as u32, |d| matches!(d, FileDescriptor::File(f) if f.flags & o::O_ACCMODE == o::O_RDONLY))
-    });
-    if read_only == Some(true) {
-        return EBADF;
-    }
     glue::fs::sys_write(fd, buf, len as usize)
 }
 
 /// `readv`/`writev`: one `read`/`write` per non-empty `iovec`, stopping at the
 /// first short transfer (continuing would splice the stream) and reporting
 /// progress over a later error. At most 1024 entries (`IOV_MAX`).
-fn vectored(fd: u64, iov: u64, cnt: u64, one: fn(u64, u64, u64) -> u64) -> u64 {
+///
+/// Public so a kernel whose `read`/`write` serve devices of its own can pass
+/// those as `one` and keep this loop.
+#[must_use]
+pub fn vectored(fd: u64, iov: u64, cnt: u64, one: fn(u64, u64, u64) -> u64) -> u64 {
     let mut total = 0u64;
     for i in 0..cnt.min(1024) {
         let mut entry = [0u64; 2];
@@ -347,6 +309,10 @@ pub fn fcntl(fd: u64, cmd: u64, arg: u64) -> u64 {
 /// is open (where `dup3` answers `EINVAL`); otherwise glue's `dup3` with no flags.
 #[must_use]
 pub fn dup2(old: u64, new: u64) -> u64 {
+    // Linux checks the target against `RLIMIT_NOFILE` first, `old == new` included.
+    if new >= akuma_syscalls_linux::proc::rlimit::NOFILE_LIMIT {
+        return EBADF;
+    }
     if old == new {
         let open = akuma_exec::process::current_process_shared().and_then(|p| p.with_fd(old as u32, |_| ()));
         return if open.is_some() { new } else { EBADF };
@@ -464,8 +430,10 @@ mod tests {
     #[test]
     fn legacy_numbers_are_not_in_the_asm_generic_table() {
         // dispatch()'s first match owns these; none may also have a Syscall row,
-        // or the order of the two matches would decide which arm serves it.
-        for nr in [2u64, 4, 6, 7, 21, 22, 23, 33, 85, 96, 201, 213, 232] {
+        // or the order of the two matches would decide which arm serves it, and
+        // none may be one the caller's `legacy::fold` already rewrote.
+        for nr in [7u64, 23, 33, 96, 201] {
+            assert!(akuma_syscalls_abi::legacy::fold(nr, [0; 6]).is_none(), "x86_64 {nr} is folded");
             assert!(Syscall::from_x86_64(nr).is_none(), "x86_64 {nr} has a Syscall row");
         }
     }

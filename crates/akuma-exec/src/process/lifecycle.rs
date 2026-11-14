@@ -36,7 +36,7 @@
 //!
 //! - **IRQs stay enabled** — timer ticks, device IRQs and the scheduler wake-pass all
 //!   still run; block I/O completes. Only the context *switch* is deferred
-//!   (`ThreadPool::schedule_indices` returns `None` for involuntary entries).
+//!   (`threading::el1_preemptible` declines the timer's switch).
 //! - **Voluntary switches still work** — an op that yields or blocks (`yield_now`,
 //!   `blocking_relax`, a file read) switches away normally. While it waits, the op is
 //!   not mid-mutation of shared state (the yield points in these ops all sit outside
@@ -60,10 +60,10 @@
 //! that way when touching teardown. As defense-in-depth, thread-slot recycling resets
 //! the per-tid preemption counter (see `threading::cleanup_terminated_threads`).
 //!
-//! On non-`kernel_smp_shared` builds this is a no-op and compiles to nothing.
+//! On non-`kernel_bkl_smp` builds this is a no-op and compiles to nothing.
 
 /// RAII guard that defers involuntary preemption of the current thread for the span of a
-/// process-lifecycle operation under `cfg(kernel_smp_shared)`. No-op on all other builds.
+/// process-lifecycle operation under `cfg(kernel_bkl_smp)`. No-op on all other builds.
 ///
 /// See the module docs for why this is a per-thread preemption disable and not a lock or
 /// IRQ mask. Ops that never return must call [`release`](Self::release) explicitly.
@@ -82,7 +82,7 @@ impl LifecycleGuard {
     #[inline]
     #[track_caller]
     pub fn acquire() -> Self {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         crate::threading::disable_preemption();
         Self {
             _no_send: core::marker::PhantomData,
@@ -100,7 +100,7 @@ impl LifecycleGuard {
 impl Drop for LifecycleGuard {
     #[inline]
     fn drop(&mut self) {
-        #[cfg(kernel_smp_shared)]
+        #[cfg(kernel_bkl_smp)]
         crate::threading::enable_preemption();
     }
 }

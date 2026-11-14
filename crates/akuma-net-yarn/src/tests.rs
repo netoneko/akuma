@@ -208,31 +208,22 @@ fn lap_start_returns_the_drain_budget() {
 #[test]
 fn park_kind_properties_match_their_mechanisms() {
     assert!(!ParkKind::Promiscuous.needs_registration());
-    assert!(ParkKind::Targeted.needs_registration());
-    assert!(ParkKind::DirectWaker.needs_registration());
+    assert!(!ParkKind::ScanRegistered.needs_registration());
     assert!(ParkKind::LightSleep.needs_registration());
 
     assert!(!ParkKind::Promiscuous.is_targeted());
-    assert!(ParkKind::DirectWaker.is_targeted());
 
     // The recorded hypothesis: targetable AND woken by any IRQ is the only
     // combination that can beat the default.
     assert!(ParkKind::Promiscuous.woken_by_any_irq());
-    assert!(!ParkKind::Targeted.woken_by_any_irq());
-    assert!(!ParkKind::DirectWaker.woken_by_any_irq());
+    assert!(!ParkKind::ScanRegistered.woken_by_any_irq());
     assert!(ParkKind::LightSleep.woken_by_any_irq());
     assert!(ParkKind::LightSleep.is_targeted() && ParkKind::LightSleep.woken_by_any_irq());
 }
 
 #[test]
-fn policy_constructors_only_change_the_park_kind() {
-    let base = WaitPolicy::promiscuous();
-    for p in [WaitPolicy::targeted(), WaitPolicy::direct_waker()] {
-        assert_eq!(p.drain_budget, base.drain_budget);
-        assert_eq!(p.fruitless_limit, base.fruitless_limit);
-        assert_eq!(p.backstop_us, base.backstop_us);
-    }
-    assert_eq!(WaitPolicy::default(), base);
+fn default_policy_is_promiscuous() {
+    assert_eq!(WaitPolicy::default(), WaitPolicy::promiscuous());
 }
 
 /// A full satisfied wait: two quiet laps, then the data lands.

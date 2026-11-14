@@ -18,26 +18,33 @@ HERE=$(dirname "$0")
 cd "$HERE/.."
 
 MEMORY="${MEMORY:-2048}"
-# Cores. The kernel starts every LAPIC the MADT lists (amd64/src/smp.rs), so
+# Cores. The kernel starts every LAPIC the MADT lists (crates/akuma-kernel-amd64/src/smp.rs), so
 # this is the whole SMP switch; `SMP=1` is the single-core boot every stage
 # before Stage U ran.
 SMP="${SMP:-1}"
-KERNEL=target/x86_64-unknown-none/release/akuma-amd64
+KERNEL=target/x86_64-unknown-none/release/akuma
 # DISK=<path> attaches an existing image; otherwise a probe disk is generated.
 # DISK=none boots with no drive, which is the pre-Stage-M shape and still valid.
 DISK="${DISK:-}"
 
 # FEATURES=a,b builds with extra cargo features. The one that matters today is
 # `no-tests`, which compiles the boot suite out — the same opt-in the AArch64
-# devbox and `extreme-size` targets build with. Without a way to boot it from
+# devbox targets build with. Without a way to boot it from
 # here, that feature could only ever be *compiled*, and a build configuration
 # nobody boots is a build configuration that rots.
 #
 #   FEATURES=no-tests sh amd64/run.sh
+#
+# NO_DEFAULT_FEATURES=1 adds `--no-default-features`, which a smaller driver set
+# needs because cargo features only add: the headless test image is
+#
+#   NO_DEFAULT_FEATURES=1 FEATURES=headless sh amd64/run.sh
 FEATURES="${FEATURES:-}"
+NO_DEFAULT_FEATURES="${NO_DEFAULT_FEATURES:-}"
 
 # shellcheck disable=SC2086  # deliberately word-split (empty = no flag)
-cargo build -p akuma-amd64 --target x86_64-unknown-none --release \
+cargo build -p akuma --target x86_64-unknown-none --release \
+    ${NO_DEFAULT_FEATURES:+--no-default-features} \
     ${FEATURES:+--features "$FEATURES"}
 
 # Fail loudly if the PVH note went missing. Without it both loaders silently
@@ -169,7 +176,7 @@ GDB_ARGS=""
 # `GDB=1` opens the gdbstub on :1234 and holds the guest at reset, so a
 # breakpoint can be armed before the boot — the x86 counterpart of the
 # aarch64 runner's `GDB=1`. Attach with:
-#   gdb target/x86_64-unknown-none/release/akuma-amd64 -ex 'target remote :1234'
+#   gdb target/x86_64-unknown-none/release/akuma -ex 'target remote :1234'
 if [ -n "$GDB" ]; then
     GDB_ARGS="-gdb tcp::1234 -S"
 fi

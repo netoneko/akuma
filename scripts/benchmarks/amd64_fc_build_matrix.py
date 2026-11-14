@@ -202,7 +202,7 @@ def run_cell(crate, vcpus, jobs, budget, target, clean_all=False):
 
     # Clean only this crate, so the cell measures the crate and not the graph —
     # unless `--clean-all` asked for the whole graph, which is what turns this
-    # harness into a self-host gate: `--crate akuma-amd64 --clean-all` rebuilds
+    # harness into a self-host gate: `--crate akuma --clean-all` rebuilds
     # every dependency the kernel has and is the "does `cargo` work at SMP>1"
     # question in full, where one crate is only the cheap repro of it.
     if clean_all:

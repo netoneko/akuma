@@ -13,7 +13,6 @@
 //! const-folding whatever it gates.** Thirteen of the flags `src/syscall/` reads
 //! are unconditionally `false` and guard trace blocks on the syscall path;
 //! handing those over would have retained all of that code in every profile.
-//! Two such flags in `akuma-vfs-glue` already cost a page of `extreme-size`.
 //!
 //! A crate of `pub const`s folds across the LTO boundary exactly as it did
 //! in-crate, and there is still only one definition of each value.
@@ -105,10 +104,8 @@ pub const DEFAULT_THREAD_STACK_SIZE: usize = 32 * 1024;
 /// Bun's JSC initialization uses ~600KB of stack, and complex dependency
 /// resolution (like @google/gemini-cli with 263 packages) may need more.
 ///
-/// On the `size` profile (small-RAM targets) we let the RAM-scaling run — the
-/// stack is eagerly committed from PMM, so pinning it to 8 MB would consume
-/// 2048 pages per process before any work is done.  Auto-scaling gives 128 KB
-/// (the minimum) on ≤ 256 MB boxes, which is sufficient for tcc and dash.
+/// Auto-scaling gives 128 KB (the minimum) on ≤ 256 MB boxes, which is
+/// sufficient for tcc and dash.
 pub const USER_STACK_SIZE_OVERRIDE: usize = 0; // auto-scale; set to e.g. 8MB to debug crush/bun/JSC stack depth
 
 /// Maximum kernel threads
@@ -132,14 +129,12 @@ pub const USER_STACK_SIZE_OVERRIDE: usize = 0; // auto-scale; set to e.g. 8MB to
 /// exhaustion, because a slot also stays TERMINATED for `THREAD_CLEANUP_COOLDOWN_US`
 /// after its thread dies (see `docs/reference/subsystems/thread-lifecycle.md`).
 ///
-/// Raised to 256 for the non-`size` profiles, where a few hundred KB of BSS is free
-/// relative to an 8 GB box. `size`/`extreme-size` keep 64: those target a 4 MB RAM floor
-/// where per-slot BSS is a real cost and nothing spawns hundreds of threads anyway.
+/// Raised to 256: a few hundred KB of BSS is free relative to an 8 GB box.
 ///
 /// **Re-exported, not redeclared.** This and `akuma_exec`'s copy were independent literals
 /// carrying a "must match" comment; they silently diverged the first time one was raised
 /// (boot logged the new limit, `set_thread_limit` clamped to the crate's old one, and the
-/// ceiling never moved). The profile split now lives at the definition.
+/// ceiling never moved).
 pub use akuma_primitives::preempt::MAX_THREADS;
 
 /// Number of kernel threads reserved for system services
@@ -158,24 +153,15 @@ pub const MAX_PROCESSES: usize = 64;
 ///
 /// Used for threads 1 through RESERVED_THREADS-1.
 /// Handles SSH/HTTP async call chains and the async main loop.
-/// 64 KB is sufficient on release (opt-level=3 inlines aggressively, shallow frames).
-/// Size profile (opt-level=z, inlining off) has deeper frames on the SSH exec path —
-/// observed ELR=0x0 crash (stack overflow → corrupted return addr) at 64 KB.
+/// opt-level=z (the `extreme-size` profile) has deeper frames than opt-level=3 —
+/// an ELR=0x0 crash (stack overflow → corrupted return addr) was observed at 64 KB.
 // release: 512 KB (was 64 KB). Bumped while investigating the intermittent
 // self-host register/memory corruption (docs/AKUMA_SELF_HOSTING.md §7k): the SSH
 // system thread overflowed 64 KB on a deep streaming path (ELR=0x0 / x29→.text
 // corruption, §7k.2). 512 KB makes stack overflow implausible on any release path,
 // so a *persisting* crash decisively rules overflow out. Lazily allocated — only
-// touched pages cost RAM. (extreme keeps its measured tighter size below.)
-#[cfg(not(kernel_profile_extreme))]
+// touched pages cost RAM.
 pub const SYSTEM_THREAD_STACK_SIZE: usize = 512 * 1024;
-// extreme: 96 KB. The stack high-water probe (threading::report_stack_high_water)
-// measured a true peak of 79 KB across the SSH exec / busybox spawn paths at the
-// 6 MB floor, so 96 KB keeps a 17 KB (~21%) margin above observed worst-case while
-// reclaiming 32 KB per live system thread (~64 KB at the idle 2-thread floor). The
-// stack canary at the base trips first if a deeper path ever exceeds it.
-#[cfg(kernel_profile_extreme)]
-pub const SYSTEM_THREAD_STACK_SIZE: usize = 96 * 1024;
 
 /// Stack size for user process threads.
 ///
@@ -188,36 +174,7 @@ pub const SYSTEM_THREAD_STACK_SIZE: usize = 96 * 1024;
 // release: 512 KB (was 128 KB). Bumped for the §7k stack-overflow experiment —
 // rustc worker threads do a deep demand-paging→ext2→readahead chain plus a nested
 // IRQ trap frame; 512 KB removes overflow as a variable. Lazily allocated.
-#[cfg(not(kernel_profile_extreme))]
 pub const USER_THREAD_STACK_SIZE: usize = 512 * 1024;
-// extreme: 128 KB (was 64 KB). 64 KB was sized for tcc's shallow syscall depth
-// (open/read/write/mmap/brk) back when the deep path — SSH exec / shell spawn —
-// ran on an SSH *system* thread and was therefore covered by the 96 KB
-// `SYSTEM_THREAD_STACK_SIZE` measured for it. Moving sshd to userspace with
-// process-per-session (`userspace/sshd`, `fork-sessions`) moved that same path
-// onto a *user* thread: each session is a forked process whose syscalls run on a
-// user-thread kernel stack. `report_stack_high_water` measures that path at
-// 74 KB (the same probe measured 79 KB when it drove the system stack), so 64 KB
-// overflowed it by ~10 KB on every session.
-//
-// Nothing caught the overflow, because the stack pool comes from the PMM and the
-// pages below a stack are ordinary allocations: the run-off wrote into whatever
-// happened to sit there. On the extreme profile that was the session process's
-// own L3 page table — three PTEs zeroed mid-`sys_spawn` (inside
-// `vfs::resolve_symlinks`), unmapping the child's malloc arena, so every ssh
-// session died instantly with a SIGSEGV whose faulting address had nothing to do
-// with the corruption. That is the failure
-// `docs/archive/TRIM_FAT_EMBARASSING_DUPLICATIONS.md` recorded as "ssh
-// sessions die instantly on extreme-size, degradation of unknown origin"; see
-// `docs/archive/EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`.
-//
-// 128 KB rather than 96 KB: the system stack's 96 KB leaves only a 17 KB margin
-// over the same measurement, and a user thread additionally carries a nested IRQ
-// trap frame. Stacks are allocated on demand here (`WARM_FREE_USER == 0`), so the
-// cost is per *live* user thread, not per slot — at the 4 MB floor that is one or
-// two threads.
-#[cfg(kernel_profile_extreme)]
-pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
 
 /// Maximum length (bytes) of a single `argv`/`envp` string copied in by
 /// `execve`/`spawn`.
@@ -231,10 +188,7 @@ pub const USER_THREAD_STACK_SIZE: usize = 128 * 1024;
 /// NOTE: exceeding this is a hard `E2BIG` failure of the whole `execve` (matching
 /// Linux); it must NOT silently truncate the argument list (a too-short cap used
 /// to drop the over-long arg and every arg after it, exec'ing a corrupt argv).
-#[cfg(not(kernel_profile_extreme))]
 pub const MAX_ARG_STRLEN: usize = 128 * 1024; // Linux MAX_ARG_STRLEN
-#[cfg(kernel_profile_extreme)]
-pub const MAX_ARG_STRLEN: usize = 4 * 1024;
 
 /// Enable stack canary checking
 ///
@@ -300,39 +254,6 @@ pub const DEADLOCK_THREAD_DUMP_ENABLED: bool = true;
 /// Set to `false` for development when testing without a fully populated disk.
 pub const FAIL_TESTS_IF_TEST_BINARY_MISSING: bool = false;
 
-/// Network polling thread scheduling ratio.
-/// The network thread (run_async_main) gets boosted every N scheduler ticks where N = this value.
-///
-/// Examples:
-/// - 2: network thread gets 50% of slots (every other tick) - too aggressive
-/// - 4: network thread gets 25% of slots (every 4th tick) - good balance
-/// - 8: network thread gets 12.5% of slots - more CPU for userspace
-///
-/// With 4 concurrent SSH sessions, each userspace thread gets:
-/// - ratio=4: (75% / 4) = ~19% CPU each
-/// - ratio=8: (87.5% / 4) = ~22% CPU each
-///
-/// Lower values = better network responsiveness, higher = more CPU for downloads
-pub const NETWORK_THREAD_RATIO: u32 = 4;
-
-/// Prefer never-scheduled READY threads over wakeup locality.
-///
-/// EXPERIMENTAL diagnostic (Failure D investigation, 2026-08-07 —
-/// docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md §7): when
-/// true, `schedule_indices` unconditionally prefers any READY thread that has
-/// **never once been scheduled** (`LAST_CORE == 0xFF`) over the wakeup-locality
-/// hint and the normal round-robin scan.
-///
-/// This is a falsification test, not a real fix: if flipping it on makes the
-/// `jobserver_stress` barrier hang under `SMP=4` + CPU-hog contention
-/// disappear, some newly-`clone()`d threads can be starved indefinitely by the
-/// normal scheduler under this load pattern — a thread-admission/fairness bug,
-/// not the futex wake-loss bug the rest of that investigation assumed. If the
-/// hang persists unchanged, this rules the theory out cleanly. Bypasses
-/// `round_robin_idx` bookkeeping on the fast path, so it is not itself fair —
-/// leave `false` outside this experiment.
-pub const PRIORITIZE_NEVER_SCHEDULED: bool = false;
-
 pub const IGNORE_THREADING_TESTS: bool = false;
 
 /// Disable all tests at boot
@@ -348,12 +269,6 @@ pub const DISABLE_ALL_TESTS: bool = false;
 /// no prints. Use this to isolate whether the crash is caused by something
 /// in the cleanup or stats code vs the core timer/ERET path.
 pub const MINIMAL_IDLE_LOOP: bool = false;
-
-/// Skip async network initialization (for debugging crashes)
-///
-/// When enabled, skips the async network stack and services (SSH, HTTP, etc.).
-/// Use this to isolate whether crashes are caused by network code.
-pub const SKIP_ASYNC_NETWORK: bool = false;
 
 /// Run network self-tests after initialization
 pub const RUN_NETWORK_TESTS: bool = false;
@@ -397,12 +312,6 @@ pub const NTP_SERVER_HOSTNAME: &str = "216.239.35.0";
 /// Runs pre-IRQ-unmask on a busy-poll loop, so this is real boot latency on any
 /// platform that hits it — kept short since a timeout is not fatal.
 pub const NTP_BOOTSTRAP_TIMEOUT_US: u64 = 3_000_000;
-
-/// Skip filesystem initialization (for debugging crashes)
-///
-/// When enabled, skips block device and filesystem init.
-/// Use this to isolate whether crashes are caused by fs code.
-pub const SKIP_FILESYSTEM_INIT: bool = false;
 
 pub const MEM_MONITOR_PERIOD_SECONDS: u64 = 3;
 pub const MEM_MONITOR_ENABLED: bool = false;
@@ -469,13 +378,6 @@ pub const SIGNAL_TRACE_ENABLED: bool = false;
 /// region-bookkeeping complaints) are NOT gated by this — they stay visible.
 pub const MEM_SYSCALL_TRACE_ENABLED: bool = false;
 
-/// Enable preemption watchdog
-///
-/// When enabled, the timer IRQ handler checks if any thread has held
-/// preemption disabled for too long and logs a warning.
-/// Disable to rule out watchdog as a source of issues.
-pub const ENABLE_PREEMPTION_WATCHDOG: bool = true;
-
 // Option to disable copying stdout to kernel log
 pub const STDOUT_TO_KERNEL_LOG_COPY_ENABLED: bool = false;
 
@@ -504,39 +406,6 @@ pub const TIMER_TICK_HEARTBEAT: bool = false;
 /// During `fork`, print a short line to **serial** every 8192 brk pages copied (Go heaps are huge).
 /// Independent of `SYSCALL_DEBUG_INFO_ENABLED` so QEMU logs show liveness without log::debug routing.
 pub const FORK_BRK_SERIAL_PROGRESS: bool = true;
-
-/// Enable Copy-on-Write fork.  When true, fork shares physical pages read-only
-/// instead of copying them.  Write faults allocate new pages on demand.
-///
-/// Set to false to fall back to the old eager-copy fork if regressions appear.
-pub const COW_FORK_ENABLED: bool = true;
-
-/// Enable the `vfork` fast-path (docs/COW_OPTIMIZATIONS.md Fix B).
-///
-/// When true, a `CLONE_VFORK` child SHARES the parent's address space (no CoW
-/// copy, no demote) instead of routing through the full `fork_process`
-/// replication — the parent is suspended until the child execs/_exits, so
-/// sharing is safe and the child's immediate `exec` discards the shared view
-/// without ever copying.
-///
-/// Also makes `read_current_pid` resolve identity via THREAD_PID_MAP→tgid so a
-/// child sharing the parent's ProcessInfo page still reports its own pid.
-/// Set to false to fall back to copy-fork for vfork (clean kill switch).
-pub const VFORK_FASTPATH_ENABLED: bool = true;
-
-/// Share one physical frame between every read-only mapper of the same file page,
-/// keyed on `(inode, file_offset)`, instead of giving each process a private copy.
-///
-/// This is the fix for "`-j4` is slower than `-j1`" on the self-host build: four
-/// concurrent `rustc`s mapping the same 295 MB `librustc_driver.so` used to hold
-/// four physical copies filled by four separate `read_at` sweeps, which pushed the
-/// PMM into `reclaim_clean_file_pages` and turned every eviction into a re-read.
-///
-/// Only mappings that give EL0 no write access are shared, so writable data
-/// segments keep their private-copy semantics untouched. Set to false to restore
-/// per-process private file pages (clean kill switch — use it to A/B).
-/// See `crate::file_page_cache`.
-pub const SHARED_FILE_PAGES_ENABLED: bool = true;
 
 /// Base size of the shared file-page cache, as a **divisor of total RAM**.
 /// `8` → RAM/8, which is 512 MB (131072 pages) at the devbox default
@@ -652,8 +521,8 @@ pub const MMAP_EAGER_MAX_PAGES: usize = 16;
 /// Demand-page file-backed `mmap` regions (1 MB readahead per fault) instead of
 /// eagerly reading every mapped page up front.
 ///
-/// **`true`** on all profiles. `size`/`extreme` always needed it (eagerly mapping
-/// even a 600 KB library exhausts user pages at 8 MB PMM). `release` was eager
+/// **`true`**: eagerly mapping even a 600 KB library exhausts user pages at 8 MB
+/// PMM, and `release` was eager
 /// until an A/B on the apk rustc toolchain showed lazy is **1.8× faster** full
 /// compile / **6.9× faster** process startup: eager read all ~240 MB of
 /// `libLLVM`+`librustc_driver` at `mmap()` time even though rustc touches only a
@@ -679,28 +548,16 @@ pub const KERNEL_HEAP_SIZE_MB: usize = 0;
 /// detected RAM. `0` = no clamp (reserves scale with real RAM, the historical
 /// behaviour).
 ///
-/// On the **extreme** profile we clamp to 4 MiB: the kernel boots and idles in
-/// ~2 MB of code+stack and a 512 KB seed heap (which grows on demand from PMM),
-/// so giving the box more RAM no longer inflates kernel overhead — the surplus
-/// all lands in the user-page pool. This is what lets a 64 MB box hand ~62 MB
-/// (instead of 52 MB) to userspace for LLM weights (e.g. llama.cpp models).
-/// The kernel still *sees* and uses the real RAM; only its internal reserve math
-/// is pinned to the small-machine numbers it was tuned for.
-#[cfg(kernel_profile_extreme)]
-pub const MEM_CALC_CLAMP_MB: usize = 4;
-#[cfg(not(kernel_profile_extreme))]
+/// A small clamp (4 MiB) hands the surplus to the user-page pool: it is what let
+/// the removed `extreme-size` build give a 64 MB box ~62 MB (instead of 52 MB) for
+/// LLM weights. The kernel still *sees* and uses the real RAM.
 pub const MEM_CALC_CLAMP_MB: usize = 0;
 
 /// Floor (bytes) on the `code_and_stack` region.
 ///
 /// Guarantees the kernel binary
-/// always fits even when `ram/16` and the boot-stack cover are both small. On
-/// **extreme** this is 0: the boot-stack cover is the effective floor, handing
-/// the slack back to the user-page pool (lets repeated tcc fit below 6 MB).
+/// always fits even when `ram/16` and the boot-stack cover are both small.
 /// Consumed by `crate::compute_memory_layout`.
-#[cfg(kernel_profile_extreme)]
-pub const MIN_CODE_AND_STACK_BYTES: usize = 0;
-#[cfg(not(kernel_profile_extreme))]
 pub const MIN_CODE_AND_STACK_BYTES: usize = 4 * 1024 * 1024;
 
 /// Slack (bytes) reserved ABOVE the boot-stack top, before the heap.
@@ -708,10 +565,6 @@ pub const MIN_CODE_AND_STACK_BYTES: usize = 4 * 1024 * 1024;
 /// The boot
 /// stack grows DOWN (away from the heap), so this is pure paranoia — the boot
 /// layout sanity guard enforces `boot_stack_top <= heap_start` unconditionally.
-/// **extreme** trims it to 64 KB (vs 1 MB) to free user pages.
-#[cfg(kernel_profile_extreme)]
-pub const STACK_GUARD_BYTES: usize = 64 * 1024;
-#[cfg(not(kernel_profile_extreme))]
 pub const STACK_GUARD_BYTES: usize = 1024 * 1024;
 
 /// RAM floor (MiB) below which the resource-heavy boot self-tests are skipped.
@@ -735,26 +588,19 @@ pub const THREAD_LIMIT_OVERRIDE: usize = 0;
 
 /// Emit per-process syscall stats on exit (total + breakdown by category).
 ///
-/// Debug instrumentation: forced `false` on `kernel_profile_extreme`. With both
-/// this and `PROC_SYSCALL_LOG_ENABLED` off, `handle_syscall` also skips the
+/// Debug instrumentation. With both this and `PROC_SYSCALL_LOG_ENABLED` off, `handle_syscall` also skips the
 /// per-syscall timing read (see `need_timing` in `src/syscall/mod.rs`).
-#[cfg(not(kernel_profile_extreme))]
 pub const PROCESS_SYSCALL_STATS: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const PROCESS_SYSCALL_STATS: bool = false;
 
 /// Enable per-process syscall ring-buffer log in procfs (/proc/<pid>/syscalls).
 ///
 /// This is the real heap cost in the debug-instrumentation group: a per-process
 /// `VecDeque` of up to `PROC_SYSCALL_LOG_MAX_ENTRIES` entries, retained
 /// `PROC_SYSCALL_LOG_RETAIN_MS` after the process exits, scaling with process
-/// count. Forced `false` on `kernel_profile_extreme` — the recording call in
-/// `src/syscall/mod.rs` is gated on this, so the `SYSCALL_LOG` map is never
-/// populated (the MAX_ENTRIES / RETAIN_MS knobs below become inert).
-#[cfg(not(kernel_profile_extreme))]
+/// count. The recording call in `src/syscall/mod.rs` is gated on this; `false`
+/// leaves the `SYSCALL_LOG` map empty (the MAX_ENTRIES / RETAIN_MS knobs below
+/// become inert).
 pub const PROC_SYSCALL_LOG_ENABLED: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const PROC_SYSCALL_LOG_ENABLED: bool = false;
 
 /// Audit `handle_syscall`'s reuse of the prologue identity in its epilogue.
 ///
@@ -785,20 +631,14 @@ pub const IDENTITY_AUDIT: bool = false;
 /// live/recently-dead process. 64 keeps the last ~64 syscalls — enough to see
 /// the lead-up to a fault — for ~2 KB/process (was 500 → ~16 KB/process, far
 /// more history than debugging needs). Only allocated when
-/// `PROC_SYSCALL_LOG_ENABLED` (off on extreme).
+/// `PROC_SYSCALL_LOG_ENABLED`.
 pub const PROC_SYSCALL_LOG_MAX_ENTRIES: usize = 64;
 
 /// How long (ms) to keep a dead process's log after it exits.
 pub const PROC_SYSCALL_LOG_RETAIN_MS: u64 = 10_000; // 10 s
 
 /// Expose SysV IPC message queue state at /proc/sysvipc/msg.
-///
-/// Forced `false` on `kernel_profile_extreme` — that profile also gates out the
-/// `sc-sysv-ipc` syscall family, so the procfs view has nothing to show.
-#[cfg(not(kernel_profile_extreme))]
 pub const PROC_SYSVIPC_ENABLED: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const PROC_SYSVIPC_ENABLED: bool = false;
 
 /// Verbose file I/O logging (openat, read, readv, fstat paths + sizes).
 pub const SYSCALL_DEBUG_IO_ENABLED: bool = false;
@@ -836,10 +676,7 @@ pub const SYSCALL_ENOSYS_DIAG: bool = false;
 /// (`pmm::quarantine_drain_all` sits on the pressure ladder), so it cannot cause
 /// an OOM. Forced `false` on the low-RAM profiles, where 2 MiB is a real fraction
 /// of RAM and the debug cost is not wanted in a shipped image.
-#[cfg(not(kernel_profile_extreme))]
 pub const PMM_UAF_QUARANTINE: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const PMM_UAF_QUARANTINE: bool = false;
 
 /// At every `free_page` that drops the **last** reference, check whether a live
 /// address space still tracks the frame (`pmm::report_premature_free`).
@@ -875,10 +712,7 @@ pub const PMM_PREMATURE_FREE_CHECK: bool = false;
 ///
 /// ~98 KB of BSS and two relaxed stores per refcount operation, so it is gated off
 /// on the low-RAM profiles alongside the quarantine.
-#[cfg(not(kernel_profile_extreme))]
 pub const COW_REF_LEDGER: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const COW_REF_LEDGER: bool = false;
 
 /// Extended diagnostics for syscalls that return EFAULT/ENOSYS/EINVAL.
 ///
@@ -889,12 +723,8 @@ pub const COW_REF_LEDGER: bool = false;
 ///
 /// Default `true` while the forktest mmap-stress investigation is active
 /// (see docs/GO_FORKTEST_DEBUG.md §E). Set to `false` to revert to the
-/// compact one-line format. Forced `false` on `kernel_profile_extreme`
-/// (debug instrumentation — trims image size on the shipped low-RAM build).
-#[cfg(not(kernel_profile_extreme))]
+/// compact one-line format.
 pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const SYSCALL_ERRNO_DIAG_EXTRA: bool = false;
 
 /// Master switch for the EFAULT/ENOSYS/EINVAL dangerous-errno log line itself
 /// (see `SYSCALL_ERRNO_DIAG_EXTRA` above for its format, not whether it fires).
@@ -944,12 +774,8 @@ pub const SYSCALL_ERRNO_DIAG_ENABLED: bool = false;
 /// When `true`, such a spurious SVC is detected at entry, the I-cache is
 /// flushed (`ic iallu`), `ELR` is backed up by 4, and the syscall is **not**
 /// dispatched — so the real instruction re-executes with registers intact.
-/// Reads 4 bytes of user code per syscall; forced `false` on the low-RAM
-/// `extreme` profile.
-#[cfg(not(kernel_profile_extreme))]
+/// Reads 4 bytes of user code per syscall.
 pub const VERIFY_SVC_AT_ENTRY: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const VERIFY_SVC_AT_ENTRY: bool = false;
 
 /// Log **`read()`** on **pipe reader FDs** (`PipeRead`): pid, tid, fd, pipe id,
 /// user buffer pointer and count on each syscall, plus **`validate_user_ptr`**
@@ -976,12 +802,7 @@ pub const SYSCALL_DEBUG_PIPE_READ_SAMPLE: u64 = 1;
 /// syscalls when Go reports **`PC≈0x13060`** (shared syscall trampoline).
 ///
 /// See **`docs/GO_FORKTEST_DEBUG.md`** (Pattern 2, Agent handoff).
-///
-/// Forced `false` on `kernel_profile_extreme` (debug instrumentation).
-#[cfg(not(kernel_profile_extreme))]
 pub const DEBUG_SIGSEGV_SYSCALL_STUB: bool = true;
-#[cfg(kernel_profile_extreme)]
-pub const DEBUG_SIGSEGV_SYSCALL_STUB: bool = false;
 
 /// Inclusive minimum user **`ELR_EL1`** for **`[sigsegv-syscall]`** (static **`forktest_parent`**
 /// trampoline ~**`0x13060`**; widen if your binary's text mapping differs).
@@ -1048,12 +869,7 @@ pub const ENABLE_SGI_DEBUG_PRINTS: bool = false;
 // (docs/archive/AKUMA_TIME_EXTRACTION.md). A runtime governor demotes further
 // if the host's behaviour changes after boot. Keep this at 3 ms (the measured
 // HVF-safe floor) so a disabled probe still boots cheap.
-// extreme-size keeps the old 10 ms: a 4 MB single-core box pays for every
-// interrupt and has no sc-epoll, and short ticks are unvalidated there.
-#[cfg(not(kernel_profile_extreme))]
 pub const TIMER_INTERVAL_US: u64 = 3_000;
-#[cfg(kernel_profile_extreme)]
-pub const TIMER_INTERVAL_US: u64 = 10_000;
 
 /// Deferred thread cleanup mode
 ///
@@ -1094,28 +910,7 @@ pub const THREADING_HEARTBEAT_INTERVAL: u64 = 50_000_000; // BSP idle heartbeat 
 /// When enabled, the kernel will spawn /bin/herd as a userspace process
 /// after the network stack is initialized. Herd manages background services
 /// defined in /etc/herd/enabled/.
-/// On by default. The one exception is the 4 MB extreme profile once the
-/// built-in SSH server is compiled out (`userspace-sshd`): there herd plus its
-/// service tree costs more RAM than the box has to spare, and the only service
-/// it would start is `/bin/sshd`, which [`AUTO_START_SSHD`] starts directly.
-pub const AUTO_START_HERD: bool =
-    !(cfg!(kernel_profile_extreme) && cfg!(feature = "userspace-sshd"));
-
-/// Login shell handed to the kernel-spawned `/bin/sshd`.
-///
-/// `/bin/paws` is the first-party mini-shell (`userspace/paws`, 7 mapped pages)
-/// rather than busybox's `/bin/sh` (265 pages): on a 4 MB box busybox alone is
-/// ~1.8x the shared file-page dedup cache, so concurrent shells stop sharing
-/// text. See docs/archive/FPCACHE_UNDERSIZED_AT_LOW_RAM.md.
-pub const USERSPACE_SSHD_SHELL: &str = "/bin/paws";
-
-/// Spawn `/bin/sshd` straight from the kernel, with no supervisor.
-///
-/// Only meaningful when there is no built-in SSH server (`userspace-sshd`) and
-/// herd is not running — otherwise herd owns service startup and starting a
-/// second sshd would collide on the listening port. This is what keeps a
-/// herd-less image reachable.
-pub const AUTO_START_SSHD: bool = cfg!(feature = "userspace-sshd") && !AUTO_START_HERD;
+pub const AUTO_START_HERD: bool = true;
 
 // ============================================================================
 // Procfs Buffer Size Limits
@@ -1189,40 +984,12 @@ pub const TRACE_TKILL: bool = false;
 
 /// Compute user process stack size based on available RAM.
 ///
-/// Returns `USER_STACK_SIZE_OVERRIDE` if non-zero, otherwise scales:
-///   - 256 MB RAM → 128 KB (minimum)
-///   - 512 MB RAM → 256 KB
-///   - 1 GB RAM   → 512 KB  
-///   - 2 GB RAM   → 1 MB
-///   - 4 GB+ RAM  → 2 MB (maximum)
-///
-/// The formula is: stack_size = RAM / 2048, clamped to [128KB, 2MB]
+/// See `akuma_mem_policy::compute_user_stack_size` — moved there (config flag sweep,
+/// 2026-11-11) so amd64 (which never called this at all, and hardcoded a flat 8 MiB ceiling
+/// instead; see `crates/akuma-kernel-amd64/src/exec_runtime.rs`) and both tokio kernels can share the same policy.
+/// No longer `const fn`: nothing called it from a const context, and the shared crate's version
+/// isn't one.
 #[must_use]
-pub const fn compute_user_stack_size(ram_size_bytes: usize) -> usize {
-    if USER_STACK_SIZE_OVERRIDE != 0 {
-        return USER_STACK_SIZE_OVERRIDE;
-    }
-    
-    const MIN_STACK: usize = 128 * 1024;  // 128 KB minimum
-    const MAX_STACK: usize = 8 * 1024 * 1024;  // 8 MB maximum
-    
-    // RAM / 2048 gives us nice scaling:
-    // 256 MB / 2048 = 128 KB
-    // 512 MB / 2048 = 256 KB
-    // 1 GB / 2048 = 512 KB
-    // 2 GB / 2048 = 1 MB
-    // 4 GB / 2048 = 2 MB
-    // 8 GB / 2048 = 4 MB
-    // 16 GB / 2048 = 8 MB
-    let computed = ram_size_bytes / 2048;
-    
-    // Clamp to [MIN_STACK, MAX_STACK]
-    if computed < MIN_STACK {
-        MIN_STACK
-    } else if computed > MAX_STACK {
-        MAX_STACK
-    } else {
-        // Round up to nearest 4KB page boundary
-        (computed + 0xFFF) & !0xFFF
-    }
+pub fn compute_user_stack_size(ram_size_bytes: usize) -> usize {
+    akuma_mem_policy::compute_user_stack_size(ram_size_bytes, USER_STACK_SIZE_OVERRIDE)
 }

@@ -33,17 +33,12 @@ use spinning_top::Spinlock;
 
 /// Bytes of console history kept for [`dmesg_snapshot_from`].
 ///
-/// 64 KiB covers a whole boot comfortably and costs only `.bss` — it is not in
-/// the image, so the `extreme-size` 4 MB floor is unaffected by the *size*. It
-/// is the **RAM** that profile is also minimising, so it selects `0` instead,
-/// and `Ring<0>` is a genuinely zero-sized type whose `push` compiles to
-/// nothing. That is the whole "optional" mechanism: a type parameter, not a
-/// `cfg` threaded through every call site, so the disabled build still
-/// type-checks the code it is not keeping.
-#[cfg(not(kernel_profile_extreme))]
+/// 64 KiB covers a whole boot comfortably and costs only `.bss`. A build that
+/// wanted no history would select `0`: `Ring<0>` is a genuinely zero-sized type
+/// whose `push` compiles to nothing. That is the whole "optional" mechanism:
+/// a type parameter, not a `cfg` threaded through every call site, so the
+/// disabled build still type-checks the code it is not keeping.
 const DMESG_CAP: usize = 64 * 1024;
-#[cfg(kernel_profile_extreme)]
-const DMESG_CAP: usize = 0;
 
 /// A copy of the last [`DMESG_CAP`] console bytes.
 ///
@@ -84,7 +79,7 @@ fn dmesg_capture(bytes: &[u8]) {
 
 /// How many bytes of console history are currently retrievable.
 ///
-/// `0` on a build with the ring disabled (`extreme-size`), which is the honest
+/// `0` on a build with the ring disabled (`DMESG_CAP == 0`), which is the honest
 /// answer rather than an error: there is no history, not a broken reader.
 #[must_use]
 pub fn dmesg_len() -> usize {
@@ -102,13 +97,6 @@ pub fn dmesg_len() -> usize {
 #[must_use]
 pub fn dmesg_snapshot_from(skip: usize, out: &mut [u8]) -> usize {
     DMESG.try_lock().map_or(0, |r| r.snapshot_from(skip, out))
-}
-
-/// Discard the buffered console history.
-pub fn dmesg_clear() {
-    if let Some(mut ring) = DMESG.try_lock() {
-        ring.clear();
-    }
 }
 
 /// Total console bytes ever emitted, including those since evicted.
@@ -169,17 +157,15 @@ static MULTICORE: AtomicBool = AtomicBool::new(false);
 /// bringup, against the alternative of never locking at all.
 ///
 /// `allow(dead_code)`: the only caller is `smp_shared::secondary_entry_shared`,
-/// which is compiled out on single-core targets (the extreme profile).
+/// which is compiled out without `smp-shared`.
 #[cfg(kernel_console_lock)]
-#[allow(dead_code)]
 pub fn set_multicore() {
     MULTICORE.store(true, Ordering::Release);
 }
 
-/// No-op when the lock is compiled out (size/extreme profiles). See above for
+/// No-op when the lock is compiled out (`CONSOLE_LOCK=0`). See above for
 /// why this can be uncalled.
 #[cfg(not(kernel_console_lock))]
-#[allow(dead_code)]
 pub fn set_multicore() {}
 
 // ============================================================================
@@ -328,17 +314,6 @@ pub fn getchar() -> u8 {
     akuma_uart::read_byte()
 }
 
-/// Read a character (blocking)
-#[allow(dead_code)]
-fn getchar_blocking() -> u8 {
-    while !has_char() {}
-    akuma_uart::read_byte()
-}
-
-#[allow(dead_code)]
-const BUFFER_SIZE: usize = 100;
-
-#[allow(dead_code)]
 pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
     loop {
         if has_char() {
@@ -352,11 +327,4 @@ pub fn read_line(buffer: &mut Vec<u8>, with_echo: bool) -> usize {
             }
         }
     }
-}
-
-#[allow(dead_code)]
-pub fn print_as_akuma(s: &str) {
-    print("≽ܫ≼ ... ");
-    print(s);
-    print("\n");
 }

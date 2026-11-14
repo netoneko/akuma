@@ -12,7 +12,7 @@ QEMU **and on the metal**.
 
 ## What landed
 
-`amd64/src/usermode.rs`'s `static mut PROCS: [Option<Process>; 128]` and its
+`crates/akuma-kernel-amd64/src/usermode.rs`'s `static mut PROCS: [Option<Process>; 128]` and its
 sibling `static mut PENDING_EXEC` are deleted. Every field of this target's
 private `Process` now lives on the registered `akuma_exec::Process` that slices
 1-2 put in `PROCESS_TABLE`:

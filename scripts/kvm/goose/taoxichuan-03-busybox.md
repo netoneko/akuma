@@ -50,7 +50,7 @@ table to the smallest thing that works (a few fixed slots), and think about whet
 crate before you grow `taoxichuan/src/main.rs` further (it is 1,106 lines now).
 
 The experiment's composition rule stands: pull as few crates as possible; extract into a crate first where
-the logic still lives in `amd64/src/`. Record the crate count (it was 14 at the end of stage 2) and the image
+the logic still lives in `crates/akuma-kernel-amd64/src/`. Record the crate count (it was 14 at the end of stage 2) and the image
 size (198,072 B) at the end of this stage in RESULT.md.
 
 ## 3. Ops rules (unchanged)

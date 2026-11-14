@@ -26,11 +26,8 @@ state:
     scripts/build_devbox_smoltcp.sh
     rust-objcopy -O binary target/aarch64-unknown-none/release/akuma /tmp/schedaudit-devbox.bin
 
-    # rump devbox at SMP=4 — build_devbox.sh is --no-default-features, so smp-shared
-    # has to be added explicitly or the secondaries are never brought up:
-    cargo build --release --no-default-features --features \
-      "devbox,sound,no-tests,rump-tests,smp-shared,sc-aio,sc-sysv-ipc,\
-sc-containers,sc-timerfd,sc-eventfd,sc-pidfd,sc-epoll"
+    # rump devbox at SMP=4 (every build is shared-kernel SMP):
+    scripts/build_devbox.sh
     rust-objcopy -O binary target/aarch64-unknown-none/release/akuma /tmp/schedaudit-rump.bin
 
 To build a baseline arm from a tree that already has the fix, stash just the two
@@ -57,9 +54,6 @@ this script serves it over HTTP to the VM.
   axes in different directions.
 - Arms measured an hour apart are not a controlled comparison. Use
   `--interleave` when a delta looks decision-critical.
-- The `extreme-size` profile cannot run this probe: the 1.2 MB static binary
-  plus its 2 MB heap does not fit a 4-8 MB box (fork failures / kernel-heap
-  OOM). Those are memory-floor facts, not scheduler results.
 """
 import argparse
 import json
@@ -97,12 +91,8 @@ ARMS = {
     "devbox-smp4-base":    dict(bin="schedaudit-devbox-base.bin", smp=4, mem=4096, disk="devbox.img", tick="10 ms", preempt=False),
     "devbox-smp4-fixed":   dict(bin="schedaudit-devbox.bin", smp=4, mem=4096, disk="devbox.img", tick="1 ms",  preempt=True),
     # rump devbox: NetBSD stack is the only network stack (RUMP_NIC=1, ssh on 2223).
-    # NOTE: scripts/build_devbox.sh is --no-default-features, so `smp-shared` must be
-    # added to DEVBOX_FEATURES to get a real SMP=4 kernel — see the docstring.
     "rump-smp4-base":      dict(bin="schedaudit-rump-base.bin", smp=4, mem=4096, disk="devbox.img", tick="10 ms", preempt=False, rump=True),
     "rump-smp4-fixed":     dict(bin="schedaudit-rump.bin", smp=4, mem=4096, disk="devbox.img", tick="1 ms", preempt=True, rump=True),
-    # extreme-size: functional check only, the probe does not fit (see Traps)
-    "extreme-4m":          dict(bin="schedaudit-ext.bin",    smp=1, mem=4,    disk="disk.img",   tick="10 ms", preempt=True),
 }
 ALL_PROBES = ["sleep", "poll", "pipe", "term", "termnet", "download", "https", "idle"]
 # HTTPS probe target. busybox wget cannot do TLS in this image — use the real

@@ -15,7 +15,7 @@ trace.
 
 `kvmtest kvmlinux` on the command line. `kvm::init` runs phases 0-5 and the ladder
 early; `kvm::late` (after the root mount — PVH path: inside `boot::late_init`'s
-closure; multiboot2 path: right after `have_fs`) runs `amd64/src/kvm/linux.rs`:
+closure; multiboot2 path: right after `have_fs`) runs `crates/akuma-kernel-amd64/src/kvm/linux.rs`:
 
 1. 128 MiB of guest RAM from `alloc_pages_contiguous_zeroed`, 2-MiB aligned,
    mapped by 2 MiB NPT leaves (guest-physical `g` = host `base + g`). Nothing else
@@ -268,11 +268,11 @@ TCG could not show it because its host timer was already running.
   (`/root/ktarget/.../build/akuma-amd64/<hash>/out`, last written Oct 18) — not
   caused by this work, not repaired; `rm -r` that directory from Pop, then `e2fsck`.
 - The ladder's last row under TCG (an emulation artefact; metal passes).
-- `unsafe`: `amd64/src` 82 → 87 (the trampoline, its call, the host `VMSAVE`,
+- `unsafe`: `crates/akuma-kernel-amd64/src` 82 → 87 (the trampoline, its call, the host `VMSAVE`,
   and two call sites); budget updated in the same commit.
 
 ## Background
 
-[`AKUMA_KVM.md`](AKUMA_KVM.md) · `crates/akuma-svm-amd64` · `amd64/src/kvm/linux.rs` ·
+[`AKUMA_KVM.md`](AKUMA_KVM.md) · `crates/akuma-svm-amd64` · `crates/akuma-kernel-amd64/src/kvm/linux.rs` ·
 `overlays/ryzen/README.md` (the one-shot drill) · APM Vol 2 §15.10-15.12,
 §15.20-15.21, Table B-1/B-2; Vol 3 Appendix E.

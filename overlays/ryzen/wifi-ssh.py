@@ -3,7 +3,7 @@
 
     python3 overlays/ryzen/wifi-ssh.py --key KEY [--net 192.168.1] [--port 2222] [--wait 900] [CMD...]
 
-The station's MAC is fixed (`amd64/src/rtw89_sta.rs`: `02:41:4b:55:4d:41`), its
+The station's MAC is fixed (`crates/akuma-kernel-amd64/src/rtw89_sta.rs`: `02:41:4b:55:4d:41`), its
 address is whatever the network's DHCP gave it. This sweeps the /24 with one
 ping each (so the Mac's ARP table learns everyone on it), looks the MAC up in
 `arp -an`, and then runs CMD (default: a short health check) as root through

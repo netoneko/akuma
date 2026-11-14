@@ -207,7 +207,7 @@ pub fn pipe_write(id: u32, data: &[u8]) -> Result<usize, i32> {
 ///
 /// For a kernel with no signal delivery: amd64 answers a broken pipe with
 /// `EPIPE` alone, which is "the whole of Linux's answer that applies" there
-/// (`amd64/src/fd.rs`, `write_pipe`). Spelled as a second entry point rather
+/// (`crates/akuma-kernel-amd64/src/fd.rs`, `write_pipe`). Spelled as a second entry point rather
 /// than as a global policy flag so the choice is visible at the call site that
 /// makes it, and so nothing can change it after boot.
 pub fn pipe_write_no_sigpipe(id: u32, data: &[u8]) -> Result<usize, i32> {
@@ -258,9 +258,8 @@ fn write_inner(id: u32, data: &[u8], raise_sigpipe: bool) -> Result<usize, i32> 
 /// is in its matching read, so a full buffer always has a live drainer on the other
 /// side. Do **not** reach for this on a pipe whose reader might be the same thread.
 // Callers live on the rump-sysproxy paths (`not(smoltcp)` sendmsg, `feature = "rump"`
-// proxy) and in the boot tests; size/extreme (smoltcp + no-tests, no rump) compile none
-// of them. Allow rather than cfg-mirror three caller gates.
-#[allow(dead_code)]
+// proxy) and in the boot tests; a smoltcp + no-tests build without rump compiles
+// none of them. Allow rather than cfg-mirror three caller gates.
 pub fn pipe_write_all_blocking(id: u32, data: &[u8]) -> Result<(), i32> {
     let mut off = 0usize;
     while off < data.len() {
@@ -404,7 +403,7 @@ pub fn pipe_pollers_count(id: u32) -> usize {
 /// two only differ on an id nobody holds — kept distinct rather than merged so a
 /// stale id reports "not ready" instead of manufacturing a readable event.
 ///
-/// **`amd64/src/pipe.rs` takes the crate's answer instead**, and that divergence
+/// **`crates/akuma-kernel-amd64/src/pipe.rs` takes the crate's answer instead**, and that divergence
 /// is deliberate rather than drift: the fixed slot array it replaced reported on
 /// the array entry, not on a live pipe, so "missing" was never a state it could
 /// answer `false` for, and it has no epoll/`tokio` callers pinned to this one.
@@ -460,20 +459,50 @@ pub fn pipe_counts(id: u32) -> Option<(u32, u32)> {
 }
 
 /// How many pipes are live right now.
-///
-/// A machine-wide ceiling is a policy, not a table rule, so the crate does not
-/// impose one — amd64 caps at 64 so that a pipe leak announces itself instead
-/// of being absorbed (each pipe is up to `PIPE_CAPACITY` of kernel buffer,
-/// claimed on a userspace request), and asks this to enforce it.
 #[must_use]
 pub fn pipe_live_count() -> usize {
     with_table(|t| t.live_count())
+}
+
+/// The machine-wide pipe ceiling `pipe2` enforces on both kernels: `ENFILE`
+/// past it, Linux's answer when the system's file table is full.
+///
+/// A policy, not a table rule, so it is here and not in `akuma-pipes`. Each
+/// pipe can hold up to `PIPE_CAPACITY` of kernel buffer claimed on a userspace
+/// request, so a bound turns a leak into a refusal that announces itself.
+/// amd64 enforced this alone until 2026-11-12 (`crates/akuma-kernel-amd64/src/pipe.rs`). The
+/// sample-then-create below is soft by one race: concurrent creators can land
+/// a few over it, which is fine for a policy nothing indexes.
+pub const MAX_PIPES: usize = 2048;
+
+static PIPE_HIGH_WATER: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static PIPE_REFUSALS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// `(live, high_water, refused, cap)`: the reading that tells a pipe leak (a
+/// high-water that climbs across a workload that ends) from demand (a
+/// high-water near the cap and a refusal count that moves).
+#[must_use]
+pub fn pipe_stats() -> (usize, usize, usize, usize) {
+    let live = pipe_live_count();
+    PIPE_HIGH_WATER.fetch_max(live, core::sync::atomic::Ordering::Relaxed);
+    (
+        live,
+        PIPE_HIGH_WATER.load(core::sync::atomic::Ordering::Relaxed),
+        PIPE_REFUSALS.load(core::sync::atomic::Ordering::Relaxed),
+        MAX_PIPES,
+    )
 }
 
 pub fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
     if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
 
+    let live = pipe_live_count();
+    if live >= MAX_PIPES {
+        PIPE_REFUSALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return ENFILE;
+    }
+    PIPE_HIGH_WATER.fetch_max(live + 1, core::sync::atomic::Ordering::Relaxed);
     let pipe_id = pipe_create();
     let fd_r = proc.alloc_fd(akuma_exec::process::FileDescriptor::PipeRead(pipe_id));
     let fd_w = proc.alloc_fd(akuma_exec::process::FileDescriptor::PipeWrite(pipe_id));

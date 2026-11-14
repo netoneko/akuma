@@ -102,8 +102,10 @@ errno_table! {
     ENOTDIR = 20;
     EISDIR = 21;
     EINVAL = 22;
+    ENFILE = 23;
     EMFILE = 24;
     ENOTTY = 25;
+    ETXTBSY = 26;
     ENOSPC = 28;
     ESPIPE = 29;
     EROFS = 30;
@@ -112,6 +114,8 @@ errno_table! {
     ERANGE = 34;
     ENOSYS = 38;
     ENOTEMPTY = 39;
+    /// Too many levels of symbolic links, and `open(O_NOFOLLOW)` on a symlink.
+    ELOOP = 40;
     ENOMSG = 42;
     /// The fd is not a socket.
     ///
@@ -226,7 +230,9 @@ mod tests {
             ("EEXIST", EEXIST, 17),
             ("EXDEV", EXDEV, 18),
             ("EINVAL", EINVAL, 22),
+            ("ENFILE", ENFILE, 23),
             ("EMFILE", EMFILE, 24),
+            ("ETXTBSY", ETXTBSY, 26),
             ("EADDRINUSE", EADDRINUSE, 98),
             ("ETIMEDOUT", ETIMEDOUT, 110),
             ("EINPROGRESS", EINPROGRESS, 115),
@@ -241,6 +247,8 @@ mod tests {
             ("ERANGE", ERANGE, 34),
             ("ENOSYS", ENOSYS, 38),
             ("ENOTEMPTY", ENOTEMPTY, 39),
+            // Added 2026-11-11 for `openat`'s `O_NOFOLLOW` refusal (glue).
+            ("ELOOP", ELOOP, 40),
             ("EDESTADDRREQ", EDESTADDRREQ, 89),
             // Added 2026-08-23 for the AF_UNIX socket family
             // (`akuma_net_unix`); no history under the old tables.

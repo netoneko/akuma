@@ -76,7 +76,7 @@ git diff --name-status $BASE..HEAD -- '*.md' ':!userspace' | grep -v '^D'
 
 # 3. fix-shaped additions to docs that are NOT archive docs: each hit is either
 #    current-state wording (leave it) or incident history (move it to archive/)
-git diff $BASE..HEAD -- docs/reference docs/runbooks overlays amd64/README.md \
+git diff $BASE..HEAD -- docs/reference docs/runbooks overlays crates/akuma-kernel-amd64/README.md \
   | grep '^+' | grep -i -E 'fixed 20|\(fixed|until 20[0-9]{2}|found on|root cause|spun|spins|wedged'
 ```
 

@@ -76,13 +76,13 @@ pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {
 }
 
 /// `pidfd_send_signal(pidfd, sig, info, flags)`. `info` is not read: this
-/// kernel's signal delivery (`akuma_exec::process::deliver_signal`, the same
-/// one `kill(2)`/`tgkill(2)` use) has no siginfo payload to carry it in, the
-/// same simplification `sys_kill` already makes. `flags` has exactly one
+/// kernel's signal delivery (`pend_signal_to_group`, the same one `kill(2)`
+/// uses) has no siginfo payload to carry it in, the same simplification
+/// `sys_kill` already makes. `flags` has exactly one
 /// defined value (0) as of this writing; anything else is `EINVAL` rather
 /// than silently ignored.
 pub(super) fn sys_pidfd_send_signal(pidfd: u32, sig: u32, _info: u64, flags: u32) -> u64 {
-    if flags != 0 {
+    if flags != 0 || sig as usize > akuma_exec::process::MAX_SIGNALS {
         return EINVAL;
     }
     let target = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(pidfd)) {
@@ -106,5 +106,9 @@ pub(super) fn sys_pidfd_send_signal(pidfd: u32, sig: u32, _info: u64, flags: u32
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::tprint!(96, "[pidfd] send_signal pidfd={} → pid={} sig={}\n", pidfd, pid, sig);
     }
-    if akuma_exec::process::deliver_signal(pid, sig) { 0 } else { ESRCH }
+    // Pended like `kill(2)`, SIGKILL included (2026-11-11): this was
+    // `deliver_signal`, whose SIGKILL marks the victim's slots `TERMINATED` from
+    // the caller's core — the path amd64 cannot survive, reached here by Go's
+    // `os.Process.Kill` (`super::signal::sys_kill` has the history).
+    if akuma_exec::process::pend_signal_to_group(pid, sig) { 0 } else { ESRCH }
 }

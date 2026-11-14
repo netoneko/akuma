@@ -260,5 +260,5 @@ enough).
 ## Background
 
 [`AKUMA_KVM.md`](AKUMA_KVM.md) · [`AKUMA_KVM_LINUX_GUEST.md`](AKUMA_KVM_LINUX_GUEST.md) ·
-`crates/akuma-svm-amd64/src/{lapic,mmio}.rs` · `amd64/src/kvm/linux.rs` ·
+`crates/akuma-svm-amd64/src/{lapic,mmio}.rs` · `crates/akuma-kernel-amd64/src/kvm/linux.rs` ·
 [`../runbooks/kvm-linux-guest.md`](../runbooks/kvm-linux-guest.md)

@@ -26,8 +26,8 @@ change to the dropped-window ledger or the ext2 guards.
 ( cd /tmp/bklpay && python3 -m http.server 8899 --bind 127.0.0.1 & )
 
 # 2. kernel. Stress verdict uses the SHIPPING config; attribution adds bkl-profile.
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile
+cargo build --profile release-smp-shared --features no-tests
+cargo build --profile release-smp-shared --features no-tests,bkl-profile
 
 # 3. boot (nothing else may hold devbox.img open — see below).
 #    SNAPSHOT=1 discards writes, so the two sides of an A/B start byte-identical.

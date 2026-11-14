@@ -17,3 +17,4 @@ workspace = true
 # for a bare-metal target before the heap exists and testable on the host with
 # nothing to vendor.
 [dependencies]
+akuma-machine-facts = { path = "../akuma-machine-facts" }

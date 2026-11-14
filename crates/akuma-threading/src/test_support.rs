@@ -60,8 +60,6 @@ pub fn ensure_test_runtime() {
                 enable_stack_canaries: false,
                 stack_canary: 0xDEAD_BEEF_DEAD_BEEF,
                 canary_words: 4,
-                network_thread_ratio: 4,
-                prioritize_never_scheduled: false,
                 deferred_thread_cleanup: false,
                 thread_cleanup_cooldown_us: 10_000,
                 syscall_debug_info_enabled: false,

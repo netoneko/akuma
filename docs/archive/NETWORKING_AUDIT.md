@@ -38,7 +38,7 @@ pollable quiesce bit to wait on and no caller today.
   `desc.rs`, `regs.rs`, `mdio.rs`, `link.rs`, `chip.rs`, `stall.rs`,
   `model.rs`), the glue in `akuma-net-nic/src/rtl8169.rs`, the call sites in
   `akuma-net-nic/src/loopback.rs`, and the platform assumptions in
-  `amd64/src/net.rs`.
+  `crates/akuma-kernel-amd64/src/net.rs`.
 * **Method:** line-level read of both layers against the RTL8168 family's
   documented behaviour; the ownership protocol was checked direction by
   direction; every suspicion that `FakeChip` could express was turned into a
@@ -167,7 +167,7 @@ been full with zero reclaim for `STALL_QUIET_US` arm a TX-side recovery
 **Where:** `driver.rs:152` (`IMR ← INT_DEFAULT_MASK`), against the crate's
 own contract at `lib.rs:34-35` ("**No interrupt handler.** … routing the line
 and deciding when to call it are the consumer's") and the platform reality
-(`amd64/src/net.rs:343`: "one-core, no-IRQ machine"; no handler is
+(`crates/akuma-kernel-amd64/src/net.rs:343`: "one-core, no-IRQ machine"; no handler is
 registered anywhere).
 
 On this target the line is never routed, so it is latent. But the chip is

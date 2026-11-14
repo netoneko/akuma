@@ -8,7 +8,7 @@ and no other handler ever ran.
 
 ## What it does now
 
-- **`kill`, `tkill`, `tgkill`** are the x86 kernels' shared bodies, moved from `amd64/src/signal.rs` into
+- **`kill`, `tkill`, `tgkill`** are the x86 kernels' shared bodies, moved from `crates/akuma-kernel-amd64/src/signal.rs` into
   `akuma-syscalls-glue-amd64::kill` (amd64 forwards to them; its `sys_kill` history stays in the doc comments). A signal
   is *pended* on the target (`akuma_exec::process::pend_signal_to_group`, or the one thread for `tkill`) and taken by each
   thread at its own next return to ring 3. Nothing marks a running thread dead from another core.

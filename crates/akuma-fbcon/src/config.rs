@@ -17,7 +17,7 @@
 //! | `cols` | columns of the printing area, anchored top-left | `73`, `50%` |
 //! | `rows` | rows of the printing area | `30`, `80%` |
 //! | `font` | cell height of the baked text font | `20`, `22`, `24`, `32`, `40`, `48` (or `10x20`) |
-//! | `smooth` | how text edges are drawn: subpixel in the panel's stripe order, or gray | `lcd` / `rgb` (default), `bgr`, `gray` / `off` |
+//! | `smooth` | how text edges are drawn: subpixel in the panel's stripe order, or gray | `gray` / `off` (default, macOS-style), `lcd` / `rgb`, `bgr` |
 //!
 //! A percentage is of the grid the screen holds **after** the margin is applied, so
 //! `cols = 50%` is half of whatever fits. Unknown keys, malformed values and

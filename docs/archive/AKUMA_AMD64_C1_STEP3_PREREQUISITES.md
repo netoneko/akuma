@@ -11,7 +11,7 @@ Firecracker and bare metal.
 
 ## The shape of the problem
 
-C1 folds `amd64/src/usermode.rs` into `akuma-syscalls-glue`, one arm at a time
+C1 folds `crates/akuma-kernel-amd64/src/usermode.rs` into `akuma-syscalls-glue`, one arm at a time
 (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`, trunk C). The gate for starting —
 `cargo check -p akuma-syscalls-glue --target x86_64-unknown-none` — went green
 with B3 (`docs/archive/AKUMA_AMD64_B3_ADDRESS_SPACE.md`), and the C1 dispatch
@@ -42,7 +42,7 @@ first thing they touch is `akuma_exec::runtime::config()`, a
         akuma-exec: ExecConfig not registered — call akuma_exec::init() first
 ```
 
-`amd64/src/exec_runtime.rs` is the answer: this target's `ExecRuntime` +
+`crates/akuma-kernel-amd64/src/exec_runtime.rs` is the answer: this target's `ExecRuntime` +
 `ExecConfig`, with every field labelled as one of three kinds — real, a no-op
 that provably cannot fire, or a loud `not_wired!` stub that panics naming
 itself and the step that will wire it. The module header argues category 3 at
@@ -58,13 +58,13 @@ which one.
 The amd64 panic handler printed a location and **discarded the message**, so
 every one of these arrived as a bare `lib.rs:208`. `Registered` exists to carry
 a string; that string was being thrown away at the last step. Fixed in
-`amd64/src/main.rs` the same day, with `safe_print!` and a fixed stack buffer —
+`crates/akuma-kernel-amd64/src/main.rs` the same day, with `safe_print!` and a fixed stack buffer —
 a panic handler is the console-survives-the-allocator path by definition.
 
 ## 2. `stac`/`clac` in the shared copy loop — the hang
 
 `akuma-user-access`'s x86 `copy_from_user_safe` was **the only x86 user copy in
-the tree without SMAP brackets**. `amd64/src/uaccess.rs`'s own
+the tree without SMAP brackets**. `crates/akuma-kernel-amd64/src/uaccess.rs`'s own
 `read_bytes`/`write_bytes` have had them since SMAP was turned on; the shared
 crate — the one every glue-served syscall copies through — did not.
 

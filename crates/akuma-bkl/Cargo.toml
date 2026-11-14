@@ -8,11 +8,13 @@ description = "The Big Kernel Lock protocol: RwSpinlock, KernelLock, hold-tag at
 workspace = true
 
 [features]
-# Real (shared-kernel) SMP, forwarded from the bin crate's `smp-shared` feature.
-# Makes this crate's build.rs emit `cfg(kernel_smp_shared)`, which is what turns
+# Akuma's shared-kernel SMP under this lock (`bkl-smp`, cfg `kernel_bkl_smp`).
+# Both Akuma kernels always turn it on; Taoxichuan never does (it serializes under
+# its own lock, proposals/ONE_BIG_KERNEL_LOCK.md); host tests build the off arms.
+# The cfg is what turns
 # `KernelLock` from a set of zero-overhead no-ops into a real lock. Off, every
 # `enter_kernel`/`leave_kernel` call in the tree compiles to nothing.
-smp-shared = ["akuma-primitives/smp-shared"]
+bkl-smp = ["akuma-primitives/bkl-smp"]
 
 [dependencies]
 # The whole dependency list. `MAX_THREADS`, `current_tid`, `disable_preemption`,

@@ -65,8 +65,8 @@ against a known disk each time and the stage-1–4 regression image stays untouc
 ## 3. Network path outbound
 
 The relay already implements outbound: `Gateway::out_accept`/`out_refuse`, host-side sockets, an
-`outbound: bool` gate (`amd64/src/kvm/relay.rs`, enabled per spec at
-`amd64/src/kvm/linux/machine.rs:1143`), plus a DNS forwarder (`dns_sock`, `dns_fwd`/`dns_answered`
+`outbound: bool` gate (`crates/akuma-kernel-amd64/src/kvm/relay.rs`, enabled per spec at
+`crates/akuma-kernel-amd64/src/kvm/linux/machine.rs:1143`), plus a DNS forwarder (`dns_sock`, `dns_fwd`/`dns_answered`
 counters). It has never been exercised guest-ward from taoxichuan. Config: add **`vm_outbound =
 true`** to `/etc/herd/available/vm-dev.conf` — that is the literal key `vm-serve-mc.conf` uses; same
 file, same shape as `vm_forward`. Gate: destination `10.0.2.2` (the gateway), which

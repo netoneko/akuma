@@ -1,6 +1,6 @@
 use super::*;
 
-use akuma_exec::threading::{WakeHandle, current_wake_handle, wake_by_handle};
+use akuma_exec::threading::{WakeHandle, wake_by_handle};
 use akuma_syscalls_sync::{Action, Located, Namespace, Step, WaiterId, WaiterTable, WakeOp};
 use akuma_syscalls_linux::flags::futex as fx;
 
@@ -333,11 +333,11 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
 /// This helper lets tests place a waiter at a non-zero tgid so we can
 /// verify that `futex_wake(tgid, ...)` correctly reaches private-futex
 /// queues (the fix for the `clear_child_tid` / `pthread_join` hang).
-#[allow(dead_code)]
+#[cfg(kernel_tests)]
 pub fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
     let key = (tgid, uaddr);
     akuma_primitives::irq::with_irqs_disabled(|| {
-        FUTEX_WAITERS.lock().enqueue(key, QueuedWaiter(current_wake_handle()), BITSET_MATCH_ANY);
+        FUTEX_WAITERS.lock().enqueue(key, QueuedWaiter(akuma_exec::threading::current_wake_handle()), BITSET_MATCH_ANY);
     });
     akuma_exec::threading::park_indefinitely();
     // futex_do_wake removed us from the queue before calling wake()
@@ -589,7 +589,7 @@ pub fn futex_purge_tid(tid: usize) {
     });
 }
 
-/// Test hooks for the boot self-test in `src/process_tests.rs`.
+/// Test hooks for the boot self-test in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
 ///
 /// The requeue table logic below was factored out of two byte-identical copies
 /// (FUTEX_REQUEUE / FUTEX_CMP_REQUEUE) while masking IRQs, so it is exactly the kind of
@@ -760,8 +760,25 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                 // a killed thread parked on an untimed FUTEX_WAIT re-parks forever and
                 // dies only to the 2 s grace-expiry hard kill. This was the dominant
                 // case — rustc's rayon workers park exactly here.
-                let signal_pending = akuma_exec::threading::peek_pending_signal(tid) != 0
-                    || akuma_exec::threading::has_pending_kill(tid);
+                //
+                // Three inputs, the union of what this loop and the amd64 kernel's
+                // own futex wait (folded into this one 2026-11-11) each consulted:
+                // - a pending signal **the thread has not blocked**. This read
+                //   `peek_pending_signal`, which ignores the mask, so a blocked
+                //   signal made every wait `EINTR` at once and musl's retry spun;
+                // - the deferred kill above, which is also how amd64's
+                //   `exit_group` (`thread::drain`) reaches a parked sibling;
+                // - the thread's interrupt flag (`is_current_interrupted`, which
+                //   consumes it): the route a thread-group *leader* takes out of an
+                //   untimed wait when a sibling's fault ends the group, which has
+                //   no deferred kill. Without it amd64's `-j4` build parked the
+                //   leader on `pthread_join` forever
+                //   (`docs/archive/AKUMA_AMD64_SELFHOST_BUILD_SLOWNESS.md` §13).
+                let signal_pending = akuma_exec::threading::pending_signals_raw(tid)
+                    & !akuma_exec::threading::thread_signal_mask_of(tid)
+                    != 0
+                    || akuma_exec::threading::has_pending_kill(tid)
+                    || akuma_exec::process::is_current_interrupted();
                 match akuma_syscalls_sync::step(
                     located,
                     signal_pending,

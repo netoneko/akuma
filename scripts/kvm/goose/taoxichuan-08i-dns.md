@@ -23,12 +23,12 @@ busybox `nslookup` is in the guest image.
 ## Composition rule (mandatory)
 `taoxichuan/` is a **composition root**, not a kernel written from scratch. It is 4,625 newly written lines (`main.rs` 3,077) next to 101 existing crates and a full amd64 kernel.
 Before you write any arm, subsystem or helper of more than about 20 lines:
-1. **Look first**: `grep -rn "<name>" crates/ amd64/src/` for the concept; `ls crates/`; plan § 0 lists the candidate crates (`akuma-net` carries the smoltcp UDP sockets).
+1. **Look first**: `grep -rn "<name>" crates/ crates/akuma-kernel-amd64/src/` for the concept; `ls crates/`; plan § 0 lists the candidate crates (`akuma-net` carries the smoltcp UDP sockets).
 2. **It exists in a crate**: add a path dependency and call it. Do not copy it.
-3. **It exists only in `amd64/src/`**: extract it into a crate first (`akuma-<thing>`, `#![forbid(unsafe_code)]` where it can; `scripts/check_unsafe_budget.py` gates new `unsafe`), make `amd64/`
+3. **It exists only in `crates/akuma-kernel-amd64/src/`**: extract it into a crate first (`akuma-<thing>`, `#![forbid(unsafe_code)]` where it can; `scripts/check_unsafe_budget.py` gates new `unsafe`), make `amd64/`
    depend on it too, then depend on it from `taoxichuan/`.
 3b. **It exists but is welded to `Process`/`akuma-exec`**: that is a seam to cut (pure leaf crate, as `akuma-sntp` was cut from `akuma-syscalls-time`) or a cargo feature. Say which and what it costs.
-    Before writing: diff `amd64/Cargo.toml`'s `akuma-*` dependencies against `taoxichuan/Cargo.toml`'s (18) and say which unused one covers this milestone, if any.
+    Before writing: diff `crates/akuma-kernel-amd64/Cargo.toml`'s `akuma-*` dependencies against `taoxichuan/Cargo.toml`'s (18) and say which unused one covers this milestone, if any.
 4. **It exists nowhere**: write it, in a crate with host tests where the logic is pure, and say why in the RESULT file.
 In the RESULT file report per change *pulled / extracted / cut / written new (why)*, `wc -l taoxichuan/src/*.rs`
 at the start and end, and the `akuma-*` dependency count of `taoxichuan/Cargo.toml` (18 now). A session that closes its gates and makes `taoxichuan/src` smaller is better than one that does not.

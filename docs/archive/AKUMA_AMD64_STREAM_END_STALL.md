@@ -83,7 +83,7 @@ So it is specific to the **final** segment of a stream, and intermittent.
 
 ## 4. The leading hypothesis, and why it fits
 
-**This target has no NIC interrupt.** `amd64/src/net.rs:433` states it plainly:
+**This target has no NIC interrupt.** `crates/akuma-kernel-amd64/src/net.rs:433` states it plainly:
 "with no NIC interrupt on this target … an arriving packet waits for the next
 tick", and the MMIO IRQ the command line already names
 (`virtio_mmio.device=512@0xfeb00000:5`) is not registered. What covers the gap
@@ -185,7 +185,7 @@ const STALL_LAPS: u32 = 2_000_000;   // "a second or two of genuine silence"
 ```
 
 That comment was true when it was written and is not true now.
-`amd64/src/net.rs`'s `netpoll_daemon` parks for one LAPIC tick whenever a lap
+`crates/akuma-kernel-amd64/src/net.rs`'s `netpoll_daemon` parks for one LAPIC tick whenever a lap
 moved nothing (`NETPOLL_IDLE_PARK_US`, added for the idle-CPU fix), so an idle
 receive lap runs about **100 times a second, not hundreds of thousands**.
 2,000,000 of them is **five and a half hours**. After boot the watchdog could

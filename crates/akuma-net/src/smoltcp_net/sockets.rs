@@ -124,15 +124,6 @@ pub fn socket_soft_cap() -> usize {
     SOCKET_SOFT_CAP.load(Ordering::Relaxed)
 }
 
-/// How many socket slots have been reclaimed under pressure since boot.
-///
-/// The count lives in [`crate::SOCKET_SLOTS_RECLAIMED`] so `/proc/health` can
-/// read it on a build with the stack compiled out.
-#[must_use]
-pub fn reclaimed_slot_count() -> u64 {
-    crate::SOCKET_SLOTS_RECLAIMED.load(Ordering::Relaxed)
-}
-
 #[must_use]
 pub fn socket_create() -> Option<SocketHandle> {
     with_network(|net| {
@@ -170,7 +161,7 @@ pub fn socket_create() -> Option<SocketHandle> {
         // ACK *and* the response. Measured on redis PING at every core count:
         // exactly 1.97-2.00 tx packets per rx packet. Each transmit costs
         // ~14.9 us of `add_notify_wait_pop` spin inside the `NETWORK` lock
-        // (`virtio_rings.rs` header), so the duplicate is ~15 us of the 69 us
+        // (`docs/archive/AKUMA_NET_ISSUES.md` §7), so the duplicate is ~15 us of the 69 us
         // serialized budget that sets the throughput ceiling.
         //
         // The old comment here justified `None` as avoiding a ~65KB/10ms

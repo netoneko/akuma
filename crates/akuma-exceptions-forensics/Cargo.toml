@@ -1,0 +1,15 @@
+[package]
+name = "akuma-exceptions-forensics"
+version = "0.1.0"
+edition = "2024"
+description = "Fault-time forensics for akuma-exceptions (RELR slot hunt, per-page frame dump), feature-gated out of production by the handler."
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-cpu = { path = "../akuma-cpu" }
+akuma-exec = { path = "../akuma-exec", features = ["elf-loader"] }
+akuma-phys = { path = "../akuma-phys" }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-primitives = { path = "../akuma-primitives" }

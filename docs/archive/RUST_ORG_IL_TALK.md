@@ -10,7 +10,7 @@ what Rust was sold as, not on specific functions or technical problems.
 - "self hosting on amd64 story that requires way more than running on qemu"
 - "rust shines in drivers, host level testing, the forced invention of inversion of control because of the big pre-porting refactor"
 - "all of this would be a complete nightmare in c"
-- "it's more about consistently apply what rust was sold as"
+- "it's more about consistently applying what rust was sold as"
 - "maybe i'll start with how it's exciting to be able to run things but running useful things forces you into a discipline because if you're doing things you should do them well"
 - "now your own software stack can be built by open models in relatively short time with minimal investment of money"
 - "the question is can reliable software be built with new tech, if yes, what enables it"
@@ -42,10 +42,165 @@ what Rust was sold as, not on specific functions or technical problems.
   has a "Measurements to take before the talk" checklist; its numbers are
   derived until re-measured on a clean tag.
 
+## Before and after the cleanup (re-measured 2026-11-02, one tool, both ends)
+
+The slide numbers. Goose + GLM wrote Taoxichuan up to the cutover; from there Opus cleaned it up
+([`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md), A1-B15, 62 commits in two days). **Before** is the
+cutover, `c362f165` (2026-11-01 13:39); **after** is `961a77be` (B15, 2026-11-02 16:37; no kernel source changed
+after it). Both ends measured today with the same `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64`,
+`--features no-tests`, clean trees. The older sections below used earlier versions of the tool or a dirty tree, so
+their "before" figures (84,761 on 10-30) do not compare with these; quote this table.
+
+| audit lines (live code compiled into the image) | before (cutover) | after (B15) | change |
+|---|---:|---:|---:|
+| **taoxichuan alone** (the guest) | **87,761** | **77,839** | -9,922 (-11%) |
+| of which the kernel's own code | 7,844 (`taoxichuan` crate) | 3,771 (`main.rs` 13 + `akuma-tokio-kernel-amd64` 3,758) | -52% |
+| of which third-party (crates.io) | 41,748 (22 crates, 48%) | 21,861 (15 crates, 28%) | -48% |
+| `unsafe` lines in the guest | 2,850 | 1,668 | -41% |
+| - in the kernel's own code | 187 (`taoxichuan`) | 98 (`akuma-tokio-kernel-amd64`; `main.rs` has none) | -48% |
+| - in other workspace crates | 791 | 781 | -1% |
+| - in third-party crates | 1,872 (66%) | 789 (47%) | -58% |
+| build-time host code (build.rs, proc-macros and their dependencies) | 31,743 | 428 | -99% |
+| every file rustc read (`whole`, a C-style count) | 131,299 | 113,163 | -14% |
+| **akuma-amd64 alone** (the host) | **152,104** | **136,727** | -15,377 (-10%) |
+| `unsafe` lines in the host | 3,505 | 2,401 | -31% |
+| - in the kernel's own code (`amd64/`) | 289 | 289 | 0 |
+| - in workspace crates | 784 | 773 | -1% |
+| - in third-party crates | 2,432 (69%) | 1,339 (56%) | -45% |
+| **taoxichuan on an Akuma host** (union, shared lines once) | **161,128** | **141,903** | -19,225 (-12%) |
+| what Taoxichuan adds to the host | 9,024 | 5,176 | -43% |
+| share of Taoxichuan already live in the host | 90% | 93% | |
+| **taoxichuan on a Linux host** (Linux 6.18 + KVM 2,362,283, + the guest) | **2,450,044** | **2,440,122** | |
+
+- **The cleanup shrank the host too**, by more than it shrank the guest: most of it was shared code. The in-tree
+  virtio driver replaced `virtio-drivers` and its stack (zerocopy alone was 8,334 lines and 743 `unsafe`) in every
+  kernel, and with it went `syn` and the proc-macros (the build-time row).
+- **The `unsafe` that went away was almost all dependencies'.** Ours barely moved: 978 -> 879 lines in the guest
+  (kernel + workspace), 1,073 -> 1,062 in the host. Third-party `unsafe` fell by 1,083 lines in the guest and 1,093
+  in the host, because the crates holding it (zerocopy, virtio-drivers, safe-mmio) left the build.
+- **The guest's own code halved and stopped being a kernel.** `taoxichuan/src` went from 12,131 lines to a 19-line
+  `main.rs`; what was its private syscall dispatch, spawn ring and fd model is now the shared glue the host runs
+  (`akuma-syscalls-glue` went from not in the guest to its second-largest crate, 10,753). The workspace share grew
+  (38,169 -> 55,965) for that reason: the same behaviour, now in code two kernels share and test.
+- Against Linux: the guest went from **9.5x** to **10.7x** smaller than Linux trimmed to the same job (836,651),
+  and from 21x to **24x** smaller than Linux as Firecracker ships it (1,868,016). The host went from 15.5x to
+  **17.3x** smaller than Linux + KVM.
+- What did not change: it still self-hosts. K1 == K2 at the cutover's predecessors (`6af48c06`, ryzen KVM and
+  metal) and after: B15 under Pop's KVM (`5f568279...`) and under TCG on the Mac (`b0c08970...`).
+
+## Bugs fixed, by subsystem (the bug-fix lists, 2026-11-03)
+
+From the two itemized lists: [`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) (Akuma, the whole project's history) and
+[`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md) (Taoxichuan's own code, its rigs and its experiment). One
+item per distinct, named bug a doc records as fixed; a fix in code both kernels run is counted once, in Akuma's list.
+Akuma's subsystems are tagged per write-up, not per bug, so a grab-bag doc lands in one row.
+
+**Total: 1,612 fixes** - 1,493 in Akuma (424 docs) and 119 in Taoxichuan (35 docs).
+
+| Akuma subsystem | fixes | % |
+|---|---:|---:|
+| Syscall / ABI compatibility | 245 | 16.4 |
+| Memory & virtual memory | 181 | 12.1 |
+| Boot & drivers | 141 | 9.4 |
+| VFS & filesystem | 140 | 9.4 |
+| Scheduler & process management | 139 | 9.3 |
+| SMP & locking | 136 | 9.1 |
+| Networking | 96 | 6.4 |
+| Toolchain & self-hosting | 91 | 6.1 |
+| Misc / cross-cutting | 64 | 4.3 |
+| Console & terminal | 58 | 3.9 |
+| Containers | 56 | 3.8 |
+| Userspace apps & libraries | 40 | 2.7 |
+| Signals & exceptions | 40 | 2.7 |
+| SSH | 40 | 2.7 |
+| Rump kernel & syscall proxy | 26 | 1.7 |
+| **Akuma total** | **1,493** | |
+
+| Taoxichuan subsystem | fixes | % |
+|---|---:|---:|
+| Syscalls, files & pipes | 37 | 31.1 |
+| Processes, fork, threads & scheduling | 33 | 27.7 |
+| Memory & copy-on-write | 16 | 13.4 |
+| Exec & ELF loading | 11 | 9.2 |
+| SMP, time & boot | 10 | 8.4 |
+| Signals | 5 | 4.2 |
+| Networking & readiness | 4 | 3.4 |
+| Build & integration | 3 | 2.5 |
+| **Taoxichuan total** | **119** | |
+
+**This branch fixed 142**: all 119 of Taoxichuan's (the kernel exists only here), plus **23 in Akuma**. Akuma's
+list on `main` reads 1,470; on this branch, 1,493:
+
+| Akuma subsystem | `main` | branch | the fixes |
+|---|---:|---:|---|
+| Syscall / ABI compatibility | 242 | 245 | `dup`/`F_DUPFD` dropped `O_NONBLOCK` (tokio's signal driver blocked); `pidfd_open` flags and close-on-exec; `rt_sigpending` served by no kernel |
+| Misc / cross-cutting | 59 | 64 | `SIG_UNBLOCK` left a stray SIGKILL/SIGSTOP bit; `akuma-pmm`'s CoW table a heap node per shared frame; a `kvm0` guest disk read as 856 MiB (herd reload race); the audit scanner swallowed code after a gated last field; amd64 self-test build broken since the boot-kit extraction |
+| Memory & virtual memory | 176 | 181 | `kvm0` guest RAM capped at 1 GiB (one NPT directory); the PVH handoff placed above 4 GiB, and `memmap_entries` always 1; glue's by-inode write never invalidated the file-page cache; `copy_from_user_str` gave `EFAULT` for a path in an untouched lazy page |
+| VFS & filesystem | 134 | 140 | ext2 wrote dirent types without `INCOMPAT_FILETYPE`, and read a 0 type as "file"; no triple-indirect blocks and 32-bit sizes (the 4 GiB cap); a full pin-table window read "pinned", stranding unlinks; a deferred free finished only at the next unlink |
+| Networking | 94 | 96 | in-tree virtio-net sent frames without the `virtio_net_hdr` (DHCP never answered); AF_UNIX `read`/`write` skipped the record queue |
+| SSH | 39 | 40 | sshd sessions had no `PATH`, so gcc could not find `cc1` |
+| Containers | 55 | 56 | every amd64 `box run` failed to spawn (glue's `exec` feature gated to AArch64) |
+| **Total** | **1,470** | **1,493** | **+23**, from 18 docs (406 -> 424) |
+
+All 23 turned up in Taoxichuan work: running a second kernel on the same crates, growing its VMs, measuring it.
+**Seventeen were bugs in `main`'s code**, which every Akuma kernel carries until this branch merges: `dup`'s lost
+`O_NONBLOCK`, `pidfd_open`, the missing `rt_sigpending`, the CoW table, the 1 GiB guest-RAM cap, the PVH handoff (2),
+the file-page cache invalidation, `copy_from_user_str`, AF_UNIX `read`/`write`, sshd's `PATH`, ext2's dirent types (2)
+and 4 GiB cap (2), and the pin table and deferred free behind deleted files keeping their space. **Six were in code
+this branch wrote**, caught and fixed before it reaches `main`: the `box run` regression (`3e2bb725`, the
+one-ELF-loader step), the in-tree virtio-net header, the amd64 self-test build, `SIG_UNBLOCK` in the newly extracted
+`akuma-syscalls-signal`, the herd reload race in the new `boot_dev.sh`, and the audit scanner.
+- Three fifths of Taoxichuan's bugs (70 of 119) are in syscalls/files/pipes and processes/threads/scheduling. 59 of
+  the 119 come from one document, the experiment's agent log
+  ([`MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md`](MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md)).
+
+## Crates: `main` vs this branch (2026-11-02)
+
+Counted as directories under `crates/` with a `Cargo.toml`; "forbids `unsafe`" = `#![forbid(unsafe_code)]` in its
+`src/lib.rs`. (`docs/reference/crate-safety.md` counts differently; these two columns compare with each other.)
+
+| | `main` | branch | change |
+|---|---:|---:|---:|
+| crates in `crates/` | 98 | 117 | +19, none removed |
+| of which forbid `unsafe` | 82 | 97 | +15 |
+| kernel roots | `src/` (AArch64), `amd64/` | + `taoxichuan/` (19 lines), `osaka/` (10 lines) | +2 |
+
+The 19 new crates, by size (raw lines of `.rs`, tests and comments included):
+
+| crate | lines | `unsafe`? | what it is |
+|---|---:|---|---|
+| `akuma-tokio-kernel-amd64` | 6,134 | yes | the whole amd64 tokio kernel (was `taoxichuan/src`) |
+| `akuma-boot-amd64` | 969 | yes | the boot kit: PVH/multiboot2 entry, the physmap, kernel page tables, heap + PMM |
+| `akuma-ring3-amd64` | 920 | yes | ring 3: ET_EXEC parsing, the initial user stack, the syscall/sysret transitions |
+| `akuma-virtqueue` | 886 | no | the driver side of virtio-mmio as pure decisions (registers, negotiation, split virtqueue); replaced `virtio-drivers` |
+| `akuma-syscalls-glue-amd64` | 706 | no | the x86_64 syscall ABI over the shared glue for the fd family and x86-only time calls |
+| `akuma-sched-amd64` | 569 | yes | the scheduler's machine half: per-slot page-table root, trap stack, user context, FP state |
+| `akuma-lapic-amd64` | 566 | no | the LAPIC timer, EOI, PIT calibration, TSC rate |
+| `akuma-elf-exec` | 525 | no | the pure exec decisions for an ELF image: interpreter, load placement, entry |
+| `akuma-user-tree` | 512 | no | copy-on-write fork decisions over a 4-level user page-table tree |
+| `akuma-user-layout` | 505 | no | the layout of a user address space: valid regions, brk window, mmap slab |
+| `akuma-syscalls-signal` | 384 | no | signal bookkeeping: the `rt_sigaction` table, mask algebra |
+| `akuma-runtime-tokio` | 322 | no | the syscall surface a tokio program needs, as one dependency |
+| `akuma-fpu-amd64` | 274 | no | the FPU save area as pure byte algebra (fxsave/xsave layout, power-on image) |
+| `akuma-user-walk` | 241 | no | user-memory access by page walk: region check, chunked copies, string readers |
+| `akuma-syscalls-eventfd` | 234 | no | the `eventfd(2)` state machine |
+| `akuma-syscalls-proc` | 222 | no | the process family's pure decisions: clone flags, exit, wait status |
+| `akuma-comconsole` | 199 | no | the 16550 COM-port boot console |
+| `akuma-affinity` | 135 | no | the pure half of `sched_setaffinity`/`sched_getaffinity` |
+| `akuma-tokio-kernel` | 55 | no | `entry!` and the `Kernel` builder |
+
+15 of the 19 forbid `unsafe`; the four that cannot are the amd64 machine layer (boot, ring 3, the scheduler's machine
+half) and the kernel crate that drives it.
+
+**Nothing fell out.** Of the 117, 116 are in at least one kernel's default build (`cargo tree -e normal,build` of
+`akuma` for `aarch64-unknown-none` and `akuma-amd64`, `taoxichuan`, `osaka` for `x86_64-unknown-none`; with
+`--all-features` the set is the same). The one that is in none is `akuma-scheduler`, by design: the scheduling-policy
+simulator, a host tool (`sched-sim`) that ranks candidates before they go into a kernel.
+
 ## Facts re-measured 2026-11-02 (after B15: the kernel is a crate)
 
-Supersedes the 11-01 section below for anything quoted on a slide; that section and the 10-30 one stay as the
-"before". Measured at `961a77be` (B15 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md); no kernel source
+The "before and after" table above supersedes this section's numbers for slides; the 11-01 and 10-30 sections stay
+as history. Measured at `961a77be` (B15 of [`TAOXICHUAN_CLEANUP_PLAN.md`](TAOXICHUAN_CLEANUP_PLAN.md); no kernel source
 changed after it), clean tree, `scripts/cloc_akuma.py --audit taoxichuan akuma-amd64`, `--features no-tests`. The
 Linux 6.18 figures are still the 10-30 builds.
 
@@ -73,19 +228,27 @@ Linux 6.18 figures are still the 10-30 builds.
   `akuma-tokio-kernel-amd64` 3,758.
 - Against Linux: the guest is **10.7x** smaller than Linux trimmed to the same job (836,651) and **24x** smaller than
   Linux as Firecracker ships it (1,868,016). The host is **17.3x**. Linux's host alone is **30x** Taoxichuan.
-- **Bugs this branch fixed: 116.** 105 in Taoxichuan's own code
-  ([`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md), 28 docs; the biggest classes are syscalls/files/pipes
-  37 and processes/fork/threads/scheduling 33), and 11 in shared Akuma crates, found through Taoxichuan or on the way
-  ([`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) went 1,470 -> 1,481 fixes, 406 -> 415 docs, over the branch's 566 commits).
+- **Bugs this branch fixed: 142.** 119 in Taoxichuan's own code
+  ([`TAOXICHUAN_BUG_FIX_LIST.md`](TAOXICHUAN_BUG_FIX_LIST.md), 35 docs; the biggest classes are syscalls/files/pipes
+  37 and processes/fork/threads/scheduling 33), and 23 in shared Akuma crates, found through Taoxichuan or on the way
+  ([`BUG_FIX_LIST.md`](BUG_FIX_LIST.md) went 1,470 -> 1,493 fixes, 406 -> 424 docs, over the branch's 566 commits).
 
 **Runs on it (B15):** the battery + goose/GLM 10/10, `tokioprobe` at `smp=1` and real `smp=4`, `rustc` + `cargo
 build`; Osaka the same `tokioprobe` and battery. Census: 76 syscalls used by the workloads, 0 unserved.
 
+**Python works, as a side effect of tokio.** Taoxichuan was built to run tokio programs, and nobody aimed it at
+Python. Then, on 2026-11-02, GLM (goose, inside a Taoxichuan guest under Akuma's hypervisor on the ryzen, working on
+[infinity](INFINITY_ON_TAOXICHUAN.md)) needed to look inside crates. It reached for `python3` and downloaded rig-core,
+reqwest and rustls-platform-verifier from crates.io with `urllib` over HTTPS. That is Alpine's CPython 3.14.8, an
+unmodified musl binary that came along with the box's root filesystem when the toolchain image was copied from it.
+`ssl` (OpenSSL 3.5.9), `sqlite3`, `threading` and `subprocess` all import and run. Nothing in the kernel knows
+Python exists: it runs on the syscall surface that was built for tokio, rustc and cargo.
+
 **Fixed points since 11-01:** A6 `8909a603` under Akuma's own hypervisor on the ryzen (`26d1ead2...`), B14 `ade75544`
 under Pop's Linux KVM at `smp=4` (`6343290a...`), and **B15 `961a77be`, the crate kernel, under Pop's KVM: K1 == K2
 (`5f568279...`, 2,304,624 bytes, about 7.5 minutes a generation)** - the kernel whose `main.rs` is 19 lines builds
-itself reproducibly. Under TCG on the Mac (x86 emulated on arm64, `fp_tcg.py`): K1 built in 34 minutes, K2 running
-(see [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md)).
+itself reproducibly. **And under TCG on the Mac** (x86 emulated on arm64, no hypervisor, `fp_tcg.py`): **K1 == K2** (`b0c08970...`),
+33 minutes a generation (see [`TAOXICHUAN_FIXED_POINT.md`](TAOXICHUAN_FIXED_POINT.md), "Under TCG").
 
 ## Facts re-measured 2026-11-01 (after the first day of cleanup)
 

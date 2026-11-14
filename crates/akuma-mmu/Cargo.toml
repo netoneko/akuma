@@ -28,7 +28,7 @@ leak-instr = ["akuma-user-space/leak-instr"]
 
 # Real (shared-kernel) SMP, forwarded from the bin crate. Only reaches
 # `akuma-bkl`, whose `current_core_id` this crate uses for the TTBR free gate.
-smp-shared = ["akuma-bkl/smp-shared", "akuma-primitives/smp-shared"]
+bkl-smp = ["akuma-bkl/bkl-smp", "akuma-primitives/bkl-smp"]
 
 [dependencies]
 # The amd64 entry format (bits, encoder, PteProt/MemAttr) and the table accessor
@@ -51,6 +51,7 @@ akuma-mmap = { path = "../akuma-mmap" }
 akuma-user-space = { path = "../akuma-user-space" }
 # Frame allocation and free for page tables and user pages.
 akuma-pmm = { path = "../akuma-pmm" }
+akuma-mmu-raw = { path = "../akuma-mmu-raw" }
 # `current_core_id`, for the per-core ACTIVE_L0/PREV_L0 free gate.
 akuma-bkl = { path = "../akuma-bkl" }
 spinning_top = "0.3"

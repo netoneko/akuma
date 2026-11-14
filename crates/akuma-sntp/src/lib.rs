@@ -9,7 +9,7 @@
 //! both modules unchanged (`pub use akuma_sntp::{boot, sntp};`) — every
 //! existing `akuma_syscalls_time::{boot, sntp}` call site is unaffected.
 //! Pulled out because a second, architecturally unrelated consumer showed up:
-//! `amd64`'s own SNTP-based wall clock (`amd64/src/clock.rs`) needs exactly
+//! `amd64`'s own SNTP-based wall clock (`crates/akuma-kernel-amd64/src/clock.rs`) needs exactly
 //! this protocol/retry logic and nothing else `akuma-syscalls-time` carries —
 //! that crate depends on `akuma-exec`, which does not build for
 //! `x86_64-unknown-none` at all, so amd64 could not have depended on

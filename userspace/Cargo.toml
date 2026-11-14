@@ -1,7 +1,7 @@
 [workspace]
 resolver = "2"
-# NOTE (self-hosting): the submodule-backed members — meow, tcc, llama.cpp,
-# nca — are temporarily removed from the workspace so the first-party crates build
+# NOTE (self-hosting): the submodule-backed members — meow, tcc, llama.cpp —
+# are temporarily removed from the workspace so the first-party crates build
 # without every submodule checked out. Cargo requires *every* listed member's
 # Cargo.toml to be present just to load the workspace, so a missing submodule
 # blocked building even unrelated crates like `hello`. Re-add them (or build them
@@ -89,7 +89,7 @@ pointers_in_nomem_asm_block = "allow"
 dead_code = "deny"
 unused_imports = "deny"
 unused_variables = "deny"
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_profile_extreme)', 'cfg(kernel_smp)', 'cfg(ext2_fs_cache)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kernel_profile_size)', 'cfg(kernel_smp)'] }
 
 [profile.release]
 panic = "abort"

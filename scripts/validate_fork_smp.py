@@ -39,7 +39,7 @@ FAULT_PATTERNS = [
 ]
 
 # Literal template lines the kernel prints as *documentation* at boot (the bun-install
-# memory-requirements banner in `src/tests.rs`), which contain the same words as a real
+# memory-requirements banner in `crates/akuma-kernel-tests-aarch64/src/tests.rs`), which contain the same words as a real
 # fault report. Without this, every boot "crashes" on line ~634 before the hammer even
 # starts — which is exactly what `fork_hammer_result.txt` recorded.
 FAULT_FALSE_POSITIVES = [
@@ -183,9 +183,10 @@ def main():
     boots = int(os.environ.get("BOOTS", "3"))
     rounds = int(os.environ.get("ROUNDS", "10"))
     smp = os.environ.get("SMP", "4")
-    # Overridable so the same harness validates a BKL carve-out build, e.g.
-    #   FEATURES=devbox-smoltcp,no-tests,no-bkl-process scripts/validate_fork_smp.py
-    features = os.environ.get("FEATURES", "devbox-smoltcp,no-tests")
+    # Overridable so the same harness validates another build, e.g.
+    #   FEATURES=no-tests,bkl-profile scripts/validate_fork_smp.py
+    # (BKL carve-outs are A/B'd with their runtime toggles, not features.)
+    features = os.environ.get("FEATURES", "no-tests")
     disk = os.environ.get("DISK", "devbox.img")
     memory = os.environ.get("MEMORY", "4096")
 

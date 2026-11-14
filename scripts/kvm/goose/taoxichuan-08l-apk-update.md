@@ -27,8 +27,8 @@ Probes: `userspace/nettest` (`std::net` and libcurl clients) if a network sympto
 
 ## Composition rule (mandatory)
 `taoxichuan/` is a **composition root**, not a kernel written from scratch. It is 4,744 newly written lines and has 18 `akuma-*` path dependencies (`grep -c '^akuma-' taoxichuan/Cargo.toml`).
-Before you write any arm, subsystem or helper of more than about 20 lines: (1) **look first** - `grep -rn "<name>" crates/ amd64/src/`; (2) **it exists in a crate**: add a path dependency and call it;
-(3) **only in `amd64/src/`**: extract it into an `akuma-<thing>` crate first and make both kernels depend on it; (3b) **welded to `Process`/`akuma-exec`**: that is a seam to cut (leaf crate or cargo feature), say which and
+Before you write any arm, subsystem or helper of more than about 20 lines: (1) **look first** - `grep -rn "<name>" crates/ crates/akuma-kernel-amd64/src/`; (2) **it exists in a crate**: add a path dependency and call it;
+(3) **only in `crates/akuma-kernel-amd64/src/`**: extract it into an `akuma-<thing>` crate first and make both kernels depend on it; (3b) **welded to `Process`/`akuma-exec`**: that is a seam to cut (leaf crate or cargo feature), say which and
 what it costs; (4) **exists nowhere**: write it in a crate with host tests, and say why in RESULT-L. The image preparation for this milestone should extend `devroot-ensure` (the existing `akuma-ext2` host writer), not
 add a hand patcher. Expect most of the work to be image/gate plumbing and a syscall or two that `apk`'s own fetcher needs and `busybox wget` did not. Report per change *pulled / extracted / cut / written new (why)*,
 `wc -l taoxichuan/src/*.rs` at start and end, and the dependency count. A session that closes its gate and makes `taoxichuan/src` smaller is better than one that does not.

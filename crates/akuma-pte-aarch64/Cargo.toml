@@ -1,0 +1,8 @@
+[package]
+name = "akuma-pte-aarch64"
+version = "0.1.0"
+edition = "2024"
+description = "The AArch64 user-leaf encoding a tokio kernel writes (stage 1, 4 KiB): the leaf for a mapping, and the questions copy-on-write and W^X ask of one - writable, CoW-marked, written - plus the edits the CoW break makes. Pure, forbid(unsafe_code), no dependencies; the counterpart of akuma-pte-amd64 (B21)."
+
+[lints]
+workspace = true

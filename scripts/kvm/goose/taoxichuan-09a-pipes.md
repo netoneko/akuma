@@ -12,13 +12,13 @@ the `fork` syscall, then the parent resumes (`taoxichuan/src/child.rs`, `fork_ar
 before its reader starts. With `a | b`, ash forks `a` first; `a` writes (at most the 64 KiB cap) and exits, then ash forks `b`, which reads
 and sees EOF. Anything bigger or concurrent (git's helper pump, `yes | head`) is M4's scheduler and is **out of scope**.
 The pipe table and buffer already exist, host-tested: `crates/akuma-pipes` (end refcounts, waiters, `create/write/read/close_write/close_read`)
-over `crates/akuma-pipe` (the 64 KiB FIFO). amd64 consumes them through `amd64/src/fd.rs` `sys_pipe2` and `amd64/src/pipe.rs`. **Pull them; do
+over `crates/akuma-pipe` (the 64 KiB FIFO). amd64 consumes them through `crates/akuma-kernel-amd64/src/fd.rs` `sys_pipe2` and `crates/akuma-kernel-amd64/src/pipe.rs`. **Pull them; do
 not write a FIFO.** Both `cargo check` clean for `x86_64-unknown-none`.
 
 ## Read first (in order; `sed -n` the named sections, never whole files)
 1. `docs/archive/TAOXICHUAN_PROCESS_MODEL_PLAN.md` - § 4 rows "pipes" and "fd dispatch", § 5 M3 - what was decided and why.
 2. `crates/akuma-pipes/src/lib.rs` lines 1-70 and the `pub fn` list - "wakes are returned, never performed"; you ignore the wakes (nothing blocks).
-3. `amd64/src/fd.rs:1073-1130` (`sys_pipe2`) and `amd64/src/pipe.rs` - the other consumer; copy its *shape*, not its fd-table plumbing.
+3. `crates/akuma-kernel-amd64/src/fd.rs:1073-1130` (`sys_pipe2`) and `crates/akuma-kernel-amd64/src/pipe.rs` - the other consumer; copy its *shape*, not its fd-table plumbing.
 4. `taoxichuan/src/child.rs` `fork_arm` (the "fd table" paragraph, ~line 750) - the child's table is `akuma-fdtable`'s `fork_copy`; its comment says
    **"no kernel-side references to take"** because descriptions are indices. A pipe end is a *counted* kernel resource: `fork_copy` returns the
    payloads in `forked.names` that "need exactly one kernel-side reference taken" - that is where `PipeTable::clone_ref` belongs.
@@ -51,8 +51,8 @@ suite `scripts/kvm/goose/run_pipes.sh` uses 5 execs. busybox 1.35 has no `stat`;
 `PACE=15` s after every exec is deliberate; do not shorten it in this session.
 
 ## Composition rule (mandatory)
-`taoxichuan/` is a composition root. For every arm or helper over ~20 lines: look first (`grep -rn <name> crates/ amd64/src/`), pull a crate by path
-dependency if it exists, extract it from `amd64/src/` into a crate if it lives only there, write new only if it exists nowhere. Expected here:
+`taoxichuan/` is a composition root. For every arm or helper over ~20 lines: look first (`grep -rn <name> crates/ crates/akuma-kernel-amd64/src/`), pull a crate by path
+dependency if it exists, extract it from `crates/akuma-kernel-amd64/src/` into a crate if it lives only there, write new only if it exists nowhere. Expected here:
 `akuma-pipes` + `akuma-pipe` **pulled**; the `pipe2` arm, a `Pipe(PipeId, is_write)` variant and its read/write/close/dup/fork hooks **written new** (taoxichuan's own glue,
 ~100 lines; say so). Report per arm: pulled / extracted / written new (why), and `wc -l taoxichuan/src/*.rs` at start and end (start: 5,833).
 

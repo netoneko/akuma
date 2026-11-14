@@ -14,8 +14,8 @@ repeated.
 > against it (Go, rustc, multikernel, rump) rather than fs-syscall bugs
 > themselves; the actual VFS/ext2/procfs layer underneath has been dormant
 > since March 2026. The recurring lesson: **most "missing" POSIX semantics
-> here are silent gaps, not errors** — `O_EXCL`, real hardlinks, and
-> `faccessat2`'s access-mode bits are all accepted and silently ignored
+> here are silent gaps, not errors** — real hardlinks and
+> `faccessat2`'s access-mode bits are accepted and silently ignored
 > rather than rejected or partially honored; don't assume an error-free
 > return means full POSIX behavior.
 
@@ -105,6 +105,18 @@ exists, and what `stat` reports — comes from one table (`akuma_vfs::dev`, via
 `open()` on `/dev/vda`..`vdd` now returns (write-open refused `EBUSY` on a
 mounted device) and why a box sees no synthetic `/dev`.
 
+Before any of that, in Linux's order: a NULL or unreadable path is `EFAULT`
+(page 0 is refused even under the boot tests' `BYPASS_VALIDATION`); an empty path
+is `ENOENT`, never the dirfd itself; `O_TMPFILE` is `EINVAL`; and a table holding
+`RLIMIT_NOFILE` descriptors is `EMFILE` whatever the path.
+
+**`RLIMIT_NOFILE` is 1024 and is enforced** (`akuma_syscalls_linux::rlimit::NOFILE_LIMIT`,
+which `prlimit64` also reports): `openat` and `dup`/`F_DUPFD` on a full table are
+`EMFILE`, `dup2`/`dup3` to `fd >= 1024` are `EBADF`, `F_DUPFD` from `>= 1024` is
+`EINVAL`. These are glue's on both kernels; a kernel keeps no descriptor ceiling of
+its own. Oracle: `userspace/forktest/c_stress/fdlimit.c`, identical to Linux at
+`ulimit -n 1024` ([`../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md), "fd: the policies are glue's").
+
 For a real path:
 - File doesn't exist and `O_CREAT` not set → `ENOENT`.
 - File doesn't exist, `O_CREAT` set, but the **parent directory** doesn't
@@ -115,17 +127,34 @@ For a real path:
   if `mode & 0o7777 != 0`, `chmod`'d to that mode.
 - File exists and `O_TRUNC` set → truncated to zero via the same
   `write_file(path, &[])`.
-- **`O_EXCL` is not implemented at all** — there is no `open_flags::O_EXCL`
-  constant and no check for it anywhere in `fs.rs`. `O_CREAT|O_EXCL` on an
-  already-existing file silently succeeds and (if `O_TRUNC` is also set,
-  which many `O_EXCL` callers don't set) may truncate it, instead of
-  returning `EEXIST`. Anything relying on `O_EXCL` for exclusive-create
-  locking semantics will not get them here.
+- **Four flag refusals come first**, from what is at the resolved path with its last
+  component not followed (`open_refusal`, before any device or `/proc/self/fd` arm), in
+  Linux's order: `O_NOFOLLOW` on a symlink is `ELOOP` (not with `O_PATH`, which opens the
+  link); `O_CREAT|O_EXCL` on anything present is `EEXIST`; `O_CREAT` on a directory is
+  `EISDIR`; `O_DIRECTORY` on anything but a directory is `ENOTDIR`. Nothing is looked up
+  unless one of those flags is set. These are glue's for every kernel; a kernel's own
+  `openat` preamble must not restate them. The oracle is
+  `userspace/forktest/c_stress/fdrefuse.c`, whose output on Linux and on both kernels is
+  identical ([`AKUMA_MULTIARCH_ATTEMPT_0.md`](../../../archive/AKUMA_MULTIARCH_ATTEMPT_0.md),
+  "Slice 4: fd").
 - `O_CLOEXEC` is honored (`proc.set_cloexec`); `O_APPEND` is honored at
   `read`/`write` time (see below), not at open time.
 - **The fd is bound to an inode here, once** (`vfs::open_file_inode`), together
   with an `InodePin` on it, so `read`/`pread64` need no directory walk of their
   own — see `read`/`pread64` below.
+
+## `read` / `write` / `pread64` / `pwrite64` — the refusals
+
+- A `File` descriptor not opened for the call is `EBADF`: `read`/`pread64` need access
+  mode `O_RDONLY` or `O_RDWR`, `write`/`pwrite64` need `O_WRONLY` or `O_RDWR`, and an
+  `O_PATH` descriptor allows neither (`akuma_syscalls_linux::flags::open::{may_read,
+  may_write}`). `readv`/`writev` inherit it through `read`/`write`.
+- `pread64`/`pwrite64` on a descriptor with no file position (pipe, socket, terminal,
+  eventfd, pidfd, a kernel's own character device) is `ESPIPE`, never `EBADF`: musl's
+  `FILE` layer falls back to `read()` on `ESPIPE` and gives up on `EBADF`. A `BlockDev`
+  has a position and is served, through the same `blockdev_read_at`/`blockdev_write_at`
+  as `read`/`write`: at the offset, the position untouched, at most 64 KiB a call, `0`
+  past the end for a read and `ENOSPC` for a write; `pwrite64` on a read-only open is `EBADF`.
 
 ## `read` / `pread64` — bound to an inode, not to a name
 
@@ -240,7 +269,7 @@ Two details worth not re-deriving:
   "bad argument" and stops a caller from retrying without the flag; `EOPNOTSUPP`
   is Linux's own answer and invites the retry.
 
-Boot-suite check: `test_pvec2` (`src/process_tests.rs`), whose load-bearing case
+Boot-suite check: `test_pvec2` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`), whose load-bearing case
 is the two-iovec positional write — an offset that fails to advance between
 iovecs makes the second overwrite the first.
 
@@ -285,9 +314,9 @@ number (`fs_magic`: `ext2`→`0xEF53`, `proc`→`0x9FA0`, `memfs`/`tmpfs`→
 **This code lives in `fs.rs`, not `container.rs`, on purpose.** `STATFS`/
 `FSTATFS` dispatch unconditionally in `syscall/mod.rs` — they are ordinary
 POSIX syscalls, not container-specific — but `container` is `#[cfg(feature =
-"sc-containers")]`-gated and absent from the `extreme-size` build. The
+"sc-containers")]`-gated and absent from a build without that family. The
 functions were briefly implemented in `container.rs` during the same change
-and had to move once `extreme-size` clippy caught the missing-module
+and had to move once the (since-removed) `extreme` clippy caught the missing-module
 compile error; `mount`/`umount2`/`mount_in_ns` and everything else box-shaped
 stay in `container.rs`, correctly gated.
 
@@ -340,7 +369,10 @@ stay in `container.rs`, correctly gated.
   `EINVAL`; a valid-but-non-seekable fd (pipe, socket, tty, eventfd, ...) →
   `ESPIPE` — this three-way split matters because musl/Rust std probe
   seekability of stdio by calling `lseek(fd, 0, SEEK_CUR)` and branch on
-  `ESPIPE` specifically.
+  `ESPIPE` specifically. A `whence` past `SEEK_HOLE` is `EINVAL` on every open
+  descriptor (after the `EBADF` check, as on Linux), and `/dev/null`, `/dev/zero`
+  and `/dev/urandom` answer `0` whatever the offset, which is Linux's `null_lseek`
+  and `noop_llseek`.
 - **`renameat2`'s `RENAME_NOREPLACE`/`RENAME_EXCHANGE` are only partially
   real:** `RENAME_NOREPLACE` does check-then-`EEXIST` if the destination
   exists; both flags together → `EINVAL`; but there is no actual atomic

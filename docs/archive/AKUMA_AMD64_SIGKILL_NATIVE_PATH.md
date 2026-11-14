@@ -29,7 +29,7 @@ the other kernel's exit machinery.
 
 ## 2. What `kill -9` did on amd64 until this fix
 
-`Syscall::Kill` was forwarded to glue (`amd64/src/usermode.rs`), whose
+`Syscall::Kill` was forwarded to glue (`crates/akuma-kernel-amd64/src/usermode.rs`), whose
 `sys_kill` calls `akuma_exec::process::deliver_signal`. For every signal but 9
 that pends the signal on each thread of the group, raises the interrupt bit so
 a parked thread's wait returns `EINTR`, and lets the thread take the signal at
@@ -142,7 +142,7 @@ in a VM in under ten minutes.
 
 ## 5. The fix
 
-- **`amd64/src/signal.rs::sys_kill`** — this target's own `kill(2)`.
+- **`crates/akuma-kernel-amd64/src/signal.rs::sys_kill`** — this target's own `kill(2)`.
   Decodes the `pid_t` through `akuma_exec::process::kill_target` (`> 0` a
   process, `0` the caller's group, `-1` everyone but init and the caller,
   `< -1` a group; the sign-extended register is recovered by truncation —

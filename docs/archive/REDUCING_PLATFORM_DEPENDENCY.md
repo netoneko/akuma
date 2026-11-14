@@ -18,12 +18,12 @@ this table — it corrects two rows below.
 |---|---|---|
 | §0 | The arch gate (`target_os` alone stopped discriminating) | **APPLIED 2026-09-03.** 13 → 36 crates build for `x86_64-unknown-none`. Re-confirmed 2026-09-04 — and see §9.4 for a live instance of the exact bug this fixed, still unfixed inside `akuma-mmu` |
 | §1 | PTE permissions are AArch64 bits inside a crate that forbids knowing that | **DONE 2026-09-06 — see §1.5.** `akuma_mmap::Prot` is the neutral vocabulary and `MmapRegion.prot: Prot` replaced `flags: u64`; the `flags`/`user_flags` bit tables moved down to `akuma_mmu::types`, which gained `user_flags::to_pte(Prot)`. Bit-exact: `prot_roundtrips_to_todays_bits` pins all six encodings to hex literals. **One thing §1.4 asked for is deliberately NOT done** — `is_exec(RO)` is still `true`, because that is a behaviour change and does not belong inside an encoding move. Blast radius was **8 sites, not the 64 predicted** |
-| §2 | Device discovery arrives as a DTB, threaded through the MMU | **OPEN**, re-confirmed 2026-09-04: x86_64 Firecracker passes no DTB at all — the memory map comes from `hvm_start_info`, parsed by `crates/akuma-ryzen-amd64` (moved out of `amd64/src/hvm.rs`, which no longer exists, 2026-09-04). The second consumer §2 predicted exists now, correctly on its own crate rather than merged with `akuma-fdt` |
-| §3 | TLB invalidation cannot express *who* | **OPEN**, re-confirmed 2026-09-04: `crates/akuma-cpu/src/lib.rs`'s `mod tlb` still has only `tlbi` forms (`vmalle1`, `vaae1is`, `aside1is`, ...); `amd64/src/paging.rs` still carries its own local `invlpg`, not in the shared crate. `invlpg` is **core-local** where `tlbi ...is` broadcasts to the inner-shareable domain, so an x86 multi-core kernel must IPI. There is no way to say that difference in today's vocabulary (`AKUMA_FIRECRACKER_AMD64.md` §3.10.3) |
-| §4 | `Context` is built by register name outside the crates that own registers | **RETARGETED 2026-09-04 — see §9.1.** `amd64/src/sched.rs`'s `Context` is no longer the evidence; it was rewritten to `{ rsp: u64 }`, private field, and its own header cites this as §4's fix shape *already applied*. The current second hand-built register block is `amd64/src/usermode.rs`'s `UserCtx` (7 public fields, `#[repr(C)]`, asm-indexed by offset) |
+| §2 | Device discovery arrives as a DTB, threaded through the MMU | **OPEN**, re-confirmed 2026-09-04: x86_64 Firecracker passes no DTB at all — the memory map comes from `hvm_start_info`, parsed by `crates/akuma-ryzen-amd64` (moved out of `crates/akuma-kernel-amd64/src/hvm.rs`, which no longer exists, 2026-09-04). The second consumer §2 predicted exists now, correctly on its own crate rather than merged with `akuma-fdt` |
+| §3 | TLB invalidation cannot express *who* | **OPEN**, re-confirmed 2026-09-04: `crates/akuma-cpu/src/lib.rs`'s `mod tlb` still has only `tlbi` forms (`vmalle1`, `vaae1is`, `aside1is`, ...); `crates/akuma-kernel-amd64/src/paging.rs` still carries its own local `invlpg`, not in the shared crate. `invlpg` is **core-local** where `tlbi ...is` broadcasts to the inner-shareable domain, so an x86 multi-core kernel must IPI. There is no way to say that difference in today's vocabulary (`AKUMA_FIRECRACKER_AMD64.md` §3.10.3) |
+| §4 | `Context` is built by register name outside the crates that own registers | **RETARGETED 2026-09-04 — see §9.1.** `crates/akuma-kernel-amd64/src/sched.rs`'s `Context` is no longer the evidence; it was rewritten to `{ rsp: u64 }`, private field, and its own header cites this as §4's fix shape *already applied*. The current second hand-built register block is `crates/akuma-kernel-amd64/src/usermode.rs`'s `UserCtx` (7 public fields, `#[repr(C)]`, asm-indexed by offset) |
 | §5 | Syscall numbers are constants, not a table | **APPLIED 2026-09-04.** `crates/akuma-syscalls-abi`, and the amd64 syscall handler dispatches through it. Re-confirmed 2026-09-04 |
 | §6 | Write down the per-CPU-identity rule | **OPEN.** One paragraph, no code change |
-| §9.2 | *(new)* Process lifecycle (fork/exec/wait4/spawn) hand-rolled a second time | **OPEN, not previously tracked.** `amd64/src/usermode.rs` reimplements this against a flat `PROCS[16]` array; getting `apk` working required rediscovering two bug classes `akuma-exec` already closed (publish-before-ready, no resource reclaim at exit) |
+| §9.2 | *(new)* Process lifecycle (fork/exec/wait4/spawn) hand-rolled a second time | **OPEN, not previously tracked.** `crates/akuma-kernel-amd64/src/usermode.rs` reimplements this against a flat `PROCS[16]` array; getting `apk` working required rediscovering two bug classes `akuma-exec` already closed (publish-before-ready, no resource reclaim at exit) |
 
 Every number below is measured — `scripts/cloc_akuma.py` for line counts, greps
 reproduced inline for call-site counts. No estimate is inferred from `wc -l`; see §8
@@ -391,9 +391,9 @@ to do here.
 ## 2. Device discovery arrives as a DTB and is threaded through the MMU
 
 **OPEN.** The second, non-DTB machine this predicted now exists: PVH's
-`hvm_start_info`, parsed by `crates/akuma-ryzen-amd64` (not `amd64/src/hvm.rs` —
+`hvm_start_info`, parsed by `crates/akuma-ryzen-amd64` (not `crates/akuma-kernel-amd64/src/hvm.rs` —
 that module moved into the crate 2026-09-04 along with `cmdline.rs`/`acpi.rs`;
-see `amd64/src/machine.rs`'s header. Corrected 2026-09-04, §9).
+see `crates/akuma-kernel-amd64/src/machine.rs`'s header. Corrected 2026-09-04, §9).
 
 `akuma-mmu` depends on `akuma-fdt` and hands a device tree to its callers:
 
@@ -521,7 +521,7 @@ implicitly re-run during each of the four investigations above.
 
 ## 4. `Context` is built by register name outside the crates that own registers
 
-**OPEN.** A second hand-built `Context` now exists in `amd64/src/sched.rs`.
+**OPEN.** A second hand-built `Context` now exists in `crates/akuma-kernel-amd64/src/sched.rs`.
 
 ```rust
 // crates/akuma-exec-core/src/thread.rs
@@ -717,7 +717,7 @@ Never increment these by hand.
 
 ## 9. Addendum, 2026-09-04: re-verified against current code, not against this document
 
-Re-checked every claim above by reading the current source and `amd64/Cargo.toml`
+Re-checked every claim above by reading the current source and `crates/akuma-kernel-amd64/Cargo.toml`
 directly — not by trusting the table, and not by trusting commit dates (this tree's
 history is same-day for nearly everything touched here, so "when" a line landed is
 not a reliable signal; "what the line says right now" is). Four items (§0, §1, §2,
@@ -727,10 +727,10 @@ since this document's original pass that none of the six items describe.
 ### 9.1 §4's evidence moved out from under it
 
 The claim as written — *"a second hand-built `Context` now exists in
-`amd64/src/sched.rs`"* — is no longer true, and `sched.rs` says so about itself:
+`crates/akuma-kernel-amd64/src/sched.rs`"* — is no longer true, and `sched.rs` says so about itself:
 
 ```rust
-// amd64/src/sched.rs
+// crates/akuma-kernel-amd64/src/sched.rs
 pub struct Context {
     rsp: u64,   // private; built only by Context::for_task
 }
@@ -746,7 +746,7 @@ describes it (nineteen named-register call sites, public mutable fields). The
 table below was never updated to say that one instance of the defect is now a
 worked example of the fix instead of a second occurrence of it.
 
-The defect itself is real and current — it just moved. `amd64/src/usermode.rs`'s
+The defect itself is real and current — it just moved. `crates/akuma-kernel-amd64/src/usermode.rs`'s
 `UserCtx` is today's second hand-built register block, and it is the textbook
 shape §4 warns about:
 
@@ -772,7 +772,7 @@ block, keep `#[repr(C)]` for the asm) applies to this struct unmodified.
 ### 9.2 A seventh item, not covered by any of the six: process lifecycle
 
 None of §1-§6 existed as a concern when this document was written because the code
-they would describe did not exist yet — `amd64/src/usermode.rs`'s `sys_execve`
+they would describe did not exist yet — `crates/akuma-kernel-amd64/src/usermode.rs`'s `sys_execve`
 (~84 lines), `sys_fork` (~102 lines), `sys_spawn` (~98 lines), plus `wait4`/`vfork`/
 `spawn_stdio`/`spawn_record_exit` scattered across another ~200 lines, all against
 a flat `PROCS: [Option<Process>; 16]` array — has no analogue in the six items
@@ -791,10 +791,10 @@ rediscovering two bug classes `akuma-exec` already closed once:
   dependent), and silent until it was decoded from a raw `#PF` log. `akuma-exec`'s
   threading module encodes "don't become visible to the scheduler until every
   field is live" as an invariant (the TERMINATED→FREE slot-reuse discipline, the
-  reap callback wired at exactly one point). `amd64/src/sched.rs` had to relearn
+  reap callback wired at exactly one point). `crates/akuma-kernel-amd64/src/sched.rs` had to relearn
   the same rule from a live crash and fix it by hand
   (`spawn_unpublished`/`publish_task`, state = Runnable as the last store).
-- **Nothing closes a task's resources at exit.** `amd64/src/fd.rs`'s descriptor
+- **Nothing closes a task's resources at exit.** `crates/akuma-kernel-amd64/src/fd.rs`'s descriptor
   table is one 16-slot array shared by every task, and nothing freed a task's
   entries when it exited — real Linux does this implicitly at `exit`/
   `exit_group`. A single `apk add curl` run left the table full; the *next*
@@ -825,15 +825,15 @@ akuma-exec
 ├─ akuma-slot-table ───────────────────────► clean (deps: primitives only)
 ├─ akuma-mmap ──────────────────────────────► clean (empty [dependencies])
 ├─ akuma-cpu, akuma-exec-core, akuma-primitives,
-│  akuma-pmm, akuma-syscalls-linux, akuma-terminal ► already in amd64/Cargo.toml directly
+│  akuma-pmm, akuma-syscalls-linux, akuma-terminal ► already in crates/akuma-kernel-amd64/Cargo.toml directly
 ```
 
 Every blocked crate is blocked because it names `akuma-mmu`, directly or through
 one more hop. Three crates in the list (`akuma-bkl`, `akuma-slot-table`,
 `akuma-mmap`) are **not** blocked at all — their own dependency graphs are already
-arch-neutral, they simply aren't wired into `amd64/Cargo.toml` yet because nothing
+arch-neutral, they simply aren't wired into `crates/akuma-kernel-amd64/Cargo.toml` yet because nothing
 on that target needs them yet (no BKL contention with one core, no generic
-process table, no region bookkeeping — `amd64/src/mm.rs`'s own header names this
+process table, no region bookkeeping — `crates/akuma-kernel-amd64/src/mm.rs`'s own header names this
 gap explicitly: building one locally "would be building the thing `akuma-mmap`
 already is").
 
@@ -895,7 +895,7 @@ anywhere in the crate** — not a missing feature, not a Cargo-graph problem, a
 different CPU's hardware format written as if it were the only one. Fixing this
 is §1 and §3's fix shape applied to the crate that most needs it: a portable
 `Prot`/permission vocabulary at the boundary (§1), and an explicit target-arch
-split — or a second, x86-native crate below `akuma-exec` the way `amd64/src/
+split — or a second, x86-native crate below `akuma-exec` the way `crates/akuma-kernel-amd64/src/
 paging.rs` already is — for the parts that are page-table format, not policy.
 Nobody has done this because nothing has needed `akuma-exec` on x86_64 badly
 enough yet to pay for it; §9.2 is what that cost looks like when it's paid

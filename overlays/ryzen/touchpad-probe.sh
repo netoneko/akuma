@@ -3,7 +3,7 @@
 #
 # Run under Pop!/Linux on the box, with sudo for the ACPI/debugfs parts. It
 # prints every number the kernel glue needs, ready to paste into the boot
-# command line or `amd64/src/touchpad.rs`:
+# command line or `crates/akuma-kernel-amd64/src/touchpad.rs`:
 #
 #   - the AMDI0010 DesignWare I2C controller's MMIO base + length
 #   - the touchpad's I2C slave address, bus number, ACPI _HID

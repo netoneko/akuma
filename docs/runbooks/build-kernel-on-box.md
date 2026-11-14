@@ -30,7 +30,7 @@ kbuild
 That's it. `kbuild` (`/bin/kbuild`) already sources `/etc/akuma-dev.env`, `cd`s
 to `$AKUMA_SRC` (`/src/github.com/netoneko/akuma`, a live git checkout — not
 something you need to fetch or sync yourself), and runs `cargo build -p
-akuma-amd64 --target x86_64-unknown-none --release --offline -j1`.
+akuma --target x86_64-unknown-none --release --offline -j1`.
 
 - **Never pass `-j1` yourself.** The default is already 1, and cargo rejects
   a duplicate `--jobs`: `error: the argument '--jobs <N>' cannot be used
@@ -60,7 +60,7 @@ the `^error` lines rather than a general "something's wrong" scroll.
 ## 2. Confirm the artifact
 
 ```sh
-ls -la /root/ktarget/x86_64-unknown-none/release/akuma-amd64
+ls -la /root/ktarget/x86_64-unknown-none/release/akuma
 ```
 
 An ELF with today's mtime and a size in the low single-digit MB (3–4 MB is
@@ -118,7 +118,7 @@ broken destroys the one thing standing between a bad build and a stuck box.
 ```sh
 uname -a                                                       # Akuma ...
 kbuild                                                         # exit 0
-ls -la /root/ktarget/x86_64-unknown-none/release/akuma-amd64   # fresh ELF, ~3-4 MB
+ls -la /root/ktarget/x86_64-unknown-none/release/akuma   # fresh ELF, ~3-4 MB
 ```
 
 Measured live, 2026-09-25, on this exact box, branch `cats-everywhere`
@@ -127,7 +127,7 @@ Measured live, 2026-09-25, on this exact box, branch `cats-everywhere`
 produced
 
 ```
--rw-r--r-- 1 0 0 3444592 Sep 25 11:33 /root/ktarget/x86_64-unknown-none/release/akuma-amd64
+-rw-r--r-- 1 0 0 3444592 Sep 25 11:33 /root/ktarget/x86_64-unknown-none/release/akuma
 md5: f07b4c874f6a1472144455639b5b613b
 ```
 

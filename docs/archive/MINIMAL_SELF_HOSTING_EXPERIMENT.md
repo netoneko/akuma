@@ -19,7 +19,7 @@ carving tool.
 
 The motivating observation (`LINE_COUNT_ANALYSIS_POST_AMD64.md`): `src/`
 production code is 136 lines, the kernel is already a composition of ~98
-crates, and most of `amd64/src` is hardware ambition, not ABI. If that is
+crates, and most of `crates/akuma-kernel-amd64/src` is hardware ambition, not ABI. If that is
 true, a "just enough" kernel is a deletion job plus one or two more
 extractions, not a rewrite.
 
@@ -77,7 +77,7 @@ toolchain the same way the existing self-host image does.
 **Build and extraction are one loop.** Each next stage is a new line of
 code, init step, or injection point in the composition root that pulls in a
 crate. The goal is to pull as few crates as possible — and where the needed
-logic still lives in `amd64/src/`, the stage's work is extracting it into a
+logic still lives in `crates/akuma-kernel-amd64/src/`, the stage's work is extracting it into a
 crate first, then pulling it. Composition and refactoring are not separate
 projects; every stage either adds a dependency or creates one.
 
@@ -116,7 +116,7 @@ the previous `RESULT` files). From stage 7B on every goose session follows this:
 4. **Same numbers for every session**, from `scripts/goose_session_stats.py` (run on the box against goose's `sessions.db`):
    tool calls, calls before the first edit, input/output tokens, `docs/` reads and which files, source reads, `vm-dev`
    boots, commits and pushes. They go in the agent log under the session's section.
-5. **The composition rule travels in every brief** (template § "Composition rule"): look in `crates/` and `amd64/src/` before
+5. **The composition rule travels in every brief** (template § "Composition rule"): look in `crates/` and `crates/akuma-kernel-amd64/src/` before
    writing, depend on or extract rather than copy, and report pulled / extracted / written-new plus `taoxichuan/src` line counts
    per session. It was in briefs 01-04 and silently dropped from 06a on; by stage 7 the composition root had grown to 4,450
    newly written lines (`main.rs` 2,928). A rule stated once at the top of a doc is not a rule the agent sees; it has to be in the brief.
@@ -137,7 +137,7 @@ not pinned yet.
 
 ## The carve, measured
 
-From the raw file survey of `amd64/src` (2026-10-23, ~56k raw lines):
+From the raw file survey of `crates/akuma-kernel-amd64/src` (2026-10-23, ~56k raw lines):
 
 | class | lines | content |
 |---|---:|---|
@@ -194,16 +194,16 @@ this table — it is a map, not a contract):
 | family | syscalls | owning crate(s) | acting half stays in |
 |---|---|---|---|
 | ABI vocabulary | all | `akuma-syscalls-abi`, `akuma-syscalls` | both kernels' dispatch |
-| Memory | `mmap`, `mremap`, `madvise`, `munmap`, `membarrier`, `brk` policy | `akuma-syscalls-mem` (plan), `akuma-mmap`, `akuma-user-space` | `amd64/src/mm.rs`, glue |
+| Memory | `mmap`, `mremap`, `madvise`, `munmap`, `membarrier`, `brk` policy | `akuma-syscalls-mem` (plan), `akuma-mmap`, `akuma-user-space` | `crates/akuma-kernel-amd64/src/mm.rs`, glue |
 | Futex / sync | `futex` | `akuma-syscalls-sync` | lock, waits, in-hold reads |
 | Poll / wait | `epoll_*`, `ppoll`, `pselect6`, readiness | `akuma-syscalls-poll`, `akuma-net-yarn` (wait loop) | waker registration, `EPOLL_TABLE` |
 | Time | `clock_gettime`, `clock_nanosleep`, `nanosleep`, `times`, `gettimeofday`, `getrusage` | `akuma-syscalls-time` | comparator + dispatch |
 | File metadata / dirs | `fstat`, `newfstatat`, `statfs`, `getdents64`, `access`/`faccessat`, `readlinkat`, `symlinkat` | `akuma-syscalls-glue` fs arms over `akuma-vfs`/`akuma-ext2` | VFS resolve, ext2 acting |
 | File mutation | `renameat`, `linkat`, `unlinkat`, `mkdir`, `utimensat`, `chmod`/`fchmodat`, `ftruncate`, `fsync`/`fdatasync` | `akuma-ext2` + glue | ext2 journaling-adjacent paths |
-| Fd lifecycle | `openat`, `close`, `dup`–`dup3`, `fcntl`, `flock`, `pipe`/`pipe2` | `akuma-fdtable` (decisions), `akuma-exec` (`SharedFdTable`, acts) | glue / `amd64/src/fd.rs` |
+| Fd lifecycle | `openat`, `close`, `dup`–`dup3`, `fcntl`, `flock`, `pipe`/`pipe2` | `akuma-fdtable` (decisions), `akuma-exec` (`SharedFdTable`, acts) | glue / `crates/akuma-kernel-amd64/src/fd.rs` |
 | Process | `clone`, `execve`, `fork`, `wait4`/`waitid`, `exit`/`exit_group`, `kill`, `getpid` family, identity syscalls, `umask`, `getcwd`/`chdir`/`fchdir`, `prlimit64`, `sched_getaffinity`/`sched_yield` | `akuma-exec`, `akuma-exec-core`, `akuma-elf` | process table, address-space switches |
 | Signals | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn`, `sigaltstack`, `tgkill` | `akuma-exec` + glue | frame build/restore |
-| Address space | `arch_prctl`, `set_tid_address`, `set_robust_list`, `rseq`, `mprotect` | `akuma-mmu`, `akuma-pagetable`, `akuma-pte-amd64`, `akuma-cpu` | `amd64/src/usermode.rs`, `mm.rs` |
+| Address space | `arch_prctl`, `set_tid_address`, `set_robust_list`, `rseq`, `mprotect` | `akuma-mmu`, `akuma-pagetable`, `akuma-pte-amd64`, `akuma-cpu` | `crates/akuma-kernel-amd64/src/usermode.rs`, `mm.rs` |
 | Sockets / net | `socket`…`shutdown`, `getsockname`/`getpeername`, sockopts | `akuma-net` (stack + AF_INET table), `akuma-syscalls-net` (ifreq) | glue net arms |
 | AF_UNIX | `socketpair`, `sendmsg`/`recvmsg` (`SCM_*` base) | `akuma-net-unix` | glue |
 | NIC | — (device, not syscall) | `akuma-net-nic` + `akuma-virtio` (virtio-net) | rings, doorbell |
@@ -262,7 +262,7 @@ percentage without re-measuring" (`600_BUGS_ANNIVERSARY.md` slide 09):
   the measured union and note the delta — if the census surprises the
   derived list, that finding goes in the talk too.
 - **Carve feasibility, one number.** From the clean tag, count
-  `amd64/src` production lines excluding the microvm-skippable files (the
+  `crates/akuma-kernel-amd64/src` production lines excluding the microvm-skippable files (the
   ~31% class in "The carve, measured") so the "deletion not extraction"
   claim is a measured line count, not a raw-file estimate. Raw lines and
   production lines are not interchangeable.

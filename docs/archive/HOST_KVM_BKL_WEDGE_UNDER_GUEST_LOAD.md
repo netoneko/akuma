@@ -50,7 +50,7 @@ so it is a lock-ordering/livelock shape, not CPU saturation.
 
 ## Hypotheses to separate (not tested)
 1. **A vCPU thread holds the host BKL across (part of) a `VMRUN`**, and another core's `kvm0` ioctl/relay path or a TLB shootdown waits
-   for it; the guest then needs the waiter (a gateway frame, an IPI ack) to progress -> livelock. Look at `amd64/src/kvm/linux/machine.rs`
+   for it; the guest then needs the waiter (a gateway frame, an IPI ack) to progress -> livelock. Look at `crates/akuma-kernel-amd64/src/kvm/linux/machine.rs`
    around the run loop for any BKL-held region that includes the exit handlers' blocking calls.
 2. **Shootdown/IPI ack** waiting on a core that is in guest mode (SVM) and does not take the host IPI until the next exit.
 3. **The gateway/relay thread** (`vm_outbound`) and the net poll contending on `NETWORK`/`SOCKET_TABLE` with a guest exit - the shape of

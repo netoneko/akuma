@@ -233,7 +233,7 @@ touched there) and continued. Branch `kvm-linux-rung` on litter. Read
   your own parser, the independent oracle (the same lesson as your PAE
   constant). The PVH guest's machine code is re-assembled (disassembly checked).
 - `vmrun` did not compile in the WIP (`r15` twice); fixed, RBP saved by hand.
-- The Linux phase: `amd64/src/kvm/linux.rs` (loader, full-register VMRUN with
+- The Linux phase: `crates/akuma-kernel-amd64/src/kvm/linux.rs` (loader, full-register VMRUN with
   VMLOAD/VMSAVE, CPUID/MSR/IOIO emulation, exception reflect-and-log) plus
   `exitinfo`/`cpuid`/`eventinj`/`devices` in the crate, all spec-pinned
   (APM Vol 2 Table B-2 offsets, Fig 15-2, Fig 15-5, §15.21.1; Vol 3 App. E).

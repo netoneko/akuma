@@ -19,9 +19,7 @@
 use alloc::string::String;
 use alloc::format;
 
-#[cfg(not(kernel_profile_extreme))]
 use akuma_primitives::irq;
-#[cfg(not(kernel_profile_extreme))]
 use akuma_timer::ArchHw;
 
 pub use akuma_timer::read_frequency;
@@ -100,8 +98,9 @@ pub fn timer_irq_handler(_irq: u32) {
     akuma_exec::alarms::on_timer_interrupt();
 
     // Check preemption watchdog - detect threads that hold preemption disabled too long
-    if crate::config::ENABLE_PREEMPTION_WATCHDOG
-        && let Some(duration_us) = akuma_exec::threading::check_preemption_watchdog() {
+    // `ENABLE_PREEMPTION_WATCHDOG` (config flag sweep, 2026-11-11): untouched since
+    // 2026-01-23, removed; the watchdog always runs now.
+    if let Some(duration_us) = akuma_exec::threading::check_preemption_watchdog() {
             // Log warning
             // Use AtomicU64 instead of static mut to avoid data races
             static LAST_WARN_US: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -142,9 +141,8 @@ pub fn timer_irq_handler(_irq: u32) {
 
     // Trigger SGI for scheduling - scheduler will decide if switch is needed.
     // Real shared-kernel SMP: this timer handler is shared across cores (one dispatch
-    // table), so it must ring the CURRENT core's scheduler SGI, not the hardcoded PE0
-    // that `trigger_sgi` targets — otherwise a secondary's tick would preempt the BSP.
-    // On the BSP (aff0 = 0) `trigger_sgi_self` is equivalent to `trigger_sgi`.
+    // table), so it must ring the CURRENT core's scheduler SGI, not PE0 — otherwise a
+    // secondary's tick would preempt the BSP.
     //
     // Runtime governor (before the SGI so a demotion lands on this very tick's
     // re-arm path next interrupt): every GOVERNOR_WINDOW_TICKS, check whether
@@ -163,10 +161,28 @@ pub fn timer_irq_handler(_irq: u32) {
             }
         }
     }
-    #[cfg(kernel_smp_shared)]
-    akuma_gic::trigger_sgi_self(akuma_gic::SGI_SCHEDULER);
-    #[cfg(not(kernel_smp_shared))]
-    akuma_gic::trigger_sgi(akuma_gic::SGI_SCHEDULER);
+    // The hooked scheduler preempts on this interrupt itself (`irq_hooked`): a self-SGI
+    // would be a second interrupt, and under KVM a trapped GIC write, for every tick.
+}
+
+/// Arm this core's timer for `deadline_us` (uptime) instead of its next periodic tick.
+///
+/// For an idle core about to halt with nothing due sooner. Never sooner than one tick from
+/// now, so a deadline already due costs one ordinary tick rather than an interrupt storm.
+///
+/// Every interrupt that ends the halt early (an SGI for new work, a device) must be
+/// followed by [`rearm_tick`]; the timer's own interrupt re-arms the tick itself.
+pub fn arm_idle_deadline(deadline_us: u64) {
+    let tick = current_tick_us();
+    let delay = deadline_us.saturating_sub(uptime_us()).max(tick);
+    let ticks = akuma_timer::ticks_from_us(akuma_timer::read_frequency(), delay);
+    akuma_cpu::vtimer::set_cval(akuma_timer::read_counter() + ticks);
+}
+
+/// Put this core back on its periodic tick after [`arm_idle_deadline`].
+pub fn rearm_tick() {
+    let ticks = akuma_timer::ticks_from_us(akuma_timer::read_frequency(), current_tick_us());
+    akuma_cpu::vtimer::set_cval(akuma_timer::read_counter() + ticks);
 }
 
 // ============================================================================
@@ -224,16 +240,8 @@ pub fn probe_irq_nop(_irq: u32) {
 /// main.rs:849, this is main.rs:955 — so it publishes the probing core for
 /// [`probe_irq_nop`], which shares its handler slot with every secondary's
 /// live periodic tick. See that function for what happens without it.
-///
-/// Skipped (returns the compiled default) on `kernel_profile_extreme`: a 4 MB
-/// single-core box keeps its historical 10 ms and needs no probing.
 #[must_use]
 pub fn probe_host_tick() -> u64 {
-    #[cfg(kernel_profile_extreme)]
-    {
-        crate::config::TIMER_INTERVAL_US
-    }
-    #[cfg(not(kernel_profile_extreme))]
     {
         // Publish before unmasking: the first sample's IRQ can land immediately.
         PROBING_CORE.store(

@@ -1,0 +1,11 @@
+[package]
+name = "akuma-params"
+version = "0.1.0"
+edition = "2024"
+description = "The boot command line, kept once and read-only, and the narrowed views (`Params`, `ParamSource`) a policy reads it through - a crate cannot see `init=` or another crate's keys"
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }

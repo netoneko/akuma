@@ -7,6 +7,17 @@ description = "The pure exec decisions for an ELF image: PT_INTERP (incl. the on
 [lints]
 workspace = true
 
+[features]
+# Refuse every dynamically linked image (one that names an interpreter) in `program()`, with `ExecErr::Dynamic`, whose errno is
+# `EPERM`. A build-time policy: there is no hook, no dispatch arm and no runtime switch, so a kernel built with it cannot load a
+# dynamic image at all. Off by default. It covers images only (execve, a `#!` interpreter, init): see `ExecErr::Dynamic`.
+refuse-dynamic = []
+# The legacy vsyscall disclosure (denver's PHASE-2-VDSO, D25): gates `AT_SYSINFO_EHDR` in the
+# auxv vocabulary - the key the kernel-provided code page is disclosed under. Off by default;
+# a kernel enables it only together with a machine half that actually serves the page
+# (the value is parsed as an ELF with no magic check: Finding 1).
+vsyscall = []
+
 [dependencies]
 # Deliberately none: this crate is the decision core both kernels call before
 # they do any mapping. Every effect (page tables, file reads, stack builds)

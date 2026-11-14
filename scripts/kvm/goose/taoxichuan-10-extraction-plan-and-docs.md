@@ -6,7 +6,7 @@ Checkout `/src/github.com/netoneko/akuma`, branch `taoxichuan-s4` (first `git fe
 landed there on 2026-10-30). Every shell command starts with `export TERM=dumb HOME=/root GIT_PAGER=cat; . /etc/akuma-dev.env`. Box log times are UTC.
 
 ## The key fact
-`taoxichuan/src` is 10,350 lines (`main.rs` 5,374, `child.rs` 2,341, `sock.rs` 1,029, `exec_twin.rs` 627) beside ~47 `akuma-*` path dependencies, and the full amd64 kernel in `amd64/src/`
+`taoxichuan/src` is 10,350 lines (`main.rs` 5,374, `child.rs` 2,341, `sock.rs` 1,029, `exec_twin.rs` 627) beside ~47 `akuma-*` path dependencies, and the full amd64 kernel in `crates/akuma-kernel-amd64/src/`
 implements most of the same things a second time. Every line that lives in only one of the two kernels is a candidate for a shared crate; every line that is neither
 shared nor a crate is the thing the composition rule exists to prevent. The user wants **a plan**, not an extraction: you write one document and update docs, and you change **no kernel code**.
 **The metal VM (`kvm0`) is busy with the supervisor's fixed-point run for the next hours. Do not boot a guest, do not touch `vm-dev` / `vm-serve-mc` or anything under `/etc/herd/`, and do not
@@ -16,14 +16,14 @@ install anything to `/boot`.** Host tests (`cargo test -p <crate> --target $HOST
 1. `taoxichuan/docs/README.md`, then `taoxichuan/docs/reference/switch-to-crates.md` - the existing plan, if any; your document extends it, it does not repeat it.
 2. `docs/reference/crate-safety.md` and `ls crates/` - which crates exist and which forbid `unsafe`. `CLAUDE.md` § Layout is the long form of the extraction rules (leaf crates, `forbid(unsafe_code)`, `amd64` not `x86`).
 3. `docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md` and `docs/archive/TAOXICHUAN_FIXED_POINT.md` - what broke last, and where in `taoxichuan/src`.
-4. `diff <(grep '^akuma-' amd64/Cargo.toml | cut -d' ' -f1 | sort) <(grep '^akuma-' taoxichuan/Cargo.toml | cut -d' ' -f1 | sort)` - the crates amd64 uses and Taoxichuan does not.
+4. `diff <(grep '^akuma-' crates/akuma-kernel-amd64/Cargo.toml | cut -d' ' -f1 | sort) <(grep '^akuma-' taoxichuan/Cargo.toml | cut -d' ' -f1 | sort)` - the crates amd64 uses and Taoxichuan does not.
 5. The code, by file, with `grep -n '^pub fn\|^fn\|^static\|^struct\|^enum\|^impl' taoxichuan/src/<file>.rs` first and `sed -n` windows after.
 
 ## What to write: `docs/archive/TAOXICHUAN_CRATE_EXTRACTION_PLAN.md`
 One table per kernel file (`main.rs`, `child.rs`, `sock.rs`, `exec_twin.rs`, `net.rs`, `pipes.rs`, `futex.rs`), a row per cluster of functions (name the functions and line ranges):
-| cluster | lines | what it decides | already in a crate? (path) | duplicated in `amd64/src/`? (path) | proposed crate name | pure? (host-testable) | `unsafe` it would take / shed | order |
+| cluster | lines | what it decides | already in a crate? (path) | duplicated in `crates/akuma-kernel-amd64/src/`? (path) | proposed crate name | pure? (host-testable) | `unsafe` it would take / shed | order |
 Then, in this order:
-1. **Ranked list** of the ten extractions with the best value (lines removed from `taoxichuan/src` + lines deduplicated against `amd64/src/`, divided by the risk), each with the seam stated in one sentence
+1. **Ranked list** of the ten extractions with the best value (lines removed from `taoxichuan/src` + lines deduplicated against `crates/akuma-kernel-amd64/src/`, divided by the risk), each with the seam stated in one sentence
    the way `CLAUDE.md` states them (what the crate owns, what it must NOT depend on, which side keeps the locks and the `unsafe`).
 2. **Seams that are in the wrong place** today (a decision welded to a lock, a `static mut` that is really a per-slot table). `main.rs`'s `task()` / `task_slots()` and `child.rs`'s `slots()` hand out long-lived `&mut` to `static mut`s; say which extraction would remove them, and what a `BorrowCell`-closure version costs.
 3. **Gates** per extraction: which test or probe proves behaviour is unchanged (`taoxichuan/docs/runbooks/`, `scripts/kvm/goose/run_gates.sh`, `scripts/kvm/goose/cow_leak_gate.py`, the `userspace/*probe*` set), and the A/B you would run.

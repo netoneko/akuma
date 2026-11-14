@@ -37,7 +37,7 @@ reproduced as worse (2 retries against 3 in a similar stress run).
 
 ## Part 2 - one task per core
 
-`amd64/src/kvm/linux/machine.rs` (see `docs/reference/subsystems/kvm.md`). Measured on the metal,
+`crates/akuma-kernel-amd64/src/kvm/linux/machine.rs` (see `docs/reference/subsystems/kvm.md`). Measured on the metal,
 two-vCPU Akuma guest, CPU-bound shell loops:
 
 | placement | 1 loop | 2 loops |

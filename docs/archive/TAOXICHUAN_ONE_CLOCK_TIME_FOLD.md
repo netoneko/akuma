@@ -45,7 +45,7 @@ showed. Every glue timed wait on this kernel had the same exposure (a `poll`/`ep
 runnable).
 
 Fix (`exec_twin::idle_main`): yield when `akuma_threading::wake_is_due(x86_earliest_wake_time(), net::uptime_us())`,
-too. That is the question amd64's wait loops already ask (`amd64/src/net.rs`). A parked deadline is now served at the
+too. That is the question amd64's wait loops already ask (`crates/akuma-kernel-amd64/src/net.rs`). A parked deadline is now served at the
 next tick, so its resolution is 10 ms on an idle core.
 
 ## Verified

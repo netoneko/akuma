@@ -7,6 +7,11 @@ making `is_pinned` answer `true` for every inode, which froze the deferred-free
 drain at *zero frees in 4567 calls*. Four changes went in; only the last one was
 the cure. §2.5 and §2.6 are the chain, §6 is what each change did and did not do.
 
+*(Corrected 2026-11-03: the cure was partial. Compaction clears only a run of tombstones that ends in an empty slot. A
+run held open by a live entry still filled a window, and `is_pinned`'s fall-through `true` stayed in place, so every
+inode homed there read pinned. On the Taoxichuan guest that stranded 65 unlinked inodes after one `cargo clean`. The
+fall-through is now `false`: [`INODE_PIN_CONGESTED_WINDOW.md`](INODE_PIN_CONGESTED_WINDOW.md).)*
+
 The four changes, in the order they landed:
 
 1. `#[must_use]` on `DeferredFrees::push` — its `bool` was discarded at its only

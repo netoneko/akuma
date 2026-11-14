@@ -122,7 +122,16 @@ things follow:
   after that name is unlinked or renamed over, which is what POSIX has always
   said and what path-based reads answered `ENOENT` to. The `InodePin` the fd
   holds is what makes reading by a reissuable number safe: ext2 defers the free
-  of a pinned inode (`release_last_link`, and see `inode_pin`).
+  of a pinned inode (`release_last_link`, and see `inode_pin`). `is_pinned` is
+  conservative only through the per-region overflow count, because a pin
+  `acquire` could not record is counted there. Inside the table its answer is
+  exact: a key lives only in its own 32-slot window, so a full window without
+  it means "not pinned". Answering `true` there kept unlinks deferred forever
+  (`archive/INODE_PIN_CONGESTED_WINDOW.md`). A deferred free finishes at the
+  **next ext2 write hold or `statfs` after the inode's last pin goes**, not at
+  the next unlink: the pin table counts last-pin releases (`unpin_epoch`), and
+  `write_state` drains when that count has moved since the mount last drained
+  (`archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md`).
 - **`inode == 0` means "read by path"**, and that is the path every filesystem
   without inode addressing takes — procfs, `MemoryFilesystem`, synthetic nodes —
   plus `/etc/mtab`, which must stay a resolve-time synthetic.
@@ -180,7 +189,9 @@ Details that bite:
 - **`open()` on `vda`..`vdd` returns a working raw block fd**
   (`FileDescriptor::BlockDev { idx, pos, writable }`,
   [`../../archive/RAW_BLOCK_DEVICE_FD.md`](../../archive/RAW_BLOCK_DEVICE_FD.md),
-  implemented 2026-08-25) — `read`/`write`/`lseek`/`fstat` all work, backed by
+  implemented 2026-08-25) — `read`/`write`/`pread64`/`pwrite64`/`lseek`/`fstat`
+  all work (`pread64`/`pwrite64` at their offset, the position untouched, up to
+  64 KiB a call), backed by
   the block driver's byte-granular `read_bytes_at`/`write_bytes_at`
   (`crates/akuma-virtio/src/block.rs`), so no sector-alignment burden lands on
   the syscall layer. **Write-open of a *mounted* device is refused with
@@ -232,10 +243,22 @@ table" above and [`syscalls/container.md`](syscalls/container.md) "mount /
 umount2".
 
 - **`first_data_block`:** off-by-one fix (`archive/EXT2_FIRST_DATA_BLOCK_FIX.md`).
+- **Directory-entry types follow `INCOMPAT_FILETYPE`.** A new entry stores its type byte only on a
+  filesystem that declares the feature, else 0 (the byte is `name_len`'s high half there). `read_dir`
+  trusts a nonzero byte only on such a filesystem; otherwise the inode decides whether an entry is a
+  directory or symlink, because `DirEntry` has no "unknown" and a 0 read as a type is "regular file"
+  (`archive/EXT2_DIRENT_TYPE_WITHOUT_FILETYPE.md`).
+- **The block map is all four levels**: direct, singly, doubly and triply indirect, so a file reaches
+  about 4 TiB at 4 KiB blocks, of which at most 2 TiB can be allocated (`i_blocks` counts 512-byte
+  sectors in 32 bits). A
+  regular file's size is 64 bits, `i_size_lo | i_size_high << 32`: read and write it only through
+  `Inode::file_size()` / `set_file_size()`, never `size_lower` (in anything that is not a regular file
+  the high field is `i_dir_acl`). The first regular file past 2 GiB sets `RO_COMPAT_LARGE_FILE`
+  (`archive/EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md`).
 - **`getdents64`:** directory cache fix (`archive/GETDENTS64_DIR_CACHE_FIX.md`).
-- **`fs-cache` feature** (`Cargo.toml`): large ext2 block cache (clock
-  eviction) — keeps the read-only toolchain resident across the many process
-  spawns in a self-host `cargo build`. Opt-in; not combinable with `extreme`.
+- **Block cache** (`akuma-ext2`'s `ClockBlockCache`, on in every build): large
+  ext2 block cache (clock eviction) — keeps the read-only toolchain resident
+  across the many process spawns in a self-host `cargo build`.
   Gives ~19× metadata speedup. See `archive/AKUMA_SELF_HOSTING.md` §7c.
 - **Write path:** ext2 is read-write; `write_at` avoids heap slurp.
 - **Hard links** (2026-10-14): `Filesystem::link`, real on ext2 (and the
@@ -249,6 +272,11 @@ umount2".
   `/bin/linkprobe` (23 checks, Linux-identical).
 - **Ownership** (`Metadata.{uid,gid}`, `Filesystem::chown`, ids above 65535 in
   `osd2`): [`permissions.md`](permissions.md).
+- **A file being executed cannot have its data changed (`ETXTBSY`).** `akuma-ext2` refuses every write, truncate and fallocate of an inode
+  that `akuma_primitives::text_busy` marks busy, by `(Filesystem::identity, inode)`, so a descriptor opened for writing before the exec is stopped too; `openat`
+  refuses `O_WRONLY`/`O_RDWR`/`O_TRUNC` on it. Unlink and rename-over stay allowed. A process holds the mark (`TextPin`) from before its
+  image is read until it exits (`Process::set_text`/`release_text` on the Akuma kernels, the task record on the tokio kernels):
+  [`../../archive/ETXTBSY_TEXT_BUSY.md`](../../archive/ETXTBSY_TEXT_BUSY.md).
 
 ## procfs
 
@@ -277,9 +305,9 @@ real**, off the same per-thread microsecond counter the custom `/bin/top`
 binary's CORE column already reads via `sys_get_cpu_stats`
 (`akuma_exec::threading::get_thread_cpu_time`; bucketed by core in `proc.rs`'s
 `cpu_time_snapshot`). The bucketing key is `LAST_CORE`, which **every switch
-path must stamp**: AArch64's `commit_switch` always did, but amd64's x86 arm
-(`x86_yield_now`) did not until 2026-09-26, and every `cpuN` row there read 0
-busy. The row count is `active_core_count`, which needs `kernel_smp_shared` on
+path must stamp**: AArch64's switch always did, but amd64's x86 arm
+(`try_yield`) did not until 2026-09-26, and every `cpuN` row there read 0
+busy. The row count is `active_core_count`, which needs `kernel_bkl_smp` on
 this crate. A kernel that forgets to forward `akuma-vfs-glue/smp-shared` (amd64
 did, until the same date) gets a single `cpu0` row with no build error
 (`archive/AMD64_PROC_REPORTS_ONE_CORE.md`). There is no user/kernel-time split tracked, so all busy
@@ -326,7 +354,7 @@ or directory` rather than `can't open`, which is the only tell that the file was
 found and the *read* was what failed
 ([`../../archive/DEVBOX_ISSUES.md`](../../archive/DEVBOX_ISSUES.md) Issue 4).
 `read_at`'s whitelist must name every path `read_file` renders; the boot-suite
-check is `test_procfs_virtual_files_are_readable` (`src/process_tests.rs`),
+check is `test_procfs_virtual_files_are_readable` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`),
 which drives `openat` + `read` rather than calling `read_file` — testing the
 renderer directly is what kept the gap invisible.
 
@@ -364,6 +392,9 @@ namespace.
 
 - `archive/PROCFS.md`, `archive/NAMESPACES.md`, `archive/CWD.md`.
 - `archive/EXT2_FIRST_DATA_BLOCK_FIX.md`, `archive/GETDENTS64_DIR_CACHE_FIX.md`.
+- `archive/EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES.md` (the 4 GiB cap).
+- `archive/INODE_PIN_CONGESTED_WINDOW.md` (a full pin-table window read "pinned").
+- `archive/UNLINKED_FILE_SPACE_RETURNED_LATE.md` (space came back at the next unlink, or at reap).
 - `archive/VFS_LOCK_OPTIMIZATION_PLAN.md` (planning, not a fire).
 - `archive/BOX_SUBDIR_FS_LIMITATIONS.md`, `archive/STAT_AND_UNLINKAT_FIX.md`,
   `archive/PIPE_TTY_FIX.md`, `archive/WRITE_AT_SYSCALL.md`.

@@ -33,7 +33,7 @@ pass; `tables_disagree_where_linux_does` and `every_number_is_claimed_once`
 cover the two new rows without needing new test bodies, same as the epoll
 pass.
 
-### `amd64/src/usermode.rs`
+### `crates/akuma-kernel-amd64/src/usermode.rs`
 
 Two `to_glue` arms next to `Renameat` (the other real-fs family), and three
 new `dispatch_smoke_test` checks that need no filesystem (`hop()` for both
@@ -54,7 +54,7 @@ and is reachable via the neutral `mount`/`umount2` numbers, not whether the
 private-syscall match has arms for the other four. See "What's still gated
 off" for why they should stay that way.
 
-### `amd64/Cargo.toml`
+### `crates/akuma-kernel-amd64/Cargo.toml`
 
 New `sc-containers` feature, added to `default`:
 
@@ -112,7 +112,7 @@ block covering the box-lifecycle functions too), not because `mount`/`umount2`
 themselves reach the gated functions.
 
 A second, smaller stale-comment correction fell out of the same finding:
-`amd64/Cargo.toml`'s `sc-sysv-ipc` comment repeated the old "does not build
+`crates/akuma-kernel-amd64/Cargo.toml`'s `sc-sysv-ipc` comment repeated the old "does not build
 for `x86_64-unknown-none` at all" claim about `ProcFilesystem` to explain why
 `akuma-vfs-glue/sc-sysv-ipc` is not forwarded. Corrected in place (dated) —
 the real reason `/proc/sysvipc/msg` has nothing to reach on this target is

@@ -29,7 +29,7 @@ restart = false
 ```
 
 The hypervisor builds the guest's command line as `nosmp virtio_mmio.device=4K@0xd0001000:6` + the spec's
-words (`spec_cmdline`, `amd64/src/kvm/linux.rs`): NetBSD's `MICROVM` kernel parses the same `virtio_mmio.device=`
+words (`spec_cmdline`, `crates/akuma-kernel-amd64/src/kvm/linux.rs`): NetBSD's `MICROVM` kernel parses the same `virtio_mmio.device=`
 syntax Linux does, and `nosmp` is harmless to it.
 
 ## What the guest printed (console, via `/var/log/herd/vm-netbsd.log`)

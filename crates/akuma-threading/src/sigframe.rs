@@ -35,6 +35,7 @@
 //! the Linux headers, which is how they were found.
 
 use super::types::{UserTrapFrame, IRQ_FRAME_SIZE};
+use akuma_trap_aarch64::FrameHandle;
 use core::mem::{offset_of, size_of};
 
 /// `_aarch64_ctx.magic` identifying the FPSIMD extension record.
@@ -289,7 +290,7 @@ impl RtSigFrame {
 ///
 /// **Not the EL0 IRQ frame's layout**, which is also 832 bytes but puts its NEON block
 /// at +288 with FPCR/FPSR at +800/+808 (`exceptions.rs`'s `irq_el0_handler` comment).
-/// Only pass a sync-frame pointer to [`sync_frame_neon`].
+/// Only a sync-frame [`FrameHandle`] reaches [`SyncFrameNeon::read`].
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct SyncFrameNeon {
@@ -309,18 +310,29 @@ const _: () = assert!(offset_of!(SyncFrameNeon, fpcr) == 512);
 const _: () = assert!(SYNC_FRAME_NEON_OFFSET + size_of::<SyncFrameNeon>() == IRQ_FRAME_SIZE);
 const _: () = assert!(size_of::<UserTrapFrame>() <= SYNC_FRAME_NEON_OFFSET);
 
-/// The NEON save area of an EL0 **sync** trap frame.
-///
-/// # Safety
-///
-/// `frame` must point at an EL0 sync trap frame — 832 bytes, laid out by
-/// `sync_el0_handler`. An EL0 *IRQ* frame has a different NEON offset and passing one
-/// here reads the wrong registers.
-#[must_use]
-pub unsafe fn sync_frame_neon(frame: *mut UserTrapFrame) -> *mut SyncFrameNeon {
-    // SAFETY: the caller guarantees an 832-byte sync frame, and the assertions above
-    // place this area entirely inside it.
-    unsafe { frame.cast::<u8>().add(SYNC_FRAME_NEON_OFFSET).cast::<SyncFrameNeon>() }
+impl SyncFrameNeon {
+    const WORDS: usize = size_of::<Self>() / 8;
+
+    /// Read the NEON save area of the EL0 **sync** trap frame `frame` names. A
+    /// [`FrameHandle`] exists only for the sync handler's frame, so the IRQ
+    /// frame's different offset cannot be passed here.
+    #[must_use]
+    pub fn read(frame: FrameHandle) -> Self {
+        let w = frame.read_save_words::<{ Self::WORDS }>(SYNC_FRAME_NEON_OFFSET);
+        let mut vregs = [0u64; 64];
+        vregs.copy_from_slice(&w[..64]);
+        Self { vregs, fpcr: w[64], fpsr: w[65] }
+    }
+
+    /// Write this area back into `frame`'s save area, where `sync_el0_handler`
+    /// restores Q0-Q31, FPCR and FPSR from after the handler returns.
+    pub fn store(&self, frame: FrameHandle) {
+        let mut w = [0u64; Self::WORDS];
+        w[..64].copy_from_slice(&self.vregs);
+        w[64] = self.fpcr;
+        w[65] = self.fpsr;
+        frame.write_save_words(SYNC_FRAME_NEON_OFFSET, &w);
+    }
 }
 
 #[cfg(test)]
@@ -406,13 +418,16 @@ mod tests {
     fn siginfo_union_arms_overlap_at_16() {
         let mut sf = RtSigFrame::zeroed();
         sf.info.fields.fault = SigfaultFields { si_addr: 0x1234_5678_9ABC_DEF0 };
-        // SAFETY: both arms are plain integers over the same 112 bytes; reading the
-        // other arm is exactly what the C union permits and what this asserts.
-        let (pid, uid) = unsafe { (sf.info.fields.chld.si_pid, sf.info.fields.chld.si_uid) };
+        // Both arms are plain integers over the same 112 bytes: where the `SIGCHLD` arm's `si_pid` and `si_uid`
+        // sit is a layout fact (`offset_of!`), and the bytes at those offsets are the fault address's halves.
+        let bytes = frame_bytes(&sf);
+        let chld = 16 + core::mem::offset_of!(SigchldFields, si_pid);
+        let pid = u32::from_le_bytes(bytes[chld..chld + 4].try_into().expect("4 bytes"));
+        let uid_at = 16 + core::mem::offset_of!(SigchldFields, si_uid);
+        let uid = u32::from_le_bytes(bytes[uid_at..uid_at + 4].try_into().expect("4 bytes"));
         assert_eq!(pid, 0x9ABC_DEF0);
         assert_eq!(uid, 0x1234_5678);
 
-        let bytes = frame_bytes(&sf);
         assert_eq!(&bytes[16..24], &0x1234_5678_9ABC_DEF0u64.to_le_bytes());
     }
 
@@ -448,9 +463,7 @@ mod tests {
     }
 
     fn frame_bytes(sf: &RtSigFrame) -> [u8; SIGFRAME_SIZE] {
-        // SAFETY: `RtSigFrame` is `#[repr(C)]` over integers and arrays of them, with
-        // no padding the assertions above do not name, so every byte is initialised.
-        unsafe { core::mem::transmute_copy(sf) }
+        akuma_switch::bytes_of::<RtSigFrame, SIGFRAME_SIZE>(sf)
     }
 
     // The `expect`s below cannot fire — the ranges are constant and in bounds — and a

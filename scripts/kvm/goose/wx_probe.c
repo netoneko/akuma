@@ -1,3 +1,14 @@
+/*
+ * W^X probe: every case asserts that the kernel REFUSES (EACCES) what W^X forbids.
+ *
+ * Decision (2026-11-05): W^X is unconditional in the Taoxichuan kernel. The `wx=0` kernel-command-line
+ * hatch, which restored the old RWX widening for JITs, was removed because we build production kernels
+ * and run no JIT. So this probe has no "wx=0 makes it succeed" variant any more: a PASS-set here is the
+ * only valid result, and a FAIL means W^X regressed. Kernel side: crates/akuma-tokio-kernel-core
+ * (mm.rs mmap/mprotect arms), decision logic in crates/akuma-syscalls-mem/src/wx.rs; history in
+ * docs/archive/TAOXICHUAN_WX_POLICY.md. Do not reintroduce a switch to make a JIT work - map the code
+ * RW, write it, then mprotect it RX before any store, or run the program on a kernel that is not prod.
+ */
 #include <sys/mman.h>
 #include <stdio.h>
 #include <errno.h>

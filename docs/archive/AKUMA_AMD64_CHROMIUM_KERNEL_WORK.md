@@ -19,7 +19,7 @@ JavaScript on the amd64 kernel under Firecracker.
 
 ## Fix 1: amd64 `sendmsg`/`recvmsg` on a unix fd answered `ENOTSOCK`
 
-`amd64/src/usermode.rs` sent every `sendmsg`/`recvmsg` to `crate::sock`, which
+`crates/akuma-kernel-amd64/src/usermode.rs` sent every `sendmsg`/`recvmsg` to `crate::sock`, which
 only knows `FileDescriptor::Socket` (AF_INET). A unix fd got `ENOTSOCK`, so
 plain unix `sendmsg` had never worked on this target, with or without
 ancillary data. Socket, bind, connect and the rest already went "AF_UNIX
@@ -399,7 +399,7 @@ fault (Vulkan ICD and layer directories, `prlimit64(RLIMIT_NPROC)` →
   [clone] thread table full
 ```
 
-`amd64/src/thread.rs` kept every non-main thread in a fixed array of **64**,
+`crates/akuma-kernel-amd64/src/thread.rs` kept every non-main thread in a fixed array of **64**,
 across all processes, with a comment calling that "well past what the
 scheduler's `MAX_TASKS` budget makes useful" — the budget is 512. A headless
 Chromium is a browser with ~20 threads and a dozen child processes of 5–7
@@ -435,7 +435,7 @@ Glue's `sys_fallocate` (by inode, since Fix 4) and ext2's mode-0
 preallocation were already there.
 
 **Fix:** row `Fallocate` (285 -> asm-generic 47) in `akuma-syscalls-abi`, an
-arm in `amd64/src/usermode.rs` that passes `a1..a4` to glue, and two pins in
+arm in `crates/akuma-kernel-amd64/src/usermode.rs` that passes `a1..a4` to glue, and two pins in
 the dispatch self-test (the hop, and `fallocate(0,0,0,0)` reaching glue's
 `EINVAL` rather than `ENOSYS`). Standard-image boot: `733 passed, 0 failed`
 (731 plus those two).
@@ -582,7 +582,7 @@ still logs, none of it fatal:
   `ERROR`, not fatal so far): ~~`/proc/cpuinfo` (`Failed to initialize
   cpuinfo`)~~ — **written 2026-10-09** (neither kernel had it; shared glue in
   `akuma-vfs-glue::proc` plus the amd64 `cpuid` block renderer
-  `amd64/src/cpuinfo.rs`; aarch64 gets bare `processor : N` blocks until it
+  `crates/akuma-kernel-amd64/src/cpuinfo.rs`; aarch64 gets bare `processor : N` blocks until it
   registers a renderer; not yet booted), `/proc/sys/fs/inotify/max_user_watches`, ~~`/proc/<pid>/oom_score_adj`~~ (**written 2026-10-09**, Fix 27),
   `/sys/devices/system/cpu/{possible,present,kernel_max}`.
 - **Missing x86_64 rows**: 40 `sendfile`, 239 `get_mempolicy`, 297
@@ -668,7 +668,7 @@ whole kernel heap tracked that one `Vec`.
 
 **Mechanism.** Three facts composed:
 
-1. `amd64/src/fd.rs`'s `Entry::data` held every open file's **entire
+1. `crates/akuma-kernel-amd64/src/fd.rs`'s `Entry::data` held every open file's **entire
    contents** in the kernel heap until `close`.
 2. A write grew it with `Vec::resize`, which **doubles**, so writing N bytes
    briefly needed about 3N of heap.
@@ -681,7 +681,7 @@ whole kernel heap tracked that one `Vec`.
   caches no contents; reads and writes stream to the VFS in `MAX_IO` (64 KiB)
   chunks.
 - **The OOM handler: half fixed.** It releases the BKL unconditionally before
-  halting (`amd64/src/main.rs`), so the machine drops to N-1 cores instead of
+  halting (`crates/akuma-kernel-amd64/src/main.rs`), so the machine drops to N-1 cores instead of
   stopping. It still halts the core. Killing the faulting process, as AArch64
   does, is still to do.
 - **`execve`'s whole-image read: fixed 2026-10-08** (Fix 8). The loader reads
@@ -723,7 +723,7 @@ Site isolation gives every cross-site iframe its own renderer, and tumblr.com
 has dozens (ads, trackers, embeds). Each renderer is forked by the zygote with
 several IPC channels (`socketpair`, `pipe2`).
 
-**Cause.** `amd64/src/pipe.rs`'s `MAX_PIPES = 256`, a machine-wide policy cap
+**Cause.** `crates/akuma-kernel-amd64/src/pipe.rs`'s `MAX_PIPES = 256`, a machine-wide policy cap
 sampled by `at_capacity()` in front of `pipe2` (and by `alloc()` on the spawn
 path). A `socketpair(2)` is two glue pipes and counts against it but is not
 gated by it, so Chromium's IPC fills the table and the **next `pipe2` answers
@@ -837,7 +837,7 @@ inaccessible for good; the next store was a `#PF` protection fault on memory the
 region called writable. Every renderer died at its first decommit/recommit cycle
 inside a pool, which in the click-through is the third document load.
 
-**Fix 29.** `amd64/src/mm.rs::sys_mprotect`: an inaccessible leaf is skipped only
+**Fix 29.** `crates/akuma-kernel-amd64/src/mm.rs::sys_mprotect`: an inaccessible leaf is skipped only
 when the request is itself `PROT_NONE` (nothing to take away); a grant
 re-permissions it.
 
@@ -883,7 +883,7 @@ A guess worth testing rather than believing: the earlier minutes-long wedges
 after a hung tree was killed (below) may have been crashpad's `tgkill` flood from
 dead renderers, which these fixes stop producing.
 
-**Fix 31 (2026-10-09, evening). `amd64/src/fd.rs::MAX_FDS` 256 -> 1024.** Glue's
+**Fix 31 (2026-10-09, evening). `crates/akuma-kernel-amd64/src/fd.rs::MAX_FDS` 256 -> 1024.** Glue's
 `prlimit64` has answered `RLIMIT_NOFILE` = 1024 since C1 step 3; the table's
 lookup bound stayed at 256. Under Firecracker with the tap NIC
 (`userspace/kami/probe/akuma/run-net.sh`, `strace_err`), tumblr.com drove the
@@ -1047,7 +1047,7 @@ and should be linked from here (done in the last column).
 | 21-24 | system-font text on Chromium 152 (FontDataService, unlinked-file mapping chain) | fixed 10-08 | Fixes 21-24 |
 | 25 | **`MAX_PIPES` 256 starved the zygote: `ENFILE`, dead renderer** | **fixed in tree 10-09, not verified live** | Fix 25 |
 | 26 | `kill(2)` took the AArch64 hard-kill path: BKL wedge after a Chromium tree `kill -9`, 2 s per threaded kill, leaked thread rows | fixed 10-09 | `AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`; symptom row in `docs/README.md` |
-| 27 | `/proc/cpuinfo` did not exist on either kernel (`Failed to initialize cpuinfo`) | **fixed and booted on the metal 10-09** (Ryzen 7 8845HS, family 25 model 117, 8 blocks) | "Still open" list above; glue `proc.rs`, `amd64/src/cpuinfo.rs` |
+| 27 | `/proc/cpuinfo` did not exist on either kernel (`Failed to initialize cpuinfo`) | **fixed and booted on the metal 10-09** (Ryzen 7 8845HS, family 25 model 117, 8 blocks) | "Still open" list above; glue `proc.rs`, `crates/akuma-kernel-amd64/src/cpuinfo.rs` |
 | 28 | `/proc/<pid>/oom_score_adj` (+ `oom_adj`, `oom_score`) did not exist | **fixed and booted 10-09**, but it was *not* the cause of the `Failed to adjust OOM score` log line (still printed: the named children are already dead) | Fix 28 above |
 | 29 | **`mprotect` skipped every page a `PROT_NONE` had made `user = false`, so a recommit never took**: PartitionAlloc's pool pages stayed inaccessible, every renderer died at its first decommit/recommit (the third document load) | **fixed and booted 10-09; `nav_try` 8/8, `stable_try` 8/8, `decommitprobe` PASS (negative control FAIL)** | Fixes 29-30 above |
 | 30 | `madvise(DONTNEED)` skipped present pages of a `PROT_NONE` region and `user = false` pages: old bytes behind a recommit | **fixed and booted 10-09** (`decommitprobe`) | Fixes 29-30 above |
@@ -1080,7 +1080,7 @@ not shown to be what unblocks Tumblr**; 7 open items below. Plus 31-34
 | **Tumblr loads nothing on the 2026-10-09 kernel** (**fixed 10-09 night: a `TimeTicks` CHECK in `HttpNetworkTransaction` tripped by cross-core clock skew; Fix 32; tumblr loads on the metal, boot 90**): navigation commits, one first frame, then no frames and no load event; `Network service crashed or was terminated, restarting service` ~3 s after the page starts (crashpad's `ptrace: Function not implemented` + a `tgkill` flood follow), and the restarted service logs `CreatePlatformSocket() failed: Address family not supported by protocol (97)`. A local `file://` page renders and scrolls fine (121 ms key->frame). Not yet separated into: this kernel (it also carries the AF_UNIX-park and kill-path commits of 2026-10-09 that the earlier, working kernel lacked), the new renderer-cap flags, or a flaky network service | `userspace/kami/README.md` § "Tumblr: why scrolling stopped" |
 | missing rows/files list (`sendfile`, `inotify_init`, `/proc/cpuinfo`, ...) | "Still open: what Chromium hits" above |
 | ~~**Timed futex waits overshoot by a full 10 ms tick**~~ — **fixed 10-09 as Fix 34, verified on the metal: 13 us** — (`FUTEX_WAIT_BITSET` abs 1 ms -> 10.0 ms median, 16 ms -> 26.3 ms; Linux +0.12 ms): every `pthread_cond_timedwait` in Chromium's frame pipeline pays it, which is most of kami's 120-160 ms key->frame against Linux's 72 ms on the same CPU | `userspace/kami/README.md` § "Frame latency: where the 120 ms goes"; probes `userspace/forktest/c_stress/{wakelat,timerlat}.c` |
-| **A fault signal's handler frame can be declined** (**fixed 10-09 as Fix 33**, exec kept the per-thread altstack; reproduced and verified fixed on the metal with `altstackexec`): `[signal] sig 5 declined: frame write to 0x100002e38 failed` on the metal — the alternate stack the kernel resolved for the thread lay in a read-only file mapping, so crashpad never ran and the process died on the trap. If that can happen to a `SIGSEGV` V8 or WebAssembly handles on purpose, it is a browser death | metal klog boot 88, 2026-10-09; `amd64/src/signal.rs` frame placement, `akuma_threading::get_sigaltstack` |
+| **A fault signal's handler frame can be declined** (**fixed 10-09 as Fix 33**, exec kept the per-thread altstack; reproduced and verified fixed on the metal with `altstackexec`): `[signal] sig 5 declined: frame write to 0x100002e38 failed` on the metal — the alternate stack the kernel resolved for the thread lay in a read-only file mapping, so crashpad never ran and the process died on the trap. If that can happen to a `SIGSEGV` V8 or WebAssembly handles on purpose, it is a browser death | metal klog boot 88, 2026-10-09; `crates/akuma-kernel-amd64/src/signal.rs` frame placement, `akuma_threading::get_sigaltstack` |
 | `[unregister] pid=N stale tid=T now owned by pid=N+1` / `[TRAMP-MISMATCH]` for every short-lived process in a fork+exec loop (25 lines for 24 `tr`/`cut` runs) — thread-slot ownership lags process exit | Firecracker runs 2026-10-09 (`run-net.sh`) |
 | "exit status 191" from a browser process 4 s after tumblr committed on the metal; meaning not established (neither a Chromium result code nor a kernel status encoding anyone found) | metal `/tmp/kami.log` 2026-10-09 21:03 |
 | ~~**`akuma-ext2` host test `rewrite_truncate_rename_and_concurrent_append_keep_files_apart` fails intermittently**~~ — **test isolation, fixed 10-09**: the captured `e2fsck` said inode 16 and blocks 379-479 (a 100 KiB file + its indirect block: the old `/tmp/big`) were allocated but unreferenced, i.e. a **deferred** free — the inode pin table is keyed on the inode number alone (by design) and a parallel pin test held 16. The test now takes `pin_test_serial()` like the pin tests; 0 failures in 20 full-suite runs (was 1 in ~10) | closed |

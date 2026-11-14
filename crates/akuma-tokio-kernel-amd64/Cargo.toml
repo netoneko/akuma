@@ -17,23 +17,31 @@ workspace = true
 no-tests = ["akuma-syscalls-glue/no-tests", "akuma-exec/no-tests"]
 # Name every syscall that answers a negative errno on the console (`[err] nr=N -E`), and keep
 # the evidence rings the leak gate reads.
-trace-err = []
-# The JIT-permitting W^X relaxation (PHASE-2-WX, G1): `WX_ENFORCE` boots off - the `wx=0` hatch's
-# behaviour at compile time - and the pure checks in `akuma-syscalls-mem::wx` answer Allow. Off by
-# default (R6); one policy per kernel build, no per-program exemption (R7).
+trace-err = ["akuma-tokio-kernel-core/trace-err"]
+# The PMM's use-after-free instruments (`akuma_boot_amd64::mem::init`'s forensics flag):
+# freed frames sit in a quarantine, a premature free and a resurrected frame are reported.
+pmm-forensics = ["akuma-pmm/pmm-forensics"]
+# The JIT-permitting W^X relaxation (PHASE-2-WX, G1): the pure checks in `akuma-syscalls-mem::wx`
+# answer Allow (main removed the `wx=0` runtime hatch; the relaxation is a build choice again).
+# Off by default (R6); one policy per kernel build, no per-program exemption (R7).
 wx-relaxed = ["akuma-syscalls-mem/wx-relaxed"]
-# The legacy vsyscall page (PHASE-2-VDSO, G3): map the ABI HotSpot hardcodes
-# (getcpu at 0xffffffffff600800, called as a C function) user-RX from the
-# kernel root, and disclose the page as `AT_SYSINFO_EHDR` in auxv. Off by
-# default (R6); one ABI statement per kernel build, no builder knob (R7).
-vsyscall = ["akuma-ring3-amd64/vsyscall"]
+# The legacy vsyscall page (PHASE-2-VDSO, G3): map the ABI HotSpot hardcodes (getcpu at
+# 0xffffffffff600800, called as a C function) user-RX from the kernel root before the first
+# spawn, and disclose the vDSO ELF as `AT_SYSINFO_EHDR` in auxv - the loader's pair comes from
+# `akuma-tokio-kernel-core`, whose feature this carries down. Off by default (R6); one ABI
+# statement per kernel build, no builder knob (R7).
+vsyscall = ["akuma-tokio-kernel-core/vsyscall"]
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
+# Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.
+middleware = ["dep:akuma-middleware", "akuma-tokio-kernel-core/middleware"]
+# Refuse every dynamically linked image at build time, EPERM (`akuma-elf-exec`'s `refuse-dynamic`). Off by default.
+refuse-dynamic-elf = ["akuma-tokio-kernel-core/refuse-dynamic-elf"]
 # The default devices, each wired by its `Kernel` method (`console()`, `disk()`, `net()`, `smp()`).
 # COM1.
 console = ["dep:akuma-comconsole"]
 # ext2 on the first virtio-blk device as the root filesystem.
-disk = ["dep:akuma-ext2"]
+disk = ["dep:akuma-ext2", "akuma-tokio-kernel-core/disk"]
 # The first virtio-net device with DHCP; without it the socket layer is loopback-only.
 net = []
 # Application processors from the command line's `smp=N`.
@@ -45,8 +53,12 @@ smp = []
 #
 # The boot kit: PVH trampoline (boot.s — its `global_asm!` lives in the crate),
 # the physmap, kernel page tables, heap + PMM bring-up. One crate where
-# `amd64/src` used to be the only home of all four.
+# `crates/akuma-kernel-amd64/src` used to be the only home of all four.
 akuma-boot-amd64 = { path = "../akuma-boot-amd64" }
+akuma-pagetable = { path = "../akuma-pagetable" }
+akuma-phys = { path = "../akuma-phys" }
+# Per-core GDT/TSS statics and lgdt/ltr, behind an API that cannot name another core's slot.
+akuma-percpu-gdt-amd64 = { path = "../akuma-percpu-gdt-amd64" }
 # The console: COM1, minimal. The banner's only dependency at this stage.
 akuma-comconsole = { path = "../akuma-comconsole", optional = true }
 # The GDT/TSS descriptors this kernel loads (one core, no userspace yet — the
@@ -60,10 +72,19 @@ akuma-trap-amd64 = { path = "../akuma-trap-amd64" }
 # The machine's own description of itself: the PVH handoff, the memory map, the
 # virtio-mmio command line.
 akuma-ryzen-amd64 = { path = "../akuma-ryzen-amd64" }
+# `Facts`, the neutral machine view `akuma_boot_amd64::mem::init` reads.
+akuma-machine-facts = { path = "../akuma-machine-facts" }
 # The heap allocator (installed here as the global allocator) and the frame
 # allocator `paging` and `virtio` allocate through.
 akuma-alloc = { path = "../akuma-alloc" }
 akuma-pmm = { path = "../akuma-pmm" }
+# user_stack_size's policy (config flag sweep, 2026-11-11), shared with every other kernel.
+akuma-mem-policy = { path = "../akuma-mem-policy" }
+# Shared frames for read-only file pages (`lazy.rs`): one copy of each page of
+# `librustc_driver` however many `rustc`s map it.
+akuma-fpcache = { path = "../akuma-fpcache" }
+# One frame per page of a writable `MAP_SHARED` file mapping, for every mapper (`shmpages.rs`).
+akuma-fpcache-rw = { path = "../akuma-fpcache-rw" }
 # The leaf crate every shared crate talks through: the console hook
 # (`safe_print!`), the physmap limit, the virtio window.
 akuma-primitives = { path = "../akuma-primitives" }
@@ -136,7 +157,7 @@ spinning_top = "0.3"
 akuma-tty = { path = "../akuma-tty" }
 # Stage 8 M4 session pb: the exec/threading ladder pulled for the preemption
 # foundation (linkage proved; the exec_runtime twin lands next session), and
-# the LAPIC timer face extracted from amd64/src/lapic.rs so both kernels share
+# the LAPIC timer face extracted from crates/akuma-kernel-amd64/src/lapic.rs so both kernels share
 # one implementation. akuma-port rides along: this kernel now masks the legacy
 # PICs before arming the timer, exactly as amd64's lapic::init does.
 akuma-exec = { path = "../akuma-exec" }
@@ -159,4 +180,8 @@ akuma-syscalls-glue = { path = "../akuma-syscalls-glue", default-features = fals
 akuma-syscalls-glue-amd64 = { path = "../akuma-syscalls-glue-amd64" }
 # The tokio surface: the allow-list, the hooks and the dispatch to glue (Phase 3).
 akuma-runtime-tokio = { path = "../akuma-runtime-tokio", features = ["process"] }
+# The arch-neutral half (B21): command-line tokens, the init program, identity, nosys, rings.
+akuma-tokio-kernel-core = { path = "../akuma-tokio-kernel-core", features = ["process", "net"] }
+akuma-params = { path = "../akuma-params" }
+akuma-middleware = { path = "../akuma-middleware", optional = true }
 akuma-user-access = { path = "../akuma-user-access" }

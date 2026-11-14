@@ -132,7 +132,7 @@ args = --port 4444 --shell /bin/toybox --shell-arg sh
   the parent can still resolve + drain it, a drained reap then **removes** it, an
   empty channel is removed immediately (no leak), and reaping an absent pid is a
   no-op. Run: `cargo test --target $(rustc -vV | grep '^host:' | cut -d' ' -f2) -p akuma-exec`.
-- **Boot self-test** — `src/process_tests.rs::test_waitpid_reap_preserves_buffered_stdout`:
+- **Boot self-test** — `crates/akuma-kernel-tests-aarch64/src/process_tests.rs::test_waitpid_reap_preserves_buffered_stdout`:
   spawns `/bin/hello`, waits for exit *without* draining, asserts the reap keeps
   the channel and the buffered output is still readable, then that a drained reap
   removes it.

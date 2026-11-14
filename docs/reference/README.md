@@ -69,9 +69,8 @@ harnesses, container/env helpers).
 
 ### Devbox overlays
 
-[`overlay/`](overlay/) — the `overlays/devbox/` and `overlays/devbox-smoltcp/`
-dev-VM images: what each is for, and how to tell apart the two
-similarly-named "devbox-smoltcp" things.
+[`overlay/`](overlay/) — the `overlays/devbox/` dev-VM images: the default
+smoltcp devbox and the deferred rump one.
 
 ## Not yet written (deferred gap list)
 
@@ -98,3 +97,4 @@ For these, consult `archive/` directly in the meantime.
 4. Cross-link runbooks that build on this reference.
 5. Add a stability grade at the top (A/B/C) with a one-line justification.
 - [`crate-safety.md`](crate-safety.md) — which extracted crates are enforced `#![forbid(unsafe_code)]`, which cannot be, and why the ban is not in `Cargo.toml`.
+- [`typed-addresses.md`](typed-addresses.md) — `PhysAddr`/`VirtAddr`/`Pfn`, the `check_addr_params.py` ratchet and the ownership-type pattern that retires `unsafe` (grade B, conversion in progress).

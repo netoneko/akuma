@@ -1,0 +1,447 @@
+//! The serial console as a `ProcessChannel` — this target's stdio bridge.
+//!
+//! # Why a channel at all
+//!
+//! `akuma-syscalls-glue` serves fd 0 from a [`ProcessChannel`]: its
+//! `Stdin`/`DevTty` read arm drains `read_stdin`, applies the line discipline
+//! held in the process's `TerminalState`, echoes back through `write`, and —
+//! when the FIFO is empty — registers an `input_waker` on that state and parks.
+//! Every consumer in that arm already exists on this target. **The producer
+//! does not.**
+//!
+//! On the AArch64 kernel the producer is userspace: `sshd` writes
+//! `/proc/<pid>/fd/0`, which lands in `akuma_exec::process::write_to_process_stdin`
+//! and fills the channel. That kernel never reads a console input device at
+//! all — `grep` finds no UART reader in `src/`. This target is the other half of
+//! `TTY_SHENANIGANS.md` round 3: here the console **is** an input device, polled
+//! destructively through [`crate::input::getb`], and until this module existed
+//! it was polled from inside the reading thread itself (`fd::read_console`'s
+//! `loop { getb() else yield_now() }`).
+//!
+//! So this is the missing producer, and it is deliberately shaped as the
+//! *console's* answer to `sshd`'s `bridge_process`: one task, both directions.
+//!
+//! # One channel, one line discipline, every console process
+//!
+//! [`CHANNEL`] and [`TERM`] are single objects shared by every console-attached
+//! process (see `usermode::register_exec_process`), which is not a shortcut —
+//! it is what a tty is. Two processes reading the same serial line share one
+//! input queue and one set of termios flags; a `fork` child inherits both
+//! because it is handed the same `Arc`. The one real limitation is inherited
+//! from `TerminalState`: `set_input_waker` holds a single waker, so two
+//! concurrently parked console readers means the second displaces the first.
+//! That is also true on AArch64 and has never been the interesting case.
+//!
+//! # The pump owns the hardware
+//!
+//! Once [`spawn_pump`] runs, **nothing else may call [`crate::input::getb`]** —
+//! it is destructive, and a second caller steals bytes out of the console's
+//! input queue. `fd::read_console` and `fd::poll_console_state` ask this module
+//! instead.
+
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use alloc::sync::Arc;
+use spinning_top::Spinlock;
+
+use akuma_exec::process::ProcessChannel;
+use akuma_tty::TerminalState;
+
+/// Tell the console's line discipline how big the screen is, in `(rows, cols)`.
+///
+/// What `TIOCGWINSZ` then answers for every console-attached process — see
+/// `drivers::fb_grid`. A no-op before [`init`].
+pub fn set_size(rows: u16, cols: u16) {
+    if let Some(term) = terminal_state() {
+        let mut ts = term.lock();
+        ts.term_height = rows;
+        ts.term_width = cols;
+    }
+}
+
+/// Is `ts` the console's own terminal state — the one every console-attached
+/// process shares — rather than a session's private one?
+#[must_use]
+pub fn is_console_terminal(ts: &Arc<Spinlock<TerminalState>>) -> bool {
+    TERM.lock().as_ref().is_some_and(|t| Arc::ptr_eq(t, ts))
+}
+
+/// glue's `TIOCSWINSZ` hook (`akuma_syscalls_glue::term::set_winsize_hook`):
+/// resizing **the console's** terminal resizes the framebuffer view, which may
+/// clamp the request to what fits on the screen. Any other terminal (a pty, an
+/// ssh session) takes the request as given.
+pub fn resize_view(ts: &Arc<Spinlock<TerminalState>>, rows: u16, cols: u16) -> (u16, u16) {
+    if is_console_terminal(ts) {
+        crate::drivers::fb_set_view(cols, rows).unwrap_or((rows, cols))
+    } else {
+        (rows, cols)
+    }
+}
+
+/// The console channel, or `None` before [`init`].: keyboard bytes in `stdin_buffer`, the line
+/// discipline's echo in `buffer`.
+///
+/// `None` until [`init`], which `boot::wire_console_and_syscalls` calls at the
+/// same point it brought the old `fd::CONSOLE` up — so a read reaching here
+/// before the console exists answers exactly as it did then (EOF, not a park).
+static CHANNEL: Spinlock<Option<Arc<ProcessChannel>>> = Spinlock::new(None);
+
+/// The console's line discipline, and the `input_waker` [`pump_once`] fires.
+///
+/// The same `Arc` every console-attached process carries as
+/// `Process::terminal_state`, so `current_terminal_state()` inside a folded glue
+/// arm and the pump's wake are looking at one object. Handing each process a
+/// fresh `TerminalState` would leave the pump waking a cell nobody registered
+/// on — a keystroke that arrives and wakes nothing is the failure this whole
+/// module exists to avoid.
+static TERM: Spinlock<Option<Arc<Spinlock<TerminalState>>>> = Spinlock::new(None);
+
+/// A `TerminalState` at **exactly what this target's `TCGETS` used to report
+/// from literals** — `Termios::console_default()`, which is now also
+/// `TerminalState::default()` on both kernels (the AArch64 terminal used to
+/// start at a different `cflag`/`lflag`/`VSUSP`). Kept as a function because
+/// every process this target registers is built from it, not just the console
+/// one: a spawned child's fd 0 is a pipe faked up as a tty by the same
+/// `console_ioctl` arm, and it has to keep reading what it read before too.
+#[must_use]
+pub fn default_terminal_state() -> TerminalState {
+    TerminalState::default()
+}
+
+/// `(c_iflag, c_oflag, c_cflag, c_lflag)` — see [`default_terminal_state`].
+///
+/// Separate from that function so `fd::console_ioctl` can answer `TCGETS` for a
+/// thread with no registered state at all without building a whole
+/// `TerminalState` to read four words out of it.
+pub const DEFAULT_FLAGS: (u32, u32, u32, u32) = {
+    let t = akuma_tty::Termios::console_default();
+    (t.iflag, t.oflag, t.cflag, t.lflag)
+};
+
+/// The `c_cc` array a thread with no registered terminal state reports:
+/// `Termios::console_default()`'s control characters in the 20-byte array — the
+/// allocation-free half of [`default_terminal_state`].
+#[must_use]
+pub fn default_cc() -> [u8; 20] {
+    let mut cc = [0u8; 20];
+    cc[..akuma_tty::termios::cc::NCCS].copy_from_slice(&akuma_tty::Termios::console_default().cc);
+    cc
+}
+
+/// The pid the pump addresses its input to, or 0 before any console-attached
+/// process is registered.
+///
+/// # Why the pump needs a pid at all
+///
+/// Writing straight into [`CHANNEL`] delivers bytes and nothing else. The
+/// **terminal's** answer to a keystroke is not always "queue it": the INTR
+/// character (`^C`) is consumed by the line discipline and raises `SIGINT` on
+/// the terminal's foreground process group instead. That decision lives in
+/// `akuma_exec::process::write_to_process_stdin` — the same function `sshd`
+/// reaches through `/proc/<pid>/fd/0` on the other kernel — and it is keyed by
+/// pid, because it has to read the process's `TerminalState` (for `ISIG` and
+/// `c_cc[VINTR]`) and its `foreground_pgid`.
+///
+/// So this is the console's "who is attached", and *which* console-attached pid
+/// it holds does not matter: every one of them carries the same [`CHANNEL`] and
+/// the same [`TERM`] `Arc`, so the write, the flag read and the broadcast are
+/// identical through any of them. In practice it is `init`, registered first and
+/// outliving everything it spawns.
+///
+/// Set by `usermode::register_exec_process` for a process whose fd 0 is the
+/// console. Never cleared: a console with no attached process is exactly the
+/// state the fallback below already handles, and clearing it on exit would
+/// introduce a window where a keystroke typed during a shell's `execve` went to
+/// the direct path and skipped `ISIG`.
+static ATTACHED_PID: AtomicU32 = AtomicU32::new(0);
+
+/// Record `pid` as the console's attached process. See [`ATTACHED_PID`].
+pub fn set_attached_pid(pid: u32) {
+    ATTACHED_PID.store(pid, Ordering::Release);
+}
+
+/// [`CHANNEL`]'s address, for [`is_console_channel`].
+///
+/// A raw pointer in an atomic rather than a second `Arc`: the question is asked
+/// on every ring-3 write to fd 1 or 2, and taking [`CHANNEL`]'s lock there would
+/// put a spinlock on the console write path to answer a question about identity.
+/// 0 before [`init`]. Never cleared — the console channel outlives everything.
+static CHANNEL_PTR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bring the console channel and its line discipline up. Called once, from
+/// `boot::wire_console_and_syscalls`, before ring 3 exists.
+pub fn init() {
+    let ch = Arc::new(ProcessChannel::new());
+    // `ProcessChannel::new` already defaults this to `true`; stated rather than
+    // assumed, because it is the flag glue's `openat` gates `/dev/tty` on and
+    // the one that selects cooked input over raw pipe pass-through.
+    ch.set_terminal(true);
+    CHANNEL_PTR.store(Arc::as_ptr(&ch) as usize, Ordering::Release);
+    *CHANNEL.lock() = Some(ch);
+    *TERM.lock() = Some(Arc::new(Spinlock::new(default_terminal_state())));
+}
+
+/// Is `ch` **the** console's channel — the serial line — rather than a spawned
+/// session's?
+///
+/// `Process::channel` means two different things on this target and the answer
+/// decides where a write to fd 1 goes: a console-attached process carries
+/// [`CHANNEL`] and its output is the UART; an `ssh` session's child carries its
+/// own, and its output belongs to `sshd` through glue's `Stdout` arm. Identity,
+/// not a flag, because both report `is_terminal()` for an interactive session
+/// and neither is distinguishable any other way.
+///
+/// `false` before [`init`], which is the safe answer: nothing has a channel yet.
+#[must_use]
+pub fn is_console_channel(ch: &Arc<ProcessChannel>) -> bool {
+    let p = CHANNEL_PTR.load(Ordering::Acquire);
+    p != 0 && Arc::as_ptr(ch) as usize == p
+}
+
+/// The console channel, or `None` before [`init`].
+#[must_use]
+pub fn channel() -> Option<Arc<ProcessChannel>> {
+    CHANNEL.lock().clone()
+}
+
+/// The console's shared line discipline, or `None` before [`init`].
+#[must_use]
+pub fn terminal_state() -> Option<Arc<Spinlock<TerminalState>>> {
+    TERM.lock().clone()
+}
+
+/// Is there input waiting in the console's queue?
+///
+/// **Not [`crate::input::has_byte`]** — that asks the hardware, and once the
+/// pump runs the hardware is drained into the channel within a lap. Asking the
+/// UART would report "nothing" while a typed line sits in the FIFO, and report
+/// "something" for a byte the reader cannot yet see.
+#[must_use]
+pub fn has_input() -> bool {
+    CHANNEL.lock().as_ref().is_some_and(|ch| ch.has_stdin_data())
+}
+
+#[cfg(feature = "console")]
+/// How many bytes of one lap's keyboard input the pump moves at a time.
+///
+/// A stack array, not a `Vec`: this runs on every lap of a daemon for the life
+/// of the kernel, and a per-lap heap allocation on the path that keeps an
+/// interactive console alive is the kind the allocator rules exist to refuse.
+const PUMP_IN: usize = 256;
+
+#[cfg(feature = "console")]
+/// Of which the keyboard may fill this many; the rest is room for pointer
+/// reports ([`crate::touchpad::console_bridge`]), which can be longer than a key.
+const PUMP_KEYS: usize = 64;
+
+#[cfg(feature = "console")]
+/// The same, for the echo the line discipline writes back.
+const PUMP_OUT: usize = 256;
+
+#[cfg(feature = "console")]
+/// One lap of the bridge. Returns whether anything moved in either direction.
+///
+/// Both directions, deliberately: the line discipline's echo is written to the
+/// channel's *stdout* FIFO (`ProcessChannel::write`, which is where glue's
+/// `Stdin` arm puts the discipline's echo), and on an ssh session `sshd` is
+/// what drains that back to the client. On the serial console there is no
+/// `sshd`, so the pump is also the drain — without it a typed character would
+/// never appear and the FIFO would climb to its 1 MiB cap.
+pub fn pump_once() -> bool {
+    // The touchpad is polled whether or not a console process is attached: its
+    // consumer is `/dev/input/mouse0`, not the tty.
+    crate::drivers::pointer_poll();
+    let Some(ch) = channel() else {
+        return false;
+    };
+    let mut moved = false;
+
+    // The machine's input devices -> the console's input queue.
+    let mut inbuf = [0u8; PUMP_IN];
+    let mut n = 0;
+    while n < PUMP_KEYS {
+        match crate::input::getb() {
+            Some(b) => {
+                inbuf[n] = b;
+                n += 1;
+            }
+            None => break,
+        }
+    }
+    // The framebuffer console's answers to the program's terminal queries
+    // (`ESC[6n` and friends) are typed in exactly like keys: a terminal replies on
+    // the line the program reads. Without this busybox's line editor waits out a
+    // timeout at every prompt, and a TUI waits to learn the terminal's colours.
+    if n < inbuf.len() {
+        n += crate::drivers::fb_take_reply(&mut inbuf[n..]);
+    }
+    // The pointer, for a program that turned mouse reporting on: reports are
+    // typed in like keys (`CSI < b ; col ; row M`). Costs one console
+    // `try_lock` and nothing else while no program has asked.
+    if n < inbuf.len() {
+        n += crate::drivers::pointer_console_bridge(&mut inbuf[n..]);
+    }
+    if n > 0 {
+        // **Through the shared line discipline, not into the FIFO.**
+        //
+        // `write_to_process_stdin` is the tty's front door on both kernels: it
+        // strips the INTR character and raises `SIGINT` on `foreground_pgid`
+        // when `ISIG` is set (`crates/akuma-exec/src/process/mod.rs`), mirrors
+        // the accepted prefix into the legacy `Process::stdin` buffer, and fires
+        // the `input_waker`. Calling `ProcessChannel::write_stdin` directly —
+        // which this did until 2026-09-11 — delivers the `0x03` to the program
+        // as data, so `^C` printed `^C` and killed nothing.
+        //
+        // A short write means the queue is at its cap, i.e. nobody is reading;
+        // the excess is dropped, which is what a tty input queue does when it
+        // overflows. Not retried — retrying here would spin against a reader
+        // that is not there.
+        //
+        // The fallback is the old direct write, for the window before any
+        // console-attached process exists (the boot self-tests) and for a pid
+        // that has since been reaped. It has no `ISIG` handling, which is
+        // correct: with nothing attached there is no foreground group to signal.
+        let pid = ATTACHED_PID.load(Ordering::Acquire);
+        if pid == 0
+            || akuma_exec::process::write_to_process_stdin(pid, &inbuf[..n]).is_err()
+        {
+            ch.write_stdin(&inbuf[..n]);
+        }
+        wake_reader();
+        moved = true;
+    }
+
+    // The line discipline's echo -> the serial port and the framebuffer.
+    //
+    // `has_stdout_data` first, and that guard is load-bearing: an *empty*
+    // `ProcessChannel::read` calls `add_poller(current_thread_id())`, so
+    // reading unconditionally would register this daemon as a poller on the
+    // console channel on every idle lap.
+    let mut outbuf = [0u8; PUMP_OUT];
+    while ch.has_stdout_data() {
+        let n = ch.read(&mut outbuf);
+        if n == 0 {
+            break;
+        }
+        for &b in &outbuf[..n] {
+            // `putb_tty`: the echo is the console's own traffic and must reach
+            // the screen while diagnostics are kept off it.
+            crate::serial::putb_tty(b);
+        }
+        moved = true;
+    }
+
+    // A `/dev/fb0` owner that died without reaching its release path gets the
+    // screen taken back here. One atomic load when nobody owns it.
+    if !moved {
+        crate::fbdev::poll_owner();
+    }
+
+    // Output has gone quiet: put the cursor where typing will land. Idempotent
+    // and `try_lock`ed, so doing it on every idle lap costs a comparison.
+    if !moved && let Some((rows, cols)) = crate::drivers::cursor_idle() {
+        // The console's grid changed under the program (a new screen margin):
+        // `stty size` and `TIOCGWINSZ` must say so.
+        set_size(rows, cols);
+    }
+
+    moved
+}
+
+#[cfg(feature = "console")]
+/// Release a reader parked in glue's `Stdin` arm.
+///
+/// Verbatim the shape `akuma_exec::process::write_to_process_stdin` uses on the
+/// other kernel — `lock_bounded` so preemption is disabled for a single
+/// `try_lock` attempt rather than across the wait, which is what
+/// `docs/archive/TERM_POLL_INPUT_PREEMPTION_FIX.md` §10 is about — because the
+/// waiter it has to release is the same waiter.
+fn wake_reader() {
+    let Some(term) = terminal_state() else {
+        return;
+    };
+    let waker = akuma_exec::sync::lock_bounded(&term).take_input_waker();
+    if let Some(waker) = waker {
+        waker.wake();
+    }
+}
+
+#[cfg(feature = "console")]
+/// The pump, as a daemon task.
+///
+/// # It parks between idle laps, and yields when it cannot
+///
+/// This loop was `pump_once(); yield_now();` unconditionally, and the note here
+/// justified that by pointing at its neighbour: *"the same cost profile this
+/// target already accepts: `net::netpoll_daemon` is a permanent yield loop"*.
+/// Both were wrong together, and the measurement says how wrong: **an idle
+/// guest — nothing running but `sshd` — burned 102% of a host core**
+/// (2026-09-13, Firecracker rig). Nothing ever parked, so the scheduler always
+/// had a runnable thread, so `sched::idle_loop` never reached its `hlt` and the
+/// vCPU never slept. On a one-vCPU guest that is the CPU a compile is trying to
+/// use. It is the AArch64 finding of `docs/archive/AKUMA_TIME_EXTRACTION.md` in
+/// a different dialect — there the host refused to honour a sub-2.5 ms `wfi`
+/// deadline and the idle loops became busy-polls; here the loops simply never
+/// asked to sleep.
+///
+/// The original objection was real and is kept as the `else`: `uptime_us`
+/// advances only on the LAPIC tick, and `lib.rs` arms the timer only when
+/// there is a network, so on a no-network boot a parked pump is **a console
+/// that never delivers a keystroke** — the one failure this module must not
+/// have. So the park is conditional on [`crate::lapic::timer_running`], and a
+/// lap that moved bytes yields rather than parking, because someone is typing.
+///
+/// Cost of the park: a keystroke arriving while parked waits for the next tick,
+/// 10 ms. Against a human at a keyboard that is not observable; against the
+/// host core it saves, it is free.
+extern "C" fn pump_daemon() -> ! {
+    loop {
+        let moved = pump_once();
+        if moved || !crate::lapic::timer_running() {
+            crate::sched::yield_now();
+        } else {
+            crate::sched::block_until_deadline(
+                crate::net::uptime_us() + PUMP_IDLE_PARK_US,
+            );
+        }
+    }
+}
+
+#[cfg(feature = "console")]
+/// How long an idle pump lap parks for: one tick, which is the resolution
+/// `block_until_deadline` has (`sched::block_until_deadline`). See
+/// [`pump_daemon`].
+const PUMP_IDLE_PARK_US: u64 = crate::lapic::US_PER_TICK_TARGET as u64; // one tick
+
+#[cfg(feature = "console")]
+/// Whether [`spawn_pump`] has already run.
+static PUMP_SPAWNED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+#[cfg(feature = "console")]
+/// Start the pump. Idempotent — the second caller is a no-op rather than a
+/// second daemon racing the first for the same destructive `getb`.
+///
+/// Returns whether a pump is running when this returns.
+pub fn spawn_pump() -> bool {
+    if PUMP_SPAWNED.swap(true, core::sync::atomic::Ordering::AcqRel) {
+        return true;
+    }
+    if crate::sched::spawn_daemon(pump_daemon).is_some() {
+        return true;
+    }
+    // The task table was full. Hand the flag back so a later caller can try
+    // again rather than believing a pump it never got.
+    PUMP_SPAWNED.store(false, core::sync::atomic::Ordering::Release);
+    false
+}
+
+/// Is the pump running? Read by `fd::read_console` to tell "the console is idle"
+/// from "nothing is filling the console", which are the same empty queue and
+/// very different answers.
+#[must_use]
+pub fn pump_running() -> bool {
+    #[cfg(feature = "console")]
+    return PUMP_SPAWNED.load(core::sync::atomic::Ordering::Acquire);
+    #[cfg(not(feature = "console"))]
+    false
+}

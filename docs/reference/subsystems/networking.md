@@ -242,8 +242,7 @@ commonly nets one frame**.
 
 > **Corrected 2026-08-30.** This said "a single `rx_buffer: [u8; 2048]` and a
 > single `rx_token`", which was wrong on both counts by then. The buffer is
-> `RX_BUFFER_LEN` — **65,568** bytes on every profile but `extreme-size`, which
-> keeps 2 KB — because Firecracker will not read a frame from the tap until the
+> `RX_BUFFER_LEN` — **65,568** bytes on every build — because Firecracker will not read a frame from the tap until the
 > driver has posted 65,562 bytes of receive capacity in total
 > (`archive/AKUMA_FIRECRACKER_KVM.md` §5.1). And it is not a struct field: it
 > lives in BSS, because `NetworkState` is built on the kernel stack before being
@@ -403,7 +402,7 @@ client bugs from userspace.
 | `SO_RCVBUF` / `SO_SNDBUF` | accepted and ignored; buffers are fixed at 16 KB each direction (`TCP_{RX,TX}_BUFFER_SIZE`) | honoured |
 | `shutdown(2)` | implemented 2026-08-20. `SHUT_WR` sends the FIN (smoltcp `close()` → `FinWait1`, so the socket can still receive); `SHUT_RD` is local-only (`KernelSocket::recv_shutdown`, later `recv`s report EOF). Neither frees the fd | half-closes the connection |
 | `TCP_NODELAY` | tracked, but Nagle is off unconditionally (`set_nagle_enabled(false)`) and delayed ACK is disabled | configurable |
-| listen backlog | a **hard** ceiling of pre-created sockets (8, or 32 with `many-sessions`), not a hint — past it the peer gets RST. Self-healing since 2026-08-20; census in `/proc/net/tcp`'s `BACKLOG` column | soft SYN-queue hint |
+| listen backlog | a **hard** ceiling of pre-created sockets (8), not a hint — past it the peer gets RST. Self-healing since 2026-08-20; census in `/proc/net/tcp`'s `BACKLOG` column | soft SYN-queue hint |
 | `recv` on a connection the peer **reset** | `ECONNRESET`. Distinct from a graceful FIN, which stays `read() == 0` | same |
 | address families | `AF_INET` only; `AF_INET6` is `EAFNOSUPPORT` | both |
 | socket budget | 128 fds (`socket::MAX_SOCKETS`) over 32–256 smoltcp sockets depending on features, 32 KB of heap each | ulimit-bound |
@@ -428,7 +427,7 @@ procedure is [`../../runbooks/debug-delayed-first-byte.md`](../../runbooks/debug
 dependency-light leaf (only `akuma-syscalls-linux`) holding the `struct ifreq`
 marshalling, the `SIOCGIFCONF` record + 40-byte stride, the netmask/broadcast
 derivation, and the `/proc/net/dev` column format, all host-tested. Both kernels
-now consume it: `akuma-syscalls-glue::net` (aarch64) and `amd64/src/fd.rs` (the
+now consume it: `akuma-syscalls-glue::net` (aarch64) and `crates/akuma-kernel-amd64/src/fd.rs` (the
 amd64 port, which had none of this before and where `busybox ifconfig` now
 works). The extraction is specifically so the stride trap below can only be
 written once. The glue keeps the user-memory reads/writes and the
@@ -522,7 +521,7 @@ clock all come through it. It sends A queries over a plain UDP socket
 (`akuma-dns`), walks the resolver list on a timeout **or an answer without a
 record**, and retransmits every 1.5 s. Until 2026-10-18 AArch64 used smoltcp's
 DNS socket (`smoltcp_net::dns_query`, now deleted along with that socket's slot)
-and amd64 had its own copy (`amd64/src/dns.rs`, deleted); they differed exactly
+and amd64 had its own copy (`crates/akuma-kernel-amd64/src/dns.rs`, deleted); they differed exactly
 where it mattered: smoltcp fails on the first `NXDOMAIN`, and a resolver that
 `NXDOMAIN`s a name another answers is a measured case (the HP box's uplink;
 QEMU slirp's forwarder answered `NXDOMAIN` for `example.com` while `1.1.1.1`

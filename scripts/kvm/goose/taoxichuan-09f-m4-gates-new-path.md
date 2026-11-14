@@ -33,7 +33,7 @@ One core. No procfs, no `/dev` (no `dd`). `PACE=15` after every exec. Ticks: PIT
 `vm-dev.log` rotates at about 250 KB and keeps older boots' lines: judge faults from your boot's start line (log mark), never a whole-log grep. `boot_dev.sh` installs the artifact you name: use the default `/root/ktarget/...` path and compare the install line's size/md5 with the fresh build before trusting a boot.
 
 ## Composition rule (mandatory)
-Look first (`grep -rn <name> crates/ amd64/src/`), pull by path dependency, extract from `amd64/src/` into a crate only if it lives only there (new crates `forbid(unsafe_code)`, unsafe budget 0), write new only when it exists nowhere, and say which for each piece. `amd64/` must keep building (`cargo check -p akuma-amd64 --target x86_64-unknown-none --features no-tests`).
+Look first (`grep -rn <name> crates/ crates/akuma-kernel-amd64/src/`), pull by path dependency, extract from `crates/akuma-kernel-amd64/src/` into a crate only if it lives only there (new crates `forbid(unsafe_code)`, unsafe budget 0), write new only when it exists nowhere, and say which for each piece. `amd64/` must keep building (`cargo check -p akuma-amd64 --target x86_64-unknown-none --features no-tests`).
 `wc -l taoxichuan/src/*.rs` at start and end (7618 now). Decisions already made (do not reopen): timer preemption is the NEXT slice (switch only where a task parks, never in ring 0); SMP-ready (slot accessors, no new current-task `static`); pull crates, do not copy code; keep M2's scaffold compiled and selectable until the new path passes every gate.
 
 ## Gates (extend `scripts/kvm/goose/run_pipes.sh` with a trailing group or add `run_fork.sh` beside it; NOT `run_gates.sh`; at most 8 execs per boot)

@@ -7,7 +7,7 @@
 //!
 //! # Why this is a crate
 //!
-//! It started as `amd64/src/serial.rs`'s `KLOG`: a `static mut [u8; 64 * 1024]`
+//! It started as `crates/akuma-kernel-amd64/src/serial.rs`'s `KLOG`: a `static mut [u8; 64 * 1024]`
 //! with a `u64` write counter, four raw-pointer helpers around it, and
 //! `sys_syslog` on top. The bare-metal reference machine's console is a
 //! write-only television with no scrollback, so `dmesg` over ssh is the *only*

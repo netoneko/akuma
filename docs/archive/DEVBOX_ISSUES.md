@@ -2158,7 +2158,7 @@ Two decisions to make deliberately rather than by default:
 ### Where
 
 - `crates/akuma-dmesg` — the ring and the `syslog(2)` action decode.
-- The `syslog` dispatch arm on each kernel (`src/syscall/`, `amd64/src/`).
+- The `syslog` dispatch arm on each kernel (`src/syscall/`, `crates/akuma-kernel-amd64/src/`).
 - `akuma-isolation` / `boxlib` for "which box is this caller in".
 
 ## Background

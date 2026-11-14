@@ -89,7 +89,7 @@ Verified on `extreme-size` at 64 MB and at the 4.0 MB floor, and on `release`.
   the kernel log names it exactly:
   `[IA-DP] … single-page fallback OOM, 16 free pages` followed by
   `[Fault] Process N (/bin/tcc) SIGSEGV`. That is the documented OOM-kill policy,
-  not a crash. `acceptance/05_meow_tcc_extreme_4mb.md`'s "run commands one by one"
+  not a crash. `acceptance/archive/05_meow_tcc_extreme_4mb.md`'s "run commands one by one"
   instruction and its free-RAM table describe this regime.
   The same floor shows a *pre-existing* limit on repeated piped spawns — the first
   `a | b` works and later ones report `paws: pipe target not found`, identically
@@ -100,7 +100,7 @@ Verified on `extreme-size` at 64 MB and at the 4.0 MB floor, and on `release`.
 - [`EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md`](EXTREME_SSHD_KERNEL_STACK_OVERFLOW.md)
   — the kernel bug that had to be fixed before `paws` could be reached over ssh on
   `extreme` at all, which is why this had gone untested there.
-- `acceptance/05_meow_tcc_extreme_4mb.md` — the playbook whose compile step this
+- `acceptance/archive/05_meow_tcc_extreme_4mb.md` — the playbook whose compile step this
   unblocks.
 - `crates/akuma-exec/src/process/spawn.rs` — `spawn_process_with_channel_ext`,
   where argv is assembled and `path` is pushed as `argv[0]`.

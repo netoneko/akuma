@@ -6,6 +6,12 @@
 > across all of them, but the underlying BKL-removal effort is itself grade **C** —
 > check `smp-shared.md` and the archive docs below for what has landed since
 > this was written.
+>
+> **The `no-bkl-*` names below are carve-outs, not features.** Each was a Cargo
+> feature until 2026-11-11, always on under `smp-shared`. They were folded into
+> it then, and their cfgs now read `kernel_bkl_smp` (the shared crates' `bkl-smp`
+> switch, which both Akuma kernels always enable). A/B one with its
+> runtime toggle in `akuma_bkl::policy` (`docs/archive/AKUMA_FEATURE_AUDIT.md` F2).
 
 This is the distilled "how to add a lock, or remove one, without re-deriving
 the lessons from scratch" reference. It is not a history — for the blow-by-blow
@@ -13,12 +19,13 @@ of any specific fix, follow the links into `docs/archive/`.
 
 ## The model
 
-Under `smp-shared` (real shared-kernel SMP, `cfg(kernel_smp_shared)`), one
+In every Akuma build (real shared-kernel SMP, `cfg(kernel_bkl_smp)`), one
 kernel runs across all cores. Correctness is anchored by a single **Big Kernel
 Lock** (`akuma_exec::sync::KernelLock`, driven via `akuma_exec::bkl`):
-**held iff a core is in EL1**, reconciled at every EL transition
-(`reconcile_for_spsr`, called from IRQ/exception epilogues), with a fair FIFO
-ticket wait so no core starves. Off `smp-shared` it's a zero-cost no-op.
+**held iff a core is in EL1**: the EL0 syscall entry takes it and drops it before
+the return, an interrupt takes it only if the interrupted code did not hold it and
+drops only what it took, and a switch crosses holding it (`yield_locked`). A fair
+FIFO ticket wait means no core starves. Without `bkl-smp` (Taoxichuan, host tests) it's a zero-cost no-op.
 
 The BKL upgraded the kernel's old single-core invariant (`with_irqs_disabled`,
 which only gives mutual exclusion on *one* core) to something SMP-safe in one
@@ -35,8 +42,10 @@ socket `read`/`write`), `no-bkl-vfs` (ext2 read paths, `mmap`, `unlinkat`,
 (`fork_process`'s CoW page-copy window), `no-bkl-mm`
 (`mprotect`/`madvise`/`munmap`/`mremap`/`mmap`), `no-bkl-drivers`
 (`getrandom`, `/dev/urandom` read/pread, `/dev/dsp` write), and `no-bkl-irq` (the timer IRQ's dispatch in
-`rust_irq_handler_with_sp`). All six are default-on in `smp-shared`
-(since 2026-08-01). `no-bkl-process` is the first that is not about I/O: it overlaps a
+`rust_irq_handler_with_sp`). The first five are part of `smp-shared`. `no-bkl-irq`'s
+dispatch-site gate lived in the SGI scheduler's IRQ path and was deleted with it
+(2026-11-11, `AKUMA_MULTIARCH_ATTEMPT_0.md` § "The SGI scheduler is deleted"); what
+follows about it is that path's history. `no-bkl-process` is the first that is not about I/O: it overlaps a
 CPU-bound page copy with peer-core EL1 rather than a disk or wire wait, and it is
 the first to lean on a *page-table* inner lock (`as_lock`) rather than a
 subsystem's own state locks. `no-bkl-mm` is the first phase picked by the plan
@@ -80,14 +89,14 @@ been **removed**: at HEAD, a waiter that loses the ownership CAS at its own turn
 through and keeps its ticket, spinning in place until the holder's release lands it in
 the `reticket-skipped` case above (`sync.rs:595-612`).
 
-The out-of-band acquirer is what forces re-tickets. `acquire_no_ticket` (the BKL-free
-EL0-preempt reconcile, `reconcile_for_spsr_no_ticket`, **default-on** via
-`SCHED_BKLFREE_EL0_ENABLED`) takes ownership without occupying a queue slot. It must
-therefore leave the FIFO **completely** untouched — no ticket on acquire, and no advance on
-release (a per-core `barged` flag on `KernelLock` tells `release` which kind of hold it is
-ending). Anything less consumes a live waiter's slot and forces that waiter to re-ticket.
-An earlier compensating `next_ticket.fetch_add(1)` in the barge kept the counters equal and
-still wedged, for exactly the phantom-ticket reason above.
+**Every hold is ticketed.** There is no out-of-band acquire: the ticket-free "barge" that
+the SGI scheduler's BKL-free EL0-preempt path used went with that scheduler
+([`SGI_SCHEDULER_RESIDUE.md`](../../archive/SGI_SCHEDULER_RESIDUE.md)), and with it the
+per-core `barged` flag `release` consulted. Do not add an acquire that skips the queue: it
+must then leave the FIFO completely untouched, no ticket and no advance, and the two
+attempts at that both lost slots (history:
+[`M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md`](../../archive/M5C_BKLFREE_EL0_SCHEDULER_DEADLOCK.md)
+and `debug-smp.md`'s `owner=0` row).
 
 **Reading the diagnostics.** `[BKL] stuck` prints `owner=`, `waiter=`, `tag=`:
 
@@ -105,12 +114,11 @@ still wedged, for exactly the phantom-ticket reason above.
   above converts what used to leak into benign `reticket-skipped` recoveries, and those
   bump the aggregate on a perfectly healthy, contended run (`sync.rs:1616-1618`).
 
-Regression: `sync::tests::kernel_lock_barge_against_waiters_does_not_leak_serving_slots`
-(host). Note that asserting *final drift* does not catch this class — the `advanced-lost`
+Note that asserting *final drift* does not catch this class — the `advanced-lost`
 self-heal repairs the counters, so a leaking build still ends balanced (it just pays a 20M
 spin freeze per leak). The leak-specific signal is `kernel_lock_lost_ticket_recoveries()`
 — non-zero there means a ticket was genuinely lost, full stop. The boot self-test
-`test_no_bkl_ticket_recoveries` (`src/process_tests.rs:874`) currently asserts the
+`test_no_bkl_ticket_recoveries` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs:874`) currently asserts the
 *aggregate* `kernel_lock_recoveries()` instead, which — per the false-alarm note just
 above — can fail on a healthy run that merely saw `reticket-skipped` bursts under real
 contention; treat a failure there as "go check `kernel_lock_lost_ticket_recoveries()`",
@@ -239,16 +247,14 @@ Each of these was a real bug found during a carve-out, not a hypothetical.
   restored on drop. The reverse order reopens, for an instant, exactly the
   window the guard exists to close. (§3.)
 
-- **An interrupt landing inside a dropped-BKL window will silently convert it
-  back to BKL-held, unless you track that on purpose.** The reconcile
-  invariant ("BKL held iff EL1") is enforced at every `eret` against the
-  *interrupted frame's* SPSR — which is EL1 — so a timer IRQ during a dropped
-  window makes the epilogue re-take the BKL and hold it for the rest of the
-  window, silently re-serializing what was supposed to be BKL-free. Fixed
-  with a **per-thread depth of open dropped-BKL windows** consulted at every
-  `eret`: "target is EL1 *and* the resumed thread has an open window" also
-  means release. Thread-scoped, not core-scoped, because windows survive
-  preemption and cross-core migration. Any new dropper (a new guard type, a
+- **Anything that re-takes the lock for a thread must check whether that thread
+  is inside a dropped-BKL window.** Under the SGI scheduler an eret-time reconcile
+  re-took it for any EL1 target, so a timer IRQ during a dropped window
+  silently re-serialized the rest of it. Today the interrupt path restores what
+  it found, and the readers of the **per-thread depth of open dropped-BKL
+  windows** are the idle loop after `wfi` and the EL0-entry tripwire.
+  Thread-scoped, not core-scoped, because windows survive preemption and
+  cross-core migration. Any new dropper (a new guard type, a
   new blocking-wait site) must go through this same
   `bkl::dropped_window_open()/close()` pair, not a bare `leave_kernel`/
   `enter_kernel`. (§9; `akuma_exec::bkl::DroppedWindowLedger`.)
@@ -499,8 +505,7 @@ so conversion moved its whole body BKL-free; cleared once gate 2 below was close
 wholesale** — their unix-socket routing arm runs before their guard and stays
 BKL-held (the AB-BA note below). **`getcwd` must not be listed** either, despite the
 VFS map calling it guardless: it *reads* `proc.cwd`, a plain `String` `Process`
-field that `chdir` writes BKL-held (see the load-bearing table). `KernelLock`/
-`reconcile_for_spsr`/the ledger/the guards must survive until the un-converted set
+field that `chdir` writes BKL-held (see the load-bearing table). `KernelLock`/the ledger/the guards must survive until the un-converted set
 is empty. See
 [`BKL_PHASE7F_OPTOUT_LIST.md`](../../archive/BKL_PHASE7F_OPTOUT_LIST.md).
 
@@ -582,7 +587,7 @@ ledger primitive, no `VfsBklGuard`/`NetBklGuard` struct):
 
 | site | toggle | scope | inner lock |
 |---|---|---|---|
-| `sys_execve` ELF read (`proc.rs:649`, inside `sys_execve` `proc.rs:544`) | `exec_bkl_drop_enabled()` (`smp_shared.rs:87`) | whole-file `read_file` — **only** in the single-image smp-shared build (`not(kernel_profile_extreme)`); the size profile reads just a 256-byte shebang header, which never takes this window | ext2 `read_state` |
+| `sys_execve` ELF read (`proc.rs:649`, inside `sys_execve` `proc.rs:544`) | `exec_bkl_drop_enabled()` (`smp_shared.rs:87`) | whole-file `read_file` | ext2 `read_state` |
 | Data-Abort demand-page fill (`exceptions.rs:2964`/`3017`) | `fault_bkl_drop_enabled()` (`smp_shared.rs:68`) | per-page fill loop only; page-table install is separate, BKL-held | ext2 `read_state` |
 | Instruction-Abort demand-page fill (`exceptions.rs:3487`/`3533`) | same | mirror of Data-Abort path | same |
 | `netpoll_drain`'s `smoltcp_net::poll()` loop (`main.rs`, `BKL_VFS_CARVE_OUT.md` §19–20) | none — unconditional under the cfg gate | the whole burst-drain `while poll() {}` loop | `NETWORK`/`SOCKET_TABLE` |
@@ -603,7 +608,7 @@ dropped-window ledger.
 
 | site | guard scope | inner lock(s) held while BKL dropped |
 |---|---|---|
-| `fork_process` CoW share/demote pass | the copy loop only — after the `for_each_process` sibling scan, the `LAZY_REGION_TABLE` snapshot, and `propagate_lazy_regions_to_child` (all hoisted BKL-held ahead of it); before steps 5–8 | thread-group **leader's** `Process::as_lock` in 64-page chunks (`FORK_AS_CHUNK_PAGES`, IRQ-masked via `AsLockHold`), plus `COW_REFCOUNTS` `Spinlock` and the PMM/allocator locks |
+| `fork_process` CoW share/demote pass | the copy loop only — after the `for_each_process` sibling scan and the leader's `mmap_regions` snapshot (both hoisted BKL-held ahead of it); before steps 5–8 | thread-group **leader's** `Process::as_lock` in 64-page chunks (`FORK_AS_CHUNK_PAGES`, IRQ-masked via `AsLockHold`), plus `COW_REFCOUNTS` `Spinlock` and the PMM/allocator locks |
 
 Two things about this one differ from the fs/net pattern and are easy to get
 wrong:
@@ -716,7 +721,7 @@ reclaiming inside `register_process`. The `ACTIVE -> RETIRED` CAS
 unregistering the same pid concurrently used to both find it and both attempt
 to free it; now exactly one wins the transition and the other's call is a no-op.
 Two new boot self-tests (`test_process_reclaim_respects_cooldown`,
-`test_unregister_process_second_call_loses_cas`, `src/process_tests.rs`) pin
+`test_unregister_process_second_call_loses_cas`, `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`) pin
 both properties, mirroring `test_thread_slot_reclaim_on_spawn`. See
 [`BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md`](../../archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md).
 
@@ -758,16 +763,16 @@ significant BKL holder).
 |---|---|---|
 | `sys_mprotect` (`mem.rs`) | after `proc` resolves | `Process::as_lock` (PTE flag edits); `LAZY_REGION_TABLE` |
 | `sys_madvise` (`mem.rs`) | after `proc` resolves, per match arm | `Process::as_lock` (prefault install / zero-mapped); `LAZY_REGION_TABLE`; PMM (`MADV_WILLNEED`'s batch alloc) |
-| `sys_munmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (region lookup/removal + free-list); `Process::as_lock` (PTE unmap); `SHARED_FILE_MAPPINGS`; `LAZY_REGION_TABLE`; PMM (frame free) |
+| `sys_munmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (region lookup/removal); `Process::as_lock` (PTE unmap); `LAZY_REGION_TABLE`; PMM (frame free); the `akuma_exec::shm` table (leaf, below the AS lock) |
 | `sys_mremap` (`mem.rs`) | after `proc` resolves once (not re-looked-up inside the window) | `Process::vm_lock`; `Process::as_lock`; `LAZY_REGION_TABLE`; PMM |
-| `sys_mmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (free-list alloc via `vm_alloc_mmap`); `Process::as_lock` (PTE install); `LAZY_REGION_TABLE`; PMM; `SHARED_FILE_MAPPINGS`; nested `VfsBklGuard` windows for on-disk fill (ledger depth-counted, safe to nest) |
+| `sys_mmap` (`mem.rs`) | after `proc` resolves | `Process::vm_lock` (placement + reservation via `vm_alloc_mmap`); `Process::as_lock` (PTE install); `LAZY_REGION_TABLE`; PMM; nested `VfsBklGuard` windows for on-disk fill (ledger depth-counted, safe to nest) |
 
 Two gaps closed as a prerequisite (not present before this phase, not a "nothing to
 build" finding like net/vfs/process):
 
-- **`ProcessMemory::free_regions`/`alloc_mmap()`** was a plain unguarded `Vec` —
-  every mm syscall now goes through `Process::vm_alloc_mmap`/`vm_free_mmap`, which
-  fold it under the existing `vm_lock` (same IRQ-disabled, pure-bookkeeping
+- **`ProcessMemory`'s free list** was a plain unguarded `Vec` — it was folded under
+  `vm_lock`, and since 2026-11-12 it is gone: placement reads `mmap_regions` under
+  that lock (`Process::vm_alloc_mmap`) (same IRQ-disabled, pure-bookkeeping
   discipline `vm_lock` already enforces for `mmap_regions`).
 - **`sys_mmap`'s OOM/reclaim fallback** (`reclaim_clean_file_pages` →
   `try_evict_ro_page`) mutated page tables with no `as_lock` hold at all — fixed
@@ -853,10 +858,10 @@ signature matches a known physical-page-reuse-race pattern. That guard was rever
 it looks like it does.**
 
 **Refinement (Phase 7f tranche 2, archive doc §4.1) — what the BKL actually covers
-here.** `KERNEL_LOCK` is a **per-core** lock, and `bkl::reconcile_for_spsr` reconciles
-it for *the thread the core is about to run*. So when a thread blocks and the core
-switches away, that thread's hold simply evaporates; nothing restores it until the
-thread is resumed and its own eret epilogue re-acquires. `schedule_blocking` never
+here.** `KERNEL_LOCK` is a **per-core** lock. A switch crosses holding it and a
+thread that did not hold it before the switch drops it after (`yield_locked`), so the
+lock follows the core, not the thread: while a thread is blocked it holds nothing, and
+it is BKL-held again only once it resumes. `schedule_blocking` never
 calls `leave_kernel` because it does not need to. Three consequences worth having
 written down:
 
@@ -941,7 +946,7 @@ footprint and sums per-tag spins over just those windows. `analyze.py`'s default
 whole-boot view is diluted by bringup and idle.
 
 ```
-cargo build --profile release-smp-shared --features devbox-smoltcp,no-tests,bkl-profile
+cargo build --profile release-smp-shared --features no-tests,bkl-profile
 ```
 
 Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
@@ -997,8 +1002,8 @@ Driving workload: `net4` (concurrent downloads → net + ext2 write), `read4`
   canonical approach: *don't remove the BKL, invert its default* via a
   per-syscall opt-in list seeded empty, so it withers into provably-dead code
   instead of being deleted in one step — note the constraint that
-  `reconcile_for_spsr` and the dropped-window ledger must survive the whole
-  traversal.
+  the dropped-window ledger must survive the whole traversal (the eret-time
+  reconcile it also named went with the SGI scheduler).
 - [`SMP_SHARED.md`](../../archive/SMP_SHARED.md) — full shared-kernel SMP
   progress log (M0–M5).
 - [`smp-shared.md`](smp-shared.md) — current-state milestone status for

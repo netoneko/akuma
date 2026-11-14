@@ -77,6 +77,7 @@
 //! a host test instead of only inside a booted VM.
 
 #![cfg_attr(not(test), no_std)]
+#![forbid(unsafe_code)]
 #![allow(
     clippy::future_not_send,
     clippy::must_use_candidate,
@@ -164,7 +165,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use spinning_top::Spinlock;
 
-use akuma_primitives::{Registered, phys_to_virt};
+use akuma_primitives::Registered;
 
 /// ARM64 page size. Duplicated from `akuma_exec::mmu::types::PAGE_SIZE` (a plain
 /// `4096` literal there too) rather than imported, since this crate sits below
@@ -435,7 +436,6 @@ impl FrameTracker {
 }
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct FrameTrackingStats {
     pub current_tracked: usize,
     pub kernel_count: usize,
@@ -466,15 +466,6 @@ pub fn tracking_stats() -> Option<FrameTrackingStats> {
         Some(FRAME_TRACKER.lock().stats())
     } else {
         None
-    }
-}
-
-#[allow(dead_code)]
-pub fn leak_count() -> usize {
-    if DEBUG_FRAME_TRACKING {
-        FRAME_TRACKER.lock().leak_count()
-    } else {
-        0
     }
 }
 
@@ -1241,15 +1232,6 @@ pub fn dp_count(counter: &AtomicUsize, n: usize) {
 // UAF hunt: free ledger — a ring of recent frees, named by thread
 // ============================================================================
 
-const FREE_LEDGER_SLOTS: usize = 4096;
-
-static FREE_LEDGER_PA: [AtomicUsize; FREE_LEDGER_SLOTS] =
-    [const { AtomicUsize::new(0) }; FREE_LEDGER_SLOTS];
-/// `tid << 32 | seq` for the matching `FREE_LEDGER_PA` slot.
-static FREE_LEDGER_META: [AtomicUsize; FREE_LEDGER_SLOTS] =
-    [const { AtomicUsize::new(0) }; FREE_LEDGER_SLOTS];
-static FREE_LEDGER_NEXT: AtomicUsize = AtomicUsize::new(0);
-
 /// **Which code path returned a frame to the PMM.**
 ///
 /// The ledger named the freeing *thread* and sequence number, which answers "when"
@@ -1315,201 +1297,43 @@ impl FreeSite {
             Self::MunmapSpan => "munmap-span",
         }
     }
-    const fn from_bits(b: u8) -> Self {
-        match b {
-            1 => Self::Munmap,
-            2 => Self::AsTeardown,
-            3 => Self::CowBreak,
-            4 => Self::FaultRaceLost,
-            5 => Self::FaultPoolSurplus,
-            6 => Self::FpcacheEvict,
-            7 => Self::FpcacheInvalidate,
-            8 => Self::MadviseDontneed,
-            9 => Self::Mremap,
-            10 => Self::SurplusRef,
-            11 => Self::MunmapRegion,
-            12 => Self::MunmapPartial,
-            13 => Self::MunmapSpan,
-            _ => Self::Unknown,
-        }
-    }
 }
 
-/// Note that `pa` was returned to the PMM by thread `tid`, from `site`. Lock-free
-/// and IRQ-safe: two relaxed stores and a fetch_add.
-///
-/// `META` packs `site << 48 | tid << 32 | seq`. `tid` is bounded by `MAX_THREADS`
-/// (≤ 256), so the 16 bits above it were dead space and the site rides for free —
-/// no extra array, no extra store on the free path.
-pub fn record_free_at(pa: usize, tid: u32, site: FreeSite) {
-    let seq = FREE_LEDGER_NEXT.fetch_add(1, Ordering::Relaxed);
-    let idx = seq & (FREE_LEDGER_SLOTS - 1);
-    FREE_LEDGER_META[idx].store(
-        ((site as usize) << 48) | ((tid as usize & 0xFFFF) << 32) | (seq & 0xFFFF_FFFF),
-        Ordering::Relaxed,
-    );
-    FREE_LEDGER_PA[idx].store(pa, Ordering::Release);
+/// Whether the free and CoW-event ledgers are compiled in (`pmm-forensics`).
+pub const LEDGERS: bool = cfg!(feature = "pmm-forensics");
+
+#[cfg(feature = "pmm-forensics")]
+mod ledger;
+#[cfg(feature = "pmm-forensics")]
+pub use ledger::{cow_event_count, cow_ever_touched, cow_ledger_record, free_ledger_seq, last_free_record,
+    last_free_record_at, print_cow_history, record_free_at};
+
+/// The ledgers compiled out (`pmm-forensics` off): nothing is recorded and every
+/// question answers "no record".
+#[cfg(not(feature = "pmm-forensics"))]
+mod no_ledger {
+    use super::FreeSite;
+    pub const fn record_free_at(_: usize, _: u32, _: FreeSite) {}
+    #[must_use]
+    pub const fn last_free_record(_: usize) -> Option<(u32, u32)> { None }
+    #[must_use]
+    pub const fn last_free_record_at(_: usize) -> Option<(u32, u32, FreeSite)> { None }
+    #[must_use]
+    pub const fn free_ledger_seq() -> u32 { 0 }
+    #[must_use]
+    pub const fn cow_ever_touched(_: usize) -> Option<bool> { None }
+    pub const fn cow_ledger_record(_: usize, _: bool, _: u16, _: u16) {}
+    #[must_use]
+    pub const fn cow_event_count(_: usize) -> usize { 0 }
+    pub const fn print_cow_history(_: usize) {}
+    pub const fn init(_: usize, _: usize) {}
 }
-
-/// Back-compat shim: record with no site attribution.
-pub fn record_free(pa: usize, tid: u32) {
-    record_free_at(pa, tid, FreeSite::Unknown);
-}
-
-/// Most recent ledger entry for `pa`, as `(tid, seq)` — `None` if this frame has
-/// not been freed inside the ring's window.
-#[must_use]
-pub fn last_free_record(pa: usize) -> Option<(u32, u32)> {
-    last_free_record_at(pa).map(|(tid, seq, _)| (tid, seq))
-}
-
-/// As [`last_free_record`], plus **which code path** did the freeing.
-#[must_use]
-pub fn last_free_record_at(pa: usize) -> Option<(u32, u32, FreeSite)> {
-    let mut best: Option<(u32, u32, FreeSite)> = None;
-    for i in 0..FREE_LEDGER_SLOTS {
-        if FREE_LEDGER_PA[i].load(Ordering::Acquire) != pa {
-            continue;
-        }
-        let meta = FREE_LEDGER_META[i].load(Ordering::Relaxed);
-        let tid = ((meta >> 32) & 0xFFFF) as u32;
-        let seq = (meta & 0xFFFF_FFFF) as u32;
-        let site = FreeSite::from_bits(((meta >> 48) & 0xFF) as u8);
-        if best.is_none_or(|(_, prev, _)| seq.wrapping_sub(prev) < u32::MAX / 2) {
-            best = Some((tid, seq, site));
-        }
-    }
-    best
-}
-
-/// Sequence number the next free will be stamped with.
-#[must_use]
-pub fn free_ledger_seq() -> u32 {
-    (FREE_LEDGER_NEXT.load(Ordering::Relaxed) & 0xFFFF_FFFF) as u32
-}
-
-// ============================================================================
-// CoW/share refcount EVENT ledger — NOT the refcount table itself (that is
-// `COW_REFCOUNTS`, staying in `src/pmm.rs` until Step 3). This records every
-// inc/dec event so an anomaly report can print a frame's whole reference
-// history; the table it is recording events *about* is a separate concern.
-// ============================================================================
-
-static COW_EVER: Spinlock<Vec<u64>> = Spinlock::new(Vec::new());
-static COW_EVER_BASE: AtomicUsize = AtomicUsize::new(0);
-
-fn cow_ever_index(pa: usize, len_words: usize) -> Option<usize> {
-    let base = COW_EVER_BASE.load(Ordering::Relaxed);
-    let idx = pa.checked_sub(base)? / PAGE_SIZE;
-    (idx / 64 < len_words).then_some(idx)
-}
-
-fn cow_ever_mark(pa: usize) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
-        let mut bits = COW_EVER.lock();
-        let Some(idx) = cow_ever_index(pa, bits.len()) else { return };
-        bits[idx / 64] |= 1u64 << (idx % 64);
-    });
-}
-
-/// Has `pa` ever taken part in a reference event? `None` when the instrument is
-/// off.
-#[must_use]
-pub fn cow_ever_touched(pa: usize) -> Option<bool> {
-    akuma_primitives::irq::with_irqs_disabled(|| {
-        let bits = COW_EVER.lock();
-        if bits.is_empty() {
-            return None;
-        }
-        let Some(idx) = cow_ever_index(pa, bits.len()) else { return Some(false) };
-        Some(bits[idx / 64] & (1u64 << (idx % 64)) != 0)
-    })
-}
-
-const COW_LEDGER_SLOTS: usize = 4096;
-static COW_LEDGER_PA: [AtomicUsize; COW_LEDGER_SLOTS] =
-    [const { AtomicUsize::new(0) }; COW_LEDGER_SLOTS];
-/// `tid << 32 | op << 24 | before << 12 | after` (op: 0 = inc, 1 = dec).
-static COW_LEDGER_META: [AtomicUsize; COW_LEDGER_SLOTS] =
-    [const { AtomicUsize::new(0) }; COW_LEDGER_SLOTS];
-static COW_LEDGER_SEQ: [AtomicUsize; COW_LEDGER_SLOTS] =
-    [const { AtomicUsize::new(0) }; COW_LEDGER_SLOTS];
-static COW_LEDGER_NEXT: AtomicUsize = AtomicUsize::new(0);
-
-/// Called by `src/pmm.rs`'s still-local `cow_ref_inc`/`cow_ref_dec` after they
-/// update `COW_REFCOUNTS`, so the event ledger stays populated across the Step
-/// 2/3 boundary with zero behaviour change.
-pub fn cow_ledger_record(pa: usize, is_dec: bool, before: u16, after: u16) {
-    if !config().cow_ref_ledger {
-        return;
-    }
-    cow_ever_mark(pa);
-    let seq = COW_LEDGER_NEXT.fetch_add(1, Ordering::Relaxed);
-    let idx = seq & (COW_LEDGER_SLOTS - 1);
-    let tid = akuma_primitives::preempt::current_tid();
-    let meta = (tid << 32)
-        | (usize::from(is_dec) << 24)
-        | (((before as usize) & 0xFFF) << 12)
-        | ((after as usize) & 0xFFF);
-    COW_LEDGER_SEQ[idx].store(seq, Ordering::Relaxed);
-    COW_LEDGER_META[idx].store(meta, Ordering::Relaxed);
-    COW_LEDGER_PA[idx].store(pa, Ordering::Release);
-}
-
-// No `#[cfg(kernel_tests)]` here: that cfg is emitted only by the kernel
-// binary's own `build.rs` (`src/`), unreachable from this crate. The
-// kernel-test-suite-only call site (`src/process_tests.rs` via
-// `crate::pmm::cow_event_count`) is gated in `src/pmm.rs`'s thin wrapper
-// instead; this stays always-compiled and relies on LTO to strip it from
-// builds where that wrapper compiles out (extreme-size / `no-tests`).
-pub fn cow_event_count(pa: usize) -> usize {
-    if !config().cow_ref_ledger {
-        return 0;
-    }
-    (0..COW_LEDGER_SLOTS)
-        .filter(|&i| COW_LEDGER_PA[i].load(Ordering::Acquire) == pa)
-        .count()
-}
-
-/// Print every recorded reference event for `pa`, oldest first (up to 12).
-pub fn print_cow_history(pa: usize) {
-    if !config().cow_ref_ledger {
-        return;
-    }
-    let mut printed = 0usize;
-    let mut last_seq: Option<usize> = None;
-    while printed < 12 {
-        let mut best: Option<(usize, usize)> = None;
-        for i in 0..COW_LEDGER_SLOTS {
-            if COW_LEDGER_PA[i].load(Ordering::Acquire) != pa {
-                continue;
-            }
-            let seq = COW_LEDGER_SEQ[i].load(Ordering::Relaxed);
-            if last_seq.is_some_and(|l| seq <= l) {
-                continue;
-            }
-            if best.is_none_or(|(bs, _)| seq < bs) {
-                best = Some((seq, i));
-            }
-        }
-        let Some((seq, idx)) = best else { break };
-        let meta = COW_LEDGER_META[idx].load(Ordering::Relaxed);
-        akuma_primitives::safe_print!(160, "  [COW-HIST] pa={:#x} seq={} tid={} {} {}->{}\n",
-            pa, seq, meta >> 32,
-            if (meta >> 24) & 1 == 1 { "dec" } else { "inc" },
-            (meta >> 12) & 0xFFF, meta & 0xFFF);
-        last_seq = Some(seq);
-        printed += 1;
-    }
-    if printed == 0 {
-        let verdict = match cow_ever_touched(pa) {
-            Some(false) => "NEVER shared (durable bitset clear)",
-            Some(true) => "shared at some point (frame, not necessarily this owner)",
-            None => "instrument off — says nothing",
-        };
-        akuma_primitives::safe_print!(160, "  [COW-HIST] pa={:#x} no events in window: {}\n", pa, verdict);
-    }
-}
+#[cfg(not(feature = "pmm-forensics"))]
+pub use no_ledger::*;
+#[cfg(not(feature = "pmm-forensics"))]
+use no_ledger::init as ledger_init;
+#[cfg(feature = "pmm-forensics")]
+use ledger::init as ledger_init;
 
 /// Is the frame containing `pa` currently marked **free** in the PMM bitmap?
 #[must_use]
@@ -1823,123 +1647,11 @@ fn quar_slot(pa: usize) -> usize {
 
 
 // ============================================================================
-// Raw frame access — every `unsafe` in this crate, in one module.
+// Raw frame access lives in `akuma-frame-raw` (this crate carries `#![forbid(unsafe_code)]`).
 // ============================================================================
 
-/// Writing to a physical frame this crate has just allocated.
-///
-/// # Why this module exists
-///
-/// These three functions are **the entire `unsafe` surface of `akuma-pmm`**. They
-/// were five sites before 2026-08-30: three byte-identical copies of a
-/// zero-then-clean loop inlined into `alloc_page_zeroed` and its contiguous and
-/// multi-page siblings, plus a hand-rolled pointer loop in each of
-/// `poison_page`/`verify_poison`. Copies of an `unsafe` block are the worst kind
-/// to have — they drift, and each one re-argues the same safety case slightly
-/// differently.
-///
-/// # Why these are safe `fn`s
-///
-/// Writing zeros to an arbitrary physical address is emphatically *not* safe, so
-/// nothing here may become `pub`. What makes them safe is a **crate invariant**,
-/// not an argument about the operation: every caller has just taken `pa` from
-/// this crate's own bitmap allocator and holds it exclusively, or — in
-/// `poison_page`'s case — is putting a frame the allocator has already reclaimed
-/// into quarantine.
-///
-/// **The module is private, and that is what discharges the obligation.** The
-/// functions inside are `pub` only so `redundant_pub_crate` is satisfied; `mod
-/// frame` has no `pub`, so nothing outside this crate can name them. Exporting
-/// any of them would be a lie — an external caller holds no such invariant, and
-/// `zero_and_clean` on an arbitrary `pa` is memory corruption with a safe
-/// signature. If one ever needs to escape this crate, it escapes as an
-/// `unsafe fn`, not as-is.
-///
-/// This is the same shape as `akuma_net_nic`'s `FrameArena`: own the storage,
-/// hand out safe operations on it, keep the raw access in one place.
-///
-/// # What is NOT here
-///
-/// The cache and barrier instructions. `dc cvac` and `dsb ish` moved to
-/// `akuma_cpu`, where they are safe by their own argument — executing a barrier
-/// cannot violate memory safety. This crate now contains no `asm!` at all.
 mod frame {
-    use super::{PAGE_SIZE, phys_to_virt};
-
-    /// Clean `pages` frames' worth of data cache starting at `pa`, then `dsb`.
-    ///
-    /// Steps by the **runtime** `CTR_EL0` line size rather than a hardcoded 64.
-    /// That is a deliberate fix, not a mechanical move: all three copies this
-    /// replaced hardcoded `CACHE_LINE_SIZE = 64`, which silently *under-cleans*
-    /// on any core whose `DminLine` is smaller than 64 bytes — the loop would
-    /// skip lines. Stepping by `DminLine` (the architectural minimum across the
-    /// D-cache levels) can only ever over-clean, which is slower and correct.
-    fn clean_range(pa: usize, pages: usize) {
-        let step = akuma_cpu::cache::line_size();
-        let start = phys_to_virt(pa) as usize;
-        let end = start + pages * PAGE_SIZE;
-        let mut addr = start;
-        while addr < end {
-            akuma_cpu::cache::dc_cvac(addr);
-            addr += step;
-        }
-        akuma_cpu::barrier::dsb_ish();
-    }
-
-    /// Zero `pages` frames starting at `pa` and clean them to the point of
-    /// coherency, so a device or another core reading the frame without going
-    /// through this core's cache sees the zeros.
-    pub fn zero_and_clean(pa: usize, pages: usize) {
-        // SAFETY: `pa` was just returned by this crate's allocator, so the
-        // `pages` frames from it are contiguous, mapped through the kernel's
-        // physical window (`phys_to_virt`), and owned exclusively by this caller
-        // — nothing else can hold a reference to a frame the bitmap has not
-        // handed out. The write is `pages * PAGE_SIZE` bytes, exactly the extent
-        // that was allocated.
-        unsafe {
-            core::ptr::write_bytes(phys_to_virt(pa), 0, pages * PAGE_SIZE);
-        }
-        clean_range(pa, pages);
-    }
-
-    /// Fill one frame with `word`, for the UAF quarantine.
-    ///
-    /// **Volatile, and it must stay volatile.** Nothing in this crate reads the
-    /// poison back in the same compilation unit as the write — `verify_poison`
-    /// runs on a later drain — so a plain store to a frame the compiler believes
-    /// is dead is exactly the kind LLVM is entitled to remove. Eliding it would
-    /// not fail loudly; it would make the quarantine silently stop detecting
-    /// use-after-free, which is the one thing it exists to do.
-    pub fn poison_fill(pa: usize, word: u64) {
-        // SAFETY: `pa` is a frame the allocator has reclaimed and parked in the
-        // quarantine ring, so no live mapping should reference it — writing the
-        // poison is how a stale writer is caught. It is a real, mapped physical
-        // frame reached through the kernel window, and the loop covers exactly
-        // one page.
-        unsafe {
-            let p = phys_to_virt(pa).cast::<u64>();
-            for i in 0..(PAGE_SIZE / 8) {
-                p.add(i).write_volatile(word);
-            }
-        }
-    }
-
-    /// Check one frame's poison. Returns `(byte offset, value found)` at the
-    /// first word that is not `want`, or `None` if the whole frame is intact.
-    pub fn poison_check(pa: usize, want: u64) -> Option<(usize, u64)> {
-        // SAFETY: as `poison_fill` — a quarantined frame, read back over exactly
-        // the page that was written.
-        unsafe {
-            let p = phys_to_virt(pa).cast::<u64>();
-            for i in 0..(PAGE_SIZE / 8) {
-                let got = p.add(i).read_volatile();
-                if got != want {
-                    return Some((i * 8, got));
-                }
-            }
-        }
-        None
-    }
+    pub use akuma_frame_raw::{poison_check, poison_fill, zero_and_clean};
 }
 
 fn poison_page(pa: usize) {
@@ -2080,11 +1792,7 @@ pub fn init(ram_base: usize, ram_size: usize, kernel_end: usize) {
     pmm.init(ram_base, ram_size, kernel_end);
     publish(&pmm);
 
-    if config().cow_ref_ledger {
-        let words = pmm.total_pages.div_ceil(64);
-        COW_EVER_BASE.store(pmm.base_addr, Ordering::Release);
-        *COW_EVER.lock() = alloc::vec![0u64; words];
-    }
+    ledger_init(pmm.base_addr, pmm.total_pages);
 }
 
 /// Bring up an arena that **spans gaps**: one bitmap from `span_base` across
@@ -2103,11 +1811,7 @@ pub fn init_sparse(span_base: usize, span_size: usize) {
     pmm.init_sparse(span_base, span_size);
     publish(&pmm);
 
-    if config().cow_ref_ledger {
-        let words = pmm.total_pages.div_ceil(64);
-        COW_EVER_BASE.store(pmm.base_addr, Ordering::Release);
-        *COW_EVER.lock() = alloc::vec![0u64; words];
-    }
+    ledger_init(pmm.base_addr, pmm.total_pages);
 }
 
 /// Declare `[base, base + len)` to be RAM the PMM may hand out. Returns the
@@ -2170,13 +1874,6 @@ static RAM_REGION_BASE: [AtomicUsize; MAX_RAM_REGIONS] =
 static RAM_REGION_END: [AtomicUsize; MAX_RAM_REGIONS] =
     [const { AtomicUsize::new(0) }; MAX_RAM_REGIONS];
 static RAM_REGION_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-/// How many more [`add_ram`] calls will be accepted. Ask **before** sizing a
-/// span across regions you then cannot describe.
-#[must_use]
-pub fn ram_region_capacity() -> usize {
-    MAX_RAM_REGIONS - RAM_REGION_COUNT.load(Ordering::Acquire)
-}
 
 pub fn alloc_page() -> Option<usize> {
     if let Some(pa) = alloc_page_once() {

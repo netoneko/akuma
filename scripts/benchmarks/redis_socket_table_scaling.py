@@ -9,8 +9,9 @@ including ones doing nothing.
 
 That is directly testable **without touching the kernel**, because a listener
 in Akuma is not one socket: `crates/akuma-net/src/socket.rs:1047` makes it a
-pool of `MAX_BACKLOG` (32, with `many-sessions`) pre-`listen()`ed smoltcp
-sockets. So every extra listening port adds 32 entries that `iface.poll()` must
+pool of `MAX_BACKLOG` pre-`listen()`ed smoltcp sockets (32 with
+`many-sessions` when this was measured; 8 since 2026-11-11). So every extra
+listening port adds that many entries that `iface.poll()` must
 walk and that never have anything to say.
 
 Method: measure the ceiling, add N idle listeners, measure again. Idle

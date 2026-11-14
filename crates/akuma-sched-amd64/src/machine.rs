@@ -30,7 +30,7 @@ impl Stacks {
         fn one(size: usize) -> &'static [AtomicU64] {
             let words: Vec<AtomicU64> = (0..size / 8).map(|_| AtomicU64::new(0)).collect();
             // No alignment is promised beyond 8, and none is needed: the context builder
-            // masks the entry slot to 16 (`x86_build_closure_context`) and the trap stack's
+            // masks the entry slot to 16 (`build_closure_context`) and the trap stack's
             // top is masked by the caller.
             words.leak()
         }

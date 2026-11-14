@@ -452,19 +452,12 @@ use akuma_procfs::JIFFY_US;
 
 use akuma_exec::threading::types::MAX_CORES;
 
-/// Number of cores the CPU-time accounting should treat as "the system" —
-/// `smp_shared::probed_core_count()` under real SMP, 1 otherwise (including
-/// the legacy `smp` multikernel feature, which doesn't track a shared count).
-/// Clamped to `MAX_CORES` (the SMP bringup cap `LAST_CORE` values are already
-/// bounded by), so callers can size a fixed `[_; MAX_CORES]` array instead of
-/// allocating.
-#[cfg(kernel_smp_shared)]
+/// Number of cores the CPU-time accounting should treat as "the system": the
+/// kernel's own count (`VfsGlueHooks::probed_core_count`; 1 on a kernel without
+/// real SMP). Clamped to `MAX_CORES`, so callers can size a fixed
+/// `[_; MAX_CORES]` array instead of allocating.
 fn active_core_count() -> usize {
     crate::probed_core_count().clamp(1, MAX_CORES)
-}
-#[cfg(not(kernel_smp_shared))]
-fn active_core_count() -> usize {
-    1
 }
 
 /// Sum every thread slot's live CPU time (`akuma_exec::threading::get_thread_cpu_time`,

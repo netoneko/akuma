@@ -1,7 +1,7 @@
 //! `powersaved`'s pure half: the dim decision and the command line.
 //!
 //! The daemon's only input is `/proc/power`'s `idle_ms=` (console-input
-//! inactivity, `amd64/src/input.rs`) and its only effect is a `dim=<percent>`
+//! inactivity, `crates/akuma-kernel-amd64/src/input.rs`) and its only effect is a `dim=<percent>`
 //! line to `/dev/power`. Everything between those — which idle duration maps
 //! to which brightness, when a change is worth a write, what the argv meant —
 //! is here, so a host test can exhaust it and the binary only carries

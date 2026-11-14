@@ -67,7 +67,7 @@ Ranked, with the top one fixed here:
 
 1. **Full TLB flush on every same-root context switch** — *fixed, see below.*
    `hook_switch_to` rewrote `CR3` for every switch into a process, even when
-   the root was already live (`amd64/src/sched.rs`). `mov cr3` flushes the
+   the root was already live (`crates/akuma-kernel-amd64/src/sched.rs`). `mov cr3` flushes the
    whole non-global TLB; with no PCID, rustc's working set (tens of MB of
    rlibs) re-page-walks after every switch. rustc's jobserver/condvar churn
    switches thousands of times per second, mostly between sibling threads of
@@ -77,15 +77,15 @@ Ranked, with the top one fixed here:
    likely **not** a real cost. Low priority; skip GS restore when unchanged is
    the cheap half-measure.
 3. No shared zero page: every anonymous *read* fault allocates and zeroes a
-   fresh 4 KiB frame (`amd64/src/mm.rs` `populate_page`). Linux maps a global
+   fresh 4 KiB frame (`crates/akuma-kernel-amd64/src/mm.rs` `populate_page`). Linux maps a global
    zero page read-only and CoWs on write. Real win for rustc's sparse arena
    mmaps; medium-size change through the CoW path.
 4. virtio-blk `read_bytes` allocates a sector-aligned temp `Vec` and
    double-copies every read (`crates/akuma-virtio/src/block.rs`); ext2
    re-derives block mappings per page (kernel-measured 2.2 µs/page,
-   `amd64/src/mm.rs`). Amortized by the 16-page file-fault readahead, so
+   `crates/akuma-kernel-amd64/src/mm.rs`). Amortized by the 16-page file-fault readahead, so
    mostly a constant tax.
-5. BKL held across fault servicing (`amd64/src/idt.rs`); the
+5. BKL held across fault servicing (`crates/akuma-kernel-amd64/src/idt.rs`); the
    `fault_bkl_drop_enabled` toggle exists in `akuma-bkl::policy` but is not
    wired on amd64. Small at SMP=1.
 
@@ -99,19 +99,19 @@ silence on hot paths.
 Three landed, each verified by the 707-test boot suite under local QEMU TCG
 and then by anchor re-timing on the FC box:
 
-1. **CR3-skip on same-root context switches** (`amd64/src/sched.rs`
+1. **CR3-skip on same-root context switches** (`crates/akuma-kernel-amd64/src/sched.rs`
    `hook_switch_to`): activate only when `want != paging::active_root()`.
    Sound because `akuma-mmu`'s L0-free liveness gate refuses to free a root
    any core's live CR3 references (see the in-file comment). **102 s → 83.5 s
    (−18%).**
 2. **Untimed futex waits no longer `hlt` before their wake check**
-   (`amd64/src/futex.rs` `wait`): the loop's `allow_tick()` ran before the
+   (`crates/akuma-kernel-amd64/src/futex.rs` `wait`): the loop's `allow_tick()` ran before the
    membership test, costing every untimed wait 1–2 LAPIC ticks (10 ms each)
    of pure latency on a core whose waker was runnable. Timed waits keep the
    window — their deadline reads `uptime_us`, which does not advance while
    `IF` is clear. **83.5 s → 77.9 s (−7%).**
-3. **`allow_tick` releases the BKL across the `hlt`** (`amd64/src/sched.rs`),
-   and **the netpoll drain runs BKL-free** (`amd64/src/net.rs`
+3. **`allow_tick` releases the BKL across the `hlt`** (`crates/akuma-kernel-amd64/src/sched.rs`),
+   and **the netpoll drain runs BKL-free** (`crates/akuma-kernel-amd64/src/net.rs`
    `netpoll_daemon`, scoped exactly like `kernel-glue`'s
    `netpoll_drain_step`). Together these fix the SMP>1 boot: at
    `vcpu_count=4` the netpoll daemon's near-continuous BKL ownership put all
@@ -168,7 +168,7 @@ on the FC host as **`/root/akuma-fc2.crash-smp4-ud.log`**.
 
 ### Cause 1 — FIXED: the file-page cache leaked one CoW reference per freshly filled page
 
-`amd64/src/mm.rs`'s `fill_file_pages` miss arm took a third `cow_ref_inc`
+`crates/akuma-kernel-amd64/src/mm.rs`'s `fill_file_pages` miss arm took a third `cow_ref_inc`
 ("this mapping's reference") before `akuma_fpcache::insert`, which takes the
 cache's own reference itself, and `populate_file_page_by_inode`'s
 allocation already carries the mapper's reference
@@ -248,14 +248,14 @@ both halves of that contract:
 
 **Fix** (three edits, no locking added anywhere else):
 
-- `amd64/src/idt.rs` `cow_write_fault`: resolve the owner via
+- `crates/akuma-kernel-amd64/src/idt.rs` `cow_write_fault`: resolve the owner via
   `address_space_owner_pid_for_fault()` → `lookup_process_shared()` and take
   the owner's AS lock for the whole servicing window — read → decide →
   rewrite → refcount → ledger swap is one critical section against the share
   pass. The Copy arm's ledger swap moved inside that hold, replacing
   `cow_swap_frame` (which additionally had the own-vs-tgid bug: it edited a
   sibling thread's throwaway view ledger, not the leader's).
-- `amd64/src/usermode.rs` `share_parent_memory_into`: lock
+- `crates/akuma-kernel-amd64/src/usermode.rs` `share_parent_memory_into`: lock
   `lookup_process_shared(parent.tgid)`'s address space — the thread-group
   leader owns the live L0, and `tgid` is the leader's pid — so fork pass, CoW
   fault, and `madvise`/`munmap` (via `with_current_address_space`) all
@@ -315,7 +315,7 @@ zero page). The wedge masks honest re-timing until it is fixed.
 
 ### Status and next steps
 
-- **Cause 1 fixed** (one-line reference fix in `amd64/src/mm.rs`), verified:
+- **Cause 1 fixed** (one-line reference fix in `crates/akuma-kernel-amd64/src/mm.rs`), verified:
   16k rewrites flat, boot suite 707/707 SMP=1 and 717/717 SMP=4, clippy
   clean, full smpstress on FC no longer OOMs.
 - **Cause 2 fixed** (`idt.rs` owner-locked CoW break + owner-resolved share
@@ -389,7 +389,7 @@ guest never idles into the `[PSTATS]` sweep).
 
 ### Status and next steps
 
-- **Cause 1 fixed** (one-line reference fix in `amd64/src/mm.rs`), verified:
+- **Cause 1 fixed** (one-line reference fix in `crates/akuma-kernel-amd64/src/mm.rs`), verified:
   16k rewrites flat, boot suite 707/707 SMP=1 and 717/717 SMP=4, clippy
   clean, full smpstress on FC no longer OOMs.
 - **Cause 2 reproduced, not yet fixed.** Next: instrument the fork share
@@ -529,7 +529,7 @@ boot+probe+teardown inside one shell invocation. Raw logs:
 *Investigation continued on `vaporwave` (the Firecracker host) after the fold
 above. Four fixes landed, all in the shared crates both kernels build from
 (`crates/akuma-virtio`, `crates/akuma-threading`) or amd64-only
-(`amd64/src/lapic.rs`, `amd64/src/net.rs`). A fifth item — a new wedge class,
+(`crates/akuma-kernel-amd64/src/lapic.rs`, `crates/akuma-kernel-amd64/src/net.rs`). A fifth item — a new wedge class,
 distinct from the `-j4` one above — was found and is OPEN, not fixed.*
 
 ### 1. The clock was never calibrated on `microvm`, and the guess could be off by up to 6x
@@ -662,7 +662,7 @@ back in under a second with **1,524 lines** (mostly individual 4 KiB `rw-p`
 regions — one `mmap` per small allocation from rustc's own arena/bump
 allocator), but a 2 MB read (~46k lines, ~30x more data) never returned at
 all inside a 30 s budget — not proportionally slower, catastrophically
-slower. `find_free_va` (`amd64/src/mm.rs:207`, first-fit placement for every
+slower. `find_free_va` (`crates/akuma-kernel-amd64/src/mm.rs:207`, first-fit placement for every
 `mmap`) explains why: its own doc comment says the outer retry loop
 "terminates in at most one pass per region," which is true and also
 incomplete — each of those up-to-`n` outer passes re-scans the **entire**
@@ -714,7 +714,7 @@ most one answer whatever order they walk in.
 
 **`/proc/<pid>/maps` was a second, independent quadratic** in the same file,
 and the reason the 64 KB read returned in under a second while the 2 MB read
-never returned. `collect_leaf_runs` (`amd64/src/fd.rs`) asked
+never returned. `collect_leaf_runs` (`crates/akuma-kernel-amd64/src/fd.rs`) asked
 `skip.iter().any(...)` — a linear scan of every region extent — **once per
 resident page**, so rendering the file cost O(regions × pages). `pid_map_rows`
 now sorts the extents (they are non-overlapping, for the reason above) and the
@@ -764,7 +764,7 @@ ext2 will not free a pinned inode's blocks on `unlink` — it defers them, which
 is correct, because the mapping is still reading them. So the pin has to be
 released when the mapping goes away.
 
-On this target it never was. `pin_mapped_inode` (`amd64/src/mm.rs`'s
+On this target it never was. `pin_mapped_inode` (`crates/akuma-kernel-amd64/src/mm.rs`'s
 `pin_mapping_inode` → `akuma_mmu::UserAddressSpace`) had **no release half at
 all**. Its own doc comment explains why the pins live in the address space:
 "this struct dies exactly when the mappings do — on `exec` and on exit". That is
@@ -955,7 +955,7 @@ Two traps worth keeping, both of which produce a confident wrong table:
 
 Reading the read path to explain the (non-existent) gap found one anyway.
 `akuma_ext2::set_cache_cap_bytes` is called from `akuma_vfs_glue::fs::init` —
-the **AArch64** mount path. This target mounts ext2 itself, and `amd64/src/fs.rs`
+the **AArch64** mount path. This target mounts ext2 itself, and `crates/akuma-kernel-amd64/src/fs.rs`
 had picked up that path's `fpcache_init` call and its inode-freed hook (both
 with comments explaining exactly why they had to be restated here) but **not
 this one**. So `CACHE_CAP_BYTES` kept `akuma-ext2`'s `DEFAULT_CACHE_CAP_BYTES`:
@@ -1072,7 +1072,7 @@ Two more things about `[PSTATS]` on this target that cost time to find:
   exit path — amd64 does not take it, so a process exiting prints nothing.)
 - **The syscall numbers are counted at two sites under two numbering schemes,
   and the name is looked up by index regardless of which site wrote it.**
-  `amd64/src/usermode.rs` counts the raw **x86_64** number (`usermode.rs`'s
+  `crates/akuma-kernel-amd64/src/usermode.rs` counts the raw **x86_64** number (`usermode.rs`'s
   `syscall_stats.inc(nr)` at syscall entry); `akuma-syscalls-glue` counts the
   **asm-generic** one for everything that reaches glue
   (`akuma-syscalls-glue/src/lib.rs`). Both write the same per-process array, and
@@ -1414,7 +1414,7 @@ defect that had been quietly making the measurement impossible.*
 `lapic.rs:174` calling `crate::sched::note_tick_sample` and `net.rs:828` calling
 `crate::sched::tick_profile`, neither of which exists in the guest's `sched.rs`.
 
-Not a code bug — a **partially synced tree**. `/src/akuma/amd64/src/lapic.rs`
+Not a code bug — a **partially synced tree**. `/src/akuma/crates/akuma-kernel-amd64/src/lapic.rs`
 was dated 2026-09-17 and `sched.rs` 2026-09-12: an earlier session copied some
 amd64 sources into the image and missed one. Every `-j4` run in this doc stopped
 short of `akuma-amd64` itself (the wedge, or a crash, came first), so nothing
@@ -1806,7 +1806,7 @@ kill is a second thing that sometimes happens on the way.
 
 #### Eliminated: the free path. `[PMM-UAF]` and friends stay silent
 
-`amd64/src/mem.rs` passed `PmmConfig { cow_ref_ledger: false,
+`crates/akuma-kernel-amd64/src/mem.rs` passed `PmmConfig { cow_ref_ledger: false,
 pmm_uaf_quarantine: false, pmm_premature_free_check: false }` with a comment
 justifying it: *"this kernel has no page cache, no retired-process list and no
 CoW"*. **All three of those are now untrue** — CoW fork is `akuma_cow` in
@@ -2501,7 +2501,7 @@ and the full matrix on the fixed kernel, default features:
 
 #### What is kept
 
-- `mm-forensics` (`amd64/Cargo.toml`) — the placement checks above, with
+- `mm-forensics` (`crates/akuma-kernel-amd64/Cargo.toml`) — the placement checks above, with
   `PLACEMENTS_CHECKED` reported on the fault line as their positive control.
   They found nothing this time and that *is* their result: the family is
   eliminated rather than untested, and the next placement bug reports itself.
@@ -2644,7 +2644,7 @@ right to deliver the byte as data; the terminal said the program wanted it.
 
 #### What the terminal flags did, session by session
 
-A temporary trace on the `TCSETS` arm (`amd64/src/fd.rs`), one line per set:
+A temporary trace on the `TCSETS` arm (`crates/akuma-kernel-amd64/src/fd.rs`), one line per set:
 
 ```
 [TCSETS] pid=57 lflag 0x8a3b -> 0x8a30     session 1: raw, for the line editor
@@ -2709,7 +2709,7 @@ The `unwrap_or_else` below then does what `sys_spawn` always intended.
 
 #### A/B and the boot-suite check
 
-`session_terminal_is_private_test` (`amd64/src/usermode.rs`, run from
+`session_terminal_is_private_test` (`crates/akuma-kernel-amd64/src/usermode.rs`, run from
 `boot.rs` beside `winsize_to_child_test`) dirties the **console's** state the
 way a departing session leaves it, spawns a `SPAWN_FLAG_PTY` child, and reads
 the child's. Written that way on purpose: `Arc::ptr_eq` would pass a kernel that

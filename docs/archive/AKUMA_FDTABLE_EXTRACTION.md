@@ -37,7 +37,7 @@ The two "pinned, not rewired" rows are deliberate. Glue's dup and
 `close_range` bodies are the *acting* half (user copies, per-variant kernel
 releases); their decision content is now expressed — and differentially
 tested — in the crate, but the bodies were left untouched, because this
-change's contract was "glue and `amd64/src/fd.rs` do not change". Until they
+change's contract was "glue and `crates/akuma-kernel-amd64/src/fd.rs` do not change". Until they
 are rewired, the crate's ops are the spec those bodies are held to by
 `fdtable_characterization_tests`.
 
@@ -60,8 +60,8 @@ the payload; the caller acts on it after the lock is down.
 `Names<D>` is generic over the payload; only `akuma-exec` instantiates it
 with `FileDescriptor` today. `SharedFdTable` gained a `Deref` to its fields so
 the pre-existing direct field borrows outside it (`akuma-syscalls-glue/src/fs.rs`,
-`akuma-vfs-glue`'s proc.rs, `amd64/src/usermode.rs`, `src/process_tests.rs`)
-compile unchanged — **`amd64/src/fd.rs`'s only change is the `KERNEL_TABLE`
+`akuma-vfs-glue`'s proc.rs, `crates/akuma-kernel-amd64/src/usermode.rs`, `src/process_tests.rs`)
+compile unchanged — **`crates/akuma-kernel-amd64/src/fd.rs`'s only change is the `KERNEL_TABLE`
 literal's three constructor names**, forced by the types moving.
 
 ## Allocation analysis
@@ -85,7 +85,7 @@ the `Forked`/`Dup`/`DupTo` returns hand back values the caller already owns.
   fd-related) are unchanged.
 - `scripts/check_unsafe_budget.py`: `akuma-fdtable` is a new crate under
   `forbid` with **0 unsafe sites**, as the gate requires. `--update` was
-  deliberately **not** run in this change: amd64/src sits at 81 vs budget 79
+  deliberately **not** run in this change: crates/akuma-kernel-amd64/src sits at 81 vs budget 79
   from prior work on this branch, and the update would have absorbed those
   unrelated sites into a diff that has nothing to do with them.
 
@@ -105,7 +105,7 @@ kernel ref count, and `dup` becomes allocation-free — a count increment under
 the table lock. That is a cross-cutting ABI change, not a crate refactor:
 
 - it rewrites `clone_fd_refs`/`release_fd_entry` and both kernels' dup bodies
-  (`akuma-syscalls-glue/src/fs.rs`, `amd64/src/fd.rs`);
+  (`akuma-syscalls-glue/src/fs.rs`, `crates/akuma-kernel-amd64/src/fd.rs`);
 - it changes `SCM_RIGHTS` fd passing, which re-bumps per received copy today;
 - it changes `fork_copy`, whose child entries currently each hold one bump;
 - and the current behaviour is pinned by the boot suites, which could not be
@@ -138,7 +138,7 @@ cargo test -p akuma-fdtable  --offline -j1 --target $HOST   # 11 passed
 cargo test -p akuma-exec     --offline -j1 --target $HOST   # 104 passed, 2 pre-existing fail
 cargo clippy -p akuma-fdtable --offline -j1 --target $HOST -- -D warnings  # clean
 cargo check -p akuma-amd64 --offline -j1 --target x86_64-unknown-none      # green
-python3 scripts/check_unsafe_budget.py   # fdtable NEW-FORBID at 0; amd64/src +2 is pre-branch
+python3 scripts/check_unsafe_budget.py   # fdtable NEW-FORBID at 0; crates/akuma-kernel-amd64/src +2 is pre-branch
 ```
 
 **Verification the user must run** (no QEMU/Lima in the extraction

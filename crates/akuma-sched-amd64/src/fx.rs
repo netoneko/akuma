@@ -18,6 +18,12 @@ pub const XCR0_ENABLED: u64 = akuma_fpu_amd64::XCR0_ENABLED;
 #[derive(Clone, Copy)]
 pub struct FxArea([u8; akuma_fpu_amd64::XSAVE_SIZE]);
 
+impl Default for FxArea {
+    fn default() -> Self {
+        Self::zeroed()
+    }
+}
+
 impl FxArea {
     pub const SIZE: usize = akuma_fpu_amd64::XSAVE_SIZE;
     const MXCSR_MASK: usize = akuma_fpu_amd64::MXCSR_MASK;

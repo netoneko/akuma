@@ -1,5 +1,5 @@
 //! Stage A: bring up the kernel heap and the physical frame allocator on x86_64
-//! — the machine half of `amd64/src/mem.rs`, extracted so a composed kernel
+//! — the machine half of `crates/akuma-kernel-amd64/src/mem.rs`, extracted so a composed kernel
 //! pulls one `mem::init` rather than inheriting the module.
 //!
 //! # Ordering, which is not obvious and not optional
@@ -22,7 +22,7 @@
 //!   no-ops.
 //! * the **forensics flag**: the full kernel's `pmm-forensics` feature.
 
-use akuma_ryzen_amd64::{MachineDescription, MemRegion};
+use akuma_machine_facts::{Facts, Range};
 use akuma_primitives::safe_print;
 
 use crate::phys::{PHYSMAP_LIMIT, phys_to_virt};
@@ -77,6 +77,18 @@ pub fn heap_size() -> usize {
     HEAP_BYTES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Total usable RAM this boot found (`ram_total` in [`init_reserving`]), for callers that need
+/// it after memory bring-up and have no `Facts` of their own still in scope — `exec_runtime`'s
+/// stack-size policy (`akuma_mem_policy::compute_user_stack_size`), called from
+/// `install_shared_sinks`, which `init_reserving`'s own doc says must run after this.
+static RAM_BYTES: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes of usable RAM this boot found. `0` before [`init_reserving`] runs.
+#[must_use]
+pub fn ram_bytes() -> usize {
+    RAM_BYTES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 const PAGE_SIZE: usize = 4096;
 
 unsafe extern "C" {
@@ -89,8 +101,10 @@ const fn align_up(v: usize, to: usize) -> usize {
 }
 
 /// Bring up heap then PMM. Returns false if the machine described no usable RAM.
-pub fn init(machine: &MachineDescription, forensics: bool, hooks: akuma_pmm::PmmHooks) -> bool {
-    init_reserving(machine, &[], forensics, hooks)
+///
+/// Reads only `facts.ram()`: the regions either boot protocol reported as RAM.
+pub fn init(facts: &Facts, forensics: bool, hooks: akuma_pmm::PmmHooks) -> bool {
+    init_reserving(facts, &[], forensics, hooks, 0)
 }
 
 /// How a region of RAM ended up being used, for the boot-log accounting.
@@ -157,11 +171,17 @@ impl Usable {
 /// `forensics` turns on the PMM's quarantine/premature-free/CoW-ledger
 /// instruments (see `akuma-amd64`'s `pmm-forensics` feature for the costs);
 /// `hooks` are registered verbatim into `akuma_pmm`.
+///
+/// `manual_heap_size_mb` is the caller's own manual-override knob (amd64's `KERNEL_HEAP_SIZE_MB`,
+/// if it has one; `0` means no override) — threaded through to `akuma_mem_policy::compute_heap_size`
+/// rather than read from any config crate here, so this crate stays dependency-free. See the config
+/// flag sweep's heap-sizing fix (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` § "Open issue").
 pub fn init_reserving(
-    machine: &MachineDescription,
+    facts: &Facts,
     reserved: &[(u64, u64)],
     forensics: bool,
     hooks: akuma_pmm::PmmHooks,
+    manual_heap_size_mb: usize,
 ) -> bool {
     let kernel_end = core::ptr::addr_of!(_kernel_end) as u64;
     // From the 1 MiB floor, not from `_kernel_start` (2 MiB): the layout above
@@ -192,7 +212,7 @@ pub fn init_reserving(
     let mut span_base = u64::MAX;
     let mut span_end = 0u64;
     let mut ram_total = 0u64;
-    for u in usable_regions(machine, &taken).take(akuma_pmm::MAX_RAM_REGIONS) {
+    for u in usable_regions(facts, &taken).take(akuma_pmm::MAX_RAM_REGIONS) {
         span_base = span_base.min(u.base);
         span_end = span_end.max(u.end);
         ram_total += u.end - u.base;
@@ -208,7 +228,7 @@ pub fn init_reserving(
     // otherwise.
     let mut roomiest: Option<Usable> = None;
     let mut kernel_home: Option<Usable> = None;
-    for u in usable_regions(machine, &taken).take(regions) {
+    for u in usable_regions(facts, &taken).take(regions) {
         if roomiest.is_none_or(|r| u.room() > r.room()) {
             roomiest = Some(u);
         }
@@ -223,13 +243,33 @@ pub fn init_reserving(
         let at = |u: Usable| heap_start_in(u, want as u64, &taken).map(|s| (u, want, s));
         kernel_home.and_then(at).or_else(|| at(roomiest))
     };
-    let (heap_home, heap_bytes, heap_at) = pick(heap_size_for(machine.usable_ram()))
-        .or_else(|| pick(HEAP_SIZE))
-        // Nothing fits at either size. Keep the historical choice so the
-        // explicit diagnostic below reports against the same region it always
-        // did.
-        .unwrap_or((roomiest, HEAP_SIZE, roomiest.floor));
+    // The RAM-proportional fallback (`akuma-mem-policy`, config flag sweep 2026-11-11):
+    // `heap_size_for`'s flat request (512 MiB / 1 GiB) is what amd64 has always asked for first,
+    // unchanged — this is only the retry, for when that flat request does not fit. The retry used
+    // to be the SAME flat value a second time, which cannot fit any better the second time either;
+    // on a genuinely small machine (511 MiB usable, one region) that meant the heap could FATAL
+    // outright asking for a 512 MiB heap out of 511 MiB of RAM. `code_and_stack` here is the
+    // kernel's own known low-memory footprint (`kernel.1 - kernel.0`); amd64 has no single
+    // AArch64-style "code+boot-stack" reserve at RAM base, so this is the closest analogue — the
+    // one quantity amd64 already knows is definitely taken.
+    let scaled_heap = akuma_mem_policy::compute_heap_size(
+        ram_total as usize,
+        (kernel.1 - kernel.0) as usize,
+        manual_heap_size_mb,
+    );
+    let (heap_home, heap_bytes, heap_at) = pick(heap_size_for(facts.ram_bytes()))
+        .or_else(|| pick(scaled_heap))
+        // Nothing fit even the proportional size (a fragmented machine with no region roomy
+        // enough). Last resort: whatever the roomiest region actually has past its floor, capped
+        // at the proportional request and never below 1 MiB — guaranteed to fit `heap_home`,
+        // unlike the flat `HEAP_SIZE` this branch used to report against (the exact FATAL this
+        // whole fallback chain exists to avoid; see the module doc's "Open issue").
+        .unwrap_or_else(|| {
+            let fits = core::cmp::max(core::cmp::min(scaled_heap as u64, roomiest.room()), 1024 * 1024);
+            (roomiest, fits as usize, roomiest.floor)
+        });
     HEAP_BYTES.store(heap_bytes, core::sync::atomic::Ordering::Relaxed);
+    RAM_BYTES.store(ram_total as usize, core::sync::atomic::Ordering::Relaxed);
     let heap_start = heap_at as usize;
     let heap_end = heap_start + heap_bytes;
 
@@ -239,8 +279,8 @@ pub fn init_reserving(
     // whole point of the rest: every reported region, and what became of it.
     let mut seen = 0usize;
     safe_print!(96, "  mem:  RAM the machine reported, and what became of each:\n");
-    for r in machine.regions().iter().filter(|r| r.is_ram()) {
-        let fate = if r.addr >= PHYSMAP_LIMIT {
+    for r in facts.ram() {
+        let fate = if r.base >= PHYSMAP_LIMIT {
             Fate::Unreachable
         } else {
             match usable_of(*r, &taken) {
@@ -262,7 +302,7 @@ pub fn init_reserving(
         safe_print!(
             160,
             "    0x{:016x} + {} MiB  {}\n",
-            r.addr,
+            r.base,
             r.size / 1024 / 1024,
             fate.label()
         );
@@ -274,7 +314,7 @@ pub fn init_reserving(
     safe_print!(
         160,
         "  mem:  {} MiB usable, {} MiB managed, physmap reaches {} GiB\n",
-        machine.usable_ram() / 1024 / 1024,
+        facts.ram_bytes() / 1024 / 1024,
         ram_total / 1024 / 1024,
         PHYSMAP_LIMIT / 1024 / 1024 / 1024
     );
@@ -334,7 +374,7 @@ pub fn init_reserving(
     // spoken for. The reverse would reserve pages that are about to be declared
     // free and hand out the kernel image.
     akuma_pmm::init_sparse(span_base as usize, (span_end - span_base) as usize);
-    for u in usable_regions(machine, &taken).take(regions) {
+    for u in usable_regions(facts, &taken).take(regions) {
         if akuma_pmm::add_ram(u.base as usize, (u.end - u.base) as usize).is_none() {
             // Cannot happen -- the scan above took at most `MAX_RAM_REGIONS` --
             // but a PMM that is handing out an undescribed region is handing
@@ -370,13 +410,57 @@ pub fn init_reserving(
         (akuma_pmm::free_count() * PAGE_SIZE / 1024 / 1024) as u64
     );
 
+    for (slot, r) in RESERVED.iter().zip(&taken[1..]) {
+        slot.0.store(r.0, core::sync::atomic::Ordering::Relaxed);
+        slot.1.store(r.1, core::sync::atomic::Ordering::Relaxed);
+    }
+    RESERVED_SET.store(true, core::sync::atomic::Ordering::Release);
     true
+}
+
+/// The spans [`init_reserving`] kept the PMM off, recorded once it succeeded.
+static RESERVED: [(core::sync::atomic::AtomicU64, core::sync::atomic::AtomicU64); 3] =
+    [const { (core::sync::atomic::AtomicU64::new(0), core::sync::atomic::AtomicU64::new(0)) }; 3];
+static RESERVED_SET: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Whether `[start, end)` lies inside one span [`init_reserving`] kept from the
+/// PMM: memory no allocator will ever hand out. `false` before it has run.
+#[must_use]
+pub fn is_reserved(start: u64, end: u64) -> bool {
+    use core::sync::atomic::Ordering;
+    RESERVED_SET.load(Ordering::Acquire)
+        && start < end
+        && RESERVED.iter().any(|(lo, hi)| {
+            let (lo, hi) = (lo.load(Ordering::Relaxed), hi.load(Ordering::Relaxed));
+            lo < hi && lo <= start && end <= hi
+        })
 }
 
 /// The RAM below this is not ours: the interrupt vector table, the BIOS data
 /// area and the EBDA live there, and page 0 is a frame whose address reads as a
 /// null pointer everywhere it is passed.
 const LOW_RAM_FLOOR: u64 = 0x10_0000;
+
+/// Physical address of the EGA text buffer (80x25 cells of character + attribute).
+const EGA_TEXT_BASE: u64 = 0xB_8000;
+/// Its length in bytes.
+const EGA_TEXT_LEN: usize = 80 * 25 * 2;
+const _: () = assert!(EGA_TEXT_BASE + EGA_TEXT_LEN as u64 <= LOW_RAM_FLOOR);
+
+/// The EGA text buffer as a byte window, for the earliest boot output there is.
+///
+/// Under UEFI in a graphics mode the range is plain low memory and the writes go
+/// nowhere visible; with a CSM, or firmware that left text mode live, they are
+/// text. Either way the range is below [`LOW_RAM_FLOOR`], which the page
+/// allocator never hands out (checked at compile time above), and inside the
+/// physmap `boot.s` maps, so a write through the window reaches no memory any
+/// Rust value owns.
+#[must_use]
+pub fn ega_text_window() -> akuma_primitives::mmio::MmioWindow {
+    // SAFETY: the range is mapped through the physmap for the kernel's life and
+    // belongs to no allocator (above); byte accesses need no alignment.
+    unsafe { akuma_primitives::mmio::MmioWindow::new(phys_to_virt(EGA_TEXT_BASE) as usize, EGA_TEXT_LEN) }
+}
 
 /// One RAM region as the kernel can actually use it, or `None` if nothing of it
 /// is left once the physmap, the low floor and whatever already occupies it are
@@ -392,8 +476,8 @@ const LOW_RAM_FLOOR: u64 = 0x10_0000;
 /// region's bottom raises `floor` past it; one covering the top clips `end`
 /// below it. A span strictly **inside** `[floor, end)` is left in the region
 /// and reserved as a hole by [`init_reserving`]; the heap is placed around it.
-fn usable_of(r: MemRegion, taken: &[(u64, u64)]) -> Option<Usable> {
-    let base = r.addr.max(LOW_RAM_FLOOR);
+fn usable_of(r: Range, taken: &[(u64, u64)]) -> Option<Usable> {
+    let base = r.base.max(LOW_RAM_FLOOR);
     let mut end = r.end().min(PHYSMAP_LIMIT);
     if end <= base {
         return None;
@@ -442,12 +526,8 @@ fn heap_start_in(u: Usable, want: u64, taken: &[(u64, u64)]) -> Option<u64> {
 /// once: this runs before the heap exists, so there is nowhere to build one,
 /// and the list is walked three times at boot and never again.
 fn usable_regions<'a>(
-    machine: &'a MachineDescription,
+    facts: &'a Facts,
     taken: &'a [(u64, u64)],
 ) -> impl Iterator<Item = Usable> + 'a {
-    machine
-        .regions()
-        .iter()
-        .filter(|r| r.is_ram())
-        .filter_map(move |r| usable_of(*r, taken))
+    facts.ram().iter().filter_map(move |r| usable_of(*r, taken))
 }

@@ -19,8 +19,19 @@ akuma-mmu = { path = "../akuma-mmu" }
 akuma-pmm = { path = "../akuma-pmm" }
 akuma-bkl = { path = "../akuma-bkl" }
 akuma-mmap = { path = "../akuma-mmap" }
+akuma-stack = { path = "../akuma-stack" }
+akuma-trap-aarch64 = { path = "../akuma-trap-aarch64" }
+akuma-switch = { path = "../akuma-switch" }
 spinning_top = "0.3"
 
 [features]
-smp-shared = ["akuma-primitives/smp-shared", "akuma-bkl/smp-shared", "akuma-mmu/smp-shared"]
-extreme = ["akuma-primitives/extreme"]
+bkl-smp = ["akuma-primitives/bkl-smp", "akuma-bkl/bkl-smp", "akuma-mmu/bkl-smp"]
+# A thread that yields without `akuma_bkl` held takes it for the switch and gives it back on
+# resume. The AArch64 root kernel (its dropped-BKL windows), through `akuma-kernel-glue`; see
+# `x86_yield_now`.
+yield-takes-bkl = []
+# A dead thread's slot is recycled only by the collector (`cleanup_terminated*`, which runs the
+# kernel's `set_cleanup_callback` teardown and the full per-slot scrub), never claimed straight from
+# `TERMINATED`. The AArch64 root kernel, whose process teardown is that callback; amd64 tears down on
+# the dying thread and claims directly. See `x86_claim_slot`.
+collector-recycles = []

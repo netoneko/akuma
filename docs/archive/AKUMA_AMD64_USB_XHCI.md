@@ -18,7 +18,7 @@ hardware, describes what was, not what is.
 
 Akuma/amd64 on the HP 500-502nj boots from a **512 MiB ext2 RAM image** GRUB loads
 whole into memory every boot (`module2 /boot/akuma/root.img`, mounted by
-`amd64/src/ramdisk.rs`). It does not persist — every `apk add`, every build
+`crates/akuma-kernel-amd64/src/ramdisk.rs`). It does not persist — every `apk add`, every build
 artifact, every edit is gone at the next reboot — and it eats half of the ~3 GiB
 the kernel can address. The user wants **reliable persistence for a full
 edit → build → run dev cycle on the metal.**
@@ -84,7 +84,7 @@ These are frozen in `crates/akuma-xhci/tests/xhci_hp_500_502nj.rs` and
 ## What was built
 
 Committed as `e647f844 "usb checkpoint"` (crates + kernel wiring), with
-`amd64/src/xhci.rs` rewritten + `amd64/src/pci.rs` extended uncommitted on top.
+`crates/akuma-kernel-amd64/src/xhci.rs` rewritten + `crates/akuma-kernel-amd64/src/pci.rs` extended uncommitted on top.
 
 ### `crates/akuma-xhci` — pure layout + bit math (`#![forbid(unsafe_code)]`, host-tested)
 
@@ -108,7 +108,7 @@ returning a `Command { cdb, cdb_len, data_len, direction }`. Response parsers
 Descriptor parsing is **not** duplicated — `akuma_usb::descriptor` is
 transport-independent and already host-tested; `xhci.rs` consumes it directly.
 
-### `amd64/src/xhci.rs` — the MMIO/DMA glue
+### `crates/akuma-kernel-amd64/src/xhci.rs` — the MMIO/DMA glue
 
 - All controller-visible memory (DCBAA, scratchpad array + 32 pages, command
   ring, event ring + ERST, device + input contexts, 3 transfer rings, control
@@ -134,14 +134,14 @@ transport-independent and already host-tested; `xhci.rs` consumes it directly.
 
 ### Kernel wiring
 
-- `amd64/src/fs.rs`: `RootDevice::Usb(UsbDisk)` variant (holds the partition
+- `crates/akuma-kernel-amd64/src/fs.rs`: `RootDevice::Usb(UsbDisk)` variant (holds the partition
   byte offset, forwards to `xhci::{read,write}_bytes`); `no_clock` replaced with
   `wall_clock_secs` (feeds `clock::now_us` — 0 until SNTP lands, then correct).
-- `amd64/src/multiboot2.rs`: `try_usb_root()` runs when `root=/dev/sda1` is on
+- `crates/akuma-kernel-amd64/src/multiboot2.rs`: `try_usb_root()` runs when `root=/dev/sda1` is on
   the command line — `xhci::init` → MBR sanity check → `mount_root_on(Usb…)`,
   falling back to the RAM image on any failure; `xhci::smoke_test` added to the
   boot suite (gated on the controller being present).
-- `amd64/src/pci.rs`: `enable_full(addr, bus_master, mask_intx)` — new;
+- `crates/akuma-kernel-amd64/src/pci.rs`: `enable_full(addr, bus_master, mask_intx)` — new;
   `enable` delegates with `mask_intx=false` (behaviour unchanged for existing
   callers).
 
@@ -710,7 +710,7 @@ full one-second `BUDGET`, BKL held, three cores queuing, once per timeout.
 
 Two changes, both on the branch:
 
-1. **amd64/Cargo.toml**: `smp-shared` now forwards
+1. **crates/akuma-kernel-amd64/Cargo.toml**: `smp-shared` now forwards
    `akuma-syscalls-glue/{smp-shared,no-bkl-vfs}`, `akuma-exec/no-bkl-vfs` and
    `akuma-ext2/no-bkl-vfs` — the VFS phase only. The other phases are
    deliberately not forwarded: this target's net syscalls are its own
@@ -718,7 +718,7 @@ Two changes, both on the branch:
    phase gets its own audit + A/B before landing here. The runtime kill
    switch `akuma_bkl::policy::set_vfs_bkl_drop_enabled(false)` still works
    unchanged.
-2. **`execve`** (`amd64/src/usermode.rs::sys_execve`) reads the whole image —
+2. **`execve`** (`crates/akuma-kernel-amd64/src/usermode.rs::sys_execve`) reads the whole image —
    and via the `akuma_elf` VFS hooks, the interpreter — off the same disk, on
    a path no carve-out covered. New `ExecIoBkl` `ToggledGuard` in
    `exec_runtime.rs` over the existing `EXEC_BKL_DROP_ENABLED` policy toggle
@@ -798,7 +798,7 @@ carve-outs all forwarded, BKL-still-storms correlate with the ssh
 connection/stall-recovery events and not with output volume (`uname -a`
 clean, `dmesg` spew dirty is *output*-correlated on the old build; on the
 new build all four discriminators grow BKL in lockstep with the ~4 disk
-timeouts each connection provokes). `amd64/src/sock.rs` — this target's own
+timeouts each connection provokes). `crates/akuma-kernel-amd64/src/sock.rs` — this target's own
 socket layer, which glue's `NetBklGuard` never covers — has no BKL handling
 at all; still unattributed.
 
@@ -906,7 +906,7 @@ the cache — the device returning bad data — which changes the bug report.
 
 **Clock finding (2026-09-11, from the "two clocks" question):** the xHCI
 timeout budget is **uncalibrated**. `spin_us`/`BUDGET` in
-`amd64/src/xhci.rs` count raw TSC ticks against an assumed ">= 1 GHz" —
+`crates/akuma-kernel-amd64/src/xhci.rs` count raw TSC ticks against an assumed ">= 1 GHz" —
 nothing on this target calibrates the TSC (`clock.rs` keeps a wall clock on
 the 10 ms LAPIC tick; the driver never consumes a frequency). On the
 trashcan's Haswell the TSC runs ~3x the assumption, so the "one second"
@@ -925,7 +925,7 @@ model. The headline: **the controller was never tearing the endpoints down.**
 
 ### The diagnostic, and what it showed
 
-A timeout-path dump was added to `amd64/src/xhci.rs` (`transfer timeout` now
+A timeout-path dump was added to `crates/akuma-kernel-amd64/src/xhci.rs` (`transfer timeout` now
 also prints PORTSC and the raw first dword of the slot context and both bulk
 endpoint contexts). Its first catch, on the real Intel controller:
 
@@ -990,7 +990,7 @@ Also pinned honestly: a second *deliberate* STALL after recovery is terminal
 
 ### Device-state transitions are now tracked on the metal
 
-`note_ep_state` in `amd64/src/xhci.rs` keeps the last observed state per bulk
+`note_ep_state` in `crates/akuma-kernel-amd64/src/xhci.rs` keeps the last observed state per bulk
 endpoint and prints every change (`ep 4 state run->halt->stop->run`) at the
 recovery and timeout sites. A transition the model does not know about is a
 driver/controller disagreement, and will now announce itself on the first
@@ -1103,7 +1103,7 @@ Endpoint. The 19,683-script sweep still records zero illegal steps;
 `a_timeout_aborts_the_live_td_before_the_retry` pins the transition trace
 `run→stop→run`.
 
-And the byte count is checked: `scsi_io` (new, `amd64/src/xhci.rs`) refuses
+And the byte count is checked: `scsi_io` (new, `crates/akuma-kernel-amd64/src/xhci.rs`) refuses
 a `Passed` CSW whose data phase moved fewer bytes than asked
 (`short transfer: device moved N of M bytes`), asks `REQUEST SENSE` on
 `Failed` and retries on UNIT ATTENTION (the device raises it after every

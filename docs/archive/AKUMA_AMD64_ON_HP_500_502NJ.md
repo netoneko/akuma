@@ -352,10 +352,10 @@ working machine, and it costs nothing but a partition.
 ---
 
 **Background.** The port itself: `docs/archive/AKUMA_FIRECRACKER_AMD64.md`
-(stage-by-stage) and `amd64/README.md`. The aarch64 Firecracker port, a different
+(stage-by-stage) and `crates/akuma-kernel-amd64/README.md`. The aarch64 Firecracker port, a different
 machine and device model: `docs/archive/AKUMA_FIRECRACKER_KVM.md`. Platform
 dependency and what the arch split needs:
-`proposals/REDUCING_PLATFORM_DEPENDENCY.md` §0.
+`docs/archive/REDUCING_PLATFORM_DEPENDENCY.md` §0.
 
 ---
 
@@ -404,7 +404,7 @@ Anything scripting it must look at the output.
 ## Two host-setup facts worth keeping
 
 * **The guest's DNS resolver address is hardcoded to `10.0.2.3`**
-  (`amd64/src/dns.rs`), QEMU SLIRP's proxy address. A dnsmasq answering only on
+  (`crates/akuma-kernel-amd64/src/dns.rs`), QEMU SLIRP's proxy address. A dnsmasq answering only on
   the gateway `10.0.2.2` gives a guest that gets a DHCP lease, reaches the
   network, and cannot resolve anything — which shows up as
   `clock: could not resolve pool.ntp.org` and then, much less obviously, as
@@ -574,7 +574,7 @@ thinner than it looks.
 there — 151 passed, 0 failed — loads an ELF off that filesystem, and drops into
 `/bin/sh`.** No storage driver is involved: GRUB reads the image off the disk it
 already knows how to read and leaves it in RAM (`module2`), and the kernel mounts
-it through a block device that is simply memory (`amd64/src/ramdisk.rs`).
+it through a block device that is simply memory (`crates/akuma-kernel-amd64/src/ramdisk.rs`).
 
 The PVH path is unregressed at 196/196, and now gets 2047 MiB of RAM rather than
 1 GiB — see bug 5 below.
@@ -671,9 +671,9 @@ as long as no OS claims the USB controllers — is closed on this board:
 Ubuntu reports `i8042: PNP: No PS/2 controller found`, and the FADT's
 `IAPC_BOOT_ARCH` has the "8042 present" bit clear (`0x10`). The keyboard
 (a ROCCAT Vulcan, USB) lights up because the *firmware* enumerated it, not
-because anything presents it to the kernel. `amd64/src/kbd.rs` is that i8042
+because anything presents it to the kernel. `crates/akuma-kernel-amd64/src/kbd.rs` is that i8042
 driver anyway — polled, set-1 scancodes, shift/ctrl/caps — because QEMU's `pc`
-machine and most other firmware do have one, and `amd64/src/input.rs` reads
+machine and most other firmware do have one, and `crates/akuma-kernel-amd64/src/input.rs` reads
 from whichever of UART and keyboard has a byte. Verified in the OVMF rig by
 typing through QEMU's monitor (`sendkey`). On this box the boot prints
 `kbd: no i8042` and the answer stays: networking, or a machine with a serial
@@ -695,7 +695,7 @@ Four pieces, all with host tests, none needing a reboot to verify.
 ## PCI enumeration exists
 
 `crates/akuma-pci` (pure: the `0xCF8` address word, the type-0 header, BAR
-decode + size math, the capability list) + `amd64/src/pci.rs` (the `unsafe`
+decode + size math, the capability list) + `crates/akuma-kernel-amd64/src/pci.rs` (the `unsafe`
 port I/O, a full 256-bus scan into a fixed registry, BAR mapping into the
 device window). Runs on both entries right after the machine description; on the
 VMM path it finds nothing, correctly. `pci::report()` prints an `lspci`-shaped
@@ -721,7 +721,7 @@ split transactions.
 * `descriptor` — USB standard descriptors + `find_boot_keyboard`
 * `hid` — the HID report-descriptor item parser, `is_boot_keyboard_report_descriptor`,
   and `BootKeyboardDecoder` (8-byte boot report → ASCII on the key-down edge)
-* `keymap` — HID usage → ASCII, matching `amd64/src/kbd.rs`'s scancode-table
+* `keymap` — HID usage → ASCII, matching `crates/akuma-kernel-amd64/src/kbd.rs`'s scancode-table
   choices (Ctrl-C → `0x03`, Caps Lock after Shift)
 * `ehci` — the capability/operational register layout, the `USBLEGSUP` BIOS→OS
   handoff, the `PORTSC` decode, and the split-transaction queue-head + qTD
@@ -734,7 +734,7 @@ polling. That is the next step and it needs the box to iterate on.
 
 ## `busybox ifconfig` works
 
-`amd64/src/fd.rs` now answers the read-only `SIOCGIF*` ioctls and serves a
+`crates/akuma-kernel-amd64/src/fd.rs` now answers the read-only `SIOCGIF*` ioctls and serves a
 generated `/proc/net/dev`, through the new `crates/akuma-syscalls-net` — the
 `struct ifreq` marshalling, the 40-byte `SIOCGIFCONF` stride, the
 netmask/broadcast math and the `/proc/net/dev` column format, extracted out of
@@ -746,7 +746,7 @@ the aarch64 kernel's `akuma-syscalls-glue` (which does not build for
 
 x86_64 169, wired through `akuma-boot::decode` (the ABI decode shared with
 aarch64's `sc-reboot`, host-tested against the values musl sends) +
-`amd64/src/reboot.rs` for the x86 reset: `0xCF9` reset-control register, then an
+`crates/akuma-kernel-amd64/src/reboot.rs` for the x86 reset: `0xCF9` reset-control register, then an
 i8042 pulse, then a triple fault. `busybox reboot`/`halt`/`poweroff` all land
 here; `poweroff` halts (no ACPI PM block). `akuma-boot` grew a `psci` feature
 (default on) so the amd64 port can reach `decode` without the AArch64
@@ -924,7 +924,7 @@ with no keyboard, `reboot(2)` over ssh is the only clean way to put it down.
 
 **Pipelines and redirects do not work.** `cmd | cmd` fails with `can't create
 pipe: Bad file descriptor`. Adding `pipe2` would not fix it: fds 0/1/2 are not
-entries in `amd64/src/fd.rs`'s table (`FIRST_FILE_FD = 3`; the console is
+entries in `crates/akuma-kernel-amd64/src/fd.rs`'s table (`FIRST_FILE_FD = 3`; the console is
 handled by number, below the table), so `dup2(pipefd, 1)` has nowhere to land.
 Making a pipeline work means giving the table real entries for 0/1/2 and
 routing the console through one — a restructure of that file, not a syscall to
@@ -954,7 +954,7 @@ assumed: an ssh session that was demonstrably passing traffic printed the same
 zeros. A diagnostic that reads the same whatever happens is worse than none, and
 this one had been the only network output the bare-metal boot produced.
 
-`netprobe` replaces it — a kernel-side daemon (`amd64/src/net.rs`) printing every
+`netprobe` replaces it — a kernel-side daemon (`crates/akuma-kernel-amd64/src/net.rs`) printing every
 two seconds:
 
 ```
@@ -1087,7 +1087,7 @@ The PVH path had been getting away with it **by accident**: `clock::sync_via_
 sntp` does its own `sti` and never puts it back. The bare-metal path calls no
 SNTP, so nothing ever re-enabled them.
 
-Fixes, in `amd64/src/lapic.rs`:
+Fixes, in `crates/akuma-kernel-amd64/src/lapic.rs`:
 
 - `calibrate()` measures the LAPIC against PIT channel 2 (the only channel with
   a software gate and a pollable output, so no interrupt and no IDT entry) and
@@ -1116,7 +1116,7 @@ uncalibrated count and **says so** on the console and in the suite.
 
 ## Two instruments, and what they cost to get wrong
 
-`netprobe` (`amd64/src/net.rs`) prints a live line from **inside the netpoll
+`netprobe` (`crates/akuma-kernel-amd64/src/net.rs`) prints a live line from **inside the netpoll
 daemon**, not beside it. A probe in its own task can go quiet for two unrelated
 reasons — its own starvation or netpoll's — and those are identical in a
 photograph. Printing from netpoll collapses that: a line appearing proves the

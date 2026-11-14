@@ -28,7 +28,7 @@ What no amd64 code did was **look at the pending set**. So:
 On AArch64 the looking happens inside the EL0 sync handler against a
 `UserTrapFrame` (`akuma_exceptions::try_deliver_signal`, ~350 lines welded to
 that architecture's `sigcontext`). This is the x86_64 counterpart, against
-`UserCtx`, in `amd64/src/signal.rs`. It is a **separate implementation on
+`UserCtx`, in `crates/akuma-kernel-amd64/src/signal.rs`. It is a **separate implementation on
 purpose**: the register file, the frame layout, the return instruction and the
 restorer convention are all different, and the only thing the two could share is
 a dispatch shape neither would be shorter for.

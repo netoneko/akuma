@@ -17,7 +17,7 @@ A `kbuild -j 1` at SMP=4, running normally, then:
 
 — and the machine was gone. No ping, no ssh, recovery a power cycle at the
 machine. `[SWIT` is `[SWITCH FREED-CR3]` truncated five characters into a
-message `amd64/src/sched.rs` built from ~7 separate `serial::puts` calls.
+message `crates/akuma-kernel-amd64/src/sched.rs` built from ~7 separate `serial::puts` calls.
 
 ## 2. The hole: a gate whose second arm was never asked
 
@@ -114,8 +114,8 @@ boot can otherwise scroll past, which is why it is an assertion and not a print.
 
 | file | change |
 |---|---|
-| `amd64/src/sched.rs` | `register_hooks` now registers `akuma_mmu::SchedHooks` (all three fields); `any_task_on_space_root` gained the unschedulable-slot carve-out (`slot_can_install`); the tripwire composes one line and demotes instead of installing; `FREED_CR3_TRIPS` + `freed_cr3_trips()` |
-| `amd64/src/idt.rs` | boot-suite assertion on `freed_cr3_trips()` |
+| `crates/akuma-kernel-amd64/src/sched.rs` | `register_hooks` now registers `akuma_mmu::SchedHooks` (all three fields); `any_task_on_space_root` gained the unschedulable-slot carve-out (`slot_can_install`); the tripwire composes one line and demotes instead of installing; `FREED_CR3_TRIPS` + `freed_cr3_trips()` |
+| `crates/akuma-kernel-amd64/src/idt.rs` | boot-suite assertion on `freed_cr3_trips()` |
 | `scripts/utils/hpbox.py` | `akuma_push()` — the missing Akuma-side file transport (there is no `scp` here) |
 
 The third `SchedHooks` field is not a freebie either.

@@ -2,7 +2,7 @@
 """Build the amd64 target's probe disk.
 
 Not an ext2 image and not a filesystem of any kind — a raw disk with two known
-sectors on it, so `amd64/src/blk.rs` can prove the whole path from a descriptor
+sectors on it, so `crates/akuma-kernel-amd64/src/blk.rs` can prove the whole path from a descriptor
 ring to the device's view of memory rather than proving that a driver object was
 constructed.
 

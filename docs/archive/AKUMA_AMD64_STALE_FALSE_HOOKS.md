@@ -12,9 +12,9 @@ hiding that on the one where `^C` looked fine.
 
 ## 1. What was wrong
 
-`amd64/src/sched.rs` wrote out `akuma_threading::ProcessHooks` **by hand**,
+`crates/akuma-kernel-amd64/src/sched.rs` wrote out `akuma_threading::ProcessHooks` **by hand**,
 because this target deliberately does not call `akuma_exec::init`
-(`amd64/src/exec_runtime.rs`, "Why this is not `akuma_exec::init`" — that
+(`crates/akuma-kernel-amd64/src/exec_runtime.rs`, "Why this is not `akuma_exec::init`" — that
 function registers seven upward surfaces at once, in an order `boot.rs` has not
 reached). Five of the table's eight rows answered a constant:
 
@@ -34,7 +34,7 @@ under two comments, each stating a reason that had since expired:
   `AKUMA_AMD64_FAULT_SIGNALS.md`). The line did not change.
 * *"No retired-process reclaim on this target yet — `akuma-exec`'s process table
   is not built here"* — it has been built here since 5b slice 1, and
-  `amd64/src` calls `akuma_exec::process::reclaim::drain_retired` from **seven**
+  `crates/akuma-kernel-amd64/src` calls `akuma_exec::process::reclaim::drain_retired` from **seven**
   places (`fd.rs`, `usermode.rs` ×3, `sched.rs`, `mem.rs`, `thread.rs`).
 
 That is the interesting property of this defect class and the reason this doc
@@ -74,7 +74,7 @@ So the table moved into the crate that owns it:
 pub fn register_process_hooks() { … }   // called by `init`, and by amd64 directly
 ```
 
-`amd64/src/sched.rs` now calls `akuma_exec::register_process_hooks()`. Both
+`crates/akuma-kernel-amd64/src/sched.rs` now calls `akuma_exec::register_process_hooks()`. Both
 kernels register **the same eight function pointers from the same line**, so
 this table cannot drift again; a future field gets one answer, not two.
 
@@ -83,7 +83,7 @@ ordering requirement beyond "before the first park" — it stays where the old
 literal was, inside `sched::init`, which `boot::early_init` runs fifth.
 
 `akuma-net`'s `NetRuntime` hook is separate and was wired too
-(`amd64/src/net.rs`), to `should_interrupt_blocking_syscall` — the same function
+(`crates/akuma-kernel-amd64/src/net.rs`), to `should_interrupt_blocking_syscall` — the same function
 `akuma-kernel-glue` gives it on AArch64, and the union of the deferred-kill bit,
 the Ctrl-C / `sys_kill` bit and the per-thread `pthread_kill` set.
 
@@ -159,7 +159,7 @@ the `sleep`. Delivery is reached. The gap is downstream of it, which rules out
 every hypothesis about the tty path, the pty request, the channel and the
 process group in one line of output.
 
-Downstream is `amd64/src/usermode.rs`'s `Syscall::Nanosleep`, a busy-yield loop
+Downstream is `crates/akuma-kernel-amd64/src/usermode.rs`'s `Syscall::Nanosleep`, a busy-yield loop
 whose only exit check was `crate::thread::should_leave_now()` — group exit,
 nothing else. Its own comment said so: *"this one cannot be interrupted except
 by the group exit above"*. So `^C` on a sleeping foreground job was a no-op: the

@@ -1,0 +1,13 @@
+[package]
+name = "akuma-phys"
+version = "0.1.0"
+edition = "2024"
+description = "Page frames through the kernel's physmap, on either architecture: Frame (a bounds-checked, volatile view of a frame something else owns) and FreshFrame (a PMM frame owned alone until published). Moved from akuma-boot-amd64::phys for the aarch64 tokio kernel (B21 A5.5)."
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+akuma-pmm = { path = "../akuma-pmm" }
+akuma-pagetable = { path = "../akuma-pagetable" }

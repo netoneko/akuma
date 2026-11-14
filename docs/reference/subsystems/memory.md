@@ -6,7 +6,7 @@ fork, and userspace address spaces. For debugging, see
 
 **This document is the AArch64 kernel's.** The **amd64** target has had its own
 copy-on-write `fork` since 2026-09-06 and shares none of the machinery here —
-its page tables, its PTE marker bit and its fault arm are all in `amd64/`. What
+its page tables, its PTE marker bit and its fault arm are all in `crates/akuma-kernel-amd64/`. What
 the two kernels *do* share is the **decision** (`crates/akuma-cow`) and the
 per-address-space frame ledger (`crates/akuma-user-space`), both host-tested.
 See [`../../archive/AKUMA_AMD64_COW.md`](../../archive/AKUMA_AMD64_COW.md);
@@ -16,12 +16,17 @@ serialized on the thread-group leader's address-space lock. The Go/crush startup
 filed against it was a signal-return defect, not CoW
 ([`AMD64_FORK_VS_THREADS_SEGV`](../../archive/AMD64_FORK_VS_THREADS_SEGV.md)).
 
+**amd64 shootdown acks need a service point.** Ring 0 runs with `IF` clear, so a core in
+kernel code acknowledges a shootdown only by servicing its own mailbox: the BKL ticket wait
+(`bkl_spin_assist`), `sched::yield_now`, and any IRQ-masked poll loop that calls
+`shootdown::masked_wait_assist()`. A new kernel loop that waits without yielding must call
+the assist, or a sender spins in `wait_for_acks` (`[TLB] stuck … missing=<that core>`; the
+report prints the missing core's task and `halted` flag). See
+[`AMD64_YIELD_POLLER_SHOOTDOWN_DEAF`](../../archive/AMD64_YIELD_POLLER_SHOOTDOWN_DEAF.md).
+
 > **Stability: C (active risk).** Highest-churn subsystem through 2026-06.
-> Four items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
-> ~5 MB; a full process table panicking instead of failing the spawn (see
-> [OPEN: a full process table still panics the
-> kernel](#open-a-full-process-table-still-panics-the-kernel)); and the
-> user-page escalation giving up while parked memory is still inside its
+> Three items still OPEN: per-run kernel-heap creep; reclaim-after-OOM below
+> ~5 MB; and the user-page escalation giving up while parked memory is still inside its
 > reclaim cooldown (see [KNOWN GAP: a premature give-up while memory is merely
 > cooling](#known-gap-a-premature-give-up-while-memory-is-merely-cooling)),
 > which is also currently invisible at runtime. The recurring
@@ -42,8 +47,8 @@ filed against it was a signal-return defect, not CoW
 
 ### Kernel regions (computed by `compute_memory_layout`)
 
-- **Code+Stack** = `max(ram/16, MIN_CODE_AND_STACK_BYTES)`; extreme clamped via `MEM_CALC_CLAMP_MB`=4. **Invariant:** must cover `BOOT_STACK_TOP + 1 MB guard`.
-- **Heap** = dynamic (seeded ~1 MB `size` / ~4 MB `release`, grows from PMM). The "fixed 16 MB heap" in `archive/MEMORY_LAYOUT.md` is **superseded**.
+- **Code+Stack** = `max(ram/16, MIN_CODE_AND_STACK_BYTES)`; `MEM_CALC_CLAMP_MB` (0 = off) can clamp the RAM it is computed from. **Invariant:** must cover `BOOT_STACK_TOP + 1 MB guard`.
+- **Heap** = dynamic (seeded ~4 MB, grows from PMM). The "fixed 16 MB heap" in `archive/MEMORY_LAYOUT.md` is **superseded**.
 - **User pages** = remainder.
 - **Device MMIO VAs:** L0[1] → `0x80_0000_0000+` (GIC), `0x80_0000_2000` (UART), `0x80_0000_4000` (VirtIO). **Invariant:** devices must NOT live in L0[0] (the bun 93 MB collision).
 
@@ -51,7 +56,7 @@ filed against it was a signal-return defect, not CoW
 
 ```
 0x00400000   code (.text/.data/.bss)
-brk          heap (dynamic lazy region, grows up)
+brk          heap (mapped by set_brk, in no region, grows up)
 0x0a000000   VirtIO device pages (L2[80])
 0x10000000   mmap region (grows up; jumps over kernel_va_end())
 ~0x3FFFF000  user stack (grows down; auto-sized, 128 KB at ≤256 MB)
@@ -100,7 +105,7 @@ flowchart TB
     subgraph FREEPIPE["akuma_pmm::free_page_at(pa, tid, site)"]
         DEC{"cow_ref_dec(pa)<br/>Some(n) → n-1<br/>None → 0→0, LAST ⚠ W3"}
         KEEP["count still > 0:<br/>return — frame stays"]
-        UNTRK["untrack_frame + record_free_at<br/>(FreeSite ledger, 4096-slot ring)"]
+        UNTRK["untrack_frame + record_free_at<br/>(FreeSite ledger, 4096-slot ring;<br/>compiled only with pmm-forensics)"]
         PREM["report_premature_free<br/>⚠ OFF by default (perturbs the race) —<br/>poisoning a still-mapped frame is SILENT"]
         QPUSH["quarantine_push: POISON WRITTEN HERE<br/>0xFEEDFACEDEAD0000 ^ pa, whole page<br/>no ownership/bitmap check first ⚠ W4"]
         RING["512-slot ring, parked<br/>(bitmap still says allocated)"]
@@ -293,8 +298,8 @@ Full investigation, including how the locks were named without debug info and th
 three ways the regression test was wrong first:
 [`../../archive/PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md`](../../archive/PMM_TALC_LOCK_CYCLE_SILENT_WEDGE.md).
 
-Regression tests: `pmm_heap_lock_order` (`src/tests.rs`, single-core) and
-`pmm_heap_lock_order_smp` (`src/process_tests.rs`, cross-core). **Both detect a
+Regression tests: `pmm_heap_lock_order` (`crates/akuma-kernel-tests-aarch64/src/tests.rs`, single-core) and
+`pmm_heap_lock_order_smp` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, cross-core). **Both detect a
 regression by HANGING the boot suite, not by failing** — the `PMM` side spins
 with IRQs masked, so there is no verdict to print.
 
@@ -333,8 +338,9 @@ with IRQs masked, so there is no verdict to print.
 
 - **Share path** (`fork_process`, `COW_FORK_ENABLED`): `cow_share_range` →
   per page `cow_ref_inc(pa)` + child `map_page(RO)` + `track_user_frame`; then
-  parent `demote_range_to_ro`; `flush_tlb_asid(0)` (all ASIDs — sibling threads
-  share L0 with different ASIDs).
+  parent `demote_range_to_ro`; `flush_tlb_asid(0)` (all ASIDs — a vfork child
+  runs the parent's L0 under an ASID of its own; see
+  [Address-space slots: ASIDs and table rows](#address-space-slots-asids-and-table-rows)).
 - **Fault path** (write to RO page, `exceptions.rs`): alloc copy,
   `track_user_frame(new)`, `remove_user_frame(old)`, `cow_ref_dec(old)`.
 - **Data structure:** `user_frames: BTreeMap<PA, u32>` (refcount = in-AS mapping
@@ -417,8 +423,24 @@ with IRQs masked, so there is no verdict to print.
 - **Demand paging:** "lazy regions" (`push_lazy_region` →
   `ensure_user_page_mapped`) for heap, large mmap, stack, large ELF segments
   (`DeferredLazySegment` via `from_elf_path`).
-- **mmap:** bump from `0x10000000`, first-fit into `free_regions` on munmap;
-  jumps over `kernel_va_end()`; MAP_FIXED may shatter a 2 MB block into L3.
+- **One region list.** A lazy region is an `MmapRegion` with `lazy` set, in the same sorted,
+  non-overlapping `Process::mmap_regions` as the eager ones, on the thread-group leader. Its file
+  is a `FileBacking` whose `lead` is the distance from the region's first page to the segment's
+  first byte. The `*lazy_region*` functions in `akuma-exec`'s `process/children.rs` are names over
+  that list, and a lookup still returns a `LazySource` view built under the lock. Rules:
+  - **Readers of eager state skip `lazy`** (`eager_region_flags_for_page_fault`,
+    `eager_region_recorded_prot_for_page_fault`, `detach_eager_regions_in_range`, `mremap`'s
+    exact-start match). Lazy regions own no frames.
+  - **A lazy push removes the lazy part it covers**; the later push wins, which is what serves an
+    ELF boundary page shared by two segments. A push over an *eager* region breaks the
+    no-overlap invariant; it is reported once as `[LR-OVERLAP]` and lookups fall back to a scan.
+  - **`mprotect` splits lazy and eager regions alike** (`mprotect_eager_regions_in_range`).
+  - **fork reads the leader's list**, whichever thread forks; the CoW child inherits it with
+    `inherit_mmap_regions_for_cow_child`, lazy records included. A `CLONE_VM` thread's own list
+    is empty and its faults resolve through the owner of the address space.
+- **mmap:** first fit over the region list from a per-process cursor, wrapping once
+  (`akuma_mmap::place`, shared with amd64); jumps over `kernel_va_end()`; MAP_FIXED may
+  shatter a 2 MB block into L3.
 - **Lazy anonymous mmap:** `MAP_PRIVATE` > `MMAP_EAGER_MAX_PAGES`=16 → lazy
   region, zero-on-demand.
 - **Stack:** top ~`0x3FFFF000`; auto-sized (128 KB at ≤256 MB by default).
@@ -429,6 +451,21 @@ with IRQs masked, so there is no verdict to print.
   realloc safety.
 - **Eviction:** `try_evict_ro_page` + `reclaim_clean_file_pages` evict clean
   `AP_RO_ALL` file-backed pages under pressure (lets models > RAM run).
+- **Mapped files stay alive through the address space's pins.** A demand-paged file mapping
+  reads its inode long after `close` and `unlink`, so the owner's `UserAddressSpace` pins every
+  inode its file mappings name (`pin_mapped_inode`; the set is `akuma_user_space::MappingPins`).
+  The rules, the same on both kernels:
+  - **One pin per distinct inode**, not per mapping. The pin table is global and bounded, and a
+    saturated table stalls ext2's deferred frees.
+  - **Released when the last mapping naming the inode goes**, not when the address space drops.
+    AArch64 checks after a `munmap` or a replacing push (`regions_name_inode` over the list);
+    amd64 calls `retain_mapped_inode_pins` over its surviving regions.
+  - **On the owner's address space**, never a thread's view, which drops with its thread.
+  - **Fork inherits; exec and exit drop.** A fork child pins what its inherited regions name.
+    `exec` pins the new image's file-backed segments in the new address space.
+
+  A region record holds no pin. A `LazySource` handed out by a lookup holds one for as long as
+  the fill reads the file. Boot test `test_lazy_file_regions_pin_in_address_space`.
 
 ### The mmu map/demote surface is safe — its obligations are not optional
 
@@ -645,7 +682,7 @@ still-mapped page costs a future re-read while freeing nothing now.
 
 **Stability: B — verify behaviour.** Landed 2026-08-05. **Both kernels since
 2026-09-13** — the amd64 kernel consumes the same `akuma-fpcache`, through its
-own demand-paged file mappings (`amd64/src/mm.rs`'s `fill_file_pages`); what is
+own demand-paged file mappings (`crates/akuma-kernel-amd64/src/mm.rs`'s `fill_file_pages`); what is
 written below about keying, references, sizing and invalidation holds there
 unchanged. Two differences worth knowing: it maps a cached frame through
 `FrameLedger::adopt_user_frame` rather than the AArch64 fault path's three-pass
@@ -763,36 +800,60 @@ self-deadlocks. So:
 | thread 0's idle loop; the `smp-shared` per-core idle loop | the regime where `netpoll_maint` is starved |
 | `alloc_page_zeroed_user` step 2 | demand-paging pressure |
 | `netpoll_maint`, 100 ms (pre-existing) | steady state |
+| `akuma_syscalls_glue::proc::retry_while_full`, at every attempt of `clone`/`fork`/`vfork` | thread churn, which consumes rows faster than exits collect them |
 
-Adding a *sixth* site means auditing its ambient lock context first. If you
-cannot, call `request_retired_reclaim()` instead and let one of the five
+Adding another site means auditing its ambient lock context first. If you
+cannot, call `request_retired_reclaim()` instead and let one of these
 collect.
 
 Runtime toggle `process::reclaim::set_pressure_reclaim_enabled` (default on) is
 both the kill switch and the same-binary A/B lever used by
 `test_retired_reclaim_pressure_ab`.
 
-### OPEN: a full process table still panics the kernel
+### Address-space slots: ASIDs and table rows
 
-`register_process` is **infallible**. On a full-table miss it prints
-`Process table full (256 slots)` and `panic!`s — even when every one of those
-`MAX_PROCESSES` slots is a RETIRED zombie whose memory is reclaimable and whose
-only problem is that no collector has run yet. It deliberately does not reclaim
-inline; that call site is ruled out by the self-deadlock in the module note
-above, and the ban is correct.
+Three fixed pools bound how many processes and threads can exist at once, and an
+exited thread holds a place in two of them for a while after it is joined:
 
-What is *not* correct is the panic. The intended fix is to return an error when
-`retired_process_count() > 0` so fork/clone/spawn surface `-EAGAIN` instead of
-halting the box — "collector starved, retry" rather than "kernel dead". It was
-left out of the pressure-reclaim change because making `register_process`
-fallible means threading a `Result` through every fork/clone/spawn caller, a
-wider diff than the whole collector mechanism.
+| Pool | Size | An exited thread holds it until |
+|---|---|---|
+| thread slots (`akuma-threading`) | 248 user slots | the slot is recycled, `THREAD_CLEANUP_COOLDOWN_US` (10 ms) after exit |
+| process-table rows (`process::table`) | `MAX_PROCESSES` = 256 | its row is reclaimed, `PROCESS_RECLAIM_COOLDOWN_US` (10 ms) after the slot recycle retired it |
+| ASIDs (AArch64 `ASID_ALLOCATOR`) | 256 | **never held by a thread**; see below |
 
-Until then the mitigation is indirect: the five drain sites above make a
-zombie-full table far less reachable than it was, but they do not make it
-impossible — a spawn storm that outruns every collector still ends in the
-panic. Treat `Process table full` as this open item, not as a genuine
-capacity limit.
+Rules:
+
+- **A thread runs under its group's ASID.** `clone_thread` builds the child's
+  address space with `UserAddressSpace::new_thread_view(l0, owner_asid)`, which
+  allocates no ASID. That matches the hardware: the child's context carries the
+  parent's `ttbr0`, ASID included. The owner's ASID outlives the owner while any
+  view is alive: an owner that drops first parks the ASID in its
+  `SHARED_L0_TABLE` entry beside its frames, and the last view flushes and frees
+  it. `new_shared` (a vfork child, the boot tests) still allocates an ASID of
+  its own. A thread created *by* a vfork child would run under that ASID, which
+  the vfork child frees when it drops; POSIX leaves anything but `exec`/`_exit`
+  in a vfork child undefined, and this is not guarded.
+- **A process-table row is reserved before the child is built.** `fork_process`,
+  `vfork_process`, `clone_thread`, AArch64 `spawn` and amd64 `sys_spawn` call
+  `reserve_process_slot()` first and register with `register_reserved`, whose
+  claim cannot miss (`ProcessSlot` states why). A full table is refused at that
+  point with `PROCESS_TABLE_FULL`, while there is nothing to undo. Plain
+  `register_process` still panics on a full table and is for boot and tests
+  only: **a runtime creation path must not call it.**
+- **A full table is waited out, not reported.** `retry_while_full` (glue) runs
+  `clone`/`fork`/`vfork` again after a 1 ms park when the refusal was
+  `PROCESS_TABLE_FULL` or `NO_FREE_USER_SLOTS`, for up to 100 ms, draining
+  before every attempt; only then does the caller see `EAGAIN` (amd64 `fork`:
+  `ENOMEM`). Linux does not fail `pthread_create` because exited threads are
+  still cooling, and here the capacity always comes back within the two
+  cooldowns. Spawn is not retried.
+- **The cooldowns are the ceiling on sustained churn**: about 250 thread
+  creations per 20 ms. Past it, creation is slowed by the wait above, not
+  refused.
+
+`userspace/forktest/c_stress/thrchurn.c` is the gate: `thrchurn 2000 0 1`
+creates and joins threads with no pause and must report `0 failed`. Background:
+[`AKUMA_THREAD_ASID_SHARE.md`](../../archive/AKUMA_THREAD_ASID_SHARE.md).
 
 ### Reading the signature
 

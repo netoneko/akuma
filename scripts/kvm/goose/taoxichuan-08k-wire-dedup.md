@@ -15,7 +15,7 @@ single revert is clean. What must NOT change: any byte the guest sees. apk, busy
    (`userspace/abiprobe/c/build.sh` uses `aarch64-linux-musl-gcc`) and cannot run in this guest; use the W1 gate below instead.**
 2. `docs/archive/TAOXICHUAN_STAGE6_REST_PLAN.md` - § 0 (the `akuma-syscalls-linux` / `-abi` rows) and § 5 (trim interleaving).
 3. `crates/akuma-syscalls-linux/src/{stat,dirent,uts,time}.rs` - the public API only (`grep -n "pub " <file> | head -40`); `crates/akuma-syscalls-abi/src/lib.rs` head comment and the `Syscall` enum's decode.
-4. How `amd64/src/` consumes them: `grep -rn "akuma_syscalls_linux\|akuma_syscalls_abi" amd64/src/ | head -30` - copy the call shape, do not invent one.
+4. How `crates/akuma-kernel-amd64/src/` consumes them: `grep -rn "akuma_syscalls_linux\|akuma_syscalls_abi" crates/akuma-kernel-amd64/src/ | head -30` - copy the call shape, do not invent one.
 5. `scripts/kvm/goose/run_gates.sh` - G3 (the guest-side sha check pattern) and the head comments.
 Probes: none needed beyond the gates below.
 
@@ -23,7 +23,7 @@ Probes: none needed beyond the gates below.
 `taoxichuan/` is a **composition root**. It is 4,779 newly written lines now (`main.rs` 3,085) and has 16 `akuma-*` path dependencies (`grep -c '^akuma-' taoxichuan/Cargo.toml`; earlier briefs said 18, that was wrong).
 This whole session *is* the rule applied: for every hand-written struct writer, **look first** (`grep -rn` in `crates/`), **pull** the crate type, delete the local bytes. Say in RESULT-K per family: *pulled / extracted / cut /
 written new (why)* with lines removed. Anything the ABI crates lack (a field, a helper) is a step-3 extraction into the crate with a host test, not a local patch. Do not widen the work into routing or the socket
-table. Before adding the two dependencies, diff `amd64/Cargo.toml`'s `akuma-*` list against `taoxichuan/Cargo.toml`'s and say what else unused there could shrink this file (do not act on it; list it).
+table. Before adding the two dependencies, diff `crates/akuma-kernel-amd64/Cargo.toml`'s `akuma-*` list against `taoxichuan/Cargo.toml`'s and say what else unused there could shrink this file (do not act on it; list it).
 A session that closes its gates and makes `taoxichuan/src` smaller is better than one that does not.
 
 ## Cost rules

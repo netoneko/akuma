@@ -16,7 +16,7 @@ Usage (one arm):
 
     scripts/benchmarks/run_nic_ab.py --label baseline --runs 5
 
-It assumes the kernel is ALREADY BUILT with `--features devbox-smoltcp,no-tests,
+It assumes the kernel is ALREADY BUILT with `--features no-tests,
 net-profile`; it does not build, so the caller controls which binary is under test.
 Results land in `logs/ab/<label>/` as one JSON per run plus a median summary.
 
@@ -42,10 +42,8 @@ SSH_BASE = [
     "-o", "LogLevel=ERROR", "-o", "ConnectTimeout=10", "-p", "2222", "root@localhost",
 ]
 
-# Both startup paths: extreme-size has the kernel spawn sshd, every other profile
-# lets herd do it. Match both so the poll does not silently hang if the profile
-# changes — and match `Started` alone as well, because the console is shared and
-# another thread's line lands MID-MARKER routinely:
+# Both spellings of the herd startup line, and `Started` alone as well, because
+# the console is shared and another thread's line lands MID-MARKER routinely:
 #     [herd] Started [syscall] socket(type=TCP) = fd 3
 # which cost one full arm before it was noticed. The log marker is only a hint
 # here anyway; `wait_ready` confirms with a real ssh round trip.
@@ -124,7 +122,7 @@ def main() -> int:
     ap.add_argument("--memory", type=int, default=4096)
     ap.add_argument("--smp", type=int, default=4)
     ap.add_argument("--disk", default="devbox.img")
-    ap.add_argument("--features", default="devbox-smoltcp,no-tests,net-profile")
+    ap.add_argument("--features", default="no-tests,net-profile")
     ap.add_argument("--settle", type=float, default=25.0,
                     help="seconds to idle between runs. NOT cosmetic: smoltcp holds "
                          "TimeWait for CLOSE_DELAY=10 s, so back-to-back 2000-request "

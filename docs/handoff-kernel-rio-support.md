@@ -55,7 +55,7 @@ valuable first, and prove each fix on the box.
    ignores Alt. When `MOD_LALT|MOD_RALT` is held and the key emits a byte,
    emit `0x1b` first (Linux "meta sends escape"). rio's bindings are declared
    as Alt+letter and its window platform already decodes ESC+letter as Alt;
-   users currently press Esc, then the letter. Check `amd64/src/kbd.rs`
+   users currently press Esc, then the letter. Check `crates/akuma-drivers-amd64/src/kbd.rs`
    (PS/2) for the same gap.
 4. **Process lifecycle**: `SOCK_CLOEXEC` not honoured on socketpairs;
    SIGCHLD not reliably delivered; a shell that hung in its own exit

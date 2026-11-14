@@ -34,7 +34,7 @@ bits are enforced **when the switch is on** — it starts off.
 |---|---|
 | `Creds`, transition rules, `SharedCreds` | `crates/akuma-isolation/src/creds.rs` (host-tested) |
 | The checks: `may`, `may_delete`/`sticky_allows`, `may_chmod`/`chmod_mode`, `may_chown`, `may_set_times`, `may_signal`, the switch | `crates/akuma-isolation/src/dac.rs` (host-tested) |
-| `Process::creds: Arc<SharedCreds>` — fork copies, `clone_thread` shares, spawn copies the caller's | `crates/akuma-exec/src/process/mod.rs`, `spawn.rs`; amd64 `register_exec_process` |
+| `Process::creds: Arc<SharedCreds>` — fork copies, `clone_thread` shares, spawn copies the caller's | `crates/akuma-exec/src/process/mod.rs`, `spawn.rs` (init and every 301 child on both kernels) |
 | Credential syscalls | `crates/akuma-syscalls-glue/src/cred.rs` |
 | Which check each path syscall makes | `crates/akuma-syscalls-glue/src/perm.rs` + call sites in `fs.rs`, `unixsock.rs`, `proc.rs` |
 | `kill`/`tkill`/`tgkill`/`pidfd_send_signal` | `akuma_exec::process::check_signal` (both kernels) |

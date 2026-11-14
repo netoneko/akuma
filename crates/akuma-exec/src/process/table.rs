@@ -33,7 +33,79 @@ pub static NEXT_PID: AtomicU32 = AtomicU32::new(1);
 /// no reader can observe ACTIVE paired with a stale stamp.
 static PROCESS_TABLE: SlotTable<Process, MAX_PROCESSES> = SlotTable::new();
 
+/// The error a fork, vfork, clone or spawn returns when [`reserve_process_slot`]
+/// finds no slot. Compared by value: `akuma-syscalls-glue` waits and retries on
+/// it (the rows are usually exited threads cooling down, not live processes)
+/// and reports `EAGAIN` if the table stays full.
+pub const PROCESS_TABLE_FULL: &str = "Process table full";
+
+/// Slots promised to a [`ProcessSlot`] and not yet claimed. Under a lock, not an
+/// atomic, so that reading the table's count and raising this is one step.
+static RESERVED: Spinlock<usize> = Spinlock::new(0);
+
+/// A claim on one process-table slot, taken **before** the child is built.
+///
+/// A full table used to be discovered by [`register_process`], at the end of a
+/// fork or clone, after the child's thread slot, task row, pid-map entry and
+/// channels existed, so it could not fail cleanly and panicked instead
+/// (`docs/archive/AKUMA_THREAD_ASID_SHARE.md`). A creation path now reserves
+/// first and fails while there is nothing to undo, then hands the reservation
+/// to [`register_reserved`], whose claim cannot miss.
+///
+/// Why the claim cannot miss: [`reserve_process_slot`] grants one only while
+/// `occupied + reserved < MAX_PROCESSES`, read and raised under [`RESERVED`]'s
+/// lock. Every other change to that sum lowers it (a reclaim frees a slot) or
+/// keeps it (a retire), and a holder claims its slot **before** it lowers
+/// `reserved`, so a concurrent reader can only over-count. This holds while every
+/// runtime claim goes through a reservation; plain [`register_process`] is left
+/// for boot, the boot suite and host tests.
+///
+/// Dropping it without registering returns the reservation.
+#[must_use = "a dropped reservation returns its slot"]
+pub struct ProcessSlot(());
+
+/// Reserve one slot, or `None` if the table is full. A refusal also requests a
+/// drain, since the table may be full of reclaimable rows.
+pub fn reserve_process_slot() -> Option<ProcessSlot> {
+    let granted = with_irqs_disabled(|| {
+        let mut reserved = RESERVED.lock();
+        let occupied = PROCESS_TABLE.active_count() + PROCESS_TABLE.retired_count();
+        if occupied + *reserved < MAX_PROCESSES {
+            *reserved += 1;
+            true
+        } else {
+            false
+        }
+    });
+    if granted {
+        Some(ProcessSlot(()))
+    } else {
+        crate::process::reclaim::request_retired_reclaim();
+        None
+    }
+}
+
+impl Drop for ProcessSlot {
+    fn drop(&mut self) {
+        with_irqs_disabled(|| {
+            let mut reserved = RESERVED.lock();
+            *reserved = reserved.saturating_sub(1);
+        });
+    }
+}
+
+/// Register a process into the slot `slot` reserved. Cannot find the table full
+/// (see [`ProcessSlot`]); the reservation is returned after the claim.
+pub fn register_reserved(pid: Pid, proc: Box<Process>, slot: ProcessSlot) {
+    register_process(pid, proc);
+    drop(slot);
+}
+
 /// Register a process in the table (takes ownership via Box).
+///
+/// Panics if the table is full: a runtime creation path reserves its slot first
+/// with [`reserve_process_slot`] and registers with [`register_reserved`]. This
+/// unreserved form is for boot and tests.
 ///
 /// Finds a free slot via CAS, stores the Process pointer.
 /// The Process is kept alive until `unregister_process` + `reclaim_retired_processes`
@@ -63,13 +135,8 @@ pub fn register_process(_pid: Pid, proc: Box<Process>) {
     // safe from here — collecting is not.
     crate::process::reclaim::request_retired_reclaim();
     drop(proc);
-    // OPEN (docs/reference/subsystems/memory.md → "OPEN: a full process table still
-    // panics the kernel"): this should return an error so fork/clone/spawn surface
-    // -EAGAIN — "collector starved, retry" — instead of halting the box, since every
-    // slot here may be a reclaimable zombie. Blocked only on making this function
-    // fallible, which means threading a `Result` through every spawn caller. The
-    // request above at least guarantees the next drain site collects; it cannot help
-    // *this* caller, which is already dead by the line below.
+    // Unreachable for a runtime creation path, which reserved its slot first
+    // (`ProcessSlot`); only an unreserved boot or test registration can get here.
     panic!(
         "Process table full ({} slots, {} reclaimable RETIRED)",
         MAX_PROCESSES,
@@ -161,14 +228,25 @@ fn retire_process(pid: Pid) -> bool {
                 // terminates silently. The comment above argues a missing entry
                 // means "nobody has claimed it" — true on AArch64, where the slot
                 // recycler evicts the map entry. **amd64 claims a TERMINATED slot
-                // directly (`x86_claim_slot`) and does not insert into the map
+                // directly (`claim_slot`) and does not insert into the map
                 // until publish**, so between claim and publish a live, freshly
                 // claimed slot also reads `None` here — and this terminates it.
                 // Suspected root cause of the `-j4` wedge; this names the killer.
+                //
+                // Rate-limited (first 8, then powers of two, with the running count): on
+                // AArch64 a missing entry is the *normal* reap, so unlimited this printed
+                // once per thread exit — ~1,200 lines per `futextest` run, each byte a trap
+                // under KVM, inside a BKL hold. That alone took the run from 2.5 s to ~13 s
+                // and was every `[BKL] stuck` line it produced
+                // (docs/archive/UNREGISTER_PRINT_BKL_HOLDS.md).
                 if slot_owner.is_none() && tid != crate::threading::current_thread_id() {
-                    crate::safe_print!(112,
-                        "[unregister] pid={} tid={} has NO map owner — terminating anyway\n",
-                        pid, tid);
+                    static NO_OWNER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+                    let n = NO_OWNER.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    if n < 8 || n.is_power_of_two() {
+                        crate::safe_print!(128,
+                            "[unregister] pid={} tid={} has NO map owner — terminating anyway (x{})\n",
+                            pid, tid, n + 1);
+                    }
                 }
                 if tid != current_tid && !recycled {
                     crate::threading::mark_thread_terminated(tid);
@@ -295,6 +373,64 @@ pub fn group_cpu_time_us(tgid: Pid) -> u64 {
         }
     });
     total
+}
+
+/// Call `f(pid, tid)` for every thread of `tgid`'s group **other than its leader** that still
+/// holds a live thread slot, and return how many there were.
+///
+/// A group is the set of table rows sharing a `tgid`; a `CLONE_THREAD` thread is its own row
+/// with its own pid. Its slot is resolved through `THREAD_PID_MAP` (the authority, see
+/// [`thread_for_pid`]) and must be live: a row whose thread was hard-terminated, or that is
+/// between `thread_pid_map_remove` and `unregister_process` on its way out, runs no more user
+/// code in the group's address space and is not counted.
+///
+/// This is what a leader's exit waits on before its address space can be freed: the process
+/// table *is* the thread list, so a kernel needs no table of its own beside it
+/// (`proposals/AKUMA_ONE_EXIT.md` step 3).
+///
+/// Allocation-free (two stack buffers, about 4 KiB) and `f` runs with no lock held, so it may
+/// wake or interrupt the thread it is handed.
+pub fn for_each_live_group_thread<F: FnMut(Pid, usize)>(tgid: Pid, mut f: F) -> usize {
+    let mut pids = [0 as Pid; MAX_PROCESSES];
+    let mut n = 0usize;
+    PROCESS_TABLE.for_each_active(|_, p| {
+        if p.tgid == tgid && p.pid != tgid && n < MAX_PROCESSES {
+            pids[n] = p.pid;
+            n += 1;
+        }
+    });
+    if n == 0 {
+        return 0;
+    }
+    let pids = &mut pids[..n];
+    pids.sort_unstable();
+    // One pass over the map rather than a `thread_for_pid` scan per member: the caller drains
+    // in a loop, and a group can be a hundred threads.
+    let mut found = [(0 as Pid, 0usize); MAX_PROCESSES];
+    let mut m = 0usize;
+    with_irqs_disabled(|| {
+        for (&tid, &owner) in THREAD_PID_MAP.lock().iter() {
+            if m < MAX_PROCESSES && pids.binary_search(&owner).is_ok() {
+                found[m] = (owner, tid);
+                m += 1;
+            }
+        }
+    });
+    let mut live = 0usize;
+    for &(pid, tid) in &found[..m] {
+        if crate::threading::slot_is_live(tid) {
+            live += 1;
+            f(pid, tid);
+        }
+    }
+    live
+}
+
+/// How many threads of `tgid`'s group other than its leader are still live; see
+/// [`for_each_live_group_thread`].
+#[must_use]
+pub fn live_group_threads(tgid: Pid) -> usize {
+    for_each_live_group_thread(tgid, |_, _| {})
 }
 
 /// Iterate all active processes, calling `f` for each. Returns early if `f` returns Some.
@@ -677,6 +813,59 @@ pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
     })
 }
 
+/// Remove every `THREAD_PID_MAP` row whose thread slot is no longer live and whose pid is no
+/// longer registered, and return how many went.
+///
+/// For a kernel whose slot recycler does not evict map rows itself (amd64 claims a `TERMINATED`
+/// slot directly; AArch64's `on_thread_cleanup` evicts at recycle and never needs this). Run it
+/// after a reap: a reaped process's row then names a pid nothing resolves, on a slot nothing
+/// runs.
+///
+/// **Both tests, and each one is load-bearing.** "Pid not registered" alone would strip a row
+/// that `clone_thread`/`spawn` published a moment before registering the pid; "slot not live"
+/// alone would strip a zombie's row while its parent may still `kill` it. A row is removed only
+/// if it still names the same pid when the lock is retaken, so a slot reissued in between keeps
+/// its new owner.
+///
+/// Allocation-free; at most [`SWEEP_BATCH`] rows per call, and a remainder waits for the next
+/// reap.
+pub fn sweep_dead_thread_identities() -> usize {
+    let mut rows = [(0usize, 0 as Pid); SWEEP_BATCH];
+    let mut n = 0usize;
+    with_irqs_disabled(|| {
+        for (&tid, &pid) in THREAD_PID_MAP.lock().iter() {
+            if n == SWEEP_BATCH {
+                break;
+            }
+            if !crate::threading::slot_is_live(tid) {
+                rows[n] = (tid, pid);
+                n += 1;
+            }
+        }
+    });
+    let mut removed = 0usize;
+    for &(tid, pid) in &rows[..n] {
+        if active_process_ref(pid).is_some() {
+            continue;
+        }
+        let gone = with_irqs_disabled(|| {
+            let mut map = THREAD_PID_MAP.lock();
+            if map.get(&tid) == Some(&pid) {
+                map.remove(&tid);
+                identity_clear_locked(tid);
+                true
+            } else {
+                false
+            }
+        });
+        removed += usize::from(gone);
+    }
+    removed
+}
+
+/// Rows [`sweep_dead_thread_identities`] looks at per call.
+pub const SWEEP_BATCH: usize = 64;
+
 /// A process whose last thread is leaving ring 3 for good **keeps its thread
 /// slot until it is reaped**: the slot is not reissued while the process is a
 /// zombie, and [`retire_process`] gives it back.
@@ -688,7 +877,7 @@ pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
 /// every `p.thread_id` table scan found the zombie (`[TRAMP-MISMATCH] … table
 /// scan found <dead pid>`, `[kill]`/`[unregister] … stale tid`). amd64 did
 /// exactly that: `run_process` -> `sched::finish` made the slot claimable at once
-/// (`x86_claim_slot` takes a `TERMINATED` slot directly) while the zombie waited
+/// (`claim_slot` takes a `TERMINATED` slot directly) while the zombie waited
 /// for its parent's `wait4` (2026-10-16, ryzen,
 /// `docs/archive/AKUMA_STALE_TID_ZOMBIE_SLOT.md`). With the hold, the zombie's
 /// records stay true until the reap, because nothing else can be on that slot.
@@ -848,7 +1037,7 @@ pub mod test_hooks {
     }
 
     /// `(own_slot, stamped own generation, live generation of that slot)`.
-    /// `test_identity_generation_detects_recycle` (`src/process_tests.rs`)
+    /// `test_identity_generation_detects_recycle` (`crates/akuma-kernel-tests-aarch64/src/process_tests.rs`)
     /// asserts the last two diverge after a recycle and that the stale entry
     /// does not resolve to the slot's next occupant.
     pub fn generation_state(tid: usize) -> (u16, u32, u32) {

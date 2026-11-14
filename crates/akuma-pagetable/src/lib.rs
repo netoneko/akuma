@@ -5,7 +5,7 @@
 //!
 //! Every walker in the tree reached a table as `phys_to_virt(pa) as *mut u64`,
 //! then `.add(index).read_volatile()` / `.write_volatile(..)` — 14 sites in
-//! `amd64/src/paging.rs`, ~30 in the amd64 half of `akuma-mmu`, 80-odd in its
+//! `crates/akuma-kernel-amd64/src/paging.rs`, ~30 in the amd64 half of `akuma-mmu`, 80-odd in its
 //! AArch64 half — each with a `// SAFETY: table is a live table frame` comment
 //! vouching for the same fact. The fact is not about the line; it is about the
 //! *frame*, and it is true once.
@@ -18,7 +18,7 @@
 //! # The one stated contract
 //!
 //! > An address handed to [`Table::at`], or reached by following a present entry
-//! > from a root handed to a walker in [`amd64`], is a 4 KiB, 4 KiB-aligned
+//! > from a root handed to a walker in [`amd64`] or [`aarch64`], is a 4 KiB, 4 KiB-aligned
 //! > frame that is a live page table (or a zeroed frame about to become one), is
 //! > mapped in the kernel's physmap, and is not freed or repurposed while a
 //! > reference derived from it is alive.
@@ -41,6 +41,7 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+pub mod aarch64;
 pub mod amd64;
 
 /// Entries in a 4 KiB table: 4096 / 8.
@@ -58,7 +59,7 @@ pub const fn index(va: usize, level: u32) -> usize {
 /// Implemented by each kernel for its physmap. **Safe** to implement: the
 /// walkers treat the returned address as a claim to be checked against the
 /// contract above, and an implementation should `assert!` its own bound the way
-/// `amd64/src/phys.rs::phys_to_virt` does, so a frame outside the physmap fails
+/// `crates/akuma-kernel-amd64/src/phys.rs::phys_to_virt` does, so a frame outside the physmap fails
 /// loudly instead of returning a plausible pointer into nothing.
 pub trait PhysMap {
     /// Kernel-virtual address of the frame at `pa`.
@@ -186,6 +187,30 @@ impl Slot<'_> {
     pub fn addr(&self) -> usize {
         core::ptr::from_ref(&self.table.0[self.idx]) as usize
     }
+}
+
+/// Entry `i` of the table frame at `pa`, on either architecture.
+///
+/// What a walker that is not one of [`aarch64`] / [`amd64`] (the fork clone, the
+/// teardown) reads. `pa` is a promise, as a root is (the crate contract); `i` is checked.
+///
+/// # Panics
+/// If `i >= 512`.
+#[must_use]
+pub fn entry<M: PhysMap>(pa: u64, i: usize) -> u64 {
+    // SAFETY: the crate contract: `pa` is a live table frame (a root, or a frame
+    // reached through a valid table entry of one).
+    unsafe { Table::at(M::table_addr(pa)) }.get(i)
+}
+
+/// Overwrite entry `i` of the table frame at `pa`. As [`entry`]; the caller owns
+/// the TLB maintenance.
+///
+/// # Panics
+/// If `i >= 512`.
+pub fn set_entry<M: PhysMap>(pa: u64, i: usize, value: u64) {
+    // SAFETY: as `entry`.
+    unsafe { Table::at(M::table_addr(pa)) }.set(i, value);
 }
 
 #[cfg(test)]

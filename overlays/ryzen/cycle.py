@@ -5,7 +5,7 @@
                                     [--kernel PATH] [--no-rehearse] [--stay]
 
 1. ship the kernel (default: this tree's `no-tests` build,
-   `target/x86_64-unknown-none/release/akuma-amd64`) to `$W/out/akuma-amd64`
+   `target/x86_64-unknown-none/release/akuma`) to `$W/out/akuma-amd64`
    and this tree's `grub.cfg` to `$W/akuma/overlays/ryzen/`;
 2. rehearse menu entry <entry> in QEMU on ryzen (`qemu.sh`, `DISK=nvme`) and
    stop unless the guest reset itself and p3 checks clean;
@@ -22,7 +22,7 @@ itself) and no wait for Pop.
 
 Everything goes through `scripts/utils/hpbox.py`: kernel and config as the
 `netoneko` user, everything else as root. Build the kernel first:
-    cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests
+    cargo build -p akuma --target x86_64-unknown-none --release --features no-tests
 (`no-tests` matters: the plain build runs the self-test suite and changes boot.)
 """
 import argparse
@@ -68,7 +68,7 @@ def main():
     ap.add_argument("--grep", default=r"\[rtw\]")
     ap.add_argument("--log", choices=("early", "dmesg"), default="early")
     ap.add_argument("--transcript", default="")
-    ap.add_argument("--kernel", default=os.path.join(ROOT, "target/x86_64-unknown-none/release/akuma-amd64"))
+    ap.add_argument("--kernel", default=os.path.join(ROOT, "target/x86_64-unknown-none/release/akuma"))
     ap.add_argument("--no-rehearse", action="store_true")
     ap.add_argument("--stay", action="store_true", help="entry stays up: no rehearsal, no wait for Pop")
     a = ap.parse_args()

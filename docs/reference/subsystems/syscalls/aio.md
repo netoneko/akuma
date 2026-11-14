@@ -28,8 +28,8 @@ laid-out page, not an opaque handle:
    context id — Linux requires zero-on-entry, but some callers (Bun) pass
    uninitialized memory, so a dead/garbage value is tolerated rather than
    rejected.
-3. Allocate one user page (`proc.memory.alloc_mmap` + `pmm::alloc_page_zeroed`
-   + `map_user_page`, `RW_NO_EXEC`), write a `struct aio_ring` header into it
+3. Allocate one user page (`proc.vm_alloc_mmap` + `pmm::alloc_page_zeroed`
+   + `map_user_page_tracked`, `RW_NO_EXEC`, recorded as a region), write a `struct aio_ring` header into it
    (`id=0, head=0, tail=0, magic=0xa10a10a1, nr=capped_nr`).
 4. Register the context in `AIO_CONTEXTS` keyed by **the ring's virtual
    address**, then write that same VA to `*ctx_idp`. The VA *is* the context

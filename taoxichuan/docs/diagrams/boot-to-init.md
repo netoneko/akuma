@@ -13,7 +13,7 @@ flowchart TD
     G --> H["akuma-ryzen-amd64::describe<br/>hvm_start_info, memmap, virtio-mmio slots"]
     H --> I["mem::init — heap (akuma-alloc) + PMM (akuma-pmm)<br/>no-op reaper hooks"]
     I --> J["lapic_init — mask PICs (akuma-port), enable xAPIC,<br/>calibrate vs PIT, arm periodic timer (akuma-lapic-amd64)"]
-    J --> K["exec_twin::init — register ExecRuntime / ThreadRuntime /<br/>ProcessHooks / X86ArchHooks (akuma-exec, akuma-threading)"]
+    J --> K["exec_twin::init — register ExecRuntime / ThreadRuntime /<br/>ProcessHooks / ArchHooks (akuma-exec, akuma-threading)"]
     K --> K2["install_surface — akuma-runtime-tokio::install, uname,<br/>vfs-glue mount table"]
     K2 --> L["map_virtio — virtio-mmio window (disk and NIC)"]
     L --> M["root: .root(make) if given, else .disk() — ext2 on device 0<br/>(akuma-ext2, BlockDevice = Vda); mounted at / and as ROOT_FS"]

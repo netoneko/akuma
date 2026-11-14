@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use spinning_top::Spinlock;
 
 use crate::process::types::{Pid, ProcessState, SignalAction, MAX_SIGNALS};
@@ -15,13 +16,104 @@ use crate::threading;
 /// via Arc — matching Linux CLONE_SIGHAND behavior. Fork/Spawn creates a fresh table.
 pub struct SharedSignalTable {
     pub actions: Spinlock<[SignalAction; MAX_SIGNALS]>,
+    /// Some thread of this group has begun the group's exit (Linux's
+    /// `SIGNAL_GROUP_EXIT`, which lives in the same shared `signal_struct`).
+    /// Only `CLONE_THREAD` shares this table, so "the table" is "the group".
+    group_exit: AtomicBool,
+    /// How the group is ending, once that is decided by something other than
+    /// the leader's own exit: [`GroupExit`] encoded, 0 for none.
+    group_exit_status: AtomicU32,
+}
+
+/// How a thread group is ending, recorded on the group's [`SharedSignalTable`] so every thread
+/// of it reads the same answer.
+///
+/// Set when the decision is made by a thread that is not the one whose exit ends the group: a
+/// sibling's `exit_group(code)`, or a sibling's death by a default-action signal (Linux's
+/// `do_group_exit`, which fixes the group's status at the signal that started it and does not
+/// consult handlers). Each thread takes it at its next return to user mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GroupExit {
+    /// `exit_group(code)`: the low byte is the status.
+    Code(u8),
+    /// Death by this signal.
+    Signal(u32),
+}
+
+impl GroupExit {
+    /// Set on a [`GroupExit::Code`] word; a [`GroupExit::Signal`] word has bit 31 set instead,
+    /// so the two never collide and 0 stays "none".
+    const CODE: u32 = 0x4000_0000;
+    const SIGNAL: u32 = 0x8000_0000;
+
+    const fn encode(self) -> u32 {
+        match self {
+            Self::Code(code) => Self::CODE | code as u32,
+            Self::Signal(sig) => Self::SIGNAL | (sig & 0xff),
+        }
+    }
+
+    const fn decode(word: u32) -> Option<Self> {
+        if word & Self::SIGNAL != 0 {
+            Some(Self::Signal(word & 0xff))
+        } else if word & Self::CODE != 0 {
+            Some(Self::Code((word & 0xff) as u8))
+        } else {
+            None
+        }
+    }
 }
 
 impl SharedSignalTable {
     pub fn new() -> Self {
         Self {
             actions: Spinlock::new([SignalAction::default(); MAX_SIGNALS]),
+            group_exit: AtomicBool::new(false),
+            group_exit_status: AtomicU32::new(0),
         }
+    }
+
+    /// Begin the group's exit: every thread of it should leave user mode at its next chance.
+    /// Unlike [`Self::claim_group_exit`], any number of callers may.
+    pub fn begin_group_exit(&self) {
+        self.group_exit.store(true, Ordering::Release);
+    }
+
+    /// Has some thread of this group begun its exit?
+    #[must_use]
+    pub fn group_exiting(&self) -> bool {
+        self.group_exit.load(Ordering::Acquire)
+    }
+
+    /// `execve` survived the siblings it stopped: the group (now one thread running a new
+    /// image) is not exiting. The recorded [`GroupExit`] is kept: one set while the exec was
+    /// in flight is still the group's death.
+    pub fn end_group_exit_for_exec(&self) {
+        self.group_exit.store(false, Ordering::Release);
+    }
+
+    /// Record how the group ends. A later record replaces an earlier one.
+    pub fn set_group_exit_status(&self, how: GroupExit) {
+        self.group_exit_status.store(how.encode(), Ordering::Release);
+    }
+
+    /// How the group ends, if a sibling decided it.
+    #[must_use]
+    pub fn group_exit_status(&self) -> Option<GroupExit> {
+        GroupExit::decode(self.group_exit_status.load(Ordering::Acquire))
+    }
+
+    /// Claim the group's exit. `true` for exactly one caller per group: the
+    /// thread that runs the teardown (`kill_thread_group` and the rest of
+    /// `exit_group`). Every later caller must not run it too. Each teardown
+    /// grace-waits for its siblings to die, so two of them in one group wait on
+    /// each other for the whole `KILL_GRACE_US` (2 s). A group `SIGKILL`, pended
+    /// on every thread and taken by each one at its own return to user mode,
+    /// did that on every kill
+    /// (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` "Slice 3: signals").
+    #[must_use]
+    pub fn claim_group_exit(&self) -> bool {
+        !self.group_exit.swap(true, Ordering::AcqRel)
     }
 
     /// A private copy of this table, for `fork`/`vfork`.
@@ -55,6 +147,9 @@ impl SharedSignalTable {
     pub fn clone_for_fork(&self) -> Self {
         Self {
             actions: Spinlock::new(*self.actions.lock()),
+            // A new process: a group of one, not exiting, whatever the parent's group is doing.
+            group_exit: AtomicBool::new(false),
+            group_exit_status: AtomicU32::new(0),
         }
     }
 }
@@ -246,13 +341,13 @@ pub fn check_signal_pid(pid: Pid) -> Result<(), SignalDeny> {
 }
 
 /// Deliver `sig` to `pid`'s whole thread group (target + CLONE_THREAD siblings),
-/// or hard-kill it if it has no live thread to interrupt. This is `sys_kill`'s
-/// per-pid delivery logic, factored out so [`kill_process_group`] can reuse it
-/// for each member of a process group instead of duplicating it.
+/// or hard-kill it if it has no live thread to interrupt. Since 2026-11-11 its
+/// only caller is [`kill_foreground_group`] (Ctrl-C from a console session):
+/// `kill(2)`, `tkill`/`tgkill` and `pidfd_send_signal` on every kernel pend
+/// through glue's `signal::sys_kill`/`sys_tkill` instead.
 ///
 /// Returns `true` if the process was found (delivered to a live thread, or
-/// hard-killed via the fallback) — `sys_kill` maps that to its 0-vs-`ESRCH`
-/// return value.
+/// hard-killed via the fallback).
 pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
     let Some(proc) = lookup_process_shared(pid) else {
         return kill_process_with_signal(pid, sig).is_ok();
@@ -262,14 +357,11 @@ pub fn deliver_signal(pid: Pid, sig: u32) -> bool {
     // SIGKILL (9) is unconditional — bypass signal delivery entirely. On
     // Linux, SIGKILL cannot be caught or ignored. Hard-kill the thread group.
     //
-    // **AArch64 only in practice.** amd64's `kill(2)` does not come through
-    // here any more (`amd64/src/signal.rs::sys_kill`, 2026-10-09): on that
-    // target a thread leaves ring 3 only through its own syscall return or a
-    // tick, so it takes `pend_signal_to_group` for every signal, 9 included,
-    // and `kill_thread_group`'s cross-core `mark_thread_terminated` never runs
-    // there. Measured before that: a `kill -9` of any threaded process cost
-    // the full 2 s `KILL_GRACE_US` (no amd64 path consumes `PENDING_KILL`),
-    // and every hard-terminated thread leaked its `amd64::thread::THREADS` row
+    // **AArch64 console Ctrl-C only.** No syscall reaches this any more
+    // (2026-11-11, `docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md` "Slice 3:
+    // signals"): `kill(2)` pends SIGKILL like any other signal, and each
+    // thread takes it at its own next return to user mode. amd64 cannot
+    // survive the cross-core `mark_thread_terminated` below at all
     // (`docs/archive/AKUMA_AMD64_SIGKILL_NATIVE_PATH.md`).
     if sig == 9 {
         crate::process::kill_thread_group(pid, l0_phys, -9);
@@ -447,49 +539,10 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
     true
 }
 
-/// Deliver `sig` to every process whose `.pgid` is `pgid` (POSIX `kill(-pgid,
-/// sig)` group semantics).
-///
-/// `fork`/`clone` propagate `.pgid` from parent to child (a plain
-/// non-job-control shell never calls `setpgid`, so it and everything it execs
-/// share one `pgid`), so this reaches a shell's foreground child without
-/// needing to track "whichever pid is currently in the foreground" — the
-/// mechanism a terminal's INTR character (Ctrl-C) needs. See
-/// `write_to_process_stdin`'s ISIG handling and
-/// `docs/archive/CTRL_C_SIGINT_DELIVERY.md`.
-///
-/// Deliberately excludes the group **leader** (`p.pid == pgid` — by
-/// construction, in every case this is called for, that's the interactive
-/// login shell itself: `spawn_process_with_channel_ext` sets a freshly
-/// spawned top-level process's own `.pgid` to its own `pid`,
-/// `crates/akuma-exec/src/process/image.rs:296`). Live-tested 2026-08-24:
-/// broadcasting to the leader too killed the shell (and the whole SSH
-/// session with it) on roughly 2 of 3 runs — real Unix relies on the shell
-/// protecting itself with `SIG_IGN`, and something in that path is not
-/// reliable here (`SIG_IGN` is correctly stored and honored, and `fork`/
-/// `vfork` both correctly give the child a private `signal_actions` copy —
-/// see `deliver_signal`'s and `SharedSignalTable::clone_for_fork`'s doc
-/// comments — so the exact mechanism is still unattributed; this exclusion
-/// sidesteps it rather than fixes it). Excluding the leader is safe for
-/// every caller of this function today: it exists solely for the terminal's
-/// INTR-character handling in `write_to_process_stdin`, not as a general
-/// `kill(-pgid, sig)` primitive, and the thing that should die on Ctrl-C is
-/// the foreground job, never the shell running it.
-///
-/// Returns how many group members it delivered to — **the number the `[ISIG]`
-/// trace in [`crate::process::write_to_process_stdin`] prints**. Zero is the
-/// interesting value: it means the INTR character reached the line discipline,
-/// named a `foreground_pgid`, and found nothing carrying that `pgid` — which is
-/// a `^C` that raises a signal at nobody and is indistinguishable, from the
-/// terminal, from one that never arrived.
-pub fn kill_process_group(pgid: Pid, sig: u32) -> usize {
-    kill_group(pgid, sig, false)
-}
-
 /// A terminal signal (`^C`, `^\\`) for the foreground group `pgid` of a terminal
 /// whose session shell's group is `session_pgid`: the shell is spared, a job is not.
 ///
-/// [`kill_process_group`] always spares the leader, which is right while the
+/// Sparing the leader is right while the
 /// foreground group *is* the shell's ([`akuma_tty::TerminalState::spares_leader`]).
 /// A job-control shell (busybox `sh -i`) instead makes each job its own group
 /// and `TIOCSPGRP`s to it, and then the leader is the job — sparing it left
@@ -803,5 +856,75 @@ mod signal_can_act_tests {
         assert!(!signal_can_act(SignalHandler::Ignore, SIGWINCH));
         assert!(signal_can_act(SignalHandler::Ignore, SIGKILL));
         assert!(signal_can_act(SignalHandler::Default, SIGSTOP));
+    }
+}
+
+/// The group's exit state lives on the group's table, so a new process starts clean by
+/// construction. On amd64 it was indexed by process slot until 2026-11-12, and a slot reused
+/// by `spawn` or `fork` inherited the dead occupant's state: every spawn on the box exited 241
+/// (`-SIGTERM & 0xff`) until a power cycle (`docs/archive/AKUMA_AMD64_STALE_GROUP_EXIT_STATUS_241.md`).
+#[cfg(test)]
+mod group_exit_tests {
+    use super::{GroupExit, SharedSignalTable};
+    use alloc::sync::Arc;
+
+    #[test]
+    fn a_new_table_is_not_exiting() {
+        let t = SharedSignalTable::new();
+        assert!(!t.group_exiting());
+        assert_eq!(t.group_exit_status(), None);
+    }
+
+    #[test]
+    fn a_fork_child_does_not_inherit_its_parents_group_exit() {
+        let parent = SharedSignalTable::new();
+        parent.begin_group_exit();
+        parent.set_group_exit_status(GroupExit::Signal(15));
+        let child = parent.clone_for_fork();
+        assert!(!child.group_exiting());
+        assert_eq!(child.group_exit_status(), None);
+    }
+
+    #[test]
+    fn threads_share_one_answer() {
+        let leader = Arc::new(SharedSignalTable::new());
+        let thread = Arc::clone(&leader);
+        thread.set_group_exit_status(GroupExit::Code(3));
+        thread.begin_group_exit();
+        assert!(leader.group_exiting());
+        assert_eq!(leader.group_exit_status(), Some(GroupExit::Code(3)));
+    }
+
+    /// The old word was `-(sig)` beside a code flag at bit 30, and every negative word has bit
+    /// 30 set: a reader that tested the flag first read SIGKILL as `exit 247`. The typed
+    /// decode cannot confuse them.
+    #[test]
+    fn codes_and_signals_round_trip_distinctly() {
+        for code in [0u8, 1, 3, 241, 255] {
+            assert_eq!(GroupExit::decode(GroupExit::Code(code).encode()), Some(GroupExit::Code(code)));
+        }
+        for sig in [1u32, 9, 11, 15, 64] {
+            assert_eq!(GroupExit::decode(GroupExit::Signal(sig).encode()), Some(GroupExit::Signal(sig)));
+        }
+        assert_eq!(GroupExit::decode(0), None);
+    }
+
+    #[test]
+    fn exec_ends_the_exit_but_keeps_a_recorded_death() {
+        let t = SharedSignalTable::new();
+        t.begin_group_exit();
+        t.set_group_exit_status(GroupExit::Signal(9));
+        t.end_group_exit_for_exec();
+        assert!(!t.group_exiting());
+        assert_eq!(t.group_exit_status(), Some(GroupExit::Signal(9)));
+    }
+
+    #[test]
+    fn claim_is_once_but_begin_is_any_number() {
+        let t = SharedSignalTable::new();
+        t.begin_group_exit();
+        t.begin_group_exit();
+        assert!(t.group_exiting());
+        assert!(!t.claim_group_exit(), "begun already: no teardown left to claim");
     }
 }

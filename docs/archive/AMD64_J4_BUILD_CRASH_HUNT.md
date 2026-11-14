@@ -37,7 +37,7 @@ slower at `-j4` than it was at `-j1`. Nothing here is parity with AArch64.
 | rig | kernel | what ran | result |
 |---|---|---|---|
 | **ryzen**, Firecracker, 4 vCPU / 4 GiB | `e6d8657` built on ryzen, md5 `9791d5a02e2e` | 10 fresh-boot `kbuild -c -j 4`, whole `/root/ktarget` wiped each time (`CLEAN_ALL=1`) | **10 of 10 PASS**, 90 s each, 0 `[Fault]`, 0 SIGSEGV, 0 `[TLB] stuck`; 27 `[BKL] stuck` per run, unchanged. **31 of 31** with the 21 from 2026-09-29 |
-| **HP box, bare metal**, SMP=4, 16 GiB, USB root | `0b800634` (one commit behind `main`: the HDA stream-release fix, `amd64/src/hda.rs` only; it contains `2d073ca0` and `0e331f5`, so §1's "known hang" gap is closed) | 10 x `rm -rf /root/ktarget; kbuild -c -j 4` via `scripts/benchmarks/amd64_metal_j4_loop.sh` | **7 PASS, 3 FAIL** (all three `EIO` at `execve`); 0 SIGSEGV |
+| **HP box, bare metal**, SMP=4, 16 GiB, USB root | `0b800634` (one commit behind `main`: the HDA stream-release fix, `crates/akuma-kernel-amd64/src/hda.rs` only; it contains `2d073ca0` and `0e331f5`, so §1's "known hang" gap is closed) | 10 x `rm -rf /root/ktarget; kbuild -c -j 4` via `scripts/benchmarks/amd64_metal_j4_loop.sh` | **7 PASS, 3 FAIL** (all three `EIO` at `execve`); 0 SIGSEGV |
 
 Metal runs (96 `Compiling` lines on a pass — the graph is 96 since `akuma-hda`
 joined it, not the 95 of the older numbers):
@@ -58,7 +58,7 @@ joined it, not the 95 of the older numbers):
 **Reading the metal failures.** All three are `lld-wrapper: could not exec
 rust-lld: I/O error (os error 5)`, all linking a **host unit** (build script or
 proc macro) in the first ~30 crates, at 291–380 s. No `rc=139`, no `[Fault]`. It is
-`EIO` from `execve`: `amd64/src/usermode.rs`'s exec path reads the whole image with
+`EIO` from `execve`: `crates/akuma-kernel-amd64/src/usermode.rs`'s exec path reads the whole image with
 `fs::read_image` under `bkl_free_io`, and a failed read of a cache-cold binary
 comes back as `IoError` and is reported as `EIO` — the layer the call-site comment
 ties to the USB-stall `[BKL] stuck` storm of 2026-09-11.
@@ -115,7 +115,7 @@ stands. It does **not** say the metal is fixed.
 
 > **Resolved 2026-09-30.** The box now runs `0b800634`, which contains `2d073ca0`
 > and `0e331f5` (checked: `git merge-base --is-ancestor`, and the box's
-> `amd64/src/sched.rs` has the `REMOVED 2026-09-26` text and no
+> `crates/akuma-kernel-amd64/src/sched.rs` has the `REMOVED 2026-09-26` text and no
 > `bkl_free_by_choice`). The section below records the 2026-09-29 state and why
 > `97fd2d10` was not a fair `-j4` subject; it is kept as history.
 
@@ -130,7 +130,7 @@ exception** after two metal hangs of exactly this shape: `[SWITCH NO-BKL] from=4
 to=2 core=2 via=yield_now`, then silence
 ([`AKUMA_AMD64_BKL_NETWORKING.md`](AKUMA_AMD64_BKL_NETWORKING.md)
 § "2026-09-26"). The box's tree has the exception: its
-`amd64/src/sched.rs` (dated Sep 25) contains `bkl_free_by_choice` ×3 and no
+`crates/akuma-kernel-amd64/src/sched.rs` (dated Sep 25) contains `bkl_free_by_choice` ×3 and no
 "REMOVED 2026-09-26" text, read on the box 2026-09-29. **Confirmed the hard way
 the same evening:** the trashcan crashed with `[SWITCH NO-BKL] … via=yield_now`
 on `97fd2d10` and had rebooted (`up 0 min`, still `97fd2d10`) when checked.

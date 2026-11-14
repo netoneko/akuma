@@ -61,10 +61,10 @@ The AArch64 root `Cargo.toml` forwards `akuma-vfs-glue/smp-shared`. The amd64
 `smp-shared` feature forwarded it to `akuma-exec` and `akuma-syscalls-glue` but
 **not** to `akuma-vfs-glue`, so the amd64 kernel compiled the `1` fallback.
 amd64 did register its `probed_core_count` hook correctly
-(`crate::smp::online_cpus`, `amd64/src/boot.rs` and `amd64/src/fs.rs`), but
+(`crate::smp::online_cpus`, `crates/akuma-kernel-amd64/src/boot.rs` and `crates/akuma-kernel-amd64/src/fs.rs`), but
 with the cfg off nothing ever called it.
 
-**Fix:** `amd64/Cargo.toml`, add `"akuma-vfs-glue/smp-shared"` to `smp-shared`.
+**Fix:** `crates/akuma-kernel-amd64/Cargo.toml`, add `"akuma-vfs-glue/smp-shared"` to `smp-shared`.
 It was safe to enable: the only code that `kernel_smp_shared` gates in that
 crate is `active_core_count` and `probed_core_count`.
 
@@ -114,8 +114,8 @@ non-empty read, so the format change affects no consumer.
 - `cargo build -p akuma-amd64 --target x86_64-unknown-none --release`: builds.
   `cargo check --release` (AArch64): builds.
 - `cargo test -p akuma-threading -p akuma-vfs-glue` on the host: green.
-- Clippy: no new warnings. The remaining ones are in `amd64/src/mm.rs`,
-  `amd64/src/usermode.rs` and `akuma-ext2`, none of them touched by this change.
+- Clippy: no new warnings. The remaining ones are in `crates/akuma-kernel-amd64/src/mm.rs`,
+  `crates/akuma-kernel-amd64/src/usermode.rs` and `akuma-ext2`, none of them touched by this change.
 - `SMP=4 sh amd64/run.sh` (microvm, TCG), a 4-way busy loop, then:
 
 ```

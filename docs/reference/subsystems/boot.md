@@ -32,7 +32,50 @@ For debugging, see [`../../runbooks/debug-boot-hang.md`](../../runbooks/debug-bo
     SGI.
 11. **Boot self-tests** (see below).
 12. **Filesystem init** (block device → ext2 mount).
-13. **SSH server / network** bring-up; main loop polls `memory_monitor()`.
+13. **Network** bring-up, then **init** ([below](#init)); the main loop drains
+    herd's output and polls `memory_monitor()`.
+
+## Init
+
+The last thing every Akuma kernel does at boot is start one userspace program
+and stay out of its way. The three kernel families do it differently today:
+
+| | AArch64 `akuma` | amd64 `akuma` (`--target x86_64-unknown-none`) | Taoxichuan / Shanghai (`akuma-tokio-kernel-*`) |
+|---|---|---|---|
+| Which program | `init=`/`initargs=`; default `/bin/herd daemon`; none if `config::AUTO_START_HERD` is off | `init=`/`initargs=`; default `/bin/sh` on a GRUB boot, none on a PVH boot | `init=` |
+| Where the line comes from | the DTB's `/chosen/bootargs` (`INIT=`/`INITARGS=` to `cargo run`) | PVH start info, or GRUB's command line (`INIT=`/`INITARGS=` to `amd64/run.sh`) | the same, per arch |
+| Started by | `kernel_main` (`crates/akuma-kernel-glue/src/lib.rs`), `spawn_process_with_channel` | `usermode::run_init`, from `lib.rs` (PVH) and `multiboot2.rs` (GRUB) | the builder's `run_init()` |
+| pid | whatever the allocator gives | 1 (`Attach { pid: Some(1) }`) | 1 |
+| stdio | its own channel; the main loop copies its output to the UART. Nothing reads the UART | the console channel and terminal (`Attach`) | COM1 if the kernel calls `.console()` |
+| Console input | none | the console pump (`console` feature) | none |
+| When it exits | `[Herd] Process exited with code N`; the kernel keeps running | `-- init exited --`; the boot task returns | exit code printed, then halt |
+
+**One reader.** Both Akuma kernels keep the boot line once (`akuma_params::capture`; AArch64 in
+`capture_bootargs`, amd64 in `boot::keep_cmdline` on both entry points) and choose init with
+`akuma_params::init::Init` (`from_line` / `from_line_or`, host-tested). Only the defaults differ.
+`initargs=` is comma-separated (`initargs=uname,-a`), and `argv[0]` is always the path.
+
+### amd64, in order
+
+`run_init(path, args)` (`crates/akuma-kernel-amd64/src/usermode.rs`) is four stages:
+
+1. **Find init.** `Init` from the boot line (above), then `fs::read_image_head(path)`, which follows symlinks
+   (`/bin -> usr/bin`). Missing: `[init] not on the disk`, and the boot stops.
+2. **The console** (`console_before_init`). With the `console` feature: end the
+   splash unless init is `herd` (herd's console service ends it), apply
+   `/etc/console.conf`, set the console's terminal size from the framebuffer
+   grid, enumerate a USB keyboard, start the pump. Without it: end the splash
+   and close the console channel's stdin, so init's `read(0)` is EOF.
+3. **Spawn.** glue's `spawn_request` with `Attach { console channel, console
+   terminal, pid: Some(1) }`: the shared spawn every 301 child uses, with the
+   console's channel as init's I/O. It publishes the child, so stage 2 has to be
+   complete first.
+4. **Wait.** `console::set_attached_pid(1)`, the banner, `-- running <path> --`,
+   then the boot task parks a tick at a time until every user task has finished.
+
+Everything in stage 2, and the console attach, exists for a console a person
+types into. The `server` image (`docs/reference/build-profiles.md` § amd64
+images) leaves it out.
 
 ## HVF vs TCG; GIC selection
 
@@ -53,9 +96,9 @@ For debugging, see [`../../runbooks/debug-boot-hang.md`](../../runbooks/debug-bo
 
 ## Boot self-test mechanism
 
-- **Modules:** `src/tests.rs`, `src/async_tests.rs`, `src/daif_tests.rs`,
-  `src/fs_tests.rs`, `src/sync_tests.rs`, `src/pthread_tests.rs`,
-  `src/process_tests.rs`, `src/shell_tests.rs`.
+- **Modules:** `crates/akuma-kernel-tests-aarch64/src/tests.rs`, `crates/akuma-kernel-tests-aarch64/src/async_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/daif_tests.rs`,
+  `crates/akuma-kernel-tests-aarch64/src/fs_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/sync_tests.rs`, `crates/akuma-kernel-tests-aarch64/src/pthread_tests.rs`,
+  `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `src/shell_tests.rs`.
 - **Order** (`src/main.rs:911+`): DAIF → memory → async → (after fs mount) fs →
   threading → futex sync → pthread → process → shell → benchmarks.
 - **Halt on regression:** returns false → `!!! … TESTS FAILED - HALTING !!!` →

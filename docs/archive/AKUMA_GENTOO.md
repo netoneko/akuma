@@ -147,14 +147,14 @@ absolute targets restarting at `/`, `max_hops` bounding loops at the link
 itself), the glue (`akuma-vfs-glue::resolve_symlinks`) supplies the
 `read_link` answers and keeps the devbox `/bin/sh` → `/bin/dash` redirect.
 Both kernels get it through the one choke point: aarch64 wires it in
-`akuma-kernel-glue`, amd64 in `amd64/src/exec_runtime.rs`.
+`akuma-kernel-glue`, amd64 in `crates/akuma-kernel-amd64/src/exec_runtime.rs`.
 
 Tests:
 
 - **12 host tests** in `akuma-vfs` (`symlink_chain_tests`): the lost suffix,
   relative and absolute targets, chains, the sbin-merge shape from the stage3,
   ELOOP bounded, `max_hops` honored, textual `..` pinned as known divergence.
-- **amd64 boot suite** (`amd64/src/fs.rs`): a link interior to a path —
+- **amd64 boot suite** (`crates/akuma-kernel-amd64/src/fs.rs`): a link interior to a path —
   suffix carried through, bytes read through the open that used it. This runs
   in the QEMU rehearsal and on every plain-kernel boot.
 
@@ -191,7 +191,7 @@ removed from p3; `available/gentoo.conf` is untouched. Re-enable with
 `ln -s /etc/herd/available/gentoo.conf /etc/herd/enabled/gentoo.conf`.
 
 **Next: a separate partition, booted as box 0.** The amd64 kernel already
-parses `root=/dev/nvme0n1pN` and `init=` (`amd64/src/multiboot2.rs:992`), so
+parses `root=/dev/nvme0n1pN` and `init=` (`crates/akuma-kernel-amd64/src/multiboot2.rs:992`), so
 the plan is a new p7 carved from the unused tail of p3 (the partition is 279 GB
 but its ext2 covers only 64 GB), the stage3 + portage + openssh copied onto it
 with Pop's tools, and a second GRUB entry
@@ -222,8 +222,8 @@ rtw89 firmware. Menu **entry 17** (`overlays/ryzen/grub.cfg`):
 
 | # | blocker (as observed) | cause | fix |
 |---|---|---|---|
-| 1 | `[init] not on the disk: /bin/sh`, back to Pop | `run_init` used `read_file(path)`, which follows no symlink; Gentoo is usr-merged (`/bin -> usr/bin`, `sh -> bash`) | `run_init` resolves symlinks first, like `execve` (`amd64/src/usermode.rs`); the entry also names the real file (`/usr/bin/bash`) so it works on older kernels |
-| 2 | `wifi: /dev/wifi0: open failed (-2)` in a loop; no network | the rtw89 loader looked up `/lib/firmware/rtw89/...` with `metadata`/`read_at`, neither follows links, and `/lib -> usr/lib`; "no firmware", so no `wifi0` registered | the loader resolves the path once and reads the resolved name (`amd64/src/rtw89.rs`, one `String` at boot) |
+| 1 | `[init] not on the disk: /bin/sh`, back to Pop | `run_init` used `read_file(path)`, which follows no symlink; Gentoo is usr-merged (`/bin -> usr/bin`, `sh -> bash`) | `run_init` resolves symlinks first, like `execve` (`crates/akuma-kernel-amd64/src/usermode.rs`); the entry also names the real file (`/usr/bin/bash`) so it works on older kernels |
+| 2 | `wifi: /dev/wifi0: open failed (-2)` in a loop; no network | the rtw89 loader looked up `/lib/firmware/rtw89/...` with `metadata`/`read_at`, neither follows links, and `/lib -> usr/lib`; "no firmware", so no `wifi0` registered | the loader resolves the path once and reads the resolved name (`crates/akuma-kernel-amd64/src/rtw89.rs`, one `String` at boot) |
 | 3 | `cannot start netmount as hostname would not start` | **`sethostname`/`setdomainname` were in neither syscall table** — no number, no variant, no handler — so OpenRC's `hostname` service got `ENOSYS` | rows in `akuma-syscalls-linux::nr` + `akuma-syscalls-abi` (82 rows), handler in `akuma-syscalls-glue::proc`, `uname` overlays the two fields; pure rule in `akuma_syscalls_linux::uts` with host tests; decode pinned in the abi tests and the amd64 boot suite |
 
 Also learned: the boot log was torn because a background job shares the log fd

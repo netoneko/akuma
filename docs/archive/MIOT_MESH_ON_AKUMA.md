@@ -69,7 +69,7 @@ after opening every file and `try_io!`s the result (`parity-db
 *existing* file, which is why a fresh store worked. The 2026-09-22 amd64
 work added the row to the shared ABI (`akuma-syscalls-abi`: x86_64 221,
 asm-generic 223) and an arm to **one** dispatcher,
-`amd64/src/usermode.rs` (`Syscall::Fadvise64 => 0`). The aarch64
+`crates/akuma-kernel-amd64/src/usermode.rs` (`Syscall::Fadvise64 => 0`). The aarch64
 dispatcher, `crates/akuma-syscalls-glue/src/lib.rs`, had none, so the call
 fell through to ENOSYS.
 

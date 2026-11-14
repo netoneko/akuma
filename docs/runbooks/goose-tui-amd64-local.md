@@ -15,7 +15,7 @@ prints is what a terminal would show.
    `hpbox.akuma()` decodes to text and corrupts binaries. 150 MB takes ~5 min.
 2. Build the kernel and a disk big enough (the 512 MiB default is too small):
    ```bash
-   cargo build -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests
+   cargo build -p akuma --target x86_64-unknown-none --release --features no-tests
    sh amd64/mkdisk.sh $TMP/root.img 700
    D=/opt/homebrew/opt/e2fsprogs/sbin/debugfs
    for d in usr usr/local usr/local/bin; do $D -w -R "mkdir $d" $TMP/root.img; done

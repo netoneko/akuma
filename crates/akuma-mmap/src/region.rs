@@ -32,8 +32,9 @@ pub struct MmapRegion {
     pub pages: usize,
     pub frames: Vec<PhysFrame>,
     /// The protection this mapping is *supposed* to have, as the neutral [`Prot`]
-    /// vocabulary — the eager counterpart of `LazyRegion::flags`, which is still a
-    /// raw AArch64 `u64` because it lives in `akuma-exec`, above this crate.
+    /// vocabulary — the eager counterpart of `LazyRegion::prot`, which records the
+    /// same thing for a demand-paged region (`Option<Prot>`, `None` = unrecorded,
+    /// the split [`prot_recorded`](Self::prot_recorded) makes here).
     ///
     /// Without it an eager region records extent and frames but no permission, so
     /// the EL0 write-permission-fault handler cannot tell a PTE that is wrongly
@@ -100,44 +101,34 @@ pub struct MmapRegion {
     /// *which* file, not a claim on it.
     pub file: Option<FileBacking>,
 
-    /// A **writable `MAP_SHARED` file mapping**: its pages must be written
-    /// back to the file when they leave the address space (`munmap`, `msync`,
-    /// `madvise(MADV_DONTNEED)`).
-    ///
-    /// Akuma has no unified page cache — the reason this shape was `ENOSYS`
-    /// for so long — so coherence is delivered the other way: the mapping is
-    /// populated **eagerly** (`Plan::is_shared_writable` excludes it from both
-    /// lazy paths), every page stays a private frame this region owns in
-    /// [`frames`](Self::frames), and a *write-back of the whole region* is the
-    /// flush. No dirty-bit tracking: each flush rewrites every in-file page
-    /// from its frame, which is wrong only in I/O spent, never in bytes.
-    ///
-    /// This is a record, not a page cache. **On amd64 since 2026-10-03 a lazy
-    /// region with this record is served from the shared writable page table
-    /// (`akuma-fpcache-rw`)**: every mapper of a page maps one frame, so
-    /// mappers *are* coherent with each other and `write(2)` is copied into
-    /// the mapped frames; the paragraph below is the eager (no-identity) path
-    /// and the AArch64 kernel, which never sets this field (its record is
-    /// `akuma-syscalls-glue`'s `SharedFileMapping`). There, two mappers of one
-    /// file do not see each other's writes until a flush lands (and
-    /// `read(2)`/`write(2)` on the same file see a mapping's writes only after
-    /// one). What it does
-    /// guarantee is the guarantee `mmap`'s contract actually needs for the
-    /// dominant single-mapper caller (a database mapping its own files):
-    /// *writes through the mapping reach the file*, and a process that
-    /// unmaps (or `msync`s) before inspecting by other means sees its own
-    /// writes. A process **killed** with the mapping live loses writes since
-    /// its last flush — the exit path does not flush; Linux's page cache
-    /// would have.
+    /// A **writable `MAP_SHARED` file mapping**: its pages are the shared
+    /// writable table's (`akuma-fpcache-rw`, the kernel half `akuma_exec::shm`),
+    /// one frame per file page for every mapper, so mappers are coherent with
+    /// each other and `write(2)` is copied into the mapped frames. Its pages are
+    /// written back to the file when they leave an address space (`munmap`,
+    /// `msync`, `MADV_DONTNEED`, `execve`, exit). Always on a lazy region with a
+    /// [`file`](Self::file) record: a file with no inode identity is refused at
+    /// `mmap`. Both kernels since 2026-11-12; AArch64 kept private frames under
+    /// a separate record until then, so two mappers did not see each other's
+    /// stores. A process **killed** with the mapping live leaves its stores in
+    /// the table, unflushed, until another mapper flushes the page.
     ///
     /// The path is carried — unlike [`FileBacking`]'s integers-only rule —
-    /// because the write-back has no by-inode route (`read_at_by_inode`
-    /// exists; `write_at_by_inode` does not) and the flush needs *some*
-    /// name the VFS can resolve. A rename under a live shared-writable
-    /// mapping redirects its flushes to the new name, which is coherent
-    /// here only because the mapping is this process's private view; the
-    /// `InodePin` keeps the *blocks* alive across an `unlink` either way.
+    /// because the write-back prefers the name (a `/proc` file renders by
+    /// path); after an `unlink` or a rename the flush writes by inode instead,
+    /// and the `InodePin` keeps the blocks alive.
     pub shared_write: Option<SharedWriteBack>,
+
+    /// **Demand-paged**: the region reserves its range and its pages are made
+    /// on first touch, from [`file`](Self::file) or as zeros. An absent page is
+    /// the normal state, not a lost one.
+    ///
+    /// `false` for an eager region, whose pages were all installed at `mmap`
+    /// time. An eager region with no `frames` is not lazy: a CoW-forked child
+    /// inherits every page mapped and owns none of them. The AArch64 readers of
+    /// eager state (the write-fault handler's recorded protection, `munmap`'s
+    /// frame free) ask this before treating a region as backed by present pages.
+    pub lazy: bool,
 }
 
 /// The write-back record for a writable `MAP_SHARED` file mapping.
@@ -211,7 +202,9 @@ pub struct FileBacking {
     /// inode identity has to read by path, and a path is not something this
     /// crate can hold.
     pub inode: u32,
-    /// Byte offset in the file of this region's `start_va`.
+    /// Byte offset in the file of the first byte of file data, which sits
+    /// [`lead`](Self::lead) bytes into the region. With `lead == 0`, as for
+    /// every mapping `mmap` creates, this is the offset of `start_va`.
     pub offset: usize,
     /// Bytes of **file data** reachable from [`offset`](Self::offset).
     ///
@@ -220,6 +213,24 @@ pub struct FileBacking {
     /// as a length rather than a file size so a clipped head adjusts it by the
     /// same arithmetic that adjusts the offset.
     pub filesz: usize,
+    /// Zero-fill bytes at the start of the region, before the file data.
+    ///
+    /// `0` for an `mmap`. Non-zero for an ELF segment whose `p_vaddr` is not
+    /// page-aligned: the region starts at the page below it, and the bytes of
+    /// that page before the segment are not this segment's, so the fill leaves
+    /// them zero. A clip consumes the lead before it moves the offset
+    /// ([`Self::advance`]).
+    pub lead: usize,
+}
+
+/// Where one page of a file-backed region gets its bytes:
+/// `len` bytes from file offset `file_off`, written at byte `dest` of the page.
+/// The rest of the page is zero. `len == 0` means the page is all zero-fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FilePageSpan {
+    pub dest: usize,
+    pub file_off: usize,
+    pub len: usize,
 }
 
 impl FileBacking {
@@ -235,8 +246,12 @@ impl FileBacking {
     /// are far apart: [`MmapRegion::file_page_source`] answers it for a VA, and
     /// a fault path filling a readahead batch answers it for page after page
     /// without a region in hand.
+    ///
+    /// For a backing with no [`lead`](Self::lead) only, which is every mapping
+    /// `mmap` makes; an ELF segment's backing goes through [`Self::page_span`].
     #[must_use]
     pub const fn page_source(self, page_index: usize) -> (usize, usize) {
+        debug_assert!(self.lead == 0, "page_source on a backing with a lead");
         let delta = page_index.saturating_mul(crate::PAGE_SIZE);
         let from_file = {
             let left = self.filesz.saturating_sub(delta);
@@ -253,11 +268,37 @@ impl FileBacking {
     #[must_use]
     pub const fn advance(self, pages: usize) -> Self {
         let bytes = pages.saturating_mul(crate::PAGE_SIZE);
+        if bytes <= self.lead {
+            return Self { lead: self.lead - bytes, ..self };
+        }
+        let past_lead = bytes - self.lead;
         Self {
             mount_id: self.mount_id,
             inode: self.inode,
-            offset: self.offset.saturating_add(bytes),
-            filesz: self.filesz.saturating_sub(bytes),
+            offset: self.offset.saturating_add(past_lead),
+            filesz: self.filesz.saturating_sub(past_lead),
+            lead: 0,
+        }
+    }
+
+    /// The bytes page `page_index` of the region takes from the file, for any
+    /// [`lead`](Self::lead). The file data occupies region bytes
+    /// `[lead, lead + filesz)`; this is that interval cut to one page.
+    #[must_use]
+    pub const fn page_span(self, page_index: usize) -> FilePageSpan {
+        let page_lo = page_index.saturating_mul(crate::PAGE_SIZE);
+        let page_hi = page_lo.saturating_add(crate::PAGE_SIZE);
+        let data_lo = self.lead;
+        let data_hi = self.lead.saturating_add(self.filesz);
+        let lo = if page_lo > data_lo { page_lo } else { data_lo };
+        let hi = if page_hi < data_hi { page_hi } else { data_hi };
+        if lo >= hi {
+            return FilePageSpan { dest: 0, file_off: 0, len: 0 };
+        }
+        FilePageSpan {
+            dest: lo - page_lo,
+            file_off: self.offset.saturating_add(lo - data_lo),
+            len: hi - lo,
         }
     }
 }
@@ -284,7 +325,7 @@ impl MmapRegion {
     pub fn owned_with_prot(start_va: usize, frames: Vec<PhysFrame>, prot: Prot) -> Self {
         Self {
             start_va, pages: frames.len(), frames, prot,
-            shared_anon: false, prot_recorded: true, file: None, shared_write: None,
+            shared_anon: false, prot_recorded: true, file: None, shared_write: None, lazy: false,
         }
     }
 
@@ -302,7 +343,7 @@ impl MmapRegion {
     pub fn inherited_with_prot(start_va: usize, pages: usize, prot: Prot) -> Self {
         Self {
             start_va, pages, frames: Vec::new(), prot,
-            shared_anon: false, prot_recorded: true, file: None, shared_write: None,
+            shared_anon: false, prot_recorded: true, file: None, shared_write: None, lazy: false,
         }
     }
 
@@ -311,6 +352,18 @@ impl MmapRegion {
     /// The accessor a *deny* decision must use. A *grant* decision can read
     /// [`prot`](Self::prot) directly, because the unrecorded default (`NONE`)
     /// grants nothing anyway.
+    /// A **demand-paged** region: `pages` reserved, none present, owning no
+    /// frames. `prot` is `None` when the mapping records no protection and the
+    /// fault path chooses one from the access, which is
+    /// [`prot_recorded`](Self::prot_recorded) `false`.
+    #[must_use]
+    pub fn demand_paged(start_va: usize, pages: usize, prot: Option<Prot>) -> Self {
+        let mut r = Self::inherited_with_prot(start_va, pages, prot.unwrap_or(crate::Prot::NONE));
+        r.prot_recorded = prot.is_some();
+        r.lazy = true;
+        r
+    }
+
     #[must_use]
     pub const fn recorded_prot(&self) -> Option<Prot> {
         if self.prot_recorded { Some(self.prot) } else { None }
@@ -414,17 +467,14 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
             // would serve them as anonymous zeros — a program image full of
             // holes, reported as a `SIGSEGV` or worse as silence.
             inherited.file = r.file;
-            // (amd64 re-attaches it for the regions it shares by identity at
-            // fork — `usermode.rs::share_parent_memory_into` — because there
-            // the child maps the parent's frames and is a real mapper.)
-            // `shared_write` is deliberately **dropped**, unlike `file`: the
-            // child owns no frames (CoW), so its flush would write nothing —
-            // and if a child write broke CoW into a private frame, flushing
-            // that frame back would be the parent-or-child divergence
-            // reaching the file. The file answers to the mapper that owns
-            // frames; a forked child of a shared-writable mapping flushes
-            // nothing, by construction.
-            inherited.shared_write = None;
+            // A lazy parent region is lazy in the child: its absent pages are
+            // still to be made on first touch, not missing.
+            inherited.lazy = r.lazy;
+            // `shared_write` is carried too: both kernels share a writable
+            // `MAP_SHARED` file mapping's frames by identity at fork (they are
+            // the shared writable table's), so the child is a real mapper — it
+            // must write back on `munmap`/exit and release its table references.
+            inherited.shared_write.clone_from(&r.shared_write);
             if r.shared_anon { inherited.shared_anon() } else { inherited }
         })
         .collect()
@@ -583,6 +633,7 @@ pub fn mprotect_eager_regions_in_range(
         // Each piece keeps its own place in the file: the head starts where the
         // region did, and the two below it start that many pages further in.
         let file = reg.file;
+        let lazy = reg.lazy;
         // `filter_map(next)` tolerates a CoW-inherited region (`frames` empty):
         // each piece then carries its page count and no frames, which is right.
         let mut it = reg.frames.into_iter();
@@ -596,14 +647,14 @@ pub fn mprotect_eager_regions_in_range(
             out.push(MmapRegion {
                 start_va: reg_start, pages: head_pages, frames: head,
                 prot: old_prot, shared_anon, prot_recorded: was_recorded, file,
-                shared_write: shared_write.clone() });
+                shared_write: shared_write.clone(), lazy });
         }
         if mid_pages > 0 {
             out.push(MmapRegion {
                 start_va: clip_start, pages: mid_pages, frames: mid,
                 prot: new_prot, shared_anon, prot_recorded: true,
                 file: file.map(|f| f.advance(head_pages)),
-                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages)) });
+                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages)), lazy });
             touched += 1;
         }
         if tail_pages > 0 {
@@ -611,7 +662,7 @@ pub fn mprotect_eager_regions_in_range(
                 start_va: clip_end, pages: tail_pages, frames: tail,
                 prot: old_prot, shared_anon, prot_recorded: was_recorded,
                 file: file.map(|f| f.advance(head_pages + mid_pages)),
-                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + mid_pages)) });
+                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + mid_pages)), lazy });
         }
     }
     *regions = out;
@@ -648,6 +699,49 @@ pub fn detach_eager_regions_in_range(
     range_start: usize,
     range_end: usize,
 ) -> alloc::vec::Vec<(usize, usize, alloc::vec::Vec<PhysFrame>)> {
+    detach_regions_in_range_where(regions, range_start, range_end, |r| !r.lazy)
+        .into_iter()
+        .map(|p| (p.start_va, p.pages, p.frames))
+        .collect()
+}
+
+/// [`detach_eager_regions_in_range`] for the **demand-paged** regions.
+///
+/// Clips at both ends. A piece names its file backing (already advanced to the piece's start), so
+/// the caller can tell which files the removal may have stopped mapping.
+#[must_use]
+pub fn detach_lazy_regions_in_range(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    range_start: usize,
+    range_end: usize,
+) -> alloc::vec::Vec<DetachedPiece> {
+    detach_regions_in_range_where(regions, range_start, range_end, |r| r.lazy)
+}
+
+/// One piece cut out of a region by [`detach_regions_in_range_where`].
+#[derive(Debug)]
+pub struct DetachedPiece {
+    pub start_va: usize,
+    pub pages: usize,
+    /// The frames the region owned in this piece (none for a lazy region or a
+    /// CoW-inherited one).
+    pub frames: alloc::vec::Vec<PhysFrame>,
+    /// The piece's file backing, advanced to `start_va`.
+    pub file: Option<FileBacking>,
+    pub lazy: bool,
+}
+
+/// Detach the regions `select` picks that overlap `[range_start, range_end)`.
+///
+/// Partial ones are clipped at both ends; regions it does not pick are left
+/// alone. The clipping, ordering and survivor rules are
+/// [`detach_eager_regions_in_range`]'s.
+pub fn detach_regions_in_range_where(
+    regions: &mut alloc::vec::Vec<MmapRegion>,
+    range_start: usize,
+    range_end: usize,
+    select: impl Fn(&MmapRegion) -> bool,
+) -> alloc::vec::Vec<DetachedPiece> {
     let mut pieces = alloc::vec::Vec::new();
     if range_end <= range_start {
         return pieces;
@@ -691,7 +785,7 @@ pub fn detach_eager_regions_in_range(
         if reg_start >= range_end {
             break;
         }
-        if reg_end <= range_start {
+        if reg_end <= range_start || !select(&regions[i]) {
             i += 1;
             continue;
         }
@@ -717,6 +811,7 @@ pub fn detach_eager_regions_in_range(
         // Nor where the region sits in its file — but the surviving *tail*
         // starts further in, by everything the head and the clip took.
         let file = regions[i].file;
+        let lazy = regions[i].lazy;
         let shared_write = regions[i].shared_write.clone();
         let mut it = core::mem::take(&mut regions[i].frames).into_iter();
         let head: alloc::vec::Vec<PhysFrame> = (0..head_pages).filter_map(|_| it.next()).collect();
@@ -759,7 +854,7 @@ pub fn detach_eager_regions_in_range(
                 start_va: clip_end, pages: tail_pages, frames: tail, prot,
                 shared_anon, prot_recorded,
                 file: file.map(|f| f.advance(head_pages + clip_pages)),
-                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + clip_pages)) };
+                shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + clip_pages)), lazy };
             if next == i {
                 regions[i] = tail_region;
             } else {
@@ -772,7 +867,13 @@ pub fn detach_eager_regions_in_range(
             regions.remove(i);
         }
         if clip_pages > 0 {
-            pieces.push((clip_start, clip_pages, mid));
+            pieces.push(DetachedPiece {
+                start_va: clip_start,
+                pages: clip_pages,
+                frames: mid,
+                file: file.map(|f| f.advance(head_pages)),
+                lazy,
+            });
         }
         // Step over the survivors. They lie outside [range_start, range_end) by
         // construction, so re-examining them could only waste overlap tests —
@@ -1127,16 +1228,16 @@ mod mmap_region_inheritance_tests {
     }
 
     #[test]
-    fn cow_child_drops_the_writeback_record_but_keeps_the_file_record() {
+    fn fork_child_keeps_the_writeback_record_and_the_file_record() {
         let mut parent = MmapRegion::owned_with_prot(0x1000_0000, frames(2), Prot::RW);
         parent.file = Some(FileBacking {
-            mount_id: 1, inode: 7, offset: 0, filesz: 2 * 4096,
+            mount_id: 1, inode: 7, offset: 0, filesz: 2 * 4096, lead: 0,
         });
         parent.shared_write = Some(swb("/data/db", 0));
         let child = &inherit_mmap_regions_for_cow_child(&[parent.clone()])[0];
         assert!(child.file.is_some(), "fault-time fills still need the source");
-        assert!(child.shared_write.is_none(),
-            "a child owns no frames; a record here would flush nothing, or worse");
+        assert_eq!(child.shared_write, parent.shared_write,
+            "the child maps the table's frames: it writes back and releases them too");
     }
 
     /// Total pages a region list covers, for conservation assertions.
@@ -1277,7 +1378,7 @@ mod file_backing_tests {
     const PAGE: usize = 4096;
 
     fn backing(offset: usize, filesz: usize) -> FileBacking {
-        FileBacking { mount_id: 2, inode: 77, offset, filesz }
+        FileBacking { mount_id: 2, inode: 77, offset, filesz, lead: 0 }
     }
 
     fn file_region(start_va: usize, pages: usize, file: FileBacking) -> MmapRegion {
@@ -1525,7 +1626,7 @@ mod file_backing_tests {
     /// Checked against the predecessor as an oracle rather than against expected
     /// values: a wrong answer here does not crash, it serves a fault from the
     /// wrong region — the same reason `maps_skip_lookup_check` is written this
-    /// way in `amd64/src/fd.rs`.
+    /// way in `crates/akuma-kernel-amd64/src/fd.rs`.
     #[test]
     fn region_lookup_matches_the_scan_it_replaced() {
         let regions = alloc::vec![
@@ -1553,5 +1654,120 @@ mod file_backing_tests {
         assert_eq!(f.advance(2), backing(2 * PAGE, PAGE));
         // Past the end of the data entirely: zero bytes, not a wrap.
         assert_eq!(f.advance(5), backing(5 * PAGE, 0));
+    }
+}
+
+#[cfg(test)]
+mod lead_tests {
+    use super::{FileBacking, FilePageSpan, MmapRegion};
+    use crate::Prot;
+
+    const PAGE: usize = 4096;
+
+    /// AArch64's `LazySource::File` model, in absolute terms: file data for VA
+    /// `v` in `[seg, seg + filesz)` is file byte `off + (v - seg)`. A clip never
+    /// changes these three; it only moves the region's start.
+    fn absolute(page_va: usize, seg: usize, off: usize, filesz: usize) -> FilePageSpan {
+        let lo = page_va.max(seg);
+        let hi = (page_va + PAGE).min(seg + filesz);
+        if lo >= hi {
+            return FilePageSpan { dest: 0, file_off: 0, len: 0 };
+        }
+        FilePageSpan { dest: lo - page_va, file_off: off + (lo - seg), len: hi - lo }
+    }
+
+    #[test]
+    fn lead_backing_matches_the_absolute_model_after_every_clip() {
+        // Region starts at the page below an unaligned segment, as the ELF
+        // loader makes it; the file offset is congruent with the VA mod a page.
+        for &(lead, filesz) in &[(0, 3 * PAGE + 17), (0x7a8, 2 * PAGE), (0xff0, 5), (0x10, 0), (0x123, 6 * PAGE)] {
+            let region_start = 0x40_0000usize;
+            let seg = region_start + lead;
+            let off = 0x1_0000 + lead;
+            let pages = 8;
+            let fb = FileBacking { mount_id: 1, inode: 9, offset: off, filesz, lead };
+            for clip in 0..pages {
+                let piece = fb.advance(clip);
+                for p in 0..(pages - clip) {
+                    let va = region_start + (clip + p) * PAGE;
+                    assert_eq!(piece.page_span(p), absolute(va, seg, off, filesz),
+                        "lead={lead:#x} filesz={filesz:#x} clip={clip} page={p}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn without_a_lead_page_span_agrees_with_page_source() {
+        let fb = FileBacking { mount_id: 1, inode: 9, offset: 0x2000, filesz: 2 * PAGE + 100, lead: 0 };
+        for p in 0..4 {
+            let (off, len) = fb.page_source(p);
+            let span = fb.page_span(p);
+            assert_eq!(span.len, len);
+            if len > 0 {
+                assert_eq!((span.dest, span.file_off), (0, off));
+            }
+        }
+    }
+
+    #[test]
+    fn a_clip_inside_the_lead_keeps_the_offset() {
+        // A lead longer than a page: the first clipped page was all zero-fill.
+        let fb = FileBacking { mount_id: 1, inode: 9, offset: 0x5000, filesz: PAGE, lead: PAGE + 8 };
+        let a = fb.advance(1);
+        assert_eq!((a.lead, a.offset, a.filesz), (8, 0x5000, PAGE));
+        let b = fb.advance(2);
+        assert_eq!((b.lead, b.offset, b.filesz), (0, 0x5000 + PAGE - 8, 8));
+    }
+
+    #[test]
+    fn demand_paged_region_records_prot_only_when_given() {
+        let r = MmapRegion::demand_paged(0x1000, 4, None);
+        assert!(r.lazy && r.frames.is_empty() && r.pages == 4);
+        assert_eq!(r.recorded_prot(), None);
+        let r = MmapRegion::demand_paged(0x1000, 4, Some(Prot::RW));
+        assert_eq!(r.recorded_prot(), Some(Prot::RW));
+    }
+
+    #[test]
+    fn splits_and_cow_inheritance_keep_the_lazy_marker() {
+        let mut list = alloc::vec![MmapRegion::demand_paged(0x10_0000, 4, Some(Prot::RW))];
+        let _ = super::mprotect_eager_regions_in_range(&mut list, 0x10_1000, 0x10_2000, Prot::RO);
+        assert_eq!(list.len(), 3);
+        assert!(list.iter().all(|r| r.lazy));
+        let _ = super::detach_eager_regions_in_range(&mut list, 0x10_0000, 0x10_1000);
+        assert!(list.iter().all(|r| r.lazy));
+        let child = super::inherit_mmap_regions_for_cow_child(&list);
+        assert!(child.iter().all(|r| r.lazy));
+    }
+
+    #[test]
+    fn eager_and_lazy_detach_each_leave_the_other_kind_alone() {
+        let base = 0x20_0000;
+        let file = FileBacking { mount_id: 1, inode: 9, offset: 0x3000, filesz: 0x10_000, lead: 0x800 };
+        let mut list = alloc::vec![
+            MmapRegion::inherited_with_prot(base, 2, Prot::RW),
+            MmapRegion::demand_paged(base + 0x2000, 4, Some(Prot::RO)).file_backed(file),
+        ];
+        // The eager detach over everything takes only the eager region.
+        let eager = super::detach_eager_regions_in_range(&mut list, base, base + 0x6000);
+        assert_eq!(eager.len(), 1);
+        assert_eq!((eager[0].0, eager[0].1), (base, 2));
+        assert_eq!(list.len(), 1);
+        assert!(list[0].lazy);
+        // The lazy detach clips: pages 1..3 of the lazy region go, head and tail stay.
+        let lazy = super::detach_lazy_regions_in_range(&mut list, base + 0x3000, base + 0x5000);
+        assert_eq!(lazy.len(), 1);
+        let p = &lazy[0];
+        assert!(p.lazy && p.frames.is_empty());
+        assert_eq!((p.start_va, p.pages), (base + 0x3000, 2));
+        // One page in: the 0x800 lead is consumed, then 0x800 of file data.
+        let f = p.file.expect("piece keeps its file");
+        assert_eq!((f.lead, f.offset, f.inode), (0, 0x3800, 9));
+        assert_eq!(list.len(), 2);
+        assert_eq!((list[0].start_va, list[0].pages), (base + 0x2000, 1));
+        assert_eq!((list[1].start_va, list[1].pages), (base + 0x5000, 1));
+        assert!(list.iter().all(|r| r.lazy));
+        assert_eq!(list[0].file.unwrap().lead, 0x800);
     }
 }

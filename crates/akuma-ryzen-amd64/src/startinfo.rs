@@ -94,6 +94,17 @@ pub struct StartInfo {
     pub memmap_entries: u32,
 }
 
+/// Why [`StartInfo::cmdline_complete`] did not return the whole line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CmdlineError {
+    /// No terminating NUL within the buffer: the line is longer than the caller allowed for.
+    TooLong,
+    /// A byte of the line could not be read from physical memory.
+    Unreadable,
+    /// The line is not UTF-8.
+    NotUtf8,
+}
+
 impl StartInfo {
     /// Parse the block at `pa`, or `None` if the magic does not match.
     #[must_use]
@@ -132,6 +143,41 @@ impl StartInfo {
             size: read_u64(m, base + 0x08)?,
             kind: read_u32(m, base + 0x10)?,
         })
+    }
+
+    /// [`Self::cmdline`], but a line that does not fit is an error instead of a prefix.
+    ///
+    /// `cmdline` stops at `buf.len()` without saying so, which is right for a consumer that wants `smp=` off the front of a long
+    /// line and wrong for one that reads a *value* from the middle of it: a cut-off hex key is still valid hex. Here the NUL
+    /// must be found inside `buf`, or the answer is [`CmdlineError::TooLong`]. `Ok(None)` is "no command line".
+    ///
+    /// # Errors
+    /// [`CmdlineError::TooLong`] when no NUL terminates the line within `buf`; [`CmdlineError::Unreadable`] when a byte of it
+    /// cannot be read; [`CmdlineError::NotUtf8`] when it is not UTF-8.
+    pub fn cmdline_complete<'a, M: PhysMem + ?Sized>(&self, m: &M, buf: &'a mut [u8]) -> Result<Option<&'a str>, CmdlineError> {
+        if self.cmdline_paddr == 0 {
+            return Ok(None);
+        }
+        let mut len = 0;
+        loop {
+            let pa = self.cmdline_paddr.checked_add(len as u64).ok_or(CmdlineError::Unreadable)?;
+            let mut one = [0u8; 1];
+            if !m.read(pa, &mut one) {
+                return Err(CmdlineError::Unreadable);
+            }
+            if one[0] == 0 {
+                break;
+            }
+            if len == buf.len() {
+                return Err(CmdlineError::TooLong);
+            }
+            buf[len] = one[0];
+            len += 1;
+        }
+        if len == 0 {
+            return Ok(None);
+        }
+        core::str::from_utf8(&buf[..len]).map(Some).map_err(|_| CmdlineError::NotUtf8)
     }
 
     /// Copy the boot command line into `buf`, returning it as a `str`.

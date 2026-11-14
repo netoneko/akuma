@@ -56,9 +56,14 @@ property, not a size trade — see
 - Used by **every profile**. There is no other sshd.
 - **Started two different ways.** Normally herd launches it from
   `/etc/herd/enabled/sshd.conf` (`--port 22` since 2026-08-10, so host `2222` as
-  documented; disks populated before that still say `--port 23`). On
-  `extreme + userspace-sshd` there is no herd, and `config::AUTO_START_SSHD`
-  spawns `/bin/sshd --port 22 --shell /bin/sh` directly from `kernel_main`.
+  documented; disks populated before that still say `--port 23`). herd is
+  the only thing that starts it (`AUTO_START_HERD` is `true` on every build).
+- **The session environment is built from scratch** (`session_env`): `HOME`,
+  `USER`, `LOGNAME` and `PATH` always, `ENV=/etc/profile`, and `TERM` only for
+  a pty. Nothing is inherited from sshd's own environment. A variable a program
+  needs must be set there: busybox ash does not export its default `PATH`, and
+  gcc without one cannot find `cc1`
+  ([`../../archive/SSHD_SESSION_WITHOUT_PATH.md`](../../archive/SSHD_SESSION_WITHOUT_PATH.md)).
 
 ### Resolved: unauthenticated pre-auth panic
 
@@ -274,7 +279,16 @@ limitations accepted and documented rather than silently left).
   though they're moot talking to this repo's own `sshd`.
 - Identity key precedence: `-i <path>` → `$HOME/.ssh/id_ed25519` →
   `/etc/sshd/id_ed25519` (`sshd`'s own host key, reused) → generate + persist
-  to `$HOME/.ssh/id_ed25519`. Raw 32-byte format only, not OpenSSH PEM.
+  to `$HOME/.ssh/id_ed25519`. An identity file is **Akuma's raw 32-byte seed or a standard
+  unencrypted OpenSSH Ed25519 private key** (`-----BEGIN OPENSSH PRIVATE KEY-----`, what
+  `ssh-keygen -t ed25519 -N ''` writes), so a key made elsewhere works with `-i` unchanged. A
+  passphrase-protected key, a non-Ed25519 key or a damaged file is refused with a message that says
+  which, then the next default is tried. The parser is
+  `akuma_ssh_crypto::keys::parse_openssh_private_key_ed25519` (host-tested against real `ssh-keygen`
+  output, including every truncation); the client only calls it
+  (`userspace/sshd/src/client/keys.rs::try_load_key`). Verified on the ryzen: the OpenSSH form of a
+  key that logs in raw also logs in, and the old client rejects that same file
+  ([`../../archive/BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md`](../../archive/BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING.md) Update 8).
 - Host-tested pure wire logic (KEXINIT, exchange-hash, packet framing) lives
   in `sshd::client_wire` (the package lib target) — the `ssh` binary itself
   links `libakuma` unconditionally, same reason `sshd`'s own `main.rs` can't
@@ -328,7 +342,7 @@ limitations accepted and documented rather than silently left).
   subprocess sharing its parent's controlling terminal. Host-tested directly
   (`spawn.rs`'s `terminal_inheritance_tests`) and end-to-end
   (`test_box_crossing_spawn_gets_fresh_terminal_state`,
-  `src/process_tests.rs`, `sc-containers`-gated): registers a `TerminalState`
+  `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`, `sc-containers`-gated): registers a `TerminalState`
   under the test thread's id, spawns once same-box and once into a fresh
   box, and compares `Arc` identity both times.
 - **Key translation** (`akuma_ssh::util::translate_input_keys`): the
@@ -336,7 +350,22 @@ limitations accepted and documented rather than silently left).
   xterm sequences into actions: Delete `\x1b[3~`, Home `\x1b[1~`, End `\x1b[4~`,
   arrows `\x1b[A/B/C/D`. Window-change requests signal a resize byte to the
   foreground process.
-- **Ctrl-C / `SIGINT`:** handled in the kernel, not sshd. `write_to_process_
+- **sshd's sessions are real Linux ptys.** sshd builds `libakuma/linux-abi` on every
+  kernel, and a `pty-req` session is spawned by `spawn_pty_linux`. That opens `/dev/ptmx`,
+  and the child takes `setsid`, then `TIOCSCTTY` on `/dev/pts/N`, as fd 0, 1 and 2. The
+  terminal is glue's pty (`crates/akuma-syscalls-glue/src/pty.rs`) on both kernels, so
+  echo, `ISIG` and job control are its line discipline. sshd's `TIOCSWINSZ` goes to the
+  master. Three rules:
+  - The session child starts from **default signal dispositions and an empty mask**. An
+    ignored SIGINT inherited from whoever started sshd would otherwise survive `execve` and
+    make `^C` dead.
+  - sshd cooks `\n` into `\r\n` only when a requested pty came back as pipes
+    (`!SpawnResult::terminal`), as on a kernel with no `/dev/ptmx`. A real pty's `ONLCR`
+    already does it.
+  - An exec channel without `pty-req` keeps pipes and raw bytes.
+
+  [`../../archive/SSH_SESSIONS_HAD_NO_PTY.md`](../../archive/SSH_SESSIONS_HAD_NO_PTY.md).
+- **Ctrl-C / `SIGINT` on a native spawn's terminal:** handled in the kernel, not sshd. `write_to_process_
   stdin` (`crates/akuma-exec/src/process/mod.rs`) — the chokepoint every
   stdin write reaches, sshd's included, via `/proc/<pid>/fd/0` — checks
   `ISIG`/`cc[VINTR]` on a real pty session (`channel.is_terminal()`) and
@@ -345,9 +374,9 @@ limitations accepted and documented rather than silently left).
   [`../../archive/CTRL_C_SIGINT_DELIVERY.md`](../../archive/CTRL_C_SIGINT_DELIVERY.md).
 - **Who owns the child's stdin depends on the ABI sshd is built for.** Natively the
   kernel's `SPAWN` owns it: sshd writes through `/proc/<pid>/fd/0` and ends it with
-  `close_child_stdin`. Built `libakuma/linux-abi` (Taoxichuan), the spawn is
-  `fork`+`execve` and sshd owns the write end of the child's stdin pipe
-  (`SpawnResult::stdin_fd`); EOF is closing it. `bridge_process` takes whichever the
+  `close_child_stdin`. Built `libakuma/linux-abi` (every sshd build), the spawn is
+  `fork`+`execve` and sshd owns the write end of the child's stdin pipe, or a duplicate of a pty
+  master (`SpawnResult::stdin_fd`). For a pipe, EOF is closing it. `bridge_process` takes whichever the
   spawn returned. A `linux-abi` spawn that gives the child no stdin pipe leaves the
   pump feeding a descriptor the child does not read
   ([`../../archive/TAOXICHUAN_SSH_STDIN_PUMP.md`](../../archive/TAOXICHUAN_SSH_STDIN_PUMP.md)).

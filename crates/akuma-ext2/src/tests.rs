@@ -2,7 +2,7 @@ use alloc::vec;
 use alloc::vec::Vec;
 use crate::BlockDevice;
 use crate::Ext2Filesystem;
-use akuma_vfs::Filesystem;
+use akuma_vfs::{Filesystem, FsError};
 
 /// In-memory block device backed by a `Vec<u8>`.
 pub struct MemBlockDevice {
@@ -219,6 +219,72 @@ fn create_dir_is_findable() {
     assert!(fs.exists("/findme"), "created dir should be findable via lookup");
     let m = fs.metadata("/findme").unwrap();
     assert!(m.is_dir, "created entry should be a directory");
+}
+
+/// A regular file is not a directory: creating anything *under* it is ENOTDIR and
+/// must leave the file untouched. `lookup_parent` used to return the file's inode, so
+/// `mkdir f/x` wrote a dirent into its data block and bumped its link count.
+#[test]
+fn creating_under_a_regular_file_is_not_a_directory() {
+    let fs = mount_empty();
+    fs.write_file("/f", b"x\n").unwrap();
+    assert_eq!(fs.create_dir("/f/x"), Err(FsError::NotADirectory));
+    assert_eq!(fs.write_file("/f/w", b"hi"), Err(FsError::NotADirectory));
+    let m = fs.metadata("/f").unwrap();
+    assert_eq!((m.size, m.is_dir), (2, false), "the file must be unchanged");
+    assert_eq!(fs.read_file("/f").unwrap(), b"x\n");
+}
+
+/// The type bytes `fs` stored for `names` in directory `dir`.
+fn stored_types(fs: &Ext2Filesystem<MemBlockDevice>, dir: &str, names: &[&str]) -> Vec<(String, u8)> {
+    let state = fs.state.read();
+    let node = fs.read_inode(&state, fs.lookup_path(dir).unwrap()).unwrap();
+    let data = fs.read_inode_data(&state, &node).unwrap();
+    fs.parse_directory(&data)
+        .into_iter()
+        .filter(|(_, n, _)| names.contains(&n.as_str()))
+        .map(|(_, n, ft)| (n, ft))
+        .collect()
+}
+
+/// Without `INCOMPAT_FILETYPE` a dirent's byte 7 is the high half of `name_len`, not a
+/// type: new entries must store 0 there (e2fsck clears anything else), and `read_dir`
+/// must take the kind from the inode. It used to read 0 as "not a directory", so after
+/// e2fsck zeroed the bytes on a guest disk, `getdents64` reported `.git/refs/heads` as a
+/// regular file and git saw every directory as an untracked file.
+#[test]
+fn without_the_filetype_feature_dirents_store_no_type_and_read_dir_asks_the_inode() {
+    extern crate std;
+    let mut bytes = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.ext2")).unwrap();
+    assert_ne!(bytes[1024 + 96] & 0x2, 0, "the fixture has INCOMPAT_FILETYPE; this test turns it off");
+    bytes[1024 + 96] &= !0x2;
+    let fs = Ext2Filesystem::new(MemBlockDevice::from_bytes(&bytes), || 0).unwrap();
+    fs.create_dir("/d").unwrap();
+    fs.create_dir("/d/sub").unwrap();
+    fs.write_file("/f", b"x").unwrap();
+
+    let root = fs.read_dir("/").unwrap();
+    let kind = |name: &str| root.iter().find(|e| e.name == name).map(|e| e.is_dir);
+    assert_eq!(kind("d"), Some(true), "a directory with no stored type is still a directory");
+    assert_eq!(kind("f"), Some(false));
+    assert!(fs.read_dir("/d").unwrap().iter().any(|e| e.name == "sub" && e.is_dir));
+
+    for (name, ft) in stored_types(&fs, "/", &["d", "f"]).into_iter().chain(stored_types(&fs, "/d", &[".", "..", "sub"])) {
+        assert_eq!(ft, 0, "{name}: no type byte may be stored without INCOMPAT_FILETYPE");
+    }
+}
+
+/// With `INCOMPAT_FILETYPE` (the fixture as built) the types are stored, so `getdents64`
+/// can report `d_type` without reading the inode.
+#[test]
+fn with_the_filetype_feature_dirents_store_their_type() {
+    let fs = mount_empty();
+    fs.create_dir("/d").unwrap();
+    fs.write_file("/f", b"x").unwrap();
+    let mut got = stored_types(&fs, "/", &["d", "f"]);
+    got.sort();
+    assert_eq!(got, vec![(alloc::string::String::from("d"), 2), (alloc::string::String::from("f"), 1)]);
+    assert!(stored_types(&fs, "/d", &[".", ".."]).iter().all(|(_, ft)| *ft == 2));
 }
 
 #[test]
@@ -904,6 +970,30 @@ fn dropping_the_last_pin_lets_the_inode_be_reclaimed() {
     );
 }
 
+/// The last pin going is enough: no further unlink or create is needed for the
+/// blocks to come back. `statfs` (what `df` asks) finishes the free, so the
+/// space shows as soon as the last mapping or fd of an unlinked file goes, and
+/// it reaches the disk before a crash can strand it.
+#[test]
+fn statfs_after_the_last_pin_goes_shows_the_space_freed() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    let before = fs.stats().unwrap().free_blocks;
+    fs.write_file("/held", &[7u8; 64 * 1024]).unwrap();
+    let inode = fs.resolve_inode("/held").unwrap();
+    let written = before - fs.stats().unwrap().free_blocks;
+    assert!(written > 0, "fixture: the file must take blocks");
+
+    let pin = akuma_primitives::InodePin::new(inode);
+    fs.remove_file("/held").unwrap();
+    assert_eq!(fs.deferred_free_len(), 1, "a pinned unlink is deferred");
+    assert_eq!(before - fs.stats().unwrap().free_blocks, written, "and keeps its blocks while pinned");
+
+    drop(pin);
+    assert_eq!(fs.stats().unwrap().free_blocks, before, "statfs alone must finish the free");
+    assert_eq!(fs.deferred_free_len(), 0);
+}
+
 /// The unchanged path — an unlink with no mapping still frees immediately, so
 /// the fix costs nothing on the overwhelmingly common case.
 #[test]
@@ -1571,7 +1661,7 @@ impl BlockDevice for RecordingDevice {
 /// ring may have evicted mid-op. The old write-through cache paid a cold
 /// device read per data block on top of that — 4 for this file. What this
 /// asserts: data blocks contribute zero, i.e. reads ≤ the metadata working
-/// set, and — the sharp version, under `fs-cache` where nothing evicts —
+/// set, and — the sharp version, with a cache big enough that nothing evicts —
 /// exactly zero.
 #[test]
 fn writeback_read_after_write_is_warm() {
@@ -1591,8 +1681,7 @@ fn writeback_read_after_write_is_warm() {
         reads <= 9,
         "read-after-write performed {reads} device reads; data blocks must be cache hits (write-through residue?)"
     );
-    #[cfg(feature = "fs-cache")]
-    assert_eq!(reads, 0, "fs-cache is big enough that nothing evicts; expected zero reads");
+    assert_eq!(reads, 0, "the cache is big enough that nothing evicts; expected zero reads");
 }
 
 /// Every mutating op ends in `flush_meta`, so when the op returns the device
@@ -1857,8 +1946,7 @@ fn writeback_coherence_oracle_zero_mismatches() {
 }
 
 // ============================================================================
-// ClockBlockCache (large block cache, feature `fs-cache`) unit tests.
-// Compiled whenever `cfg(test)` is active (the cache type is `cfg(any(ext2_fs_cache, test))`).
+// ClockBlockCache (the block cache) unit tests.
 // ============================================================================
 
 use crate::ext2::{ClockBlockCache, cache_stats, set_cache_cap_bytes};
@@ -3488,4 +3576,156 @@ fn lookup_of_first_entry_touches_far_fewer_blocks_than_the_whole_directory() {
         "a full listing ({listed}) must cost more blocks than any single \
          lookup ({last})"
     );
+}
+
+/// A file past 4 GiB on a 1 KiB-block image: logical blocks above
+/// `12 + 256 + 256²` live under the triply-indirect pointer, and the size needs
+/// `i_size_high`. Until 2026-11-03 `get_block_num`/`ensure_block` stopped at
+/// doubly indirect (`NotSupported` there: 64 MiB on 1 KiB blocks, 4 GiB on
+/// 4 KiB ones - the Taoxichuan guest image on the Akuma host could not grow
+/// past it) and `read_at`, `write_at` and `metadata` read only `i_size_lo`.
+/// Oracles: the bytes and size through this mount and a fresh one, the free
+/// count back at its baseline after truncating to zero, and `e2fsck -fn`.
+#[test]
+fn a_file_past_4_gib_uses_the_triple_indirect_map_and_its_full_size() {
+    extern crate std;
+    let dev = RecordingDevice::from_fixture("manyinodes.ext2");
+    let clock = || 1_700_000_000_000_000;
+    let fs = Ext2Filesystem::new(&dev, clock).unwrap();
+    fs.write_file("/big", b"").unwrap();
+    let baseline = fs.stats().unwrap().free_blocks;
+
+    const MIB: usize = 1 << 20;
+    let triple = 70 * MIB; // past 12 + 256 + 65536 KiB
+    let far = (5usize << 30) + 1020; // past 4 GiB, straddling a block boundary
+    let pieces: [(usize, &[u8]); 3] = [(0, b"head"), (triple, b"triple-indirect"), (far, b"past four gib")];
+    for (off, data) in pieces {
+        assert_eq!(fs.write_at("/big", off, data).unwrap(), data.len());
+    }
+    let size = (far + b"past four gib".len()) as u64;
+
+    let check = |fs: &Ext2Filesystem<&RecordingDevice>| {
+        assert_eq!(fs.metadata("/big").unwrap().size, size, "the size keeps its high word");
+        for (off, data) in pieces {
+            let mut back = vec![0u8; data.len()];
+            assert_eq!(fs.read_at("/big", off, &mut back).unwrap(), data.len());
+            assert_eq!(back, data, "bytes at {off:#x}");
+        }
+        let mut hole = vec![0xFFu8; 64];
+        assert_eq!(fs.read_at("/big", 3 << 30, &mut hole).unwrap(), 64);
+        assert!(hole.iter().all(|&b| b == 0), "a hole past 2 GiB reads zero");
+    };
+    check(&fs);
+    check(&Ext2Filesystem::new(&dev, clock).unwrap());
+
+    let fsck = || {
+        let e2fsck = ["/opt/homebrew/opt/e2fsprogs/sbin/e2fsck", "/usr/local/opt/e2fsprogs/sbin/e2fsck", "/sbin/e2fsck", "/usr/sbin/e2fsck"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists());
+        let Some(e2fsck) = e2fsck else {
+            std::eprintln!("note: e2fsck not found; skipping the on-disk consistency oracle");
+            return;
+        };
+        let img = std::env::temp_dir().join(alloc::format!("akuma-ext2-triple-{}.img", std::process::id()));
+        std::fs::write(&img, &*dev.inner.lock()).unwrap();
+        let out = std::process::Command::new(e2fsck).arg("-fn").arg(&img).output().unwrap();
+        let _ = std::fs::remove_file(&img);
+        assert!(
+            out.status.success(),
+            "e2fsck -fn found problems:\n{}{}",
+            alloc::string::String::from_utf8_lossy(&out.stdout),
+            alloc::string::String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    fs.sync().unwrap();
+    fsck();
+
+    // Shrink into the triply-indirect range, then out of it, then to zero.
+    fs.truncate("/big", (triple + 4) as u64).unwrap();
+    let mut back = [0u8; 4];
+    assert_eq!(fs.read_at("/big", triple, &mut back).unwrap(), 4);
+    assert_eq!(&back, b"trip");
+    fs.truncate("/big", 4).unwrap();
+    assert_eq!(fs.metadata("/big").unwrap().size, 4);
+    fs.truncate("/big", 0).unwrap();
+    assert_eq!(fs.stats().unwrap().free_blocks, baseline, "every data and pointer block came back");
+    fs.sync().unwrap();
+    fsck();
+}
+
+/// `ETXTBSY`: while a process is executing a file, every way of changing its data is refused (by path and by inode, so a
+/// descriptor opened for writing before the exec is stopped too), and the refusal lifts when the last executor is gone.
+#[test]
+fn a_file_being_executed_cannot_have_its_data_changed() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/bin-x", b"ORIGINAL CODE").unwrap();
+    let inode = fs.resolve_inode("/bin-x").unwrap();
+    let text = akuma_primitives::TextPin::try_new(fs.identity(), inode).unwrap();
+
+    assert_eq!(fs.write_file("/bin-x", b"EVIL"), Err(akuma_vfs::FsError::TextBusy), "open(O_TRUNC) + write");
+    assert_eq!(fs.write_at("/bin-x", 0, b"EVIL"), Err(akuma_vfs::FsError::TextBusy), "write by path");
+    assert_eq!(fs.write_at_by_inode(inode, 0, b"EVIL"), Err(akuma_vfs::FsError::TextBusy), "write through an fd opened earlier");
+    assert_eq!(fs.truncate("/bin-x", 0), Err(akuma_vfs::FsError::TextBusy), "truncate by path");
+    assert_eq!(fs.truncate_by_inode(inode, 0), Err(akuma_vfs::FsError::TextBusy), "ftruncate");
+    assert_eq!(fs.fallocate_by_inode(inode, 0, 0, 4096), Err(akuma_vfs::FsError::TextBusy), "fallocate");
+    assert_eq!(fs.read_file("/bin-x").unwrap(), b"ORIGINAL CODE", "none of it changed a byte");
+
+    // Another file is not affected.
+    fs.write_file("/other", b"fine").unwrap();
+    fs.write_at("/other", 0, b"FINE").unwrap();
+
+    drop(text);
+    fs.write_at("/bin-x", 0, b"NEW ").unwrap();
+    assert_eq!(fs.read_file("/bin-x").unwrap(), b"NEW INAL CODE");
+}
+
+/// Linux lets a package manager replace a running binary by unlinking it or renaming a new file over it; the process keeps the old
+/// inode. That stays true: only changing the data in place is refused.
+#[test]
+fn a_file_being_executed_can_still_be_unlinked_or_renamed_over() {
+    let _serial = pin_test_serial();
+    let fs = mount_empty();
+    fs.write_file("/run", b"RUNNING IMAGE").unwrap();
+    let inode = fs.resolve_inode("/run").unwrap();
+    let text = akuma_primitives::TextPin::try_new(fs.identity(), inode).unwrap();
+
+    // Rename a new file over it: the name now means the new file, and the old inode's data is intact for the process.
+    fs.write_file("/run.new", b"UPGRADED").unwrap();
+    fs.rename("/run.new", "/run").unwrap();
+    assert_eq!(fs.read_file("/run").unwrap(), b"UPGRADED");
+    assert_eq!(fs.read_at_by_inode(inode, 0, &mut [0u8; 13]).unwrap(), 13);
+    let mut old = [0u8; 13];
+    fs.read_at_by_inode(inode, 0, &mut old).unwrap();
+    assert_eq!(&old, b"RUNNING IMAGE", "the executing image's inode kept its bytes");
+
+    // Unlink the executing file's last name: allowed, and the data still reads (the text pin holds the inode).
+    fs.write_file("/gone", b"STILL RUNS").unwrap();
+    let gone = fs.resolve_inode("/gone").unwrap();
+    let t2 = akuma_primitives::TextPin::try_new(fs.identity(), gone).unwrap();
+    fs.remove_file("/gone").unwrap();
+    let mut buf = [0u8; 10];
+    fs.read_at_by_inode(gone, 0, &mut buf).unwrap();
+    assert_eq!(&buf, b"STILL RUNS");
+    drop((text, t2));
+}
+
+/// Two filesystems number their inodes alike. A mark on one must not make the other's same-numbered file busy (a test run caught the
+/// table when it was keyed on the inode number alone).
+#[test]
+fn a_busy_inode_on_one_filesystem_does_not_block_the_same_number_on_another() {
+    let _serial = pin_test_serial();
+    let a = mount_empty();
+    let b = mount_empty();
+    assert_ne!(a.identity(), 0);
+    assert_ne!(a.identity(), b.identity(), "each instance has its own identity");
+    a.write_file("/prog", b"A").unwrap();
+    b.write_file("/prog", b"B").unwrap();
+    let (ia, ib) = (a.resolve_inode("/prog").unwrap(), b.resolve_inode("/prog").unwrap());
+    assert_eq!(ia, ib, "the premise: the same inode number on both");
+    let text = akuma_primitives::TextPin::try_new(a.identity(), ia).unwrap();
+    assert_eq!(a.write_at("/prog", 0, b"X"), Err(akuma_vfs::FsError::TextBusy));
+    b.write_at("/prog", 0, b"X").unwrap();
+    assert_eq!(b.read_file("/prog").unwrap(), b"X");
+    drop(text);
 }

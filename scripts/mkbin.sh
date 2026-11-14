@@ -57,10 +57,9 @@ TMP="${DST}.$$.tmp"
 mv -f "$TMP" "$DST"
 
 BYTES=$(wc -c < "$DST" | tr -d ' ')
-case "$DST" in
-  */extreme-size/*) LIMIT=$((1 * 1024 * 1024)); LABEL="1 MB" ;;
-  *)                LIMIT=$((4 * 1024 * 1024)); LABEL="4 MB" ;;
-esac
+# One guard for every profile: `extreme-size` is codegen only since the 4 MB-RAM
+# `extreme` build (whose 1 MB image cap this used to carry) was removed 2026-11-11.
+LIMIT=$((4 * 1024 * 1024)); LABEL="4 MB"
 
 echo "$BYTES $LIMIT"
 

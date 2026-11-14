@@ -6,7 +6,7 @@ both are prerequisites for self-hosting on this target.
 
 - § 1 — `CR0.WP` was never set, so `copy_to_user` onto a copy-on-write page
   corrupted the *parent*. Silent, no error, no fault.
-- § 2 — `amd64/src/sched.rs` stopped being a scheduler. `akuma-threading` is now
+- § 2 — `crates/akuma-kernel-amd64/src/sched.rs` stopped being a scheduler. `akuma-threading` is now
   the scheduler on both architectures; what is left here is the machine effects
   it is not allowed to know about. Pipes, `futex` and `wait4` park instead of
   polling as a consequence, not as the goal.
@@ -143,15 +143,15 @@ them style:
 
 `paging::PageFaultCode` is now the decode, `describe_page_fault` prints it in
 words before the fatal printer's hex, and `paging::smoke_test` pins every bit
-against a decoded value. It lives in `amd64/src/paging.rs` rather than a crate
+against a decoded value. It lives in `crates/akuma-kernel-amd64/src/paging.rs` rather than a crate
 because that is where the tree's stated split already puts x86 paging bits —
 `akuma-mmap`'s `types.rs` says so explicitly: *"the bits live with the walker
-that writes them — `akuma_mmu::types` for AArch64, `amd64/src/paging.rs` for
+that writes them — `akuma_mmu::types` for AArch64, `crates/akuma-kernel-amd64/src/paging.rs` for
 x86_64."*
 
 ---
 
-## 2. `amd64/src/sched.rs` stopped being a scheduler
+## 2. `crates/akuma-kernel-amd64/src/sched.rs` stopped being a scheduler
 
 `docs/archive/AKUMA_SELF_HOSTING_AMD64.md` calls this **A1**, the trunk the rest
 of the amd64 self-hosting tree hangs off, and its one-line summary is
@@ -159,7 +159,7 @@ of the amd64 self-hosting tree hangs off, and its one-line summary is
 
 ### The wrong turn first, because it is the instructive part
 
-The first attempt did **A2 without A1**: it gave `amd64/src/sched.rs` its own
+The first attempt did **A2 without A1**: it gave `crates/akuma-kernel-amd64/src/sched.rs` its own
 `State::Blocked`, its own `wake_pending` flag, its own deadline sweep, and
 pointed pipes, `futex` and `wait4` at them. It worked — 295/0 at `SMP=1`, 304/0
 at `SMP=4`, every wait released by a real wake.
@@ -185,7 +185,7 @@ debugged.
 
 ### What the fold actually moved
 
-The crate schedules; `amd64/src/sched.rs` performs. Everything the scheduler
+The crate schedules; `crates/akuma-kernel-amd64/src/sched.rs` performs. Everything the scheduler
 cannot know about is registered once as `akuma_threading::X86ArchHooks` and
 lives in a per-slot `Machine` side table indexed by the crate's own thread id:
 `CR3`, the TSS trap stack, `IA32_FS_BASE`/`GS_BASE`, the `fxsave` area, the Big
@@ -212,7 +212,7 @@ The crate gained, all `#[cfg(target_arch = "x86_64")]` and inert on AArch64:
   table, not boxed closures.
 
 `MAX_THREADS` gained an `x86_64` arm of **512**, deliberately not a tidier
-universal number: `amd64/src/sched.rs` raised its own table 96 → 512 against a
+universal number: `crates/akuma-kernel-amd64/src/sched.rs` raised its own table 96 → 512 against a
 measurement (a real session runs dozens of commands, every one a slot, `fork`
 takes a second), and folding must not walk that back to 256.
 
@@ -244,7 +244,7 @@ calls the failure mode that costs the most to diagnose and says the least. With
 a backstop the same bug degrades to a 1 Hz poll. `sched::backstop_wakes()`
 counts them and the boot prints the total.
 
-It is spelled in `amd64/src/sched.rs` rather than in the crate on purpose:
+It is spelled in `crates/akuma-kernel-amd64/src/sched.rs` rather than in the crate on purpose:
 AArch64 parks untimed constantly and has an interrupt-driven scheduler to
 recover, where this target reaches its scheduler only by being called.
 
@@ -324,7 +324,7 @@ the tree**, the one that runs on real silicon where the emulators cannot reach.
 It is why bare metal reported 262 checks where QEMU reported 295, and nobody had
 noticed, because both said `0 failed`.
 
-The two blocks that were genuinely identical now live in `amd64/src/boot.rs`:
+The two blocks that were genuinely identical now live in `crates/akuma-kernel-amd64/src/boot.rs`:
 
 - `early_init` — descriptor tables, per-CPU block, IDT, SMAP/SMEP/WP, the
   scheduler, drop the identity map. Six steps whose *order* is load-bearing and

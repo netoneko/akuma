@@ -157,7 +157,7 @@ That is an argument only while the lock is in fact held. It is not, on one path:
   whole point of `lock_bounded`.
 - `akuma_exec::init` registers `threading::yield_now` as that hook. On this
   target `yield_now` is a context switch.
-- `amd64/src/console.rs` reaches `lock_bounded` on the terminal state, which
+- `crates/akuma-kernel-amd64/src/console.rs` reaches `lock_bounded` on the terminal state, which
   under an ssh session is contended constantly.
 
 *(That path is real in the shared crates but **not** what fires here: amd64

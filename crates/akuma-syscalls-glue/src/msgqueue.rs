@@ -14,11 +14,11 @@ pub use akuma_syscalls_ipc::{sys_msgctl, sys_msgget, sys_msgrcv, sys_msgsnd};
 ///
 /// `kernel_tests`-gated because `-D unused-imports` is on and a `no-tests` build
 /// (devbox, devbox-smoltcp) calls none of them — an ungated re-export fails
-/// those profiles while `--release` and `extreme-size` stay green, which is the
+/// those profiles while `--release` stays green, which is the
 /// most annoying shape of build break to discover.
 #[cfg(kernel_tests)]
 pub use akuma_syscalls_ipc::{
-    msgqueue_add_recv_poller, msgqueue_add_send_poller, msgqueue_is_recv_poller,
+    cleanup_box_queues, list_msg_queues, msgqueue_add_recv_poller, msgqueue_add_send_poller, msgqueue_is_recv_poller,
     msgqueue_message_count, msgqueue_pop_direct, msgqueue_push_direct,
     msgqueue_recv_pollers_count, msgqueue_send_pollers_count,
 };

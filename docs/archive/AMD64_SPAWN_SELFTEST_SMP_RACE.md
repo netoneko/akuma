@@ -29,7 +29,7 @@ and other boots pass all 797.
 On the Ryzen host, `~/akuma/boot.log.pre-oom-20260925` (794/3) and
 `~/akuma/boot.log.prev` (797/0) came from **the same kernel file**. It was
 staged at 02:27 and not replaced until the 16:44 redeploy. The test itself
-(`spawn_test`, `amd64/src/usermode.rs`, the check at ~line 5714) is unchanged
+(`spawn_test`, `crates/akuma-kernel-amd64/src/usermode.rs`, the check at ~line 5714) is unchanged
 since `e414f41d` (2026-09-11). One binary gives both results, so this is timing.
 
 ## Mechanism
@@ -44,7 +44,7 @@ since `e414f41d` (2026-09-11). One binary gives both results, so this is timing.
    can be scheduled on the other vCPU at once.
 3. `hello` is tiny. It can run to `exit_group` before the parent reaches the
    check. On exit, `run_process` calls `fds.close_all()` immediately
-   (`amd64/src/usermode.rs`, the `exit_fds` sweep after `thread::drain`), but
+   (`crates/akuma-kernel-amd64/src/usermode.rs`, the `exit_fds` sweep after `thread::drain`), but
    the `Process` record, and its `channel`, stays registered until the parent's
    `waitpid` reaps it.
 4. So the parent finds a live record with a channel and an **empty** fd table:

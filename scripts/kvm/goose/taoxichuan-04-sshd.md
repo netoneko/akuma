@@ -65,7 +65,7 @@ pipe that is just a buffer); decide, say why in RESULT.md, and pull as few crate
 `taoxichuan/src/main.rs` further: it is 1,790 lines and should not be where this stage lives.
 
 Per the experiment's composition rule: pull as few crates as possible; extract into a crate first where the logic
-still lives in `amd64/src/`. Record the crate count (15 at the end of stage 3) and the image size (266,752 B) in
+still lives in `crates/akuma-kernel-amd64/src/`. Record the crate count (15 at the end of stage 3) and the image size (266,752 B) in
 RESULT.md.
 
 ## 3. Ops rules (unchanged)

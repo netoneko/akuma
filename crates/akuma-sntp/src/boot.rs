@@ -4,7 +4,7 @@
 //!
 //! Same shape as `akuma-net-yarn`'s `wait_until` state machine
 //! (`WaitPolicy` takes only effects; the caller wires the real socket/timer
-//! calls). **`amd64/src/clock.rs`** is the one real caller today, wiring
+//! calls). **`crates/akuma-kernel-amd64/src/clock.rs`** is the one real caller today, wiring
 //! `akuma_net::socket::{socket_send_udp, socket_recv_udp}` and its own
 //! iteration-counted `uptime_us` stand-in (see that module's doc — this
 //! target has no calibrated timer to feed the real thing) into

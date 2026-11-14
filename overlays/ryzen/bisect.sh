@@ -24,8 +24,8 @@ for c in "$@"; do
             git -C $A worktree add -q --detach $B/wt $c || exit 1
             rmdir $B/wt/crates/akuma-fbcon/vendor/spleen 2>/dev/null
             ln -sfn $A/crates/akuma-fbcon/vendor/spleen $B/wt/crates/akuma-fbcon/vendor/spleen
-            cd $B/wt && CARGO_TARGET_DIR=$B/target cargo build -q -p akuma-amd64 --target x86_64-unknown-none --release --features no-tests 2>&1 | grep -E '^error' | head -3
-            cp $B/target/x86_64-unknown-none/release/akuma-amd64 $K"
+            cd $B/wt && CARGO_TARGET_DIR=$B/target cargo build -q -p akuma --target x86_64-unknown-none --release --features no-tests 2>&1 | grep -E '^error' | head -3
+            cp $B/target/x86_64-unknown-none/release/akuma $K"
     fi
     [ -s $K ] || { echo "$c: BUILD FAILED"; continue; }
     S=$(date +%s)

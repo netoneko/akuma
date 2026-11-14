@@ -5,7 +5,7 @@
  * 2: epoll_wait(-1)) and with a sibling parked in pause(). amd64 once left the
  * leader where it was: `goose --version` printed its version and never exited,
  * because Rust runs `main` on a spawned thread and the original thread sits in
- * the join futex. Fixed by amd64/src/thread.rs `exit_group_from_thread`
+ * the join futex. Fixed by crates/akuma-kernel-amd64/src/thread.rs `exit_group_from_thread`
  * (docs/archive/AKUMA_AMD64_AGENT_STAGING_AND_ACCOUNTING.md § 13).
  *
  * Build: x86_64-linux-musl-gcc -O1 -static -pthread -o groupexit_thread groupexit_thread.c

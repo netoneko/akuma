@@ -4,8 +4,8 @@
 //! the ring boundary in both directions —
 //! extracted as a crate rather than grown inline in `taoxichuan/`, per the
 //! experiment's composition rule. The full kernel's counterparts live in
-//! `amd64/src/usermode.rs` (9 k lines: demand paging, signals, threads, an
-//! interpreter loader) and `amd64/src/loader.rs` (over `akuma-elf` +
+//! `crates/akuma-kernel-amd64/src/usermode.rs` (9 k lines: demand paging, signals, threads, an
+//! interpreter loader) and `crates/akuma-kernel-amd64/src/loader.rs` (over `akuma-elf` +
 //! `akuma-mmu`); none of that serves a task that only prints and exits, and
 //! pulling it would pull the whole MMU. What is here is the irreducible core:
 //!
@@ -52,147 +52,9 @@ mod tests;
 // The initial user stack: argc/argv/envp/auxv, the Linux layout.
 // ---------------------------------------------------------------------------
 
-/// `AT_NULL` — ends the auxiliary vector.
-pub const AT_NULL: u64 = 0;
-/// `AT_PHDR` — the program header table's link address.
-pub const AT_PHDR: u64 = 3;
-/// `AT_PHENT` — size of one program header entry.
-pub const AT_PHENT: u64 = 4;
-/// `AT_PHNUM` — number of program headers.
-pub const AT_PHNUM: u64 = 5;
-/// `AT_PAGESZ` — page size.
-pub const AT_PAGESZ: u64 = 6;
-/// `AT_ENTRY` — the image entry point.
-pub const AT_ENTRY: u64 = 9;
-/// `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` — the credentials musl caches.
-pub const AT_UID: u64 = 11;
-/// `AT_EUID`.
-pub const AT_EUID: u64 = 12;
-/// `AT_GID`.
-pub const AT_GID: u64 = 13;
-/// `AT_EGID`.
-pub const AT_EGID: u64 = 14;
-/// `AT_HWCAP` — the ELF capability word (none: no HWCAP features offered).
-pub const AT_HWCAP: u64 = 16;
-/// `AT_CLKTCK` — `times(2)` resolution.
-pub const AT_CLKTCK: u64 = 17;
-/// `AT_SECURE` — whether the kernel elevated the process (no).
-pub const AT_SECURE: u64 = 23;
-/// `AT_RANDOM` — 16 bytes for the stack canary. The builder materialises them
-/// inside the stack block and writes their address into the auxv itself.
-pub const AT_RANDOM: u64 = 25;
-/// `AT_EXECFN` — pointer to the program name string.
-pub const AT_EXECFN: u64 = 31;
-/// `AT_BASE` — the interpreter's base (none: static).
-pub const AT_BASE: u64 = 7;
-/// `AT_SYSINFO_EHDR` — the kernel-provided fast-path code page (PHASE-2-VDSO,
-/// D21/D25): the legacy x86-64 vsyscall page at its ABI-fixed address
-/// `0xffff_ff60_0000`, mapped user-RX from the kernel root and inherited by
-/// every task through the shared upper half. The value is the page's real
-/// address; the page is not an ELF (the legacy layout fixes the stub slots at
-/// +0x000/+0x400/+0x800, an ELF header needs +0 — D22's recorded caveat).
-/// Off by default: this const and the auxv entry that carries it exist only
-/// under the `vsyscall` feature (R6).
-#[cfg(feature = "vsyscall")]
-pub const AT_SYSINFO_EHDR: u64 = 33;
-
-/// Most `argv`+`envp` strings whose addresses the builder will remember.
-/// The composed kernel passes one argv entry and no env; the bound is a
-/// sanity check, not a resource decision.
-const MAX_STRS: usize = 512;
-
-/// Lay out the initial user stack into `buf`, whose **last** byte is the last
-/// byte of the stack page at `stack_top` (i.e. `buf` is the tail of the stack,
-/// placed so that `buf.as_ptr() + buf.len() == stack_top`).
-///
-/// Returns the initial user `RSP`, 16-byte aligned, pointing at `argc`.
-///
-/// The layout, built from `stack_top` down: the strings (env, then argv, then
-/// 16 canary bytes), padding to 16, the auxv (`AT_NULL`-terminated), a NULL,
-/// envp pointers with a NULL, argv pointers with a NULL, and `argc` last — the
-/// exact order Linux builds and musl's `__init_libc` walks. `AT_RANDOM` and
-/// `AT_EXECFN` values are supplied by the builder itself (`AT_RANDOM` gets the
-/// in-block canary address, `AT_EXECFN` the `argv[0]` string address), so the
-/// caller states them as `(AT_RANDOM, 0)` / `(AT_EXECFN, 0)` placeholders.
-pub fn build_stack(buf: &mut [u8], stack_top: u64, argv: &[&str], env: &[&str], aux: &[(u64, u64)]) -> u64 {
-    assert!(
-        argv.len() + env.len() <= MAX_STRS,
-        "argv+envp exceed the builder's string table"
-    );
-    let mut top = stack_top;
-    let mut addrs = [0u64; MAX_STRS];
-    let mut n_strs = 0usize;
-    for s in env.iter().chain(argv.iter()) {
-        let bytes = s.as_bytes();
-        top -= bytes.len() as u64 + 1; // NUL
-        let i = buf.len() - (stack_top - top) as usize;
-        buf[i..i + bytes.len()].copy_from_slice(bytes);
-        buf[i + bytes.len()] = 0;
-        addrs[n_strs] = top;
-        n_strs += 1;
-    }
-    let env_addrs = &addrs[..env.len()];
-    let argv_addrs = &addrs[env.len()..n_strs];
-    let execfn = if argv.is_empty() { 0 } else { addrs[env.len()] };
-
-    // The 16 canary bytes `AT_RANDOM` points at, then 16-byte alignment for
-    // the pointer area (always applied: the vectors are u64s but the ABI
-    // promises the initial rsp itself is 16-aligned).
-    let mut random_va = 0u64;
-    if aux.iter().any(|(k, _)| *k == AT_RANDOM) {
-        top = (top - 16) & !0xF;
-        random_va = top;
-        let i = buf.len() - (stack_top - top) as usize;
-        for (j, b) in buf[i..i + 16].iter_mut().enumerate() {
-            *b = canary_byte(j as u64);
-        }
-    }
-    top &= !0xF;
-
-    // Everything from here down is 8-byte words, written back-to-front so the
-    // final `rsp` lands on `argc`.
-    let mut push = |v: u64| {
-        top -= 8;
-        let i = buf.len() - (stack_top - top) as usize;
-        buf[i..i + 8].copy_from_slice(&v.to_le_bytes());
-    };
-    // The `AT_NULL` terminator is pushed first so it lands highest — musl
-    // walks the vector upward and stops at a zero key — then the pairs in
-    // reverse, so entry 0 ends up lowest, first above the envp NULL.
-    push(AT_NULL);
-    push(0);
-    let mut i_aux = aux.len();
-    while i_aux > 0 {
-        i_aux -= 1;
-        let (k, v) = aux[i_aux];
-        let value = match k {
-            AT_RANDOM => random_va,
-            AT_EXECFN => execfn,
-            _ => v,
-        };
-        push(value);
-        push(k);
-    }
-
-    push(0); // envp NULL
-    for p in env_addrs.iter().rev() {
-        push(*p);
-    }
-    push(0); // argv NULL
-    for p in argv_addrs.iter().rev() {
-        push(*p);
-    }
-    push(argv.len() as u64); // argc
-    top
-}
-
-/// Deterministic canary byte. There is no entropy source behind this kernel;
-/// a fixed canary defeats naive overflow chains and costs nothing, and is
-/// stated here rather than disguised as randomness.
-#[must_use]
-pub fn canary_byte(i: u64) -> u8 {
-    0xA5_u8.rotate_left((i % 8) as u32 * 3) ^ (i as u8).wrapping_mul(0x5A)
-}
+// Moved to `akuma_elf_exec::stack` (B21 A5.6): the layout is the Linux ABI's, the
+// same on both architectures, and the aarch64 tokio kernel builds the same stack.
+pub use akuma_elf_exec::stack::*;
 
 // ---------------------------------------------------------------------------
 // The syscall machinery: MSRs, the stub, the frames it builds.
@@ -236,7 +98,7 @@ static SYSCALL_STACK: SyscallStack = SyscallStack([0; SYSCALL_STACK_SIZE]);
 /// `gs:[32]` the running slot. Replaces the two single-core statics
 /// (`USER_RSP_STASH`, `SYSCALL_STACK_TOP`) this crate used to keep.
 ///
-/// Invariant (the amd64 kernel's, `amd64/src/smp.rs`): in ring 0 `GS_BASE` is
+/// Invariant (the amd64 kernel's, `crates/akuma-kernel-amd64/src/smp.rs`): in ring 0 `GS_BASE` is
 /// this core's block and `KERNEL_GS_BASE` is the program's; the stub, the
 /// IDT stubs and [`enter_user`] `swapgs` at every ring crossing.
 #[cfg(target_arch = "x86_64")]
@@ -629,6 +491,38 @@ pub unsafe extern "C" fn enter_user(f: &EntryFrame) -> ! {
         "swapgs",                // ring 0 -> ring 3: GS_BASE becomes the program's
         "sysretq",
     );
+}
+
+/// [`enter_user`] after checking the parts of `f` that make a `sysretq` hostile to ring 0.
+///
+/// The safe entry for a caller that built `f` from an ELF image and a stack: `sysretq` with a **non-canonical
+/// `RCX`** faults in ring 0 (the famous `sysret` privilege bug), a kernel-half `rip`/`rsp` would run or push in
+/// the kernel's own address range, and an `rflags` with `IOPL`/`VM`/`NT` set or `IF` clear hands the task more
+/// than ring 3 should have or hangs the core. So it refuses (panics) unless:
+///
+/// * `rip` and `rsp` are in the canonical **lower** half (`< 0x0000_8000_0000_0000`);
+/// * `rflags` has `IF` and the reserved bit 1 set and `IOPL`, `NT`, `VM` clear.
+///
+/// The active address space still has to map the kernel half and the user half; the checked
+/// `akuma_pagetable::amd64::activate` establishes the first for every root this kernel loads, and a user half
+/// that does not map `rip` is an ordinary page fault in ring 3.
+///
+/// # Panics
+/// If `f` fails the checks above.
+#[cfg(target_arch = "x86_64")]
+pub fn enter_user_checked(f: &EntryFrame) -> ! {
+    const USER_LIMIT: u64 = 0x0000_8000_0000_0000;
+    const IF: u64 = 1 << 9;
+    const RESERVED1: u64 = 1 << 1;
+    const FORBIDDEN: u64 = (3 << 12) | (1 << 14) | (1 << 17); // IOPL, NT, VM
+    assert!(f.rip < USER_LIMIT && f.rsp < USER_LIMIT, "enter_user: rip/rsp not in the user half");
+    assert!(
+        f.rflags & (IF | RESERVED1) == (IF | RESERVED1) && f.rflags & FORBIDDEN == 0,
+        "enter_user: unsafe rflags for ring 3"
+    );
+    // SAFETY: the checks above make `f` a ring-3-enterable state; the kernel-half mapping of the active root is
+    // the loader's `activate` (checked), and `enter_user` is `!`.
+    unsafe { enter_user(f) }
 }
 
 // ---------------------------------------------------------------------------

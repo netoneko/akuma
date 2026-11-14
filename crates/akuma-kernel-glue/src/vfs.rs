@@ -44,13 +44,7 @@ fn pipe_health(buf: &mut [u8]) -> usize {
     pos
 }
 
-#[cfg(kernel_smp_shared)]
 fn probed_core_count() -> usize {
     crate::smp_shared::probed_core_count()
 }
 
-/// Without real SMP there is one core; the crate's caller is gated off anyway.
-#[cfg(not(kernel_smp_shared))]
-fn probed_core_count() -> usize {
-    1
-}
