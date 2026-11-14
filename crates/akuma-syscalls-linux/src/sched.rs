@@ -5,8 +5,9 @@
 //! the calling core's index — is the dispatching kernel's
 //! (`ring3::cpu_index()`), passed in as a parameter.
 
-/// The `getcpu(2)` answer for a task running on core `cpu`: the core's own
-/// index and NUMA node 0 (the guest is single-NUMA; the taoxichuan aarch64
+/// The `getcpu(2)` answer for a task running on core `cpu`.
+///
+/// The core's own index and NUMA node 0 (the guest is single-NUMA; the taoxichuan aarch64
 /// precedent wrote the same pair — `docs/archive/TAOXICHUAN_JVM_ATTEMPT_2026_11_09.md`).
 ///
 /// The cpu is the **caller's** core, never a constant: a hardcoded cpu is the
