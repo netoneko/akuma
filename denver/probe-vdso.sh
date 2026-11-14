@@ -16,8 +16,10 @@
 #      booting would mean staging failed);
 #   2. tokioprobe RESULT PASS (platform sanity under the new mapping);
 #   3. RWX PASS rw_to_rx=42 (wx-relaxed still active - this binary carries both features);
-#   4. AUXV PASS AT_SYSINFO_EHDR= (phase 1's RED arm flips; the value is the page's real
-#      address, 0xffffffffff600000 = 18446744073709493248);
+#   4. AUXV PASS AT_SYSINFO_EHDR= (phase 1's RED arm flips; the value is the vDSO ELF's real
+#      address, 0xffffffffff5ff000 = 18446744073699061760 (python-checked — run 1 printed a
+#      false SURPRISE off a hand-computed constant; FAULTNAME's lesson, paid again). It must
+#      be a VALID ELF: Finding 1 — the static-PIE musl startup parses the value unchecked);
 #   5. the java arm runs, and the console window carries NO `rip=0xffffffffff600800` - the
 #      closed death must not recur. The workload's next shape (a new fault elsewhere, a clean
 #      nonzero exit, or outright JVM PASS) is recorded as movement/surprise, not gated.
@@ -116,8 +118,8 @@ case "$aux" in
     *) verdict "RESULT FAIL: the auxv arm did not print AUXV PASS AT_SYSINFO_EHDR=" 1 ;;
 esac
 case "$aux" in
-    *"AUXV PASS AT_SYSINFO_EHDR=18446744073709493248"*)
-        echo "  (value = 0xffffffffff600000: the disclosed page is the ABI-fixed base, D21)" ;;
+    *"AUXV PASS AT_SYSINFO_EHDR=18446744073699061760"*)
+        echo "  (value = 0xffffffffff5ff000: the disclosed ELF is the vDSO page, one page below the ABI base, D22 revised)" ;;
     *)
         echo "  (SURPRISE: AT_SYSINFO_EHDR carries a different value - the disclosure and the map disagree; read the research artifact)" ;;
 esac

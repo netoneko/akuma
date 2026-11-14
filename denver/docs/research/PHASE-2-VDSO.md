@@ -60,6 +60,47 @@ failure, and reads the pre-zeroed cpu → **0**. So for the JVM path the getcpu 
 to "cpu is always 0" without G2 closing; the raw `getcpu(2)` arm stays RED and stays G2's
 gate. Whatever the workload does next is movement to record, not a verdict to assume.
 
+## Finding 1 — musl DOES consume AT_SYSINFO_EHDR, without a magic check (RED-2; overturns Finding 0's caveat 3)
+
+The first gate build served `AT_SYSINFO_EHDR = 0xffffffffff600000` (the legacy stubs page) and
+**tokioprobe — a plain static musl Rust binary, no JVM anywhere — died with SIGSEGV**. The
+bisect (one variable per boot):
+
+| boot | map | auxv pair | verdict |
+|---|---|---|---|
+| RED-1 | on | on (legacy base) | tokioprobe SEGV; console carried no fault line (guest stopped before flush) |
+| bisect 1 | on | off | tokioprobe `RESULT PASS` — the map is innocent |
+| bisect 2 (RED-2) | off | on (legacy base) | tokioprobe SEGV, **named by the console** (G6's capability paying for itself): `[Fault] ring3 PageFault rip=0x0000000010179dd3 rsp=0x00006fffffffea60 cr2=0xffffffffff600020 code=0x4` |
+
+Disassembling tokioprobe at `rip − PIE_BASE(0x10000000) = 0x179dd3` (extracted from
+`denver-jdk.img` with debugfs):
+
+```asm
+179dac:  mov (%rcx,%rax,8),%rdx     # auxv[2i].a_type
+179db0:  cmp $0x21,%rdx             # key == 33 — AT_SYSINFO_EHDR, by name!
+179db4:  je  0x179dc5               # → parse the value as an ELF
+179dc5:  mov 0x8(%rcx,%rax,8),%rdi  # auxv[2i].a_val — the disclosed address
+179dd3:  mov 0x20(%rdi),%rdx        # e_phoff — THE FAULT (no magic check first)
+179dd7:  movzwl 0x38(%rdi),%r8d     # e_phnum
+         # walks phdrs: PT_LOAD(1) → base = ehdr + p_offset − p_vaddr;
+         # PT_DYNAMIC(2) → dyn = ehdr + p_offset;
+         # then dynamic entries until DT_NULL, collecting hash/strtab/symtab/
+         # versym; no tables ⇒ clean "vDSO has no symbols" return (0x179e99).
+```
+
+So the static-PIE musl startup **seeks key 33 by name and dereferences it unchecked** — on
+real Linux the vDSO is always a valid ELF, so the bug never shows there. Finding 0's caveat
+3 ("musl ignores the key") was wrong; this artifact's record stands corrected. Note the
+symmetry: on this userland HotSpot asks for getcpu **without** auxv (hardcoded imm32), and
+musl asks for the vDSO **through** auxv — one ABI object per consumer, neither serves the
+other.
+
+**Design consequence (D21 revised):** the auxv disclosure must be a *valid ELF*. A
+`DT_NULL`-only dynamic array parses cleanly to "no vDSO symbols" and every consumer falls
+back to syscalls — the same functional state as no vDSO, minus the read fault. That is what
+ships here; the symbol-exporting fast-clock vDSO stays G5's work (its consumer just proved
+itself live — musl's own resolver — which is precisely where a real vDSO would pay).
+
 ## Crates, files, functions found (named)
 
 | piece | path | what it decides |
@@ -121,13 +162,15 @@ the vsyscall page lives in the kernel-half VA range, mapped user-executable glob
   auxv key reserved for exactly that concept. This flips the gate arm honestly (the value is
   the real address of a real kernel-provided page) while the actual consumer keeps using the
   ABI constant.
-- **D22 — the semantic caveat is recorded, the real ELF vDSO is deferred (G5).**
-  `AT_SYSINFO_EHDR` points at a non-ELF page: the legacy layout fixes stub slots at +0/+0x400/
-  +0x800, an ELF header needs +0 — mutually exclusive. Known consumers are safe by
-  construction: musl ignores the key; HotSpot never reads it (proven above); Go validates the
-  ELF magic before use and would bail. A real vDSO (symbols, vvar fast clock) serves no
-  current consumer and is G5's home (`CYCLES` measured the trap tax in phase 1) — not built
-  here (R5: budget for what the gate greps).
+- **D22 — ~~the semantic caveat is recorded~~ SUPERSEDED by Finding 1 (kept as written-then-corrected).**
+  The first build served `AT_SYSINFO_EHDR = 0xffffffffff600000` (a non-ELF page) on the
+  theory that every consumer validates or ignores; **RED-2 proved that false** — musl's
+  static-PIE startup parses the value with no magic check and tokioprobe died (see Finding
+  1). What ships instead: the legacy stubs stay at their ABI base, *undisclosed*; the
+  disclosure is a valid exports-free vDSO ELF one page below (`VDSO_BASE =
+  0xffffffffff5ff000`, `DT_NULL`-only dynamic array — "no symbols" is a clean return for
+  every resolver). The symbol-exporting fast-clock vDSO remains G5's home (`CYCLES` measured
+  the trap tax in phase 1); its consumer (musl's own resolver) just proved itself live.
 - **D23 — the map is one boot-time call into the kernel root.**
   `paging::map_page(0xffff_ff60_0000, frame.pa(), PteProt::USER_RX, MemAttr::WriteBack)` with
   the stub bytes written through the physmap first (`phys::Frame::alloc_zeroed` +

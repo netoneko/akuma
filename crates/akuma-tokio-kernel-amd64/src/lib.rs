@@ -2507,8 +2507,19 @@ fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg) -> Opti
 /// every task root spawned after boot.
 #[cfg(feature = "vsyscall")]
 mod vsyscall {
-    /// The ABI-fixed base; also the value served in auxv as `AT_SYSINFO_EHDR`.
+    /// The ABI-fixed base; also the value served in auxv as `AT_SYSINFO_EHDR`
+    /// is the vDSO one below — this base is HotSpot's hardcoded interface
+    /// only (Finding 0).
     pub const BASE: u64 = 0xffff_ffff_ff60_0000;
+
+    /// The disclosed vDSO base (`AT_SYSINFO_EHDR`): one page below the legacy
+    /// stubs, in the same top-GiB subtree. It must hold a *valid* ELF —
+    /// Finding 1 (PHASE-2-VDSO RED-2): musl's static-PIE startup seeks key 33
+    /// (`cmp $0x21` at tokioprobe+0x179db0), takes the value, and parses
+    /// e_phoff/e_phnum/e_phentsize with **no magic check**; a non-ELF value
+    /// is a ring-3 read fault in every static-PIE musl program (tokioprobe
+    /// died there: `cr2=0xffffffffff600020 code=0x4`).
+    pub const VDSO_BASE: u64 = 0xffff_ffff_ff5f_f000;
 
     /// `mov $nr, %eax; syscall; ret` — C-callable as `int fn(...)`: every
     /// callee register stays intact, and the syscall ABI takes the first three
@@ -2522,6 +2533,27 @@ mod vsyscall {
         page[off + 5] = 0x0f;
         page[off + 6] = 0x05;
         page[off + 7] = 0xc3;
+    }
+
+    const fn wr16(page: &mut [u8; 4096], off: usize, v: u16) {
+        page[off] = v as u8;
+        page[off + 1] = (v >> 8) as u8;
+    }
+
+    const fn wr32(page: &mut [u8; 4096], off: usize, v: u32) {
+        let mut k = 0;
+        while k < 4 {
+            page[off + k] = (v >> (8 * k)) as u8;
+            k += 1;
+        }
+    }
+
+    const fn wr64(page: &mut [u8; 4096], off: usize, v: u64) {
+        let mut k = 0;
+        while k < 8 {
+            page[off + k] = (v >> (8 * k)) as u8;
+            k += 1;
+        }
     }
 
     /// The page image — the legacy layout: gettimeofday at +0x000 (nr 96),
@@ -2538,14 +2570,65 @@ mod vsyscall {
         stub(&mut p, 0x800, 168);
         p
     };
+
+    /// The vDSO image (D22 revised): a *valid, exports-free* vDSO ELF. What
+    /// the one parser in this userland reads (Finding 1's disassembly) is:
+    /// `e_phoff` (+0x20), `e_phentsize` (+0x36), `e_phnum` (+0x38); the phdrs
+    /// walked for PT_LOAD (base = `ehdr + p_offset - p_vaddr`) and
+    /// PT_DYNAMIC (dyn = `ehdr + p_offset`); then dynamic entries until
+    /// `DT_NULL`, collecting hash/strtab/symtab/versym. An image whose
+    /// dynamic array is only `DT_NULL` parses cleanly to "no vDSO symbols"
+    /// and every consumer falls back to syscalls — the same functional state
+    /// as an absent vDSO, minus the static-PIE read fault. Layout:
+    /// `[0..64)` Ehdr, `[64..176)` two Phdrs, `[176..192)` the DT_NULL.
+    pub const VDSO_PAGE: [u8; 4096] = {
+        let mut p = [0u8; 4096];
+        // Ehdr.
+        p[0] = 0x7f;
+        p[1] = b'E';
+        p[2] = b'L';
+        p[3] = b'F';
+        p[4] = 2; // ELFCLASS64
+        p[5] = 1; // ELFDATA2LSB
+        p[6] = 1; // EV_CURRENT
+        wr16(&mut p, 16, 3); // e_type = ET_DYN
+        wr16(&mut p, 18, 0x3e); // e_machine = EM_X86_64
+        wr32(&mut p, 20, 1); // e_version
+        wr64(&mut p, 32, 64); // e_phoff
+        wr16(&mut p, 52, 64); // e_ehsize
+        wr16(&mut p, 54, 56); // e_phentsize
+        wr16(&mut p, 56, 2); // e_phnum
+        // Phdr 0: PT_LOAD covering the page, identity vaddr==offset (base=ehdr).
+        wr32(&mut p, 64, 1); // p_type = PT_LOAD
+        wr32(&mut p, 68, 4); // p_flags = PF_R
+        wr64(&mut p, 72, 0); // p_offset
+        wr64(&mut p, 80, 0); // p_vaddr
+        wr64(&mut p, 96, 4096); // p_filesz
+        wr64(&mut p, 104, 4096); // p_memsz
+        wr64(&mut p, 112, 4096); // p_align
+        // Phdr 1: PT_DYNAMIC at +176.
+        wr32(&mut p, 120, 2); // p_type = PT_DYNAMIC
+        wr32(&mut p, 124, 4); // p_flags = PF_R
+        wr64(&mut p, 128, 176); // p_offset
+        wr64(&mut p, 136, 176); // p_vaddr
+        wr64(&mut p, 152, 16); // p_filesz: one DT_NULL
+        wr64(&mut p, 160, 16); // p_memsz
+        wr64(&mut p, 168, 8); // p_align
+        // Dynamic: DT_NULL only — no symbols, so every consumer's lookup
+        // returns "not found" and falls back to syscalls (the honest shape
+        // until G5's fast-clock vDSO).
+        // d_tag = DT_NULL = 0, d_val = 0 — the page is zeroed, so it is in.
+        p
+    };
 }
 
-/// Map the vsyscall page into the kernel root: one frame, user-RX, at the
-/// ABI-fixed base. `step_down` widens the present PML4[511] entry
-/// (`P|RW|US`, NX clear) while the kernel-image siblings keep their own
-/// `U=0` guards — U/S ANDs down the walk, so nothing opens to ring 3 but this
-/// page. Runs before the first spawn and before SMP (`map_page`'s own
-/// precondition: boot-time kernel tables, core-local `invlpg` complete).
+/// Map both pages into the kernel root: the legacy stubs user-RX at the
+/// ABI-fixed base, the disclosed vDSO ELF user-RO one page below. `step_down`
+/// widens the present PML4[511] entry (`P|RW|US`, NX clear) while the
+/// kernel-image siblings keep their own `U=0` guards — U/S ANDs down the
+/// walk, so nothing opens to ring 3 but these pages. Runs before the first
+/// spawn and before SMP (`map_page`'s own precondition: boot-time kernel
+/// tables, core-local `invlpg` complete).
 #[cfg(feature = "vsyscall")]
 fn map_vsyscall() {
     let Some(frame) = phys::Frame::alloc_zeroed() else {
@@ -2557,7 +2640,21 @@ fn map_vsyscall() {
         console::puts("  vsyscall: map refused - the ABI stays unserved\n");
         return;
     }
-    console::puts("  vsyscall: legacy page rx @ 0xffffffffff600000\n");
+    let Some(frame) = phys::Frame::alloc_zeroed() else {
+        console::puts("  vsyscall: no frame for the vDSO page - the disclosure stays off\n");
+        return;
+    };
+    frame.write_bytes(0, &vsyscall::VDSO_PAGE);
+    if !paging::map_page(
+        vsyscall::VDSO_BASE as usize,
+        frame.pa(),
+        PteProt::USER_RO,
+        MemAttr::WriteBack,
+    ) {
+        console::puts("  vsyscall: vDSO map refused - the disclosure stays off\n");
+        return;
+    }
+    console::puts("  vsyscall: legacy page rx @ 0xffffffffff600000, vDSO elf ro @ 0xffffffffff5ff000\n");
 }
 
 /// Load an ELF image into the CURRENT task slot: fresh page root (the
@@ -2682,9 +2779,12 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     aux[13] = (ring3::AT_RANDOM, 0);
     // A `cfg` cannot sit on the assignment statement itself (attributes on
     // expressions are experimental), so the disclosure hides inside a block.
+    // The value is the *vDSO* ELF's base — Finding 1: the value is parsed as
+    // an ELF with no magic check, so the legacy stubs page must not be the
+    // disclosure (the stubs stay at their ABI base for HotSpot only).
     #[cfg(feature = "vsyscall")]
     {
-        aux[14] = (ring3::AT_SYSINFO_EHDR, vsyscall::BASE);
+        aux[14] = (ring3::AT_SYSINFO_EHDR, vsyscall::VDSO_BASE);
     }
     // `..n_args`, not `..=n_args`: the array is exactly argv-sized and the
     // slice must be too. The old builder pre-filled every slot with argv[0]
@@ -3035,9 +3135,10 @@ fn boot(k: &Kernel) -> ! {
     // the tables" (amd64's ordering rule).
     exec_twin::init();
     install_surface();
-    // The legacy vsyscall page (`vsyscall` feature, PHASE-2-VDSO): map the ABI
-    // HotSpot hardcodes before any task root copies the upper half. Off by
-    // default (R6).
+    // The legacy vsyscall page + the disclosed vDSO ELF (`vsyscall` feature,
+    // PHASE-2-VDSO): map the ABI HotSpot hardcodes and the valid ELF the
+    // static-PIE musl parser demands, before any task root copies the upper
+    // half. Off by default (R6).
     #[cfg(feature = "vsyscall")]
     map_vsyscall();
     // The virtio-mmio window is the disk's and the NIC's: map it whichever is compiled in.
