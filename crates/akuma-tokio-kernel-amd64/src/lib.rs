@@ -2490,6 +2490,76 @@ fn place_segment(root: u64, image: &[u8], seg: &akuma_elf_exec::LoadSeg) -> Opti
     Some((first, last))
 }
 
+// ---------------------------------------------------------------------------
+// The legacy vsyscall page (`vsyscall` feature): the ABI HotSpot hardcodes.
+// ---------------------------------------------------------------------------
+
+/// The legacy x86-64 vsyscall page (PHASE-2-VDSO, D21/D24; see
+/// denver/docs/research/PHASE-2-VDSO.md). HotSpot 21 does not consult
+/// `AT_SYSINFO_EHDR` for its getcpu path — it loads the legacy address as a
+/// sign-extended imm32 and calls the slot as a *C function* (libjvm.so+0xaef710:
+/// `mov $0xffffffffff600800, %rax; … ; call *%rax`). Serving the page at the
+/// ABI-fixed base is the only interface that closes the death; the auxv entry
+/// (in `load_task`) is the disclosure the probe arm greps. Linux maps this
+/// page in its kernel-half VA range, user-executable, globally; here that is
+/// PML4[511]/PDPT[511] — the top GiB, proven unmapped by the FAULTNAME gate's
+/// not-present fetch — and `copy_kernel_half` hands the widened PML4 entry to
+/// every task root spawned after boot.
+#[cfg(feature = "vsyscall")]
+mod vsyscall {
+    /// The ABI-fixed base; also the value served in auxv as `AT_SYSINFO_EHDR`.
+    pub const BASE: u64 = 0xffff_ffff_ff60_0000;
+
+    /// `mov $nr, %eax; syscall; ret` — C-callable as `int fn(...)`: every
+    /// callee register stays intact, and the syscall ABI takes the first three
+    /// C args in the same registers (`rdi`, `rsi`, `rdx`).
+    const fn stub(page: &mut [u8; 4096], off: usize, nr: u64) {
+        page[off] = 0xb8;
+        page[off + 1] = nr as u8;
+        page[off + 2] = (nr >> 8) as u8;
+        page[off + 3] = (nr >> 16) as u8;
+        page[off + 4] = (nr >> 24) as u8;
+        page[off + 5] = 0x0f;
+        page[off + 6] = 0x05;
+        page[off + 7] = 0xc3;
+    }
+
+    /// The page image — the legacy layout: gettimeofday at +0x000 (nr 96),
+    /// time at +0x400 (nr 201), getcpu at +0x800 (nr 168), `int3` padding
+    /// elsewhere. Only +0x800 is proven consumed (Finding 0); all three are
+    /// the ABI. The +0x800 stub answers ENOSYS (-38) today (G2), which
+    /// HotSpot's `cmp $-1` wrapper does not treat as failure: it reads the
+    /// pre-zeroed cpu — the getcpu need *softens* for the JVM, it does not
+    /// close (the raw `getcpu(2)` arm stays G2's gate).
+    pub const PAGE: [u8; 4096] = {
+        let mut p = [0xccu8; 4096];
+        stub(&mut p, 0x000, 96);
+        stub(&mut p, 0x400, 201);
+        stub(&mut p, 0x800, 168);
+        p
+    };
+}
+
+/// Map the vsyscall page into the kernel root: one frame, user-RX, at the
+/// ABI-fixed base. `step_down` widens the present PML4[511] entry
+/// (`P|RW|US`, NX clear) while the kernel-image siblings keep their own
+/// `U=0` guards — U/S ANDs down the walk, so nothing opens to ring 3 but this
+/// page. Runs before the first spawn and before SMP (`map_page`'s own
+/// precondition: boot-time kernel tables, core-local `invlpg` complete).
+#[cfg(feature = "vsyscall")]
+fn map_vsyscall() {
+    let Some(frame) = phys::Frame::alloc_zeroed() else {
+        console::puts("  vsyscall: no frame for the stub page - the ABI stays unserved\n");
+        return;
+    };
+    frame.write_bytes(0, &vsyscall::PAGE);
+    if !paging::map_page(vsyscall::BASE as usize, frame.pa(), PteProt::USER_RX, MemAttr::WriteBack) {
+        console::puts("  vsyscall: map refused - the ABI stays unserved\n");
+        return;
+    }
+    console::puts("  vsyscall: legacy page rx @ 0xffffffffff600000\n");
+}
+
 /// Load an ELF image into the CURRENT task slot: fresh page root (the
 /// kernel's upper half shared by PML4 copy), every `PT_LOAD` placed eagerly
 /// at its link address, a Linux initial stack with argc/argv/envp/auxv on
@@ -2587,6 +2657,13 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
 
     // argc/argv/envp/auxv. `AT_RANDOM`/`AT_EXECFN` values are the builder's
     // to fill.
+    // Fifteen when the vsyscall page is served (PHASE-2-VDSO, D21): the extra
+    // pair discloses the page as `AT_SYSINFO_EHDR` (the key the phase-1 auxv
+    // arm greps). Feature-gated rather than always-on — the metal loader's
+    // own warning ("the auxv grew past what STACK_WORDS_MAX budgets", D25).
+    #[cfg(feature = "vsyscall")]
+    const AUX_N: usize = 15;
+    #[cfg(not(feature = "vsyscall"))]
     const AUX_N: usize = 14;
     let mut aux = [(0u64, 0u64); AUX_N];
     aux[0] = (ring3::AT_BASE, at_base); // the interpreter's base, 0 if none
@@ -2603,6 +2680,12 @@ fn load_task(argv: &[&str], env: &[&str], image: &[u8]) -> Option<TaskImage> {
     aux[11] = (ring3::AT_HWCAP, 0);
     aux[12] = (ring3::AT_CLKTCK, 100);
     aux[13] = (ring3::AT_RANDOM, 0);
+    // A `cfg` cannot sit on the assignment statement itself (attributes on
+    // expressions are experimental), so the disclosure hides inside a block.
+    #[cfg(feature = "vsyscall")]
+    {
+        aux[14] = (ring3::AT_SYSINFO_EHDR, vsyscall::BASE);
+    }
     // `..n_args`, not `..=n_args`: the array is exactly argv-sized and the
     // slice must be too. The old builder pre-filled every slot with argv[0]
     // and then sliced one slot PAST the copied prefix (`..=`), so the new
@@ -2952,6 +3035,11 @@ fn boot(k: &Kernel) -> ! {
     // the tables" (amd64's ordering rule).
     exec_twin::init();
     install_surface();
+    // The legacy vsyscall page (`vsyscall` feature, PHASE-2-VDSO): map the ABI
+    // HotSpot hardcodes before any task root copies the upper half. Off by
+    // default (R6).
+    #[cfg(feature = "vsyscall")]
+    map_vsyscall();
     // The virtio-mmio window is the disk's and the NIC's: map it whichever is compiled in.
     #[cfg(any(feature = "disk", feature = "net"))]
     let virtio = map_virtio(&machine.virtio);

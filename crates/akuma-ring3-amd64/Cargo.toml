@@ -15,3 +15,8 @@ akuma-cpu = { path = "../akuma-cpu" }
 # derives user CS/SS from `STAR` in turn, so the transitions and the table
 # cannot drift apart.
 akuma-gdt = { path = "../akuma-gdt" }
+
+[features]
+# The legacy vsyscall page (PHASE-2-VDSO, D25): gates `AT_SYSINFO_EHDR`, the
+# auxv key the kernel-provided code page is disclosed under. Off by default.
+vsyscall = []

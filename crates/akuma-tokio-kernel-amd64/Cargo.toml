@@ -22,6 +22,11 @@ trace-err = []
 # behaviour at compile time - and the pure checks in `akuma-syscalls-mem::wx` answer Allow. Off by
 # default (R6); one policy per kernel build, no per-program exemption (R7).
 wx-relaxed = ["akuma-syscalls-mem/wx-relaxed"]
+# The legacy vsyscall page (PHASE-2-VDSO, G3): map the ABI HotSpot hardcodes
+# (getcpu at 0xffffffffff600800, called as a C function) user-RX from the
+# kernel root, and disclose the page as `AT_SYSINFO_EHDR` in auxv. Off by
+# default (R6); one ABI statement per kernel build, no builder knob (R7).
+vsyscall = ["akuma-ring3-amd64/vsyscall"]
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # The default devices, each wired by its `Kernel` method (`console()`, `disk()`, `net()`, `smp()`).

@@ -32,6 +32,9 @@ trace-err = ["akuma-tokio-kernel/trace-err"]
 # cache, relayed 1:1 onto akuma-tokio-kernel. Off by default (R6) - a kernel build states its
 # policy by enabling it (the console propagation pattern, phase-0 D2).
 wx-relaxed = ["akuma-tokio-kernel/wx-relaxed"]
+# The legacy vsyscall page (PHASE-2-VDSO, G3): the ABI HotSpot hardcodes, relayed 1:1 onto
+# akuma-tokio-kernel. Off by default (R6) - the same policy-by-features pattern.
+vsyscall = ["akuma-tokio-kernel/vsyscall"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

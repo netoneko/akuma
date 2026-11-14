@@ -85,6 +85,16 @@ pub const AT_RANDOM: u64 = 25;
 pub const AT_EXECFN: u64 = 31;
 /// `AT_BASE` — the interpreter's base (none: static).
 pub const AT_BASE: u64 = 7;
+/// `AT_SYSINFO_EHDR` — the kernel-provided fast-path code page (PHASE-2-VDSO,
+/// D21/D25): the legacy x86-64 vsyscall page at its ABI-fixed address
+/// `0xffff_ff60_0000`, mapped user-RX from the kernel root and inherited by
+/// every task through the shared upper half. The value is the page's real
+/// address; the page is not an ELF (the legacy layout fixes the stub slots at
+/// +0x000/+0x400/+0x800, an ELF header needs +0 — D22's recorded caveat).
+/// Off by default: this const and the auxv entry that carries it exist only
+/// under the `vsyscall` feature (R6).
+#[cfg(feature = "vsyscall")]
+pub const AT_SYSINFO_EHDR: u64 = 33;
 
 /// Most `argv`+`envp` strings whose addresses the builder will remember.
 /// The composed kernel passes one argv entry and no env; the bound is a

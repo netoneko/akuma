@@ -1,5 +1,14 @@
 use super::*;
 
+// ---- the vDSO gate's ABI pin (PHASE-2-VDSO, D21/D25): the auxv key is the
+// Linux constant, and the gate arm greps exactly this key ----
+
+#[cfg(feature = "vsyscall")]
+#[test]
+fn at_sysinfo_ehdr_is_the_linux_key() {
+    assert_eq!(AT_SYSINFO_EHDR, 33);
+}
+
 // ---- the stack builder: read the block back through the same mapping the
 // kernel places it with ----
 

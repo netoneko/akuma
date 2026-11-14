@@ -16,6 +16,10 @@ akuma-jvm-kernel = { path = "../akuma-jvm-kernel", features = ["no-tests"] }
 # relayed 1:1 down the front crate. Off by default (R6): the phase-0 default build (console,
 # disk, net, smp) is unchanged; the gate kernel is `--features wx-relaxed` (rig: denver-wx).
 wx-relaxed = ["akuma-jvm-kernel/wx-relaxed"]
+# The legacy vsyscall page (PHASE-2-VDSO, G3): the ABI HotSpot hardcodes, relayed 1:1 down the
+# front crate. Off by default (R6); the gate kernel is `--features wx-relaxed,vsyscall`
+# (rig: denver-vdso).
+vsyscall = ["akuma-jvm-kernel/vsyscall"]
 
 [[bin]]
 name = "denver"
