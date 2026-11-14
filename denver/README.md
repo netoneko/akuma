@@ -1,11 +1,17 @@
 # denver
 
-<!-- PREFACE: placeholder — written together next; the lessons curriculum below is locked. -->
+denver is an experimental platform kernel, written almost entirely by GLM-5.3-flash
+working in autoresearch mode — one gate per session, captured probe output as the only
+judge (`docs/runbooks/AUTORESEARCH.md`), a human operator in the loop. The goal was
+twofold: condense the previous experiments into a set of generic lessons for building
+platform kernels, and prove them on a concrete platform — here, the JVM.
 
-The lessons below are the general method distilled from the denver autoresearch run
-(2026-11-13 → 2026-11-14). Every rule is proven by a captured gate log or a recorded
-decision — nothing here is doctrine without evidence. The links go to the living lesson
-files, which carry the full worked example and the per-gate `Record` trail.
+It took the loop about 24 hours to go from a bare kernel that boots tokio to enough
+artifacts to run Java, Clojure, Scala and Groovy — and to serve an HTTP server written
+in Clojure, from a fresh kernel booting under KVM on metal. Every rule below is proven
+by a captured gate log or a recorded decision — nothing here is doctrine without
+evidence. The links go to the living lesson files, which carry the full worked example
+and the per-gate `Record` trail.
 
 ## The lessons
 
