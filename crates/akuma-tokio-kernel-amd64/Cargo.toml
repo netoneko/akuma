@@ -40,6 +40,9 @@ procfs-diag = ["akuma-tokio-kernel-core/procfs-diag", "akuma-runtime-tokio/procf
 # arguments as the caller's register state. Under this feature the six registers as they arrived
 # are put back before the return (D39). Off by default (R6).
 fold-regpreserve = []
+# The release sweep's lazy-record clearing (PHASE-2-HEAPRO): 1:1 onto `akuma-mmu`
+# (the x86 `unmap_present` blind spot). Off by default (R6).
+lazy-release-sweep = ["akuma-mmu/lazy-release-sweep"]
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.

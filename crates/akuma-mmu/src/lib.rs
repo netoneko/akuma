@@ -3982,6 +3982,52 @@ impl UserAddressSpace {
             }
             LeafAction::Unmap
         });
+        #[cfg(feature = "lazy-release-sweep")]
+        self.clear_lazy_records_in_range(start, end);
+    }
+
+    /// PHASE-2-HEAPRO (D45, research/PHASE-2-HEAPRO.md): release must also clear
+    /// the range's *lazy records* — the P=0 software leaves `lazy::reserve`
+    /// installs via `leaf_table_slot`. The present-leaf walk above classifies
+    /// them `Missing` (`akuma-pagetable`'s lookup tests the valid bit first —
+    /// lazy_record's own contract) and jumps over them, so after any release the
+    /// leaf slots still described what *used to* live there, and `lazy::fill` —
+    /// which decodes the leaf it is handed, no region check possible from below
+    /// `akuma-exec` — re-served the range: a stale anon record handed out a
+    /// fresh zero page over a released VA (a write that Linux would SIGSEGV
+    /// silently succeeded), a stale file record read the old file's page back
+    /// RO and the next write died at code=0x7 unmarked — the PHASE-2-NULLFIX
+    /// java death, byte for byte (`pte=0x20dc6025`, refs=2, kind=2 range).
+    ///
+    /// A not-present leaf is never cached, so this pass needs no TLB
+    /// maintenance; the walk above's shootdown stands unchanged. Feature-gated
+    /// (R6): off, `unmap_present` is the walk and nothing else. NOT in
+    /// `rewrite_leaves_in_range` deliberately — `reprotect_present` (mprotect)
+    /// walks the same leaves and must keep untouched lazy records: clearing
+    /// them there would strand every not-yet-faulted page of an mprotect'd
+    /// lazy range. The AArch64 twin's per-page walk tests VALID first and
+    /// carries the same hole, recorded in the research artifact, not fixed
+    /// here (denver is amd64; R6 scope). Large leaves need no clearing — there
+    /// are no lazy records under one, and `leaf_table_slot` reports `None`
+    /// under a large intermediate entry for the same reason.
+    #[cfg(feature = "lazy-release-sweep")]
+    fn clear_lazy_records_in_range(&self, start: usize, end: usize) {
+        let first = start & !(PAGE_SIZE - 1);
+        let mut va = first;
+        while va < end {
+            if let Some(slot) = x86_walk::leaf_table_slot::<KernelPhysMap>(self.root as u64, va) {
+                let entry = slot.get();
+                if entry != 0 && entry & 1 == 0 {
+                    // Bit 0 clear, bits 1.. set: software's record of a released
+                    // mapping. Release means it goes.
+                    slot.set(0);
+                }
+            }
+            match va.checked_add(PAGE_SIZE) {
+                Some(next) => va = next,
+                None => break,
+            }
+        }
     }
 
     /// `mprotect`'s page-table half — the AArch64 twin's contract, in one

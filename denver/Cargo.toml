@@ -37,6 +37,13 @@ trace-err = ["akuma-jvm-kernel/trace-err"]
 # `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve`
 # (rig: denver-nullfix).
 fold-regpreserve = ["akuma-jvm-kernel/fold-regpreserve"]
+# The release sweep's lazy-record clearing (PHASE-2-HEAPRO): the released range's
+# P=0 records the present-only walk skipped were re-served by the not-present
+# fault arm; a stale file record read back RO and the next write died at
+# code=0x7 unmarked — PHASE-2-NULLFIX's java death. Off by default (R6); the gate
+# kernel is `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep`
+# (rig: denver-heapro).
+lazy-release-sweep = ["akuma-jvm-kernel/lazy-release-sweep"]
 
 [[bin]]
 name = "denver"

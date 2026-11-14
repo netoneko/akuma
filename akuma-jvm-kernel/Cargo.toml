@@ -44,6 +44,9 @@ procfs-diag = ["akuma-tokio-kernel/procfs-diag"]
 # `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve`
 # (rig: denver-nullfix).
 fold-regpreserve = ["akuma-tokio-kernel/fold-regpreserve"]
+# PHASE-2-HEAPRO's release-sweep fix (D45). Off by default (R6); the gate kernel
+# is `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep`.
+lazy-release-sweep = ["akuma-tokio-kernel/lazy-release-sweep"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

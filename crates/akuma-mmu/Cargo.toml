@@ -30,6 +30,14 @@ leak-instr = ["akuma-user-space/leak-instr"]
 # `akuma-bkl`, whose `current_core_id` this crate uses for the TTBR free gate.
 bkl-smp = ["akuma-bkl/bkl-smp", "akuma-primitives/bkl-smp"]
 
+# PHASE-2-HEAPRO (D45): the release sweep also clears the range's lazy records —
+# the P=0 software leaves `lazy::reserve` installs that the present-leaf walk
+# classifies `Missing` and skips, so after a release `lazy::fill` re-served the
+# stale records (the observed java death: a released range came back RO via the
+# file-page cache and the next write died at code=0x7 unmarked). Off by default
+# (R6): with the feature off, `unmap_present` is the present-leaf walk only.
+lazy-release-sweep = []
+
 [dependencies]
 # The amd64 entry format (bits, encoder, PteProt/MemAttr) and the table accessor
 # + 4-level walker over it. Unconditional: both are pure data / `no_std`, and the
