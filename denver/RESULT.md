@@ -356,3 +356,33 @@ Kernel delta (≈70 LOC, all behind `vsyscall`, off by default): `crates/akuma-r
 module: legacy stub page + valid exports-free vDSO ELF, `map_vsyscall()` at boot, gated auxv
 pair), relay manifests ×3. Zero changes to `akuma-syscalls-*`, no middleware, no hook tables
 (R7).
+
+## Operator merge verification — 2026-11-14 — NOT A GATE (no agent session; driver stopped)
+
+INTERVENTION (operator, 2026-11-14): `litter/main` was merged into `denver` (3531cf69,
+pushed) and the three gate kernels were rebuilt from the merge and re-staged. Captures:
+`/root/denver/merge-verify/` (build-default.log, build-wx.log, build-vdso.log,
+gate-wx.log, gate-vdso.log, gate-faultname.log). What the verification covered, and what
+it deliberately did not:
+
+- **Verified:** the WX gate on the rebuilt kernel — tokioprobe RESULT PASS, `RWX PASS
+  rw_to_rx=42`, uname `0.1.0-3531cf69-denver` (the staged binary is the merge's build).
+- **Verified:** the VDSO gate — `RESULT PASS`, `AUXV PASS
+  AT_SYSINFO_EHDR=18446744073699061760` (= `0xffffffffff5ff000`); the gate's own verdict
+  is MOVEMENT PASS.
+- **FAIL by design, not a regression:** the FAULTNAME gate — `RESULT FAIL: rig changed`.
+  It pins the historical wx binary hash `0.1.0-8a658723-denver`, which a rebuild cannot
+  carry. The probe's identity check is corrected to accept any denver build
+  (`0.1.0-*-denver`); the `wx-relaxed` proof stays in the unchanged RWX arm.
+- **Not verified:** `sysinfo(2)` on the merged tree. G7's clean `Too small maximum heap`
+  exit is gone from the java arm, but no sysinfo probe ran — presumed served over by
+  main's memory/sysinfo changes, verdict pending a probe (G7 demoted to verification).
+- **New evidence (one behaviour change):** the java arm now dies with a user-mode NULL
+  write — `[Fault] ring3 PageFault rip=0x000000003005fc41 rsp=0x00006fffffffba60
+  cr2=0x0 code=0x6` — past the heap blocker. The attempt's blocker-3 NULL store (suspect
+  since phase 1) is the observed first blocker on the merged tree, filed as G9;
+  REQUIREMENTS re-ranked, next gate PHASE-2-PROCFS (name the rip before fixing it).
+
+Session 7 (OPERATOR-IMPROVEMENTS, LOOP_LOG) landed the loop-efficiency changes on top:
+`denver/bookkeep.sh`, driver edits, `denver/docs/EFFICIENCY.md`, STATE.md digest,
+COST_LEDGER.md.

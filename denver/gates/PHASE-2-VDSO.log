@@ -1,0 +1,39 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-vdso.spec (elapsed=3s)
+== rig identity: uname says denver, and NOT the WX rig hash 8a658723 (D26) (elapsed=3s)
+Linux denver 0.1.0-e0924225-denver e0924225-release x86_64 GNU/Linux
+== the new mapping's boot line (console side) (elapsed=3s)
+  vsyscall: legacy page rx @ 0xffffffffff600000, vDSO elf ro @ 0xffffffffff5ff000
+== platform sanity: tokioprobe (phase 0's marker) (elapsed=3s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-e0924225-denver e0924225-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.15s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (this binary carries wx-relaxed AND vsyscall) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== the G3 flip: the auxv arm (RED in phase 1: AT_SYSINFO_EHDR missing) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV INFO /proc/self/auxv unreadable errno=2 (No such file or directory)
+  (value = 0xffffffffff5ff000: the disclosed ELF is the vDSO page, one page below the ABI base, D22 revised)
+== the death must not recur: java -version, then the console window (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=1 signal=0 bytes=66
+JVM-INFO raw: Too small maximum heap
+JVM RED Error occurred during initialization of VM
+-- console window: fault line:
+<none>
+-- console window: slot line:
+<none>
+MOVEMENT PASS: the workload exited without the vsyscall death and without a signal - read the arm's own lines above
+== verdict (elapsed=7s)
+RESULT PASS
+== wall clock: seconds=7 (t0=1794616107 end=1794616114)

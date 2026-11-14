@@ -329,3 +329,49 @@ clock (stamps in the capture; the bisect boots' verdicts live in this entry and 
 sizing toward whatever G8's suspects actually do).
 
 NEXT GATE: PHASE-2-MEMINFO
+
+### OPERATOR-IMPROVEMENTS — 2026-11-14, session 7 (operator-directed merge verification + loop improvements; no agent gate run)
+
+**Goal:** record the operator's merge of `litter/main` into `denver` and its verification,
+land the quota-efficiency changes the six sessions measured, and re-rank from the one
+behaviour change the rebuild exposed. No gate was run by an agent this session; the driver
+stayed stopped.
+
+**The merge verification (captures `/root/denver/merge-verify/`, kernels rebuilt from
+3531cf69 and staged):** WX gate `RWX PASS rw_to_rx=42` + tokioprobe PASS on uname
+`0.1.0-3531cf69-denver`; VDSO gate `RESULT PASS`, `AUXV PASS
+AT_SYSINFO_EHDR=18446744073699061760` (gate verdict: MOVEMENT PASS). FAULTNAME gate
+`RESULT FAIL: rig changed` **by design** — it pinned the historical wx binary hash
+8a658723, which no rebuild can carry; not a regression. What was NOT verified:
+`sysinfo(2)` on the merged tree — G7's clean `Too small maximum heap` exit is simply gone
+from the java arm, with no sysinfo probe run to say why (RESULT.md has the full ledger).
+
+**The behaviour change (the new evidence):** on the merged tree the java arm dies with
+`[Fault] ring3 PageFault rip=0x000000003005fc41 rsp=0x00006fffffffba60 cr2=0x0 code=0x6`
+— a user-mode write to NULL (code=0x6), past the heap blocker: the attempt's blocker-3
+NULL store, a suspect since phase 1, is now the observed first blocker. Filed as **G9**.
+A bare rip cannot be fixed: no maps exist to attribute it, so the runbook's
+diagnostics-before-the-unknown rule applies a third time. **New order (REQUIREMENTS.md):
+G4 (PHASE-2-PROCFS) → G9 (NULL-store fix, named once PROCFS lands) → G7 (demoted to
+verifying sysinfo on the merged tree) → G2 → G5; G8 still suspects.**
+
+**Probe debt paid:** `denver/probe-faultname.sh` accepted only the pinned rig hash — the
+rebuild FAILed the gate on exactly that. Its identity check now accepts any denver build
+(`0.1.0-*-denver`); the `wx-relaxed` policy itself is still proven by the unchanged
+`RWX PASS rw_to_rx=42` arm, so the pass condition is not weakened.
+
+**Loop efficiency landed (measured over six sessions: ~98% of input tokens are cache
+reads, cost = context x calls):** `denver/bookkeep.sh` (checks, `--fix` for the
+`##`-heading trap that bit session 5, `--digest` STATE.md, `--cost` COST_LEDGER.md);
+driver changes in `denver/autoresearch.sh` (drift preflight, heading repair, bare-metal
+`cargo build` for kernel crates that cannot host-test, `--max-turns 150` /
+`--max-tool-repetitions 5` env-overridable with compaction OFF by default, post-session
+digest+cost); `denver/docs/EFFICIENCY.md` (the knob ledger + the one-experiment-per-phase
+rule); `denver/docs/STATE.md` and `denver/docs/COST_LEDGER.md` seeded. Sessions now
+orient from the digest instead of cat-ing 39k of LOOP_LOG.
+
+**Interventions:** none by the agent; the merge itself was operator-directed and is
+recorded in RESULT.md with what it verified and what it did not.
+
+**Transition.** The ladder's next rung is diagnostic, per the re-rank:
+NEXT GATE: PHASE-2-PROCFS

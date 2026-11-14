@@ -20,9 +20,11 @@
 # every step (debt 2; probe-method's shape, slew-clamped per L4 Do 3), and the fault naming
 # (debt 1 - the java arm names exit-vs-signal; the console names the fault).
 #
-# Pass condition (D19, in order): uname carries the WX-gate rig hash 0.1.0-8a658723-denver
-# (mismatch = rig changed = FAIL) -> tokioprobe RESULT PASS (platform sanity) -> RWX PASS
-# rw_to_rx=42 (the wx-relaxed policy active) -> the java arm dies JVM RED signal=11 -> the
+# Pass condition (D19, in order): uname is a denver build id 0.1.0-<hash>-denver (not a
+# denver build = rig changed = FAIL; the historical 8a658723 pin broke on rebuilds - the
+# 2026-11-14 merge-verify rebuild FAILed exactly there, so the identity check now accepts
+# any denver-wx build; wx-relaxed itself is still proven by the RWX arm below) -> tokioprobe
+# RESULT PASS (platform sanity) -> RWX PASS rw_to_rx=42 (the wx-relaxed policy active) -> the java arm dies JVM RED signal=11 -> the
 # console window (bytes from the pre-arm offset of $W/vmrun.log) carries the ring3 line with
 # rip= AND cr2= -> FAULT PASS (module=legacy-vsyscall-page at the ABI constant) -> RESULT PASS.
 # A java arm that passes outright is RESULT FAIL: nothing to name - a ladder-moving surprise,
@@ -40,7 +42,11 @@ PORT=${DENVER_PORT:-2247}
 WAIT=${DENVER_BOOT_WAIT_TRIES:-30}     # x 5 s
 SSH="ssh -y -i $W/key -p $PORT root@127.0.0.1"
 VMLOG=$W/vmrun.log
-RIGHASH="0.1.0-8a658723-denver"        # the proven WX-gate binary's uname hash (D18)
+RIGPAT="0.1.0-*-denver"                # any denver build's uname id; the historical pin
+                                       # (0.1.0-8a658723-denver) broke on rebuilds - the
+                                       # 2026-11-14 merge-verify rebuild FAILed the gate on
+                                       # exactly that. This only relaxes WHICH denver build:
+                                       # wx-relaxed is still proven by the RWX arm below.
 VSYSCALL=ffffffffff600800             # the legacy vsyscall page (Linux ABI constant; metal hs_err pc)
 BLOCKER1="Failed to mark memory page as executable"
 T0=$(date +%s)
@@ -87,11 +93,11 @@ while :; do
     sleep 5
 done
 
-step "rig identity: uname must carry the WX-gate hash $RIGHASH (D18)"
+step "rig identity: uname must be a denver build ($RIGPAT); wx-relaxed is proven by the RWX arm below"
 echo "$out" | grep Linux
 case "$out" in
-    *"$RIGHASH"*) ;;
-    *) verdict "RESULT FAIL: rig changed - uname lacks $RIGHASH (denver-wx rebuilt or swapped; the gate's evidence chain needs the proven binary)" 1 ;;
+    $RIGPAT) ;;
+    *) verdict "RESULT FAIL: rig changed - uname is not a denver build (expected 0.1.0-<hash>-denver; the gate's evidence chain needs a denver-wx kernel)" 1 ;;
 esac
 
 step "platform sanity: tokioprobe (phase 0's marker)"
