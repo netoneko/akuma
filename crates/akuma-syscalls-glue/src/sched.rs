@@ -8,8 +8,9 @@
 
 use super::*;
 
-/// `getcpu(cpu, node, tcache)`: write the caller's CPU index to `cpu` and its
-/// NUMA node to `node`; either pointer may be NULL (Linux allows that).
+/// `getcpu(cpu, node, tcache)`: write the caller's CPU index and NUMA node.
+///
+/// The CPU index goes to `cpu` and the node to `node`; either pointer may be NULL (Linux allows that).
 /// `tcache` has been ignored by Linux since 2.6.24 — ignored here too,
 /// recorded rather than implemented. Returns 0, or `EFAULT` when a given
 /// pointer is not writable.

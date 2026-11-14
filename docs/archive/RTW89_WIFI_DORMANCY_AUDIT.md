@@ -111,6 +111,50 @@ new fw format (`crates/akuma-kernel-amd64/src/rtw89.rs:76`) for no measured bene
    network selection if present. -65 dBm on 2.4 GHz is the shared RF root
    cause; 5 GHz is the real robustness win.
 
+## 2026-11-14 outage: silent channel change (11 -> 6), no recovery (observation, cause not proven)
+
+Written down at the user's request so the stability work can pick it up later; nothing was changed.
+
+**What happened.** The ryzen box (KVM-herd kernel, ~17.5 h uptime, no reboot) became unreachable from the LAN at
+about 19:30 UTC while its console still said `wlan0: connected to Onyxia (a4:91:b1:e6:84:b1), chan 11`. It stayed
+that way until the user ran `wifi disconnect` + `wifi connect` at ~19:46:55 UTC, after which it joined the **same
+BSSID on chan 6** and worked. The scan list shows that BSSID on chan 6 and at least four other networks on chan 11.
+
+**Evidence (all from the persisted `/var/log/ryzen/klog-290.all`, 91,917 lines; the in-kernel dmesg ring of 595
+lines had already overwritten the moment).** Times are estimates (+-1 min) reconstructed from herd `PSTATS`
+uptime stamps, not from a wall clock. The once-a-minute `[rtw] link:` line:
+
+| time (UTC) | rx data | tx | tx `retry-limit` | note |
+|---|---|---|---|---|
+| 19:29:25 | 1,333,500 | 1,128,077 | 4 | normal traffic |
+| 19:30:25 | 1,334,674 | 1,128,944 | 4 | last rx advance |
+| 19:31 - 19:39 | 1,334,674 (frozen) | 1,128,944 (frozen) | 4 | nothing in, nothing out for ~10 min |
+| 19:40 - 19:46 | frozen | +16..+45 | 10 -> 38 -> 46 -> 48 | transmits start, all fail at the retry limit |
+| 19:46:55 | | | | `[rtw] join4 (keys)` = the user's reconnect |
+
+- **No** `disconnected`, `deauth` or `beacon loss` line anywhere in that window. The only `beacon loss ignored: the
+  access point's frames still arrive` in the boot is the one at join time (log line 802). The driver never noticed.
+- `rx data` stopping dead while the link believes it is up is the signature of the radio sitting on a channel the AP
+  left, not of a rekey or a lock problem (a group rekey ran normally at 19:26:25 and again at 19:56:25).
+- The `wifi` daemon had `Onyxia` marked `auto` and did not reconnect, because from its side nothing dropped.
+
+**Hypothesis, not confirmed:** the AP changed channel 11 -> 6 (auto-channel on a crowded 2.4 GHz band) without a
+usable CSA, and the station neither followed nor detected the loss. This is the second channel hop seen on this AP
+(chan 1 -> 11 above), and the cost this time was a manual rejoin after ~17 minutes dark. Not ruled out: a firmware
+state wedge that only a rejoin clears. A beacon capture on chan 11 vs 6 at the time of the drop would settle it.
+
+**Corrects the first read of this outage:** it was reported that nothing persisted the log. `klogd` does persist
+(`/var/log/ryzen/klog-<boot>.all`); what was missing is any line at the moment of the drop, because the driver
+logged none.
+
+**Candidate work, in the plan's own order (no new ranking implied):**
+1. A stall detector: `rx data` unchanged for N minutes while associated (or tx `retry-limit` rising with no rx) is a
+   dead link; log it loudly and kick a rescan/rejoin. This one needs no CSA parsing and covers every cause above.
+2. The CSA path already listed under "akuma fix plan" item 2, plus a `[rtw]` line when a beacon's channel differs
+   from the joined one.
+3. Have the `wifi` daemon's `auto` mode treat a stalled link as disconnected, so it rejoins by itself.
+4. The 5 GHz BSSID preference (item 5) would take most of the exposure away.
+
 ## References
 
 - `docs/archive/GOOSE_GLM_SERVE_ON_RYZEN.md` — the "~5 s of ping" symptom.

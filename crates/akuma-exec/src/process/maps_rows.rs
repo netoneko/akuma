@@ -143,6 +143,7 @@ pub fn pid_map_rows_of_kernel_owned_roots(pid: u32) -> Option<Vec<MapRow>> {
 /// A run is not a VMA: two adjacent loader mappings with identical permissions
 /// merge into one line. That is what the hardware says, which is the only
 /// record this target keeps for pages the loader placed.
+#[cfg(target_arch = "x86_64")]
 fn collect_leaf_runs(uas: &akuma_mmu::UserAddressSpace, skip: &[(usize, usize)]) -> Vec<MapRow> {
     let mut rows: Vec<MapRow> = Vec::new();
     let mut run: Option<MapRow> = None;
@@ -173,6 +174,15 @@ fn collect_leaf_runs(uas: &akuma_mmu::UserAddressSpace, skip: &[(usize, usize)])
         rows.push(r);
     }
     rows
+}
+
+/// The AArch64 `UserAddressSpace` has no whole-space leaf walk (`for_each_user_leaf` is the amd64 struct's; the walk
+/// was written and tested only there, PHASE-2-PROCFS), so this target reports the region rows alone — what its
+/// `/proc/<pid>/maps` showed before the walk moved into this crate. Gating, not porting: porting the walk is its own
+/// piece of work with its own tests.
+#[cfg(not(target_arch = "x86_64"))]
+fn collect_leaf_runs(_uas: &akuma_mmu::UserAddressSpace, _skip: &[(usize, usize)]) -> Vec<MapRow> {
+    Vec::new()
 }
 
 /// Does any extent in the sorted, non-overlapping `skip` contain `va`?
