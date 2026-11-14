@@ -375,6 +375,45 @@ pub fn render_maps_line(
 /// 128 bytes: two 16-digit addresses, the fixed text, and the path.
 pub const MAPS_LINE_MAX: usize = 192;
 
+/// `/proc/<pid>/auxv` — the auxiliary vector, raw.
+///
+/// Linux serves the bytes the program's own stack carries: one `(a_type,
+/// a_val)` pair of native-endian `unsigned long`s per entry, **terminated by
+/// an `AT_NULL` pair**. `entries` is the kernel's table *without* the
+/// terminator — the shape `akuma-elf-exec`'s `build_stack` takes (it pushes
+/// the terminator onto the stack itself) — and this renders the terminator,
+/// so the byte stream a reader `fread`s is the vector `getauxval` walks.
+/// Nothing here interprets a key:
+/// the `AT_*` vocabulary lives with the loader (`akuma-ring3-amd64`,
+/// `akuma-elf-exec`); this is the wire layer, like every renderer in this
+/// crate.
+///
+/// Truncation is by **whole pairs**: a reader that sees a partial pair would
+/// read one entry's value as the next entry's key, so a buffer that cannot
+/// take the next 16 bytes ends the file rather than splitting an entry.
+/// Returns the bytes written (0 when `buf` cannot hold even the terminator);
+/// bytes. Callers wanting the whole table unconditionally should pass at
+/// least [`AUXV_MAX`]. Endianness is the target's (`to_ne_bytes`): the pair
+/// stream is defined against the process that reads it, which on every
+/// architecture these kernels boot is little-endian.
+pub fn render_auxv(entries: &[(u64, u64)], buf: &mut [u8]) -> usize {
+    let mut pos = 0usize;
+    for &(key, val) in entries.iter().copied().chain(core::iter::once((0u64, 0u64))) {
+        if buf.len().saturating_sub(pos) < 16 {
+            break;
+        }
+        buf[pos..pos + 8].copy_from_slice(&key.to_ne_bytes());
+        buf[pos + 8..pos + 16].copy_from_slice(&val.to_ne_bytes());
+        pos += 16;
+    }
+    pos
+}
+
+/// A buffer size [`render_auxv`] can never overflow for a table of up to 16
+/// pairs (the loader's 14, + `AT_SYSINFO_EHDR` under `vsyscall`, + one spare)
+/// plus the `AT_NULL` terminator.
+pub const AUXV_MAX: usize = 17 * 16;
+
 pub mod tree;
 
 #[cfg(test)]

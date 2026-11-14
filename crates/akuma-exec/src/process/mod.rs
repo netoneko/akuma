@@ -20,6 +20,7 @@
 pub use akuma_user_access as user_access;
 pub mod lazy_prefault;
 pub mod address_space;
+pub mod maps_rows;
 pub mod types;
 pub mod table;
 pub mod channel;
@@ -808,6 +809,15 @@ pub struct Process {
     /// around the old `vm_lock` with `&mut *(addr_of!(..) as *mut Vec<_>)`
     /// because there is no way to get `&mut` out of a lock that guards nothing.
     pub mmap_regions: AssistedSpinlock<Vec<MmapRegion>>,
+    /// The auxv table this process was exec'd with (`/proc/<pid>/auxv`):
+    /// the pairs the initial stack block carries, retained at exec and copied
+    /// at fork (a Linux child's auxv is the parent's until execve), so the
+    /// pairs live where the process frees them (PHASE-2-PROCFS D28). `None`
+    /// for a process the loader never started, and in a kernel built without
+    /// the `procfs-diag` feature — where the file stays *absent rather than
+    /// empty*, the `maps` rule.
+    #[cfg(feature = "procfs-diag")]
+    pub auxv: Option<Vec<(u64, u64)>>,
     pub fds: Arc<SharedFdTable>,
     pub thread_id: Option<usize>,
     pub spawner_pid: Option<Pid>,
@@ -1011,6 +1021,8 @@ impl Process {
             brk: AtomicUsize::new(parent.brk.load(Ordering::Relaxed)),
             initial_brk: AtomicUsize::new(parent.initial_brk.load(Ordering::Relaxed)),
             memory: parent.memory.clone(),
+            #[cfg(feature = "procfs-diag")]
+            auxv: parent.auxv.clone(),
             cwd: parent.cwd.clone(),
             root: parent.root.clone(),
             stdin: parent.stdin.clone(),   // shared
@@ -4156,6 +4168,8 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
     alloc::boxed::Box::new(Process {
         pid, pgid: pid, tgid: pid,
         state: AtomicProcessState::new(ProcessState::Ready),
+        #[cfg(feature = "procfs-diag")]
+        auxv: None,
         address_space: ProcAddressSpace::new(addr_space),
         image: Spinlock::new(ProcessImage {
             name: "test".to_string(),

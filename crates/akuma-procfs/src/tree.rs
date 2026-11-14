@@ -104,6 +104,14 @@ pub trait ProcModel {
     /// an address-space walk, and the process has one).
     fn has_address_space(&self, pid: Pid) -> bool;
 
+    /// Whether the kernel retained an auxv table for `pid` (`/proc/<pid>/auxv`).
+    ///
+    /// Default `false` — a model that does not retain one keeps the file
+    /// *absent rather than empty*, the `maps` rule (PHASE-2-PROCFS D28).
+    fn has_pid_auxv(&self, _pid: Pid) -> bool {
+        false
+    }
+
     /// Calls `f` with each live member of thread group `tgid` (the leader
     /// counts), in [`for_each_pid`](Self::for_each_pid) order.
     ///
@@ -218,12 +226,16 @@ pub enum PidFile {
     OomScore,
     Maps,
     Statm,
+    /// The raw auxv the process was exec'd with (`/proc/<pid>/auxv`), when
+    /// the kernel retained one (`ProcModel::has_pid_auxv`) — absent rather
+    /// than empty, like `maps` (PHASE-2-PROCFS).
+    Auxv,
     Syscalls,
 }
 
 impl PidFile {
     /// Listing order inside a pid directory (after `fd` and `task`).
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Cmdline,
         Self::Status,
         Self::Stat,
@@ -234,6 +246,7 @@ impl PidFile {
         Self::OomScore,
         Self::Maps,
         Self::Statm,
+        Self::Auxv,
         Self::Syscalls,
     ];
 
@@ -250,6 +263,7 @@ impl PidFile {
             Self::OomScore => "oom_score",
             Self::Maps => "maps",
             Self::Statm => "statm",
+            Self::Auxv => "auxv",
             Self::Syscalls => "syscalls",
         }
     }
@@ -268,6 +282,7 @@ impl PidFile {
         match self {
             Self::Syscalls => m.features().syscall_log && m.has_syscall_log(view.pid),
             Self::Maps | Self::Statm => visible && m.has_address_space(view.pid),
+            Self::Auxv => visible && m.has_pid_auxv(view.pid),
             _ => visible,
         }
     }

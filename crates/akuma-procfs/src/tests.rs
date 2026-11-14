@@ -330,3 +330,42 @@ fn status_fits_with_the_maximum_group_list() {
     let text = core::str::from_utf8(&buf[..n]).unwrap();
     assert!(text.ends_with('\n') && text.contains("ExitCode:"), "nothing truncated: {n} bytes");
 }
+
+// ---------------- /proc/<pid>/auxv (PHASE-2-PROCFS) ----------------
+// The pair stream fails silently in a way byte offsets notice: a missing
+// terminator reads as one more entry whose key is the previous value, a
+// partial pair reads a value as a key, and a big-endian pair stream on a
+// little-endian reader turns every key into garbage. All three are invisible
+// to the kernel that commits them and visible only as HotSpot or a debugger
+// parsing nonsense.
+
+#[test]
+fn auxv_renders_pairs_native_terminated() {
+    let entries = [(6u64, 4096u64), (33, 0xffff_ffff_ffff_f000)];
+    let mut buf = [0u8; AUXV_MAX];
+    let n = render_auxv(&entries, &mut buf);
+    assert_eq!(n, 3 * 16, "two pairs + the AT_NULL terminator");
+    let words = |i: usize| u64::from_ne_bytes(buf[i * 8..i * 8 + 8].try_into().unwrap());
+    assert_eq!((words(0), words(1)), (6, 4096));
+    assert_eq!((words(2), words(3)), (33, 0xffff_ffff_ffff_f000));
+    assert_eq!((words(4), words(5)), (0, 0), "AT_NULL pair rendered");
+}
+
+#[test]
+fn auxv_truncates_by_whole_pairs() {
+    let entries = [(6u64, 4096u64), (17, 100), (9, 0x1000)];
+    let mut buf = [0u8; 16 + 16 + 15]; // room for two pairs, not three
+    let n = render_auxv(&entries, &mut buf);
+    assert_eq!(n, 32, "the third pair is dropped whole, never split");
+    let mut min = [0u8; 8];
+    let n0 = render_auxv(&entries, &mut min);
+    assert_eq!(n0, 0, "a buffer that cannot hold the terminator renders nothing");
+}
+
+#[test]
+fn auxv_of_an_empty_table_is_just_the_terminator() {
+    let mut buf = [0u8; AUXV_MAX];
+    let n = render_auxv(&[], &mut buf);
+    assert_eq!(n, 16);
+    assert!(buf[..16].iter().all(|&b| b == 0));
+}

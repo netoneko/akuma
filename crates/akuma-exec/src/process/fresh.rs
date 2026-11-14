@@ -111,6 +111,8 @@ impl Process {
             exit_code: AtomicI32::new(0),
             dynamic_page_tables: Vec::new(),
             mmap_regions: AssistedSpinlock::new(mmap_regions),
+            #[cfg(feature = "procfs-diag")]
+            auxv: None,
             fds,
             thread_id,
             // Set when spawned by another process.
