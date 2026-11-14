@@ -88,7 +88,7 @@ _/                                    \_     Beans System Debauchery:
 <section class="slide">
   <span class="tag">the idea</span>
   <h2>A kernel is a manifest</h2>
-  <p>Denver has no kernel code of its own. One binary crate and one front crate choose, by feature name, which existing crates make up the kernel. Every feature is off by default, so the default build never changes.</p>
+  <p>Denver adds almost no kernel code of its own. One binary crate and one front crate choose, by feature name, which existing crates make up the kernel. Every feature is off by default, so the default build never changes.</p>
   <pre>denver                  the binary: main.rs, banner, the feature list
   |  features, 1:1
 akuma-jvm-kernel        front crate: entry!, Kernel, zero capabilities
@@ -106,8 +106,11 @@ akuma-tokio-kernel      the platform: tokio on bare metal
     <div><b>~24 h</b><span>bare kernel to a JVM</span></div>
     <div><b>JDK 21</b><span>HotSpot, G1, C1 + C2</span></div>
     <div><b>8</b><span>defects found and fixed</span></div>
-    <div><b>~1,750</b><span>lines of kernel Rust</span></div>
+    <div><b>~1,750</b><span>auditable lines of kernel Rust, all behind off-by-default features</span></div>
     <div><b>66</b><span>loop commits to Hello World</span></div>
+    <div><b>48</b><span>lines in the two crates Denver adds: the binary and the front crate</span></div>
+    <div><b>2.4 MiB</b><span>the whole kernel, one ELF</span></div>
+    <div><b>KVM</b><span>as a guest of Akuma's own hypervisor, on real AMD Ryzen metal</span></div>
     <div><b>+3</b><span>Clojure, Scala, Groovy on the javac kernel, no extra fix</span></div>
   </div>
   <p>javac compiles inside the guest and its output is identical to the host's. Clojure, Scala and Groovy compile and run. A Clojure HTTP server answers from outside, from a fresh kernel under KVM on metal.</p>
