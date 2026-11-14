@@ -32,6 +32,7 @@
 #include <sys/mman.h>
 #include <sys/auxv.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
@@ -389,6 +390,10 @@ static int arm_name(char **argv) {
         printf("NAME MISSING no /proc/<pid>/maps snapshot before death - the diagnostic cannot do its job\n");
         return 1;
     }
+    /* Best-effort file copy (PHASE-2-NULLSTORE D35): if sshd ever answers again,
+     * the whole snapshot is recoverable; the console verdict never requires it. */
+    { int df = open("/tmp/name-maps.log", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (df >= 0) { size_t w = 0; while (w < snap_len) { ssize_t k = write(df, snap + w, snap_len - w); if (k <= 0) break; w += (size_t)k; } close(df); } }
     size_t lines = 0, exec_lines = 0;
     for (char *p = snap; *p; ) {
         char *nl = strchr(p, '\n');
@@ -420,10 +425,112 @@ static int arm_name(char **argv) {
     return 2;
 }
 
+/* ---------------- mmaparms (PHASE-2-NULLSTORE D35) ----------------
+ * The taoxichuan blocker-3 suspects, as contract facts a healthy sshd can carry
+ * (no java in the room): (1) mmap failures arrive as MAP_FAILED (-errno), never
+ * 0 — suspect 1's "musl hands HotSpot a NULL cache base" shape; (2) the JIT
+ * commit shape works: reserve anon PROT_NONE, mprotect a sub-range to RW and
+ * write it, mprotect another to RX and call it — suspect 2's reserve/commit
+ * contract; (3) under wx-relaxed, W+X maps and executes. Each sub-fact prints
+ * its own MMARMS line; the arm's verdict is the AND. */
+static int child_mmaparms(void) {
+    int fails = 0;
+    /* (1) failure conventions */
+    errno = 0;
+    void *z = mmap(NULL, 0, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (z != MAP_FAILED) { printf("MMARMS RED len0 mmap returned %p (must be MAP_FAILED)\n", z); fails++; }
+    else if (errno != EINVAL) { printf("MMARMS RED len0 errno=%d (%s; Linux says EINVAL)\n", errno, estr(errno)); fails++; }
+    else printf("MMARMS PASS len0 MAP_FAILED EINVAL\n");
+    errno = 0;
+    z = mmap(NULL, (size_t)1 << 62, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (z == NULL) { printf("MMARMS RED oversize mmap returned NULL (taoxichuan suspect 1)\n"); fails++; }
+    else if (z != MAP_FAILED) { printf("MMARMS RED oversize mmap returned %p (must be MAP_FAILED)\n", z); fails++; }
+    else printf("MMARMS PASS oversize MAP_FAILED errno=%d\n", errno);
+    /* (2) the code-cache shape: 48 MiB PROT_NONE reserve, commit sub-ranges */
+    size_t RES = 48u << 20;
+    unsigned char *base = mmap(NULL, RES, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (base == MAP_FAILED || base == NULL) { printf("MMARMS RED reserve errno=%d (%s)\n", errno, estr(errno)); return 1; }
+    printf("MMARMS PASS reserve base=%p size=%zu prot=NONE\n", (void *)base, RES);
+    if (mprotect(base, 4096, PROT_READ | PROT_WRITE) != 0) {
+        printf("MMARMS RED commit-RW errno=%d (%s)\n", errno, estr(errno)); fails++;
+    } else {
+        *(volatile unsigned int *)base = 0x42;
+        if (*(volatile unsigned int *)base != 0x42) { printf("MMARMS RED commit-RW readback\n"); fails++; }
+        else printf("MMARMS PASS commit-RW write-readback off=0\n");
+    }
+    unsigned char *rx = base + 2 * 4096;
+    static const unsigned char code[] = { 0xb8, 0x2a, 0x00, 0x00, 0x00, /* mov eax,42 */
+                                          0xc3 };                        /* ret */
+    /* the JIT cycle: write while RW, flip to RX, call. Writing after the flip
+     * faults on every W^X kernel (this arm did, on the metal host, before the
+     * fix) — the bugs this arm exists to catch in the KERNEL are a flip that
+     * does not take or a call that cannot fetch. */
+    if (mprotect(rx, 4096, PROT_READ | PROT_WRITE) != 0) {
+        printf("MMARMS RED commit-RW2 errno=%d (%s)\n", errno, estr(errno)); fails++;
+    } else {
+        memcpy(rx, code, sizeof code);
+        if (mprotect(rx, 4096, PROT_READ | PROT_EXEC) != 0) {
+            printf("MMARMS RED commit-RX errno=%d (%s)\n", errno, estr(errno)); fails++;
+        } else {
+            int (*f)(void) = (int (*)(void))rx;
+            int v = f();
+            printf("MMARMS %s commit-RX call=%d\n", v == 42 ? "PASS" : "RED", v);
+            if (v != 42) fails++;
+        }
+    }
+    /* (3) RWX under wx-relaxed */
+    unsigned char *wx = mmap(NULL, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (wx == MAP_FAILED) { printf("MMARMS INFO rwx mmap errno=%d (%s) (policy refused)\n", errno, estr(errno)); }
+    else {
+        memcpy(wx, code, sizeof code);
+        int (*f2)(void) = (int (*)(void))wx;
+        int v = f2();
+        printf("MMARMS %s rwx call=%d\n", v == 42 ? "PASS" : "RED", v);
+        if (v != 42) fails++;
+    }
+    munmap(base, RES);
+    return fails ? 1 : 0;
+}
+
+static int arm_mmaparms(void) {
+    pid_t pid = fork();
+    if (pid == 0) _exit(child_mmaparms());
+    int st = 0;
+    waitpid(pid, &st, 0);
+    if (WIFSIGNALED(st)) {
+        printf("MMARMS RED CRASH signal=%d\n", WTERMSIG(st));
+        return 1;
+    }
+    return WEXITSTATUS(st);
+}
+
+/* ---------------- sysinfo (PHASE-2-NULLSTORE D35; G7's feed) ----------------
+ * `sysinfo(2)` was ENOSYS in phase 1 and the merged tree presumed it served over
+ * by main's memory changes (REQUIREMENTS G9 row, "unverified: no sysinfo probe
+ * ran"). This arm makes the presumption measured: served with sane totals, or
+ * INFO errno=N for the record. G7 owns the verdict; this gate records. */
+static int arm_sysinfo(void) {
+    struct sysinfo si;
+    memset(&si, 0, sizeof si);
+    long r = sysinfo(&si);
+    if (r != 0) {
+        printf("SYSINFO INFO errno=%d (%s)\n", errno, estr(errno));
+        return 1;
+    }
+    printf("SYSINFO PASS uptime=%lu totalram=%lu freeram=%lu mem_unit=%u\n",
+           si.uptime, si.totalram, si.freeram, si.mem_unit);
+    if (si.totalram == 0) {
+        printf("SYSINFO RED totalram=0 (a sizing consumer divides by this)\n");
+        return 1;
+    }
+    return 0;
+}
+
 /* ---------------- main ---------------- */
 static void usage(void) {
     fprintf(stderr,
-            "usage: jvmprobe getcpu|auxv|cycles|rwx|maps|java CMD [ARG]...\n"
+            "usage: jvmprobe getcpu|auxv|cycles|rwx|maps|mmaparms|sysinfo|java CMD [ARG]...\n"
             "       jvmprobe name CMD EXPECTED_RIP_HEX [ARG]...\n"
             "  one arm per invocation; NAME VERDICT detail on stdout; exit 0 iff PASS\n");
 }
@@ -439,6 +546,8 @@ int main(int argc, char **argv) {
     if (!strcmp(arm, "cycles")) return arm_cycles();
     if (!strcmp(arm, "rwx")) return arm_rwx();
     if (!strcmp(arm, "maps")) return arm_maps();
+    if (!strcmp(arm, "mmaparms")) return arm_mmaparms();
+    if (!strcmp(arm, "sysinfo")) return arm_sysinfo();
     if (!strcmp(arm, "name")) return argc < 4 ? usage(), 2 : arm_name(argv + 2);
     if (!strcmp(arm, "java")) return argc < 3 ? usage(), 2 : arm_java(argv + 2);
     return usage(), 2;
