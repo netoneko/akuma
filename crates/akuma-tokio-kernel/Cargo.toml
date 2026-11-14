@@ -58,6 +58,11 @@ lazy-release-sweep = ["akuma-tokio-kernel-amd64/lazy-release-sweep"]
 sysinfo = ["akuma-tokio-kernel-amd64/sysinfo"]
 # getcpu(2) through glue (PHASE-2-GETCPU, G2), 1:1 onto the amd64 half's arm.
 getcpu = ["akuma-tokio-kernel-amd64/getcpu"]
+# Synchronous fault -> signal delivery (PHASE-3-JAVAC, G13), 1:1 onto the amd64
+# half: a ring-3 page fault reaches the task's own SIGSEGV handler instead of
+# `task killed` — HotSpot's trap-and-handle (implicit null checks, safepoint
+# polls) is faults by design. Off by default (R6).
+fault-signal = ["akuma-tokio-kernel-amd64/fault-signal"]
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]

@@ -49,6 +49,8 @@ const _: () = assert!(
 
 mod child;
 mod console;
+#[cfg(feature = "fault-signal")]
+mod faultsig;
 mod exec_twin;
 mod lazy;
 mod net;
@@ -338,6 +340,15 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
     // then end the task (below). What matters for the gate is that this prints
     // `[Fault]` instead of triple-faulting into guest silence.
     if t.from_ring3() {
+        // `fault-signal` (PHASE-3-JAVAC, G13): HotSpot's trap-and-handle —
+        // implicit null checks, safepoint polls — is a synchronous fault the
+        // JVM's own SIGSEGV handler must see. A declined delivery (no handler,
+        // blocked, no restorer, unwritable stack) falls through to the kill
+        // unchanged, so the unfeatured behavior is byte-identical.
+        #[cfg(feature = "fault-signal")]
+        if faultsig::deliver(t, cr2, code) {
+            return;
+        }
         akuma_primitives::safe_print!(
             192,
             "[Fault] ring3 {:?} rip=0x{:016x} rsp=0x{:016x} cr2=0x{:016x} code=0x{:x} -- task killed\n",

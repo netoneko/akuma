@@ -51,6 +51,15 @@ sysinfo = []
 # `ring3::cpu_index()`, the copies out in glue, `EFAULT` on failure; the
 # decision is pure (`akuma-syscalls-linux::sched`). Off by default (R6).
 getcpu = []
+# Synchronous fault -> signal delivery (PHASE-3-JAVAC, G13): a ring-3 page fault the
+# fill/stack-grow/COW arms cannot resolve reaches the task's own SIGSEGV handler —
+# real siginfo (`si_code`, `si_addr` = cr2) and ucontext (`uc_mcontext` in Linux/glibc
+# field order; `rt_sigreturn` restores FROM the ucontext, so a handler's register
+# edits take effect) — instead of `task killed`. 1:1 port of the metal kernel's
+# `akuma-kernel-amd64::signal` fault path (`deliver_fault_signal`/`build_frame`/
+# `install_handler_frame`). HotSpot's trap-and-handle (implicit null checks,
+# safepoint polls) is faults by design and dies without it. Off by default (R6).
+fault-signal = []
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.

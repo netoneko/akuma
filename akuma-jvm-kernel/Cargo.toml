@@ -53,6 +53,10 @@ sysinfo = ["akuma-tokio-kernel/sysinfo"]
 # getcpu(2) through glue (PHASE-2-GETCPU, G2): the arm lives in the amd64 half;
 # musl's sched_getcpu (raw nr 168) must not ENOSYS for direct callers.
 getcpu = ["akuma-tokio-kernel/getcpu"]
+# The fault->signal delivery (PHASE-3-JAVAC, G13) relayed 1:1: a ring-3 page
+# fault reaches the task's own SIGSEGV handler (real siginfo + ucontext) instead
+# of `task killed`. Off by default (R6).
+fault-signal = ["akuma-tokio-kernel/fault-signal"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

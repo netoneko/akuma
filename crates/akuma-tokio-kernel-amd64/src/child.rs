@@ -229,7 +229,7 @@ pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
 /// restorer.
 static RETURN_RSP: [core::sync::atomic::AtomicU64; NSLOTS] = [const { core::sync::atomic::AtomicU64::new(0) }; NSLOTS];
 
-fn set_return_rsp(rsp: u64) {
+pub(crate) fn set_return_rsp(rsp: u64) {
     let me = crate::exec_twin::current_slot();
     if me < NSLOTS {
         RETURN_RSP[me].store(rsp, core::sync::atomic::Ordering::Relaxed);
@@ -401,6 +401,14 @@ fn push_handler(
 /// `rt_sigreturn` - x86_64 15: the restorer's call after a handler returned. The user `rsp` is
 /// just past the restorer slot, where [`push_handler`] put the saved block.
 pub fn sigreturn_arm(fr: &mut ring3::SyscallFrame) -> u64 {
+    // `fault-signal` (PHASE-3-JAVAC, G13): a fault frame restores from its
+    // ucontext — the JVM edits `uc_mcontext.gregs[REG_RIP]`, so the ucontext,
+    // not the private block, is the restore source. Not one of the fault
+    // frames? The async path below proceeds untouched.
+    #[cfg(feature = "fault-signal")]
+    if let Some(rax) = crate::faultsig::sync_sigreturn(fr) {
+        return rax;
+    }
     let at = ring3::user_rsp_stash();
     let mut buf = [0u8; SIGFRAME_BYTES];
     if !crate::user_ok(at, buf.len() as u64) || !crate::copy_from_user(&mut buf, at) {

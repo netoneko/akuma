@@ -57,6 +57,12 @@ sysinfo = ["akuma-jvm-kernel/sysinfo"]
 # `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep,sysinfo,getcpu`
 # (rig: denver-getcpu).
 getcpu = ["akuma-jvm-kernel/getcpu"]
+# The fault->signal delivery (PHASE-3-JAVAC, G13) relayed 1:1: a ring-3 page fault
+# reaches the JVM's own SIGSEGV handler (HotSpot's implicit null checks and
+# safepoint polls are faults by design; javac dies on the first one without it).
+# Off by default (R6); the gate kernel is the denver-getcpu feature set plus this
+# (rig: denver-faultsig).
+fault-signal = ["akuma-jvm-kernel/fault-signal"]
 
 [[bin]]
 name = "denver"
