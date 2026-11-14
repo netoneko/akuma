@@ -222,6 +222,12 @@ pub fn bind_init<M: Proc>(path: &str, ti: &TaskImage) -> Option<usize> {
         safe_print!(128, "  [init] root view for the process table failed\n");
         return None;
     }
+    // Init's auxv, retained the same way an exec's is (PHASE-2-PROCFS D28):
+    // pid 1 never execve'd, so this registration is the only retention point.
+    #[cfg(feature = "procfs-diag")]
+    akuma_exec::process::with_process(1, |p| {
+        p.auxv = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+    });
     INIT_TID.store(tid, Relaxed);
     Some(tid)
 }
@@ -645,6 +651,14 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
         }
         adopt_exec_root(cur, ti.root_pa);
     }
+    // Retain the new image's auxv on the Process (`/proc/<pid>/auxv`,
+    // PHASE-2-PROCFS D28): the pairs the stack block now carries, copied
+    // where the process frees them. A fork child inherits its parent's
+    // (`Process::inherit_from`); this overwrites it at exec, as Linux's does.
+    #[cfg(feature = "procfs-diag")]
+    akuma_exec::process::with_process(pid, |p| {
+        p.auxv = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+    });
     Ok(ti)
 }
 

@@ -15,6 +15,9 @@ net = ["akuma-syscalls-glue/smoltcp"]
 # registers at fork, and `pidfd_open` (tokio's reaper polls a pidfd and falls back
 # to SIGCHLD without one). Spawning, `kill` and signal delivery stay the kernel's.
 process = ["akuma-syscalls-glue/sc-pidfd"]
+# Per-pid /proc address-space diagnostics (PHASE-2-PROCFS D28): register the real
+# `pid_map_rows` walk (akuma-exec's, both kernels share it) and the auxv serve.
+procfs-diag = ["akuma-exec/procfs-diag"]
 # Not a tokio feature: what a shell and its tools call and no tokio program does
 # (job control, the other ids, limits and accounting, `sync`, the clock and
 # hostname setters). A kernel whose images run busybox or bash turns it on.

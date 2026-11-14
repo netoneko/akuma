@@ -79,8 +79,22 @@ fn render_pid_statm(proc: &process::Process) -> Option<Vec<u8>> {
     Some(buf[..n].to_vec())
 }
 
-/// The bytes of `<pid>/maps` or `<pid>/statm`, or `None` if this kernel cannot
-/// describe the address space (or the pid is not visible).
+/// `/proc/<pid>/auxv` — the process's auxv, raw pairs with the `AT_NULL`
+/// terminator, from [`crate::pid_auxv`] (PHASE-2-PROCFS D28). `None` when the
+/// kernel retained no table for this pid, which keeps the file *absent rather
+/// than empty* — the `maps` rule, and the same lie `auxv` would tell: a reader
+/// that saw an empty file would conclude the program has no auxv, which no
+/// exec'd program on this kernel is true of.
+fn render_pid_auxv(pid: Pid) -> Option<Vec<u8>> {
+    let entries = crate::pid_auxv(pid)?;
+    let mut out = alloc::vec![0u8; akuma_procfs::AUXV_MAX];
+    let n = akuma_procfs::render_auxv(&entries, &mut out);
+    out.truncate(n);
+    Some(out)
+}
+
+/// The bytes of `<pid>/maps`, `<pid>/statm`, or `<pid>/auxv`, or `None` if
+/// this kernel cannot describe them (or the pid is not visible).
 fn pid_address_space_file(pid: Pid, name: &str) -> Option<Vec<u8>> {
     if !ProcFilesystem::process_visible(pid, caller_box_id()) {
         return None;
@@ -91,6 +105,7 @@ fn pid_address_space_file(pid: Pid, name: &str) -> Option<Vec<u8>> {
             let proc = process::lookup_process_shared(pid)?;
             render_pid_statm(proc)
         }
+        "auxv" => render_pid_auxv(pid),
         _ => None,
     }
 }
@@ -238,6 +253,12 @@ impl ProcModel for KernelModel {
         // kernel can describe `pid`), but rows only: the old check rendered and
         // formatted the whole of `maps` to throw it away.
         crate::pid_map_rows(pid).is_some()
+    }
+
+    fn has_pid_auxv(&self, pid: Pid) -> bool {
+        // Same rule as `has_address_space`: exists exactly when it can be
+        // rendered, so `open`, `stat` and `access` agree about `auxv`.
+        crate::pid_auxv(pid).is_some()
     }
 
     fn for_each_live_member(&self, tgid: Pid, f: &mut dyn FnMut(Pid)) {
@@ -841,7 +862,7 @@ impl ProcFilesystem {
                     meta(RO, size as u64, None)
                 }
                 PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::OomScore => meta(RW, 2, None),
-                PidFile::Maps | PidFile::Statm => {
+                PidFile::Maps | PidFile::Statm | PidFile::Auxv => {
                     let data = pid_address_space_file(v.pid, f.name()).ok_or(FsError::NotFound)?;
                     meta(RO, data.len() as u64, None)
                 }
@@ -1224,11 +1245,13 @@ impl Filesystem for ProcFilesystem {
             return Ok(n);
         }
 
-        // <pid>/maps and <pid>/statm — see `pid_address_space_file`.
+        // <pid>/maps, <pid>/statm and <pid>/auxv — see `pid_address_space_file`.
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
-            if parts.len() == 2 && (parts[1] == "maps" || parts[1] == "statm")
-                && let Ok(pid) = parts[0].parse::<Pid>() {
+            if parts.len() == 2
+                && (parts[1] == "maps" || parts[1] == "statm" || parts[1] == "auxv")
+                && let Ok(pid) = parts[0].parse::<Pid>()
+            {
                     let data = pid_address_space_file(pid, parts[1]).ok_or(FsError::NotFound)?;
                     if offset >= data.len() {
                         return Ok(0);

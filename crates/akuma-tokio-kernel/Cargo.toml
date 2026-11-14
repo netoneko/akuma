@@ -44,6 +44,9 @@ wx-relaxed = ["akuma-tokio-kernel-amd64/wx-relaxed"]
 # The legacy vsyscall page (PHASE-2-VDSO, G3), 1:1 onto the machine half: the page HotSpot
 # hardcodes is mapped user-RX and disclosed as `AT_SYSINFO_EHDR`. Off by default (R6).
 vsyscall = ["akuma-tokio-kernel-amd64/vsyscall"]
+# Per-pid /proc address-space diagnostics (PHASE-2-PROCFS, G4): the maps walk
+# registration and the auxv retention, relayed 1:1.
+procfs-diag = ["akuma-tokio-kernel-amd64/procfs-diag"]
 
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.

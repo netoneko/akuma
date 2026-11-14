@@ -20,6 +20,10 @@ wx-relaxed = ["akuma-jvm-kernel/wx-relaxed"]
 # front crate. Off by default (R6); the gate kernel is `--features wx-relaxed,vsyscall`
 # (rig: denver-vdso).
 vsyscall = ["akuma-jvm-kernel/vsyscall"]
+# Per-pid /proc address-space diagnostics (PHASE-2-PROCFS, G4): /proc/<pid>/maps and
+# /proc/<pid>/auxv so a fault rip gets an owner. Off by default (R6); the gate kernel is
+# `--features wx-relaxed,vsyscall,procfs-diag` (rig: denver-procfs).
+procfs-diag = ["akuma-jvm-kernel/procfs-diag"]
 
 [[bin]]
 name = "denver"

@@ -35,6 +35,10 @@ wx-relaxed = ["akuma-tokio-kernel/wx-relaxed"]
 # The legacy vsyscall page (PHASE-2-VDSO, G3): the ABI HotSpot hardcodes, relayed 1:1 onto
 # akuma-tokio-kernel. Off by default (R6) - the same policy-by-features pattern.
 vsyscall = ["akuma-tokio-kernel/vsyscall"]
+# Per-pid /proc address-space diagnostics (PHASE-2-PROCFS, G4): /proc/<pid>/maps and
+# /proc/<pid>/auxv, relayed 1:1 onto akuma-tokio-kernel. Off by default (R6) - the same
+# policy-by-features pattern.
+procfs-diag = ["akuma-tokio-kernel/procfs-diag"]
 
 [dependencies]
 akuma-tokio-kernel = { path = "../crates/akuma-tokio-kernel" }

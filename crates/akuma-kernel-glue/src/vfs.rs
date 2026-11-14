@@ -29,6 +29,7 @@ pub fn register() {
         // x86-only), so it cannot describe an address space and `maps`/`statm`
         // stay absent here — which is what they were before the hook existed.
         pid_map_rows: |_pid| None,
+        pid_auxv: |_pid| None,
     });
     // `/proc/health`'s pipe-table line: the table is in `akuma-syscalls-glue`,
     // which `akuma-vfs-glue` cannot name.

@@ -1704,14 +1704,29 @@ pub struct VfsGlueHooks {
     /// So the kernel that *can* walk registers this; the one that cannot
     /// registers a function returning `None`, and procfs reports both files as
     /// absent — exactly what it did before the hook existed.
+    ///
+    /// PHASE-2-PROCFS (D27): the walk itself moved to
+    /// `akuma-exec::process::maps_rows::pid_map_rows` — it reads only shared
+    /// `Process` facts, and its leaf iterator (`for_each_user_leaf`) lives in
+    /// `akuma-mmu`, so the "x86-only" caveat above is historical: both kernels
+    /// may register the same fn now. What stays per-kernel is only the
+    /// *registration*.
     pub pid_map_rows: fn(u32) -> Option<alloc::vec::Vec<MapRow>>,
+    /// One process's auxv table (`/proc/<pid>/auxv`, PHASE-2-PROCFS D28) —
+    /// the pairs the loader handed the image at exec, **without** the `AT_NULL`
+    /// terminator (the renderer adds it, matching the stack's own vector), or
+    /// `None` from a kernel that retained nothing — which keeps the file
+    /// absent rather than empty, the `maps` rule. A hook for the same reason
+    /// `pid_map_rows` is: the pairs live where the kernel's exec path put
+    /// them, and this file must not reach into a Process.
+    pub pid_auxv: fn(u32) -> Option<alloc::vec::Vec<(u64, u64)>>,
 }
 
 /// One mapping: `(start, end, readable, writable, executable, private)`.
 ///
 /// `end` is exclusive. `private` is `p` in the `maps` permission column; a
 /// shared anonymous mapping is `s`.
-pub type MapRow = (usize, usize, bool, bool, bool, bool);
+pub use akuma_exec::process::maps_rows::MapRow;
 
 static HOOKS: akuma_primitives::OnceCopy<VfsGlueHooks> = akuma_primitives::OnceCopy::new();
 
@@ -1812,6 +1827,12 @@ fn fs_exists(path: &str) -> bool {
 /// when the one that did cannot describe this pid.
 pub(crate) fn pid_map_rows(pid: u32) -> Option<alloc::vec::Vec<MapRow>> {
     HOOKS.get().and_then(|h| (h.pid_map_rows)(pid))
+}
+
+/// See [`VfsGlueHooks::pid_auxv`]. `None` when no kernel registered one, or
+/// when it retained no table for this pid.
+pub(crate) fn pid_auxv(pid: u32) -> Option<alloc::vec::Vec<(u64, u64)>> {
+    HOOKS.get().and_then(|h| (h.pid_auxv)(pid))
 }
 
 /// The kernel's core count. Every kernel supplies the hook (the main kernel

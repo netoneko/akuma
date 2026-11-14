@@ -380,6 +380,10 @@ pub fn init_vfs() {
         // `ProcFilesystem` renders and cannot walk for itself — the leaf walk
         // is x86-only. See `fd::pid_map_rows`.
         pid_map_rows: crate::fd::pid_map_rows,
+        // The metal does not retain an auxv table per process yet (PHASE-2-PROCFS
+        // D28 landed the retention in the tokio kernels); the file stays absent here
+        // rather than empty, the `maps` rule.
+        pid_auxv: |_pid| None,
     });
     // The caches' inode-freed hook and the shared writable table's write
     // observers, before any mapping can be made. The AArch64 kernel gets them

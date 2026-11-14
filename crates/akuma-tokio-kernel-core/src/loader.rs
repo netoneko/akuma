@@ -28,7 +28,24 @@ pub struct TaskImage {
     pub root_pa: u64,
     pub entry: u64,
     pub sp: u64,
+    /// The auxv pairs the stack block carries, retained for
+    /// `/proc/<pid>/auxv` (PHASE-2-PROCFS D28): `AT_NULL`-less, the shape
+    /// `akuma_procfs::render_auxv` takes, copied out because the local table
+    /// dies with `load_task`'s frame. `[0, 0]`-padded past `aux_len`; empty
+    /// (`aux_len == 0`) in a kernel built without the `procfs-diag` feature,
+    /// where nothing is retained and the file stays absent.
+    #[cfg(feature = "procfs-diag")]
+    pub aux: [[u64; 2]; AUXV_PAIRS_MAX],
+    /// How many of [`TaskImage::aux`]'s pairs are real.
+    #[cfg(feature = "procfs-diag")]
+    pub aux_len: usize,
 }
+
+/// The most pairs `load_task` can build: the 14-entry table, + `AT_SYSINFO_EHDR`
+/// under `vsyscall` (D25), + one spare so growth does not resize [`TaskImage`]
+/// (whose `Copy` shape a heap vector would break).
+#[cfg(feature = "procfs-diag")]
+pub const AUXV_PAIRS_MAX: usize = 16;
 
 /// What the loader needs beyond the tree: the capability word the auxv hands
 /// the program (`AT_HWCAP`).
@@ -400,6 +417,16 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
     };
     // The block is sized by its contents; the stack below it is lazy.
     let block_pages = stack_block_len(argv, env, aux.len()).div_ceil(4096);
+    // Retain the pairs for `/proc/<pid>/auxv` (PHASE-2-PROCFS D28): copied
+    // out here because `aux` is a borrow of a local that dies with this frame.
+    #[cfg(feature = "procfs-diag")]
+    let mut aux_retained = [[0u64; 2]; AUXV_PAIRS_MAX];
+    #[cfg(feature = "procfs-diag")]
+    let aux_len = aux.len().min(AUXV_PAIRS_MAX);
+    #[cfg(feature = "procfs-diag")]
+    for (dst, &(k, v)) in aux_retained.iter_mut().zip(aux.iter()).take(AUXV_PAIRS_MAX) {
+        *dst = [k, v];
+    }
     let mut block: Vec<u8> = Vec::new();
     block.try_reserve_exact(block_pages * 4096).ok()?;
     block.resize(block_pages * 4096, 0);
@@ -429,5 +456,13 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
     add_region::<M>(brk0, brk0 + BRK_SLAB);
     add_region::<M>(MMAP_BASE, MMAP_BASE + MMAP_SLAB);
 
-    Some(TaskImage { root_pa: root, entry: cross_entry, sp })
+    Some(TaskImage {
+        root_pa: root,
+        entry: cross_entry,
+        sp,
+        #[cfg(feature = "procfs-diag")]
+        aux: aux_retained,
+        #[cfg(feature = "procfs-diag")]
+        aux_len,
+    })
 }

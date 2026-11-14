@@ -32,6 +32,10 @@
 
 #![no_std]
 #![forbid(unsafe_code)]
+// `alloc`, for the auxv serve (PHASE-2-PROCFS D28) - the pairs leave the
+// `Process` as an owned `Vec`.
+#[cfg(feature = "procfs-diag")]
+extern crate alloc;
 
 use akuma_syscalls_abi::Syscall;
 
@@ -54,6 +58,20 @@ pub struct Kernel {
 
 static KERNEL: akuma_primitives::OnceCopy<Kernel> = akuma_primitives::OnceCopy::new();
 
+/// `/proc/<pid>/auxv`'s rows (PHASE-2-PROCFS D28): the pairs the kernel
+/// retained at exec — or, for a thread, its thread-group leader's (a clone
+/// thread runs the group's table; Linux reads the leader's for every member).
+/// `None` keeps the file absent rather than empty.
+#[cfg(feature = "procfs-diag")]
+fn pid_auxv_of(pid: u32) -> Option<alloc::vec::Vec<(u64, u64)>> {
+    let direct = akuma_exec::process::with_process(pid, |p| p.auxv.clone()).flatten();
+    if direct.is_some() {
+        return direct;
+    }
+    let tgid = akuma_exec::process::with_process(pid, |p| p.tgid)?;
+    akuma_exec::process::with_process(tgid, |p| p.auxv.clone()).flatten()
+}
+
 /// Register the kernel's half and install every hook a tokio kernel needs. Call
 /// once, before the root is mounted (`akuma-vfs-glue` reads its hooks while
 /// mounting) and before the first ring-3 crossing.
@@ -68,7 +86,15 @@ pub fn install(k: Kernel) {
         // itself and arms the file-page cache there (Taoxichuan: `mount_root`).
         fpcache_init: |_| {},
         // Nothing renders `/proc/<pid>/maps` rows from here.
+        #[cfg(not(feature = "procfs-diag"))]
         pid_map_rows: |_| None,
+        #[cfg(feature = "procfs-diag")]
+        pid_map_rows: akuma_exec::process::maps_rows::pid_map_rows,
+        // `/proc/<pid>/auxv`: absent until the feature retains tables (D28).
+        #[cfg(not(feature = "procfs-diag"))]
+        pid_auxv: |_| None,
+        #[cfg(feature = "procfs-diag")]
+        pid_auxv: pid_auxv_of,
     });
     akuma_syscalls_glue::set_hooks(akuma_syscalls_glue::SyscallHooks {
         box_is_rump: |_| false,
