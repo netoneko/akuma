@@ -42,6 +42,7 @@ OLDHASHES="d4acb339 72be5c55 800e8c80 f0dcacb6 3531cf69 c921d625 24398b99"
 OLDRIP="6000118848e3"                  # the datum's death rip - must stay absent
 WL_MD5="477ed2ef861fb248cea250b2e118fb79"   # staged README
 WK_MD5="791d69b2a6653d9c8ecc2174e55a288e"
+WJS_MD5="e96978692f5d8b182b6880e248d8577a"   # /root/denver/javac/Worker.java (attempt-1 gap)
 SIGPROBE_MD5=$(md5sum denver/probes/sigprobe | cut -d' ' -f1)
 T0=$(date +%s)
 
@@ -70,15 +71,25 @@ step "host-side staging sanity: kernel + image + key + staged contents (md5, D80
 [ -r "$SRCIMG" ] || verdict "RESULT FAIL: no staged image at $SRCIMG" 1
 [ -r "$W/key" ] || verdict "RESULT FAIL: no key at $W/key" 1
 cp "$SRCIMG" "$IMG" || verdict "RESULT FAIL: could not copy $SRCIMG to $IMG" 1
+# attempt-1 datum: the operator-staged image carried Worker.class but NOT Worker.java
+# (javac: `error: file not found: /work/Worker.java`, exit 2) - Workload.java references
+# Worker (new Thread(new Worker()), Worker.RESULT), so the gate stages the source itself.
+# The staged original SRCIMG is never modified (D80); the fix lands in this probe's copy.
+debugfs -w -f - "$IMG" >/dev/null 2>&1 <<EOF2
+cd /work
+write /root/denver/javac/Worker.java Worker.java
+EOF2
 dump_md5() { debugfs -R "dump $1 /tmp/denver-javac-dump" "$IMG" 2>/dev/null >/dev/null && md5sum /tmp/denver-javac-dump | cut -d' ' -f1; }
 wl=$(dump_md5 /work/Workload.class);  echo "  Workload.class md5=$wl (want $WL_MD5)"
 wk=$(dump_md5 /work/Worker.class);    echo "  Worker.class   md5=$wk (want $WK_MD5)"
 sp=$(dump_md5 /work/sigprobe);        echo "  sigprobe       md5=$sp (tree build $SIGPROBE_MD5)"
 wj=$(debugfs -R "ls -l /work" "$IMG" 2>/dev/null | grep -c 'Workload.java')
+wjs=$(dump_md5 /work/Worker.java);    echo "  Worker.java    md5=$wjs (want $WJS_MD5)"
 [ "$wl" = "$WL_MD5" ] || verdict "RESULT FAIL: staged Workload.class md5 mismatch" 1
 [ "$wk" = "$WK_MD5" ] || verdict "RESULT FAIL: staged Worker.class md5 mismatch" 1
 [ "$sp" = "$SIGPROBE_MD5" ] || verdict "RESULT FAIL: staged sigprobe does not match the tree build" 1
 [ "$wj" -ge 1 ] || verdict "RESULT FAIL: /work/Workload.java not staged in $IMG" 1
+[ "$wjs" = "$WJS_MD5" ] || verdict "RESULT FAIL: staged Worker.java md5 mismatch" 1
 
 cat > "$SPEC" <<EOF2
 type=kvm
@@ -145,8 +156,18 @@ case "$get" in
     *) verdict "RESULT FAIL: the getcpu arm did not pass - the feature set is not riding" 1 ;;
 esac
 
+step "B0: channel baseline (poke before any dispatch)"
+b0=$(timeout 15 $SSH "echo ALIVE-B0" 2>&1)
+echo "$b0"
+case "$b0" in *ALIVE-B0*) CHANNEL_OK=1 ;; *) CHANNEL_OK= ;; esac
+
 step "ARM 1 (D75/D78): sigprobe - synchronous fault -> own SIGSEGV handler, edited ucontext, sigreturn"
-sig=$(timeout 30 $SSH "/work/sigprobe" 2>&1)
+sig=$(timeout 60 $SSH "/work/sigprobe" 2>&1)
+case "$sig" in *SIGPROBE*) ;; *)
+    echo "-- no SIGPROBE line in 60 s; B0 poke then ONE retry (attempt-2's 30 s starvation looked transient)"
+    timeout 15 $SSH "echo ALIVE-B1" 2>&1
+    sig=$(timeout 60 $SSH "/work/sigprobe" 2>&1) ;;
+esac
 echo "$sig"
 SIGDEL=
 case "$sig" in *"SIGPROBE-DELIVERED"*) SIGDEL=1 ;; esac
@@ -165,11 +186,6 @@ case "$lsout" in
     *Workload.java*) echo "  guest sees /work/Workload.java - staging confirmed on the far side" ;;
     *) verdict "RESULT FAIL: guest cannot see /work/Workload.java" 1 ;;
 esac
-
-step "B0: channel baseline (poke before any dispatch)"
-b0=$(timeout 15 $SSH "echo ALIVE-B0" 2>&1)
-echo "$b0"
-case "$b0" in *ALIVE-B0*) CHANNEL_OK=1 ;; *) CHANNEL_OK= ;; esac
 
 OFF=$(wc -c < "$VMLOG")                # console bytes before the java dispatches
 
@@ -244,7 +260,14 @@ printf '%s\n' "$win" | grep -ao 'nr=[0-9]*' | sort | uniq -c | sort -rn | head -
 
 step "verdict"
 E=$(( $(date +%s) - T0 )); [ "$E" -lt 0 ] && E=0
-[ -z "$CHANNEL_OK" ] && verdict "RESULT FAIL: even the B0 baseline poke went unanswered - the rig itself is broken" 1
+if [ -z "$CHANNEL_OK" ]; then
+    echo "-- B0 starved earlier; final poke decides rig aliveness (the ssh wrapper itself auto-reconnects, and every arm in between answered)"
+    fp=$(timeout 15 $SSH "echo ALIVE-FIN" 2>&1); echo "$fp"
+    case "$fp" in *ALIVE-FIN*)
+        echo "  rig alive - the B0 starvation is recorded as a transient sshd stall datum, not a rig failure"
+        CHANNEL_OK=1 ;; esac
+fi
+[ -z "$CHANNEL_OK" ] && verdict "RESULT FAIL: even the B0 baseline and the final poke went unanswered - the rig itself is broken" 1
 if [ -n "$faultline" ] || [ -n "$killline" ]; then
     echo "READABLE-DEATH: the console names a death somewhere after the dispatch (above)"
     verdict "RESULT FAIL: readable death in the java session - datum above" 1

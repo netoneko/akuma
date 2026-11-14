@@ -1,0 +1,118 @@
+== host-side staging sanity: kernel + image + key + staged contents (md5, D80) (elapsed=0s)
+  Workload.class md5=477ed2ef861fb248cea250b2e118fb79 (want 477ed2ef861fb248cea250b2e118fb79)
+  Worker.class   md5=791d69b2a6653d9c8ecc2174e55a288e (want 791d69b2a6653d9c8ecc2174e55a288e)
+  sigprobe       md5=aa74a7306290cf4d51fb900344a148a3 (tree build aa74a7306290cf4d51fb900344a148a3)
+== free the VM slot (a stale guest answers EBUSY; the gate stops whatever holds /dev/kvm0 - expected) (elapsed=6s)
+== boot: herd vm-run /root/denver/w/vm-javac.spec (gate kernel 38f16b2d + the javac disk copy) (elapsed=10s)
+== rig identity: uname carries the gate kernel 38f16b2d, no older rig (elapsed=15s)
+Linux denver 0.1.0-38f16b2d-denver 38f16b2d-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=15s)
+[ssh] connecting to 127.0.0.1:2249...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-38f16b2d-denver 38f16b2d-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.15s)
+  title: Akuma
+RESULT PASS
+== feature-set proof: the getcpu arm (one PASS proves the underlying feature set rides) (elapsed=16s)
+[ssh] connecting to 127.0.0.1:2249...
+GETCPU PASS cpu=1 node=0
+== ARM 1 (D75/D78): sigprobe - synchronous fault -> own SIGSEGV handler, edited ucontext, sigreturn (elapsed=16s)
+[ssh] connecting to 127.0.0.1:2249...
+SIGPROBE-INFO handler installed
+SIGPROBE-DELIVERED si_signo=11 si_code=1 si_addr=0 ripdelta=3 rsp=0x6ffffffffcf8 rax=0 cr2=0 err=0x6 fp=0x6ffffffff900
+SIGPROBE FAIL rc=0 (want 99) sig fields above
+  KNOWN-OPEN (D78): delivery + rip edit work, the rax edit did not take (recorded verbatim above); carried to REQUIREMENTS as its own open row - NOT a gate blocker
+== guest-side staging identity: the guest can NAME the source and the probe binary (elapsed=16s)
+total 215
+-rw-r--r--    1 0        0              372 Nov 14 15:29 Hello.class
+-rw-r--r--    1 0        0             1405 Nov 14 16:07 HelloWorld.class
+-rw-r--r--    1 0        0              564 Nov 14 16:07 HelloWorld.java
+-rw-r--r--    1 0        0             1842 Nov 14 15:58 Logo.class
+-rw-r--r--    1 0        0             1918 Nov 14  2026 Logo.java
+-rw-r--r--    1 0        0              646 Nov 14 15:56 Worker.class
+-rw-r--r--    1 0        0             2456 Nov 14 15:56 Workload.class
+-rw-r--r--    1 0        0             2172 Nov 14  2026 Workload.java
+drwxr-xr-x    2 0        0             4096 Nov 14 15:56 clj
+drwxr-xr-x    3 502      20            4096 Nov 14 15:58 env
+drwxr-xr-x    2 0        0             4096 Nov 14  2026 groovy
+drwxr-xr-x    2 0        0             4096 Nov 14 15:56 out
+-rw-r--r--    1 0        0             4096 Nov 14 15:57 out.bin
+drwxr-xr-x    2 0        0             4096 Nov 14 15:57 out2
+drwxr-xr-x    3 0        0             4096 Nov 14  2026 scala
+-rwxr-xr-x    1 0        0           174048 Nov 14  2026 sigprobe
+drwxr-xr-x    2 0        0             4096 Nov 14 15:57 t
+  guest sees /work/Workload.java - staging confirmed on the far side
+== B0: channel baseline (poke before any dispatch) (elapsed=16s)
+[ssh] connecting to 127.0.0.1:2249...
+ALIVE-B0
+== ARM 2 (recorded observation): javac -version under -Xint (JIT-specificity, alarm-bounded) (elapsed=16s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=18
+JVM PASS javac 21.0.13.0.3
+== ARM 3 = THE DATUM: javac -version on the JIT (the old death must not recur) (elapsed=16s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=18
+JVM PASS javac 21.0.13.0.3
+  DATUM PASS: exit=0, javac banner JVM PASS javac 21.0.13.0.3, window clean of fault/kill, old rip absent
+== ARM 4 (D79): the staged real-javac classes run on the GATE kernel (the operator's exact command line) (elapsed=17s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=197
+JVM-INFO raw: WORKLOAD-EXC-PASS
+JVM-INFO raw: WORKLOAD-IO-PASS
+JVM-INFO raw: freeMemory before: 67057808
+JVM-INFO raw: freeMemory after: 549245136
+JVM-INFO raw: WORKLOAD-GC-PASS
+JVM-INFO raw: WORKLOAD-THREAD-RAN
+JVM-INFO raw: 42
+JVM-INFO raw: WORKLOAD-THREAD-PASS
+JVM-INFO raw: WORKLOAD-ALL-PASS
+JVM PASS workload-exception-message
+  STAGED PASS: four surfaces + WORKLOAD-ALL-PASS on kernel 38f16b2d (was proven on d4acb339 at 16:23)
+== ARM 5a = DONE compile: javac compiles /work/Workload.java + Worker.java INSIDE the guest (elapsed=18s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=2 signal=0 bytes=121
+JVM-INFO raw: Usage: javac <options> <source files>
+JVM-INFO raw: use --help for a list of possible options
+JVM RED error: file not found: /work/Worker.java
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=2 signal=0 bytes=121
+JVM-INFO raw: Usage: javac <options> <source files>
+JVM-INFO raw: use --help for a list of possible options
+JVM RED error: file not found: /work/Worker.java
+JVM INFO exit=1 signal=0 bytes=16383
+JVM-INFO raw: [0.143s][info][class,load] java.io.Serializable source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.Comparable source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.CharSequence source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.constant.Constable source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.constant.ConstantDesc source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.String source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.reflect.AnnotatedElement source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.reflect.GenericDeclaration source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.reflect.Type source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.invoke.TypeDescriptor source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.invoke.TypeDescriptor$OfField source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.Class source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.Cloneable source: shared objects file
+JVM-INFO raw: [0.143s][info][class,load] java.lang.ClassLoader source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.System source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.Throwable source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.Error source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.Exception source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.RuntimeException source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.SecurityManager source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.security.ProtectionDomain source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.security.AccessControlContext source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.security.AccessController source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.security.SecureClassLoader source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.ReflectiveOperationException source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.ClassNotFoundException source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.Record source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.LinkageError source: shared objects file
+JVM-INFO raw: [0.144s][info][class,load] java.lang.NoClassDefFoundError source: shared objects file
+RESULT FAIL: in-guest javac exited rc=2 (diagnostics above)
+== wall clock: seconds=51 (t0=1794683929 end=1794683980)

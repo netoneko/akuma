@@ -1,0 +1,145 @@
+== host-side staging sanity: kernel + image + key + staged contents (md5, D80) (elapsed=0s)
+  Workload.class md5=477ed2ef861fb248cea250b2e118fb79 (want 477ed2ef861fb248cea250b2e118fb79)
+  Worker.class   md5=791d69b2a6653d9c8ecc2174e55a288e (want 791d69b2a6653d9c8ecc2174e55a288e)
+  sigprobe       md5=aa74a7306290cf4d51fb900344a148a3 (tree build aa74a7306290cf4d51fb900344a148a3)
+  Worker.java    md5=e96978692f5d8b182b6880e248d8577a (want e96978692f5d8b182b6880e248d8577a)
+== free the VM slot (a stale guest answers EBUSY; the gate stops whatever holds /dev/kvm0 - expected) (elapsed=7s)
+== boot: herd vm-run /root/denver/w/vm-javac.spec (gate kernel 38f16b2d + the javac disk copy) (elapsed=10s)
+== rig identity: uname carries the gate kernel 38f16b2d, no older rig (elapsed=13s)
+Linux denver 0.1.0-38f16b2d-denver 38f16b2d-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=14s)
+[ssh] connecting to 127.0.0.1:2249...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-38f16b2d-denver 38f16b2d-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.13s)
+  title: Akuma
+RESULT PASS
+== feature-set proof: the getcpu arm (one PASS proves the underlying feature set rides) (elapsed=15s)
+[ssh] connecting to 127.0.0.1:2249...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 2s (attempt 1/10)
+[ssh] connecting to 127.0.0.1:2249...
+GETCPU PASS cpu=2 node=0
+== B0: channel baseline (poke before any dispatch) (elapsed=47s)
+[ssh] connecting to 127.0.0.1:2249...
+ALIVE-B0
+== ARM 1 (D75/D78): sigprobe - synchronous fault -> own SIGSEGV handler, edited ucontext, sigreturn (elapsed=47s)
+[ssh] connecting to 127.0.0.1:2249...
+SIGPROBE-INFO handler installed
+SIGPROBE-DELIVERED si_signo=11 si_code=1 si_addr=0 ripdelta=3 rsp=0x6ffffffffcf8 rax=0 cr2=0 err=0x6 fp=0x6ffffffff900
+SIGPROBE FAIL rc=0 (want 99) sig fields above
+  KNOWN-OPEN (D78): delivery + rip edit work, the rax edit did not take (recorded verbatim above); carried to REQUIREMENTS as its own open row - NOT a gate blocker
+== guest-side staging identity: the guest can NAME the source and the probe binary (elapsed=48s)
+total 216
+-rw-r--r--    1 0        0              372 Nov 14 15:29 Hello.class
+-rw-r--r--    1 0        0             1405 Nov 14 16:07 HelloWorld.class
+-rw-r--r--    1 0        0              564 Nov 14 16:07 HelloWorld.java
+-rw-r--r--    1 0        0             1842 Nov 14 15:58 Logo.class
+-rw-r--r--    1 0        0             1918 Nov 14  2026 Logo.java
+-rw-r--r--    1 0        0              646 Nov 14 15:56 Worker.class
+-rw-r--r--    1 0        0              482 Nov 14  2026 Worker.java
+-rw-r--r--    1 0        0             2456 Nov 14 15:56 Workload.class
+-rw-r--r--    1 0        0             2172 Nov 14  2026 Workload.java
+drwxr-xr-x    2 0        0             4096 Nov 14 15:56 clj
+drwxr-xr-x    3 502      20            4096 Nov 14 15:58 env
+drwxr-xr-x    2 0        0             4096 Nov 14  2026 groovy
+drwxr-xr-x    2 0        0             4096 Nov 14 15:56 out
+-rw-r--r--    1 0        0             4096 Nov 14 15:57 out.bin
+drwxr-xr-x    2 0        0             4096 Nov 14 15:57 out2
+drwxr-xr-x    3 0        0             4096 Nov 14  2026 scala
+-rwxr-xr-x    1 0        0           174048 Nov 14  2026 sigprobe
+drwxr-xr-x    2 0        0             4096 Nov 14 15:57 t
+  guest sees /work/Workload.java - staging confirmed on the far side
+== ARM 2 (recorded observation): javac -version under -Xint (JIT-specificity, alarm-bounded) (elapsed=48s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=18
+JVM PASS javac 21.0.13.0.3
+== ARM 3 = THE DATUM: javac -version on the JIT (the old death must not recur) (elapsed=48s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=18
+JVM PASS javac 21.0.13.0.3
+  DATUM PASS: exit=0, javac banner JVM PASS javac 21.0.13.0.3, window clean of fault/kill, old rip absent
+== ARM 4 (D79): the staged real-javac classes run on the GATE kernel (the operator's exact command line) (elapsed=49s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=197
+JVM-INFO raw: WORKLOAD-EXC-PASS
+JVM-INFO raw: WORKLOAD-IO-PASS
+JVM-INFO raw: freeMemory before: 67057808
+JVM-INFO raw: freeMemory after: 552388512
+JVM-INFO raw: WORKLOAD-GC-PASS
+JVM-INFO raw: WORKLOAD-THREAD-RAN
+JVM-INFO raw: 42
+JVM-INFO raw: WORKLOAD-THREAD-PASS
+JVM-INFO raw: WORKLOAD-ALL-PASS
+JVM PASS workload-exception-message
+  STAGED PASS: four surfaces + WORKLOAD-ALL-PASS on kernel 38f16b2d (was proven on d4acb339 at 16:23)
+== ARM 5a = DONE compile: javac compiles /work/Workload.java + Worker.java INSIDE the guest (elapsed=49s)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=0
+JVM PASS 
+  COMPILE PASS: exit=0, classes written to /work/out
+== ARM 5b = DONE run: the guest-compiled class runs (the gate's bar) (elapsed=50s)
+[ssh] connecting to 127.0.0.1:2249...
+[ssh] connection lost: connection stalled during handshake — no data from server
+[ssh] reconnecting in 2s (attempt 1/10)
+[ssh] connecting to 127.0.0.1:2249...
+JVM INFO loader present
+JVM INFO exit=0 signal=0 bytes=197
+JVM-INFO raw: WORKLOAD-EXC-PASS
+JVM-INFO raw: WORKLOAD-IO-PASS
+JVM-INFO raw: freeMemory before: 50280592
+JVM-INFO raw: freeMemory after: 398244080
+JVM-INFO raw: WORKLOAD-GC-PASS
+JVM-INFO raw: WORKLOAD-THREAD-RAN
+JVM-INFO raw: 42
+JVM-INFO raw: WORKLOAD-THREAD-PASS
+JVM-INFO raw: WORKLOAD-ALL-PASS
+JVM PASS workload-exception-message
+  DONE PASS: javac-compiled-in-the-guest classes run all four surfaces + WORKLOAD-ALL-PASS
+== console window: the whole java session clean + census (elapsed=82s)
+-- console window: fault line: <none>
+-- console window: kill line: <none>
+-- console window: evidence lines:
+[err] s2 nr=436 -38 a=0x3,0xffffffff,0x0
+[err] s2 nr=102 -38 a=0x6fffffffff82,0x2f,0x2f
+[err] s2 nr=104 -38 a=0x6fffffffff80,0x6ffffffffdf8,0x6ffffffffdf8
+[err] s2 nr=106 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=105 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=110 -38 a=0x50409d,0x50409c,0x4
+[err] s2 nr=102 -38 a=0x6fffffffff6f,0x2f,0x2f
+[err] s2 nr=104 -38 a=0x6fffffffff6a,0x6ffffffffdf0,0x6ffffffffdf0
+[err] s2 nr=106 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=105 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=436 -38 a=0x3,0xffffffff,0x0
+[err] s2 nr=102 -38 a=0x6fffffffff82,0x2f,0x2f
+[err] s2 nr=104 -38 a=0x6fffffffff80,0x6ffffffffdb8,0x6ffffffffdb8
+[err] s2 nr=106 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=105 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=110 -38 a=0x50409d,0x50409c,0x4
+[nosys] nr=38
+[err] s2 nr=38 -38 a=0x0,0x6fffffffbb10,0x6fffffffbb30
+[err] s3 nr=38 -38 a=0x0,0x6fffffffbb10,0x6fffffffbb30
+[nosys] nr=324
+-- console window: syscall census (trace-err buckets, top counts):
+     50 nr=9
+     50 nr=89
+     41 nr=98
+     21 nr=324
+     20 nr=72
+     20 nr=2
+     18 nr=97
+     18 nr=302
+     15 nr=38
+     15 nr=3
+     12 nr=102
+     10 nr=8
+== verdict (elapsed=82s)
+GATE GREEN: kernel 38f16b2d (fault-signal riding) delivers a synchronous fault to the JVM's own SIGSEGV handler -
+  javac -version exits 0, the staged real-javac workload passes on this kernel, javac compiled Workload.java INSIDE
+  the guest and the produced class ran all four surfaces to WORKLOAD-ALL-PASS. G13's bar is met.
+RESULT PASS
+== wall clock: seconds=82 (t0=1794684341 end=1794684423)
