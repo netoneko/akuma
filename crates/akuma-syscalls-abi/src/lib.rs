@@ -675,7 +675,6 @@ syscall_table! {
     Chroot        => CHROOT        = 161, nr::CHROOT;
     Sethostname   => SETHOSTNAME   = 170, nr::SETHOSTNAME;
     Setdomainname => SETDOMAINNAME = 171, nr::SETDOMAINNAME;
-    Getcpu      => GETCPU      = 168, nr::GETCPU;
     Sysinfo    => SYSINFO    = 99,  nr::SYSINFO;
     Syslog     => SYSLOG     = 103, nr::SYSLOG;
     Reboot     => REBOOT     = 169, nr::REBOOT;

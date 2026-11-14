@@ -97,8 +97,19 @@ flipping its line.
        fr.arg1(), fr.arg2(), ring3::cpu_index() as u32,
    ),
    ```
-4. **ABI + nr** — `pub const GETCPU: u64 = 168;` in `nr.rs`;
-   `Getcpu => GETCPU = 168, nr::GETCPU;` in the abi table (one row).
+4. **nr const only — deliberately NO `Syscall` row** — `pub const GETCPU: u64 = 168;`
+   in `nr.rs` (x86_64 168 is getcpu too, the pidfd rule). **Attempt-1 lesson
+   (mechanism named, `PHASE-2-GETCPU.attempt1-FAIL.log`):** the first cut added
+   the full ABI row (`Getcpu => GETCPU = 168, nr::GETCPU;`) and the gate REDd
+   ENOSYS on the correct new binary — because `akuma-syscalls-glue-amd64`'s
+   dispatch decodes through `Syscall::from_x86_64(nr)` and forwards
+   table-named numbers into glue's `handle_syscall`, which has no getcpu arm:
+   the row HIJACKED nr 168 into an ENOSYS before the tokio match ever saw it
+   (the pre-row census `[nosys] nr=168` proves the old path reached the
+   match's default arm). The pidfd precedent is written down for exactly this
+   (`akuma-runtime-tokio`'s `shared_numbers_agree` test: "the abi table names
+   neither" — calls served outside glue's table carry an `nr` const, not a
+   `Syscall` row).
 5. **Feature relay 1:1** — `getcpu = []` → `["akuma-tokio-kernel-amd64/getcpu"]`
    → `["akuma-tokio-kernel/getcpu"]` → `["akuma-jvm-kernel/getcpu"]`, the
    `sysinfo` comments' shape.

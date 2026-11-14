@@ -1789,10 +1789,14 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
         // pre-zeroed cpu). The taoxichuan aarch64 precedent's shape: the
         // caller's core from `ring3::cpu_index()`, node 0, the copies out in
         // glue, `EFAULT` on failure; the decision is pure
-        // (`akuma-syscalls-linux::sched`). Off by default (R6); PHASE-2-GETCPU
-        // research artifact, D55.
+        // (`akuma-syscalls-linux::sched`). Keyed on the raw number — NO
+        // `Syscall` row (attempt-1's lesson: `glue_amd64::dispatch` decodes
+        // through `from_x86_64` and forwards table-named numbers into glue's
+        // table, which has no getcpu arm — the pidfd rule, "the abi table
+        // names neither", is the reason `nr` carries this const instead).
+        // Off by default (R6); PHASE-2-GETCPU research artifact, D55.
         #[cfg(feature = "getcpu")]
-        akuma_syscalls_abi::x86_64::GETCPU => akuma_syscalls_glue::sched::sys_getcpu(
+        akuma_syscalls_linux::nr::GETCPU => akuma_syscalls_glue::sched::sys_getcpu(
             fr.arg1(),
             fr.arg2(),
             ring3::cpu_index() as u32,

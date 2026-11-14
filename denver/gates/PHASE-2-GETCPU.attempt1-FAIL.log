@@ -1,0 +1,48 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-getcpu.spec (elapsed=3s)
+== rig identity: uname says denver, NOT 72be5c55/800e8c80/f0dcacb6/3531cf69/c921d625/24398b99 (elapsed=7s)
+Linux denver 0.1.0-50d64942-denver 50d64942-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=7s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-50d64942-denver 50d64942-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.16s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (rides; this binary carries wx-relaxed AND vsyscall AND procfs-diag AND trace-err AND fold-regpreserve AND lazy-release-sweep AND sysinfo AND getcpu) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== procfs-diag alive: the maps arm (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+MAPS-LINE: 10000000-10001000 r--p 00000000 00:00 0 
+MAPS-LINE: 10001000-10005000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10007000-10009000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000b000-1000d000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000f000-10010000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10010000-10013000 r--p 00000000 00:00 0 
+MAPS-LINE: 10013000-10015000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10054000-10065000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10095000-10096000 rw-p 00000000 00:00 0 
+MAPS-LINE: 6ffffffff000-700000000000 rw-p 00000000 00:00 0 
+MAPS PASS lines=10 exec_lines=4 bytes=418
+== procfs-diag alive: the auxv arm (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096 AT_SYSINFO_EHDR matches stack=18446744073699061760
+== the contract facts, java-free (D35): mmaparms (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+MMARMS PASS len0 MAP_FAILED EINVAL
+MMARMS PASS oversize MAP_FAILED errno=12
+MMARMS PASS reserve base=0x600000000000 size=50331648 prot=NONE
+MMARMS PASS commit-RW write-readback off=0
+MMARMS PASS commit-RX call=42
+MMARMS PASS rwx call=42
+== THE GATE: getcpu served with the caller's core (D56 condition 6 - was GETCPU RED ENOSYS) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+GETCPU RED ENOSYS
+RESULT FAIL: getcpu still not served (GETCPU RED ENOSYS) - the getcpu kernel did not take
+== wall clock: seconds=9 (t0=1794656198 end=1794656207)
