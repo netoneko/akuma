@@ -25,6 +25,12 @@ vsyscall = ["akuma-jvm-kernel/vsyscall"]
 # `--features wx-relaxed,vsyscall,procfs-diag` (rig: denver-procfs).
 procfs-diag = ["akuma-jvm-kernel/procfs-diag"]
 
+# The fault-path evidence tables (PHASE-2-NULLSTORE, D34): the syscall ring,
+# the instruction-bytes and mmap-slab dumps at a ring-3 kill, now also relayed
+# into the denver gate kernel. Off by default (R6); the gate kernel is
+# `--features wx-relaxed,vsyscall,procfs-diag,trace-err` (rig: denver-nullstore).
+trace-err = ["akuma-jvm-kernel/trace-err"]
+
 [[bin]]
 name = "denver"
 path = "src/main.rs"

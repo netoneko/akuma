@@ -351,6 +351,14 @@ fn fault_trap_locked(t: &mut Trap<'_>) {
         mm_dump_for(cr2);
         #[cfg(feature = "trace-err")]
         fault_code_dump(t.frame.rip);
+        // `procfs-diag` (PHASE-2-NULLSTORE D33): the death names its owner on the
+        // console — the workload starves sshd, so no other channel crosses.
+        #[cfg(feature = "procfs-diag")]
+        fault_attribution(t);
+        // `trace-err`: the lethal caller's last syscalls, results included — the
+        // NULL that reached `fstatat`'s copy-out was made somewhere upstream.
+        #[cfg(feature = "trace-err")]
+        ring_dump_slot(exec_twin::current_slot() as i32, 40);
         // A fork child or thread dies alone (SIGSEGV status to its waiter);
         // the machine runs on. The boot task has no slot to reap through, so
         // a fault there halts.
@@ -1069,6 +1077,103 @@ fn mm_event(kind: u8, start: u64, end: u64) {
 }
 #[cfg(not(feature = "trace-err"))]
 fn mm_event(_kind: u8, _start: u64, _end: u64) {}
+
+/// `--features procfs-diag` (PHASE-2-NULLSTORE D33): a ring-3 death names its
+/// owner on the console. The workload starves the guest's sshd within seconds
+/// and never lets it recover (RESULT.md, session 8), so a userspace maps reader
+/// cannot deliver attribution — the kernel prints it where the console capture
+/// lives. Three bounded prints, evidence not verdicts: the map rows at/near the
+/// faulting rip (the registered walk — the same rows `/proc/<pid>/maps` serves,
+/// D32), the GPR file (the faulting instruction's operands), and the top stack
+/// qwords (return addresses). Lock order is the syscall path's: `fault_trap`
+/// holds the BKL for user faults, and the walk's locks sit below it there too.
+#[cfg(feature = "procfs-diag")]
+fn fault_attribution(t: &Trap<'_>) {
+    let rip: u64 = t.frame.rip;
+    // `MapRow` addresses are `usize`; the frame is `u64` — compare in usize,
+    // print in the frame's width so the console line matches the `[Fault]` one.
+    let rip_ix = rip as usize;
+    let pid = child::pid_for_slot(exec_twin::current_slot());
+    let Some(rows) = pid.and_then(akuma_exec::process::maps_rows::pid_map_rows_of_kernel_owned_roots) else {
+        akuma_primitives::safe_print!(
+            96,
+            "[Fault] ring3 map rip=0x{rip:016x} pid={} rows=<none: no walk or no pid>\n",
+            pid.map_or(-1, i64::from)
+        );
+        return;
+    };
+    // The containing row, then the nearest below and above: a rip in a hole
+    // still has neighbors to name, and an unattributed rip is a finding too.
+    let pick = [
+        ("at", rows.iter().find(|r| r.0 <= rip_ix && rip_ix < r.1)),
+        ("below", rows.iter().rev().find(|r| r.1 <= rip_ix)),
+        ("above", rows.iter().find(|r| r.0 > rip_ix)),
+    ];
+    for (label, row) in pick {
+        let Some(r) = row else { continue };
+        akuma_primitives::safe_print!(
+            128,
+            "[Fault] ring3 map {label} rip=0x{rip:016x} in 0x{:x}-0x{:x} {}{}{}{}\n",
+            r.0,
+            r.1,
+            if r.2 { "r" } else { "-" },
+            if r.3 { "w" } else { "-" },
+            if r.4 { "x" } else { "-" },
+            if r.5 { "s" } else { "p" }
+        );
+    }
+    let g = &t.regs;
+    akuma_primitives::safe_print!(
+        224,
+        "[Fault] ring3 regs rip=0x{rip:016x} rsp=0x{:016x} rax=0x{:x} rbx=0x{:x} rcx=0x{:x} rdx=0x{:x}\n",
+        t.frame.rsp,
+        g.rax,
+        g.rbx,
+        g.rcx,
+        g.rdx
+    );
+    akuma_primitives::safe_print!(
+        224,
+        "[Fault] ring3 regs rsi=0x{:x} rdi=0x{:x} rbp=0x{:x} r8=0x{:x} r9=0x{:x} r10=0x{:x}\n",
+        g.rsi,
+        g.rdi,
+        g.rbp,
+        g.r8,
+        g.r9,
+        g.r10
+    );
+    akuma_primitives::safe_print!(
+        160,
+        "[Fault] ring3 regs r11=0x{:x} r12=0x{:x} r13=0x{:x} r14=0x{:x} r15=0x{:x}\n",
+        g.r11,
+        g.r12,
+        g.r13,
+        g.r14,
+        g.r15
+    );
+    let mut words = [0u8; 64];
+    if copy_from_user(&mut words, t.frame.rsp) {
+        // Eight stack qwords, oldest convention: [rsp] first. A return address
+        // among them names the caller once the probe maps it onto a module.
+        let w = core::array::from_fn::<u64, 8, _>(|i| {
+            u64::from_le_bytes(words[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]))
+        });
+        akuma_primitives::safe_print!(
+            224,
+            "[Fault] ring3 stack [rsp..+64)={:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x} {:016x}\n",
+            w[0],
+            w[1],
+            w[2],
+            w[3],
+            w[4],
+            w[5],
+            w[6],
+            w[7]
+        );
+    } else {
+        akuma_primitives::safe_print!(64, "[Fault] ring3 stack [rsp..+64) unreadable\n");
+    }
+}
 
 /// What the faulting task actually executes at `rip`: the 16 bytes mapped there, the frame
 /// that maps them, and that frame's share count. A fault the instruction at `rip` cannot raise
