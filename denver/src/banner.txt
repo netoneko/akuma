@@ -1,5 +1,5 @@
    /\        /\        /\        /\        /\
   /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
- /    \/  \/    \/  \/    \/  \/    \
-_/                                    \_     the mile-high teaching kernel:
-  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       boots tokio, uname says denver.
+ /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
+_/                                    \_     Beans System Debauchery:
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       kernel for Clojure
