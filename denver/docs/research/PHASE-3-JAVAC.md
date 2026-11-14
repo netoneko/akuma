@@ -119,3 +119,34 @@ is the pipe arm only (L2 rule); alarms bound every dispatch.
 
 PASS = arms 1, 3, 4 (2 is a recorded observation). Every failure names its datum into
 the log; REDs land with the class-load/diagnostic trace like the workload gate's.
+
+## The run (session 20, 2026-11-14 ~19:15 UTC) — design deltas from the night update
+
+- **G12/JAVACLASSLIB is already closed** (a same-day re-run at 16:23 UTC on d4acb339 with the
+  staged real-javac classes: `denver/gates/PHASE-3-JAVACLASSLIB.log` RESULT PASS; G12 row
+  striken in REQUIREMENTS.md). This session's gate is the kernel, not the class files.
+- **D77 — the gate kernel is the existing binary `/root/denver/w/denver-faultsig`, stamp
+  `38f16b2d-release`** (git `38f16b2d`, the 17:17 wip checkpoint carrying the fault-signal
+  relay; the operator measured their javac/Clojure/Scala/Groovy runs on it, zero `[Fault]`).
+  No rebuild: the gate judges the operator-proven binary as-is; identity arms pin the stamp
+  and refuse every older rig hash. Shell-feature membership of the binary is settled
+  behaviorally (the arms pass or the gate names what is missing), not by binary archaeology.
+- **D78 — verdict rule change for arm 1 (operator night update):** sigprobe's delivery + rip
+  edit are required (no delivery at all ⇒ gate FAIL); the **rax edit is a KNOWN-OPEN datum**
+  (delivery works, rip edit takes effect, rax stays 0 — want 99, unexplained): recorded
+  verbatim in the gate log, carried into REQUIREMENTS as its own open row, NOT a gate
+  blocker. The gate's bar is javac (G13), not sigprobe's last field.
+- **D79 — a staged-precompiled arm is added between the datum and DONE:** the operator's
+  exact command line (`java -Xms64m -Xmx1536m -cp /work Workload`) runs the staged
+  real-javac classes on the GATE kernel — re-proving the four surfaces on 38f16b2d (the
+  JAVACLASSLIB closure citation moves from d4acb339 to the featured kernel for free).
+- **D80 — image policy (house rule "use your own images"):** the probe copies the
+  operator-staged `/root/denver/w/denver-faultsig.img` to `/root/denver/w/denver-javac.img`
+  each run (javac's `-d /work/out` writes into the disk; the staged original stays pristine)
+  and uses its own spec `vm-javac.spec` (identical to the operator's proven `vm-faultsig.spec`
+  except disk + `forward=2249:22`) and its own console log `vm-javac.log` (vmrun.log still
+  holds the 16:23 JAVACLASSLIB console — not clobbered). Staging identity is verified host-side
+  by debugfs dump + md5 (Workload.class `477ed2ef…`, Worker.class `791d69b2…` per the staged
+  README; sigprobe against the tree's build) before any boot.
+- **D81 — NEXT GATE candidate:** the one open item on the signal path (sigprobe rax) becomes
+  PHASE-4-SIGRAX if this gate is GREEN.
