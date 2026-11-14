@@ -176,3 +176,73 @@ composition only.
 None new — PHASE-2-NULLSTORE's recorded proposal (knob
 `GOOSE_TOOL_CALL_CUTOFF` at default, judged by later sessions' `final_ctx` in
 COST_LEDGER.md) stands for the phase; the operator owns applying it.
+
+## D57 — the diagnosis trail, three REDs against a provably sound dispatch [SUPERSEDED by D58 — the "feature-drift" theory below was wrong; kept as the record of how the trail actually went]
+
+Attempt-2 (11:45:20, preserved as `PHASE-2-GETCPU.attempt2-FAIL.log`) and this session's
+attempt-3 (preserved as `PHASE-2-GETCPU.attempt3-FAIL.log`) both REDd ENOSYS, and the
+session's first theory — that the 11:54 staged binary lacked the `getcpu` feature — died
+when a rebuild WITH the feature (verified by symbol, then by a marker build) still REDd.
+What the trail actually established, each step dispositive:
+
+- **Dispatch-path audit**: exactly one dispatcher is installed
+  (`ring3::enable_syscalls(dispatch)`, `lib.rs:1935`; the stub's `DISPATCH` is an
+  AtomicUsize written once); `glue_amd64::dispatch` answers `None` for undecodable 168
+  (legacy match 7/23/33/96/201, then `Syscall::from_x86_64(168)?`); `legacy::fold` has no
+  168 (`NUMBERS` = 19 x86_64 legacy numbers, checked); `serve_shared` claims only pidfd
+  424/434; `sys_getcpu` returns only 0 or EFAULT. A compiled-in arm cannot answer ENOSYS.
+- **Static proof on the built binary**: the match compiles to a jump table over `nr-9`;
+  entry 159 (nr 168) held the getcpu arm block verbatim (`mov %gs:0x18,%edx` —
+  `ring3::cpu_index()` — then `call sys_getcpu`); the nr-99 entry held sysinfo's block as
+  the control. The routing was correct in every binary that REDd.
+- **Marker experiment** (prints inside the feature-gated arm and at boot, R6-clean):
+  boot marker `[gcpu-build]` appeared in the console; the arm markers never did, and the
+  RED persisted — the syscall answers -38 **before the match**, with no `[err]`/`[nosys]`
+  trace for nr 168 anywhere, on a live, flushed console.
+
+The trail's own errors, kept as warnings: (1) a stale R6 snapshot
+(`/tmp/denver-default-pre-getcpu`, 11:27) was from the attempt-1 tree that still carried
+the abi `Getcpu` ROW — its `.text` differs from every post-row build, so the first
+"R6 FAIL" was the comparator's fault, not the change's; the honest compare is
+stash→build→pop→build (see D58). (2) The console's `[nosys] nr=309` + `[err] s4 nr=309
+-38` lines in the attempt-3 boot were read as sshd noise. They were the gate.
+
+## D58 — the real root cause: the arm keyed on the asm-generic number; x86_64 getcpu is 309
+
+**D55's premise "x86_64 nr 168, asm-generic nr 168 — the tables agree" was FALSE.** The
+x86_64 Linux number for `getcpu(2)` is **309** (`arch/x86/entry/syscalls/syscall_64.tbl`;
+musl's `<sys/syscall.h>` names it `SYS_getcpu`=309 on x86_64); 168 is the asm-generic /
+aarch64 number. The two tables **disagree** for getcpu — it predates the unified-number
+era, so the pidfd rule ("everything since ~5.1 shares one number") does not apply.
+
+Measured, three ways: the image's `/bin/jvmprobe` getcpu arm performs `mov $0x135,%edi` =
+309 before `call syscall` (disassembled from the extracted image binary); the gate's
+console carried `[nosys] nr=309` + `[err] s4 nr=309 -38` exactly when the gate REDd; and
+`BUG_FIX_LIST.md:2117` already warned that the x86_64 300-range is occupied (its own text
+says "300 is getcpu" — 309; finit_module=313 is correct there). Every RED since
+PHASE-1-METHOD was the default arm honestly ENOSYSing the **real** getcpu call while the
+kernel's answer sat keyed on a number no x86_64 caller performs. The phase-1 datum
+"`GETCPU RED ENOSYS` on both kernels" was a true measurement of a real gap — the gap was
+just never where the arm looked for it.
+
+**The fix (composition, ~14 LOC incl. comments):**
+1. `akuma-syscalls-abi::x86_64` gains a hand-written, ROW-FREE const:
+   `pub const GETCPU: u64 = 309;` — row-free per D55's own attempt-1 lesson (a `Syscall`
+   row would route 309 into `glue_amd64::dispatch`'s decode → glue's table → ENOSYS
+   hijack). `nr::GETCPU`=168 stays: it is the asm-generic/aarch64 truth the aarch64
+   halves use.
+2. The amd64 arm keys on `akuma_syscalls_abi::x86_64::GETCPU`; comment rewritten with the
+   correction. Glue, the pure crate, the relay, the probe: untouched.
+
+**R6 evidence (the D49 standard, done right this time):** default build `.text`
+sha256 before/after via stash→build→pop→build — **identical**
+`94da2dbf0f19c44814e2b4c9…` (the earlier mismatch was the stale 11:27 snapshot from the
+abi-row tree; a cross-commit snapshot is not a comparator). Gate feature set builds;
+linux-crate sched host tests unaffected (pure crate untouched).
+
+**Verdict:** `sh denver/probe-getcpu.sh` → `denver/gates/PHASE-2-GETCPU.log` —
+**RESULT PASS**, wall 83 s: `GETCPU PASS cpu=1 node=0` (the caller's core, in the spec's
+0..3 range, node 0), tokioprobe, RWX `rw_to_rx=42`, MAPS+AUXV, MMARMS incl. `rwx call=42`,
+regpreserve REGPASS x20 zero REGRED, LAZYREL both arms, java arm moved — no return to the
+old death, no fault at all in the window, output again unrecoverable over ssh (the
+phase-3 capture problem stands, fed forward unread). G2 **closed**.

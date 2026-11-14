@@ -635,4 +635,50 @@ attribute before alarming. G7 closed; the standing rank puts G2 (getcpu, java-fr
 by `git add -A` (untracked in a follow-up commit), and attempt-1's totalram extraction
 bug (log preserved as `PHASE-2-MEMINFO.attempt1-FAIL.log`).
 
-NEXT GATE: PHASE-2-GETCPU
+### PHASE-2-GETCPU — 2026-11-14, session 15 (~13:50–15:05 UTC) — GREEN (G2 closed: one arm on the ABI's own number; the gate REDd three times on a sound kernel before the number moved)
+
+**What we did.** The gate inherited a fix already committed (D55: thin `sys_getcpu` arm,
+decision in `akuma-syscalls-linux::sched`, feature relay x4) and three honest REDs
+(`attempt1` = the abi-row hijack, named then; attempts 2–3 preserved as FAIL logs). This
+session re-ran first (RED again), then stopped touching code and audited the machine:
+one dispatcher only (`ring3::enable_syscalls(dispatch)`, written once); `glue_amd64` and
+`legacy::fold` provably answer `None` for 168; the jump table's entry 159 held the arm
+block (`mov %gs:0x18,%edx` = `cpu_index()`, `call sys_getcpu`) in **every** binary that
+REDd. A feature-gated **marker build** (boot print + arm-enter/ret prints, R6-clean,
+reverted after) proved the boot marker appears and the arm markers never do: the -38
+never came from the match. The answer was in the console the whole time — the gate's
+call logged `[nosys] nr=309` + `[err] s4 nr=309 -38`, read twice as sshd noise.
+
+**What decision it forced (D58).** D55's premise — "x86_64 nr 168, asm-generic nr 168,
+the tables agree" — is **false**: x86_64 `getcpu(2)` is **309** (`syscall_64.tbl`; musl's
+`SYS_getcpu`=309 on x86_64 — measured from the image's jvmprobe: `mov $0x135,%edi`), and
+168 is the asm-generic/aarch64 number. getcpu predates the unified-number era, so the
+pidfd rule does not apply and the tables legitimately disagree. The fix is a hand-written
+ROW-FREE `akuma_syscalls_abi::x86_64::GETCPU = 309` (row-free per attempt-1's own lesson:
+a `Syscall` row would hijack 309 into glue's ENOSYS) and the arm keyed on it. `nr.rs`
+keeps 168 — the aarch64 halves' truth. Every RED since PHASE-1 was the default arm
+honestly ENOSYSing the real getcpu call; the gap was real, the arm was aimed at the wrong
+number.
+
+**What the machine taught (machine notes).** (1) The marker-build technique — feature-
+gated prints at boot and inside the arm — is the cheap dispositive instrument for "did
+the call reach the arm" on this rig; the console `[err]`/`[nosys]` lines only exist for
+calls that reach `dispatch_locked`. (2) A cross-commit R6 snapshot is not a comparator:
+`/tmp/denver-default-pre-getcpu` (11:27) came from the abi-row tree, so the first
+"R6 FAIL" was the snapshot's, not the change's — the honest compare is
+stash→build→pop→build, and it passed: default `.text` identical `94da2dbf0f19c44814e2b4c9…`.
+(3) `[nosys]`/`[err]` lines deserve per-line attribution before anyone says "noise":
+nr 309 at the gate's moment was the datum, misread twice.
+
+**The verdict.** `sh denver/probe-getcpu.sh` → `denver/gates/PHASE-2-GETCPU.log` —
+RESULT PASS, wall 83 s, guest d4acb339+arm: `GETCPU PASS cpu=1 node=0` (the caller's
+core; D56's cpu-in-range/node-0 checks hold), tokioprobe, RWX `rw_to_rx=42`, MAPS+AUXV,
+MMARMS incl. `rwx call=42`, regpreserve x20 zero REGRED, LAZYREL both arms. The java arm
+moved with no fault at all in the 30 s window and its output stayed unrecoverable over
+ssh — the phase-3 capture problem (window/output recovery) is the ladder's next blocker,
+per HEAPRO/MEMINFO's standing record. G2 **closed**; G5 stays deferred; phase 3 opens.
+
+**Interventions:** three, in RESULT.md — the stale R6 snapshot (stash compare needed),
+the marker diagnostic build, and the twice-misread `nr=309` console line.
+
+NEXT GATE: PHASE-3-JAVAVERSION

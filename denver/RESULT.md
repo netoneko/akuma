@@ -615,3 +615,39 @@ the phase-3 blocker datum; every java-carrying gate now opens with it.
 - INTERVENTION: attempt-1 FAIL was the probe's own sanity check misreading a multi-line
   capture — extraction must grep the judged line first (`SYSINFO PASS`), never sed the
   raw capture; the kernel change under test was already proven by that same failed run.
+
+## Gate PHASE-2-GETCPU — 2026-11-14 ~13:50–15:05 UTC, session 15 (goose, glm-5.3-flash) — GREEN (closes G2)
+
+| record | what | outcome |
+|---|---|---|
+| research artifact | `denver/docs/research/PHASE-2-GETCPU.md` (D55–D58; D57 = the superseded diagnosis trail, kept; D58 = the number correction) | updated before code moved (R1); D55's "tables agree" premise corrected |
+| code | one hand-written ROW-FREE const `akuma_syscalls_abi::x86_64::GETCPU = 309` + the arm re-keyed (`akuma_syscalls_abi::x86_64::GETCPU`, was `nr::GETCPU`=168) | ~14 LOC incl. comments; glue/pure-crate/relay/probe untouched |
+| R6 check | default build `.text` sha256, stash→build→pop→build (the D49 standard; the 11:27 cross-commit snapshot was invalid — attempt-1's abi-row tree) | **identical** `94da2dbf0f19c44814e2b4c9…` |
+| gate kernel | the D56 feature set build → `/root/denver/w/denver-getcpu`, staged (marker build staged for the diagnosis, clean build for the gate) | boot marker `[gcpu-build]` seen; arm markers never fired for the guest's real call |
+| attempts 2–3 | preserved FAIL logs (`PHASE-2-GETCPU.attempt2-FAIL.log`, `.attempt3-FAIL.log`) | honest FAILs — the arm keyed on 168; the guest performed 309 (`[nosys] nr=309` at the gate, misread twice as sshd noise) |
+| gate | `sh denver/probe-getcpu.sh` → `denver/gates/PHASE-2-GETCPU.log` | **RESULT PASS**, wall 83 s, guest d4acb339+arm |
+
+`GETCPU PASS cpu=1 node=0` — G2's feed SERVED (was `GETCPU RED ENOSYS` since PHASE-1): the
+caller's core from `ring3::cpu_index()`, node 0, either output pointer optional, `EFAULT`
+on bad user ranges. Riding arms all green: tokioprobe, RWX `rw_to_rx=42`, MAPS lines=10,
+AUXV procfs-auxv, MMARMS incl. `rwx call=42`, regpreserve x20 zero REGRED, LAZYREL both
+arms. The java arm MOVED with no fault at all in the 30 s window, output unrecoverable
+over ssh again — the phase-3 capture problem (window / output recovery) is the next
+blocker, per the HEAPRO and MEMINFO records.
+
+**The lesson this gate paid for** (recorded in L2): the number a probe's libc sends is
+the number to serve — `SYS_getcpu` on x86_64 musl is **309**, not the asm-generic 168
+the research premise assumed; and a console `[nosys] nr=…` line that appears exactly at
+the gate's moment is a datum, not noise.
+
+**Interventions (3):**
+- INTERVENTION: the session's first R6 comparison failed against `/tmp/denver-default-pre-getcpu`
+  — a cross-commit snapshot (it still carried attempt-1's abi `Getcpu` row, which shifts
+  every build's decode path); the honest comparator is stash→build→pop→build on the same
+  commit, and it passed byte-identical.
+- INTERVENTION: a feature-gated marker kernel (boot print + arm-enter/ret prints) was
+  built and staged to prove the arm was never entered; reverted from the tree after the
+  diagnosis (the clean d4acb339 binary was preserved beside it for the gate).
+- INTERVENTION: the gate's own `[nosys] nr=309` + `[err] s4 nr=309 -38` console lines were
+  attributed to sshd noise twice, costing the diagnosis several turns — per-line
+  attribution (which nr, which slot, which moment) before "noise" is now the rule.

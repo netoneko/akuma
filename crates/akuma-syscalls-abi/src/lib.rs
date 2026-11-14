@@ -139,6 +139,17 @@ macro_rules! syscall_table {
         /// architecture it means.
         pub mod x86_64 {
             $( pub const $konst: u64 = $x86; )*
+            // `getcpu(2)`, hand-written and deliberately ROW-FREE (the pidfd
+            // rule, D55): x86_64 is 309 (`arch/x86/entry/syscalls/syscall_64.tbl`;
+            // musl's <sys/syscall.h> names it SYS_getcpu=309 — measured: the
+            // image's jvmprobe issues `mov $0x135,%edi`). The asm-generic
+            // table's 168 (`akuma_syscalls_linux::nr::GETCPU`) is the AARCH64
+            // number — the two DO NOT agree for this pre-unified-number call,
+            // and a `Syscall` row here would hijack 309 into glue's ENOSYS
+            // before the amd64 match ever saw it (attempt-1's lesson). The
+            // PHASE-2-GETCPU research artifact D55 claimed "168 agrees across
+            // tables" — false; corrected in D58.
+            pub const GETCPU: u64 = 309;
         }
 
         /// A syscall, named rather than numbered.

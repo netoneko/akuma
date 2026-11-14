@@ -48,6 +48,17 @@ the RED phase proves the probes themselves before any pass claims anything.
    channel the evidence lives on (here: the guest console = `$W/vmrun.log`, read with per-arm
    byte-offset attribution, `-a`-tolerant greps), and a census quote carries the whole fault
    block — not the line that fits the story.
+7. **The probe's syscall number is ground truth; the kernel arm must key on it.** —
+   *Defect, named 2026-11-14 (PHASE-2-GETCPU, D58):* three REDs against a provably sound
+   dispatch (one dispatcher, jump-table entry verified to hold the arm, marker build
+   proving the arm never entered) ended the only way left: the guest was never performing
+   the number the arm keyed on. `SYS_getcpu` on x86_64 musl is **309**, not the
+   asm-generic 168 (`mov $0x135,%edi` in the image's binary — `debugfs -R dump` the
+   image's `/bin/jvmprobe` to the host and `objdump` it; the probe binary is a
+   first-class artifact, inspectable like any other). And the console line that appears
+   exactly at the gate's moment — `[nosys] nr=309 -38` — is a datum demanding per-line
+   attribution (which nr, which slot, which second), never "sshd noise": it was read as
+   noise twice and cost the diagnosis turns.
 
 ## Gate
 
@@ -141,3 +152,14 @@ the RED phase proves the probes themselves before any pass claims anything.
   line inside the same run. One `grep 'SYSINFO PASS'` before the extraction fixes it.
   Corollary of the D42 rule: a lying check is worse than no check — it can bury a real
   PASS under a probe FAIL, and it costs a boot to discover.
+- 2026-11-14 (PHASE-2-GETCPU GREEN): **the number the caller performs is the contract.**
+  Three attempt REDs against a dispatch audited sound at every layer (single dispatcher;
+  glue/fold/serve all `None` for the number; jump-table entry held the arm; marker build
+  boot-printed but never arm-printed) forced the only remaining question — *what number
+  is the guest actually sending?* — answered by disassembling the image's own
+  `/bin/jvmprobe` (`debugfs -R "dump /bin/jvmprobe …"` then `objdump`): `mov $0x135,%edi`
+  = 309 = x86_64 `SYS_getcpu`, not the asm-generic 168 the kernel arm keyed on. The fix
+  was two lines (row-free x86_64 const + re-keyed arm); first run of the corrected arm
+  passed the gate (wall 83 s). Console corollary recorded in Do 7: the gate's own
+  `[nosys] nr=309 -38` line was misattributed to sshd noise twice — attribution before
+  dismissal.

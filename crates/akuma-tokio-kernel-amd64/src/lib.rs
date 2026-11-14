@@ -1789,14 +1789,19 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
         // pre-zeroed cpu). The taoxichuan aarch64 precedent's shape: the
         // caller's core from `ring3::cpu_index()`, node 0, the copies out in
         // glue, `EFAULT` on failure; the decision is pure
-        // (`akuma-syscalls-linux::sched`). Keyed on the raw number — NO
-        // `Syscall` row (attempt-1's lesson: `glue_amd64::dispatch` decodes
-        // through `from_x86_64` and forwards table-named numbers into glue's
-        // table, which has no getcpu arm — the pidfd rule, "the abi table
-        // names neither", is the reason `nr` carries this const instead).
-        // Off by default (R6); PHASE-2-GETCPU research artifact, D55.
+        // (`akuma-syscalls-linux::sched`). Keyed on the ABI's OWN number —
+        // `akuma_syscalls_abi::x86_64::GETCPU` (309), NOT the asm-generic 168:
+        // an x86_64 musl caller performs 309 (the image's jvmprobe: `mov
+        // $0x135,%edi`; the gate's `[nosys] nr=309` was the real call arriving
+        // at the default arm). Attempts 1-3 REDd because this arm keyed on
+        // 168, a number no x86_64 caller performs. NO `Syscall` row
+        // (attempt-1's lesson: `glue_amd64::dispatch` decodes through
+        // `from_x86_64` and forwards table-named numbers into glue's table,
+        // which has no getcpu arm — the pidfd rule, "the abi table names
+        // neither", is the reason the number carries a const instead).
+        // Off by default (R6); PHASE-2-GETCPU research artifact, D55/D58.
         #[cfg(feature = "getcpu")]
-        akuma_syscalls_linux::nr::GETCPU => akuma_syscalls_glue::sched::sys_getcpu(
+        akuma_syscalls_abi::x86_64::GETCPU => akuma_syscalls_glue::sched::sys_getcpu(
             fr.arg1(),
             fr.arg2(),
             ring3::cpu_index() as u32,

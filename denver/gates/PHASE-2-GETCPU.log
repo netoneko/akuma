@@ -1,0 +1,120 @@
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-getcpu.spec (elapsed=3s)
+== rig identity: uname says denver, NOT 72be5c55/800e8c80/f0dcacb6/3531cf69/c921d625/24398b99/50d64942 (elapsed=3s)
+== platform sanity: tokioprobe (elapsed=3s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-d4acb339-denver d4acb339-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.10s)
+  title: Akuma
+RESULT PASS
+== wx-relaxed proof: the rwx arm (rides; this binary carries wx-relaxed AND vsyscall AND procfs-diag AND trace-err AND fold-regpreserve AND lazy-release-sweep AND sysinfo AND getcpu) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+RWX INFO mmap-RWX-allowed (policy baseline moved; attempt-doc blocker 1 may not apply)
+RWX PASS rw_to_rx=42
+== procfs-diag alive: the maps arm (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+MAPS-LINE: 10000000-10001000 r--p 00000000 00:00 0 
+MAPS-LINE: 10001000-10005000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10007000-10009000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000b000-1000d000 r-xp 00000000 00:00 0 
+MAPS-LINE: 1000f000-10010000 r-xp 00000000 00:00 0 
+MAPS-LINE: 10010000-10013000 r--p 00000000 00:00 0 
+MAPS-LINE: 10013000-10015000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10054000-10065000 rw-p 00000000 00:00 0 
+MAPS-LINE: 10095000-10096000 rw-p 00000000 00:00 0 
+MAPS-LINE: 6ffffffff000-700000000000 rw-p 00000000 00:00 0 
+MAPS PASS lines=10 exec_lines=4 bytes=418
+== procfs-diag alive: the auxv arm (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+AUXV PASS AT_PAGESZ=4096
+AUXV PASS AT_CLKTCK=100
+AUXV INFO AT_HWCAP missing
+AUXV PASS AT_SYSINFO_EHDR=18446744073699061760
+AUXV PASS procfs-auxv bytes=256 pairs=15 pagesz=4096 AT_SYSINFO_EHDR matches stack=18446744073699061760
+== the contract facts, java-free (D35): mmaparms (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+MMARMS PASS len0 MAP_FAILED EINVAL
+MMARMS PASS oversize MAP_FAILED errno=12
+MMARMS PASS reserve base=0x600000000000 size=50331648 prot=NONE
+MMARMS PASS commit-RW write-readback off=0
+MMARMS PASS commit-RX call=42
+MMARMS PASS rwx call=42
+== THE GATE: getcpu served with the caller's core (D56 condition 6 - was GETCPU RED ENOSYS) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+GETCPU PASS cpu=1 node=0
+  (G2's gap SERVED: GETCPU PASS cpu=1 node=0 - the gate's named line)
+== the NULLFIX fix rides: regpreserve - every canary kept (D56 condition 7) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+REGPASS r8 kept across lazy-fault store
+REGPASS r9 kept across lazy-fault store
+REGPASS r10 kept across lazy-fault store
+REGPASS r11 kept across lazy-fault store
+REGPASS rdi kept across lazy-fault store
+REGPASS rsi kept across lazy-fault store
+REGPASS rdx kept across lazy-fault store
+REGPASS rcx kept across lazy-fault store
+REGPASS r8 kept across syscall
+REGPASS r9 kept across syscall
+REGPASS r10 kept across syscall
+REGPASS rdi kept across syscall
+REGPASS rsi kept across syscall
+REGPASS rdx kept across syscall
+REGINFO c-start
+REGINFO c-mmap q=0x600000001000
+REGINFO c-syscall stat returned -2 (rdx canary kept)
+REGPASS r8 kept across kernel-write-to-unfaulted-page
+REGPASS r9 kept across kernel-write-to-unfaulted-page
+REGPASS r10 kept across kernel-write-to-unfaulted-page
+REGPASS rdi kept across kernel-write-to-unfaulted-page
+REGPASS rsi kept across kernel-write-to-unfaulted-page
+REGPASS rdx kept across kernel-write-to-unfaulted-page
+== the HEAPRO fix rides: lazyrel - a released range must stay dead (D56 condition 8) (elapsed=5s)
+[ssh] connecting to 127.0.0.1:2247...
+LAZYREL INFO anon released; writing (fixed kernel: SIGSEGV expected)
+LAZYREL PASS anon-release-kills (SIGSEGV: the released range stayed dead)
+LAZYREL INFO file released; reading (fixed kernel: SIGSEGV expected)
+LAZYREL PASS file-release-kills (SIGSEGV: the released range stayed dead)
+LAZYREL PASS both released ranges stayed dead (lazy records swept)
+== the payoff datum: the java arm (riding, D37/D41 honesty; window 30 s, double recovery) (elapsed=5s)
+  (arm dispatched; java's output goes to /tmp/java-out.log guest-side)
+== the console window: the old death must be absent (elapsed=22s)
+-- console window: fault line:
+<none>
+-- console window: kill line:
+<none>
+-- console window: evidence lines (incl. the census [nosys]/[err] - the next gates' data):
+CENSUS DATUM: no [nosys] nr=168 in the window - the raw getcpu path is served (was: present in VDSO's census)
+MOVED: no fault at all in the window - the old death is gone
+== best-effort: recover java's output, attempt 1 (+30 s window; never a pass condition) (elapsed=52s)
+== best-effort: recover java's output, attempt 2 (another 30 s) (elapsed=53s)
+  (sshd did not answer or the file has no version line - the console window above is the verdict's evidence)
+== verdict (elapsed=83s)
+MOVEMENT: getcpu(2) is served with the caller's core behind the getcpu feature - GETCPU PASS cpu=1 node=0 (was GETCPU RED ENOSYS since PHASE-1), every riding arm green, and the java arm never returned to the old death
+RESULT PASS
+== wall clock: seconds=83 (t0=1794667112 end=1794667195)
+ rip=0x30044415
+[ring] nr=13 a=0x22,0x6000014fb940,0x0 -> 0 rip=0x3005f26c
+[ring] nr=14 a=0x0,0x300a0c08,0x6000014fb9a0 -> 0 rip=0x3005ef4b
+[ring] nr=324 a=0x8,0x0,0x60000002c7a8 -> -38 rip=0x30044349
+[ring] nr=14 a=0x0,0x300a0c08,0x6000014fbb80 -> 0 rip=0x3005ef4b
+[ring] nr=10 a=0x600001526000,0x2000,0x1 -> 0 rip=0x300383e9
+[ring] nr=3 a=0x3,0x0,0x0 -> 0 rip=0x30067294
+[ring] nr=5 a=0x3,0x6000014fb5d0,0x6000014fb5d0 -> 0 rip=0x3005fb6a
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30042b2c
+[ring] nr=2 a=0x6000014fb890,0x88000,0x0 -> 3 rip=0x30067294
+[ring] nr=3 a=0x3,0x0,0x0 -> 0 rip=0x30067294
+[ring] nr=9 a=0x600001526000,0x3000,0x3 -> 105553138442240 rip=0x30057812
+[ring] nr=9 a=0x600001520000,0x6000,0x1 -> 105553138417664 rip=0x30057812
+[ring] nr=9 a=0x600001507000,0x19000,0x5 -> 105553138315264 rip=0x30057812
+[ring] nr=9 a=0x0,0x24000,0x1 -> 105553138307072 rip=0x30057812
+[ring] nr=5 a=0x3,0x6000014fb5f0,0x6000014fb5f0 -> 0 rip=0x3005fb6a
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30042b2c
+[ring] nr=2 a=0x6000014fc340,0x88000,0x0 -> 3 rip=0x30067294
+[ring] nr=11 a=0x600001505000,0x1000,0x0 -> 0 rip=0x300579e7
+[ring] nr=3 a=0x3,0xfffffffffffffe31,0x1 -> 0 rip=0x30060593
+[ring] nr=8 a=0x3,0xfffffffffffffe31,0x1 -> 680 rip=0x3006b8d6
+[ring] nr=19 a=0x3,0x6000014fbc20,0x2 -> 1079 rip=0x30060680
+[ring] nr=8 a=0x3,0x40,0x0 -> 64 rip=0x3006b8d6
+[ring] nr=19 a=0x3,0x6000014fbc20,0x2 -> 1087 rip=0x30060680
+[ring] nr=72 a=0x3,0x2,0x1 -> 0 rip=0x30060208
