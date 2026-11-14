@@ -43,6 +43,10 @@ fold-regpreserve = []
 # The release sweep's lazy-record clearing (PHASE-2-HEAPRO): 1:1 onto `akuma-mmu`
 # (the x86 `unmap_present` blind spot). Off by default (R6).
 lazy-release-sweep = ["akuma-mmu/lazy-release-sweep"]
+# `sysinfo(2)` through glue (PHASE-2-MEMINFO, G7): one translated arm next to the
+# signal-family ones; every decision (the offset-asserted 112-byte layout, the real
+# PMM totals, the user copy) is `akuma-syscalls-glue`'s. Off by default (R6).
+sysinfo = []
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.

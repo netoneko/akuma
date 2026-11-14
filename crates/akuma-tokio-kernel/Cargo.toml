@@ -54,7 +54,8 @@ procfs-diag = ["akuma-tokio-kernel-amd64/procfs-diag"]
 fold-regpreserve = ["akuma-tokio-kernel-amd64/fold-regpreserve"]
 # PHASE-2-HEAPRO's release-sweep fix (D45), amd64-only line (the procfs-diag shape).
 lazy-release-sweep = ["akuma-tokio-kernel-amd64/lazy-release-sweep"]
-
+# sysinfo(2) through glue (PHASE-2-MEMINFO, G7), 1:1 onto the amd64 half's arm.
+sysinfo = ["akuma-tokio-kernel-amd64/sysinfo"]
 # The machine half, chosen by the target. `target_os = "none"` too: `cfg(target_arch)` alone is the
 # *host's* under `cargo test`, and the machine halves build only for the kernel targets.
 [target.'cfg(all(target_arch = "x86_64", target_os = "none"))'.dependencies]

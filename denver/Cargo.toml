@@ -44,6 +44,12 @@ fold-regpreserve = ["akuma-jvm-kernel/fold-regpreserve"]
 # kernel is `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep`
 # (rig: denver-heapro).
 lazy-release-sweep = ["akuma-jvm-kernel/lazy-release-sweep"]
+# sysinfo(2) (PHASE-2-MEMINFO, G7): musl's sysconf(_SC_PHYS_PAGES) performs sysinfo
+# (nr 99) and HotSpot's heap sizing died on the ENOSYS (`Too small maximum heap`, a
+# clean exit=1). Off by default (R6); the gate kernel is
+# `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep,sysinfo`
+# (rig: denver-meminfo).
+sysinfo = ["akuma-jvm-kernel/sysinfo"]
 
 [[bin]]
 name = "denver"

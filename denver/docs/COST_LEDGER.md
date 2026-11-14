@@ -15,3 +15,4 @@ session denver-PHASE-2-PROCFS wall=44 in=4.5M out=68k final_ctx=114k cache_read=
 session denver-PHASE-2-NULLSTORE wall=76 in=17.7M out=123k final_ctx=194k cache_read=99% tools=184
 session denver-PHASE-2-NULLSTORE wall=15 in=2.1M out=38k final_ctx=72k cache_read=97% tools=233
 session denver-PHASE-2-NULLFIX wall=41 in=7.6M out=71k final_ctx=134k cache_read=98% tools=104
+session denver-PHASE-2-HEAPRO wall=65 in=16.5M out=108k final_ctx=188k cache_read=99% tools=165

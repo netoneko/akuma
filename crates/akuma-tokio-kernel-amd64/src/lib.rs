@@ -1766,6 +1766,22 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
             akuma_syscalls_abi::Syscall::RtSigpending.to_aarch64(),
             &[fr.arg1(), fr.arg2(), 0, 0, 0, 0],
         ),
+        // `sysinfo` (PHASE-2-MEMINFO, G7): musl's sysconf(_SC_PHYS_PAGES) performs
+        // nr 99 and HotSpot's heap sizing died on its ENOSYS (`Too small maximum
+        // heap`, a clean exit=1). The metal kernel translates it to glue the same
+        // way (`akuma-kernel-amd64/src/usermode/dispatch.rs`: `Syscall::Sysinfo =>
+        // to_glue`); this lineage parked the number in `akuma-runtime-tokio`'s
+        // `shell` set, which a JVM-facing build does not enable, so it fell to the
+        // default arm (`[nosys] nr=99`, `SYSINFO INFO errno=38` twice). Every
+        // decision — the 112-byte layout (`akuma-syscalls-linux::Sysinfo`,
+        // offset-asserted), the real PMM totals, the user copy — is glue's,
+        // host-tested there. Off by default (R6); PHASE-2-MEMINFO research
+        // artifact, D53.
+        #[cfg(feature = "sysinfo")]
+        akuma_syscalls_abi::x86_64::SYSINFO => akuma_syscalls_glue::handle_syscall(
+            akuma_syscalls_abi::Syscall::Sysinfo.to_aarch64(),
+            &[fr.arg1(), 0, 0, 0, 0, 0],
+        ),
         ring3::nr::PAUSE => akuma_syscalls_glue::sys_pause(),
         akuma_syscalls_abi::x86_64::RT_SIGRETURN => child::sigreturn_arm(fr),
         // musl's realloc on an mmapped chunk (`akuma_tokio_kernel_core::mm`'s).
