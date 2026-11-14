@@ -85,11 +85,15 @@ pub fn install(k: Kernel) {
         // Glue's `fs::init` would call this; a tokio kernel mounts its root
         // itself and arms the file-page cache there (Taoxichuan: `mount_root`).
         fpcache_init: |_| {},
-        // Nothing renders `/proc/<pid>/maps` rows from here.
+        // `/proc/<pid>/maps`: the kernel-owned-roots walk — every `Process`
+        // here is a borrowed view of a root the kernel owns (`disown_space`),
+        // so the metal's owner resolution answers `None` for every pid; this
+        // sibling walk reads pid's own view instead (maps_rows's doc carries
+        // the why and the residual).
         #[cfg(not(feature = "procfs-diag"))]
         pid_map_rows: |_| None,
         #[cfg(feature = "procfs-diag")]
-        pid_map_rows: akuma_exec::process::maps_rows::pid_map_rows,
+        pid_map_rows: akuma_exec::process::maps_rows::pid_map_rows_of_kernel_owned_roots,
         // `/proc/<pid>/auxv`: absent until the feature retains tables (D28).
         #[cfg(not(feature = "procfs-diag"))]
         pid_auxv: |_| None,

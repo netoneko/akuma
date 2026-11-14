@@ -46,7 +46,10 @@ WAIT=${DENVER_BOOT_WAIT_TRIES:-30}     # x 5 s
 SSH="ssh -y -i $W/key -p $PORT root@127.0.0.1"
 VMLOG=$W/vmrun.log
 WXHASH="8a658723"                      # the proven WX binary - must NOT boot now (D31)
-VDsoHASH="3531cf69"                    # the merged-tree/vdso binary - must NOT boot now
+MERGEDHASH="3531cf69"                    # the merged-tree/vdso binary - must NOT boot now
+# an EMPTY identity constant matches anything (`*""*`) and lies - the FAULTNAME lesson
+[ -n "$WXHASH" ] && [ -n "$MERGEDHASH" ] ||
+    { echo "RESULT FAIL: rig identity constant empty (WXHASH/MERGEDHASH) - the probe would match any uname" >&2; exit 1; }
 VSYSCALL=ffffffffff600800              # the legacy vsyscall getcpu slot (the closed death)
 RIP=3005fc41                           # G9's rip (python-checked: 805698625, gate-vdso.log)
 BLOCKER1="Failed to mark memory page as executable"
@@ -94,7 +97,7 @@ while :; do
     sleep 5
 done
 
-step "rig identity: uname says denver, NOT $WXHASH, NOT $VDSoHASH (D31)"
+step "rig identity: uname says denver, NOT $WXHASH, NOT $MERGEDHASH (D31)"
 echo "$out" | grep Linux
 case "$out" in
     *denver*) ;;
@@ -104,7 +107,7 @@ case "$out" in
     *"$WXHASH"*) verdict "RESULT FAIL: the WX rig binary booted - staging of denver-procfs failed" 1 ;;
 esac
 case "$out" in
-    *"$VDSoHASH"*) verdict "RESULT FAIL: the vdso rig binary booted - it does not serve procfs-diag; staging failed" 1 ;;
+    *"$MERGEDHASH"*) verdict "RESULT FAIL: the vdso rig binary booted - it does not serve procfs-diag; staging failed" 1 ;;
 esac
 
 step "platform sanity: tokioprobe (phase 0's marker)"

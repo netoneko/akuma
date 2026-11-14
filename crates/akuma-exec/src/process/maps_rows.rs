@@ -21,6 +21,12 @@ pub type MapRow = (usize, usize, bool, bool, bool, bool);
 ///
 /// `None` when `pid` has no visible address space (the file is *absent* rather
 /// than empty — `akuma-vfs-glue`'s rule).
+///
+/// This is the **metal** registration (the registered `Process` owns its
+/// tables, `is_shared()` marks only a `CLONE_VM` member). The tokio kernels
+/// register [`pid_map_rows_of_kernel_owned_roots`] — every `Process` there is
+/// a borrowed view of a kernel-owned root, so the owner resolution this fn
+/// starts from answers `None` for every process; see that fn's doc.
 pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
     // Walk the address space's **owner**, not `pid`. A `/proc/<tid>/maps` read
     // for a `CLONE_VM` thread reaches the leader's page tables, but the thread's
@@ -30,24 +36,7 @@ pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
     // into an unmapped physmap address (`docs/archive/PROC_MAPS_WALK_FREED_TABLES.md`).
     // The leader also holds the regions; a member's list is empty.
     let (owner, l0) = crate::process::address_space_owner_of(pid)?;
-    let regions = crate::process::with_process(owner, |p| {
-        p.mmap_regions
-            .lock()
-            .iter()
-            .map(|r| {
-                let prot = r.recorded_prot().unwrap_or(akuma_mmap::Prot::RW_NO_EXEC);
-                (
-                    r.start_va,
-                    r.start_va.saturating_add(r.len_bytes()),
-                    !prot.is_none(),
-                    prot.is_write(),
-                    prot.is_exec(),
-                    !r.shared_anon,
-                )
-            })
-            .collect::<Vec<MapRow>>()
-    })?;
-    let mut rows = regions;
+    let mut rows = mmap_region_rows(owner)?;
     // Sorted because `collect_leaf_runs` binary-searches it: the region list
     // itself is in no particular order, and a linear "is this page already
     // covered?" test per leaf is the second half of the `mmap` blowup in
@@ -63,6 +52,75 @@ pub fn pid_map_rows(pid: u32) -> Option<Vec<MapRow>> {
         // lookup and here, the tables `l0` named are freed. Report no such file
         // rather than walk them.
         if p.address_space.is_shared() || p.address_space.l0_phys() != l0 {
+            return None;
+        }
+        Some(collect_leaf_runs(&uas, &extents))
+    })??;
+    rows.extend(leaves);
+    rows.sort_unstable_by_key(|r| r.0);
+    Some(rows)
+}
+
+/// `(start, end, r, w, x, private)` for every recorded `mmap` region of `pid`,
+/// in no particular order (the caller sorts).
+fn mmap_region_rows(pid: u32) -> Option<Vec<MapRow>> {
+    crate::process::with_process(pid, |p| {
+        p.mmap_regions
+            .lock()
+            .iter()
+            .map(|r| {
+                let prot = r.recorded_prot().unwrap_or(akuma_mmap::Prot::RW_NO_EXEC);
+                (
+                    r.start_va,
+                    r.start_va.saturating_add(r.len_bytes()),
+                    !prot.is_none(),
+                    prot.is_write(),
+                    prot.is_exec(),
+                    !r.shared_anon,
+                )
+            })
+            .collect::<Vec<MapRow>>()
+    })
+}
+
+/// [`pid_map_rows`] for a kernel whose registered `Process` holds only a
+/// *borrowed view* of a root the kernel itself owns — the tokio kernels
+/// (`disown_space`, `akuma-tokio-kernel-core/src/proc.rs`: `OWNED_ROOT` per
+/// slot, a dead image's root parked rather than freed, the kernel freeing
+/// roots at the reap). There `is_shared()` is the ownership *model*, not the
+/// metal's `CLONE_VM` hazard, and [`pid_map_rows`]'s first step —
+/// `address_space_owner_of`, whose answer for a shared process with no
+/// non-shared owner is `None` — would mean "tables freed, do not walk" on the
+/// metal but "kernel-owned" here; observed first-hand as a permanently absent
+/// `/proc/self/maps` (PHASE-2-PROCFS gate run 2026-11-14: `MAPS RED errno=2`
+/// beside a working `/proc/self/auxv` — same hook table, so the divergence was
+/// the address-space model, not the registration).
+///
+/// So this walk resolves no owner: it reads the thread-group leader's recorded
+/// regions (a member's list is empty; every view of the group names the
+/// leader's root) and walks **`pid`'s own view** under its own lock,
+/// re-checked by the same l0 compare the metal walk uses — a concurrent exec
+/// swaps the view's root (`disown_space`, which like this walk runs under
+/// `with_process`'s exclusive slot hold, so the swap cannot land inside a
+/// walk), and the compare reports no such file for that read.
+///
+/// Residual, recorded: a sibling view's fault flips a PTE without this view's
+/// lock (per-view locks over one root), so a run may miss a page placed
+/// mid-walk — the staleness class the kernel's own reclaim sweep already
+/// walks under (`try_evict_ro_page` takes its view's lock; sibling-view
+/// faults are that path's residual too). The metal must not register this fn:
+/// a metal `CLONE_VM` member's own lock excludes nothing, which is the
+/// freed-tables hazard (`docs/archive/PROC_MAPS_WALK_FREED_TABLES.md`) the
+/// owner resolution exists to avoid.
+pub fn pid_map_rows_of_kernel_owned_roots(pid: u32) -> Option<Vec<MapRow>> {
+    let (l0, tgid) =
+        crate::process::with_process(pid, |p| (p.address_space.l0_phys(), p.tgid))?;
+    let mut rows = mmap_region_rows(tgid)?;
+    let mut extents: Vec<(usize, usize)> = rows.iter().map(|r| (r.0, r.1)).collect();
+    extents.sort_unstable();
+    let leaves = crate::process::with_process(pid, |p| {
+        let uas = p.address_space.lock();
+        if p.address_space.l0_phys() != l0 {
             return None;
         }
         Some(collect_leaf_runs(&uas, &extents))
