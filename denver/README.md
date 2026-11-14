@@ -185,7 +185,7 @@ switch?"
 - Honest cost accounting: admit what you turned on but didn't test, and admit when you
   skipped a process step
 
-→ example: [`docs/lessons/L6-find-the-feature-flag.md`](docs/lessons/L6-find-the-feature-flag.md
+→ example: [`docs/lessons/L6-find-the-feature-flag.md`](docs/lessons/L6-find-the-feature-flag.md)
 
 ## House pointers
 
