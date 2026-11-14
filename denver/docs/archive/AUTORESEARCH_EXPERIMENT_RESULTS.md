@@ -25,6 +25,17 @@ its limits are in the last two sections. One run, one model, one box: an experim
 | Clojure 1.12.0 (runtime bytecode generation, `pmap`) | works (operator-run, on the loop's kernel, no code change) |
 | `sigprobe` (does `rt_sigreturn` restore an edited `rax`?) | FAIL, unexplained; javac and Clojure do not need it |
 
+## Where it ran: Akuma all the way down
+
+The whole loop ran **on Akuma**, on the ryzen box booted into the KVM-herd entry (`/dev/kvm0`): `goose` and the
+driver, `git`, `cargo`/`rustc` (the denver kernels were built there, about 27 s per build), the gate probes, and
+every guest the agent debugged (`herd vm-run`, one VM at a time on `/dev/kvm0`) were Akuma processes. The agent's
+debugging loop was: build a kernel on Akuma, boot it as a guest of Akuma's own hypervisor, read the guest console, fix,
+repeat. Nothing in that loop ran on Linux or macOS. What did run elsewhere: the operator's Mac (one real `javac`
+for the staged classes, the `Logo`/`Workload` cross-checks, the Maven downloads) and Claude Code's ssh into the box.
+So the hypervisor, the toolchain and the JVM's host were all the system under test's own family, which is also why
+a host-kernel fault (box wedges, one reboot into the KVM entry, a GRUB index trap) showed up as a loop intervention.
+
 ## Size: denver against taoxichuan (linked production Rust)
 
 Workspace crates in each binary's dependency closure (`cargo tree -e normal`, target `x86_64-unknown-none`),
