@@ -131,14 +131,6 @@ switch?"
 ¹ filename predates the L5/L6 renumber (this lesson moved down when the interrupt
 lesson landed); the file keeps its name until its cross-references move with it.
 
-## How L5 and L6 relate
-
-Both are the check-before-build discipline. **L5 is the judgment half** — pause the
-momentum, interrogate whether the obstacle exists at all, let human intuition aim the
-shortcut. **L6 is the mechanical half** — the work seems necessary now, so diff the
-configuration of the system that works against the one that doesn't. Read in order:
-first ask whether the work exists, then whether it's already configured in.
-
 ## House pointers
 
 - Lessons index (file map, renumber note): [`docs/lessons/README.md`](docs/lessons/README.md)
