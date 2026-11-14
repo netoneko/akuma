@@ -23,6 +23,7 @@ its limits are in the last two sections. One run, one model, one box: an experim
 | Real-javac `Workload`/`Worker` (exceptions, file I/O, 24 x 16 MiB churn, thread) | green (loop gate JAVACLASSLIB, 17 s) |
 | `javac` compiling and running programs **inside the guest** | works (operator-run; the loop was cut off before its own gate) |
 | Clojure 1.12.0 (runtime bytecode generation, `pmap`) | works (operator-run, on the loop's kernel, no code change) |
+| Scala 2.13.14: `scalac` compiles a program in the guest and the class runs | works (operator-run, one run, ~3 s compile) |
 | `sigprobe` (does `rt_sigreturn` restore an edited `rax`?) | FAIL, unexplained; javac and Clojure do not need it |
 
 ## Where it ran: Akuma all the way down

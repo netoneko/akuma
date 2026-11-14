@@ -44,6 +44,7 @@ Build on the ryzen Akuma box (cargo is at `/usr/local/rust/bin`, not on the defa
 | javac compiles `Workload.java`; the class runs | exceptions, file I/O, 24 x 16 MiB humongous churn, thread returning 42; `WORKLOAD-ALL-PASS` |
 | Clojure 1.12.0 `clojure.main -e "(println :hello)"` | prints `:hello 1.12.0`, ~2 s wall (Mac clock) |
 | Clojure script: `reduce`, recursive `fib 20`, `pmap` | `5050`, `6765`, `[0 1 4 9 16 25 36 49]` |
+| Scala 2.13.14: `scalac` (scala-compiler/-library/-reflect from Maven, SHA-1 checked) compiles `HelloScala.scala` inside the guest, then the class runs | scalac rc 0 in ~3 s (Mac clock), 4 classes (object, case class, companion); output `Hello from Scala 2.13.14 on Linux amd64`, `squares: List(1, 4, 9, ...)`, `sum of evens: 30`, sorted case classes; run rc 0 |
 | Console `[Fault]` lines across all of it | 0 |
 
 ## Clojure details
