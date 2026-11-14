@@ -1,4 +1,4 @@
-# Lesson 5 — before you write a syscall, look for the build feature that already serves it
+# Lesson 6 — before you write a syscall, look for the build feature that already serves it
 
 **Motivating archive docs:** `CLOJURE_AND_JAVAC_ON_DENVER.md` (the HTTP server, "What is still open"),
 `AUTORESEARCH_EXPERIMENT_RESULTS.md`. Commit `9ec07523` is the whole fix.

@@ -324,7 +324,7 @@ Operator-run, one run each unless noted. Detail and numbers are in the sections 
   taoxichuan enables by default and denver never did. Fix: `shell = ["akuma-jvm-kernel/shell"]` in `denver/Cargo.toml`
   (`9ec07523`), +88 B. The server then answered `HTTP/1.1 200 OK` to a `curl` from the Mac (VM spec `forward=8080:8080`),
   and a real pty ssh session ran **without** `--shell-arg +m` (finding 1 above is resolved). Lesson:
-  `denver/docs/lessons/L5-find-the-feature-flag.md`.
+  `denver/docs/lessons/L6-find-the-feature-flag.md`.
 - Process slip, recorded: the `9ec07523` commit touched a Cargo manifest but was made with `--no-verify`, so the
   pre-commit hook (clippy, tests, secret scan) did not run on it.
 - State at the quota cutoff: the weekly z.ai window was 95% used, resetting Thursday 2026-11-19 16:36 UTC (18:36 IST). The

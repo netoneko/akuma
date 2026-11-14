@@ -18,7 +18,7 @@ It took the loop about 24 hours to go from a bare kernel that boots tokio to eno
 artifacts to run Java, Clojure, Scala and Groovy — and to serve an HTTP server written
 in Clojure, from a fresh kernel booting under KVM on metal. Every rule below is proven
 by a captured gate log or a recorded decision — nothing here is doctrine without
-evidence. The links go to the living lesson files, which carry the full worked example
+evidence. The links go to the living lesson files, which carry the full example
 and the per-gate `Record` trail.
 
 ## A platform kernel as a collection of crates
@@ -86,7 +86,7 @@ want to work, and let its failures write the list.
 - "Not found in the repo" ≠ "doesn't exist" — ask before you build a substitute
 - Evidence comes from captured logs, never from memory
 
-→ worked example: [`docs/lessons/L1-collecting-requirements.md`](docs/lessons/L1-collecting-requirements.md)
+→ example: [`docs/lessons/L1-collecting-requirements.md`](docs/lessons/L1-collecting-requirements.md)
 
 ### L2 — Writing probes
 
@@ -112,7 +112,7 @@ trust any result — a verdict that depends on how you captured it is not a verd
 - The instrument can *be* the failure — and when it reports the impossible, suspect
   its own map of the world first
 
-→ worked example: [`docs/lessons/L2-writing-probes.md`](docs/lessons/L2-writing-probes.md)
+→ example: [`docs/lessons/L2-writing-probes.md`](docs/lessons/L2-writing-probes.md)
 
 ### L3 — Building a platform crate
 
@@ -131,7 +131,7 @@ before writing code.
 - Rig hygiene before diagnosis: a stale leftover answering EBUSY reads as "the system
   is broken"
 
-→ worked example: [`docs/lessons/L3-building-a-kernel-platform-crate.md`](docs/lessons/L3-building-a-kernel-platform-crate.md)
+→ example: [`docs/lessons/L3-building-a-kernel-platform-crate.md`](docs/lessons/L3-building-a-kernel-platform-crate.md)
 
 ### L4 — The loop
 
@@ -152,7 +152,7 @@ before polish.
   when something depends on it
 - Interventions are data — human corrections are findings, not interruptions
 
-→ worked example: [`docs/lessons/L4-the-loop.md`](docs/lessons/L4-the-loop.md)
+→ example: [`docs/lessons/L4-the-loop.md`](docs/lessons/L4-the-loop.md)
 
 ### L5 — Interrupt when it matters
 
@@ -168,7 +168,7 @@ chasing — a well-aimed interruption is the cheapest tool in the box.
 - The detour can still pay (lessons, instruments) — but it was work on a false
   premise; the same hours after one question produce the gate directly
 
-→ worked example: [`docs/lessons/L5-interrupt-when-it-matters.md`](docs/lessons/L5-interrupt-when-it-matters.md)
+→ example: [`docs/lessons/L5-interrupt-when-it-matters.md`](docs/lessons/L5-interrupt-when-it-matters.md)
 
 ### L6 — Find the feature flag
 
@@ -185,14 +185,11 @@ switch?"
 - Honest cost accounting: admit what you turned on but didn't test, and admit when you
   skipped a process step
 
-→ worked example: [`docs/lessons/L5-find-the-feature-flag.md`](docs/lessons/L5-find-the-feature-flag.md)¹
-
-¹ filename predates the L5/L6 renumber (this lesson moved down when the interrupt
-lesson landed); the file keeps its name until its cross-references move with it.
+→ example: [`docs/lessons/L6-find-the-feature-flag.md`](docs/lessons/L6-find-the-feature-flag.md
 
 ## House pointers
 
-- Lessons index (file map, renumber note): [`docs/lessons/README.md`](docs/lessons/README.md)
+- Lessons index (file map): [`docs/lessons/README.md`](docs/lessons/README.md)
 - Governing runbook (the loop, R1–R9, file ownership): [`docs/runbooks/AUTORESEARCH.md`](docs/runbooks/AUTORESEARCH.md)
 - Requirements table the lessons feed: [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md)
 - The experiment's records and captured evidence: [`RESULT.md`](RESULT.md), [`docs/LOOP_LOG.md`](docs/LOOP_LOG.md), [`gates/`](gates/)

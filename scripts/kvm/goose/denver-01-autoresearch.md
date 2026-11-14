@@ -120,7 +120,7 @@ Your quota is nearly spent (weekly 95%); this is probably the last session. Fact
   (`rc=0`, want 99) - unexplained, and the one open item on the signal path.
 - The `shell` feature (`akuma-runtime-tokio::shell`: getrlimit/prlimit64, getpgid, getppid, getrusage, clock_getres,
   membarrier, ...) was enabled for denver with one relay line (`shell = ["akuma-jvm-kernel/shell"]`, commit `9ec07523`). It
-  fixed the JDK HTTP server and interactive ssh without `--shell-arg +m`. Lesson: `denver/docs/lessons/L5-find-the-feature-flag.md`.
+  fixed the JDK HTTP server and interactive ssh without `--shell-arg +m`. Lesson: `denver/docs/lessons/L6-find-the-feature-flag.md`.
   The gate kernel is now your denver-faultsig feature set plus `shell`.
 - Do not touch `/root/denver/w/denver-operator.img`, `vm-operator.spec`, `denver-shell` (operator's rig). Use your own images.
   Your gates stop whatever holds `/dev/kvm0`; that is expected.

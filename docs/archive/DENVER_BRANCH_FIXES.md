@@ -30,7 +30,7 @@ interactive ssh shell spun until started with `--shell-arg +m`. Cause: `getrlimi
 `--no-default-features` denver build did not; glue already implemented them. Fix: one relay line in `denver/Cargo.toml`
 (`9ec07523`, +88 B). Verified (one run): `HTTP/1.1 200 OK` from outside; a pty ssh session with no `+m`. Only the two
 calls above were exercised; `setsid`, `times`, `membarrier` and the id getters are enabled and untested
-(`denver/docs/lessons/L5-find-the-feature-flag.md`).
+(`denver/docs/lessons/L6-find-the-feature-flag.md`).
 
 **4. W^X policy refused what the JIT needs (`wx-relaxed`).**
 Symptom: HotSpot's code cache (RWX, and RW -> R+X flips) was refused and the JVM died at init. Fix: pure checks answer
