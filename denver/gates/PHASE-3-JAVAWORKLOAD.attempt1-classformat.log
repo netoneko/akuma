@@ -1,0 +1,123 @@
+== host-side staging sanity: the hello image exists and carries /work/Hello.class (elapsed=0s)
+  in image:     438  100644 (0)      0      0     370 14-Nov-2026 15:26 Hello.class
+== free the VM slot (a stale guest answers EBUSY) (elapsed=0s)
+== boot: herd vm-run /root/denver/w/vm-hello.spec (proven kernel d4acb339 + staged hello disk) (elapsed=3s)
+== rig identity: uname carries the GREEN kernel d4acb339, no older rig (elapsed=7s)
+Linux denver 0.1.0-d4acb339-denver d4acb339-release x86_64 GNU/Linux
+== platform sanity: tokioprobe (elapsed=7s)
+[ssh] connecting to 127.0.0.1:2247...
+RUNTIME PASS multi-thread workers=4
+UNAME PASS Linux denver 0.1.0-d4acb339-denver d4acb339-release x86_64 GNU/Linux (0.00s)
+HTTPS PASS https://akuma.sh/ status=200 HTTP/1.1 bytes=663 (1.82s)
+  title: Akuma
+RESULT PASS
+== feature-set proof: the getcpu arm (one PASS proves getcpu/sysinfo/wx/vsyscall/procfs-diag/fold/lazyrel all ride) (elapsed=9s)
+[ssh] connecting to 127.0.0.1:2247...
+GETCPU PASS cpu=0 node=0
+== guest-side staging identity: the guest can NAME the class before java is blamed (elapsed=9s)
+total 1
+-rw-r--r--    1 0        0              370 Nov 14  2026 Hello.class
+  guest sees /work/Hello.class - image staging confirmed on the far side
+== B0: channel baseline (poke before any dispatch) (elapsed=8s)
+[ssh] connecting to 127.0.0.1:2247...
+ALIVE-B0
+== THE ARM (reader): jvmprobe java - pipe capture, blocking read, ZERO polling (L2 rule, D63/D66; alarm bounds mean the exit report always returns) (elapsed=10s)
+[ssh] connecting to 127.0.0.1:2247...
+JVM INFO loader present
+JVM INFO exit=1 signal=0 bytes=147
+JVM-INFO raw: 	java.lang.ClassFormatError: Field "<init>" in class Hello has illegal signature "()V"
+JVM RED Error: LinkageError occurred while loading main class Hello reason="	java.lang.ClassFormatError: Field "<init>" in class Hello has illegal signature "()V""
+  (reader arm wall=0s; child alarm=90s, parent alarm=120s inside jvmprobe)
+== diagnostic arm (fires only on a non-RUN outcome): class-load trace names the failing resolution step (elapsed=10s)
+JVM INFO exit=1 signal=0 bytes=16383
+JVM-INFO raw: [0.136s][info][class,load] java.io.Serializable source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.Comparable source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.CharSequence source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.constant.Constable source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.constant.ConstantDesc source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.String source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.reflect.AnnotatedElement source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.reflect.GenericDeclaration source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.reflect.Type source: shared objects file
+JVM-INFO raw: [0.136s][info][class,load] java.lang.invoke.TypeDescriptor source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.invoke.TypeDescriptor$OfField source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.Class source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.Cloneable source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ClassLoader source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.System source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.Throwable source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.Error source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.Exception source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.RuntimeException source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.SecurityManager source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.security.ProtectionDomain source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.security.AccessControlContext source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.security.AccessController source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.security.SecureClassLoader source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ReflectiveOperationException source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ClassNotFoundException source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.Record source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.LinkageError source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.NoClassDefFoundError source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ClassCastException source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ArrayStoreException source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.VirtualMachineError source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.InternalError source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.OutOfMemoryError source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.StackOverflowError source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.IllegalMonitorStateException source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ref.Reference source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ref.SoftReference source: shared objects file
+JVM-INFO raw: [0.137s][info][class,load] java.lang.ref.WeakReference source: shared objects file
+  (full class-load capture above, trimmed to the load lines + verdict)
+== console window: old death absent + census (elapsed=10s)
+-- console window: fault line:
+<none>
+-- console window: kill line:
+<none>
+-- console window: evidence lines:
+[err] s2 nr=102 -38 a=0x6fffffffffc4,0x2f,0x2f
+[err] s2 nr=104 -38 a=0x6fffffffffc2,0x6ffffffffe58,0x6ffffffffe58
+[err] s2 nr=106 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=105 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s2 nr=110 -38 a=0x50409d,0x50409c,0x4
+[err] s3 nr=102 -38 a=0x6fffffffffc4,0x2f,0x2f
+[err] s3 nr=104 -38 a=0x6fffffffffc2,0x6ffffffffe28,0x6ffffffffe28
+[err] s3 nr=106 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s3 nr=105 -38 a=0xffffffffffffffda,0x0,0x0
+[err] s3 nr=110 -38 a=0x50409d,0x50409c,0x4
+[nosys] nr=38
+[err] s3 nr=38 -38 a=0x0,0x6fffffffbb80,0x6fffffffbba0
+[err] s4 nr=38 -38 a=0x0,0x6fffffffbb80,0x6fffffffbba0
+[nosys] nr=324
+[err] s4 nr=324 -38 a=0x8,0x0,0x300a7278
+[err] s4 nr=324 -38 a=0x10,0x0,0x0
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xfe7
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xfeb
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xfef
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0xff6
+[err] s5 nr=89 -22 a=0x6000014fa680,0x6000014fb680,0x1000
+[err] s5 nr=324 -38 a=0x8,0x0,0x60000002c7a8
+[ring] tkill by s5; its last syscalls:
+[ring] nr=200 a=0x4,0x22,0x300a6b28 -> 0 rip=0x30044415
+[ring] nr=13 a=0x22,0x6000014fb940,0x0 -> 0 rip=0x3005f26c
+-- console window: syscall census (trace-err buckets, top counts):
+     68 nr=20
+     68 nr=15
+     34 nr=89
+     20 nr=9
+      9 nr=98
+      9 nr=97
+      9 nr=324
+      9 nr=302
+      8 nr=72
+      8 nr=2
+      7 nr=38
+      6 nr=3
+      5 nr=102
+      4 nr=8
+      4 nr=5
+== verdict (elapsed=11s)
+READABLE-FAIL: java exited rc=1 with JVM RED Error: LinkageError occurred while loading main class Hello reason="	java.lang.ClassFormatError: Field "<init>" in class Hello has illegal signature "()V""; class-load trace above names the failing step
+RESULT FAIL: the class did not run clean (exit=1) - the datum is named; next gate = fix pass
+== wall clock: seconds=11 (t0=1794670091 end=1794670102)

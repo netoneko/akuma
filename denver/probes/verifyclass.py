@@ -111,6 +111,9 @@ def main():
     access, this, sup = r.u2(), r.u2(), r.u2()
     expect(access == 0x0021, "class access=0x%04x want 0x0021" % access)
     expect(this == 21 and sup == 2, "this/super indices")
+    icount = r.u2()
+    expect(icount == 0, "interfaces_count=%d want 0 (missing u2 here shifts every "
+                        "later field - the JVM reads methods as fields)" % icount)
     expect(r.u2() == 0, "fields count")
 
     nmethods = r.u2()

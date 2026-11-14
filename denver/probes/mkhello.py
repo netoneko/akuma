@@ -117,6 +117,10 @@ def main():
     out = u4(0xCAFEBABE) + u2(0) + u2(65) + u2(len(cp))  # Java 21 = major 65
     out += b"".join(cp[1:])
     out += u2(ACC_PUBLIC | ACC_SUPER) + u2(21) + u2(2)  # this=Hello, super=Object
+    out += u2(0)                             # interfaces_count (JVMS 4.1 - OMITTING
+    # this u2 is fatal: HotSpot reads fields_count as interfaces_count, then parses the
+    # methods table as fields -> ClassFormatError: Field "<init>" illegal signature
+    # "()V" (attempt 1's measured datum). The interfaces table must be present, empty.
     out += u2(0)  # fields
     out += u2(2)  # methods
     out += method(ACC_PUBLIC, 5, 6, code_attr(1, 1, u1(0x2A) + u1(0xB7) + u2(1) + u1(0xB1)))
