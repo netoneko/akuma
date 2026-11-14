@@ -597,4 +597,42 @@ are recorded suspects (D51).
 E0463), attempt-1's preserved FAIL log + vmrun.log ring recovery, the lying rwx arm
 rewritten with two image re-injections.
 
-NEXT GATE: PHASE-2-MEMINFO
+### PHASE-2-MEMINFO — 2026-11-14, session 14 (~10:52–11:15 UTC) — GREEN (G7 closed: one translated arm; the sizing feed went errno=38 → the guest's real 3 GiB)
+
+**What we did.** The gate opened with its datum already measured twice (`SYSINFO INFO
+errno=38` — NULLSTORE's arm, then HEAPRO's ride-along): sysinfo(2) served nowhere and
+HotSpot's heap sizing died cleanly on `Too small maximum heap`. R1 found composition,
+not a feature: glue's table already serves sysinfo (`nr::SYSINFO => sys_sysinfo` — real
+PMM totals, the offset-asserted `Sysinfo` with its padding-leak tests), the metal kernel
+translates the number in one arm (`akuma-kernel-amd64/src/usermode/dispatch.rs:1305`),
+and `akuma-runtime-tokio` had parked sysinfo in its `shell()` set — which a JVM-facing
+build does not enable — so nr 99 fell to the default ENOSYS arm. The fix is that metal
+arm, tokio-shaped (the `RT_SIGSUSPEND` translation precedent), behind the off-by-default
+`sysinfo` feature, relayed 1:1 down four Cargo.tomls. R6 evidence sharpened: the default
+build's `.text` is byte-identical across the change (the whole-binary hash moved because
+comments shift line numbers that metadata carries — compare sections, not files); the
+gate feature set builds; sysinfo host tests green on the musl target (4, incl. the
+padding-leak canary).
+
+**What the run forced.** Attempt 1 FAILED on the probe's own new sanity check: the
+totalram extraction sed'd the raw `$sys` — which still carries the ssh banner lines —
+so the test saw a multi-line "number". The gate's named line had already LANDED inside
+that failed run (`SYSINFO PASS … totalram=3220164608`): the kernel change was good; a
+probe check lied (D42's rule, probe half again — extract from the grep'd PASS line,
+never the raw capture). Attempt 2: RESULT PASS, wall 103 s — `SYSINFO PASS uptime=31956
+totalram=3220164608 freeram=2675982336 mem_unit=1` (the spec's real 3 GiB; uptime ≈8.9 h
+also answers the clock-hook known-unknown: the hook IS registered), tokioprobe, RWX,
+MAPS+AUXV, MMARMS incl. rwx call=42, regpreserve 20/20, LAZYREL both arms riding green.
+
+**What decision it forced.** The java-fate datum advanced but is still unreadable: 30 s
+window + two recoveries — no fault at all, no exit report in ≥90 s. java SURVIVES and
+runs long post-sysinfo; its fate is phase 3's blocker and every java-carrying gate now
+opens with this datum. The window's only fault was the lazyrel child's DESIGNED death
+(rip `10002bb0` cr2 `600000000000` — HEAPRO's own proof arm, arriving by console lag):
+attribute before alarming. G7 closed; the standing rank puts G2 (getcpu, java-free) next.
+
+**Interventions:** two, in RESULT.md — the accidental gitlink swept into the WIP commit
+by `git add -A` (untracked in a follow-up commit), and attempt-1's totalram extraction
+bug (log preserved as `PHASE-2-MEMINFO.attempt1-FAIL.log`).
+
+NEXT GATE: PHASE-2-GETCPU

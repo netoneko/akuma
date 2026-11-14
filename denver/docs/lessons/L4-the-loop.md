@@ -111,3 +111,18 @@ before bugs — runs in minutes, and the minutes are *measured*, not remembered.
   and retires a three-gate "divergence". Movement without a capturable death is a new
   shape: the next gate opens on a capture problem (longer window / output recovery), not
   a fix — and the host-test target fact re-paid (musl target or E0463; L4's PROCFS entry).
+- 2026-11-14 (PHASE-2-MEMINFO GREEN on attempt 2): the composition pass, fastest cycle
+  yet — R1 found the serving already exists one layer up (glue's table serves sysinfo;
+  the metal kernel's one-line translation; a runtime classifier had parked the number
+  behind a feature the JVM build does not enable), so the "implementation" gate was
+  ~28 LOC, no new pure logic, no image re-injection; research → GREEN ≈ 25 min, one
+  probe-side FAIL. The FAIL re-taught D42's probe half: a sanity check must extract its
+  number from the grep'd PASS line — sed over the raw capture keeps the ssh banner and
+  the test sees a multi-line number (while the gate's named line had already PASSED in
+  that same run). R6's standard sharpened: the whole-binary hash moves when comments
+  shift line numbers (metadata carries them) — compare the `.text` SECTION
+  (byte-identical here), not the file. The java-fate capture problem survived its first
+  dedicated instrumentation (window 30 s, two recoveries): java now survives ≥90 s with
+  no fault and no exit report — progress, still unreadable. And the window's only fault
+  was a PRIOR gate's designed proof arm arriving by console lag — attribute before
+  alarming (D41's rule applied backwards in time).

@@ -580,3 +580,38 @@ regpreserve 20/20, LAZYREL PASS both arms), and the java arm MOVED — the old d
   overlapping live fixed mappings (java's ring: three-plus collisions — data-corruption
   class); the `mmdbg` bisect hatch gates the slab's release bodies (default 7 is honest;
   any lower value makes munmap/MAP_FIXED silent no-ops that answer success).
+
+## PHASE-2-MEMINFO — 2026-11-14 ~10:52–11:15 UTC, session 14 (goose, glm-5.3-flash) — GREEN (G7 closed: the sizing feed went errno=38 → the guest's real 3 GiB)
+
+| step | command / artifact | verdict |
+|---|---|---|
+| research artifact | `denver/docs/research/PHASE-2-MEMINFO.md` (D52–D54; R9: metal kernel's `to_glue` translation, glue's table, taoxichuan census, BUG_FIX_LIST lessons) | written before code (R1) |
+| code | one translated arm in `crates/akuma-tokio-kernel-amd64/src/lib.rs` (`Syscall::Sysinfo` → glue's `handle_syscall`, the metal kernel's shape / the `RT_SIGSUSPEND` precedent), `sysinfo` feature relayed 1:1 in 4 Cargo.tomls | ~28 LOC incl. comments; no new pure logic (glue + `akuma-syscalls-linux::Sysinfo` reused as-is) |
+| R6 check | default build `.text` sha256 before/after the change | **identical** `527770305e43d34a…` (the whole-binary hash moves when comments shift line numbers — metadata carries them; section-level compare is the standard, D49's lesson) |
+| host tests | `cargo test -p akuma-syscalls-linux --target x86_64-unknown-linux-musl sysinfo` | **PASS** 4/4 incl. `defaulted_sysinfo_has_no_uninitialised_bytes` (the padding-leak canary) |
+| gate kernel | `cargo build -p denver --features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep,sysinfo --target x86_64-unknown-none --release -j4` → `/root/denver/w/denver-meminfo` + `vm-meminfo.spec` (heapro spec's disk and port, new kernel path) | **PASS** 26.6 s; NO image re-injection (the jdk image already carried the sysinfo/lazyrel arms) |
+| attempt 1 | `sh denver/probe-meminfo.sh` → `denver/gates/PHASE-2-MEMINFO.attempt1-FAIL.log` | honest FAIL — the probe's own totalram sanity check sed'd the RAW multi-line `$sys` (ssh banner lines inside), so the test saw a multi-line number; the gate's named line `SYSINFO PASS totalram=3220164608` had ALREADY landed in that same run |
+| gate | `sh denver/probe-meminfo.sh` → `denver/gates/PHASE-2-MEMINFO.log` | **RESULT PASS**, wall 103 s, guest `0.1.0-24398b99-denver` |
+
+`SYSINFO PASS uptime=31956 totalram=3220164608 freeram=2675982336 mem_unit=1` — G7's feed
+SERVED (was `SYSINFO INFO errno=38`, measured twice). The real 3 GiB from `akuma-pmm`'s
+frame counters, not a constant (the BUG_FIX_LIST hardcoded-256MB lesson); uptime ≈ 8.9 h
+answers the clock-hook known-unknown (the hook IS registered). Riding arms all green:
+tokioprobe, RWX `rw_to_rx=42`, MAPS lines=10, AUXV procfs-auxv, MMARMS incl.
+`rwx call=42`, regpreserve 20/20 with zero REGRED, LAZYREL both arms.
+
+Java arm MOVED (old rip `60000067cd7a` absent) and the capture instrumentation advanced
+the datum: window 30 s + two `/tmp/java-out.log` recoveries — **no fault at all, no exit
+report in ≥90 s**: java survives and runs long post-sysinfo, its fate still unreadable
+(sshd starved both recoveries, RC=127). The window's only fault was the lazyrel child's
+DESIGNED death (rip `0x10002bb0` cr2 `600000000000` code=0x4 — the HEAPRO artifact's own
+proof arm, arriving by console lag), correctly attributed, not alarmed. java's fate is
+the phase-3 blocker datum; every java-carrying gate now opens with it.
+
+**Interventions (2):**
+- INTERVENTION: `git add -A` swept an unrelated embedded gitlink
+  (`userspace/nca/native-cli-ai`) into the WIP commit; untracked in a follow-up
+  `git rm --cached` commit (never rewrite history; the WIP was already pushed).
+- INTERVENTION: attempt-1 FAIL was the probe's own sanity check misreading a multi-line
+  capture — extraction must grep the judged line first (`SYSINFO PASS`), never sed the
+  raw capture; the kernel change under test was already proven by that same failed run.

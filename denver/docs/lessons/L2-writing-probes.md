@@ -134,3 +134,10 @@ the RED phase proves the probes themselves before any pass claims anything.
   `[ring]` fit; `ring3 map/regs/stack`, `[mm]`, `[fault-code]` did not) — display bounds are
   not evidence bounds; size window displays to the ring's cap + attribution, and grep the
   source console (`$W/vmrun.log`) when a record needs the full block.
+- 2026-11-14 (PHASE-2-MEMINFO attempt 1): **a sanity check reads the line it judges, not
+  the raw capture.** The totalram range check sed'd the whole `$sys` variable — which
+  still carried the `[ssh] connecting …` banner lines — so `$totalram` was a multi-line
+  string and the gate FAILED on a kernel change that had already passed the gate's named
+  line inside the same run. One `grep 'SYSINFO PASS'` before the extraction fixes it.
+  Corollary of the D42 rule: a lying check is worse than no check — it can bury a real
+  PASS under a probe FAIL, and it costs a boot to discover.
