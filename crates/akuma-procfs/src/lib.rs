@@ -398,7 +398,7 @@ pub const MAPS_LINE_MAX: usize = 192;
 /// architecture these kernels boot is little-endian.
 pub fn render_auxv(entries: &[(u64, u64)], buf: &mut [u8]) -> usize {
     let mut pos = 0usize;
-    for &(key, val) in entries.iter().copied().chain(core::iter::once((0u64, 0u64))) {
+    for (key, val) in entries.iter().copied().chain(core::iter::once((0u64, 0u64))) {
         if buf.len().saturating_sub(pos) < 16 {
             break;
         }
