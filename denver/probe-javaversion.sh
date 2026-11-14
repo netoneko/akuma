@@ -142,7 +142,7 @@ echo "$b0"
 case "$b0" in *ALIVE-B0*) CHANNEL_OK=1 ;; *) CHANNEL_OK= ;; esac
 
 step "B1: concurrent-session baseline (a background sleep while a second connection pokes - kills H2)"
-sl=$(timeout 15 $SSH "command -v sleep" 2>&1 | head -1)
+sl=$(timeout 15 $SSH "command -v sleep" 2>&1 | grep -v 'connecting' | head -1)
 echo "  sleep binary: ${sl:-<none>}"
 B1=
 case "$sl" in */*) 
@@ -159,47 +159,44 @@ esac
 [ -z "$B1" ] && [ -n "$sl" ] && echo "  B1 RED: a second connection went unanswered during a benign sleep"
 [ -z "$sl" ] && echo "  B1 SKIPPED: no sleep in the image (datum recorded)"
 
-step "THE ARM: java -version foreground, NO maps poller, window ${JAVA_WINDOW}s, pokes every ${POKE_EVERY}s (D59/D60)"
-timeout 15 $SSH "rm -f /tmp/java-out.log" > /dev/null 2>&1
+step "THE ARM (reader): jvmprobe java - pipe capture, blocking read, ZERO polling (arm_java's parent never spins; prints the exit report + every raw line). Attempt 1 taught: the guest has no cat/sleep/command, so /tmp files are write-only for us - the pipe arm is the reader"
 OFF=$(wc -c < "$VMLOG")                # console bytes before the dispatch
-timeout "$JAVA_WINDOW" $SSH "/opt/jdk/bin/java -version > /tmp/java-out.log 2>&1; echo JAVARC=\$? >> /tmp/java-out.log" > /tmp/java-ssh.log 2>&1 &
-JP=$!
+TARM=$(date +%s)
+jv=$(timeout 240 $SSH "/bin/jvmprobe java /opt/jdk/bin/java -version" 2>&1)
+EAR=$(( $(date +%s) - TARM ))
+echo "$jv"
+echo "  (reader arm wall=${EAR}s; child alarm=90s, parent alarm=120s inside jvmprobe)"
+case "$jv" in
+    *"JVM INFO exit="*)
+        EXITED=1
+        RCODE=$(printf '%s\n' "$jv" | grep 'JVM INFO exit=' | sed -E 's/.*exit=(-?[0-9]+).*/\1/') ;;
+    *) EXITED= ;;
+esac
+case "$jv" in
+    *"JVM PASS "*|*"JVM RED "*)
+        GOTOUT=1
+        JVERDICT=$(printf '%s\n' "$jv" | grep -E '^JVM (PASS|RED)' | tail -1) ;;
+    *) GOTOUT= ;;
+esac
 
-ANSWERED=0
-n=0
-while kill -0 "$JP" 2>/dev/null; do
-    sleep "$POKE_EVERY"
-    n=$((n + 1))
-    [ "$n" -gt "$POKE_MAX" ] && break
-    poke=$(timeout 12 $SSH "echo ALIVE-POKE$n; cat /tmp/java-out.log 2>/dev/null | head -5" 2>&1)
-    echo "-- poke $n: $poke"
-    case "$poke" in *ALIVE-POKE*) ANSWERED=$((ANSWERED + 1)) ;; esac
-done
-wait "$JP" 2>/dev/null
-JP=
-
-step "the arm's own channel return (foreground session; JAVARC present = java exited)"
-cat /tmp/java-ssh.log 2>/dev/null | head -5
-final=$(timeout 15 $SSH "cat /tmp/java-out.log 2>/dev/null; echo ENDRC=\$?" 2>&1)
-echo "-- final recovery:"
-echo "$final"
-case "$final" in *"JAVARC="*) EXITED=1 ;; *) EXITED= ;; esac
-case "$final" in *"version "*|*"OpenJDK"*) GOTOUT=1 ;; *) GOTOUT= ;; esac
-
-step "recovery tries 2-3 (post-arm, +${POKE_EVERY}s apart)"
+step "THE ARM (fallback, only if the reader produced no exit report): foreground file dispatch, NO maps poller, pokes every ${POKE_EVERY}s (D59/D60). NOTE: the guest has no cat - /tmp files are write-only from here; the pokes carry the channel-alive datum, not the output"
 if [ -z "$EXITED" ]; then
-    sleep "$POKE_EVERY"
-    r2=$(timeout 15 $SSH "cat /tmp/java-out.log 2>/dev/null; echo ENDRC=\$?" 2>&1)
-    echo "-- recovery 2: $r2"
-    case "$r2" in *"JAVARC="*) EXITED=1 ;; esac
-    case "$r2" in *"version "*|*"OpenJDK"*) GOTOUT=1 ;; esac
-fi
-if [ -z "$EXITED" ]; then
-    sleep "$POKE_EVERY"
-    r3=$(timeout 15 $SSH "cat /tmp/java-out.log 2>/dev/null; echo ENDRC=\$?" 2>&1)
-    echo "-- recovery 3: $r3"
-    case "$r3" in *"JAVARC="*) EXITED=1 ;; esac
-    case "$r3" in *"version "*|*"OpenJDK"*) GOTOUT=1 ;; esac
+    timeout "$JAVA_WINDOW" $SSH "/opt/jdk/bin/java -version > /tmp/java-out.log 2>&1; echo JAVARC=\$? >> /tmp/java-out.log" > /tmp/java-ssh.log 2>&1 &
+    JP=$!
+    ANSWERED=0
+    n=0
+    while kill -0 "$JP" 2>/dev/null; do
+        sleep "$POKE_EVERY"
+        n=$((n + 1))
+        [ "$n" -gt "$POKE_MAX" ] && break
+        poke=$(timeout 12 $SSH "echo ALIVE-POKE$n" 2>&1)
+        echo "-- poke $n: $poke"
+        case "$poke" in *ALIVE-POKE*) ANSWERED=$((ANSWERED + 1)) ;; esac
+    done
+    wait "$JP" 2>/dev/null
+    JP=
+    echo "-- fallback arm's channel return:"
+    head -3 /tmp/java-ssh.log 2>/dev/null
 fi
 
 step "console window: old death absent + census (the next gate's data)"
@@ -237,7 +234,8 @@ step "verdict (D60)"
 E=$(( $(date +%s) - T0 )); [ "$E" -lt 0 ] && E=0
 [ -z "$CHANNEL_OK" ] && verdict "RESULT FAIL: even the B0 baseline poke went unanswered - the capture rig itself is broken" 1
 if [ -n "$EXITED" ] && [ -n "$GOTOUT" ]; then
-    echo "READABLE-EXIT: java -version exits and its output is recovered - the phase-3 ladder's first rung"
+    echo "READABLE-EXIT: java -version exited (rc=${RCODE:-?}, reader-arm wall=${EAR:-?}s) with output recovered - ${JVERDICT:-<none>}"
+    echo "  the phase-3 ladder's first rung: the fate READS (attempt 1's poller-less arm also returned in <45s - the three-gate 'no exit' datum was the name arm's own 2 ms poller, D59)"
     verdict "RESULT PASS" 0
 fi
 if [ -n "$faultline" ]; then
@@ -245,7 +243,7 @@ if [ -n "$faultline" ]; then
     verdict "RESULT PASS" 0
 fi
 if [ -n "$EXITED" ]; then
-    echo "READABLE-EXIT(partial): java exited (JAVARC) but the version line never surfaced - output buffering is the suspect; the exit code is the datum"
+    echo "READABLE-EXIT(partial): java exited (rc=${RCODE:-?}) but no version line surfaced - ${JVERDICT:-no JVM verdict line}; the exit code is the datum"
     verdict "RESULT PASS" 0
 fi
 if [ "$ANSWERED" -gt 0 ]; then

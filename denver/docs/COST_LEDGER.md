@@ -16,3 +16,6 @@ session denver-PHASE-2-NULLSTORE wall=76 in=17.7M out=123k final_ctx=194k cache_
 session denver-PHASE-2-NULLSTORE wall=15 in=2.1M out=38k final_ctx=72k cache_read=97% tools=233
 session denver-PHASE-2-NULLFIX wall=41 in=7.6M out=71k final_ctx=134k cache_read=98% tools=104
 session denver-PHASE-2-HEAPRO wall=65 in=16.5M out=108k final_ctx=188k cache_read=99% tools=165
+session denver-PHASE-2-MEMINFO wall=22 in=2.8M out=58k final_ctx=105k cache_read=96% tools=70
+session denver-PHASE-2-GETCPU wall=48 in=10.7M out=97k final_ctx=159k cache_read=98% tools=142
+session denver-PHASE-2-GETCPU wall=62 in=12.3M out=119k final_ctx=184k cache_read=98% tools=271
