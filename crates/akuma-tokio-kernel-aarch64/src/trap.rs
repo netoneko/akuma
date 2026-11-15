@@ -185,6 +185,13 @@ fn el0_sync_locked(f: &mut Frame) {
         f.esr,
         pte
     );
+    // A program with a SIGSEGV handler (HotSpot's null checks) gets the fault first.
+    if matches!(f.ec(), ec::DABT_LOWER | ec::IABT_LOWER) {
+        let code = if is_translation(f.esr) { 1 } else { 2 }; // SEGV_MAPERR / SEGV_ACCERR
+        if crate::signal::deliver_fault(f, f.far, code) {
+            return;
+        }
+    }
     // Signals are A5.8: a fault ends the process as SIGSEGV would.
     crate::proc::die_segv()
 }

@@ -48,7 +48,16 @@ const FPSR_BITS: u64 = 0xF800_009F;
 pub struct A64<'a> {
     pub f: &'a mut Frame,
     pub x0: u64,
+    /// A synchronous fault being delivered: `(si_addr, si_code)`.
+    pub fault: Option<(u64, i32)>,
 }
+
+/// `uc_sigmask` and `uc_mcontext` offsets in the AArch64 `ucontext_t`; the mcontext is
+/// `fault_address`, `regs[31]`, `sp`, `pc`, `pstate`. HotSpot's SIGSEGV handler edits `pc`.
+const UC_SIGMASK: usize = 40;
+const UC_MCTX: usize = 176;
+/// Bytes of the ucontext that carry state (through `pstate`); the rest is zeros.
+const UC_HEAD: usize = UC_MCTX + 8 * 35;
 
 fn frame_bytes(f: &Frame) -> [u8; FRAME_BYTES] {
     let mut out = [0u8; FRAME_BYTES];
@@ -127,9 +136,24 @@ impl Deliver for A64<'_> {
         tail[..8].copy_from_slice(&restore_mask.to_le_bytes());
         let mut info = [0u8; SIGINFO_BYTES as usize];
         info[..4].copy_from_slice(&sig.cast_signed().to_le_bytes()); // si_signo; si_errno, si_code (SI_USER) 0
+        if let Some((addr, code)) = self.fault {
+            info[8..12].copy_from_slice(&code.to_le_bytes());
+            info[16..24].copy_from_slice(&addr.to_le_bytes());
+        }
+        // The interrupted state, as Linux's `ucontext` carries it: a handler that edits it
+        // (`pc` for a null-check stub) changes where `rt_sigreturn` resumes.
+        let mut uc = [0u8; UC_HEAD];
+        uc[UC_SIGMASK..UC_SIGMASK + 8].copy_from_slice(&cur_mask.to_le_bytes());
+        let fa = self.fault.map_or(0, |(a, _)| a);
+        uc[UC_MCTX..UC_MCTX + 8].copy_from_slice(&fa.to_le_bytes());
+        for i in 0..34 {
+            // regs[0..31], sp, pc, pstate are words 0..34 of the saved frame.
+            uc[UC_MCTX + 8 + i * 8..UC_MCTX + 16 + i * 8].copy_from_slice(&saved[i * 8..i * 8 + 8]);
+        }
         if akuma_user_access::copy_to_user(at, &saved).is_err()
             || akuma_user_access::copy_to_user(at + FRAME_BYTES as u64, &tail).is_err()
-            || !zero_user(uc_at, UCONTEXT_BYTES)
+            || akuma_user_access::copy_to_user(uc_at, &uc).is_err()
+            || !zero_user(uc_at + UC_HEAD as u64, UCONTEXT_BYTES - UC_HEAD as u64)
             || akuma_user_access::copy_to_user(info_at, &info).is_err()
         {
             return false;
@@ -174,11 +198,47 @@ pub fn sigreturn(f: &mut Frame) -> u64 {
     f.fpcr = word(&b, 38 + 64) & FPCR_BITS;
     f.fpsr = word(&b, 39 + 64) & FPSR_BITS;
     akuma_exec::threading::set_thread_signal_mask(word(&b, FRAME_BYTES / 8));
+    // The handler's edits to the ucontext win (Linux restores from it).
+    let mut uc = [0u8; UC_HEAD];
+    if akuma_user_access::copy_from_user(&mut uc, at + BLOCK_BYTES as u64).is_ok() {
+        let g = |i: usize| word(&uc, (UC_MCTX / 8) + 1 + i);
+        let (usp, upc) = (g(31), g(32));
+        if usp < USER_TOP && upc < USER_TOP {
+            for i in 0..31 {
+                f.x[i] = g(i);
+            }
+            f.sp = usp;
+            f.elr = upc;
+            f.spsr = g(33) & SPSR_USER;
+        }
+    }
     f.x[0]
+}
+
+/// A synchronous fault at `far`: run the program's `SIGSEGV` handler, as HotSpot's implicit
+/// null checks and safepoint polls need. `false` (nothing changed) = no handler, blocked,
+/// or no room: the caller kills the task as before.
+pub fn deliver_fault(f: &mut Frame, far: u64, code: i32) -> bool {
+    use akuma_exec::process::SignalHandler;
+    const SIGSEGV: u32 = 11;
+    let idx = SIGSEGV as usize - 1;
+    let Some(p) = akuma_exec::process::current_process_shared() else {
+        return false;
+    };
+    let act = p.signal_actions.actions.lock()[idx];
+    let SignalHandler::UserFn(entry) = act.handler else {
+        return false;
+    };
+    let mask = akuma_exec::threading::thread_signal_mask();
+    if mask & (1u64 << idx) != 0 {
+        return false;
+    }
+    let x0 = f.x[0];
+    A64 { f, x0, fault: Some((far, code)) }.push_handler(SIGSEGV, entry as u64, &act, x0, None, mask, mask)
 }
 
 /// The syscall return: pending signals, after the result is in `x0`.
 pub fn at_return(f: &mut Frame, n: u64, x0: u64) {
     let r = f.x[0];
-    let _ = signal::deliver_at_return::<Aarch64, _>(&mut A64 { f, x0 }, n, r, &NO_RESTART);
+    let _ = signal::deliver_at_return::<Aarch64, _>(&mut A64 { f, x0, fault: None }, n, r, &NO_RESTART);
 }

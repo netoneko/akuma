@@ -78,10 +78,9 @@ The same `denver` source builds for **aarch64 and amd64**, and the kernel boots 
 | | boots | the JVM |
 |---|---|---|
 | amd64 | Akuma's own KVM on real AMD Ryzen metal; QEMU microvm (TCG) for the local overlay | HotSpot, javac, Clojure, Scala, Groovy, a Clojure HTTP server |
-| aarch64 | QEMU `virt` with HVF on an Apple Silicon Mac | boots and starts the JVM; HotSpot runs Java initialization, then fails reading a class from the memory-mapped `modules` file (`ClassFormatError`) |
+| aarch64 | QEMU `virt` with HVF on an Apple Silicon Mac | HotSpot, a Clojure HTTP server (plain 64-bit pointers: the kernel ignores mmap address hints) |
 
-The JVM features (`vsyscall`, `fold-regpreserve`, `fault-signal`, ...) live in the amd64 machine half; on aarch64
-`wx-relaxed` and `getcpu` are relayed so far. Reproduce either with [`overlays/denver`](../overlays/denver/README.md)
+The amd64-only JVM features (`vsyscall`, `fold-regpreserve`, ...) live in the amd64 machine half; the aarch64 half has `wx-relaxed` and `getcpu` relayed, a SIGSEGV handler delivery with a real `ucontext`, and a `read` that fills the whole request. Reproduce either with [`overlays/denver`](../overlays/denver/README.md)
 (`ARCH=aarch64 overlays/denver/check.sh`).
 
 ## The lessons

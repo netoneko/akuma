@@ -94,17 +94,29 @@ never gone through the hook. A default-workspace `cargo check` in every gate wou
 - The `9ec07523` manifest commit skipped the pre-commit hook (`--no-verify`): clippy, tests and the secret scan did not
   run on it, and nothing has re-checked it since.
 
-- aarch64 (QEMU `virt`, HVF, 2026-11-15, `overlays/denver`): Denver boots and starts the JVM. With `wx-relaxed` and
-  `getcpu` relayed to the aarch64 half, HotSpot passes the W^X and getcpu gates, but its 1 GiB compressed-class-space
-  reservation fails (`-XX:-UseCompressedClassPointers -XX:-UseCompressedOops` gets past it, so the cause is address
-  placement), and then Java initialization dies with `ClassFormatError: Illegal constant pool index 0` on a class read
-  from the memory-mapped `modules` file: wrong bytes from a file mapping. Not investigated; the Clojure server runs on amd64 only.
+- aarch64: the JVM needs `-XX:-UseCompressedClassPointers -XX:-UseCompressedOops`. The kernel ignores mmap address hints and
+  places everything in one slab at `0x6000_0000_0000`, and HotSpot's 1 GiB compressed-class-space reservation fails
+  (`Could not allocate compressed class space`). Honoring a free, in-range hint is the real fix. One `-version` and one
+  Clojure server run each; the two `[Fault] ... -- task killed` lines on the server run (a null access at `far=0x8` that
+  delivery did not take) were not chased, and the server still answered.
 
 ## Fixed after the fact (2026-11-15)
 
 - A boot argument was silently cut at 96 bytes (`akuma-tokio-kernel-core::init::ARG_LEN`), so a three-jar `-cp`
   (108 characters) lost the end of its last jar name and the JVM reported a missing class. `ARG_LEN` is 256 now, with a
   host test (`a_long_classpath_survives_whole`). Found by running the overlay, not by a gate.
+
+- **aarch64, `read`/`pread64` answered short (2026-11-15).** Symptom: `java -version` died in `System.initPhase1` with
+  `ClassFormatError: Illegal constant pool index 0 for method signature in class file jdk/internal/misc/ScopedMemoryAccess`.
+  Cause: the file arms of `sys_read` and `sys_pread64` (`akuma-syscalls-glue::fs`) capped a request at their 64 KiB bounce
+  buffer and returned that, so a 4 MiB `read` came back 64 KiB. A mapped file was fine (a probe showed mmap equal to pread
+  byte for byte); the JDK's jimage reader takes one `read` as the whole answer and parsed a truncated class. Both arms now loop
+  to the full count or EOF, as Linux does for a regular file. Verified: `java -version` and the Clojure server on aarch64
+  (`overlays/denver/check.sh`, `RESULT PASS`).
+- **aarch64, SIGSEGV never reached the program (2026-11-15).** HotSpot's implicit null checks fault, and the kernel killed the
+  task. `akuma-tokio-kernel-aarch64::signal::deliver_fault` now runs the SIGSEGV handler with a real siginfo (`si_code`,
+  `si_addr`) and a filled `ucontext` (regs, sp, pc, pstate); `rt_sigreturn` restores from the ucontext, so a handler that edits
+  `pc` takes effect. Async signals get the same ucontext. The amd64 half's `faultsig.rs` is the model.
 
 ## Background
 

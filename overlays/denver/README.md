@@ -17,12 +17,10 @@ curl http://localhost:8080/         # from another terminal
 ```
 
 Both architectures build and boot (`ARCH=aarch64` or `ARCH=amd64`, default amd64): the kernel, the image and the
-runner each take it. **aarch64 boots Denver under HVF and starts the JVM, but the Clojure server runs on amd64 only for
-now**: HotSpot gets through Java initialization on aarch64 and then dies with a `ClassFormatError` reading a class
-from the memory-mapped `modules` file. `ARCH=aarch64 overlays/denver/check.sh` prints `RESULT BOOT-PASS` when the kernel
-reaches and starts init.
+runner each take it. On aarch64 the JVM runs with plain 64-bit pointers (`-XX:-UseCompressedClassPointers
+-XX:-UseCompressedOops`, set by `run.sh`), because the kernel ignores mmap address hints.
 
-Expected (amd64): `Hello from Clojure 1.12.0 on Akuma/denver`, a hit counter, the JVM version and the cpu
+Expected: `Hello from Clojure 1.12.0 on Akuma/denver`, a hit counter, the JVM version and the cpu
 and heap sizes; `curl http://localhost:8080/json` answers the same as JSON.
 `overlays/denver/check.sh` runs the whole boot-and-curl for you and prints `RESULT PASS` or `RESULT FAIL`.
 

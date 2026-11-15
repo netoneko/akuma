@@ -146,7 +146,7 @@ akuma-tokio-kernel      the platform: tokio on bare metal
     <div><b>JDK 21</b><span>HotSpot, G1, C1 + C2</span></div>
     <div><b>8</b><span>defects found and fixed</span></div>
     <div><b>~1,750</b><span>auditable lines of kernel Rust, all behind off-by-default features</span></div>
-    <div><b>2</b><span>platforms: aarch64 and amd64 boot; the JVM runs on amd64 so far</span></div>
+    <div><b>2</b><span>platforms: the Clojure server runs on aarch64 and amd64</span></div>
     <div><b>48</b><span>lines in the two crates Denver adds: the binary and the front crate</span></div>
     <div><b>2.4 MiB</b><span>the whole kernel, one ELF</span></div>
     <div><b>KVM</b><span>as a guest of Akuma's own hypervisor, on real AMD Ryzen metal</span></div>
@@ -199,7 +199,7 @@ akuma-tokio-kernel      the platform: tokio on bare metal
 <section class="slide">
   <span class="tag">try it</span>
   <h2>Reproduce it locally</h2>
-  <p>You need Rust (nightly toolchain from the repo), QEMU and Docker. No KVM needed: QEMU runs the x86 guest under TCG, which is slow but takes about 15 seconds to answer. <code>ARCH=aarch64</code> boots the aarch64 kernel on QEMU with HVF; the JVM does not finish starting there yet.</p>
+  <p>You need Rust (nightly toolchain from the repo), QEMU and Docker. No KVM needed: QEMU runs the x86 guest under TCG, which is slow but takes about 15 seconds to answer. <code>ARCH=aarch64</code> runs the same on the aarch64 kernel under QEMU with HVF (fast on an Apple Silicon Mac).</p>
   <pre>git clone https://github.com/netoneko/akuma &amp;&amp; cd akuma
 overlays/denver/build-kernel.sh     # the gate feature set  -> out/denver
 overlays/denver/build-image.sh      # JDK 21 + Clojure 1.12 -> out/denver-clojure.img

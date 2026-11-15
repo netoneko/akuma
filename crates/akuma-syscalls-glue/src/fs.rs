@@ -640,33 +640,48 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // non-IRQ-masked terminal-state locks, which this carve-out has not audited.
             let _vfs_bkl = VfsBklGuard::new();
             rec.lap(crate::utils::read_profile::S_BKL);
+            // A regular-file read returns everything asked for, up to EOF, as on Linux: callers (the
+            // JDK's jimage reader among them) take one `read` as the whole answer. The bounce buffer
+            // is 64 KiB, so a larger request is served in chunks.
             let limit = 64 * 1024;
             let to_read = count.min(limit);
             let mut temp = alloc::vec![0u8; to_read];
             rec.lap(crate::utils::read_profile::S_ALLOC);
 
-            let read_result = akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.position, &mut temp);
-            rec.lap(crate::utils::read_profile::S_FS);
-            match read_result {
-                Ok(n) => {
-                    if n > 0 {
-                        if copy_to_user(buf_ptr, &temp[..n]).is_err() {
-                            return EFAULT;
+            let mut total = 0usize;
+            let mut failure = None;
+            while total < count {
+                let want = (count - total).min(limit);
+                match akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.position + total, &mut temp[..want]) {
+                    Ok(n) => {
+                        if n > 0 {
+                            if copy_to_user(buf_ptr + total as u64, &temp[..n]).is_err() {
+                                if total == 0 { return EFAULT; }
+                                break;
+                            }
+                            total += n;
                         }
-                        rec.lap(crate::utils::read_profile::S_COPY);
-                        if let Some(proc) = akuma_exec::process::current_process_shared() {
-                            proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += n; });
-                        }
-                        rec.lap(crate::utils::read_profile::S_POS);
+                        if n < want { break; }
                     }
-                    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
-                        akuma_primitives::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, to_read, n);
-                    }
-                    rec.commit(to_read);
-                    n as u64
+                    Err(e) => { failure = Some(e); break; }
                 }
-                Err(e) => fs_error_to_errno(e)
             }
+            rec.lap(crate::utils::read_profile::S_FS);
+            if total == 0 && let Some(e) = failure {
+                return fs_error_to_errno(e);
+            }
+            if total > 0 {
+                rec.lap(crate::utils::read_profile::S_COPY);
+                if let Some(proc) = akuma_exec::process::current_process_shared() {
+                    proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += total; });
+                }
+                rec.lap(crate::utils::read_profile::S_POS);
+            }
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
+                akuma_primitives::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, count, total);
+            }
+            rec.commit(to_read);
+            total as u64
         }
         akuma_exec::process::FileDescriptor::BlockDev { idx, pos, .. } => {
             // Raw block read (`docs/archive/RAW_BLOCK_DEVICE_FD.md`) — same BKL
@@ -1003,22 +1018,34 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
             let _vfs_bkl = VfsBklGuard::new();
+            // Full count up to EOF, like `read` above (64 KiB bounce buffer, served in chunks).
             let limit = 64 * 1024;
-            let to_read = count.min(limit);
-            let mut temp = alloc::vec![0u8; to_read];
-            match akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), offset as usize, &mut temp) {
-                Ok(n) => {
-                    if n > 0
-                        && copy_to_user(buf_ptr, &temp[..n]).is_err() {
-                            return EFAULT;
+            let mut temp = alloc::vec![0u8; count.min(limit)];
+            let mut total = 0usize;
+            let mut failure = None;
+            while total < count {
+                let want = (count - total).min(limit);
+                match akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), offset as usize + total, &mut temp[..want]) {
+                    Ok(n) => {
+                        if n > 0 {
+                            if copy_to_user(buf_ptr + total as u64, &temp[..n]).is_err() {
+                                if total == 0 { return EFAULT; }
+                                break;
+                            }
+                            total += n;
                         }
-                    if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
-                        akuma_primitives::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, to_read, n);
+                        if n < want { break; }
                     }
-                    n as u64
+                    Err(e) => { failure = Some(e); break; }
                 }
-                Err(e) => fs_error_to_errno(e)
             }
+            if total == 0 && let Some(e) = failure {
+                return fs_error_to_errno(e);
+            }
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
+                akuma_primitives::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, count, total);
+            }
+            total as u64
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevZero => {

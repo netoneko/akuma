@@ -26,7 +26,10 @@ DISK=${DENVER_DISK:-$OUT/denver-clojure-$ARCH.img}
 
 CP=/opt/clojure/clojure-1.12.0.jar:/opt/clojure/spec.alpha-0.5.238.jar:/opt/clojure/core.specs.alpha-0.4.74.jar
 INIT=${DENVER_INIT:-/opt/jdk/bin/java}
-INITARGS=${DENVER_INITARGS:--cp,$CP,clojure.main,/opt/server.clj}
+# aarch64: the kernel ignores mmap address hints, which HotSpot's compressed class space needs there
+# (docs/archive/DENVER_BRANCH_FIXES.md), so the JVM runs with plain 64-bit pointers.
+A64OPT=; [ "$ARCH" = aarch64 ] && A64OPT=-XX:-UseCompressedClassPointers,-XX:-UseCompressedOops,-XX:+UseSerialGC,-Xmx512m,
+INITARGS=${DENVER_INITARGS-${A64OPT}-cp,$CP,clojure.main,/opt/server.clj}
 MEMORY=${MEMORY:-3072}
 SMP=${SMP:-1}
 PORT=${HTTP_PORT:-8080}
