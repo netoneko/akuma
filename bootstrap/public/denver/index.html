@@ -159,17 +159,23 @@ _/                                    \_     Beans System Debauchery:
   <pre class="src"><code><i class="c">;; A standard HTTP server on the JDK&#x27;s own com.sun.net.httpserver, written in Clojure.</i>
 <i class="c">;; Run in a denver guest:  java -cp clojure-1.12.0.jar:spec.alpha-0.5.238.jar:core.specs.alpha-0.4.74.jar clojure.main server.clj</i>
 <i class="c">;; Then from outside (guest port 8080 forwarded by the VM spec):  curl http://&lt;host&gt;:8080/</i>
+<i class="p">(</i><i class="k">require</i> &#x27;clojure.string<i class="p">)</i>
 <i class="p">(</i><i class="k">import</i> &#x27;<i class="p">(</i>com.sun.net.httpserver HttpServer HttpHandler<i class="p">)</i>
         &#x27;<i class="p">(</i>java.net InetSocketAddress<i class="p">)</i><i class="p">)</i>
 
 <i class="p">(</i><i class="k">def</i> hits <i class="p">(</i>atom <i class="n">0</i><i class="p">)</i><i class="p">)</i>
 
+<i class="p">(</i><i class="k">defn</i> json <i class="p">[</i>m<i class="p">]</i>
+  <i class="p">(</i>str <i class="s">&quot;{&quot;</i> <i class="p">(</i>clojure.string/join <i class="s">&quot;,&quot;</i> <i class="p">(</i><i class="k">for</i> <i class="p">[</i><i class="p">[</i>k v<i class="p">]</i> m<i class="p">]</i> <i class="p">(</i>str <i class="p">(</i>pr-str <i class="p">(</i>name k<i class="p">)</i><i class="p">)</i> <i class="s">&quot;:&quot;</i> <i class="p">(</i>pr-str v<i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i> <i class="s">&quot;}\n&quot;</i><i class="p">)</i><i class="p">)</i>
+
 <i class="p">(</i><i class="k">defn</i> body <i class="p">[</i><i class="p">]</i>
   <i class="p">(</i><i class="k">let</i> <i class="p">[</i>rt <i class="p">(</i>Runtime/getRuntime<i class="p">)</i><i class="p">]</i>
-    <i class="p">(</i><i class="k">format</i> <i class="s">&quot;{\&quot;server\&quot;:\&quot;clojure %s\&quot;,\&quot;hit\&quot;:%d,\&quot;java\&quot;:\&quot;%s\&quot;,\&quot;arch\&quot;:\&quot;%s\&quot;,\&quot;cpus\&quot;:%d,\&quot;heap_mib\&quot;:%d}\n&quot;</i>
-            <i class="p">(</i>clojure-version<i class="p">)</i> <i class="p">(</i><i class="k">swap!</i> hits inc<i class="p">)</i>
-            <i class="p">(</i>System/getProperty <i class="s">&quot;java.version&quot;</i><i class="p">)</i> <i class="p">(</i>System/getProperty <i class="s">&quot;os.arch&quot;</i><i class="p">)</i>
-            <i class="p">(</i>.availableProcessors rt<i class="p">)</i> <i class="p">(</i>quot <i class="p">(</i>.maxMemory rt<i class="p">)</i> <i class="n">1048576</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i>
+    <i class="p">(</i>json <i class="p">{</i>:server   <i class="p">(</i>str <i class="s">&quot;clojure &quot;</i> <i class="p">(</i>clojure-version<i class="p">)</i><i class="p">)</i>
+           :hit      <i class="p">(</i><i class="k">swap!</i> hits inc<i class="p">)</i>
+           :java     <i class="p">(</i>System/getProperty <i class="s">&quot;java.version&quot;</i><i class="p">)</i>
+           :arch     <i class="p">(</i>System/getProperty <i class="s">&quot;os.arch&quot;</i><i class="p">)</i>
+           :cpus     <i class="p">(</i>.availableProcessors rt<i class="p">)</i>
+           :heap_mib <i class="p">(</i>quot <i class="p">(</i>.maxMemory rt<i class="p">)</i> <i class="n">1048576</i><i class="p">)</i><i class="p">}</i><i class="p">)</i><i class="p">)</i><i class="p">)</i>
 
 <i class="p">(</i><i class="k">def</i> handler
   <i class="p">(</i><i class="k">proxy</i> <i class="p">[</i>HttpHandler<i class="p">]</i> <i class="p">[</i><i class="p">]</i>
