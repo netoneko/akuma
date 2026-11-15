@@ -23,15 +23,7 @@
     ['out', '{hl}listening on :8080{/}', 300],
     ['wait', 700],
     ['cmd', 'curl http://localhost:8080/', 'host'],
-    ['out', 'Hello from Clojure 1.12.0 on Akuma/denver', 120],
-    ['out', 'path:   /', 60],
-    ['out', 'hit:    1', 60],
-    ['out', 'java:   21.0.11 (amd64)', 60],
-    ['out', 'cpus:   1', 60],
-    ['out', 'heap:   742 MiB max', 60],
-    ['wait', 600],
-    ['cmd', 'curl http://localhost:8080/json', 'host'],
-    ['out', '{"server":"clojure 1.12.0","hits":2,"java":"21.0.11","cpus":1}', 120],
+    ['out', '{"server":"clojure 1.12.0","hit":1,"java":"21.0.11","arch":"amd64","cpus":1,"heap_mib":742}', 160],
     ['wait', 1800]
   ];
   var MAXLINES = 17, lines = [], gen = 0;

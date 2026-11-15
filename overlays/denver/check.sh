@@ -12,7 +12,7 @@ trap 'kill $QP 2>/dev/null || true' EXIT
 t=0
 while [ "$t" -lt "${WAIT:-600}" ]; do
     body=$(curl -fsS --max-time 5 "http://localhost:$PORT/" 2>/dev/null || true)
-    case "$body" in *"Hello from Clojure"*) echo "$body"; echo "RESULT PASS"; exit 0 ;; esac
+    case "$body" in *'"server":"clojure'*) echo "$body"; echo "RESULT PASS"; exit 0 ;; esac
     kill -0 $QP 2>/dev/null || { echo "QEMU exited early; console tail:"; tail -c 800 "$LOG"; echo "RESULT FAIL"; exit 1; }
     sleep 5; t=$((t + 5))
 done

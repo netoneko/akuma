@@ -20,9 +20,7 @@ Both architectures build and boot (`ARCH=aarch64` or `ARCH=amd64`, default amd64
 runner each take it. On aarch64 the JVM runs with plain 64-bit pointers (`-XX:-UseCompressedClassPointers
 -XX:-UseCompressedOops`, set by `run.sh`), because the kernel ignores mmap address hints.
 
-Expected: `Hello from Clojure 1.12.0 on Akuma/denver`, a hit counter, the JVM version and the cpu
-and heap sizes; `curl http://localhost:8080/json` answers the same as JSON.
-`overlays/denver/check.sh` runs the whole boot-and-curl for you and prints `RESULT PASS` or `RESULT FAIL`.
+Expected: one line of JSON: `{"server":"clojure 1.12.0","hit":1,"java":"21...","arch":"...","cpus":1,"heap_mib":...}`.
 
 ## What you need
 
@@ -51,7 +49,7 @@ The disk is attached with `snapshot=on`, so a run never modifies the image.
 
 ## Verify
 
-`overlays/denver/check.sh` exits 0 and prints `RESULT PASS` when `curl` got `Hello from Clojure` from the guest.
+`overlays/denver/check.sh` exits 0 and prints `RESULT PASS` when `curl` got the JSON from the guest.
 
 ## Background
 

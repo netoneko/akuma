@@ -6,43 +6,21 @@
 
 (def hits (atom 0))
 
-(defn facts [path]
+(defn body []
   (let [rt (Runtime/getRuntime)]
-    {:path    path
-     :hit     (swap! hits inc)
-     :clojure (clojure-version)
-     :java    (System/getProperty "java.version")
-     :arch    (System/getProperty "os.arch")
-     :cpus    (.availableProcessors rt)
-     :heap    (quot (.maxMemory rt) 1048576)}))
-
-(defn text [{:keys [path hit clojure java arch cpus heap]}]
-  (format "Hello from Clojure %s on Akuma/denver
-path:   %s
-hit:    %d
-java:   %s (%s)
-cpus:   %d
-heap:   %d MiB max
-" clojure path hit java arch cpus heap))
-
-(defn json [{:keys [hit clojure java cpus]}]
-  (format "{\"server\":\"clojure %s\",\"hits\":%d,\"java\":\"%s\",\"cpus\":%d}\n"
-          clojure hit java cpus))
-
-(defn reply [ex status ctype body]
-  (let [bytes (.getBytes ^String body "UTF-8")]
-    (.add (.getResponseHeaders ex) "Content-Type" ctype)
-    (.sendResponseHeaders ex status (count bytes))
-    (with-open [out (.getResponseBody ex)]
-      (.write out bytes))))
+    (format "{\"server\":\"clojure %s\",\"hit\":%d,\"java\":\"%s\",\"arch\":\"%s\",\"cpus\":%d,\"heap_mib\":%d}\n"
+            (clojure-version) (swap! hits inc)
+            (System/getProperty "java.version") (System/getProperty "os.arch")
+            (.availableProcessors rt) (quot (.maxMemory rt) 1048576))))
 
 (def handler
   (proxy [HttpHandler] []
     (handle [ex]
-      (let [info (facts (.getPath (.getRequestURI ex)))]
-        (if (= "/json" (:path info))
-          (reply ex 200 "application/json" (json info))
-          (reply ex 200 "text/plain; charset=utf-8" (text info)))))))
+      (let [bytes (.getBytes ^String (body) "UTF-8")]
+        (.add (.getResponseHeaders ex) "Content-Type" "application/json")
+        (.sendResponseHeaders ex 200 (count bytes))
+        (with-open [out (.getResponseBody ex)]
+          (.write out bytes))))))
 
 (doto (HttpServer/create (InetSocketAddress. 8080) 0)
   (.createContext "/" handler)
