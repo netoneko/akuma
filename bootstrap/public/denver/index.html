@@ -82,6 +82,7 @@ _/                                    \_     Beans System Debauchery:
   <h1>A platform kernel,<br>assembled from crates.</h1>
   <p class="lead">How to build a KVM kernel for Java, Clojure, Scala and Groovy with open source and open weights: 24 hour practical joke from early 2000s</p>
   <div class="top">
+<a href="https://github.com/netoneko">Kirill Maksimov</a>
     <a href="https://akuma.sh/">akuma.sh</a>
     <a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a>
     
@@ -106,12 +107,32 @@ _/                                    \_     Beans System Debauchery:
  ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
          .--+**%@@@@@%@@%%@@%*       :-.
                   ::::---#@%%*</pre>
+
   <div>
   <p class="lead"><a href="https://github.com/netoneko/akuma">Akuma</a> is a bare-metal kernel written in Rust. It is Linux ABI-compatible, runs on aarch64 and amd64, and is released under the BSD 2-clause license.</p>
+  </div>
+  </div>
   <p>Akuma runs on real hardware with real drivers. It serves as a basis for other, more experimental kernels that look at what open-weight models can do in open-source kernel development and systems programming. Akuma is a self-hosting kernel, which means it builds itself: rustc and cargo run on Akuma and compile Akuma's own source. <a href="https://akuma.sh/self-hosting-rust-kernel">Here is the talk</a> presented at <a href="https://">rust.org.il</a> in November 2026.</p>
   <p>It is built from small host-tested crates, and amd64 includes its own hypervisor, which is what Denver runs on.</p>
+</section>
+
+<section class="slide">
+  <span class="tag">the guest</span>
+  <h2>Denver, the KVM guest kernel</h2>
+  <div class="cols logo">
+  <pre class="mark" aria-label="Akuma logo">   /\        /\        /\        /\        /\
+  /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
+ /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
+_/                                    \_     Beans System Debauchery:
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       kernel for Clojure</pre>
+  <div>
+  <p class="lead">Denver is a Rust kernel that can run on bare metal via KVM. It reuses Akuma's crates to present a smaller surface still providing OS level isolation.</p>
   </div>
   </div>
+  <p>After finishing with a Rust crate for kernel that can run a specific platform, Tokio runtime, I remembered about all these fun languages that were released in 2000s after JVM got generics and fast reflection and other cool stuff, and tried to estimate how much code would it take to take <code>akuma-tokio-kernel</code> to the next level and build a new crate, <code>akuma-jvm-kernel</code>? My guess was 2-3k lines, not more than 5k. It took about 1750 lines of code to make it happen.</p>
+  <p>All the work was performed by <code>GLM-5.3-Flash</code> mostly in autoresearch mode, methodology and runbooks are available on GitHub.</p>
+  <p>Autoresearch loop did require human intervention a couple of times but mostly to set up a test environment and to save tokens.</p>
+  <p>All work was performed on Akuma kernel running on a Ryzen amd64 laptop with a <code>goose</code> agentic harness. Denver kernel builds were built with nigtly Rust and Cargo on Akuma and tested as KVM guests.</p>
 </section>
 
 <section class="slide">
@@ -145,15 +166,14 @@ akuma-tokio-kernel      the platform: tokio on bare metal
     <div><b>~24 h</b><span>bare kernel to a JVM</span></div>
     <div><b>JDK 21</b><span>HotSpot, G1, C1 + C2</span></div>
     <div><b>8</b><span>defects found and fixed</span></div>
-    <div><b>~1,750</b><span>auditable lines of kernel Rust, all behind off-by-default features</span></div>
-    <div><b>2</b><span>platforms: the Clojure server runs on aarch64 and amd64</span></div>
+    <div><b>~1,750</b><span>auditable lines of kernel Rust, all behind off-by-default features added to existing composable kernel infrastructure</span></div>
+    <div><b>aarch64+amd64</b><span>2 platforms: the Clojure server runs on both</span></div>
     <div><b>48</b><span>lines in the two crates Denver adds: the binary and the front crate</span></div>
     <div><b>2.4 MiB</b><span>the whole kernel, one ELF</span></div>
     <div><b>KVM</b><span>as a guest of Akuma's own hypervisor, on real AMD Ryzen metal</span></div>
     <div><b>+3</b><span>Clojure, Scala, Groovy on the javac kernel, no extra fix</span></div>
   </div>
   <p>javac compiles inside the guest and its output is identical to the host's. Clojure, Scala and Groovy compile and run. A Clojure HTTP server answers from outside, from a fresh kernel under KVM on metal.</p>
-  <p class="dim">One run, one model, one box: an experiment report, not a benchmark.</p>
 </section>
 
 <section class="slide">
