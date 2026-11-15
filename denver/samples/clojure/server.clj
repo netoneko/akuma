@@ -6,33 +6,48 @@
 
 (def hits (atom 0))
 
-(defn reply [ex status ctype ^String body]
-  (let [bs (.getBytes body "UTF-8")]
+(defn facts [path]
+  (let [rt (Runtime/getRuntime)]
+    {:path    path
+     :hit     (swap! hits inc)
+     :clojure (clojure-version)
+     :java    (System/getProperty "java.version")
+     :arch    (System/getProperty "os.arch")
+     :cpus    (.availableProcessors rt)
+     :heap    (quot (.maxMemory rt) 1048576)}))
+
+(defn text [{:keys [path hit clojure java arch cpus heap]}]
+  (format "Hello from Clojure %s on Akuma/denver
+path:   %s
+hit:    %d
+java:   %s (%s)
+cpus:   %d
+heap:   %d MiB max
+" clojure path hit java arch cpus heap))
+
+(defn json [{:keys [hit clojure java cpus]}]
+  (format "{\"server\":\"clojure %s\",\"hits\":%d,\"java\":\"%s\",\"cpus\":%d}\n"
+          clojure hit java cpus))
+
+(defn reply [ex status ctype body]
+  (let [bytes (.getBytes ^String body "UTF-8")]
     (.add (.getResponseHeaders ex) "Content-Type" ctype)
-    (.sendResponseHeaders ex status (count bs))
-    (with-open [o (.getResponseBody ex)] (.write o bs))))
+    (.sendResponseHeaders ex status (count bytes))
+    (with-open [out (.getResponseBody ex)]
+      (.write out bytes))))
 
 (def handler
   (proxy [HttpHandler] []
     (handle [ex]
-      (let [n (swap! hits inc)
-            path (.getPath (.getRequestURI ex))
-            rt (Runtime/getRuntime)]
-        (if (= path "/json")
-          (reply ex 200 "application/json"
-                 (str "{\"server\":\"clojure " (clojure-version) "\",\"hits\":" n
-                      ",\"java\":\"" (System/getProperty "java.version") "\",\"cpus\":" (.availableProcessors rt) "}\n"))
-          (reply ex 200 "text/plain; charset=utf-8"
-                 (str "Hello from Clojure " (clojure-version) " on Akuma/denver\n"
-                      "path:   " path "\n"
-                      "hit:    " n "\n"
-                      "java:   " (System/getProperty "java.version") " (" (System/getProperty "os.arch") ")\n"
-                      "cpus:   " (.availableProcessors rt) "\n"
-                      "heap:   " (quot (.maxMemory rt) 1048576) " MiB max\n")))))))
+      (let [info (facts (.getPath (.getRequestURI ex)))]
+        (if (= "/json" (:path info))
+          (reply ex 200 "application/json" (json info))
+          (reply ex 200 "text/plain; charset=utf-8" (text info)))))))
 
-(let [srv (HttpServer/create (InetSocketAddress. 8080) 0)]
-  (.createContext srv "/" handler)
-  (.start srv)
-  (println "listening on :8080")
-  (flush)
-  @(promise))
+(doto (HttpServer/create (InetSocketAddress. 8080) 0)
+  (.createContext "/" handler)
+  (.start))
+
+(println "listening on :8080")
+(flush)
+@(promise)

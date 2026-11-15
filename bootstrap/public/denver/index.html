@@ -164,36 +164,51 @@ _/                                    \_     Beans System Debauchery:
 
 <i class="p">(</i><i class="k">def</i> hits <i class="p">(</i>atom <i class="n">0</i><i class="p">)</i><i class="p">)</i>
 
-<i class="p">(</i><i class="k">defn</i> reply <i class="p">[</i>ex status ctype ^String body<i class="p">]</i>
-  <i class="p">(</i><i class="k">let</i> <i class="p">[</i>bs <i class="p">(</i>.getBytes body <i class="s">&quot;UTF-8&quot;</i><i class="p">)</i><i class="p">]</i>
+<i class="p">(</i><i class="k">defn</i> facts <i class="p">[</i>path<i class="p">]</i>
+  <i class="p">(</i><i class="k">let</i> <i class="p">[</i>rt <i class="p">(</i>Runtime/getRuntime<i class="p">)</i><i class="p">]</i>
+    <i class="p">{</i>:path    path
+     :hit     <i class="p">(</i><i class="k">swap!</i> hits inc<i class="p">)</i>
+     :clojure <i class="p">(</i>clojure-version<i class="p">)</i>
+     :java    <i class="p">(</i>System/getProperty <i class="s">&quot;java.version&quot;</i><i class="p">)</i>
+     :arch    <i class="p">(</i>System/getProperty <i class="s">&quot;os.arch&quot;</i><i class="p">)</i>
+     :cpus    <i class="p">(</i>.availableProcessors rt<i class="p">)</i>
+     :heap    <i class="p">(</i>quot <i class="p">(</i>.maxMemory rt<i class="p">)</i> <i class="n">1048576</i><i class="p">)</i><i class="p">}</i><i class="p">)</i><i class="p">)</i>
+
+<i class="p">(</i><i class="k">defn</i> text <i class="p">[</i><i class="p">{</i>:keys <i class="p">[</i>path hit clojure java arch cpus heap<i class="p">]</i><i class="p">}</i><i class="p">]</i>
+  <i class="p">(</i><i class="k">format</i> <i class="s">&quot;Hello from Clojure %s on Akuma/denver
+path:   %s
+hit:    %d
+java:   %s (%s)
+cpus:   %d
+heap:   %d MiB max
+&quot;</i> clojure path hit java arch cpus heap<i class="p">)</i><i class="p">)</i>
+
+<i class="p">(</i><i class="k">defn</i> json <i class="p">[</i><i class="p">{</i>:keys <i class="p">[</i>hit clojure java cpus<i class="p">]</i><i class="p">}</i><i class="p">]</i>
+  <i class="p">(</i><i class="k">format</i> <i class="s">&quot;{\&quot;server\&quot;:\&quot;clojure %s\&quot;,\&quot;hits\&quot;:%d,\&quot;java\&quot;:\&quot;%s\&quot;,\&quot;cpus\&quot;:%d}\n&quot;</i>
+          clojure hit java cpus<i class="p">)</i><i class="p">)</i>
+
+<i class="p">(</i><i class="k">defn</i> reply <i class="p">[</i>ex status ctype body<i class="p">]</i>
+  <i class="p">(</i><i class="k">let</i> <i class="p">[</i>bytes <i class="p">(</i>.getBytes ^String body <i class="s">&quot;UTF-8&quot;</i><i class="p">)</i><i class="p">]</i>
     <i class="p">(</i>.add <i class="p">(</i>.getResponseHeaders ex<i class="p">)</i> <i class="s">&quot;Content-Type&quot;</i> ctype<i class="p">)</i>
-    <i class="p">(</i>.sendResponseHeaders ex status <i class="p">(</i>count bs<i class="p">)</i><i class="p">)</i>
-    <i class="p">(</i><i class="k">with-open</i> <i class="p">[</i>o <i class="p">(</i>.getResponseBody ex<i class="p">)</i><i class="p">]</i> <i class="p">(</i>.write o bs<i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i>
+    <i class="p">(</i>.sendResponseHeaders ex status <i class="p">(</i>count bytes<i class="p">)</i><i class="p">)</i>
+    <i class="p">(</i><i class="k">with-open</i> <i class="p">[</i>out <i class="p">(</i>.getResponseBody ex<i class="p">)</i><i class="p">]</i>
+      <i class="p">(</i>.write out bytes<i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i>
 
 <i class="p">(</i><i class="k">def</i> handler
   <i class="p">(</i><i class="k">proxy</i> <i class="p">[</i>HttpHandler<i class="p">]</i> <i class="p">[</i><i class="p">]</i>
     <i class="p">(</i>handle <i class="p">[</i>ex<i class="p">]</i>
-      <i class="p">(</i><i class="k">let</i> <i class="p">[</i>n <i class="p">(</i><i class="k">swap!</i> hits inc<i class="p">)</i>
-            path <i class="p">(</i>.getPath <i class="p">(</i>.getRequestURI ex<i class="p">)</i><i class="p">)</i>
-            rt <i class="p">(</i>Runtime/getRuntime<i class="p">)</i><i class="p">]</i>
-        <i class="p">(</i><i class="k">if</i> <i class="p">(</i>= path <i class="s">&quot;/json&quot;</i><i class="p">)</i>
-          <i class="p">(</i>reply ex <i class="n">200</i> <i class="s">&quot;application/json&quot;</i>
-                 <i class="p">(</i><i class="k">str</i> <i class="s">&quot;{\&quot;server\&quot;:\&quot;clojure &quot;</i> <i class="p">(</i>clojure-version<i class="p">)</i> <i class="s">&quot;\&quot;,\&quot;hits\&quot;:&quot;</i> n
-                      <i class="s">&quot;,\&quot;java\&quot;:\&quot;&quot;</i> <i class="p">(</i>System/getProperty <i class="s">&quot;java.version&quot;</i><i class="p">)</i> <i class="s">&quot;\&quot;,\&quot;cpus\&quot;:&quot;</i> <i class="p">(</i>.availableProcessors rt<i class="p">)</i> <i class="s">&quot;}\n&quot;</i><i class="p">)</i><i class="p">)</i>
-          <i class="p">(</i>reply ex <i class="n">200</i> <i class="s">&quot;text/plain; charset=utf-8&quot;</i>
-                 <i class="p">(</i><i class="k">str</i> <i class="s">&quot;Hello from Clojure &quot;</i> <i class="p">(</i>clojure-version<i class="p">)</i> <i class="s">&quot; on Akuma/denver\n&quot;</i>
-                      <i class="s">&quot;path:   &quot;</i> path <i class="s">&quot;\n&quot;</i>
-                      <i class="s">&quot;hit:    &quot;</i> n <i class="s">&quot;\n&quot;</i>
-                      <i class="s">&quot;java:   &quot;</i> <i class="p">(</i>System/getProperty <i class="s">&quot;java.version&quot;</i><i class="p">)</i> <i class="s">&quot; (&quot;</i> <i class="p">(</i>System/getProperty <i class="s">&quot;os.arch&quot;</i><i class="p">)</i> <i class="s">&quot;)\n&quot;</i>
-                      <i class="s">&quot;cpus:   &quot;</i> <i class="p">(</i>.availableProcessors rt<i class="p">)</i> <i class="s">&quot;\n&quot;</i>
-                      <i class="s">&quot;heap:   &quot;</i> <i class="p">(</i>quot <i class="p">(</i>.maxMemory rt<i class="p">)</i> <i class="n">1048576</i><i class="p">)</i> <i class="s">&quot; MiB max\n&quot;</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i>
+      <i class="p">(</i><i class="k">let</i> <i class="p">[</i>info <i class="p">(</i>facts <i class="p">(</i>.getPath <i class="p">(</i>.getRequestURI ex<i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">]</i>
+        <i class="p">(</i><i class="k">if</i> <i class="p">(</i>= <i class="s">&quot;/json&quot;</i> <i class="p">(</i>:path info<i class="p">)</i><i class="p">)</i>
+          <i class="p">(</i>reply ex <i class="n">200</i> <i class="s">&quot;application/json&quot;</i> <i class="p">(</i>json info<i class="p">)</i><i class="p">)</i>
+          <i class="p">(</i>reply ex <i class="n">200</i> <i class="s">&quot;text/plain; charset=utf-8&quot;</i> <i class="p">(</i>text info<i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i><i class="p">)</i>
 
-<i class="p">(</i><i class="k">let</i> <i class="p">[</i>srv <i class="p">(</i>HttpServer/create <i class="p">(</i>InetSocketAddress. <i class="n">8080</i><i class="p">)</i> <i class="n">0</i><i class="p">)</i><i class="p">]</i>
-  <i class="p">(</i>.createContext srv <i class="s">&quot;/&quot;</i> handler<i class="p">)</i>
-  <i class="p">(</i>.start srv<i class="p">)</i>
-  <i class="p">(</i><i class="k">println</i> <i class="s">&quot;listening on :8080&quot;</i><i class="p">)</i>
-  <i class="p">(</i><i class="k">flush</i><i class="p">)</i>
-  @<i class="p">(</i><i class="k">promise</i><i class="p">)</i><i class="p">)</i></code></pre>
+<i class="p">(</i><i class="k">doto</i> <i class="p">(</i>HttpServer/create <i class="p">(</i>InetSocketAddress. <i class="n">8080</i><i class="p">)</i> <i class="n">0</i><i class="p">)</i>
+  <i class="p">(</i>.createContext <i class="s">&quot;/&quot;</i> handler<i class="p">)</i>
+  <i class="p">(</i>.start<i class="p">)</i><i class="p">)</i>
+
+<i class="p">(</i><i class="k">println</i> <i class="s">&quot;listening on :8080&quot;</i><i class="p">)</i>
+<i class="p">(</i><i class="k">flush</i><i class="p">)</i>
+@<i class="p">(</i><i class="k">promise</i><i class="p">)</i></code></pre>
 </section>
 
 <section class="slide">
