@@ -195,6 +195,51 @@ _/                                    \_     Beans System Debauchery:
 </section>
 
 <section class="slide">
+  <span class="tag">why</span>
+  <h2>Why run Scala on a Rust kernel?</h2>
+  <p class="lead">Sometimes you just need more types.</p>
+  <p class="dim">The same server in Scala 2.13, on the same JDK's HTTP server: a lambda is the handler, string interpolation builds the JSON.
+  Source: <a href="https://github.com/netoneko/akuma/blob/main/denver/samples/scala/Server.scala">denver/samples/scala/Server.scala</a>.</p>
+  <pre class="src"><code><i class="k">import</i> com.sun.net.httpserver.<i class="p">{</i>HttpExchange, HttpServer<i class="p">}</i>
+<i class="k">import</i> java.net.InetSocketAddress
+
+<i class="k">object</i> Server <i class="k">extends</i> <i class="k">App</i> <i class="p">{</i>
+  <i class="k">var</i> hits = <i class="n">0</i>
+
+  <i class="k">def</i> json<i class="p">(</i>fields: Seq<i class="p">[</i><i class="p">(</i>String, Any<i class="p">)</i><i class="p">]</i><i class="p">)</i>: String =
+    fields.map <i class="p">{</i>
+      <i class="k">case</i> <i class="p">(</i>k, v: String<i class="p">)</i> =&gt; <i class="s">s&quot;&quot;&quot;&quot;$k&quot;:&quot;$v&quot;&quot;&quot;&quot;</i>
+      <i class="k">case</i> <i class="p">(</i>k, v<i class="p">)</i>         =&gt; <i class="s">s&quot;&quot;&quot;&quot;$k&quot;:$v&quot;&quot;&quot;</i>
+    <i class="p">}</i>.mkString<i class="p">(</i><i class="s">&quot;{&quot;</i>, <i class="s">&quot;,&quot;</i>, <i class="s">&quot;}\n&quot;</i><i class="p">)</i>
+
+  <i class="k">def</i> body: String = <i class="p">{</i>
+    hits += <i class="n">1</i>
+    <i class="k">val</i> rt = Runtime.getRuntime
+    json<i class="p">(</i>Seq<i class="p">(</i>
+      <i class="s">&quot;server&quot;</i>   -&gt; <i class="s">s&quot;scala ${scala.util.Properties.versionNumberString}&quot;</i>,
+      <i class="s">&quot;hit&quot;</i>      -&gt; hits,
+      <i class="s">&quot;os&quot;</i>       -&gt; sys.props<i class="p">(</i><i class="s">&quot;os.version&quot;</i><i class="p">)</i>,
+      <i class="s">&quot;vm&quot;</i>       -&gt; sys.props<i class="p">(</i><i class="s">&quot;java.vm.name&quot;</i><i class="p">)</i>,
+      <i class="s">&quot;java&quot;</i>     -&gt; sys.props<i class="p">(</i><i class="s">&quot;java.version&quot;</i><i class="p">)</i>,
+      <i class="s">&quot;arch&quot;</i>     -&gt; sys.props<i class="p">(</i><i class="s">&quot;os.arch&quot;</i><i class="p">)</i>,
+      <i class="s">&quot;cpus&quot;</i>     -&gt; rt.availableProcessors,
+      <i class="s">&quot;heap_mib&quot;</i> -&gt; rt.maxMemory / <i class="n">1048576</i><i class="p">)</i><i class="p">)</i>
+  <i class="p">}</i>
+
+  <i class="k">val</i> server = HttpServer.create<i class="p">(</i><i class="k">new</i> InetSocketAddress<i class="p">(</i><i class="n">8080</i><i class="p">)</i>, <i class="n">0</i><i class="p">)</i>
+  server.createContext<i class="p">(</i><i class="s">&quot;/&quot;</i>, <i class="p">(</i>ex: HttpExchange<i class="p">)</i> =&gt; <i class="p">{</i>
+    <i class="k">val</i> bytes = body.getBytes<i class="p">(</i><i class="s">&quot;UTF-8&quot;</i><i class="p">)</i>
+    ex.getResponseHeaders.add<i class="p">(</i><i class="s">&quot;Content-Type&quot;</i>, <i class="s">&quot;application/json&quot;</i><i class="p">)</i>
+    ex.sendResponseHeaders<i class="p">(</i><i class="n">200</i>, bytes.length<i class="p">)</i>
+    ex.getResponseBody.write<i class="p">(</i>bytes<i class="p">)</i>
+    ex.close<i class="p">(</i><i class="p">)</i>
+  <i class="p">}</i><i class="p">)</i>
+  server.start<i class="p">(</i><i class="p">)</i>
+  println<i class="p">(</i><i class="s">&quot;listening on :8080&quot;</i><i class="p">)</i>
+<i class="p">}</i></code></pre>
+</section>
+
+<section class="slide">
   <span class="tag">the idea</span>
   <h2>A kernel is a manifest</h2>
   <p>Denver adds almost no kernel code of its own. One binary crate and one front crate choose, by feature name, which existing crates make up the kernel. Every feature is off by default, so the default build never changes.</p>
