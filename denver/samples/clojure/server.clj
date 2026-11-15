@@ -1,5 +1,7 @@
 ;; A standard HTTP server on the JDK's own com.sun.net.httpserver, written in Clojure.
-;; Run in a denver guest:  java -cp clojure-1.12.0.jar:spec.alpha-0.5.238.jar:core.specs.alpha-0.4.74.jar clojure.main server.clj
+;; Run in a denver guest:
+;;   java -cp clojure-1.12.0.jar:spec.alpha-0.5.238.jar:core.specs.alpha-0.4.74.jar \
+;;        clojure.main server.clj
 ;; Then from outside (guest port 8080 forwarded by the VM spec):  curl http://<host>:8080/
 (require 'clojure.string)
 (import '(com.sun.net.httpserver HttpServer HttpHandler)
@@ -14,6 +16,8 @@
   (let [rt (Runtime/getRuntime)]
     (json {:server   (str "clojure " (clojure-version))
            :hit      (swap! hits inc)
+           :os       (System/getProperty "os.version")
+           :vm       (System/getProperty "java.vm.name")
            :java     (System/getProperty "java.version")
            :arch     (System/getProperty "os.arch")
            :cpus     (.availableProcessors rt)

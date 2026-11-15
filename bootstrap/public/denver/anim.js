@@ -23,7 +23,7 @@
     ['out', '{hl}listening on :8080{/}', 300],
     ['wait', 700],
     ['cmd', 'curl http://localhost:8080/', 'host'],
-    ['out', '{"server":"clojure 1.12.0","hit":1,"java":"21.0.11","arch":"amd64","cpus":1,"heap_mib":742}', 160],
+    ['out', '{"server":"clojure 1.12.0","hit":1,"os":"0.1.0-7e530f21-denver","vm":"OpenJDK 64-Bit Server VM","java":"21.0.11","arch":"amd64","cpus":1,"heap_mib":742}', 160],
     ['wait', 1800]
   ];
   var MAXLINES = 17, lines = [], gen = 0;
