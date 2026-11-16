@@ -64,6 +64,9 @@
 )]
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+extern crate alloc;
+
+use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_arch = "aarch64")]
@@ -761,7 +764,7 @@ pub fn copy_to_user_upper_half(dst_user: u64, src: &[u8]) -> Result<(), Errno> {
 ///
 /// Lives here rather than in `src/syscall/` because this is the crate that owns
 /// user-memory access; the syscall layer re-exports it.
-pub fn read_user_byte(ptr: u64) -> Result<u8, Errno> {
+fn read_user_byte(ptr: u64) -> Result<u8, Errno> {
     let mut b: u8 = 0;
     // SAFETY: the destination is one byte of a live local. The user side is covered
     // by the recovery trampoline, which turns a fault into `Err` instead of taking
@@ -770,6 +773,79 @@ pub fn read_user_byte(ptr: u64) -> Result<u8, Errno> {
         return Err(EFAULT);
     }
     Ok(b)
+}
+
+/// A NUL-terminated user string as read by [`read_user_cstr`].
+pub struct UserCStr {
+    /// The bytes before the NUL (or the first `max_len` bytes when none was found).
+    pub bytes: Vec<u8>,
+    /// Whether a NUL ended the string within `max_len`.
+    pub terminated: bool,
+}
+
+/// Read a NUL-terminated string from user memory, at most `max_len` bytes.
+///
+/// This is the only caller `read_user_byte` was ever meant for, and it is private for that reason: a byte walk has
+/// no range to validate up front, so the walk itself must refuse what a range check would. It does, once per page it
+/// enters, and **uses the answer** on AArch64. The kernel's RAM is mapped below `USER_VA_LIMIT` in every address space
+/// as EL1-only blocks, and the byte read runs at EL1, so it does not fault on them: a discarded validation result let
+/// a path argument name a kernel address (`symlinkat(<kernel va>, ..)` then `readlink` read it back). The same hole
+/// was open in the rump proxy's `copyinstr`, which walked bytes with no per-page check at all.
+///
+/// amd64 keeps the old shape: its kernel half is above `USER_VA_LIMIT`, SMAP faults a ring-0 read of a supervisor
+/// page into the fixup, and its lazy pages are filled by the fault the byte read takes, which the walk does not model.
+///
+/// The null page is refused even under `BYPASS_VALIDATION`: the bypass lets the boot self-tests pass *kernel*
+/// buffers, and no kernel buffer lives in page 0. On amd64 page 0 reads as zeros in ring 0, so a waived check turned
+/// `openat(AT_FDCWD, NULL)` into `openat(AT_FDCWD, "")` and opened the cwd.
+///
+/// `max_len` is a kernel-side bound the caller chose; the heap only grows as bytes are actually read.
+pub fn read_user_cstr(ptr: u64, max_len: usize) -> Result<UserCStr, Errno> {
+    let bypass = BYPASS_VALIDATION.load(Ordering::Acquire);
+    if ptr < 0x1000 || (!bypass && ptr >= USER_VA_LIMIT) {
+        return Err(EFAULT);
+    }
+    let mut bytes = Vec::new();
+    let mut len = 0usize;
+    while len < max_len {
+        let addr = ptr.checked_add(len as u64).ok_or(EFAULT)?;
+        if !bypass && addr >= USER_VA_LIMIT {
+            return Err(EFAULT);
+        }
+        // One walk per page the string enters (the first byte, then each page boundary).
+        if !bypass
+            && cfg!(target_arch = "aarch64")
+            && (len == 0 || addr.trailing_zeros() >= 12)
+            && !validate_user_range(addr, 1, Prefault::Yes)
+        {
+            return Err(EFAULT);
+        }
+        let c = read_user_byte(addr)?;
+        if c == 0 {
+            return Ok(UserCStr { bytes, terminated: true });
+        }
+        bytes.try_reserve(1).map_err(|_| Errno::new(akuma_primitives::errno::ENOMEM))?;
+        bytes.push(c);
+        len += 1;
+    }
+    Ok(UserCStr { bytes, terminated: false })
+}
+
+/// Read exactly `len` bytes from user memory into a new `Vec`, refusing a length over `max` before any allocation.
+///
+/// The one spelling of "a user-chosen length sizes a kernel buffer": the bound is an argument, the allocation is
+/// fallible (`try_reserve_exact`, so a heap that cannot supply it is `ENOMEM`, not `handle_alloc_error`, which halts
+/// the kernel), and the range is validated before it is copied. `E2BIG` past `max`. Never `vec![0u8; n]` with an `n`
+/// userspace chose.
+pub fn read_user_vec(src_user: u64, len: usize, max: usize) -> Result<Vec<u8>, Errno> {
+    if len > max {
+        return Err(Errno::new(akuma_primitives::errno::E2BIG));
+    }
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).map_err(|_| Errno::new(akuma_primitives::errno::ENOMEM))?;
+    v.resize(len, 0);
+    copy_from_user(&mut v, src_user)?;
+    Ok(v)
 }
 
 /// Write one ABI value out to user memory. The length is `size_of::<T>()`, which

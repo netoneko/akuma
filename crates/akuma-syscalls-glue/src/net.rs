@@ -1254,10 +1254,7 @@ fn read_scm_rights(msg: &MsgHdr) -> Result<super::unixsock::InFlight, u64> {
     if !validate_user_ptr(msg.msg_control, len) {
         return Err(EFAULT);
     }
-    let mut control = alloc::vec![0u8; len];
-    if copy_from_user(&mut control, msg.msg_control).is_err() {
-        return Err(EFAULT);
-    }
+    let Ok(control) = read_user_vec(msg.msg_control, len, MAX_CONTROL as usize) else { return Err(EFAULT) };
     let fds = akuma_net_unix::scm::parse_rights(&control).map_err(neg_errno)?;
     if fds.is_empty() {
         return Ok(super::unixsock::InFlight::none());
@@ -1811,10 +1808,7 @@ pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> 
     // A host name is at most 253 bytes; the length sizes a kernel buffer.
     if path_len > 255 { return EINVAL; }
     if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
-    let mut kernel_path = alloc::vec![0u8; path_len];
-    if copy_from_user(&mut kernel_path, path_ptr).is_err() {
-        return EFAULT;
-    }
+    let Ok(kernel_path) = read_user_vec(path_ptr, path_len, 255) else { return EFAULT };
     let host = core::str::from_utf8(&kernel_path).unwrap_or("");
     match akuma_net::dns::resolve_host_blocking(host) {
         Ok(ipv4) => {

@@ -44,7 +44,7 @@ silent.** Two families of fallible helper meet in `src/syscall/`:
 
 | helper | lives in | `Err` carries |
 |---|---|---|
-| `copy_from_user_str`, `copy_from_user_byte` | `src/syscall/mod.rs` | **negated** (`-14`) |
+| `copy_from_user_str` | `akuma-syscalls-glue` | **negated** (`-14`) |
 | `copy_from_user`, `copy_to_user`, `read_user_into`, `write_user_val`, … | `akuma_exec::mmu::user_access` | **positive** (`14`) |
 
 The second is deliberate and documented at its definition — *"`x0 = -errno`

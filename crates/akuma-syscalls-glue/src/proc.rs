@@ -1790,10 +1790,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
         // kernel buffer; unbounded, `cwd_len = usize::MAX` was a capacity-overflow
         // panic, which halts the kernel.
         if o.cwd_len > 4096 { return Err(EINVAL); }
-        let mut kernel_cwd = alloc::vec![0u8; o.cwd_len];
-        if copy_from_user(&mut kernel_cwd, o.cwd_ptr).is_err() {
-            return Err(EFAULT);
-        }
+        let Ok(kernel_cwd) = read_user_vec(o.cwd_ptr, o.cwd_len, 4096) else { return Err(EFAULT) };
         Some(alloc::string::String::from_utf8(kernel_cwd).unwrap_or_else(|_| String::from("/")))
     } else {
         None
@@ -1812,10 +1809,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
 
     let stdin_data = if o.stdin_ptr != 0 {
         if o.stdin_len > SPAWN_STDIN_MAX { return Err(E2BIG); }
-        let mut data = alloc::vec![0u8; o.stdin_len];
-        if copy_from_user(&mut data, o.stdin_ptr).is_err() {
-            return Err(EFAULT);
-        }
+        let Ok(data) = read_user_vec(o.stdin_ptr, o.stdin_len, SPAWN_STDIN_MAX) else { return Err(EFAULT) };
         Some(data)
     } else {
         None

@@ -40,7 +40,7 @@
 //!
 //! | was, here | is, there |
 //! |---|---|
-//! | `copy_from_user_safe` byte loop | `akuma_exec::process::user_access::read_user_byte` |
+//! | `copy_from_user_safe` byte loop | `akuma_exec::process::user_access::read_user_cstr` (the byte read is private) |
 //! | `map_user_page` + hand-rolled frame tracking | `UserAddressSpace::map_user_page_tracked` |
 //! | `phys_to_virt` + `slice::from_raw_parts` | `akuma_mmu::copy_from_phys` / `copy_to_phys` |
 //! | `msr tpidr_el0` | `akuma_cpu::sysreg::set_tpidr_el0` |
@@ -97,7 +97,7 @@ use spinning_top::Spinlock;
 // `docs/archive/UNSAFE_AUDIT.md` §4 P0.
 pub use akuma_exec::process::user_access::{
     Prefault, as_user_bytes, as_user_bytes_mut, copy_from_user, copy_to_user,
-    copy_to_user_with, read_user_byte, read_user_into, read_user_into_with,
+    copy_to_user_with, read_user_into, read_user_vec, read_user_into_with,
     write_user_val, write_user_val_with,
 };
 // The excursion shape crate: which counter bucket a number falls in, which
@@ -407,7 +407,7 @@ pub type SysResult = Result<u64, u64>;
 /// **Two families of `Result<_, u64>` meet in this module and their `Err`
 /// values have opposite signs.**
 ///
-/// - This module's own helpers — [`copy_from_user_str`], [`copy_from_user_byte`]
+/// - This module's own helpers — [`copy_from_user_str`]
 ///   — carry the **negated** form, because they are written for syscall arms.
 /// - `akuma_exec::process::user_access`'s helpers (`copy_from_user`,
 ///   `read_user_into`, `write_user_val`, …) carry the **positive** form. That
@@ -497,69 +497,16 @@ fn validate_user_ptr(ptr: u64, len: usize) -> bool {
 /// Measurement helpers for this layer — see [`utils`].
 pub mod utils;
 
-/// Read a single byte from user memory.
+/// Read a NUL-terminated string from user memory, at most `max_len` bytes; `EINVAL` if it is longer or not UTF-8.
 ///
-/// The raw `copy_from_user_safe` this used to wrap moved into
-/// [`akuma_exec::process::user_access::read_user_byte`], which is the crate that owns
-/// user-memory access — the last `unsafe` block in `src/syscall/` that was about
-/// *reaching* user memory rather than editing a page table.
-///
-/// Kept as a named alias because the name says which caller it exists for:
-/// [`copy_from_user_str`], which walks a NUL-terminated string one byte at a time.
-/// The length of such a string is not known until it has been read, so there is no
-/// range to validate up front; the string reader supplies the bound (its own
-/// `max_len` and the VA limit) and the fault trampoline supplies the mapped-ness.
-pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
-    read_user_byte(ptr).map_err(akuma_primitives::errno::Errno::ret)
-}
-
+/// The walk lives in `akuma_user_access::read_user_cstr`, which is the crate that owns user-memory access and the only
+/// caller of the byte read; see there for the per-page validation it must honour.
 pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
-    let limit = user_va_limit();
-    // The null page is refused even under `BYPASS_VALIDATION`: the bypass lets the
-    // boot self-tests pass *kernel* buffers, and no kernel buffer lives in page 0.
-    // On amd64 page 0 reads as zeros in ring 0, so a waived check turned
-    // `openat(AT_FDCWD, NULL)` into `openat(AT_FDCWD, "")` and opened the cwd.
-    if ptr < 0x1000 { return Err(EFAULT); }
-    if !BYPASS_VALIDATION.load(Ordering::Acquire) && ptr >= limit { return Err(EFAULT); }
-    let mut bytes = Vec::new();
-    let mut len = 0;
-    while len < max_len {
-        let addr = ptr + len as u64;
-        if !BYPASS_VALIDATION.load(Ordering::Acquire) && addr >= limit {
-            return Err(EFAULT);
-        }
-        // Each page the string enters is faulted in here, one walk per page:
-        // a kernel that will not fill a lazy *file* page from a ring-0 fault
-        // (Taoxichuan - the fault may arrive with filesystem state held) would
-        // otherwise answer `EFAULT` for a path in an image's `.rodata`. A page
-        // that cannot be filled is left to the byte read to refuse.
-        if (len == 0 || addr.trailing_zeros() >= 12) && !BYPASS_VALIDATION.load(Ordering::Acquire) {
-            let page_ok = validate_user_ptr(addr, 1);
-            // On AArch64 the answer is binding. The kernel's own RAM is mapped
-            // below `USER_VA_LIMIT` in every address space as EL1-only blocks,
-            // and the byte read below runs at EL1: it does not fault on them. A
-            // discarded `false` here let any path argument name a kernel address
-            // (`symlinkat(<kernel va>, ..)` then `readlink` read it back). The
-            // validator's walk tests EL0 access, so `false` is `EFAULT`.
-            //
-            // x86_64 keeps the old shape: its kernel half is above the limit
-            // checked at the top of the loop, SMAP faults a ring-0 read of a
-            // supervisor page into the fixup, and its lazy pages are filled by
-            // the fault the byte read takes, which this walk does not model.
-            if cfg!(target_arch = "aarch64") && !page_ok {
-                return Err(EFAULT);
-            }
-        }
-        let c = copy_from_user_byte(addr)?;
-        if c == 0 { break; }
-        bytes.push(c);
-        len += 1;
-    }
-    if len == max_len {
+    let s = akuma_exec::process::user_access::read_user_cstr(ptr, max_len).map_err(akuma_primitives::errno::Errno::ret)?;
+    if !s.terminated {
         return Err(EINVAL);
     }
-    
-    if let Ok(s) = core::str::from_utf8(&bytes) { Ok(String::from(s)) } else {
+    if let Ok(s) = String::from_utf8(s.bytes) { Ok(s) } else {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
         }

@@ -663,15 +663,13 @@ impl ClientMem for ProcMem {
 
     fn copyinstr(&mut self, addr: u64, max: usize, out: &mut Vec<u8>) -> Result<(), i32> {
         out.clear();
-        for i in 0..max.min(MAX_TRANSFER) {
-            let Ok(byte) = crate::syscall::copy_from_user_byte(addr + i as u64) else {
-                return Err(NETBSD_EFAULT);
-            };
-            let b = [byte];
-            out.push(b[0]);
-            if b[0] == 0 {
-                break;
-            }
+        // The shared walk validates each page it enters; the byte-at-a-time read this used to do did not.
+        let Ok(s) = akuma_exec::process::user_access::read_user_cstr(addr, max.min(MAX_TRANSFER)) else {
+            return Err(NETBSD_EFAULT);
+        };
+        out.extend_from_slice(&s.bytes);
+        if s.terminated {
+            out.push(0);
         }
         Ok(())
     }

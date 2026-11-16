@@ -6,15 +6,8 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
     if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
 
-    let mut name_buf = alloc::vec![0u8; name_len];
-    let mut root_buf = alloc::vec![0u8; root_len];
-
-    if copy_from_user(&mut name_buf, name_ptr).is_err() {
-        return EFAULT;
-    }
-    if copy_from_user(&mut root_buf, root_ptr).is_err() {
-        return EFAULT;
-    }
+    let Ok(name_buf) = read_user_vec(name_ptr, name_len, 256) else { return EFAULT };
+    let Ok(root_buf) = read_user_vec(root_ptr, root_len, 4096) else { return EFAULT };
 
     let name = core::str::from_utf8(&name_buf).unwrap_or("unknown");
     let root = core::str::from_utf8(&root_buf).unwrap_or("/");
@@ -355,15 +348,8 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     if !validate_user_ptr(target_ptr, target_len) { return Err(EFAULT); }
     if !validate_user_ptr(fstype_ptr, fstype_len) { return Err(EFAULT); }
 
-    let mut target_buf = alloc::vec![0u8; target_len];
-    let mut fstype_buf = alloc::vec![0u8; fstype_len];
-    
-    if copy_from_user(&mut target_buf, target_ptr).is_err() {
-        return Err(EFAULT);
-    }
-    if copy_from_user(&mut fstype_buf, fstype_ptr).is_err() {
-        return Err(EFAULT);
-    }
+    let Ok(target_buf) = read_user_vec(target_ptr, target_len, 4096) else { return Err(EFAULT) };
+    let Ok(fstype_buf) = read_user_vec(fstype_ptr, fstype_len, 64) else { return Err(EFAULT) };
 
     // Same reason as sys_mount: mount points are matched literally.
     let target = akuma_vfs_glue::canonicalize_path(core::str::from_utf8(&target_buf).unwrap_or(""));

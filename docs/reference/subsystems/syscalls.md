@@ -47,7 +47,8 @@ exists, and is very likely what you want:
 | you need to | call |
 |---|---|
 | read/write user memory | `copy_from_user` / `copy_to_user` / `write_user_val` / `read_user_into` — the folded API, re-exported from `mod.rs` |
-| read a NUL-terminated user string of unknown length | `copy_from_user_str`, or `read_user_byte` for one byte |
+| read a NUL-terminated user string of unknown length | `copy_from_user_str` (`akuma_user_access::read_user_cstr` below it) |
+| read a user-sized buffer into the kernel | `read_user_vec(ptr, len, max)`: bounded, fallible allocation; never `vec![0u8; n]` |
 | map a page into the caller's address space | `Process::with_address_space` + `UserAddressSpace::map_user_page_tracked{,_no_flush}` — it tracks the frames and refuses a VA that is not this address space's |
 | read or write a physical frame's bytes | `akuma_mmu::copy_from_phys` / `copy_to_phys` — bounds-checked against PMM-managed RAM |
 | set userspace's TLS base | `akuma_cpu::sysreg::set_tpidr_el0` |
@@ -145,7 +146,7 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
     allocation, or a blocking wait. `UNSAFE_AUDIT.md` §4.0 lists every surviving
     call and which of those three reasons it is there for.
   - The raw `copy_{to,from}_user_safe` are the byte loop plus a fault trampoline and
-    check **nothing**; the only deliberate caller left is `copy_from_user_byte`
+    check **nothing**; the only deliberate caller left is `read_user_cstr` (via `read_user_byte`, now private)
     (NUL-terminated strings have no range to validate up front).
   - **The range check tests the leaf PTE's AP bits, not mere presence** (since
     2026-08-14). Kernel RAM is identity-mapped EL1-only into every user address
