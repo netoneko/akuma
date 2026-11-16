@@ -2459,6 +2459,14 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
                 }
                 return Err(ENOENT);
             }
+            // A parent that exists and is not a directory: Linux refuses the
+            // open with `ENOTDIR`. This used to hand out a descriptor for
+            // `open("file/x", O_CREAT)` and fail at the first `write`, the wrong
+            // call, which is how a tar extraction through a file-typed path
+            // component reported a write error instead of a create error.
+            if parent_path != "/" && akuma_vfs_glue::metadata(&parent_path).is_ok_and(|m| !m.is_dir) {
+                return Err(ENOTDIR);
+            }
         }
         super::perm::check_create(&path)?;
     } else {
@@ -2502,7 +2510,11 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         }
 
         if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
-            let _ = akuma_vfs_glue::fs::write_file(&path, &[]);
+            // A create that fails is the open failing. The result was dropped,
+            // so the caller got a descriptor naming a file that was never made.
+            if let Err(e) = akuma_vfs_glue::fs::write_file(&path, &[]) {
+                return Err(fs_error_to_errno(e));
+            }
             // `mode & ~umask`, as Linux applies it. The umask was not applied
             // here before credentials existed (only `mkdirat` used it), so a
             // `creat(f, 0666)` came out world-writable.
