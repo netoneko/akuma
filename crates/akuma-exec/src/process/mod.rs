@@ -1513,9 +1513,13 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     let tgid = table::with_process(my_pid, |p| p.tgid).unwrap_or(my_pid);
 
     let mut siblings: Vec<(Pid, Option<usize>)> = Vec::new();
+    // The recorded incarnation of each sibling, in the same order: the deferred kill below is an effect that happens after
+    // the snapshot, so it goes through `ThreadRef::with_live` and cannot land on a recycled slot.
+    let mut sibling_refs: Vec<Option<akuma_threading::ThreadRef>> = Vec::new();
     table::for_each_process(|p| {
         if p.pid != my_pid && p.tgid == tgid {
             siblings.push((p.pid, p.thread_id.get_live()));
+            sibling_refs.push(p.thread_id.thread_ref());
         }
     });
     // Who is tearing down which group, ungated. A group kill is rare and always
@@ -1574,7 +1578,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     // build stays byte-for-byte unchanged.
     #[cfg(kernel_bkl_smp)]
     {
-        for (sib_pid, sib_tid) in &siblings {
+        for ((sib_pid, sib_tid), sib_ref) in siblings.iter().zip(sibling_refs.iter()) {
             if let Some(tid) = sib_tid {
                 // Ownership test before posting the kill: a sibling that died before
                 // this group kill even started keeps its recorded `thread_id`, and by
@@ -1583,7 +1587,12 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                 // posting to a recycled slot aims at an innocent thread. Same rule as
                 // the grace-expiry hard kill below.
                 if grace_kill_should_terminate(*sib_pid, *tid) {
-                    crate::threading::request_thread_kill(*tid);
+                    // `with_live`: the ownership test above and this post are not atomic; the slot could be recycled
+                    // between them. With the recorded incarnation, a recycled slot is refused here.
+                    match sib_ref {
+                        Some(r) => { let _ = r.with_live(crate::threading::request_thread_kill); }
+                        None => crate::threading::request_thread_kill(*tid),
+                    }
                 }
             }
         }

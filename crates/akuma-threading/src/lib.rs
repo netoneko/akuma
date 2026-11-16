@@ -546,6 +546,29 @@ pub fn thread_generation(tid: usize) -> u64 {
     }
 }
 
+/// Per-slot count of [`ThreadRef::with_live`] sections currently running. A slot's rebirth ([`begin_rebirth`]) bumps the
+/// generation and then waits for this to reach zero before it touches any of the slot's state, which is what makes
+/// `with_live` a proof and not a check: while it runs, the slot cannot be scrubbed or handed to a new occupant.
+static SLOT_PINS: [AtomicU32; MAX_THREADS] = {
+    const INIT: AtomicU32 = AtomicU32::new(0);
+    [INIT; MAX_THREADS]
+};
+
+/// Start a slot's next incarnation: bump the generation so every [`ThreadRef`] for the old one is refused from now on, then
+/// wait until no `with_live` section that was admitted under the old generation is still running.
+///
+/// The two halves are a Dekker pair with [`ThreadRef::with_live`] (which pins, then reads the generation); all four
+/// operations are `SeqCst`, so at least one side sees the other: either `with_live` reads the new generation and runs
+/// nothing, or this sees the pin and waits. Only the claim path's winning `FREE`/`TERMINATED`→`INITIALIZING` CAS calls
+/// this, once per rebirth. The wait is bounded by the section: `with_live` bodies are short, hold no blocking lock, and run
+/// with IRQs masked on their own core, so no section can be descheduled while this spins.
+fn begin_rebirth(slot: usize) {
+    SLOT_GEN[slot].fetch_add(1, Ordering::SeqCst);
+    while SLOT_PINS[slot].load(Ordering::SeqCst) != 0 {
+        core::hint::spin_loop();
+    }
+}
+
 /// Bits of a [`ThreadRef`] that hold the tid. `MAX_THREADS` is 256 (64 on
 /// host), so 16 bits leaves the upper 48 for the generation — at a pathological
 /// million spawns/second that wraps after ~9 years of uptime.
@@ -584,6 +607,29 @@ impl ThreadRef {
     #[must_use]
     pub const fn from_raw(raw: u64) -> Self {
         Self(raw)
+    }
+
+    /// Run `f(slot)` only if this incarnation is still the slot's, and **guarantee the slot is not reborn while `f` runs**.
+    ///
+    /// `is_current()` followed by an action is a race: the generation bump is lock-free, so the slot can be recycled between
+    /// the check and the act, and the act lands on the next occupant (the stale-tid incident class). Here the check and the
+    /// act are one section: the slot is pinned, the generation is read, `f` runs, the pin is dropped; a rebirth that starts
+    /// meanwhile bumps the generation and then waits for the pin ([`begin_rebirth`]) before it scrubs anything. `None` means
+    /// the incarnation was already gone and `f` did not run.
+    ///
+    /// `f` must be short and must not block, sleep, yield, spawn or claim a slot, or take a lock a claim path might hold:
+    /// a rebirth spins on it. IRQs are masked on this core for the duration, so `f` cannot be preempted. Do the effect
+    /// here (set a flag, stamp an exit, queue a signal) and do any waiting outside.
+    pub fn with_live<R>(self, f: impl FnOnce(usize) -> R) -> Option<R> {
+        let tid = self.tid();
+        if tid >= MAX_THREADS {
+            return None;
+        }
+        let _irq = IrqGuard::new();
+        SLOT_PINS[tid].fetch_add(1, Ordering::SeqCst);
+        let r = if SLOT_GEN[tid].load(Ordering::SeqCst) == self.generation() { Some(f(tid)) } else { None };
+        SLOT_PINS[tid].fetch_sub(1, Ordering::SeqCst);
+        r
     }
 
     /// The reference to the calling thread's incarnation.
@@ -1378,6 +1424,11 @@ fn get_current_thread_register() -> usize {
 fn scrub_thread_slot(i: usize) {
     if i >= MAX_THREADS { return; }
 
+    // New incarnation: every ThreadRef minted for the previous occupant goes stale here, and any `with_live` section still
+    // running against it is waited out BEFORE anything below is cleared. Exactly one bumper per rebirth: scrub runs under
+    // the claim path's winning CAS.
+    begin_rebirth(i);
+
     // Signal state. A stale mask or restore-mask is invisible until a signal is
     // *not* delivered, which reads as a hang rather than an error.
     PENDING_SIGNALS[i].store(0, Ordering::Release);
@@ -1418,11 +1469,6 @@ fn scrub_thread_slot(i: usize) {
     // (a stale expected-L0 would flag the new occupant's first switch as a mismatch).
     EXPECTED_L0[i].store(0, Ordering::Release);
     SWITCH_INS[i].store(0, Ordering::Relaxed);
-
-    // New incarnation: every ThreadRef minted for the previous occupant goes
-    // stale here, before the new occupant is observable. Exactly one bumper per
-    // rebirth — scrub runs under the claim path's winning FREE→INITIALIZING CAS.
-    SLOT_GEN[i].fetch_add(1, Ordering::AcqRel);
 
     // Diagnostics. Stale values here are not a correctness bug but a *debugging* one:
     // `[THR-DUMP]`/`[PSTATS]` would attribute the previous occupant's syscall and core
@@ -2697,14 +2743,9 @@ pub fn claim_slot() -> Option<usize> {
             PICK_HITS[slot].store(0, Ordering::Relaxed);
             PICK_SKIP_ONCPU[slot].store(0, Ordering::Relaxed);
             PICK_SKIP_CANRUN[slot].store(0, Ordering::Relaxed);
-            // The generation is what makes a `ThreadRef` for the *previous*
-            // occupant inert. Bumped here — under the winning CAS, before
-            // anything can hold a handle to the new occupant — which is the
-            // same "exactly one bumper per rebirth" rule `scrub_thread_slot`
-            // follows on the AArch64 claim paths. Without it a futex or pipe
-            // waiter that outlived its thread would spend its wake on whoever
-            // inherits the slot.
-            SLOT_GEN[slot].fetch_add(1, Ordering::AcqRel);
+            // The generation bump that makes a `ThreadRef` for the *previous* occupant inert happened in
+            // `scrub_thread_slot` above (`begin_rebirth`), which also waited out any `ThreadRef::with_live` section;
+            // exactly one bump per rebirth. This path used to bump a second time here.
             return Some(slot);
         }
     }
@@ -5769,6 +5810,59 @@ mod state_transition_guard_tests {
 
         WOKEN_STATES[tid].store(false, Ordering::SeqCst);
         WAKE_TIMES[tid].store(0, Ordering::SeqCst);
+        release_test_thread_slot(tid);
+    }
+
+    /// `with_live` is a proof, not a check: while its closure runs, a rebirth of the slot that starts meanwhile bumps the
+    /// generation and then **waits** before it scrubs anything, so the closure's writes to per-slot state survive until it
+    /// returns and the rebirth cannot return before it does.
+    #[test]
+    fn with_live_holds_off_a_rebirth_until_the_section_ends() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicBool;
+        crate::test_support::ensure_test_runtime();
+        let tid = claim_free_slot(37, 38).expect("slot 37 is this test's");
+        let r = ThreadRef::of_live_tid(tid);
+        let started = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+        let (s2, f2) = (started.clone(), finished.clone());
+        let worker = std::thread::spawn(move || {
+            r.with_live(|slot| {
+                // Per-slot state the rebirth's scrub would clear.
+                PENDING_SIGNALS[slot].store(0xAA, Ordering::SeqCst);
+                s2.store(true, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                let survived = PENDING_SIGNALS[slot].load(Ordering::SeqCst) == 0xAA;
+                f2.store(true, Ordering::SeqCst);
+                survived
+            })
+        });
+        while !started.load(Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+        // The slot's thread "dies" and the slot is claimed again while the section is running.
+        release_test_thread_slot(tid);
+        let tid2 = claim_free_slot(37, 38).expect("re-claim of slot 37");
+        assert!(finished.load(Ordering::SeqCst), "the rebirth returned before the with_live section ended");
+        assert_eq!(tid, tid2);
+        assert_eq!(worker.join().unwrap(), Some(true), "the section's per-slot write was scrubbed under it");
+        assert!(!r.is_current(), "after the rebirth the old reference is stale");
+        assert_eq!(r.with_live(|_| ()), None, "and with_live refuses it");
+        assert_eq!(PENDING_SIGNALS[tid].load(Ordering::SeqCst), 0, "the scrub ran once the section ended");
+        release_test_thread_slot(tid);
+    }
+
+    /// A reference for the current incarnation runs; one from before a rebirth does not.
+    #[test]
+    fn with_live_runs_for_the_current_incarnation_and_refuses_a_stale_one() {
+        crate::test_support::ensure_test_runtime();
+        let tid = claim_free_slot(36, 37).expect("slot 36 is this test's");
+        let old = ThreadRef::of_live_tid(tid);
+        assert_eq!(old.with_live(|slot| slot), Some(tid));
+        release_test_thread_slot(tid);
+        claim_free_slot(36, 37).expect("re-claim of slot 36");
+        assert_eq!(old.with_live(|_| unreachable!("a stale reference must not run")), None);
+        assert_eq!(ThreadRef::of_live_tid(tid).with_live(|slot| slot), Some(tid));
         release_test_thread_slot(tid);
     }
 

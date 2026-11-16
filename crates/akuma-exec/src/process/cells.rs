@@ -117,6 +117,21 @@ impl OptTidCell {
         let r = akuma_threading::ThreadRef::from_raw(raw);
         r.is_current().then(|| r.tid())
     }
+    /// The recorded incarnation, whether or not it is still current: what to hold when the effect happens later than the
+    /// observation (it is `ThreadRef::with_live` that decides, at the moment of the effect).
+    #[inline]
+    #[must_use]
+    pub fn thread_ref(&self) -> Option<akuma_threading::ThreadRef> {
+        let raw = self.0.load(Ordering::Acquire);
+        (raw != NONE).then(|| akuma_threading::ThreadRef::from_raw(raw))
+    }
+    /// Run `f(slot)` only while the recorded incarnation is still the slot's, with the slot guaranteed not to be reborn
+    /// until `f` returns (`ThreadRef::with_live`: short, non-blocking effects only). `None` if the cell is empty or its
+    /// thread is gone.
+    #[inline]
+    pub fn with_live<R>(&self, f: impl FnOnce(usize) -> R) -> Option<R> {
+        self.thread_ref()?.with_live(f)
+    }
     /// Record `v` as live now (its current generation).
     #[inline]
     pub fn set(&self, v: Option<usize>) {
@@ -233,6 +248,16 @@ mod opt_tid_cell_tests {
         assert_eq!(c.get_live(), None);
         c.set(Some(7));
         assert_eq!((c.get(), c.get_live()), (Some(7), Some(7)));
+    }
+
+    #[test]
+    fn with_live_runs_for_a_live_cell_and_not_for_an_empty_one() {
+        let c = OptTidCell::new_live(Some(4));
+        assert_eq!(c.with_live(|slot| slot + 100), Some(104));
+        assert!(c.thread_ref().is_some());
+        c.set(None);
+        assert_eq!(c.with_live(|_| unreachable!("an empty cell has no thread")), None);
+        assert!(c.thread_ref().is_none());
     }
 
     #[test]

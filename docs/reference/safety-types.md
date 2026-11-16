@@ -78,14 +78,27 @@ count and an end within `2^48`, checked at construction; `sys_mprotect` uses it 
 The architecture's own user limit (47 bits on amd64) is still the caller's check against `end()`. **Open:** the other ~90
 page-math sites (`akuma-mmap`, `akuma-mmu`, `akuma-exec`) belong to wave 4 of `typed-addresses.md`, not a second sweep.
 
-### `ThreadRef` (`akuma-threading`) and `OptTidCell::get_live` — §5
-`WakeHandle` generalised and renamed (`WakeHandle` is an alias). `Process::thread_id` is stored as a packed `ThreadRef`, so
-slot and generation are read atomically. `get_live()` answers `None` for a recycled slot. Used where the tid is *acted on*
-or reported: `kill_process`, `kill_process_with_signal`, `kill_thread_group`, the SIGCHLD target choice, `group_cpu_time_us`
-and the procfs `cpu_time`/`processor` fields (each could previously attribute another process's thread to the wrong one).
-Left on `get()`: the table's own staleness test (`unregister_process`, which compares against `THREAD_PID_MAP`), diagnostics,
-and the exit path's own current thread. **Limit:** a check followed by an action is still a race (the
-generation bump is lock-free); the window is one load instead of the process's lifetime.
+### `ThreadRef`, `with_live` and `OptTidCell` (`akuma-threading`, `akuma-exec`) — §5
+`WakeHandle` generalised and renamed (`WakeHandle` is an alias). `Process::thread_id` is stored as a packed `ThreadRef`, so slot
+and generation are read atomically.
+
+- **`get_live()`** answers `None` for a recycled slot: a check, used where the tid is *reported* (`group_cpu_time_us`, the
+  procfs `cpu_time`/`processor` fields, the SIGCHLD target choice) or collected for later.
+- **`ThreadRef::with_live(f)`** is a *proof*: it pins the slot, checks the generation, runs `f(slot)`, unpins. A rebirth of the
+  slot (`scrub_thread_slot` → `begin_rebirth`) bumps the generation and then **waits for the pins to drain before it clears
+  anything**; a Dekker pair, all `SeqCst`. So an effect inside `f` cannot land on the next occupant. `f` must be short and must
+  not block, yield, spawn, claim a slot, or take a lock a claim path may hold (a rebirth spins on it); IRQs are masked on the
+  core for the duration. Used for `interrupt_thread` in `kill_process`/`kill_process_with_signal` and for the deferred
+  `request_thread_kill` in `kill_thread_group` (which carries each sibling's recorded `ThreadRef` through its 2-second grace
+  wait). `OptTidCell::{thread_ref, with_live}` are the cell-level forms.
+- Also fixed: the x86 claim path bumped the generation a second time after `scrub_thread_slot` had; one bump per rebirth now.
+- **Tests:** `with_live_holds_off_a_rebirth_until_the_section_ends` runs a section on a second thread while the slot is
+  released and re-claimed, and asserts the section's per-slot write survives and the rebirth returns only after the section
+  ends. Mutation-checked: with the wait removed from `begin_rebirth` it fails ("the rebirth returned before the with_live
+  section ended"). It runs on the host; it has not been exercised on real SMP hardware.
+- **Not converted:** `kill_process_with_signal`'s per-thread loop over `all_tids` (plain tids guarded by `slot_still_owned_by`),
+  and the grace-expiry hard terminate, whose effect (`mark_thread_terminated`) is not the short non-blocking kind `with_live`
+  allows. The 60 `slot: usize` functions in `akuma-threading` and a distinct `Pid` type are unchanged.
 
 ### `IrqSpinlock` (`akuma-irq-lock`) — §9
 A new crate, because `akuma-primitives` takes no dependencies and this needs `spinning_top`. `lock()` masks IRQs, then
@@ -178,8 +191,8 @@ host ports are unprivileged, and the active toolchain's `rust-objcopy` on `PATH`
 
 ## Open work (what the report listed that is not done)
 
-3. **§5** the 60 `slot: usize` functions in `akuma-threading`; a distinct `Pid` type; a real `with_live` that holds the slot
-   state lock. Without it, a generation check followed by an action is a race with a one-load window.
+3. **§5** the 60 `slot: usize` functions in `akuma-threading` and a distinct `Pid` type; converting the remaining acting sites
+   to `with_live` where their effect fits its contract.
 4. **§8** the 189 untyped user-pointer parameters (classified below; the other 21 matches are validators or not user pointers). And deleting `BYPASS_VALIDATION` outright: it is compiled out of `no-tests`
    images now (below), but the boot self-tests still use it at ~125 sites that pass kernel buffers as user pointers; each needs
    a real user mapping instead (`proposals/FUTURE_WORK.md`).
