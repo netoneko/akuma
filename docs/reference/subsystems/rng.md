@@ -13,6 +13,26 @@ duplicated here.
 > this doc's grading bar wants for an A. No churn since (`fix clippy`,
 > Jun 19, was repo-wide and mechanical).
 
+## The pool every reader goes through
+
+Nothing reads a device's bytes directly. `getrandom`, `/dev/urandom`, `AT_RANDOM` and the network
+stack's seed all read `akuma_primitives::rng::fill_bytes`, which is a ChaCha20 pool:
+
+- seeded with 32 bytes from the registered source on first use, and from `RNDR` as well on an
+  AArch64 core that has it;
+- mixed with a fresh read of the source on every call, and ratcheted after every call;
+- lock-free (atomics only), so it is usable from interrupt context.
+
+**Invariants.** An unseeded pool answers nothing: `getrandom` is `EIO`, never a weaker value.
+A source failing after seeding does not fail the caller. A machine with no source (no virtio-rng,
+no `RNDR`, no `RDRAND`) has no entropy, and says so on the console at boot. The one stated
+exception is the network stack on such a machine, which falls back to a counter mixed with the
+timer so sequence numbers differ between boots; nothing else is served from it.
+
+Sources by machine: virtio-rng (plus `RNDR` when present) under a VMM on AArch64; `RNDR` alone on
+AArch64 with no virtio-rng; `RDRAND` on amd64. Background:
+[`../../archive/SECURITY_AUDIT_2026_11_16.md`](../../archive/SECURITY_AUDIT_2026_11_16.md) C3.
+
 ## What it is
 
 A minimal, standalone VirtIO MMIO driver (`:1-11`) — not the `virtio-drivers`

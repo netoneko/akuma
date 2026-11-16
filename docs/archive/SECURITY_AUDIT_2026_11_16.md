@@ -1,6 +1,48 @@
 # Security audit before an EC2 AMI (2026-11-16)
 
-**Status: OPEN.** Nothing in this document is fixed yet. It is the work list.
+**Status: PARTLY FIXED (2026-11-16).** The findings below are as written at audit time. What
+has landed since, and what is still open, is in the next section.
+
+## Status
+
+Fixed on branch `ouch` (each verified as stated in its commit message):
+
+| Finding | Commit | How it was checked |
+|---|---|---|
+| C1, C2 sshd key material | `41559adb` | builds; hook tests. **Not** exercised against a live client with the new binary |
+| C3 kernel entropy pool, M2 TCP seed and first ephemeral port | `31badd58` | RFC 8439 vector and pool host tests; AArch64 QEMU boot, `/dev/urandom` differs per read |
+| H2, M9 host-root gate (`caller_is_host_root`) | `f9c13a54` | AArch64 QEMU: root keeps clock and mount; uid 1000 refused `date -s`, `mount`, `/dev/vda`, `reboot -f` |
+| M7 validation bypass sealed before init | `ed65401d` | AArch64 QEMU boot suite unchanged |
+| New: path strings must be EL0-readable (AArch64 kernel memory read through path arguments) | `c4a34af6` | boot suite and path syscalls; **the exploit probe itself was not run** |
+| New: caller-chosen lengths sized infallible kernel allocations (unprivileged halt) | `c4a34af6` | `dd` from `/dev/zero` and `/dev/urandom`, pipes, `getdents`; the halt was not reproduced first |
+| New: amd64 `reboot` had no gate at all | `f9c13a54` | build only; not booted on amd64 |
+| `akuma-slot-table::with_active_mut` aliasing (`UNSAFE_SITE_REDUCTION.md` §3) | `7f35af4f` | nine kernel configurations build; AArch64 boot suite unchanged |
+| Allocator canary unaligned reads (same §3) | `7f35af4f` | build only; the code is dead while canaries are off |
+
+Not verified anywhere yet: every amd64 change above has been built but not booted, and nothing
+has run on the ryzen (the sanity run found it booted into another OS and stopped).
+
+Still open:
+
+- **H1** one privilege level (DAC default, sshd user switching, services off uid 0).
+- **H3** no ASLR.
+- **H4** instance identity (first-boot key fetch, no baked host key, metadata service).
+- **H5** no packet filter; no privileged-port check on `bind`.
+- **H6** `apk add --allow-untrusted` in the AWS image build.
+- **M1** sshd rekeying, per-source limits, key file modes; **M3** quotas; **M4** panic triage;
+  **M5** speculative-execution mitigations; **M6** AArch64 PAN; **M8** build the AMI with `server`.
+- Every host key generated before `41559adb` must be regenerated; the fix does not rotate them.
+- From `UNSAFE_SITE_REDUCTION.md` §3: the `akuma_switch` functions that are safe to call but
+  whose obligations are doc-only. It is wider than the three named there:
+  `build_closure_context`, `write_frame_word`, `setup_fake_irq_frame` and `irq_frame_at` take a
+  bare stack address the same way. The fix that fits is a per-slot stack registry
+  (`bind` by the code that allocates the stack, every accessor takes the slot and is
+  bounds-checked against it), and it touches the context-switch path, so it needs its own
+  measured change. `akuma-pagetable`'s amd64 `read_user`/`write_user` can move into `akuma-phys`
+  (which already depends on `akuma-pagetable`) for one site fewer; left because only the
+  Taoxichuan kernels call them and they could not be boot-tested here.
+- No boot-suite test pins the host-root gate or the bounded allocations yet; both were checked
+  by hand over ssh.
 
 **Question asked:** what has to be patched before Akuma can be published as an Amazon machine
 image and exposed to the internet?
