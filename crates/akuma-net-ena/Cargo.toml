@@ -1,0 +1,8 @@
+[package]
+name = "akuma-net-ena"
+version = "0.1.0"
+edition = "2024"
+description = "Amazon ENA device protocol"
+
+[lints]
+workspace = true
