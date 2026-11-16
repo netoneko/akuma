@@ -190,6 +190,11 @@ cannot be swapped with a length or an fd) and the call sites, not the arithmetic
   unreachable from the other, and after a fork every frame visible in two spaces is read-only, CoW-marked/counted ≥ 2, while an
   unrelated third process is untouched. These read page tables and frames; they do not execute a user read from a second
   process.
+- **Mutation-checked (2026-11-17), each reverted afterwards.** aarch64 under QEMU: skipping the parent's read-only demotion in
+  `cow_share_and_demote_range` fails it ("a frame mapped in two processes is writable in one of them"); making two unrelated spaces
+  map the test's page 3 to one frame fails it ("two unrelated processes share a physical frame", plus its knock-on checks).
+  amd64 under KVM: the same shared-frame mutation in `map_page` fails five of its checks, and dropping the CoW marker in
+  `map_page_pte` fails "every frame in two spaces is read-only, CoW-marked and counted" (and 13 fork tests).
 - Host unit tests: `Errno` (incl. `from_negated`), `FileKey`, `Pages`/`PageRange`, `IrqSpinlock`, `SpawnBox`, `munmap_len`,
   `mremap::plan`, `ThreadRef` (packed round trip; stale after a slot's rebirth) and `OptTidCell` (`get` vs `get_live`). The crates
   above `akuma-mmu` build for the host since 2026-11-17 (`akuma-exec`: 112 of 114 pass; the two failures are old, see
@@ -207,8 +212,6 @@ host ports are unprivileged, and the active toolchain's `rust-objcopy` on `PATH`
    images now (below), but the boot self-tests still use it at ~125 sites that pass kernel buffers as user pointers; each needs
    a real user mapping instead (`proposals/FUTURE_WORK.md`).
 5. **§9** classifying and migrating the other static spinlocks.
-7. Mutation checks for the two isolation tests (break isolation on purpose, see them fail); they pass today, which is not
-   the same as proving they would catch a break.
 
 Out of scope on purpose, as in the report: newtypes for every id, `TidSlot` alone, lock ordering in types, may-allocate /
 may-sleep tokens, typed PTE flags (already planned), a canonical-path type for the VFS.
