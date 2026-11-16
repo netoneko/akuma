@@ -1757,6 +1757,15 @@ fn run_async_main() -> ! {
     // Address-space randomization for every program from init on, unless the
     // boot line says `aslr=0`. Off until here on purpose: the self-tests above
     // assert exact addresses (`akuma_primitives::aslr`).
+    // `dac=1`: owner/group/other mode bits are enforced from the first user
+    // program on, instead of waiting for someone to write `/proc/dac`. It is
+    // not the default because disks written while modes were ignored hold
+    // binaries with no execute bit, which root can no longer run once this is
+    // on (`docs/reference/subsystems/permissions.md`).
+    if akuma_params::Params::new(akuma_params::line(), "").value("dac") == Some("1") {
+        akuma_exec::dac::set_enforcing(true);
+        console::print("[Main] dac=1: file permissions are enforced\n");
+    }
     let aslr = akuma_params::Params::new(akuma_params::line(), "").value("aslr") != Some("0");
     akuma_primitives::aslr::set_enabled(aslr);
     if !aslr {

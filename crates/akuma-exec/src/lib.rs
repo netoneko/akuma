@@ -145,6 +145,8 @@ pub mod shm;
 /// `crate::box_registry::…` and `akuma_exec::process::box_*` call site resolves
 /// unchanged.
 pub use akuma_isolation::box_registry;
+/// The file-permission switch (`/proc/dac`, and `dac=1` on the boot line).
+pub use akuma_isolation::dac;
 #[cfg(target_os = "none")]
 pub mod kernel_tests;
 

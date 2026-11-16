@@ -410,6 +410,12 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
             boot::apply_runtime_flags(cmdline);
             // The self-tests are over; their user-pointer bypass is closed for good.
             akuma_user_access::seal_bypass();
+            // `dac=1`: file permissions enforced from init on (see the AArch64
+            // kernel's note on why it is not the default).
+            if akuma_params::Params::new(akuma_params::line(), "").value("dac") == Some("1") {
+                akuma_isolation::dac::set_enforcing(true);
+                crate::serial::puts("  [boot] dac=1: file permissions are enforced\n");
+            }
             // Randomize every image from init on unless the boot line says
             // `aslr=0`; off until here because the self-tests assert addresses.
             akuma_primitives::aslr::set_enabled(
