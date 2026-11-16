@@ -48,6 +48,11 @@ BOUNDARY_FILES = {
 BOUNDARY_FNS = {
     ("crates/akuma-syscalls-glue/src/lib.rs", "validate_user_ptr"),
     ("crates/akuma-syscalls-glue/src/lib.rs", "copy_from_user_str"),
+    ("crates/akuma-syscalls-ipc/src/lib.rs", "validate_user_ptr"),   # the ipc crate's copy of the same helper
+    ("crates/akuma-kernel-amd64/src/fd.rs", "copy_in"),              # amd64's user-copy helpers, beside uaccess.rs
+    ("crates/akuma-kernel-amd64/src/fd.rs", "copy_to_user"),
+    ("crates/akuma-kernel-amd64/src/fd.rs", "trace_user_cstr"),      # debug tracing of a user string
+    ("crates/akuma-kernel-amd64/src/usermode.rs", "trace_cstr"),
 }
 
 _walk = base.walk

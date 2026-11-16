@@ -643,7 +643,7 @@ pub fn retry_while_full<T>(mut f: impl FnMut() -> Result<T, &'static str>) -> Re
 }
 
 pub fn clone_thread(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
-    match retry_while_full(|| akuma_exec::process::clone_thread(stack, tls, parent_tid, child_tid, flags)) {
+    match retry_while_full(|| akuma_exec::process::clone_thread(stack, tls, UserAddr::new(parent_tid), UserAddr::new(child_tid), flags)) {
         Ok(tid) => {
             if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
                 akuma_primitives::tprint!(64, "[clone] new thread TID={}\n", tid);
@@ -745,9 +745,9 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             && akuma_exec::runtime::config().vfork_fastpath_enabled;
         let fork_result = retry_while_full(|| {
             if use_vfork_fastpath {
-                akuma_exec::process::vfork_process(child_pid, stack)
+                akuma_exec::process::vfork_process(child_pid, UserAddr::new(stack))
             } else {
-                akuma_exec::process::fork_process(child_pid, stack)
+                akuma_exec::process::fork_process(child_pid, UserAddr::new(stack))
             }
         });
         match fork_result {

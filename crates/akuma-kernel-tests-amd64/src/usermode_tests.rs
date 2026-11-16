@@ -317,7 +317,7 @@ pub fn spawn_test(t: &mut Suite) {
     let path = b"/bin/hello\0";
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, 0);
     if !t.check("spawn: sys_spawn returned a handle", r < ERRNO_FLOOR) {
         return;
     }
@@ -405,7 +405,7 @@ pub fn spawn_test(t: &mut Suite) {
             out.extend_from_slice(&buf[..n as usize]);
         }
         let mut st: i32 = -1;
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
@@ -484,7 +484,7 @@ pub fn winsize_to_child_test(t: &mut Suite) {
     let path = b"/bin/hello\0";
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, 0);
     if !t.check("winsize: spawned a child to describe a terminal to", r < ERRNO_FLOOR) {
         return;
     }
@@ -589,7 +589,7 @@ pub fn winsize_to_child_test(t: &mut Suite) {
         }
         let _ = k::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
         let mut st: i32 = -1;
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             break;
         }
         k::sched::yield_now();
@@ -649,7 +649,7 @@ pub fn session_terminal_is_private_test(t: &mut Suite) {
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
     // `SPAWN_FLAG_PTY`: the session shape, the one whose `^C` must be a signal.
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, SPAWN_FLAG_PTY);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, SPAWN_FLAG_PTY);
     if !t.check("session-term: spawned a pty child", r < ERRNO_FLOOR) {
         console_ts.lock().lflag = saved;
         return;
@@ -687,7 +687,7 @@ pub fn session_terminal_is_private_test(t: &mut Suite) {
         }
         let _ = k::fd::sys_read(stdout_fd, sink.as_mut_ptr() as u64, sink.len() as u64);
         let mut st: i32 = -1;
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             break;
         }
         k::sched::yield_now();
@@ -745,7 +745,7 @@ pub fn busybox_test(t: &mut Suite) {
         a2a.as_ptr() as u64,
         0,
     ];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, 0);
     if !t.check("busybox: spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -767,7 +767,7 @@ pub fn busybox_test(t: &mut Suite) {
             out.extend_from_slice(&buf[..n as usize]);
         }
         let mut st: i32 = -1;
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
@@ -810,7 +810,7 @@ pub fn execve_test(t: &mut Suite) {
     // have yet.
     let (a0, a1a, a2a) = (b"sh\0", b"-c\0", b"uname -a\0");
     let argv: [u64; 4] = [a0.as_ptr() as u64, a1a.as_ptr() as u64, a2a.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, 0);
     if !t.check("execve: sh spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -832,7 +832,7 @@ pub fn execve_test(t: &mut Suite) {
             out.extend_from_slice(&buf[..n as usize]);
         }
         let mut st: i32 = -1;
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
@@ -862,7 +862,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
     let path = b"/bin/sh\0";
     let (a0, adash) = (b"sh\0", b"-c\0");
     let argv: [u64; 4] = [a0.as_ptr() as u64, adash.as_ptr() as u64, cmd.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, 0);
     if r >= ERRNO_FLOOR {
         return None;
     }
@@ -884,7 +884,7 @@ fn run_sh_capture(cmd: &[u8]) -> Option<(u64, alloc::vec::Vec<u8>)> {
             out.extend_from_slice(&buf[..n as usize]);
         }
         let mut st: i32 = -1;
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }
@@ -941,7 +941,7 @@ pub fn closed_stdin_test(t: &mut Suite) {
     let argv: [u64; 3] = [a0.as_ptr() as u64, ai.as_ptr() as u64, 0];
     // A terminal on fd 0 (`SPAWN_FLAG_PTY`), or ash never starts its line editor
     // and reads without polling, which was never broken.
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, SPAWN_FLAG_PTY);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, SPAWN_FLAG_PTY);
     if r >= ERRNO_FLOOR {
         t.check("closed stdin: sh -i spawned", false);
         return;
@@ -966,7 +966,7 @@ pub fn closed_stdin_test(t: &mut Suite) {
     let mut st: i32 = -1;
     let mut reaped = false;
     for _ in 0..4_000_000u64 {
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             reaped = true;
             break;
         }
@@ -1336,7 +1336,7 @@ pub fn wait4_ownership_test(t: &mut Suite) {
 
     // No children yet: the answer must be ECHILD, not "block" and not ESRCH.
     let mut st: i32 = -1;
-    let r = sys_waitpid(u64::MAX, core::ptr::addr_of_mut!(st) as u64, 0);
+    let r = sys_waitpid(u64::MAX, akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0);
     t.check_eq("wait4: no children -> ECHILD", r, errno::ECHILD);
 
     if k::fs::read_file("/bin/hello").is_err() {
@@ -1349,7 +1349,7 @@ pub fn wait4_ownership_test(t: &mut Suite) {
     let path = b"/bin/hello\0";
     let arg0 = b"hello\0";
     let argv: [u64; 2] = [arg0.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, 0);
     if !t.check("wait4: child spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -1363,7 +1363,7 @@ pub fn wait4_ownership_test(t: &mut Suite) {
             break 0;
         }
         let mut st: i32 = -1;
-        let r = sys_waitpid(u64::MAX, core::ptr::addr_of_mut!(st) as u64, 0);
+        let r = sys_waitpid(u64::MAX, akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0);
         if r != 0 {
             break r;
         }
@@ -1376,7 +1376,7 @@ pub fn wait4_ownership_test(t: &mut Suite) {
     // fails on the pre-fix kernel: the caller's own row (or any other live
     // process) kept `exists` true, so this returned 0 and the caller parked.
     let mut st: i32 = -1;
-    let r = sys_waitpid(u64::MAX, core::ptr::addr_of_mut!(st) as u64, 0);
+    let r = sys_waitpid(u64::MAX, akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0);
     t.check_eq("wait4: after the last reap -> ECHILD again", r, errno::ECHILD);
 }
 
@@ -1392,7 +1392,7 @@ pub fn fork_test(t: &mut Suite) {
     let path = b"/bin/sh\0";
     let (a0, a1a, a2a) = (b"sh\0", b"-c\0", b"uname; echo DONE\0");
     let argv: [u64; 4] = [a0.as_ptr() as u64, a1a.as_ptr() as u64, a2a.as_ptr() as u64, 0];
-    let r = sys_spawn(path.as_ptr() as u64, argv.as_ptr() as u64, 0, 0, 0, 0);
+    let r = sys_spawn(akuma_user_access::UserAddr::new(path.as_ptr() as u64), akuma_user_access::UserAddr::new(argv.as_ptr() as u64), akuma_user_access::UserAddr::new(0), akuma_user_access::UserAddr::new(0), 0, 0);
     if !t.check("fork: sh spawned", r < ERRNO_FLOOR) {
         return;
     }
@@ -1414,7 +1414,7 @@ pub fn fork_test(t: &mut Suite) {
             out.extend_from_slice(&buf[..n as usize]);
         }
         let mut st: i32 = -1;
-        if sys_waitpid(u64::from(pid), core::ptr::addr_of_mut!(st) as u64, 0) == u64::from(pid) {
+        if sys_waitpid(u64::from(pid), akuma_user_access::UserAddr::new(core::ptr::addr_of_mut!(st) as u64), 0) == u64::from(pid) {
             status = ((st >> 8) & 0xff) as u64;
             break;
         }

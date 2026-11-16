@@ -278,7 +278,7 @@ fn akuma_private(nr: u64, a: [u64; 6]) -> u64 {
         // it never did (it pushes `r9` precisely so a sixth argument
         // survives — `futex`'s bitset is the other user). So `SPAWN_FLAG_PTY`
         // was not "accepted and ignored", it was not received.
-        301 => sys_spawn(a1, a2, a3, a4, a5, a6),
+        301 => sys_spawn(akuma_syscalls_glue::UserAddr::new(a1), akuma_syscalls_glue::UserAddr::new(a2), akuma_syscalls_glue::UserAddr::new(a3), akuma_syscalls_glue::UserAddr::new(a4), a5, a6),
         // `resolve_host(name_ptr, name_len, out4)` — Akuma's own 300.
         //
         // Wired 2026-09-06 because `hget` (and anything else built on
@@ -344,7 +344,7 @@ fn akuma_private(nr: u64, a: [u64; 6]) -> u64 {
                 crate::fd::sys_poll_input_event(a1, a2, a3)
             }
         }
-        303 => sys_waitpid(a1, a2, a3),
+        303 => sys_waitpid(a1, akuma_syscalls_glue::UserAddr::new(a2), a3),
         // The **terminal family** — Akuma-private 307-312 and 314, all of
         // them glue's, all of them `ENOSYS` here until 2026-09-19.
         //
@@ -853,8 +853,8 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         Syscall::Prctl => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         // `rustc` sizes its codegen thread pool from this one, so an `ENOSYS`
         // was quietly making every in-guest build single-threaded.
-        Syscall::SchedGetaffinity => sys_sched_getaffinity(a1, a2, a3),
-        Syscall::SchedSetaffinity => sys_sched_setaffinity(a1, a2, a3),
+        Syscall::SchedGetaffinity => sys_sched_getaffinity(a1, a2, akuma_syscalls_glue::UserAddr::new(a3)),
+        Syscall::SchedSetaffinity => sys_sched_setaffinity(a1, a2, akuma_syscalls_glue::UserAddr::new(a3)),
         // `exit` (60) and `exit_group` (231) are the same call for a
         // single-threaded process and emphatically not for a threaded one:
         // `exit` ends the calling thread, `exit_group` ends every thread in the
@@ -923,7 +923,7 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         }
         // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
         // forked) task replaces its own image in place. See `sys_execve`.
-        Syscall::Execve => sys_execve(a1, a2, a3),
+        Syscall::Execve => sys_execve(akuma_syscalls_glue::UserAddr::new(a1), akuma_syscalls_glue::UserAddr::new(a2), akuma_syscalls_glue::UserAddr::new(a3)),
         Syscall::Clone => {
             // `CLONE_VM` is the fork/thread fork in the road, and the only one:
             // with it the caller wants to share an address space

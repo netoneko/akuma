@@ -30,6 +30,7 @@
 //! `akuma-usermode-amd64`'s. This module keeps the BKL hand-off and everything
 //! the kernel decides: dispatch, `fork`, `execve`, the program loader.
 
+use akuma_user_access::UserAddr;
 use akuma_cpu::msr::{self, Msr};
 use akuma_syscalls_abi::Syscall;
 
@@ -706,7 +707,8 @@ fn affinity_slot(tid: u64) -> Option<usize> {
 
 /// `sched_setaffinity(tid, len, mask)`: the request is decoded and clipped by
 /// `akuma_affinity`; `sched::set_affinity` stores it and moves the caller if needed.
-fn sys_sched_setaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
+fn sys_sched_setaffinity(tid: u64, len: u64, mask_ptr: UserAddr) -> u64 {
+    let mask_ptr = mask_ptr.get();
     use crate::fd::errno;
     use akuma_affinity as affinity;
     const MAX: usize = 128;
@@ -728,7 +730,8 @@ fn sys_sched_setaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
 
 /// `sched_getaffinity(tid, len, mask)`: the stored mask, or every online core; returns the bytes
 /// written (musl zeroes the rest from that count).
-fn sys_sched_getaffinity(tid: u64, len: u64, mask_ptr: u64) -> u64 {
+fn sys_sched_getaffinity(tid: u64, len: u64, mask_ptr: UserAddr) -> u64 {
+    let mask_ptr = mask_ptr.get();
     use crate::fd::errno;
     let len = len as usize;
     if len < 8 {
@@ -2436,7 +2439,10 @@ fn exec_load_errno(e: &str) -> u64 {
 /// `execve(path, argv, envp)` — x86_64 syscall 59: glue's `execve::run` over
 /// [`Amd64Exec`]. On success it returns 0 into the new image (see
 /// [`Amd64Exec`]); on failure a negative errno to the caller's own image.
-fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+fn sys_execve(path_ptr: UserAddr, argv_ptr: UserAddr, envp_ptr: UserAddr) -> u64 {
+    let path_ptr = path_ptr.get();
+    let argv_ptr = argv_ptr.get();
+    let envp_ptr = envp_ptr.get();
     use crate::fd::errno;
 
     if current_process().is_none() {
@@ -2658,7 +2664,7 @@ fn sys_fork() -> u64 {
     // the same question asked of the authoritative table.
     crate::drivers::hypervisor_note_fork();
     let child_pid = alloc_pid();
-    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, 0)) {
+    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, UserAddr::new(0))) {
         Ok(pid) => u64::from(pid),
         Err(e) => {
             // Named, not swallowed. Every failure inside `fork_process` is a
@@ -2680,7 +2686,7 @@ fn sys_fork() -> u64 {
 fn sys_spawn_clone(child_stack: u64) -> u64 {
     use crate::fd::errno;
     let child_pid = alloc_pid();
-    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, child_stack)) {
+    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, UserAddr::new(child_stack))) {
         Ok(pid) => u64::from(pid),
         Err(e) => {
             serial::puts("  [spawn-clone] ");
@@ -2765,13 +2771,17 @@ const SPAWN_FLAG_CONSOLE: u64 = 2;
 /// piece (see the `ioctl` header in `crate::fd`).
 #[must_use]
 pub fn sys_spawn(
-    path_ptr: u64,
-    argv_ptr: u64,
-    envp_ptr: u64,
-    stdin_ptr: u64,
+    path_ptr: UserAddr,
+    argv_ptr: UserAddr,
+    envp_ptr: UserAddr,
+    stdin_ptr: UserAddr,
     stdin_len: u64,
     flags: u64,
 ) -> u64 {
+    let path_ptr = path_ptr.get();
+    let argv_ptr = argv_ptr.get();
+    let envp_ptr = envp_ptr.get();
+    let stdin_ptr = stdin_ptr.get();
     use crate::fd::errno;
 
     let pty = (flags & SPAWN_FLAG_PTY) != 0;
@@ -2912,7 +2922,8 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
 /// from the child channel (set after); one copy needed one signal, and it is the
 /// channel's (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "One waitpid").
 #[must_use]
-pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
+pub fn sys_waitpid(pid: u64, status_ptr: UserAddr, _options: u64) -> u64 {
+    let status_ptr = status_ptr.get();
     let r = akuma_syscalls_glue::proc::sys_waitpid(pid as u32, akuma_syscalls_glue::UserAddr::new(status_ptr));
     after_reap();
     r

@@ -310,7 +310,7 @@ pub fn sys_rt_sigtimedwait(set_ptr: UserAddr, info_ptr: UserAddr, timeout_ptr: U
 
     // A NULL timeout is `rt_sigtimedwait`'s "wait forever", which this loop
     // spells as a `u64::MAX` deadline rather than a separate flag.
-    let timeout_us = time::read_timeout_us(timeout_ptr)?.unwrap_or(u64::MAX);
+    let timeout_us = time::read_timeout_us(UserAddr::new(timeout_ptr))?.unwrap_or(u64::MAX);
 
     let start_time = akuma_primitives::clock::uptime_us();
 

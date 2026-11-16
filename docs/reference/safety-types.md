@@ -98,8 +98,9 @@ IRQ handler or the scheduler takes"; `grep -rn 'static [A-Z_]*: Spinlock<'` list
 `UserSlice` proof. Used at the two pointer-arithmetic sites the report named, and as the parameter type of eight
 `akuma-syscalls-time` handlers (the template conversion: change the parameter, wrap the raw argument once at dispatch, let
 the compiler find the rest). `scripts/check_user_ptr_params.py` (pre-commit) ratchets the remaining untyped `*_ptr`
-parameters per component; `--list <crate>` prints the sites. **Open:** 189 parameters, 169 of them in
-`akuma-syscalls-glue`; classified in "Untyped pointer classification" below.
+parameters per component; `--list <crate>` prints the sites. **Done:** the 189 real user pointers are `UserAddr`
+(batches: `unixsock`/`net`, `fs`, the process/signal/small files, `poll`/`container`, then the amd64 handlers, `akuma-exec` and
+`akuma-syscalls-time`); the budget is 0 and the hook keeps it there. Classified in "Untyped pointer classification" below.
 
 ### The self-test validation bypass (`BYPASS_VALIDATION`) — audit M7
 Sealed before init since `ed65401d`; now also **compiled out** of any image built with `--features no-tests`
@@ -139,8 +140,11 @@ a chain; 3 are unused (`_addr_len_ptr`, `_sigmask_ptr`, `_data_ptr`, kept for AB
 makes `slice()` the one validation. The previous defects in this family (validate-then-ignore, wrapping `iov + i * 16`) are
 already fixed at their sites; what remains is preventing the next one.
 
-**Conversion order** (each step compiles on its own; the `akuma-syscalls-time` conversion is the template): the amd64 twins
-convert with their glue counterparts, because both call the same handlers.
+**Conversion** (done 2026-11-17, in batches, with the compiler's JSON diagnostics wrapping each mismatched argument so the call
+sites needed no hand edits): a handler takes `UserAddr` and shadows it with the raw value at the top of its body, so the body
+is unchanged and the dispatch wraps `args[n]` once. Glue's own `validate_user_ptr` and `copy_from_user_str` stayed raw `u64`:
+they are the boundary helpers beside the `akuma_user_access` copy family, and converting them wrapped ~120 call sites for
+nothing. The plan that was followed:
 
 1. `unixsock.rs` (12) and the matching `net.rs` `dispatch_*` (33): the largest pass-through chain, and the one with the most
    same-typed neighbours (`addr_ptr`, `len_ptr`, `addrlen_ptr`).
@@ -150,6 +154,10 @@ convert with their glue counterparts, because both call the same handlers.
 
 Each step is one crate-local sweep with the pattern: change the parameter to `UserAddr`, wrap `args[n]` once at dispatch, let
 the compiler find the rest, run both boot suites, lower the budget with `--update`.
+
+**What this does not do yet.** The bodies still read the raw `u64` after the shadow; the type protects the signature (a pointer
+cannot be swapped with a length or an fd) and the call sites, not the arithmetic inside. Moving a body onto `offset_of` /
+`slice()` is incremental and is not required for the ratchet.
 
 ## Tests
 

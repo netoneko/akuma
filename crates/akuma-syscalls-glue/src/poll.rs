@@ -1225,7 +1225,7 @@ pub fn sys_pselect6(nfds: usize, readfds_ptr: UserAddr, writefds_ptr: UserAddr, 
         UserAddr::new(readfds_ptr),
         UserAddr::new(writefds_ptr),
         UserAddr::new(exceptfds_ptr),
-        time::read_timeout_us(timeout_ptr)?,
+        time::read_timeout_us(UserAddr::new(timeout_ptr))?,
     )
 }
 
@@ -1673,7 +1673,7 @@ pub fn sys_ppoll(fds_ptr: UserAddr, nfds: usize, timeout_ptr: UserAddr, _sigmask
     // `int` of milliseconds and has no `struct timespec` to point at — reaches
     // the loop through [`ppoll_timeout_us`] without fabricating a user pointer
     // for one. Both spellings then share one wait loop.
-    ppoll_timeout_us(UserAddr::new(fds_ptr), nfds, time::read_timeout_us(timeout_ptr)?)
+    ppoll_timeout_us(UserAddr::new(fds_ptr), nfds, time::read_timeout_us(UserAddr::new(timeout_ptr))?)
 }
 
 /// [`sys_ppoll`] with the timeout already decoded: `None` blocks forever.

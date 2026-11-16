@@ -60,6 +60,7 @@ pub use spawn::*;
 pub use exec::*;
 pub use akuma_isolation::creds::{Creds, SharedCreds};
 
+use akuma_user_access::UserAddr;
 use alloc::boxed::Box;
 use alloc::collections::BTreeSet;
 use alloc::collections::BTreeMap;
@@ -3230,7 +3231,8 @@ pub fn fork_share_parent_memory(
 /// so fork is not expected to deadlock the fd table or either process's
 /// region list. A pathological
 /// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
-pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+pub fn fork_process(child_pid: u32, stack_ptr: UserAddr) -> Result<u32, &'static str> {
+    let stack_ptr = stack_ptr.get();
     // Serialize lifecycle against preemption under shared-kernel SMP. See
     // `process/lifecycle.rs`. The guard drops on every return path (including `?`
     // early-returns), so the lock is released exactly when the function exits.
@@ -3382,7 +3384,8 @@ pub fn fork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str>
 /// and do **not** clone lazy regions (the child shares the parent's already
 /// mapped pages; faulting new memory before exec would violate the vfork
 /// contract and mutate the shared L0 — a stray fault instead fails safely).
-pub fn vfork_process(child_pid: u32, stack_ptr: u64) -> Result<u32, &'static str> {
+pub fn vfork_process(child_pid: u32, stack_ptr: UserAddr) -> Result<u32, &'static str> {
+    let stack_ptr = stack_ptr.get();
     // Serialize lifecycle against preemption under shared-kernel SMP — see
     // `process/lifecycle.rs`. vfork's state mutations (shared-AS clone, parent
     // suspension, child registration) must not be exposed mid-flight.
@@ -3589,7 +3592,9 @@ pub const GROUP_EXITING: &str = "clone_thread: thread group is exiting";
 /// and `child_tid_ptr` are only written when the caller asked for them
 /// (`CLONE_PARENT_SETTID` / `CLONE_CHILD_SETTID`) — see the tid-publication
 /// block below for why writing an unrequested `child_tid_ptr` corrupts musl.
-pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: u64, child_tid_ptr: u64, flags: u64) -> Result<u32, &'static str> {
+pub fn clone_thread(stack: u64, tls: u64, parent_tid_ptr: UserAddr, child_tid_ptr: UserAddr, flags: u64) -> Result<u32, &'static str> {
+    let parent_tid_ptr = parent_tid_ptr.get();
+    let child_tid_ptr = child_tid_ptr.get();
     // Serialize lifecycle against preemption under shared-kernel SMP — see
     // `process/lifecycle.rs`. CLONE_THREAD creates a new thread + Process and
     // registers it; the half-built child must not be observable by a peer core's
