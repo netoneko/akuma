@@ -1098,7 +1098,7 @@ fn user_fault(
                     covered = true;
                     let _ = core::fmt::write(&mut w, format_args!(
                         "  [Fault-REGION] cr2 inside va={:#x} pages={} file={} sw={} prot={:?}\n",
-                        r.start_va, r.pages, r.file.is_some(), r.shared_write.is_some(), r.prot));
+                        r.start_va, r.pages, r.file.is_some(), r.shared_write.is_some(), r.protection()));
                     // What the page table says about the page, beside what the
                     // region says it should be: a write fault the CoW handler
                     // refused is `read-only PTE, no marker`, and whether the
@@ -1114,7 +1114,7 @@ fn user_fault(
                         shown += 1;
                         let _ = core::fmt::write(&mut w, format_args!(
                             "  [Fault-BIG] va={:#x} pages={} prot={:?} file={}\n",
-                            g.start_va, g.pages, g.prot, g.file.is_some()));
+                            g.start_va, g.pages, g.protection(), g.file.is_some()));
                     }
                     let _ = core::fmt::write(&mut w, format_args!(
                         "  [Fault-BIG] {} region(s) of >= 1 GiB shown, {} regions in all\n", shown, regions.len()));
@@ -1139,7 +1139,7 @@ fn user_fault(
                 for (i, r) in regions.iter().take(8).enumerate() {
                     let _ = core::fmt::write(&mut w, format_args!(
                         "  [MR{}] va={:#x} pages={} prot={:?} file={} sw={}\n",
-                        i, r.start_va, r.pages, r.prot, r.file.is_some(), r.shared_write.is_some()));
+                        i, r.start_va, r.pages, r.protection(), r.file.is_some(), r.shared_write.is_some()));
                 }
             }
         } else {

@@ -80,4 +80,4 @@ pub use region::{
 };
 pub mod span;
 
-pub use types::{PAGE_SHIFT, PAGE_SIZE, Prot};
+pub use types::{PAGE_SHIFT, PAGE_SIZE, Prot, Protection};

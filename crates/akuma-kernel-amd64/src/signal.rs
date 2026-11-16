@@ -774,7 +774,7 @@ pub fn deliver_fault_signal(
                     akuma_primitives::tprint!(
                         160,
                         "[sig!-at] region va={:#x} pages={} prot={:?} file={} sw={}\n",
-                        r.start_va, r.pages, r.prot, r.file.is_some(), r.shared_write.is_some(),
+                        r.start_va, r.pages, r.protection(), r.file.is_some(), r.shared_write.is_some(),
                     );
                 }
             }

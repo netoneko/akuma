@@ -1496,7 +1496,7 @@ pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
     let lookup = |p: Pid| -> Option<u64> {
         let proc = lookup_process_shared(p)?;
         proc.vm_with_regions(|r| {
-            r.iter().find(|reg| !reg.lazy && reg.contains(va)).map(|reg| crate::mmu::user_flags::to_pte(reg.prot))
+            r.iter().find(|reg| !reg.lazy && reg.contains(va)).map(|reg| crate::mmu::user_flags::to_pte(reg.grant_prot()))
         })
     };
     if let Some(owner) = address_space_owner_pid_for_fault()
@@ -1515,7 +1515,7 @@ pub fn eager_region_flags_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
 /// the region actually say anything", which is what a refusal needs: treating an
 /// unrecorded region as read-only refuses legitimate CoW breaks and kills `rustc`.
 ///
-/// See `MmapRegion::prot_recorded` for the `NONE`-is-two-facts problem this exists
+/// See `akuma_mmap::Protection` for the `NONE`-is-two-facts problem this exists
 /// to resolve.
 pub fn eager_region_recorded_prot_for_page_fault(pid: Pid, va: usize) -> Option<u64> {
     let lookup = |p: Pid| -> Option<u64> {
@@ -1551,7 +1551,7 @@ pub fn eager_regions_containing(pid: Pid, va: usize) -> alloc::vec::Vec<(usize, 
             proc.vm_with_regions(|r| {
                 r.iter()
                     .filter(|reg| !reg.lazy && reg.contains(va))
-                    .map(|reg| (reg.start_va, reg.pages, crate::mmu::user_flags::to_pte(reg.prot)))
+                    .map(|reg| (reg.start_va, reg.pages, crate::mmu::user_flags::to_pte(reg.grant_prot())))
                     .collect()
             })
         })

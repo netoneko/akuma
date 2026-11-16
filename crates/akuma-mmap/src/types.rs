@@ -60,7 +60,7 @@ pub struct Prot(u8);
 
 impl Prot {
     /// `PROT_NONE`: the owner may not read, write or execute. Distinct from
-    /// "not recorded" — see `MmapRegion::prot_recorded`.
+    /// "not recorded" — see `akuma_mmap::Protection`.
     pub const NONE: Self = Self(0);
     /// Read and execute by the owner. EL1 fetch permitted (no `PXN` on AArch64)
     /// — the distinction from [`Self::RX`], and the only thing separating them.
@@ -180,6 +180,51 @@ impl Prot {
     #[must_use]
     pub const fn is_shareable_mapping(self, shared_file_pages_enabled: bool) -> bool {
         shared_file_pages_enabled && self.is_read_only_to_user()
+    }
+}
+
+/// What a mapping says about its own protection: nothing, or a statement.
+///
+/// `PROT_NONE` is a legitimate statement ("the caller asked for no access") and also what an unrecorded region
+/// defaults to, and the two used to share one `u64` with a second `bool` beside it. That is how a reader that was
+/// written for *granting* (where both read as "grant nothing") got reused for *denying* and refused legitimate
+/// copy-on-write breaks, which killed `rustc` four times (`GRANT_RECORDS_VS_DENY_RECORDS.md`). The type makes each
+/// reader say which one it is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Protection {
+    /// Nothing was recorded; the region was built without an explicit protection.
+    Unrecorded,
+    /// The mapping's protection, as stated by `mmap`/`mprotect` or inherited from a parent that stated it.
+    Stated(Prot),
+}
+
+impl Protection {
+    /// For a *grant* decision (give a write the fault handler would refuse): `NONE` when unrecorded, which grants
+    /// nothing.
+    #[must_use]
+    pub const fn for_grant(self) -> Prot {
+        match self {
+            Self::Unrecorded => Prot::NONE,
+            Self::Stated(p) => p,
+        }
+    }
+
+    /// For a *deny* decision (refuse an access): `None` when unrecorded, which denies nothing.
+    #[must_use]
+    pub const fn for_deny(self) -> Option<Prot> {
+        match self {
+            Self::Unrecorded => None,
+            Self::Stated(p) => Some(p),
+        }
+    }
+
+    /// `Stated(p)` for `Some(p)`, `Unrecorded` for `None`.
+    #[must_use]
+    pub const fn from_option(p: Option<Prot>) -> Self {
+        match p {
+            Some(p) => Self::Stated(p),
+            None => Self::Unrecorded,
+        }
     }
 }
 

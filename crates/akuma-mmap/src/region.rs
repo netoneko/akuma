@@ -8,7 +8,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{PhysFrame, Prot};
+use crate::{PhysFrame, Prot, Protection};
 
 /// An eagerly-mapped `mmap` region (all pages resident at mmap time).
 ///
@@ -31,19 +31,14 @@ pub struct MmapRegion {
     pub start_va: usize,
     pub pages: usize,
     pub frames: Vec<PhysFrame>,
-    /// The protection this mapping is *supposed* to have, as the neutral [`Prot`]
-    /// vocabulary — the eager counterpart of `LazyRegion::prot`, which records the
-    /// same thing for a demand-paged region (`Option<Prot>`, `None` = unrecorded,
-    /// the split [`prot_recorded`](Self::prot_recorded) makes here).
+    /// The protection this mapping is *supposed* to have, or the fact that none was recorded. Private: write it
+    /// through [`MmapRegion::set_protection`], read it through [`MmapRegion::protection`],
+    /// [`MmapRegion::grant_prot`] (a grant decision) or [`MmapRegion::recorded_prot`] (a deny decision).
     ///
-    /// Without it an eager region records extent and frames but no permission, so
-    /// the EL0 write-permission-fault handler cannot tell a PTE that is wrongly
-    /// read-only (page state lost some other way) from a mapping that is
-    /// legitimately read-only (`mprotect(PROT_READ)`). Lazy regions carry flags and
-    /// therefore get a permission upgrade; eager regions had no such path and died
-    /// with SIGSEGV instead. See
-    /// `docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3.
-    pub prot: Prot,
+    /// The eager counterpart of `LazyRegion::prot`. Without it the EL0 write-permission-fault handler cannot tell a
+    /// PTE that is wrongly read-only from a mapping that is legitimately read-only (`mprotect(PROT_READ)`); see
+    /// `docs/archive/J4_WRITE_PERM_FAULT_AND_HALF_WRITTEN_LINKER_OUTPUT.md` §3 and [`Protection`].
+    protection: Protection,
 
     /// `MAP_SHARED | MAP_ANONYMOUS`: this mapping must survive `fork` as **one
     /// object**, not as a copy-on-write copy.
@@ -59,25 +54,6 @@ pub struct MmapRegion {
     /// Must propagate to inherited regions too, or a grandchild silently stops
     /// sharing. Probe: `userspace/forktest/c_stress/shmanon.c`.
     pub shared_anon: bool,
-
-    /// Whether [`prot`](Self::prot) is a **statement** about this mapping's
-    /// protection, or merely the safe default.
-    ///
-    /// This exists because `NONE` is otherwise two different facts in one `u64`:
-    /// [`MmapRegion::owned`] uses it to mean "protection unrecorded" (see its doc
-    /// for why that default is the safe one), and `from_prot(PROT_NONE)` produces
-    /// the identical value to mean "the caller asked for no access".
-    ///
-    /// Telling them apart did not matter while `flags` was only ever used to
-    /// **grant** a write the fault handler would otherwise refuse — `NONE` grants
-    /// nothing either way. It matters the moment `flags` is used to **deny** one:
-    /// treating "unrecorded" as "not writable" refuses legitimate CoW breaks on
-    /// every region built without explicit flags, which killed `rustc` mid-build
-    /// with `[WPF] … eager=0x60000000000080 cow_ref=1` — `NONE`, exactly.
-    ///
-    /// Use [`recorded_prot`](Self::recorded_prot) rather than reading this
-    /// directly.
-    pub prot_recorded: bool,
 
     /// Where this region's pages come from when it is **file-backed and
     /// demand-paged**: the file's identity and this region's place in it.
@@ -315,8 +291,8 @@ impl MmapRegion {
     #[must_use]
     pub fn owned(start_va: usize, frames: Vec<PhysFrame>) -> Self {
         let mut r = Self::owned_with_prot(start_va, frames, crate::Prot::NONE);
-        // `NONE` here is the safe default, NOT a statement — see `prot_recorded`.
-        r.prot_recorded = false;
+        // Not a statement: see `Protection::Unrecorded`.
+        r.protection = Protection::Unrecorded;
         r
     }
 
@@ -324,8 +300,8 @@ impl MmapRegion {
     #[must_use]
     pub fn owned_with_prot(start_va: usize, frames: Vec<PhysFrame>, prot: Prot) -> Self {
         Self {
-            start_va, pages: frames.len(), frames, prot,
-            shared_anon: false, prot_recorded: true, file: None, shared_write: None, lazy: false,
+            start_va, pages: frames.len(), frames, protection: Protection::Stated(prot),
+            shared_anon: false, file: None, shared_write: None, lazy: false,
         }
     }
 
@@ -334,7 +310,7 @@ impl MmapRegion {
     #[must_use]
     pub fn inherited(start_va: usize, pages: usize) -> Self {
         let mut r = Self::inherited_with_prot(start_va, pages, crate::Prot::NONE);
-        r.prot_recorded = false;
+        r.protection = Protection::Unrecorded;
         r
     }
 
@@ -342,8 +318,8 @@ impl MmapRegion {
     #[must_use]
     pub fn inherited_with_prot(start_va: usize, pages: usize, prot: Prot) -> Self {
         Self {
-            start_va, pages, frames: Vec::new(), prot,
-            shared_anon: false, prot_recorded: true, file: None, shared_write: None, lazy: false,
+            start_va, pages, frames: Vec::new(), protection: Protection::Stated(prot),
+            shared_anon: false, file: None, shared_write: None, lazy: false,
         }
     }
 
@@ -355,18 +331,35 @@ impl MmapRegion {
     /// A **demand-paged** region: `pages` reserved, none present, owning no
     /// frames. `prot` is `None` when the mapping records no protection and the
     /// fault path chooses one from the access, which is
-    /// [`prot_recorded`](Self::prot_recorded) `false`.
+    /// [`Protection::Unrecorded`].
     #[must_use]
     pub fn demand_paged(start_va: usize, pages: usize, prot: Option<Prot>) -> Self {
         let mut r = Self::inherited_with_prot(start_va, pages, prot.unwrap_or(crate::Prot::NONE));
-        r.prot_recorded = prot.is_some();
+        r.protection = Protection::from_option(prot);
         r.lazy = true;
         r
     }
 
     #[must_use]
     pub const fn recorded_prot(&self) -> Option<Prot> {
-        if self.prot_recorded { Some(self.prot) } else { None }
+        self.protection.for_deny()
+    }
+
+    /// What this region says about its protection. See [`Protection`].
+    #[must_use]
+    pub const fn protection(&self) -> Protection {
+        self.protection
+    }
+
+    /// The protection for a *grant* decision: `NONE` (grants nothing) when unrecorded.
+    #[must_use]
+    pub const fn grant_prot(&self) -> Prot {
+        self.protection.for_grant()
+    }
+
+    /// Replace what this region says about its protection (the fork copy, `mprotect`).
+    pub fn set_protection(&mut self, protection: Protection) {
+        self.protection = protection;
     }
 
     /// Mark this region `MAP_SHARED | MAP_ANONYMOUS`. See [`MmapRegion::shared_anon`].
@@ -455,10 +448,10 @@ pub fn inherit_mmap_regions_for_cow_child(parent_regions: &[MmapRegion]) -> allo
     parent_regions
         .iter()
         .map(|r| {
-            let mut inherited = MmapRegion::inherited_with_prot(r.start_va, r.pages, r.prot);
-            // Carry `prot_recorded` too: a child of an unrecorded region is itself
-            // unrecorded, and a child of an `mprotect`ed one keeps the statement.
-            inherited.prot_recorded = r.prot_recorded;
+            let mut inherited = MmapRegion::inherited_with_prot(r.start_va, r.pages, r.grant_prot());
+            // Carry whether it was recorded too: a child of an unrecorded region is itself unrecorded, and a
+            // child of an `mprotect`ed one keeps the statement.
+            inherited.protection = r.protection;
             // Must carry `shared_anon` across, or a grandchild silently stops sharing:
             // the child would CoW-share a mapping its parent shares by identity.
             // And the file backing, for the same reason one step further on: a
@@ -615,16 +608,14 @@ pub fn mprotect_eager_regions_in_range(
         // Fully covered: no split, and the common "mprotect a whole mapping" case
         // does not churn the vector.
         if head_pages == 0 && tail_pages == 0 {
-            reg.prot = new_prot;
-            reg.prot_recorded = true;
+            reg.protection = Protection::Stated(new_prot);
             touched += 1;
             out.push(reg);
             continue;
         }
 
-        let old_prot = reg.prot;
+        let old_protection = reg.protection;
         let shared_anon = reg.shared_anon;
-        let was_recorded = reg.prot_recorded;
         // The write-back record follows its pages, like the file backing does:
         // each piece flushes exactly the file range it covers. A piece made
         // PROT_NONE keeps its record — an `mprotect` does not unmap, and a
@@ -646,13 +637,13 @@ pub fn mprotect_eager_regions_in_range(
         if head_pages > 0 {
             out.push(MmapRegion {
                 start_va: reg_start, pages: head_pages, frames: head,
-                prot: old_prot, shared_anon, prot_recorded: was_recorded, file,
+                protection: old_protection, shared_anon, file,
                 shared_write: shared_write.clone(), lazy });
         }
         if mid_pages > 0 {
             out.push(MmapRegion {
                 start_va: clip_start, pages: mid_pages, frames: mid,
-                prot: new_prot, shared_anon, prot_recorded: true,
+                protection: Protection::Stated(new_prot), shared_anon,
                 file: file.map(|f| f.advance(head_pages)),
                 shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages)), lazy });
             touched += 1;
@@ -660,7 +651,7 @@ pub fn mprotect_eager_regions_in_range(
         if tail_pages > 0 {
             out.push(MmapRegion {
                 start_va: clip_end, pages: tail_pages, frames: tail,
-                prot: old_prot, shared_anon, prot_recorded: was_recorded,
+                protection: old_protection, shared_anon,
                 file: file.map(|f| f.advance(head_pages + mid_pages)),
                 shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + mid_pages)), lazy });
         }
@@ -802,12 +793,10 @@ pub fn detach_regions_in_range_where(
         // Taken out of the slot rather than by removing the region, because the
         // region usually stays: a clip at either edge leaves one survivor, and
         // that survivor can reuse the slot the original occupied.
-        let prot = regions[i].prot;
+        let protection = regions[i].protection;
         // A partial unmap changes extent, not identity: both survivors are still the
         // same `MAP_SHARED|MAP_ANONYMOUS` object if the original was.
         let shared_anon = regions[i].shared_anon;
-        // A partial unmap changes extent, not what the region states about itself.
-        let prot_recorded = regions[i].prot_recorded;
         // Nor where the region sits in its file — but the surviving *tail*
         // starts further in, by everything the head and the clip took.
         let file = regions[i].file;
@@ -851,8 +840,8 @@ pub fn detach_regions_in_range_where(
         }
         if tail_pages > 0 {
             let tail_region = MmapRegion {
-                start_va: clip_end, pages: tail_pages, frames: tail, prot,
-                shared_anon, prot_recorded,
+                start_va: clip_end, pages: tail_pages, frames: tail, protection,
+                shared_anon,
                 file: file.map(|f| f.advance(head_pages + clip_pages)),
                 shared_write: shared_write.as_ref().map(|sw| sw.advance(head_pages + clip_pages)), lazy };
             if next == i {
@@ -929,7 +918,7 @@ mod mmap_region_inheritance_tests {
         let ro = MmapRegion::owned_with_prot(0x2013_0000, frames(1), Prot::RO);
         let unknown = MmapRegion::owned(0x2014_0000, frames(1));
 
-        let writable = |r: &MmapRegion| r.prot.is_write();
+        let writable = |r: &MmapRegion| r.grant_prot().is_write();
         assert!(writable(&rw), "a PROT_WRITE region must permit the upgrade");
         assert!(!writable(&ro), "mprotect(PROT_READ) must still fault");
         assert!(!writable(&unknown),
@@ -937,8 +926,8 @@ mod mmap_region_inheritance_tests {
              would silently defeat mprotect on every region built this way");
 
         let child = inherit_mmap_regions_for_cow_child(&[rw, ro]);
-        assert_eq!(child[0].prot, Prot::RW_NO_EXEC, "child loses the repair path otherwise");
-        assert_eq!(child[1].prot, Prot::RO, "child must not gain write on a RO mapping");
+        assert_eq!(child[0].grant_prot(), Prot::RW_NO_EXEC, "child loses the repair path otherwise");
+        assert_eq!(child[1].grant_prot(), Prot::RO, "child must not gain write on a RO mapping");
     }
 
     /// A CoW child keeps the extent but owns no frames — the exact state whose
@@ -1011,11 +1000,11 @@ mod mmap_region_inheritance_tests {
     #[test]
     fn unrecorded_none_and_explicit_prot_none_are_distinguishable() {
         let unrecorded = MmapRegion::owned(0x1000_0000, frames(1));
-        assert_eq!(unrecorded.prot, Prot::NONE, "the safe default is still NONE");
+        assert_eq!(unrecorded.grant_prot(), Prot::NONE, "the safe default is still NONE");
         assert_eq!(unrecorded.recorded_prot(), None, "…but it states nothing");
 
         let explicit = MmapRegion::owned_with_prot(0x1000_0000, frames(1), Prot::NONE);
-        assert_eq!(explicit.prot, unrecorded.prot, "identical in the flags field");
+        assert_eq!(explicit.grant_prot(), unrecorded.grant_prot(), "identical in the flags field");
         assert_eq!(
             explicit.recorded_prot(),
             Some(Prot::NONE),
@@ -1268,7 +1257,7 @@ mod mmap_region_inheritance_tests {
         assert_eq!(r[0].start_va, 0x1000_2000);
         assert_eq!(r[0].pages, 4);
         assert_eq!(r[0].frames.len(), 4);
-        assert_eq!(r[0].prot, Prot::RW, "extent changed, permission did not");
+        assert_eq!(r[0].grant_prot(), Prot::RW, "extent changed, permission did not");
     }
 
     /// A suffix unmap keeps the head at the original base.

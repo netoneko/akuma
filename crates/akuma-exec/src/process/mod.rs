@@ -3152,10 +3152,10 @@ pub fn fork_share_parent_memory(
                 // stated a protection into a child that states `NONE`, and the
                 // write-fault handler then refuses the child's legitimate CoW
                 // breaks — the same shape as the `mremap` bug this pattern caused
-                // (`MmapRegion::prot_recorded`).
+                // (`akuma_mmap::Protection`).
                 let mut child_region = MmapRegion::owned_with_prot(
-                    *va_start, child_frames, region.prot);
-                child_region.prot_recorded = region.prot_recorded;
+                    *va_start, child_frames, region.grant_prot());
+                child_region.set_protection(region.protection());
                 child_mmap_regions.push(child_region);
             } else {
                 if config().syscall_debug_info_enabled {
