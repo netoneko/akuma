@@ -133,7 +133,7 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
 
                 Some(akuma_exec::process::FileDescriptor::File(ref f)) => {
                     akuma_vfs_glue::fs::file_size(&f.path)
-                        .map_or(0, |sz| (sz as usize).saturating_sub(f.position) as i32)
+                        .map_or(0, |sz| (sz as usize).saturating_sub(f.pos()) as i32)
                 }
                 Some(akuma_exec::process::FileDescriptor::ChildStdout(_)) => 0,
                 Some(akuma_exec::process::FileDescriptor::PipeWrite(_)) => 0,

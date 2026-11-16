@@ -320,7 +320,15 @@ pub struct DirCacheEntry {
 #[derive(Debug, Clone)]
 pub struct KernelFile {
     pub path: String,
-    pub position: usize,
+    /// The file offset, **shared by every copy of this descriptor**: `dup`,
+    /// `fork` and fd passing clone the `KernelFile`, and the clone must keep
+    /// reading and writing where the original left off (POSIX: they are one
+    /// open file description). It was a plain `usize`, so each copy had its own
+    /// cursor, and `{ cmd1; cmd2; } > file` in a shell kept only the last
+    /// command's bytes: each child wrote from the offset it was forked with.
+    /// Two `open`s of one path still get two cells. Use [`Self::pos`],
+    /// [`Self::set_pos`] and [`Self::advance`].
+    position: alloc::sync::Arc<core::sync::atomic::AtomicUsize>,
     pub flags: u32,
     /// Snapshot of directory entries taken on the first getdents64 call.
     /// Prevents position drift when entries are deleted between calls.
@@ -353,13 +361,35 @@ impl KernelFile {
     pub fn new(path: String, flags: u32) -> Self {
         Self {
             path,
-            position: 0,
+            position: alloc::sync::Arc::new(core::sync::atomic::AtomicUsize::new(0)),
             flags,
             dir_cache: None,
             inode: 0,
             mount_id: 0,
             pin: akuma_primitives::InodePin::none(),
         }
+    }
+
+    /// The current file offset.
+    #[must_use]
+    pub fn pos(&self) -> usize {
+        self.position.load(core::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Move the offset to `pos` (`lseek`, or a read/write that knows where it ended).
+    pub fn set_pos(&self, pos: usize) {
+        self.position.store(pos, core::sync::atomic::Ordering::Release);
+    }
+
+    /// Move the offset forward by `n` bytes.
+    pub fn advance(&self, n: usize) {
+        self.position.fetch_add(n, core::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Whether `other` is a copy of this descriptor (they share one offset).
+    #[must_use]
+    pub fn shares_offset_with(&self, other: &Self) -> bool {
+        alloc::sync::Arc::ptr_eq(&self.position, &other.position)
     }
 
     /// Bind this descriptor to the `(mount, inode)` pair `open(2)` resolved.
@@ -1064,7 +1094,7 @@ mod tests {
     fn kernel_file_new() {
         let f = KernelFile::new(String::from("/etc/test"), 0o100);
         assert_eq!(f.path, "/etc/test");
-        assert_eq!(f.position, 0);
+        assert_eq!(f.pos(), 0);
         assert_eq!(f.flags, 0o100);
     }
 

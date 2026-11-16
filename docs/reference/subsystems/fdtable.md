@@ -47,13 +47,19 @@ after dropping the locks.
 
 Both are glue's adopted `dup` model, pinned at three layers: the crate's
 tests, `akuma-exec`'s `fdtable_characterization_tests`, and the amd64 boot
-suite (`crates/akuma-kernel-amd64/src/fd.rs`: "a dup's cursor is independent", "a dup keeps
+suite (`crates/akuma-kernel-amd64/src/fd.rs`: "a dup shares the file offset", "a dup keeps
 nonblock"):
 
-1. **`dup` copies the payload by value** — two descriptors on one file carry
-   independent cursors. POSIX shares the open file description. The design
-   that would fix it, and the reason it stayed a recommendation, is
-   `docs/archive/AKUMA_FDTABLE_EXTRACTION.md` § "The dup fix".
+1. **`dup` copies the payload by value, except the file offset.** A regular
+   file's offset is one shared cell inside `KernelFile` (`pos`/`set_pos`/
+   `advance`), so every copy of a descriptor (`dup`, `fork`, fd passing) reads
+   and writes at one offset, as POSIX says of an open file description. Two
+   `open`s of one path have two offsets. Everything else in the payload is
+   still per copy (a directory's `getdents` snapshot, a block device's
+   position). The full one-description-per-open design is
+   `docs/archive/AKUMA_FDTABLE_EXTRACTION.md` § "The dup fix"; the offset alone
+   was shared because its absence lost data
+   (`docs/archive/FORKED_DESCRIPTORS_DID_NOT_SHARE_AN_OFFSET.md`).
 2. **`nonblock` is keyed by fd number** — every dup (`dup`, `dup2`/`dup3`,
    `F_DUPFD`) *copies* the bit, so a dup starts non-blocking when its original
    is, as on Linux; a later `F_SETFL` on one does not reach the other (Linux

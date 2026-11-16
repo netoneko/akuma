@@ -59,7 +59,7 @@ pub(super) fn sys_fcntl_lock(fd: u32, cmd: u32, arg: u64) -> u64 {
         return ESRCH;
     };
     let (path, position) = match proc.get_fd(fd) {
-        Some(akuma_exec::process::FileDescriptor::File(f)) => (f.path, f.position as i64),
+        Some(akuma_exec::process::FileDescriptor::File(f)) => { let pos = f.pos() as i64; (f.path, pos) }
         // Locks on pipes, sockets and devices are meaningless; accept as before.
         Some(_) => return if cmd == F_GETLK { write_unlocked(arg) } else { 0 },
         None => return EBADF,

@@ -2622,12 +2622,11 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
     // dups must leave the survivor open, and the underlying socket/pipe must
     // survive until the last name goes.
     //
-    // **The cursor is NOT shared, and that is pinned here on purpose.** The
-    // step 4b flip adopted `akuma-syscalls-glue`'s `dup`, which copies the
-    // `KernelFile` by value — independent cursors, where POSIX (and this
-    // target's deleted `FILES` table) shared the open file description. See
-    // `sys_dup`'s header; this check fails if the divergence ever quietly
-    // becomes something else.
+    // **The cursor IS shared**, as POSIX says of one open file description.
+    // Glue's `dup` still copies the `KernelFile` by value, but the offset in it
+    // is one shared cell (`KernelFile::pos`). This check pinned the opposite
+    // until 2026-11-16; an independent cursor per copy is what made
+    // `{ cmd1; cmd2; } > file` keep only the last command's bytes.
     {
         let a = sys_openat(0, path.as_ptr() as u64, 0, 0);
         let b = sys_dup(a);
@@ -2638,12 +2637,11 @@ pub fn smoke_test(t: &mut Suite, have_fs: bool) {
             sys_read(a, one.as_mut_ptr() as u64, 8),
             8,
         );
-        // The divergence, asserted: `b`'s cursor is a copy taken at `dup`
-        // time — 0 — not a window onto `a`'s.
+        // `b` is the same open file description: it is where `a` left off.
         t.check_eq(
-            "fd: a dup's cursor is independent (glue divergence, pinned)",
+            "fd: a dup shares the file offset",
             sys_lseek(b, 0, 1),
-            0,
+            8,
         );
         sys_close(a);
         // The description's backing reference went with `b`, so it stays open.

@@ -180,8 +180,8 @@ impl SharedFdTable {
                 Some(FileDescriptor::File(file))
                     if file.flags & crate::process::types::open_flags::O_APPEND == 0 =>
                 {
-                    let pos = file.position;
-                    file.position = pos.saturating_add(count);
+                    let pos = file.pos();
+                    file.set_pos(pos.saturating_add(count));
                     Some(pos)
                 }
                 _ => None,
@@ -464,7 +464,7 @@ mod reserve_write_pos_tests {
         assert_eq!(t.reserve_write_pos(3, 25), Some(10));
         assert_eq!(t.reserve_write_pos(3, 1), Some(35));
         assert_eq!(t.table.lock().get(&3).map(|e| match e {
-            FileDescriptor::File(f) => f.position,
+            FileDescriptor::File(f) => f.pos(),
             _ => unreachable!(),
         }), Some(36));
     }
@@ -540,7 +540,7 @@ mod reserve_write_pos_tests {
             assert_eq!(start, i * CHUNK, "reservation {} did not tile exactly — overlap or gap", i);
         }
         let final_pos = table.table.lock().get(&1).map(|e| match e {
-            FileDescriptor::File(f) => f.position,
+            FileDescriptor::File(f) => f.pos(),
             _ => unreachable!(),
         });
         assert_eq!(final_pos, Some(total * CHUNK));
@@ -666,7 +666,7 @@ mod alloc_fd_tests {
 /// rather than against intentions. Each test states which syscall-level
 /// behaviour it is the table-level image of; the two `PINNED DIVERGENCE`
 /// tests carry the divergences `crates/akuma-kernel-amd64/src/fd.rs`'s boot-suite self-tests pin
-/// end-to-end (`fd: a dup's cursor is independent`; `fd: a dup keeps nonblock`
+/// end-to-end (`fd: a dup shares the file offset`; `fd: a dup keeps nonblock`
 /// since 2026-11-01) so the table layer cannot drift underneath them.
 ///
 /// These run against the real locked table (not a model) and must keep
@@ -680,13 +680,13 @@ mod fdtable_characterization_tests {
 
     fn file_at(pos: usize) -> FileDescriptor {
         let mut f = KernelFile::new("/x".into(), open_flags::O_RDWR);
-        f.position = pos;
+        f.set_pos(pos);
         FileDescriptor::File(f)
     }
 
     fn position_of(t: &SharedFdTable, fd: u32) -> Option<usize> {
         t.table.lock().get(&fd).map(|e| match e {
-            FileDescriptor::File(f) => f.position,
+            FileDescriptor::File(f) => f.pos(),
             _ => unreachable!("test only installs File entries here"),
         })
     }
@@ -727,14 +727,15 @@ mod fdtable_characterization_tests {
         assert!(t.nonblock.lock().contains(&1));
     }
 
-    /// **PINNED DIVERGENCE** (`crates/akuma-kernel-amd64/src/fd.rs` boot suite: "a dup's cursor is
-    /// independent"): `dup` is a *by-value* copy of the `KernelFile`, so the
-    /// two descriptors do not share the open file description — advancing one
-    /// cursor leaves the other where the copy was taken. POSIX shares the
-    /// description; this table does not, and the boot suite asserts the same
-    /// thing end-to-end through `sys_lseek`.
+    /// A `dup` shares the open file description's offset, as POSIX says: the
+    /// table still copies the `KernelFile` by value, but the offset inside it is
+    /// one shared cell, so advancing either descriptor moves both. Until
+    /// 2026-11-16 this test pinned the opposite (an independent cursor per
+    /// copy), which is what made `{ cmd1; cmd2; } > file` keep only the last
+    /// command's bytes. The amd64 boot suite asserts the same end to end
+    /// ("a dup shares the file offset").
     #[test]
-    fn pinned_dup_inserts_an_independent_by_value_copy() {
+    fn a_dup_shares_the_file_offset() {
         ensure_test_runtime();
         let t = SharedFdTable::with_stdio();
         t.alloc_fd_from(0, file_at(0)); // fd 3, position 0
@@ -742,14 +743,36 @@ mod fdtable_characterization_tests {
         let newfd = t.alloc_fd_from(0, entry); // glue `sys_dup`'s table shape
         assert_eq!(newfd, 4);
         if let Some(FileDescriptor::File(f)) = t.table.lock().get_mut(&3) {
-            f.position += 16;
+            f.advance(16);
         }
-        assert_eq!(
-            position_of(&t, 4),
-            Some(0),
-            "PINNED DIVERGENCE: the dup's cursor is a copy taken at dup time"
-        );
-        assert_eq!(position_of(&t, 3), Some(16));
+        assert_eq!(position_of(&t, 4), Some(16), "the dup sees the original's writes");
+        if let Some(FileDescriptor::File(f)) = t.table.lock().get_mut(&4) {
+            f.set_pos(4);
+        }
+        assert_eq!(position_of(&t, 3), Some(4), "and the original sees the dup's seek");
+    }
+
+    /// The offset is shared across `fork`: the child's table is its own (a
+    /// close in one does not reach the other), but a descriptor inherited from
+    /// the parent keeps writing where the parent, or a sibling, left off.
+    #[test]
+    fn a_forked_table_shares_inherited_offsets_only() {
+        ensure_test_runtime();
+        let t = SharedFdTable::with_stdio();
+        t.alloc_fd_from(0, file_at(0)); // fd 3, inherited
+        let child = t.clone_deep_for_fork();
+        if let Some(FileDescriptor::File(f)) = child.table.lock().get_mut(&3) {
+            f.advance(5); // what a child's `write` does
+        }
+        assert_eq!(position_of(&t, 3), Some(5), "the parent continues after the child's bytes");
+        // A descriptor opened after the fork belongs to one side only, and a
+        // second open of the same path has its own offset.
+        child.alloc_fd_from(0, file_at(0)); // child's fd 4
+        if let Some(FileDescriptor::File(f)) = child.table.lock().get_mut(&4) {
+            f.advance(9);
+        }
+        assert!(t.table.lock().get(&4).is_none());
+        assert_eq!(position_of(&t, 3), Some(5));
     }
 
     /// `nonblock` is keyed by fd *number*: a fresh number from `alloc_fd_from` starts without

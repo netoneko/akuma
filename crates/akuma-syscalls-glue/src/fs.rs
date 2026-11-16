@@ -696,7 +696,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let mut failure = None;
             while total < count {
                 let want = (count - total).min(limit);
-                match akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.position + total, &mut temp[..want]) {
+                match akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.pos() + total, &mut temp[..want]) {
                     Ok(n) => {
                         if n > 0 {
                             if copy_to_user(buf_ptr + total as u64, &temp[..n]).is_err() {
@@ -717,12 +717,12 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             if total > 0 {
                 rec.lap(crate::utils::read_profile::S_COPY);
                 if let Some(proc) = akuma_exec::process::current_process_shared() {
-                    proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.position += total; });
+                    proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry { file.advance(total); });
                 }
                 rec.lap(crate::utils::read_profile::S_POS);
             }
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
-                akuma_primitives::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.position, count, total);
+                akuma_primitives::safe_print!(256, "[syscall] read(fd={}, file={}, pos={}, req={}) = {}\n", fd_num, &f.path, f.pos(), count, total);
             }
             rec.commit(to_read);
             total as u64
@@ -1249,8 +1249,8 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             akuma_vfs_glue::fs::file_size(&f.path).unwrap_or(0) as usize
         } else {
             match akuma_exec::process::current_process_shared() {
-                Some(p) => p.reserve_write_pos(fd_num as u32, count).unwrap_or(f.position),
-                None => f.position,
+                Some(p) => p.reserve_write_pos(fd_num as u32, count).unwrap_or_else(|| f.pos()),
+                None => f.pos(),
             }
         }
     } else if let akuma_exec::process::FileDescriptor::BlockDev { pos, .. } = fd {
@@ -1416,7 +1416,7 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                             let new_pos = write_pos;
                             if let Some(proc) = akuma_exec::process::current_process_shared() {
                                 proc.update_fd(fd_num as u32, |entry| if let akuma_exec::process::FileDescriptor::File(file) = entry {
-                                    file.position = new_pos;
+                                    file.set_pos(new_pos);
                                 });
                             }
                         }
@@ -2726,9 +2726,9 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
                     // seeking to `offset`.
                     let size = akuma_vfs_glue::fs::metadata_open_file(&f.path, f.mount_id(), f.inode())
                         .map_or(0, |m| m.size) as i64;
-                    new_pos = match whence { 0 => offset, 1 => f.position as i64 + offset, 2 => size + offset, _ => -1 };
+                    new_pos = match whence { 0 => offset, 1 => f.pos() as i64 + offset, 2 => size + offset, _ => -1 };
                     if new_pos >= 0 {
-                        f.position = new_pos as usize;
+                        f.set_pos(new_pos as usize);
                         if new_pos == 0 { f.dir_cache = None; }
                         success = true;
                     }
@@ -4059,14 +4059,14 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
             file.dir_cache = Some(c);
         }
         let Some(cache) = file.dir_cache.as_ref() else { return };
-        let position = file.position;
+        let position = file.pos();
         if position >= cache.len() {
             eof = true;
             return;
         }
         let (w, c) = getdents_step(cache, position, &mut kernel_buf);
         if c > 0 {
-            file.position = position + c;
+            file.set_pos(position + c);
         }
         written = w;
         count = c;

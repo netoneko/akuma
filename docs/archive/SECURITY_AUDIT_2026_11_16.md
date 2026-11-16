@@ -56,10 +56,15 @@ Still open:
   measured change. `akuma-pagetable`'s amd64 `read_user`/`write_user` can move into `akuma-phys`
   (which already depends on `akuma-pagetable`) for one site fewer; left because only the
   Taoxichuan kernels call them and they could not be boot-tested here.
-- Found while testing H4 and left alone: a descriptor is copied by value across `fork`, so
-  `{ cmd1; cmd2; } > file` keeps only the last command's bytes (three external `echo`s wrote one
-  line). It is `fdtable.md`'s pinned divergence 1, with its fix designed in
-  `AKUMA_FDTABLE_EXTRACTION.md`; shell scripts written for Linux lose data on it silently.
+- Found while testing H4 and since fixed: descriptors copied across `fork` did not share a file
+  offset (`FORKED_DESCRIPTORS_DID_NOT_SHARE_AN_OFFSET.md`).
+- The ryzen run of `25bc71ab` (bare metal, GRUB path) found three amd64 faults, fixed in
+  `55a342d8` and not yet re-run there: the GRUB boot path applied neither ASLR, the bypass seal nor
+  `dac=1`; `--features no-tests` did not compile; `/dev/zero` and `/dev/urandom` returned short
+  reads. It also reported two self-test failures with no baseline (`pci: every enumerated
+  function has a real vendor id`, `smp ring3: two processes ran on two cores`), and a
+  tcc-built dynamic program that segfaults (it does on AArch64 too; tcc output is linked
+  static on Akuma).
 - No boot-suite test pins the host-root gate or the bounded allocations yet; both were checked
   by hand over ssh.
 
