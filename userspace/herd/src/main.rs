@@ -83,8 +83,30 @@ const STOP_KILL_GRACE_MS: u64 = 2_000;
 /// Reap-poll interval while a stop waits for the process to exit.
 const STOP_POLL_MS: u64 = 20;
 
-/// How long a control connection gets to send its request line.
-const CONTROL_READ_TIMEOUT_MS: u64 = 1_000;
+/// How long a control connection gets to send its request line. The CLI
+/// sends its line straight after connecting; this only bounds a client that
+/// connects and says nothing, during which the supervisor does nothing else.
+const CONTROL_READ_TIMEOUT_MS: u64 = 250;
+
+/// Time `serve_control` may spend on silent or slow clients in one tick before
+/// it leaves the rest for the next one. A `stop` that is waiting for a reap is
+/// bounded by the stop grace periods instead, and is not cut short.
+const CONTROL_TICK_BUDGET_MS: u64 = 500;
+
+/// Where the daemon that owns [`HERD_CONTROL_ADDR`] writes its control token
+/// (hex, mode 0600), which `start` and `stop` requests must carry.
+///
+/// The socket is loopback TCP, so anything that can open a loopback
+/// connection can reach it: every local user, and every boxed service that
+/// shares the host's network stack. Until 2026-09-25 the kernel also bound
+/// `127.0.0.1` as any-address, which put `stop <svc>` on the LAN
+/// (`docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md`). The token limits
+/// `start`/`stop` to callers who can read this file. `status` is a read and
+/// stays open.
+const CONTROL_TOKEN_PATH: &str = "/var/run/herd/control.token";
+
+/// Bytes of randomness in the control token (hex-encoded on the wire).
+const CONTROL_TOKEN_BYTES: usize = 16;
 
 /// Upper bound on control connections served per supervisor tick.
 const MAX_CONTROL_REQUESTS_PER_TICK: usize = 8;
@@ -427,12 +449,17 @@ struct SupervisedProcess {
     /// `herd start` refuses, because a second copy beside a half-dead first
     /// (same port, same on-disk store) is worse than no copy.
     stopping_pid: Option<u32>,
+    /// The config file text `config` was parsed from. A reload re-parses only
+    /// a file whose text changed, so a warning about a bad line is printed
+    /// once per edit, not every 20 s.
+    config_text: String,
 }
 
 impl SupervisedProcess {
-    fn new(_name: String, config: ServiceConfig) -> Self {
+    fn new(config: ServiceConfig, config_text: String, log_size: usize) -> Self {
         Self {
             config,
+            config_text,
             pid: None,
             stdout_fd: None,
             state: ServiceState::Stopped,
@@ -442,7 +469,7 @@ impl SupervisedProcess {
             last_exit_code: None,
             restart_at_ms: None,
             start_at_ms: None,
-            log_size: 0,
+            log_size,
             stopping_pid: None,
         }
     }
@@ -462,6 +489,12 @@ struct HerdState {
     /// The `herd start`/`herd stop` listener on [`HERD_CONTROL_ADDR`], or
     /// `None` if it could not be opened (the daemon still supervises).
     control: Option<TcpListener>,
+    /// The token `start`/`stop` must carry ([`CONTROL_TOKEN_PATH`]); `None`
+    /// if it could not be written, in which case they are accepted without.
+    control_token: Option<String>,
+    /// Config files that did not parse, by service name, with the text that
+    /// failed: the error is printed once per edit rather than every reload.
+    rejected_configs: BTreeMap<String, String>,
 }
 
 impl HerdState {
@@ -471,6 +504,8 @@ impl HerdState {
             last_config_reload_ms: 0,
             pinned_cores: BTreeMap::new(),
             control: None,
+            control_token: None,
+            rejected_configs: BTreeMap::new(),
         }
     }
 }
@@ -492,96 +527,69 @@ pub extern "C" fn main() {
         }
     }
 
-    // Ensure required directories exist
-    ensure_directories();
-
     // Check for command-line arguments
     let argc = libakuma::argc();
-    
-    if argc > 1 {
-        // Command mode - handle subcommand
-        let subcommand = libakuma::arg(1).unwrap_or("");
-        let service_name = libakuma::arg(2);
-        
-        match subcommand {
-            "daemon" | "run" | "foreground" | "fg" => {
-                // Run as daemon in foreground (fall through to supervisor loop)
-            }
-            "status" => {
-                cmd_status();
-                exit(0);
-            }
-            "add" => {
-                if let Some(name) = service_name {
-                    cmd_add(name);
-                } else {
-                    print("Usage: herd add <service>\n");
-                }
-                exit(0);
-            }
-            "config" => {
-                if let Some(name) = service_name {
-                    cmd_config(name);
-                } else {
-                    print("Usage: herd config <service>\n");
-                }
-                exit(0);
-            }
-            "enable" => {
-                if let Some(name) = service_name {
-                    cmd_enable(name);
-                } else {
-                    print("Usage: herd enable <service>\n");
-                }
-                exit(0);
-            }
-            "disable" => {
-                if let Some(name) = service_name {
-                    cmd_disable(name);
-                } else {
-                    print("Usage: herd disable <service>\n");
-                }
-                exit(0);
-            }
-            "start" => {
-                let Some(name) = service_name else {
-                    print("Usage: herd start <service>\n");
-                    exit(1);
-                };
-                exit(if cmd_start(name) { 0 } else { 1 });
-            }
-            "stop" => {
-                let Some(name) = service_name else {
-                    print("Usage: herd stop <service>\n");
-                    exit(1);
-                };
-                exit(if cmd_stop(name) { 0 } else { 1 });
-            }
-            "log" => {
-                if let Some(name) = service_name {
-                    cmd_log(name);
-                } else {
-                    print("Usage: herd log <service>\n");
-                }
-                exit(0);
-            }
-            "version" | "--version" | "-V" => {
-                print("herd ");
-                print(libakuma::GIT_REV);
-                print("\n");
-                exit(0);
-            }
-            "help" | "--help" | "-h" => {
-                print_usage();
-                exit(0);
-            }
-            _ => {
-                print("Unknown command: ");
-                print(subcommand);
-                print("\n");
-                print_usage();
-                exit(1);
-            }
+    let subcommand = if argc > 1 { libakuma::arg(1).unwrap_or("") } else { "daemon" };
+    let service_name = libakuma::arg(2);
+
+    // Only the commands that create something need the directory tree; a
+    // `herd status` or `herd log` must not mkdir (or warn) as a side effect.
+    if matches!(subcommand, "daemon" | "run" | "foreground" | "fg" | "add" | "enable")
+        || subcommand.starts_with("--")
+    {
+        ensure_directories();
+    }
+
+    // A subcommand that takes a service name: the name, checked, or exit 1.
+    let named = |usage: &str| -> &str {
+        let Some(name) = service_name else {
+            print("Usage: herd ");
+            print(usage);
+            print(" <service>\n");
+            exit(1);
+        };
+        if !valid_service_name(name) {
+            print("Error: invalid service name '");
+            print(name);
+            print("' (no '/', whitespace or leading '.')\n");
+            exit(1);
+        }
+        name
+    };
+    let done = |ok: bool| -> ! { exit(if ok { 0 } else { 1 }) };
+
+    match subcommand {
+        // Run as daemon in foreground (fall through to supervisor loop).
+        // `--enabled-dir`/`--service` as the first argument mean the same.
+        "daemon" | "run" | "foreground" | "fg" => {}
+        s if s.starts_with("--") => {}
+        "status" => {
+            cmd_status();
+            exit(0);
+        }
+        "add" => done(cmd_add(named("add"))),
+        "config" => done(cmd_config(named("config"))),
+        "enable" => done(cmd_enable(named("enable"))),
+        "disable" => done(cmd_disable(named("disable"))),
+        "start" => done(cmd_start(named("start"))),
+        "stop" => done(cmd_stop(named("stop"))),
+        "log" => done(cmd_log(named("log"))),
+        "version" | "--version" | "-V" => {
+            print("herd ");
+            print(libakuma::GIT_REV);
+            print("\n");
+            exit(0);
+        }
+        "help" | "--help" | "-h" => {
+            print_usage();
+            exit(0);
+        }
+        _ => {
+            print("Unknown command: ");
+            print(subcommand);
+            print("\n");
+            print_usage();
+            exit(1);
         }
     }
 
@@ -593,6 +601,11 @@ pub extern "C" fn main() {
     let mut state = HerdState::new();
 
     state.control = open_control_socket();
+    // Only the daemon that owns the socket writes the token: a second,
+    // core-pinned herd (whose bind fails) must not replace the first's.
+    if state.control.is_some() {
+        state.control_token = write_control_token();
+    }
 
     // Initial config load
     reload_config(&mut state);
@@ -625,7 +638,6 @@ fn supervisor_loop(mut state: HerdState) {
 
         // 4. Reload config every 20 seconds
         if now_ms.saturating_sub(state.last_config_reload_ms) >= CONFIG_RELOAD_INTERVAL_MS {
-            print("[herd] Reloading config...\n");
             reload_config(&mut state);
             start_stopped_services(&mut state, now_ms);
             state.last_config_reload_ms = now_ms;
@@ -640,6 +652,51 @@ fn supervisor_loop(mut state: HerdState) {
 // Config Parsing
 // ============================================================================
 
+/// A config problem worth a console line. Not under the host test harness,
+/// where `print` is an Akuma syscall.
+fn config_warning(what: &str, key: &str, value: &str) {
+    if !cfg!(test) {
+        print("[herd] Warning: ");
+        print(what);
+        print(" `");
+        print(key);
+        print(" = ");
+        print(value);
+        print("`\n");
+    }
+}
+
+/// `true`/`yes`/`on`/`1` or `false`/`no`/`off`/`0`; anything else is `None`.
+///
+/// One spelling set for every boolean key. They used to differ per key:
+/// `backoff` and `console` took `yes`, `boxed` and `oneshot` did not, and
+/// `restart` read anything but `false`/`0`/`no` as true — so
+/// `oneshot = yes` silently made a restarting service.
+fn parse_bool(value: &str) -> Option<bool> {
+    match value {
+        "true" | "yes" | "on" | "1" => Some(true),
+        "false" | "no" | "off" | "0" => Some(false),
+        _ => None,
+    }
+}
+
+/// `value` without a trailing ` # comment`.
+///
+/// The README's own example writes `restart_delay = 1000     # ms ...`, and
+/// that value did not parse as a number: it fell back to the default, which
+/// happened to be 1000 too. `restart_delay = 5000  # five seconds` silently
+/// became one second. A `#` counts as a comment only after whitespace, so a
+/// path or argument containing `#` is kept; `env` values are never cut.
+fn strip_inline_comment(value: &str) -> &str {
+    let b = value.as_bytes();
+    for i in 1..b.len() {
+        if b[i] == b'#' && (b[i - 1] == b' ' || b[i - 1] == b'\t') {
+            return value[..i].trim_end();
+        }
+    }
+    value
+}
+
 fn parse_service_config(content: &str) -> Option<ServiceConfig> {
     let mut config = ServiceConfig::default();
     let mut vmc = VmConfig::default();
@@ -652,7 +709,14 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
 
         if let Some((key, value)) = line.split_once('=') {
             let key = key.trim();
-            let value = value.trim();
+            let value = if key == "env" { value.trim() } else { strip_inline_comment(value.trim()) };
+            // A value that does not parse keeps the default, and says so.
+            let bool_or = |default: bool| {
+                parse_bool(value).unwrap_or_else(|| {
+                    config_warning("not a boolean, keeping the default:", key, value);
+                    default
+                })
+            };
 
             // `vm`, `vm_*`: gathered whole and checked once, below.
             if vmc.apply(key, value) {
@@ -672,13 +736,19 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                 // silently falling through to `_ => {}` — so that config's
                 // 10-second wait for box 0's rump DHCP handshake never happened.
                 "restart_delay" | "restart_delay_ms" => {
-                    config.restart_delay_ms = value.parse::<u64>().ok().unwrap_or(DEFAULT_RESTART_DELAY_MS);
+                    config.restart_delay_ms = value.parse::<u64>().unwrap_or_else(|_| {
+                        config_warning("not a number of ms, keeping the default:", key, value);
+                        DEFAULT_RESTART_DELAY_MS
+                    });
                 }
                 "max_retries" => {
-                    config.max_retries = value.parse::<u32>().ok().unwrap_or(DEFAULT_MAX_RETRIES);
+                    config.max_retries = value.parse::<u32>().unwrap_or_else(|_| {
+                        config_warning("not a number, keeping the default:", key, value);
+                        DEFAULT_MAX_RETRIES
+                    });
                 }
                 "boxed" => {
-                    config.boxed = value == "true" || value == "1";
+                    config.boxed = bool_or(config.boxed);
                 }
                 "box_root" => {
                     config.box_root = String::from(value);
@@ -688,8 +758,8 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                     config.boxed = true; // bundles are always boxed
                 }
                 "stack" => config.stack = String::from(value),
-                "restart" => config.restart = value != "false" && value != "0" && value != "no",
-                "backoff" => config.backoff = value == "true" || value == "1" || value == "yes",
+                "restart" => config.restart = bool_or(config.restart),
+                "backoff" => config.backoff = bool_or(config.backoff),
                 "join_box" => {
                     config.join_box = String::from(value);
                     config.boxed = true; // a joined service always runs in a box
@@ -701,14 +771,17 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                         .collect();
                 }
                 "start_delay" | "start_delay_ms" => {
-                    config.start_delay_ms = value.parse::<u64>().ok().unwrap_or(0);
+                    config.start_delay_ms = value.parse::<u64>().unwrap_or_else(|_| {
+                        config_warning("not a number of ms, keeping the default:", key, value);
+                        0
+                    });
                 }
                 "oneshot" => {
-                    config.oneshot = value == "true" || value == "1";
+                    config.oneshot = bool_or(config.oneshot);
                 }
                 // Both spellings, because both are the obvious one to reach for.
                 "workdir" | "working_dir" => config.workdir = String::from(value),
-                "console" => config.console = value == "true" || value == "1" || value == "yes",
+                "console" => config.console = bool_or(config.console),
                 // Repeatable: each line adds one variable. The `split_once('=')`
                 // above takes the FIRST `=`, so the value keeps any further ones
                 // (`env = DSN=host=db port=5432` is one entry, spaces and all).
@@ -729,9 +802,15 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
                     }
                 },
                 "core" => {
-                    config.core = value.parse::<u64>().ok().unwrap_or(0) as u32;
+                    config.core = value.parse::<u32>().unwrap_or_else(|_| {
+                        config_warning("not a core number, ignored:", key, value);
+                        0
+                    });
                 }
-                _ => {}
+                // A misspelt key (`restart_dealy`) used to be skipped without
+                // a word, leaving the default in force. Still skipped - a newer
+                // config on an older herd must load - but now said.
+                _ => config_warning("unknown key ignored:", key, value),
             }
         }
     }
@@ -769,8 +848,8 @@ fn parse_service_config(content: &str) -> Option<ServiceConfig> {
 /// isn't forwarded). Returns `(service_name, content)` pairs (name = basename minus `.conf`), or
 /// `None` to fall back to an enabled-dir scan. Lets a per-core herd (e.g. pinned to core 2 to
 /// bring up that core's own rump box) load its services without ever scanning a directory.
-fn explicit_service_files() -> Option<Vec<(String, String)>> {
-    let mut out: Vec<(String, String)> = Vec::new();
+fn explicit_service_files() -> Option<Vec<(String, Option<String>)>> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
     let mut saw_service_flag = false;
     let mut i = 1;
     loop {
@@ -780,14 +859,13 @@ fn explicit_service_files() -> Option<Vec<(String, String)>> {
                 if let Some(path) = libakuma::arg(i + 1) {
                     let base = path.rsplit('/').next().unwrap_or(path);
                     let name = base.trim_end_matches(".conf");
-                    match read_file_string(path) {
-                        Some(c) => out.push((String::from(name), c)),
-                        None => {
-                            print("[herd] Warning: cannot read --service ");
-                            print(path);
-                            print("\n");
-                        }
+                    let content = read_file_string(path);
+                    if content.is_none() {
+                        print("[herd] Warning: cannot read --service ");
+                        print(path);
+                        print("\n");
                     }
+                    out.push((String::from(name), content));
                 }
                 i += 2;
             }
@@ -812,7 +890,11 @@ fn reload_config(state: &mut HerdState) {
     // Source the service configs: explicit `--service <path>` files (read directly), else scan
     // the enabled dir (honors --enabled-dir). Direct files work on a secondary core, where the
     // VFS is forwarded to core 0 and file reads work but directory listing does not.
-    let entries: Vec<(String, String)> = match explicit_service_files() {
+    //
+    // `None` content is a file that is listed but could not be read this time. Its
+    // service is kept as it is: a transient read failure used to drop the entry, and
+    // the removal pass below then stopped a running service nobody had disabled.
+    let entries: Vec<(String, Option<String>)> = match explicit_service_files() {
         Some(list) => list,
         None => {
             let ed = enabled_dir();
@@ -823,52 +905,66 @@ fn reload_config(state: &mut HerdState) {
                     return;
                 }
             };
-            let mut v: Vec<(String, String)> = Vec::new();
+            let mut v: Vec<(String, Option<String>)> = Vec::new();
             for entry in dir {
                 if !entry.name.ends_with(".conf") {
                     continue;
                 }
                 let name = String::from(entry.name.trim_end_matches(".conf"));
                 let path = format!("{}/{}", ed, entry.name);
-                if let Some(c) = read_file_string(&path) {
-                    v.push((name, c));
+                let content = read_file_string(&path);
+                if content.is_none() {
+                    print("[herd] Warning: cannot read ");
+                    print(&path);
+                    print("; keeping the service as it was\n");
                 }
+                v.push((name, content));
             }
             v
         }
     };
 
-    let mut found_services: Vec<String> = Vec::new();
     for (service_name, content) in &entries {
-        found_services.push(service_name.clone());
+        let Some(content) = content else { continue };
+        if state.services.get(service_name).is_some_and(|svc| svc.config_text == *content)
+            || state.rejected_configs.get(service_name) == Some(content)
+        {
+            continue; // unchanged since the last reload
+        }
 
-        // Parse config
-        let config = match parse_service_config(content) {
-            Some(c) => c,
-            None => {
-                print("[herd] Error parsing ");
-                print(service_name);
-                print("\n");
-                continue;
+        let Some(config) = parse_service_config(content) else {
+            print("[herd] Error parsing ");
+            print(service_name);
+            if state.services.contains_key(service_name) {
+                print("; keeping the previous config");
             }
+            print("\n");
+            state.rejected_configs.insert(service_name.clone(), content.clone());
+            continue;
         };
+        state.rejected_configs.remove(service_name);
 
-        // Update or add service
         if let Some(svc) = state.services.get_mut(service_name) {
+            print("[herd] Config changed: ");
+            print(service_name);
+            if svc.pid.is_some() {
+                print(" (takes effect at its next start)");
+            }
+            print("\n");
             svc.config = config;
+            svc.config_text = content.clone();
         } else {
-            let svc = SupervisedProcess::new(service_name.clone(), config);
+            let svc = SupervisedProcess::new(config, content.clone(), existing_log_size(service_name));
             state.services.insert(service_name.clone(), svc);
         }
     }
 
     // Remove services that are no longer enabled
-    let to_remove: Vec<String> = state.services.iter()
-        .filter(|(name, _)| {
-            !found_services.iter().any(|n| n == *name)
-        })
-        .map(|(name, _)| name.clone())
+    let to_remove: Vec<String> = state.services.keys()
+        .filter(|name| !entries.iter().any(|(n, _)| n == *name))
+        .cloned()
         .collect();
+    state.rejected_configs.retain(|name, _| entries.iter().any(|(n, _)| n == name));
 
     for name in to_remove {
         print("[herd] Stopping and removing disabled service: ");
@@ -880,6 +976,14 @@ fn reload_config(state: &mut HerdState) {
         print("\n");
         state.services.remove(&name);
     }
+}
+
+/// The size of a service's existing log, so rotation counts what an earlier
+/// herd (the previous boot, or a restarted daemon) already wrote. It started
+/// at 0, so each herd start let a log grow another [`MAX_LOG_SIZE`].
+fn existing_log_size(service_name: &str) -> usize {
+    let path = format!("{}/{}.log", HERD_LOG_DIR, service_name);
+    libakuma::fstatat(-100, &path, 0).map_or(0, |st| usize::try_from(st.st_size).unwrap_or(0))
 }
 
 // ============================================================================
@@ -970,15 +1074,20 @@ fn service_env(base: &[String], overrides: &[String]) -> Option<Vec<String>> {
     Some(spec::compose_env(base, overrides))
 }
 
+/// `cwd` is a path inside the box's namespace. It was hard-coded to `/`, so
+/// `workdir` was silently ignored for boxed and `join_box` services, and so was
+/// an OCI bundle's `process.cwd`.
 fn spawn_in_box(
     box_id: u64,
     command: &str,
     args: &[&str],
     env: Option<&[String]>,
+    cwd: &str,
 ) -> Option<SpawnResult> {
+    let cwd = if cwd.is_empty() { "/" } else { cwd };
     let mut options = sys::SpawnOptions {
-        cwd_ptr: "/".as_ptr() as u64,
-        cwd_len: 1,
+        cwd_ptr: cwd.as_ptr() as u64,
+        cwd_len: cwd.len(),
         root_dir_ptr: 0,
         root_dir_len: 0,
         args_ptr: 0,
@@ -1220,41 +1329,19 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
                 } else {
                     ServiceState::Running
                 };
-            } else {
-                // core_init failed (likely ENOSYS in shared-kernel SMP mode)
-                // Fall back to starting as a normal local process on the BSP
-                print("[herd] core_init unavailable for ");
-                print(name);
-                print(" — falling back to local process on BSP\n");
-                // Clear the core pinning and continue to normal spawning below
-                let config_for_local = ServiceConfig {
-                    core: 0, // Force BSP (core 0)
-                    ..config.clone()
-                };
-                let args: Vec<&str> = config_for_local.args.iter().map(|s| s.as_str()).collect();
-                let args_opt = if args.is_empty() { None } else { Some(args.as_slice()) };
-                let spawn_res = spawn(&config_for_local.command, args_opt);
-                
-                match spawn_res {
-                    Some(SpawnResult { pid, stdout_fd, .. }) => {
-                        svc.pid = Some(pid);
-                        svc.stdout_fd = Some(nonblocking_stdout(stdout_fd));
-                        svc.state = ServiceState::Running;
-                        svc.restart_at_ms = None;
-                        print("[herd] Started ");
-                        print(name);
-                        print(" (pid=");
-                        print_dec(pid as usize);
-                        print(") on BSP fallback\n");
-                    }
-                    None => {
-                        svc.state = ServiceState::Failed;
-                        print("[herd] Failed to start ");
-                        print(name);
-                        print("\n");
-                    }
-                }
             }
+        }
+        if !ok {
+            // core_init failed (ENOSYS on shared-kernel SMP, where every core
+            // already runs this kernel): start it here like any service. This
+            // used to be a second, plain spawn that dropped env, workdir,
+            // console, cpus, the log and `started_at_ms` (so every exit
+            // counted as a quick failure).
+            print("[herd] core_init unavailable for ");
+            print(name);
+            print(" - starting it as a local process\n");
+            let local = ServiceConfig { core: 0, ..config.clone() };
+            start_service(state, name, &local);
         }
         return;
     }
@@ -1285,7 +1372,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         setup_fs_mounts(target_box_id, &config.mount_fs);
         let args: Vec<&str> = config.args.iter().map(|s| s.as_str()).collect();
         let env = service_env(&[], &config.env);
-        spawn_in_box(target_box_id, &config.command, &args, env.as_deref())
+        spawn_in_box(target_box_id, &config.command, &args, env.as_deref(), &config.workdir)
     } else if !config.bundle.is_empty() {
         // OCI Bundle mode
         let config_path = format!("{}/config.json", config.bundle);
@@ -1340,7 +1427,9 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         //    OCI runtime spec says it is the container's environment — and the
         //    service's own `env =` lines override it by name.
         let env = service_env(&oci.process_env, &config.env);
-        let res = spawn_in_box(box_id, &command, &args, env.as_deref());
+        // The service's `workdir` overrides the bundle's `process.cwd`.
+        let cwd = if config.workdir.is_empty() { oci.process_cwd.as_str() } else { config.workdir.as_str() };
+        let res = spawn_in_box(box_id, &command, &args, env.as_deref(), cwd);
         if let Some(ref r) = res {
             sys::register_box(box_id, name, &root_dir, r.pid);
         }
@@ -1359,7 +1448,7 @@ fn start_service(state: &mut HerdState, name: &str, config: &ServiceConfig) {
         }
         setup_fs_mounts(box_id, &config.mount_fs);
         let env = service_env(&[], &config.env);
-        let res = spawn_in_box(box_id, &config.command, &args, env.as_deref());
+        let res = spawn_in_box(box_id, &config.command, &args, env.as_deref(), &config.workdir);
         if let Some(ref r) = res {
             sys::register_box(box_id, name, &config.box_root, r.pid);
         }
@@ -1680,22 +1769,80 @@ enum Request<'a> {
     Status,
 }
 
-/// `start <svc>`, `stop <svc>` or `status`, whitespace-separated, nothing else.
-fn parse_request(line: &str) -> Option<Request<'_>> {
-    let mut words = line.split_whitespace();
+/// `[token=<hex>] start <svc>`, `[token=<hex>] stop <svc>` or `status`,
+/// whitespace-separated, nothing else. Returns the token, if any, beside the
+/// request; [`authorized`] decides what it is worth.
+fn parse_request(line: &str) -> Option<(Option<&str>, Request<'_>)> {
+    let mut words = line.split_whitespace().peekable();
+    let token = words.peek().and_then(|w| w.strip_prefix("token="));
+    if token.is_some() {
+        words.next();
+    }
     let verb = words.next()?;
     if verb == "status" {
-        return if words.next().is_none() { Some(Request::Status) } else { None };
+        return if words.next().is_none() { Some((token, Request::Status)) } else { None };
     }
     let name = words.next()?;
-    if words.next().is_some() || name.contains('/') {
+    if words.next().is_some() || !valid_service_name(name) {
         return None;
     }
     match verb {
-        "start" => Some(Request::Start(name)),
-        "stop" => Some(Request::Stop(name)),
+        "start" => Some((token, Request::Start(name))),
+        "stop" => Some((token, Request::Stop(name))),
         _ => None,
     }
+}
+
+/// Whether a request may run: `status` always; `start`/`stop` only with the
+/// daemon's token, when it has one. The comparison does not stop at the first
+/// differing byte.
+fn authorized(expected: Option<&str>, given: Option<&str>, request: &Request<'_>) -> bool {
+    if *request == Request::Status {
+        return true;
+    }
+    let Some(expected) = expected else { return true };
+    let Some(given) = given else { return false };
+    expected.len() == given.len()
+        && expected.bytes().zip(given.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
+}
+
+/// A service name the CLI and the control socket accept: what can name a
+/// `<name>.conf` file in one directory and travel as one word on the wire.
+/// `herd add ../x` used to write outside `/etc/herd/available`.
+fn valid_service_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && !name.starts_with('.')
+        && name.bytes().all(|b| b.is_ascii_graphic() && b != b'/')
+}
+
+/// Make a fresh control token and publish it at [`CONTROL_TOKEN_PATH`]: a
+/// temporary file, made 0600 before anything is in it, renamed over the old
+/// one. Returns the token, or `None` (with a warning) if any step failed.
+fn write_control_token() -> Option<String> {
+    let mut raw = [0u8; CONTROL_TOKEN_BYTES];
+    if !matches!(libakuma::getrandom(&mut raw), Ok(n) if n == raw.len()) {
+        print("[herd] Warning: no randomness for a control token; start/stop are unauthenticated\n");
+        return None;
+    }
+    let mut token = String::with_capacity(2 * CONTROL_TOKEN_BYTES);
+    for b in raw {
+        token.push_str(&format!("{b:02x}"));
+    }
+    let tmp = format!("{CONTROL_TOKEN_PATH}.tmp");
+    let _ = libakuma::unlink(&tmp);
+    let ok = write_file(&tmp, b"")
+        && libakuma::chmod(&tmp, 0o600) == 0
+        && write_file(&tmp, token.as_bytes())
+        && libakuma::rename(&tmp, CONTROL_TOKEN_PATH) == 0;
+    if !ok {
+        let _ = libakuma::unlink(&tmp);
+        print("[herd] Warning: cannot write ");
+        print(CONTROL_TOKEN_PATH);
+        print("; start/stop are unauthenticated\n");
+        return None;
+    }
+    Some(token)
 }
 
 /// The wire form of a reply: `ok <msg>\n` / `err <msg>\n`.
@@ -1739,7 +1886,11 @@ fn open_control_socket() -> Option<TcpListener> {
 /// Answer the control connections pending since the last tick, each in full:
 /// read its request, act on it, write the reply, close.
 fn serve_control(state: &mut HerdState) {
+    let begin = uptime();
     for _ in 0..MAX_CONTROL_REQUESTS_PER_TICK {
+        if uptime().saturating_sub(begin) / 1000 >= CONTROL_TICK_BUDGET_MS {
+            return; // the rest wait in the backlog for the next tick
+        }
         let Some(listener) = state.control.as_ref() else { return };
         // `WouldBlock` is the idle case; any other error is retried next tick.
         let Ok((stream, _)) = listener.try_accept() else { return };
@@ -1789,7 +1940,19 @@ fn status_report(state: &HerdState) -> String {
 }
 
 fn handle_request(state: &mut HerdState, line: &str) -> Reply {
-    let reply = match parse_request(line) {
+    let request = match parse_request(line) {
+        Some((token, request)) => {
+            if !authorized(state.control_token.as_deref(), token, &request) {
+                print("[herd] Refused a control request without a valid token\n");
+                return Reply::err(format!(
+                    "not authorized: start/stop need the token in {CONTROL_TOKEN_PATH}"
+                ));
+            }
+            Some(request)
+        }
+        None => None,
+    };
+    let reply = match request {
         Some(Request::Stop(name)) => {
             print("[herd] Stop requested for ");
             print(name);
@@ -1803,7 +1966,8 @@ fn handle_request(state: &mut HerdState, line: &str) -> Reply {
             control_start(state, name)
         }
         Some(Request::Status) => return Reply::ok(status_report(state)),
-        None => Reply::err(format!("bad request {line:?}; expected `start <svc>`, `stop <svc>` or `status`")),
+        // The line is not echoed back or logged: it may carry the token.
+        None => Reply::err(String::from("bad request; expected `start <svc>`, `stop <svc>` or `status`")),
     };
     print("[herd] ");
     print(&reply.msg);
@@ -2124,11 +2288,11 @@ fn append_to_log(state: &mut HerdState, service_name: &str, data: &[u8]) {
 
     // Check if rotation is needed
     if current_size + data.len() > max_size {
-        // Rotate: copy current to .old
-        if let Some(content) = read_file_bytes(&log_path) {
-            write_file(&log_old_path, &content);
-        }
-        
+        // Rotate by rename. It used to read the whole log into memory (up to
+        // the VM limit) and write it out again, on the supervisor's thread.
+        let _ = libakuma::unlink(&log_old_path);
+        let _ = libakuma::rename(&log_path, &log_old_path);
+
         // Write new data to log (overwrite)
         write_file(&log_path, data);
 
@@ -2193,23 +2357,37 @@ fn read_file_bytes(path: &str) -> Option<Vec<u8>> {
     Some(content)
 }
 
+/// Write all of `data` to `fd`, across short writes; false on an error.
+/// `write_file` used to issue one `write` and report success whatever it did.
+fn write_all_fd(fd: i32, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        let n = write_fd(fd, data);
+        if n <= 0 {
+            return false;
+        }
+        data = &data[(n as usize).min(data.len())..];
+    }
+    true
+}
+
 fn write_file(path: &str, data: &[u8]) -> bool {
     let fd = open(path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
         return false;
     }
-    write_fd(fd, data);
+    let ok = write_all_fd(fd, data);
     close(fd);
-    true
+    ok
 }
 
-fn append_file(path: &str, data: &[u8]) {
+fn append_file(path: &str, data: &[u8]) -> bool {
     let fd = open(path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_APPEND);
     if fd < 0 {
-        return;
+        return false;
     }
-    write_fd(fd, data);
+    let ok = write_all_fd(fd, data);
     close(fd);
+    ok
 }
 
 // ============================================================================
@@ -2238,6 +2416,7 @@ fn print_usage() {
     print("  stop <svc>     Stop and reap a running service now, without disabling it\n");
     print("  log <svc>      Show service log\n");
     print("  vm-run <file>  (internal) the process a `vm = true` service runs\n");
+    print("  version        Show the build's git revision\n");
     print("  help           Show this help\n");
     print("\n");
     print("Without arguments, runs as daemon in foreground.\n");
@@ -2275,7 +2454,7 @@ fn cmd_status() {
     }
 }
 
-fn cmd_add(name: &str) {
+fn cmd_add(name: &str) -> bool {
     let path = format!("{}/{}.conf", HERD_AVAILABLE_DIR, name);
     
     // Check if already exists
@@ -2285,7 +2464,7 @@ fn cmd_add(name: &str) {
         print("' already exists in ");
         print(HERD_AVAILABLE_DIR);
         print("/\n");
-        return;
+        return false;
     }
     
     let default_config = format!(
@@ -2306,14 +2485,16 @@ fn cmd_add(name: &str) {
         print("Edit this file and then run 'herd enable ");
         print(name);
         print("' to start it.\n");
+        true
     } else {
         print("Error: Failed to create service configuration at ");
         print(&path);
         print("\n");
+        false
     }
 }
 
-fn cmd_config(name: &str) {
+fn cmd_config(name: &str) -> bool {
     // Try enabled directory first
     let enabled_path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
     if let Some(content) = read_file_string(&enabled_path) {
@@ -2324,7 +2505,7 @@ fn cmd_config(name: &str) {
         if !content.ends_with('\n') {
             print("\n");
         }
-        return;
+        return true;
     }
     
     // Try available directory
@@ -2337,7 +2518,7 @@ fn cmd_config(name: &str) {
         if !content.ends_with('\n') {
             print("\n");
         }
-        return;
+        return true;
     }
     
     print("Service '");
@@ -2348,9 +2529,10 @@ fn cmd_config(name: &str) {
     print("/ and ");
     print(HERD_ENABLED_DIR);
     print("/\n");
+    false
 }
 
-fn cmd_enable(name: &str) {
+fn cmd_enable(name: &str) -> bool {
     let src_path = format!("{}/{}.conf", HERD_AVAILABLE_DIR, name);
     let dst_path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
     
@@ -2359,7 +2541,7 @@ fn cmd_enable(name: &str) {
         print("Service '");
         print(name);
         print("' is already enabled.\n");
-        return;
+        return true;
     }
     
     // Read source config
@@ -2371,7 +2553,7 @@ fn cmd_enable(name: &str) {
             print("' not found in ");
             print(HERD_AVAILABLE_DIR);
             print("/\n");
-            return;
+            return false;
         }
     };
     
@@ -2381,16 +2563,19 @@ fn cmd_enable(name: &str) {
         print(name);
         print("'\n");
         print("Service will start on next config reload (within 20s) or reboot.\n");
+        true
     } else {
         print("Error: Failed to enable service '");
         print(name);
         print("'. Could not write to ");
         print(&dst_path);
         print("\n");
+        let _ = libakuma::unlink(&dst_path); // not a half-written config
+        false
     }
 }
 
-fn cmd_disable(name: &str) {
+fn cmd_disable(name: &str) -> bool {
     let path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
     
     // Check if enabled
@@ -2398,7 +2583,7 @@ fn cmd_disable(name: &str) {
         print("Service '");
         print(name);
         print("' is not enabled.\n");
-        return;
+        return true;
     }
     
     // Remove from enabled
@@ -2406,10 +2591,12 @@ fn cmd_disable(name: &str) {
         print("Disabled service '");
         print(name);
         print("'\n");
+        true
     } else {
         print("Error: Failed to delete ");
         print(&path);
         print("\n");
+        false
     }
 }
 
@@ -2438,7 +2625,18 @@ fn send_control(verb: &str, name: &str) -> bool {
             return false;
         }
     };
-    let request = if name.is_empty() { format!("{verb}\n") } else { format!("{verb} {name}\n") };
+    // `start`/`stop` carry the daemon's token. No token file means a daemon
+    // that predates it or could not write one; it accepts the bare request.
+    let token = if name.is_empty() {
+        None
+    } else {
+        read_file_string(CONTROL_TOKEN_PATH).map(|t| String::from(t.trim()))
+    };
+    let request = match (name.is_empty(), token) {
+        (true, _) => format!("{verb}\n"),
+        (false, Some(t)) if !t.is_empty() => format!("token={t} {verb} {name}\n"),
+        (false, _) => format!("{verb} {name}\n"),
+    };
     if stream.write_all(request.as_bytes()).is_err() {
         print("Error: failed to send the request to the herd daemon\n");
         return false;
@@ -2467,7 +2665,7 @@ fn send_control(verb: &str, name: &str) -> bool {
     ok
 }
 
-fn cmd_log(name: &str) {
+fn cmd_log(name: &str) -> bool {
     let log_path = format!("{}/{}.log", HERD_LOG_DIR, name);
     
     match read_file_string(&log_path) {
@@ -2482,11 +2680,13 @@ fn cmd_log(name: &str) {
                     print("\n");
                 }
             }
+            true
         }
         None => {
             print("No log found for '");
             print(name);
             print("'\n");
+            false
         }
     }
 }
@@ -2697,13 +2897,70 @@ vm_ram_mib = 768\nvm_vcpus = 2\nvm_forward = 2223:4444\nvm_cmdline = init=/usr/b
 
     #[test]
     fn requests_parse() {
-        assert_eq!(parse_request("stop kot"), Some(Request::Stop("kot")));
-        assert_eq!(parse_request("  start   sshd \r"), Some(Request::Start("sshd")));
+        assert_eq!(parse_request("stop kot"), Some((None, Request::Stop("kot"))));
+        assert_eq!(parse_request("  start   sshd \r"), Some((None, Request::Start("sshd"))));
+        assert_eq!(parse_request("token=ab12 stop kot"), Some((Some("ab12"), Request::Stop("kot"))));
+        assert_eq!(parse_request("token=ab12 status"), Some((Some("ab12"), Request::Status)));
         assert_eq!(parse_request("stop"), None);
+        assert_eq!(parse_request("token=ab12"), None);
         assert_eq!(parse_request("stop kot now"), None);
         assert_eq!(parse_request("restart kot"), None);
         assert_eq!(parse_request("stop ../kot"), None);
+        assert_eq!(parse_request("stop .hidden"), None);
         assert_eq!(parse_request(""), None);
+    }
+
+    #[test]
+    fn start_and_stop_need_the_token_status_does_not() {
+        let stop = Request::Stop("kot");
+        assert!(authorized(Some("ab12"), Some("ab12"), &stop));
+        assert!(!authorized(Some("ab12"), Some("ab13"), &stop));
+        assert!(!authorized(Some("ab12"), Some("ab1"), &stop), "a prefix is not the token");
+        assert!(!authorized(Some("ab12"), None, &stop));
+        assert!(!authorized(Some("ab12"), None, &Request::Start("kot")));
+        assert!(authorized(Some("ab12"), None, &Request::Status));
+        assert!(authorized(None, None, &stop), "a daemon with no token accepts bare requests");
+    }
+
+    #[test]
+    fn service_names_stay_in_their_directory() {
+        assert!(valid_service_name("sshd"));
+        assert!(valid_service_name("rump-net_2"));
+        for bad in ["", "..", ".x", "a/b", "../etc/passwd", "a b", "a\tb", "a\nb"] {
+            assert!(!valid_service_name(bad), "{bad:?}");
+        }
+        assert!(!valid_service_name(&"x".repeat(65)));
+    }
+
+    #[test]
+    fn booleans_have_one_spelling_set() {
+        for t in ["true", "yes", "on", "1"] {
+            assert_eq!(parse_bool(t), Some(true));
+        }
+        for f in ["false", "no", "off", "0"] {
+            assert_eq!(parse_bool(f), Some(false));
+        }
+        assert_eq!(parse_bool("maybe"), None);
+        // `oneshot = yes` used to read as false and make a restarting service.
+        let c = parse_service_config("command = /bin/x\noneshot = yes\nboxed = on\nrestart = no\n").unwrap();
+        assert!(c.oneshot && c.boxed && !c.restart);
+        // An unparseable value keeps the default rather than flipping it.
+        let c = parse_service_config("command = /bin/x\nrestart = nope\n").unwrap();
+        assert!(c.restart, "restart defaults to true");
+    }
+
+    #[test]
+    fn inline_comments_are_stripped_except_from_env() {
+        assert_eq!(strip_inline_comment("5000  # five seconds"), "5000");
+        assert_eq!(strip_inline_comment("/bin/x#y"), "/bin/x#y", "a # inside a word is kept");
+        assert_eq!(strip_inline_comment("# all comment"), "# all comment");
+        let c = parse_service_config(
+            "command = /bin/x   # the binary\nrestart_delay = 5000 # ms\nenv = A=b # c\n",
+        )
+        .unwrap();
+        assert_eq!(c.command, "/bin/x");
+        assert_eq!(c.restart_delay_ms, 5000, "used to fall back to the 1000 ms default");
+        assert_eq!(c.env, ["A=b # c"]);
     }
 
     #[test]

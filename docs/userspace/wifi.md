@@ -5,7 +5,8 @@ The wifi manager: known networks in `/etc/wifi/<network>`, the kernel's
 supplicant: the kernel does the WPA2 handshake.
 
 The main doc is [`userspace/wifi/README.md`](../../userspace/wifi/README.md)
-(commands, the service, building and testing).
+(commands, the service, building and testing). Review findings (atomic saves, passphrase echo,
+`forget` of a broken file): [`userspace/wifi/docs/ISSUES_2026_11_16.md`](../../userspace/wifi/docs/ISSUES_2026_11_16.md).
 
 See also: [`../reference/subsystems/wifi.md`](../reference/subsystems/wifi.md)
 (the device protocol, the simulated radio, the config file format) and

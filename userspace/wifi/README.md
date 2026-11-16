@@ -52,8 +52,11 @@ menu entry 7; against `wifisim=lossy`, entry 15 (`overlays/ryzen/README.md`).
 
 ## Limits
 
-- `wifi add` reads the passphrase without suppressing terminal echo. Redirect
-  it from a file.
+- `wifi add` turns terminal echo off while it reads the passphrase, and only
+  when stdin is a terminal. Piped input is read as is.
+- A hand-edited `passphrase = ...` line is trimmed, so leading and trailing
+  spaces in a passphrase are lost. Use `psk = <64 hex>` for one that has them.
+  (`wifi add` always writes the derived `psk`.)
 - Status is polled (100 ms steps); `/dev/wifi0` has no `poll(2)` readiness yet.
 - The one real radio is ryzen's RTL8852CE (`rtw89wifi`); everywhere else
   only `wifisim` / `wifisim=lossy` gives the tool something to manage.

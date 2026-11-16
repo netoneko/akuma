@@ -88,7 +88,9 @@ pub extern "C" fn main() {
     };
 
     match extract_file(&archive_path, &target_dir, &opts) {
-        Ok(_) => exit(0),
+        // An entry that was refused or could not be written fails the run,
+        // as in GNU tar; it used to exit 0 after printing the error.
+        Ok(stats) => exit(if stats.rejected > 0 || stats.failed > 0 { 1 } else { 0 }),
         Err(e) => {
             eprintln(&format!("tar: error: {}", e.describe()));
             exit(1);

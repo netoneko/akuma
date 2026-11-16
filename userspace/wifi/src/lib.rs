@@ -10,7 +10,8 @@
 //! | [`derive_psk`] | WPA2's PBKDF2-SHA1(passphrase, ssid, 4096, 32) — done here so the kernel never has to |
 //! | [`choose`] | which known network to join, given a scan |
 //! | [`auto_step`] / [`auto_backoff`] | what `wifi auto` does with one status read, and how long it then waits |
-//! | [`valid_name`] / [`printable_ssid`] | file names and display |
+//! | [`valid_name`] / [`printable_ssid`] / [`scan_mark`] | file names and display |
+//! | [`replacing`] | what `wifi add` keeps from a file it overwrites |
 //!
 //! The design is `proposals/AKUMA_WIFI_CONTROL.md`; the device protocol is
 //! `akuma-wifi`, shared with the kernel.
@@ -192,6 +193,42 @@ impl Network {
         b.ssid == self.ssid
             && self.bssid.is_none_or(|want| want == b.bssid)
             && matches!((b.security, self.psk), (Security::Open, None) | (Security::Wpa2Psk, Some(_)))
+    }
+}
+
+/// The network `wifi add` writes when `/etc/wifi/<name>` may already exist:
+/// the new SSID and key, with the old file's `priority` and `autoconnect`
+/// kept, and its `bssid` pin kept only while the SSID is the same.
+///
+/// `wifi add home` over an existing `home` (say, to change a password) used
+/// to reset the network to priority 0, autoconnect on and no pin, silently
+/// undoing what had been set by hand.
+#[must_use]
+pub fn replacing(new: Network, old: Option<&Network>) -> Network {
+    match old {
+        None => new,
+        Some(o) => Network {
+            priority: o.priority,
+            autoconnect: o.autoconnect,
+            bssid: if o.ssid == new.ssid { o.bssid } else { None },
+            ..new
+        },
+    }
+}
+
+/// The mark `wifi scan` puts beside a network in range: `*` for a known
+/// network that can be joined over it, `!` for a known SSID whose security
+/// does not match the stored key (an open network stored, WPA2 in the air, or
+/// the reverse: `wifi connect` would fail), blank otherwise. Matching on the
+/// SSID alone used to star networks `wifi connect` then could not join.
+#[must_use]
+pub fn scan_mark(known: &[Network], b: &Bss) -> char {
+    if known.iter().any(|n| n.can_join(b)) {
+        '*'
+    } else if known.iter().any(|n| n.ssid == b.ssid) {
+        '!'
+    } else {
+        ' '
     }
 }
 

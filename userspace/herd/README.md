@@ -44,7 +44,12 @@ Run with no arguments (or `herd daemon`), it becomes a foreground supervisor:
    - fires due restarts,
    - answers pending `herd start`/`herd stop` connections,
    - reloads config every 20 s (picking up newly enabled / disabled services;
-     a disabled one is stopped and reaped like `herd stop`).
+     a disabled one is stopped and reaped like `herd stop`). Only a file whose
+     text changed is re-parsed, and the change is logged once
+     (`[herd] Config changed: <svc>`). It takes effect at the service's next
+     start. A file that stops parsing keeps the service's previous config, and
+     one that cannot be read leaves the service as it was. Neither counts as
+     disabled.
 
 Run with a subcommand, it's a thin CLI for managing service config files instead
 (see [CLI](#cli)).
@@ -67,9 +72,17 @@ discovers services by listing that directory.
 
 ## Config format
 
-Plain `key = value`, one per line. Blank lines and `#` comments are ignored.
-Unknown keys are silently skipped (forward-compatible). The only required key is
+Plain `key = value`, one per line. Blank lines and `#` comments are ignored,
+and so is a trailing ` # comment` after a value: a `#` that follows whitespace,
+on every key except `env` (an `env` value is taken whole). A `#` inside a word
+(`/srv/a#b`) is kept. Unknown keys are skipped with a warning (forward-compatible,
+but a typo is reported). The only required key is
 `command` — a config with no `command` is rejected.
+
+Every `bool` key takes `true`/`yes`/`on`/`1` or `false`/`no`/`off`/`0`. A
+value that is neither, or a number that does not parse, keeps the key's
+default and logs a warning (`[herd] Warning: not a boolean, keeping the
+default: ...`).
 
 ```conf
 # /etc/herd/enabled/httpd.conf
@@ -100,7 +113,7 @@ backoff       = false    # true: double restart_delay per quick failure, up to 6
 | `join_box` | name | *(none)* | Spawn into an **existing** box (by name) instead of registering a new one. Implies `boxed = true`. The target box must already exist and be stack-marked by its owner service. |
 | `mount` | space-separated | *(none)* | Filesystems to mount in the box's namespace before spawning. Only `proc` (→ `/proc`) and `tmpfs` (→ `/tmp`). A fresh-root box has no `/proc` otherwise — sshd's interactive bridge needs `/proc/<pid>/fd/0`. |
 | `env` | `KEY=VALUE`, repeatable | *(none)* | One environment variable per line; the value may contain spaces and `=`. Overrides by name the bundle's `process.env`, or `DEFAULT_ENV` otherwise. With no `env` lines the kernel's default environment applies unchanged. |
-| `workdir` / `working_dir` | path | *(inherit `/`)* | Working directory, passed through `SPAWN_EXT` (a `chdir` in herd would not reach the child). |
+| `workdir` / `working_dir` | path | *(inherit `/`)* | Working directory, passed through `SPAWN_EXT` (a `chdir` in herd would not reach the child). For a boxed, `join_box` or `bundle` service it is a path inside the box. A bundle without it uses `process.cwd` from `config.json`. |
 | `cpus` | core list (`4-7`, `0,2`) | *(any core)* | Host cores the service and everything it spawns may run on (`sched_setaffinity`, amd64 kernel). herd sets its own affinity to the mask around the spawn, so the child is born with it (affinity is inherited) and never runs elsewhere. A core named in `kvmcores=` is reserved from boot and runs only threads that name it, so this is how a service reaches one. A core the machine does not have: warning, the service starts unrestricted. For a `command = firecracker ...` service, vCPU `i` runs on the `i`-th core of the list. Not combinable with `core`. |
 | `core` | u32 | `0` (BSP) | Run the service on a specific multikernel secondary core. `0`/unset = spawn locally on the BSP (default). Non-zero = herd calls `core_init(N, command)` so core N's kernel spawns it locally (no cross-core spawn, no local pid). Mutually exclusive with boxes. See [`docs/CORE_AWARE_SCHEDULING.md`](docs/CORE_AWARE_SCHEDULING.md). |
 
@@ -184,18 +197,38 @@ herd <command> [args]
   start <svc>           Start an enabled service now (no reload wait).
   stop <svc>            Stop and reap a running service now, without disabling it.
   log <svc>             Print /var/log/herd/<svc>.log.
+  version               Print the build's git revision.
   help | --help | -h    Usage.
 ```
+
+A `<svc>` name is one word: no `/`, no whitespace, no leading `.`, at most 64
+bytes. Anything else is refused with exit 1 before a file is touched. Every
+subcommand exits non-zero when it fails.
 
 Note: `enable`/`disable` only edit the config files. A running daemon picks the
 change up on its next 20 s config reload; a fresh boot picks it up at start.
 
 `start`/`stop` talk to the running daemon over a loopback TCP socket,
 `127.0.0.1:7117` (`HERD_CONTROL_ADDR`) — loopback TCP rather than AF_UNIX
-because the amd64 kernel has no AF_UNIX. The CLI sends one line (`stop kot`),
-the daemon acts on it and answers `ok <msg>` / `err <msg>`, and the CLI prints
-the message and exits 0 / 1. So the reply says what happened, not that a
-request was queued:
+because the amd64 kernel has no AF_UNIX. The CLI sends one line
+(`token=<hex> stop kot`), the daemon acts on it and answers `ok <msg>` /
+`err <msg>`, and the CLI prints the message and exits 0 / 1. So the reply says
+what happened, not that a request was queued.
+
+**The token.** Anything that can open a loopback connection can reach the
+socket: every local process, including boxed services that share the host's
+network stack. So the daemon that binds it writes a fresh random token to
+`/var/run/herd/control.token` (mode 0600, written to a temp file and renamed
+into place), and `start`/`stop` must carry it as a leading `token=<hex>` word.
+The CLI reads the file and sends it. `status` needs no token. A daemon that
+could not write the token logs a warning and accepts bare requests, and a CLI
+that finds no token file sends a bare request, so mixed old and new binaries
+still work. A second herd whose bind fails (a core-pinned sub-herd) never
+writes the token. The file mode only helps once the kernel enforces file
+permissions; until then the token keeps out what cannot see the host's
+`/var/run`, such as a box with its own root.
+
+The two verbs:
 
 - **`stop`** sends SIGTERM, waits up to 3 s for the process to be reapable,
   then SIGKILL and up to 2 s more, reaps it, and only then replies — e.g.
@@ -220,7 +253,9 @@ was `/etc/herd/control/<svc>.{start,stop}` marker files, listed on every
 
 herd polls each running service's stdout fd every loop and appends what it reads
 to `/var/log/herd/<svc>.log`. When a write would push the file past `MAX_LOG_SIZE`
-(32 KB), the current log is moved to `<svc>.log.old` and a new log is started.
+(32 KB), the current log is renamed to `<svc>.log.old` and a new log is started.
+The size count starts from the existing file's size, so a restarted herd does
+not let a log grow past the limit again.
 View logs with `herd log <svc>` or read the files directly.
 
 ---

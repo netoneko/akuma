@@ -9,6 +9,9 @@ Docs live at [`userspace/box/docs/`](../../userspace/box/docs/):
 - `BOX_RUN.md` — containers, the overlay root, what is and is not docker-compatible.
 - `BOX_BUILD.md` — `box build`/`commit`/`save`/`tag`/`rmi`: layers, cache, what Dockerfile features exist.
 - `TESTING.md` — test procedures.
+- `ISSUES_2026_11_16.md` — review findings for box and the tar it links, among them **layer
+  extraction writing through symlinks** (a pulled image could overwrite host files) and
+  registry digests used as paths unchecked.
 
 See also: [`../reference/subsystems/containers.md`](../reference/subsystems/containers.md)
 -> "OCI images and the overlay root", the runbook

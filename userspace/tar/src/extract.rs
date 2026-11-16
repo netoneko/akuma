@@ -4,16 +4,81 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use alloc::collections::BTreeSet;
+
 use libakuma::{
-    chmod, close, lchown, link, eprintln, mkdir_p, open, open_flags, print, print_dec, println, read_fd, symlink,
-    write_fd,
+    chmod, close, eprintln, fstatat, lchown, link, mkdir_p, open, open_flags, print, print_dec, println, read_fd,
+    readlink, symlink, unlink, write_fd,
 };
 use miniz_oxide::inflate;
 
 use crate::format::{
-    BLOCK_SIZE, Entry, EntryKind, is_path_safe, join_path, parse_header, relative_symlink_target,
-    strip_gzip_header,
+    BLOCK_SIZE, Entry, EntryKind, PathState, is_path_safe, join_path, parse_header, relative_symlink_target,
+    resolve_in_root, strip_gzip_header,
 };
+
+const S_IFMT: u32 = 0o170_000;
+const S_IFDIR: u32 = 0o040_000;
+const S_IFLNK: u32 = 0o120_000;
+const AT_FDCWD: i32 = -100;
+const AT_SYMLINK_NOFOLLOW: u32 = 0x100;
+
+/// `lstat`'s file type bits, `None` if nothing is there.
+fn file_type(path: &str) -> Option<u32> {
+    fstatat(AT_FDCWD, path, AT_SYMLINK_NOFOLLOW).ok().map(|st| st.st_mode & S_IFMT)
+}
+
+/// The extraction directory, and the directories under it already seen to be
+/// real directories. Every entry is placed through it, so no write follows a
+/// symlink out of the tree (`crate::format::resolve_in_root`).
+///
+/// The cache is sound because extraction never turns a directory into anything
+/// else: it unlinks only symlinks, and `symlink()` over a directory fails. It
+/// keeps the check to one `lstat` per new directory rather than one per
+/// component per entry.
+struct Root {
+    dir: String,
+    known_dirs: BTreeSet<String>,
+}
+
+impl Root {
+    fn new(dir: &str) -> Self {
+        Self { dir: String::from(dir), known_dirs: BTreeSet::new() }
+    }
+
+    /// Where root-relative `rel` really is, with its directories resolved
+    /// inside the root. `None`: a symlink loop or an unreadable link.
+    fn resolve(&mut self, rel: &str) -> Option<String> {
+        let dir = &self.dir;
+        let known = &mut self.known_dirs;
+        let resolved = resolve_in_root(rel, |p| {
+            if known.contains(p) {
+                return PathState::NotLink;
+            }
+            let full = join_path(dir, p);
+            match file_type(&full) {
+                Some(S_IFLNK) => readlink(&full).map_or(PathState::Unreadable, PathState::Link),
+                Some(S_IFDIR) => {
+                    known.insert(String::from(p));
+                    PathState::NotLink
+                }
+                _ => PathState::NotLink,
+            }
+        })?;
+        Some(join_path(&self.dir, &resolved))
+    }
+
+    /// The full path to create entry `rel` at. A symlink already at that name
+    /// is removed so the entry replaces it (GNU tar's behaviour) rather than
+    /// being written through it.
+    fn place(&mut self, rel: &str) -> Option<String> {
+        let full = self.resolve(rel)?;
+        if file_type(&full) == Some(S_IFLNK) {
+            unlink(&full);
+        }
+        Some(full)
+    }
+}
 
 #[derive(Debug)]
 pub enum TarError {
@@ -58,6 +123,11 @@ pub struct Stats {
     pub whiteouts: usize,
     /// Entries refused for pointing outside the extraction directory.
     pub rejected: usize,
+    /// Entries that could not be written: a create or write that failed, or
+    /// an archive that ended inside an entry. Each used to be printed and
+    /// forgotten - `tar` exited 0 and `box pull` cached the half-written
+    /// layer as complete.
+    pub failed: usize,
 }
 
 /// Extract `archive_path` into `target_dir`.
@@ -91,6 +161,7 @@ fn extract_stream(
     }
 
     let mut stats = Stats::default();
+    let mut root = Root::new(target_dir);
     let mut header = [0u8; BLOCK_SIZE];
     let mut zero_blocks = 0;
 
@@ -123,18 +194,27 @@ fn extract_stream(
             continue;
         }
 
+        let Some(full_path) = root.place(&entry.path) else {
+            eprintln(&format!("tar: refusing entry behind a symlink loop: {}", entry.path));
+            stats.rejected += 1;
+            read_skip(fd, entry.payload_span());
+            continue;
+        };
         count(&mut stats, &entry);
-        let full_path = join_path(target_dir, &entry.path);
 
         if entry.kind == EntryKind::File {
-            let written = write_entry_streaming(fd, &full_path, entry.size, opts.verbose);
-            apply_attrs(&full_path, &entry);
+            let (written, ok) = write_entry_streaming(fd, &full_path, entry.size, opts.verbose);
+            if ok {
+                apply_attrs(&full_path, &entry);
+            } else {
+                stats.failed += 1;
+            }
             let padding = crate::format::padded_size(entry.size) - written;
             if padding > 0 {
                 read_skip(fd, padding);
             }
         } else {
-            create_nonfile(&full_path, &entry, opts.verbose);
+            create_nonfile(&full_path, &entry, opts.verbose, &mut root);
             read_skip(fd, entry.payload_span());
         }
     }
@@ -165,6 +245,7 @@ fn extract_gzip(
     if opts.max_bytes != 0 && data.len() > opts.max_bytes {
         return Err(TarError::TooLarge(opts.max_bytes));
     }
+    let mut root = Root::new(target_dir);
     if opts.verbose {
         print("tar: decompressed to ");
         print_dec(data.len());
@@ -221,18 +302,26 @@ fn extract_gzip(
             continue;
         }
 
+        let Some(full_path) = root.place(&entry.path) else {
+            eprintln(&format!("tar: refusing entry behind a symlink loop: {}", entry.path));
+            stats.rejected += 1;
+            pos += entry.payload_span();
+            continue;
+        };
         count(&mut stats, &entry);
-        let full_path = join_path(target_dir, &entry.path);
 
         if entry.kind == EntryKind::File {
             let end = pos + entry.size;
             if end > data.len() {
                 eprintln(&format!("tar: error: truncated entry {}", entry.path));
+                stats.failed += 1;
                 break;
             }
-            write_entry(&full_path, &data[pos..end], &entry, opts.verbose);
+            if !write_entry(&full_path, &data[pos..end], &entry, opts.verbose) {
+                stats.failed += 1;
+            }
         } else {
-            create_nonfile(&full_path, &entry, opts.verbose);
+            create_nonfile(&full_path, &entry, opts.verbose, &mut root);
         }
 
         pos += entry.payload_span();
@@ -251,13 +340,17 @@ fn count(stats: &mut Stats, entry: &Entry) {
 }
 
 fn report(stats: &Stats, verbose: bool) {
-    if verbose || stats.rejected > 0 {
+    if verbose || stats.rejected > 0 || stats.failed > 0 {
         print("tar: extracted ");
         print_dec(stats.entries);
         print(" entries");
         if stats.rejected > 0 {
             print(", refused ");
             print_dec(stats.rejected);
+        }
+        if stats.failed > 0 {
+            print(", failed ");
+            print_dec(stats.failed);
         }
         println("");
     }
@@ -266,7 +359,7 @@ fn report(stats: &Stats, verbose: bool) {
 /// Directory, symlink or hardlink. A hardlink is a real `link(2)` since
 /// 2026-10-14; it was a relative symlink while the kernel's `linkat` copied the
 /// whole file, and an image layer routinely has hundreds of names for one binary.
-fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool) {
+fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool, root: &mut Root) {
     match entry.kind {
         EntryKind::Directory => {
             if verbose {
@@ -309,15 +402,19 @@ fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool) {
                 println(&target);
             }
             ensure_parent(full_path);
-            // A real hard link to the earlier entry. `full_path` is the
-            // extraction root joined with `entry.path`, so the root is its
-            // prefix. The relative symlink this always used to be — while
-            // `linkat` copied the file — is the fallback for a filesystem
-            // that cannot link (`EPERM`) or a target outside it (`EXDEV`).
-            let root = &full_path[..full_path.len() - entry.path.len()];
-            let target_full = format!("{root}{target}");
-            if is_path_safe(&target) && link(&target_full, full_path) == 0 {
-                return;
+            // A real hard link to the earlier entry, its path resolved inside
+            // the root like any other (a link through a planted symlink would
+            // otherwise be a second name for a host file). Never to a symlink
+            // itself, which `link` may follow. The relative symlink this always
+            // used to be — while `linkat` copied the file — is the fallback for
+            // a filesystem that cannot link (`EPERM`) or a target outside it
+            // (`EXDEV`).
+            if is_path_safe(&target) {
+                if let Some(target_full) = root.resolve(&target) {
+                    if file_type(&target_full) != Some(S_IFLNK) && link(&target_full, full_path) == 0 {
+                        return;
+                    }
+                }
             }
             let rel = relative_symlink_target(&entry.path, &target);
             let ret = symlink(&rel, full_path);
@@ -329,7 +426,20 @@ fn create_nonfile(full_path: &str, entry: &Entry, verbose: bool) {
     }
 }
 
-fn write_entry(full_path: &str, data: &[u8], entry: &Entry, verbose: bool) {
+/// Write `data` to `fd` across short writes; false on an error.
+fn write_all_fd(fd: i32, mut data: &[u8]) -> bool {
+    while !data.is_empty() {
+        let n = write_fd(fd, data);
+        if n <= 0 {
+            return false;
+        }
+        data = &data[(n as usize).min(data.len())..];
+    }
+    true
+}
+
+/// False if the file could not be created or fully written.
+fn write_entry(full_path: &str, data: &[u8], entry: &Entry, verbose: bool) -> bool {
     if verbose {
         print("x ");
         print(&entry.path);
@@ -342,19 +452,22 @@ fn write_entry(full_path: &str, data: &[u8], entry: &Entry, verbose: bool) {
     let fd = open(full_path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
     if fd < 0 {
         eprintln(&format!("tar: error: failed to create {full_path}: errno {}", -fd));
-        return;
+        return false;
     }
-    if !data.is_empty() {
-        write_fd(fd, data);
-    }
+    let ok = write_all_fd(fd, data);
     close(fd);
+    if !ok {
+        eprintln(&format!("tar: error: write failed for {full_path}"));
+        return false;
+    }
     apply_attrs(full_path, entry);
+    true
 }
 
 /// Copy `size` bytes from `fd` into a new file. Returns the bytes consumed from
 /// the archive, so the caller can skip the right amount of padding even if the
-/// read stopped early.
-fn write_entry_streaming(fd: i32, full_path: &str, size: usize, verbose: bool) -> usize {
+/// read stopped early, and whether all `size` bytes reached the file.
+fn write_entry_streaming(fd: i32, full_path: &str, size: usize, verbose: bool) -> (usize, bool) {
     if verbose {
         print("x ");
         print(full_path);
@@ -368,26 +481,29 @@ fn write_entry_streaming(fd: i32, full_path: &str, size: usize, verbose: bool) -
     if out < 0 {
         eprintln(&format!("tar: error: failed to create {full_path}: errno {}", -out));
         read_skip(fd, size);
-        return size;
+        return (size, false);
     }
 
     let mut remaining = size;
     let mut buf = [0u8; 4096];
+    let mut write_ok = true;
     while remaining > 0 {
         let want = remaining.min(buf.len());
         let n = read_fd(fd, &mut buf[..want]);
         if n <= 0 {
+            eprintln(&format!("tar: error: archive ended inside {full_path}"));
             break;
         }
         let n = n as usize;
-        if write_fd(out, &buf[..n]) < 0 {
+        remaining -= n; // consumed from the archive, written or not
+        if !write_all_fd(out, &buf[..n]) {
             eprintln(&format!("tar: error: write failed for {full_path}"));
+            write_ok = false;
             break;
         }
-        remaining -= n;
     }
     close(out);
-    size - remaining
+    (size - remaining, write_ok && remaining == 0)
 }
 
 /// Apply the archived owner and permission bits — owner first, as GNU tar

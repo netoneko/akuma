@@ -121,6 +121,15 @@ pub extern "C" fn main() {
         println(&format!("sshd rev {}", libakuma::GIT_REV));
         exit(0);
     }
+    // `--help` used to fall through to "unknown argument" and start a server.
+    if args().any(|a| a == "--help" || a == "-h") {
+        println(
+            "usage: sshd [--port N] [--no-banner] [--shell PATH] [--shell-arg ARG]... \
+             [--max-sessions N] [--login-grace-secs N] [--idle-timeout-secs N] [--version]\n\
+             Defaults come from /etc/sshd/sshd.conf; flags override it.",
+        );
+        exit(0);
+    }
     println(&format!("[SSHD] Starting userspace SSH server (rev {})...", libakuma::GIT_REV));
 
     // 1. Load config from file first
@@ -134,29 +143,50 @@ pub extern "C" fn main() {
     let mut args = args();
     args.next(); // Skip program name
     
+    // A flag whose value is missing or does not parse used to be skipped
+    // without a word, so `--port 22x` served on the default 2222 and nothing
+    // said why. It is still not fatal - on a box whose only remote way in is
+    // this daemon, refusing to start is worse than starting on a default -
+    // but it is now said, on stderr, with the default that applies.
+    fn bad_value(flag: &str, value: Option<&str>) {
+        eprintln(&format!(
+            "[SSHD] WARNING: {}: bad or missing value {:?}; keeping the default",
+            flag,
+            value.unwrap_or("")
+        ));
+    }
+
     while let Some(arg) = args.next() {
         match arg {
             "--shell" => {
-                if let Some(shell_path) = args.next() {
-                    ssh_config.shell = alloc::string::String::from(shell_path);
-                    println(&format!("[SSHD] Shell override from CLI: {}", shell_path));
+                match args.next() {
+                    Some(shell_path) => {
+                        ssh_config.shell = alloc::string::String::from(shell_path);
+                        println(&format!("[SSHD] Shell override from CLI: {}", shell_path));
+                    }
+                    None => bad_value(arg, None),
                 }
             }
             "--shell-arg" => {
                 // Extra argv for the spawned shell (e.g. the applet name for a
                 // multicall binary: `--shell /bin/toybox --shell-arg sh`). May be
                 // repeated; each occurrence appends one argument.
-                if let Some(shell_arg) = args.next() {
-                    ssh_config.shell_args.push(alloc::string::String::from(shell_arg));
-                    println(&format!("[SSHD] Shell arg from CLI: {}", shell_arg));
+                match args.next() {
+                    Some(shell_arg) => {
+                        ssh_config.shell_args.push(alloc::string::String::from(shell_arg));
+                        println(&format!("[SSHD] Shell arg from CLI: {}", shell_arg));
+                    }
+                    None => bad_value(arg, None),
                 }
             }
             "--port" => {
-                if let Some(port_str) = args.next()
-                    && let Ok(p) = port_str.parse::<u16>()
-                {
-                    cli_port = Some(p);
-                    println(&format!("[SSHD] Port override from CLI: {}", p));
+                let v = args.next();
+                match v.and_then(|s| s.parse::<u16>().ok()).filter(|&p| p != 0) {
+                    Some(p) => {
+                        cli_port = Some(p);
+                        println(&format!("[SSHD] Port override from CLI: {}", p));
+                    }
+                    None => bad_value(arg, v),
                 }
             }
             "--no-banner" => {
@@ -167,34 +197,43 @@ pub extern "C" fn main() {
                 // Same 0-is-rejected rule as the config file parser: the cap
                 // exists to protect the global process table, so a bad value
                 // must not turn it off.
-                if let Some(n_str) = args.next()
-                    && let Ok(n) = n_str.parse::<usize>()
-                    && n > 0
-                {
-                    ssh_config.max_sessions = n;
-                    println(&format!("[SSHD] Max sessions override from CLI: {}", n));
+                let v = args.next();
+                match v.and_then(|s| s.parse::<usize>().ok()).filter(|&n| n > 0) {
+                    Some(n) => {
+                        ssh_config.max_sessions = n;
+                        println(&format!("[SSHD] Max sessions override from CLI: {}", n));
+                    }
+                    None => bad_value(arg, v),
                 }
             }
             "--login-grace-secs" => {
                 // 0 is accepted (timer off) — see the config parser note on
                 // why this one, unlike max_sessions, may be disabled.
-                if let Some(n_str) = args.next()
-                    && let Ok(n) = n_str.parse::<u64>()
-                {
-                    ssh_config.login_grace_secs = n;
-                    println(&format!("[SSHD] Login grace override from CLI: {}s", n));
+                let v = args.next();
+                match v.and_then(|s| s.parse::<u64>().ok()) {
+                    Some(n) => {
+                        ssh_config.login_grace_secs = n;
+                        println(&format!("[SSHD] Login grace override from CLI: {}s", n));
+                    }
+                    None => bad_value(arg, v),
                 }
             }
             "--idle-timeout-secs" => {
-                if let Some(n_str) = args.next()
-                    && let Ok(n) = n_str.parse::<u64>()
-                {
-                    ssh_config.idle_timeout_secs = n;
-                    println(&format!("[SSHD] Idle timeout override from CLI: {}s", n));
+                let v = args.next();
+                match v.and_then(|s| s.parse::<u64>().ok()) {
+                    Some(n) => {
+                        ssh_config.idle_timeout_secs = n;
+                        println(&format!("[SSHD] Idle timeout override from CLI: {}s", n));
+                    }
+                    None => bad_value(arg, v),
                 }
             }
             _ => {
-                println(&format!("[SSHD] Unknown argument: {}", arg));
+                eprintln(&format!(
+                    "[SSHD] WARNING: unknown argument {} ignored (known: --shell --shell-arg --port \
+                     --no-banner --max-sessions --login-grace-secs --idle-timeout-secs --version)",
+                    arg
+                ));
             }
         }
     }
@@ -230,8 +269,9 @@ pub extern "C" fn main() {
 /// `WouldBlock` rather than erroring, so a session idling on its socket
 /// suspends and lets its peers make progress.
 ///
-/// This is the default because it is the path with service history, not because
-/// it is the better design — it has two limits nothing inside it can fix: a
+/// Built only with `--no-default-features` minus `fork-sessions` (the
+/// memory-constrained images); the default build forks a process per session
+/// (`fork-sessions`, the `serve` below). It has two limits nothing inside it can fix: a
 /// panic is `panic = "abort"` and so takes down every session at once, and it is
 /// one OS thread, so sessions never use a second core and any genuinely blocking
 /// syscall stalls every peer for its duration (hence the standing rule that

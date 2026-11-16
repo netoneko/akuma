@@ -5,7 +5,7 @@ use akuma_wifi::sim::{SIM_WPA2_PSK, SimRadio};
 use akuma_wifi::status::{Bss, Error, Link};
 use akuma_wifi::{IfName, Security, Ssid, hex};
 
-use crate::{AutoStep, ConfigError, auto_backoff, auto_step, choose, derive_psk, parse_config, printable_ssid, valid_name};
+use crate::{AutoStep, ConfigError, auto_backoff, auto_step, choose, derive_psk, parse_config, printable_ssid, replacing, scan_mark, valid_name};
 
 fn h(s: &str) -> [u8; 32] {
     let mut k = [0u8; 32];
@@ -238,4 +238,30 @@ fn config_parser_survives_random_text() {
             assert_eq!(parse_config("x", &n.to_config()).as_ref(), Ok(&n), "{t:?}");
         }
     }
+}
+
+#[test]
+fn re_adding_keeps_priority_and_autoconnect() {
+    let mut old = net("home", b"home-ssid", true, 7);
+    old.autoconnect = false;
+    old.bssid = Some([2, 0, 0, 0, 0, 1]);
+    let new = net("home", b"home-ssid", true, 0);
+    let r = replacing(new.clone(), Some(&old));
+    assert_eq!((r.priority, r.autoconnect, r.bssid), (7, false, Some([2, 0, 0, 0, 0, 1])));
+    assert_eq!(r.psk, new.psk);
+    // A different SSID drops the pin: it named another network's access point.
+    let moved = replacing(net("home", b"new-ssid", true, 0), Some(&old));
+    assert_eq!((moved.priority, moved.bssid), (7, None));
+    assert_eq!(replacing(new.clone(), None), new);
+}
+
+#[test]
+fn scan_marks_only_joinable_networks_with_a_star() {
+    let known = [net("home", b"home", true, 0), net("cafe", b"cafe", false, 0)];
+    assert_eq!(scan_mark(&known, &bss(b"home", 1, -50, Security::Wpa2Psk)), '*');
+    assert_eq!(scan_mark(&known, &bss(b"cafe", 2, -50, Security::Open)), '*');
+    // Known SSID, wrong security: `wifi connect` would fail.
+    assert_eq!(scan_mark(&known, &bss(b"home", 3, -50, Security::Open)), '!');
+    assert_eq!(scan_mark(&known, &bss(b"cafe", 4, -50, Security::Wpa2Psk)), '!');
+    assert_eq!(scan_mark(&known, &bss(b"other", 5, -50, Security::Open)), ' ');
 }

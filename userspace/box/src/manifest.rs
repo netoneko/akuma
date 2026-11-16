@@ -103,6 +103,32 @@ pub fn parse_manifest(doc: &str) -> Result<Manifest, String> {
     })
 }
 
+/// Whether `d` is a sha256 digest in canonical form: `sha256:` and 64
+/// lowercase hex digits.
+#[must_use]
+pub fn is_sha256_digest(d: &str) -> bool {
+    d.strip_prefix("sha256:")
+        .is_some_and(|h| h.len() == 64 && h.bytes().all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)))
+}
+
+/// Refuse a manifest whose digests are not canonical sha256 digests.
+///
+/// The digests a registry sends become **file names** here
+/// (`paths::layer_dir`, `paths::blob_path`), and a layer directory that
+/// already exists is taken as present without downloading anything. A digest
+/// of `sha256:../../../..` therefore named the host's `/` as a layer, and
+/// `box run` stacked it under the container, which could then read every file
+/// on the host (`docs/ISSUES_2026_11_16.md` B2). Hash verification never ran:
+/// it happens only to what is downloaded.
+pub fn check_digests(m: &Manifest) -> Result<(), String> {
+    for d in core::iter::once(&m.config_digest).chain(&m.layer_digests) {
+        if !is_sha256_digest(d) {
+            return Err(alloc::format!("manifest names a malformed digest {d:?}; refusing it"));
+        }
+    }
+    Ok(())
+}
+
 /// A layer's declared size in bytes, used to verify a download was not
 /// truncated.
 pub fn layer_size(doc: &str, index: usize) -> Option<i64> {
@@ -278,5 +304,29 @@ mod tests {
         assert_eq!(layer_size(MANIFEST, 0), Some(2_295_859));
         assert_eq!(layer_size(MANIFEST, 1), Some(128));
         assert_eq!(layer_size(MANIFEST, 2), None);
+    }
+
+    #[test]
+    fn digests_must_be_canonical_sha256() {
+        let good = "sha256:".to_string() + &"0123456789abcdef".repeat(4);
+        assert!(is_sha256_digest(&good));
+        for bad in [
+            "sha256:../../../..",
+            "sha256:layer0",
+            "sha512:00",
+            "",
+            "sha256:",
+            &("sha256:".to_string() + &"0123456789ABCDEF".repeat(4)),
+            &("sha256:".to_string() + &"0".repeat(63) + "/"),
+            &("sha256:".to_string() + &"0".repeat(65)),
+        ] {
+            assert!(!is_sha256_digest(bad), "{bad:?}");
+        }
+        let m = Manifest { config_digest: good.clone(), layer_digests: vec![good.clone()] };
+        assert!(check_digests(&m).is_ok());
+        let m = Manifest { config_digest: good.clone(), layer_digests: vec![String::from("sha256:../../..")] };
+        assert!(check_digests(&m).is_err());
+        let m = Manifest { config_digest: String::from("sha256:x"), layer_digests: vec![good] };
+        assert!(check_digests(&m).is_err());
     }
 }

@@ -24,6 +24,7 @@ use super::keys;
 // Channel-message byte layout lives in the crate's lib target so it can be
 // unit-tested on the host — see `wire.rs`.
 use sshd::session_policy::{self, SessionWatch};
+use sshd::transport::{self, Phase, PacketError};
 use sshd::wire;
 use crate::SshStream;
 use libakuma::*;
@@ -48,12 +49,14 @@ const SSH_MSG_GLOBAL_REQUEST: u8 = 80;
 const SSH_MSG_REQUEST_FAILURE: u8 = 82;
 const SSH_MSG_CHANNEL_OPEN: u8 = 90;
 const SSH_MSG_CHANNEL_OPEN_CONFIRMATION: u8 = 91;
+const SSH_MSG_CHANNEL_OPEN_FAILURE: u8 = 92;
 const SSH_MSG_CHANNEL_WINDOW_ADJUST: u8 = 93;
 const SSH_MSG_CHANNEL_DATA: u8 = 94;
 const SSH_MSG_CHANNEL_EOF: u8 = 96;
 const SSH_MSG_CHANNEL_CLOSE: u8 = 97;
 const SSH_MSG_CHANNEL_REQUEST: u8 = 98;
 const SSH_MSG_CHANNEL_SUCCESS: u8 = 99;
+const SSH_MSG_CHANNEL_FAILURE: u8 = 100;
 
 const KEX_ALGO: &str = "curve25519-sha256";
 const HOST_KEY_ALGO: &str = "ssh-ed25519";
@@ -76,6 +79,22 @@ enum SshState {
     Authenticated,
 }
 
+impl SshState {
+    /// The same state in `sshd::transport`'s vocabulary, where the rule for
+    /// which message may arrive when is host-tested.
+    const fn phase(self) -> Phase {
+        match self {
+            Self::AwaitingVersion => Phase::Version,
+            Self::AwaitingKexInit => Phase::KexInit,
+            Self::AwaitingKexEcdhInit => Phase::KexEcdhInit,
+            Self::AwaitingNewKeys => Phase::NewKeys,
+            Self::AwaitingServiceRequest => Phase::ServiceRequest,
+            Self::AwaitingUserAuth => Phase::UserAuth,
+            Self::Authenticated => Phase::Authenticated,
+        }
+    }
+}
+
 struct SshSession {
     state: SshState,
     rng: SimpleRng,
@@ -89,6 +108,14 @@ struct SshSession {
     input_buffer: Vec<u8>,
     channel_open: bool,
     client_channel: u32,
+    /// Bytes the client will still accept on the channel (RFC 4254 §5.2): set
+    /// from its `CHANNEL_OPEN`'s initial window, grown by its
+    /// `WINDOW_ADJUST`s, spent by every `CHANNEL_DATA` we send. The bridge
+    /// reads the child's stdout only as far as this allows. It used to be
+    /// ignored, so a client that drained slowly (`ssh host cmd | slow`) was
+    /// sent past its window and OpenSSH dropped the excess with
+    /// `channel 0: rcvd too much data`.
+    remote_window: u32,
     config: SshdConfig,
     /// PTY dimensions from the client's `pty-req` (columns / rows). Applied to
     /// the spawned login shell via `TIOCSWINSZ` after `spawn_pty` — without
@@ -144,6 +171,7 @@ impl SshSession {
             input_buffer: Vec::new(),
             channel_open: false,
             client_channel: 0,
+            remote_window: 0,
             config,
             term_width: 80,
             term_height: 24,
@@ -408,17 +436,35 @@ fn session_env(session: &SshSession) -> Vec<String> {
     env
 }
 
+/// How much of an `exec` command the console log shows.
+const EXEC_LOG_MAX: usize = 120;
+
 async fn run_exec_session(
     stream: &mut SshStream,
     session: &mut SshSession,
     command: &[u8],
 ) -> Result<(), NetError> {
-    let cmd_str = core::str::from_utf8(command).unwrap_or("");
+    // A command that is not UTF-8 used to become `""`, so `sh -c ""` ran and
+    // the client saw exit 0 for a command that never ran. Say so instead,
+    // with the shell's "could not run" status.
+    let Ok(cmd_str) = core::str::from_utf8(command) else {
+        let msg = "sshd: the command is not valid UTF-8; not running it\r\n";
+        println("[SSH] Exec refused: command is not valid UTF-8");
+        send_channel_data(stream, session, msg.as_bytes()).await?;
+        return send_exit_report(stream, session, WaitStatus { pid: 0, raw: 127 << 8 }).await;
+    };
     let shell_path = session.config.shell.clone();
     let mut arg_refs: Vec<&str> = session.config.shell_args.iter().map(|s| s.as_str()).collect();
     arg_refs.push("-c");
     arg_refs.push(cmd_str);
-    println(&format!("[SSH] Exec: {} {:?}", shell_path, arg_refs));
+    // The command is logged to the console and herd's log, so only its head:
+    // a heredoc'd script is kilobytes, and a command line can carry a token.
+    println(&format!(
+        "[SSH] Exec: {} -c {:?}{}",
+        shell_path,
+        wire::log_prefix(cmd_str, EXEC_LOG_MAX),
+        if cmd_str.len() > EXEC_LOG_MAX { " (truncated)" } else { "" }
+    ));
     // `ssh -tt host 'cmd'` sends `pty-req` and *then* `exec`, and a client that
     // asked for a terminal expects the command to get one: `TERM` set, and
     // `TIOCGWINSZ` answering the real window rather than 80x24. This path
@@ -689,9 +735,16 @@ async fn run_builtin_paws(
 
         // Drained every iteration, not only after a fresh read — the same
         // reason as in `bridge_process`: data can already be buffered.
-        while let Some((msg_type, payload)) = process_encrypted_packet(session) {
+        loop {
+            let (msg_type, payload) = match next_packet(session) {
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(e) => return Err(bad_packet(e)),
+            };
             did_io = true;
-            if msg_type == SSH_MSG_CHANNEL_DATA {
+            if msg_type == SSH_MSG_CHANNEL_WINDOW_ADJUST {
+                apply_window_adjust(session, &payload);
+            } else if msg_type == SSH_MSG_CHANNEL_DATA {
                 let mut offset = 0;
                 let _recipient = read_u32(&payload, &mut offset);
                 let Some(data) = read_string(&payload, &mut offset) else { continue };
@@ -983,7 +1036,8 @@ async fn bridge_process_inner(
         //    bridge happened to read them before or after the child exited.
         if let Some(status) = waitpid_status(pid) {
             loop {
-                let n = read_fd(stdout_fd as i32, &mut buf);
+                let budget = await_window(stream, session, buf.len(), cook).await?;
+                let n = read_fd(stdout_fd as i32, &mut buf[..budget]);
                 if n > 0 {
                     let out = cook_output(&buf[..n as usize], cook);
                     send_channel_data(stream, session, &out).await?;
@@ -1016,7 +1070,11 @@ async fn bridge_process_inner(
         let mut did_io = false;
 
         // 2. Output from process to SSH (non-blocking). See cook_output().
-        let n = read_fd(stdout_fd as i32, &mut buf);
+        //    Only as much as the client's window still takes (RFC 4254 §5.2);
+        //    with the window spent the child's output waits in its channel,
+        //    which is the backpressure, until a WINDOW_ADJUST arrives below.
+        let budget = transport::stdout_read_budget(session.remote_window, buf.len(), cook);
+        let n = if budget > 0 { read_fd(stdout_fd as i32, &mut buf[..budget]) } else { 0 };
         if n > 0 {
             let out = cook_output(&buf[..n as usize], cook);
             send_channel_data(stream, session, &out).await?;
@@ -1072,9 +1130,37 @@ async fn bridge_process_inner(
             // `input_buffer` (buffered while the handshake completed, before this
             // bridge took over); if we only processed on a fresh read, that data
             // would never be forwarded and the shell would hang waiting for input.
-            while let Some((msg_type, payload)) = process_encrypted_packet(session) {
+            loop {
+                let (msg_type, payload) = match next_packet(session) {
+                    Ok(Some(p)) => p,
+                    Ok(None) => break,
+                    Err(e) => {
+                        let err = bad_packet(e);
+                        teardown_child(pid, stdout_fd, stdin_fd);
+                        return Ok(Err(err));
+                    }
+                };
                 did_io = true;
-                if msg_type == SSH_MSG_CHANNEL_DATA {
+                if msg_type == SSH_MSG_CHANNEL_WINDOW_ADJUST {
+                    apply_window_adjust(session, &payload);
+                } else if msg_type == SSH_MSG_CHANNEL_OPEN {
+                    // `ssh -L` forwards and multiplexed sessions arrive here,
+                    // mid-session. Unanswered, the client waited on them for ever.
+                    let mut offset = 0;
+                    let _type = read_string(&payload, &mut offset);
+                    let sender = read_u32(&payload, &mut offset).unwrap_or(0);
+                    send_packet(stream, &channel_open_failure(sender, transport::OPEN_RESOURCE_SHORTAGE), session).await?;
+                } else if !transport::message_allowed(session.state.phase(), msg_type) {
+                    // A re-key (KEXINIT) or anything else out of phase: the
+                    // client's next packets would be unreadable, so end here
+                    // with the reason rather than spin on garbage.
+                    eprintln(&format!(
+                        "[SSHD] Session pid {}: message {} not allowed mid-session (re-key is unsupported) - tearing down",
+                        pid, msg_type
+                    ));
+                    teardown_child(pid, stdout_fd, stdin_fd);
+                    return Ok(Ok(()));
+                } else if msg_type == SSH_MSG_CHANNEL_DATA {
                     let mut offset = 0;
                     let _recipient = read_u32(&payload, &mut offset);
                     if let Some(data) = read_string(&payload, &mut offset) {
@@ -1150,9 +1236,21 @@ async fn bridge_process_inner(
                     did_io = true;
                     session.watch.note_activity(now_ms());
                     session.input_buffer.extend_from_slice(&drain[..n]);
-                    // Keep the cipher's sequence numbers in step; the content
-                    // (probe replies, window adjusts) needs no action.
-                    while process_encrypted_packet(session).is_some() {}
+                    // Keep the cipher's sequence numbers in step. Window
+                    // adjusts still matter - output keeps flowing after the
+                    // client's EOF; probe replies need no action.
+                    loop {
+                        match next_packet(session) {
+                            Ok(Some((SSH_MSG_CHANNEL_WINDOW_ADJUST, payload))) => apply_window_adjust(session, &payload),
+                            Ok(Some(_)) => {}
+                            Ok(None) => break,
+                            Err(e) => {
+                                let err = bad_packet(e);
+                                teardown_child(pid, stdout_fd, stdin_fd);
+                                return Ok(Err(err));
+                            }
+                        }
+                    }
                 }
                 Err(e) if e.kind() == NetErrorKind::WouldBlock
                     || e.kind() == NetErrorKind::Interrupted => {}
@@ -1303,7 +1401,7 @@ async fn send_exit_report(
                 // soon as it arrives instead of spinning to the bound.
                 session.input_buffer.extend_from_slice(&scratch[..n]);
                 let mut saw_close = false;
-                while let Some((msg_type, _)) = process_encrypted_packet(session) {
+                while let Ok(Some((msg_type, _))) = next_packet(session) {
                     if msg_type == SSH_MSG_CHANNEL_CLOSE {
                         saw_close = true;
                     }
@@ -1332,6 +1430,23 @@ async fn handle_message(
     payload: &[u8],
     session: &mut SshSession,
 ) -> Result<MessageResult, NetError> {
+    // The gate. Every arm below assumes the connection is in the phase that
+    // message belongs to; until 2026-11-16 nothing checked, and a client that
+    // completed the key exchange could send CHANNEL_OPEN + `exec` and have the
+    // command run as root without authenticating
+    // (`docs/ISSUES_2026_11_16.md` S1). Out-of-phase means close: there is no
+    // benign client that does it, and replying would only help a probe.
+    if !transport::message_allowed(session.state.phase(), msg_type) {
+        if msg_type == SSH_MSG_KEXINIT {
+            eprintln("[SSHD] Closing connection: client asked to re-key, which this server does not support");
+        } else {
+            eprintln(&format!(
+                "[SSHD] Closing connection: message {} is not allowed in state {:?}",
+                msg_type, session.state
+            ));
+        }
+        return Ok(MessageResult::Disconnect);
+    }
     match msg_type {
         SSH_MSG_KEXINIT => {
             let mut full = vec![SSH_MSG_KEXINIT];
@@ -1366,6 +1481,13 @@ async fn handle_message(
         SSH_MSG_SERVICE_REQUEST => {
             let mut offset = 0;
             if let Some(service) = read_string(payload, &mut offset) {
+                // Only `ssh-userauth` may be requested before authentication
+                // (RFC 4252 §3); any other name used to be echoed back as
+                // accepted.
+                if service != transport::USERAUTH_SERVICE {
+                    eprintln("[SSHD] Closing connection: service request for something other than ssh-userauth");
+                    return Ok(MessageResult::Disconnect);
+                }
                 let mut reply = vec![SSH_MSG_SERVICE_ACCEPT];
                 write_string(&mut reply, service);
                 send_packet(stream, &reply, session).await?;
@@ -1379,10 +1501,24 @@ async fn handle_message(
         }
         SSH_MSG_CHANNEL_OPEN => {
             let mut offset = 0;
-            let _type = read_string(payload, &mut offset);
+            let channel_type = read_string(payload, &mut offset).unwrap_or(b"");
             let sender = read_u32(payload, &mut offset).unwrap_or(0);
+            let initial_window = read_u32(payload, &mut offset).unwrap_or(0);
+            // One `session` channel per connection is what this server serves.
+            // A `direct-tcpip` (`ssh -L`) or a second session used to be
+            // confirmed as if it were the first, overwriting its channel id.
+            if channel_type != transport::SESSION_CHANNEL || session.channel_open {
+                let reason = if session.channel_open {
+                    transport::OPEN_RESOURCE_SHORTAGE
+                } else {
+                    transport::OPEN_UNKNOWN_CHANNEL_TYPE
+                };
+                send_packet(stream, &channel_open_failure(sender, reason), session).await?;
+                return Ok(MessageResult::Continue);
+            }
             session.client_channel = sender;
             session.channel_open = true;
+            session.remote_window = initial_window;
             let mut reply = vec![SSH_MSG_CHANNEL_OPEN_CONFIRMATION];
             write_u32(&mut reply, sender);
             write_u32(&mut reply, 0);
@@ -1396,9 +1532,17 @@ async fn handle_message(
             let req_type = read_string(payload, &mut offset).unwrap_or(b"");
             let want_reply = if offset < payload.len() { payload[offset] != 0 } else { false };
             if want_reply {
-                let mut full_reply = vec![SSH_MSG_CHANNEL_SUCCESS];
+                // FAILURE for what is not served (`subsystem sftp`, `x11-req`,
+                // agent forwarding): a SUCCESS here used to leave `scp`
+                // waiting for an SFTP server that was never started.
+                let supported = session.channel_open && transport::channel_request_supported(req_type);
+                let tag = if supported { SSH_MSG_CHANNEL_SUCCESS } else { SSH_MSG_CHANNEL_FAILURE };
+                let mut full_reply = vec![tag];
                 write_u32(&mut full_reply, session.client_channel);
                 send_packet(stream, &full_reply, session).await?;
+            }
+            if !session.channel_open {
+                return Ok(MessageResult::Continue);
             }
             if req_type == b"shell" { return Ok(MessageResult::StartShell); }
             if req_type == b"exec" {
@@ -1444,10 +1588,68 @@ async fn handle_message(
                 send_packet(stream, &[SSH_MSG_REQUEST_FAILURE], session).await?;
             }
         }
+        SSH_MSG_CHANNEL_WINDOW_ADJUST => apply_window_adjust(session, payload),
         SSH_MSG_DISCONNECT => return Ok(MessageResult::Disconnect),
         _ => {}
     }
     Ok(MessageResult::Continue)
+}
+
+/// RFC 4254 §5.1 `SSH_MSG_CHANNEL_OPEN_FAILURE` for the client's channel
+/// `sender`.
+fn apply_window_adjust(session: &mut SshSession, payload: &[u8]) {
+    let mut offset = 0;
+    let _recipient = read_u32(payload, &mut offset);
+    if let Some(add) = read_u32(payload, &mut offset) {
+        session.remote_window = session.remote_window.saturating_add(add);
+    }
+}
+
+/// Wait until the client's window takes at least one more read of the child's
+/// stdout, and return how many bytes that read may be (see
+/// `transport::stdout_read_budget`). Only the drain after the child exited
+/// needs this: the live loop simply skips the read while the window is shut.
+/// Everything except WINDOW_ADJUST is discarded - stdin is no longer wanted.
+/// Bounded by the session-lifetime watch like every other wait.
+async fn await_window(
+    stream: &mut SshStream,
+    session: &mut SshSession,
+    buf_len: usize,
+    cook: bool,
+) -> Result<usize, NetError> {
+    loop {
+        let budget = transport::stdout_read_budget(session.remote_window, buf_len, cook);
+        if budget > 0 {
+            return Ok(budget);
+        }
+        let mut scratch = [0u8; 512];
+        match read_with_lifetime(stream, session, &mut scratch).await? {
+            ReadStep::Bytes(n) => {
+                session.input_buffer.extend_from_slice(&scratch[..n]);
+                loop {
+                    match next_packet(session) {
+                        Ok(Some((SSH_MSG_CHANNEL_WINDOW_ADJUST, payload))) => apply_window_adjust(session, &payload),
+                        Ok(Some(_)) => {}
+                        Ok(None) => break,
+                        Err(e) => return Err(bad_packet(e)),
+                    }
+                }
+            }
+            ReadStep::PeerClosed => {
+                return Err(NetError::new(NetErrorKind::ConnectionReset, "client closed with output pending"));
+            }
+            ReadStep::ProbeDue => send_idle_probe(stream, session).await,
+        }
+    }
+}
+
+fn channel_open_failure(sender: u32, reason: u32) -> Vec<u8> {
+    let mut reply = vec![SSH_MSG_CHANNEL_OPEN_FAILURE];
+    write_u32(&mut reply, sender);
+    write_u32(&mut reply, reason);
+    write_string(&mut reply, b"only one session channel per connection is served");
+    write_string(&mut reply, b"");
+    reply
 }
 
 // ============================================================================
@@ -1590,63 +1792,91 @@ async fn send_window_adjust(stream: &mut SshStream, session: &mut SshSession, by
 
 async fn send_channel_data(stream: &mut SshStream, session: &mut SshSession, data: &[u8]) -> Result<(), NetError> {
     if !session.channel_open { return Ok(()); }
+    // Spend the client's window. The bridge sizes its reads to fit; the
+    // banner and the built-in paws output are small enough not to bother.
+    session.remote_window = session.remote_window.saturating_sub(data.len() as u32);
     let mut payload = vec![SSH_MSG_CHANNEL_DATA];
     write_u32(&mut payload, session.client_channel);
     write_string(&mut payload, data);
     send_packet(stream, &payload, session).await
 }
 
-fn process_encrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
-    if session.input_buffer.len() < 4 { return None; }
-    let cipher = session.crypto.decrypt_cipher.as_mut()?;
+/// The next complete packet in `session.input_buffer`, decrypted when keys are
+/// in place: `Ok(None)` when more bytes are needed, `Err` when what arrived
+/// can never become a valid packet and the connection must be closed.
+///
+/// Both the length and the padding are checked before anything is buffered or
+/// sliced (`sshd::transport`): the length field used to be trusted outright,
+/// and a padding length one short of the packet length made the payload slice
+/// panic. A bad MAC used to read as "need more bytes", which parked the
+/// connection on a packet that could never complete.
+type Packet = Option<(u8, Vec<u8>)>;
+
+fn next_packet(session: &mut SshSession) -> Result<Packet, PacketError> {
+    if matches!(
+        session.state,
+        SshState::AwaitingNewKeys | SshState::AwaitingKexInit | SshState::AwaitingKexEcdhInit
+    ) {
+        process_unencrypted_packet(session)
+    } else {
+        process_encrypted_packet(session)
+    }
+}
+
+fn process_encrypted_packet(session: &mut SshSession) -> Result<Packet, PacketError> {
+    if session.input_buffer.len() < 4 { return Ok(None); }
+    let Some(cipher) = session.crypto.decrypt_cipher.as_mut() else { return Ok(None) };
     use ctr::cipher::StreamCipher;
     let mut peek_cipher = cipher.clone();
     let mut len_buf = [0u8; 4];
     len_buf.copy_from_slice(&session.input_buffer[..4]);
     peek_cipher.apply_keystream(&mut len_buf);
     let packet_len = u32::from_be_bytes(len_buf) as usize;
+    transport::check_packet_len(packet_len)?;
     let total_needed = 4 + packet_len + MAC_SIZE;
-    if session.input_buffer.len() < total_needed { return None; }
+    if session.input_buffer.len() < total_needed { return Ok(None); }
     let encrypted_data = &session.input_buffer[..4 + packet_len];
     let received_mac = &session.input_buffer[4 + packet_len..total_needed];
     let mut decrypted = encrypted_data.to_vec();
     cipher.apply_keystream(&mut decrypted);
     let seq = session.crypto.decrypt_seq;
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&session.crypto.decrypt_mac_key).ok()?;
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(&session.crypto.decrypt_mac_key)
+        .map_err(|_| PacketError::BadMac)?;
     mac.update(&seq.to_be_bytes());
     mac.update(&decrypted);
-    if mac.verify_slice(received_mac).is_err() { return None; }
+    if mac.verify_slice(received_mac).is_err() { return Err(PacketError::BadMac); }
     session.crypto.decrypt_seq = seq.wrapping_add(1);
-    let padding_len = decrypted[4] as usize;
-    // padding_len is attacker/client-controlled; without this, a packet with
-    // padding_len >= packet_len underflows payload_len (wraps to a huge
-    // usize with this workspace's overflow-checks=false) and the slice below
-    // panics -> panic=abort takes the whole process down, dropping every
-    // other session sharing it. See docs/PROTOCOL_UNDER_LOAD.md.
-    if padding_len >= packet_len { return None; }
-    let payload_len = packet_len - padding_len - 1;
+    // padding_len is client-controlled; see `transport::payload_len` for the
+    // two ways it used to take the process down.
+    let payload_len = transport::payload_len(packet_len, decrypted[4] as usize)?;
     let msg_type = decrypted[5];
     let payload = decrypted[6..5 + payload_len].to_vec();
-    session.input_buffer = session.input_buffer[total_needed..].to_vec();
-    Some((msg_type, payload))
+    session.input_buffer.drain(..total_needed);
+    Ok(Some((msg_type, payload)))
 }
 
-fn process_unencrypted_packet(session: &mut SshSession) -> Option<(u8, Vec<u8>)> {
-    if session.input_buffer.len() < 5 { return None; }
-    let packet_len = u32::from_be_bytes(session.input_buffer[..4].try_into().ok()?) as usize;
+fn process_unencrypted_packet(session: &mut SshSession) -> Result<Packet, PacketError> {
+    if session.input_buffer.len() < 5 { return Ok(None); }
+    let mut len_buf = [0u8; 4];
+    len_buf.copy_from_slice(&session.input_buffer[..4]);
+    let packet_len = u32::from_be_bytes(len_buf) as usize;
+    // Pre-auth and unauthenticated by a MAC: the easiest place to ask the
+    // server to buffer gigabytes, so the bound is checked before waiting.
+    transport::check_packet_len(packet_len)?;
     let total_len = 4 + packet_len;
-    if session.input_buffer.len() < total_len { return None; }
-    let padding_len = session.input_buffer[4] as usize;
-    // Same underflow guard as process_encrypted_packet above -- this path is
-    // reachable pre-auth with no MAC at all, so it's the easier of the two
-    // to trigger. See docs/PROTOCOL_UNDER_LOAD.md.
-    if padding_len >= packet_len { return None; }
-    let payload_len = packet_len - padding_len - 1;
+    if session.input_buffer.len() < total_len { return Ok(None); }
+    let payload_len = transport::payload_len(packet_len, session.input_buffer[4] as usize)?;
     let msg_type = session.input_buffer[5];
     let payload = session.input_buffer[6..5 + payload_len].to_vec();
     session.crypto.decrypt_seq = session.crypto.decrypt_seq.wrapping_add(1);
-    session.input_buffer = session.input_buffer[total_len..].to_vec();
-    Some((msg_type, payload))
+    session.input_buffer.drain(..total_len);
+    Ok(Some((msg_type, payload)))
+}
+
+/// The error that closes a connection over a malformed packet, logged once.
+fn bad_packet(e: PacketError) -> NetError {
+    eprintln(&format!("[SSHD] Closing connection: {}", e.describe()));
+    NetError::new(NetErrorKind::InvalidData, e.describe())
 }
 
 pub async fn handle_connection(mut stream: SshStream, config: SshdConfig) {
@@ -1664,18 +1894,33 @@ pub async fn handle_connection(mut stream: SshStream, config: SshdConfig) {
                 if session.state == SshState::AwaitingVersion {
                     if let Some(pos) = session.input_buffer.iter().position(|&b| b == b'\n') {
                         let line = session.input_buffer[..pos].to_vec();
-                        session.input_buffer = session.input_buffer[pos+1..].to_vec();
+                        session.input_buffer.drain(..pos + 1);
                         session.client_version = if line.ends_with(b"\r") { line[..line.len()-1].to_vec() } else { line };
                         session.state = SshState::AwaitingKexInit;
+                        // Bytes after the newline are the client's KEXINIT: fall
+                        // through and parse them now rather than on the next read,
+                        // which may never come if the client sent both at once.
+                    } else {
+                        // RFC 4253 §4.2 caps the line at 255 bytes. Without a
+                        // cap a client that never sends `\n` grows this buffer
+                        // until the login grace runs out.
+                        if session.input_buffer.len() > transport::MAX_VERSION_LINE {
+                            eprintln("[SSHD] Closing connection: identification line over 255 bytes");
+                            return;
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
-                while let Some((msg_type, payload)) = if !matches!(session.state, SshState::AwaitingNewKeys | SshState::AwaitingKexInit | SshState::AwaitingKexEcdhInit) {
-                    process_encrypted_packet(&mut session)
-                } else {
-                    process_unencrypted_packet(&mut session)
-                } {
+                loop {
+                    let (msg_type, payload) = match next_packet(&mut session) {
+                        Ok(Some(p)) => p,
+                        Ok(None) => break,
+                        Err(e) => {
+                            let _ = bad_packet(e);
+                            return;
+                        }
+                    };
                     match handle_message(&mut stream, msg_type, &payload, &mut session).await {
                         Ok(MessageResult::Continue) => {}
                         Ok(MessageResult::StartShell) => {

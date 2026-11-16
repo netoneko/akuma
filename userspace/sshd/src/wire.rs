@@ -186,6 +186,20 @@ pub fn sanitize_term(raw: &[u8]) -> String {
     String::from_utf8(raw.to_vec()).unwrap_or_default()
 }
 
+/// The first `max` bytes of `s`, cut back to a character boundary, for a log
+/// line that must stay short.
+#[must_use]
+pub fn log_prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +453,14 @@ mod tests {
                 1, // want_reply = true
             ]
         );
+    }
+
+    #[test]
+    fn log_prefix_cuts_on_a_char_boundary() {
+        assert_eq!(log_prefix("echo hi", 120), "echo hi");
+        assert_eq!(log_prefix("abcdef", 3), "abc");
+        // 'é' is two bytes: a cut inside it backs off.
+        assert_eq!(log_prefix("aé", 2), "a");
+        assert_eq!(log_prefix("", 0), "");
     }
 }
