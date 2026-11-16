@@ -410,6 +410,20 @@ pub fn keep_cmdline(cmdline: &str) {
     if r.is_err() {
         crate::serial::puts("  [params] the command line was not kept: init= and initargs= are ignored\n");
     }
+    // The ingress filter, as early as the line is known and before any NIC is
+    // read: `net.allow=22,udp:53` admits those ports from outside and nothing
+    // else (`akuma_net::ingress`). Read from `cmdline` directly so a line too
+    // long to keep still installs it.
+    {
+        use akuma_net::ingress::{Configured, configure_from_boot_line};
+        match configure_from_boot_line(akuma_params::Params::new(cmdline, "net.").value("allow")) {
+            Configured::Off => {}
+            Configured::On => crate::serial::puts("  [net] ingress filter ON (net.allow=)\n"),
+            Configured::DenyAllOnError(_) => {
+                crate::serial::puts("  [net] net.allow= is not a port list: ingress filter ON, admitting NOTHING\n");
+            }
+        }
+    }
 }
 
 /// Apply the boot flags that steer the running kernel rather than the boot:

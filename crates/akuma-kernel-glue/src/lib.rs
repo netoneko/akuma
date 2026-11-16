@@ -1570,6 +1570,20 @@ fn run_async_main() -> ! {
     // `SKIP_ASYNC_NETWORK` (config flag sweep, 2026-11-11): removed with the
     // other unconditional debug kill-switches. Network init always runs now.
     console::print("\n--- Network Initialization ---\n");
+    // The ingress filter, before the first frame is read: `net.allow=22,udp:53`
+    // admits those ports from outside and nothing else (`akuma_net::ingress`).
+    #[cfg(feature = "smoltcp")]
+    {
+        use akuma_net::ingress::{Configured, configure_from_boot_line};
+        let spec = akuma_params::Params::new(akuma_params::line(), "net.").value("allow");
+        match configure_from_boot_line(spec) {
+            Configured::Off => {}
+            Configured::On => safe_print!(96, "[Net] ingress filter ON: net.allow={}\n", spec.unwrap_or("")),
+            Configured::DenyAllOnError(_) => {
+                safe_print!(128, "[Net] net.allow={} is not a port list: ingress filter ON, admitting NOTHING\n", spec.unwrap_or(""));
+            }
+        }
+    }
 
     // Initialize the akuma-net networking stack. The MMIO slot table lives in
     // `akuma_virtio::slot_addr` now — this used to be a fifth copy of the table.

@@ -393,12 +393,19 @@ impl Device for LoopbackAwareDevice {
                 // up, under the same contract; the borrow ends at the end of
                 // this statement, before the next `take_rx_frame` releases the
                 // slot.
-                let martian = is_loopback_frame(unsafe { core::slice::from_raw_parts(ptr, len) });
-                if !martian {
+                // The ingress filter (`crate::ingress`, off unless `net.allow=`
+                // installed a policy) reads the same borrow and drops by the
+                // same path, so a refused frame never reaches the stack.
+                let frame = unsafe { core::slice::from_raw_parts(ptr, len) };
+                let martian = is_loopback_frame(frame);
+                let refused = !martian && crate::ingress::drops(frame);
+                if !martian && !refused {
                     crate::ifstats::record_wire_rx(len);
                     break FrameSource::External(ptr, len);
                 }
-                MARTIAN_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                if martian {
+                    MARTIAN_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
                 dropped += 1;
                 if dropped == MARTIAN_DROPS_PER_RECEIVE {
                     return None;

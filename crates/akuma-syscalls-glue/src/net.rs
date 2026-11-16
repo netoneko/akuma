@@ -235,6 +235,26 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u
     0
 }
 
+/// The link-local address every cloud serves instance metadata on, including
+/// the instance role's temporary credentials.
+#[cfg(feature = "smoltcp")]
+const METADATA_IP: [u8; 4] = [169, 254, 169, 254];
+
+/// Whether the caller may send to `ip`. Everything is allowed but one address:
+/// the metadata service, which only the host root may reach. A service that
+/// is compromised, or a program in a box, must not be able to read the
+/// machine's cloud credentials with one HTTP request
+/// (`docs/archive/SECURITY_AUDIT_2026_11_16.md` H4).
+#[cfg(feature = "smoltcp")]
+fn egress_allowed(ip: [u8; 4]) -> bool {
+    ip != METADATA_IP || akuma_exec::process::caller_is_host_root()
+}
+
+/// Ports below this are the privileged ones: only uid 0 binds them, as on
+/// Linux, so an unprivileged program cannot stand in for sshd or a web server.
+#[cfg(feature = "smoltcp")]
+const UNPRIVILEGED_PORT_START: u16 = 1024;
+
 #[cfg(feature = "smoltcp")]
 pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     let _net_bkl = NetBklGuard::new();
@@ -252,6 +272,12 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
     }
     let addr = sa.to_addr();
     akuma_primitives::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
+    if addr.port != 0
+        && addr.port < UNPRIVILEGED_PORT_START
+        && !akuma_exec::process::current_creds().is_root()
+    {
+        return neg_errno(libc_errno::EACCES);
+    }
     let idx = match get_socket_from_fd(fd) {
         Some(i) => i,
         None => return not_a_socket(fd),
@@ -347,6 +373,9 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
         return EFAULT;
     }
     let addr = sa.to_addr();
+    if !egress_allowed(addr.ip) {
+        return neg_errno(libc_errno::EACCES);
+    }
     if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         akuma_primitives::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
     }
@@ -578,6 +607,9 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
                 return EFAULT;
             }
             let a = sa.to_addr();
+            if !egress_allowed(a.ip) {
+                return neg_errno(libc_errno::EACCES);
+            }
             // Gated like the DNS trace directly below it — this fires on EVERY
             // sendto, i.e. per datagram on the UDP send path. Same class as the
             // ungated `epoll_ctl` trace in poll.rs (LONG_ROAD_TO_REDIS_PART_2.md §9).
@@ -1354,7 +1386,11 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 &mut as_user_bytes_mut(core::slice::from_mut(&mut sa))[..16],
                 msg.msg_name,
             );
-            sa.to_addr()
+            let a = sa.to_addr();
+            if !egress_allowed(a.ip) {
+                return neg_errno(libc_errno::EACCES);
+            }
+            a
         } else {
             match socket::udp_default_peer(idx) {
                 Some(peer) => peer,
