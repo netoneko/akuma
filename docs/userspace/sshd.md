@@ -17,6 +17,9 @@ Docs live at [`userspace/sshd/docs/`](../../userspace/sshd/docs/):
 - `CLIENT_REAL_SERVER_INTEROP_FIX.md` — `ssh` client vs a real server: it
   choked on interleaved `GLOBAL_REQUEST`/`WINDOW_ADJUST` messages that only a
   real (non-Akuma) sshd sends.
+- `ISSUES_2026_11_16.md` — review findings, among them **the connection protocol served
+  before authentication** (unauthenticated root `exec`), unbounded packet lengths, and channel
+  requests answered SUCCESS that sshd does not support (`sftp` hung).
 - `LIMITATIONS.md`, `MIGRATION_SUMMARY.md`.
 
 See also: [`../reference/subsystems/ssh.md`](../reference/subsystems/ssh.md),

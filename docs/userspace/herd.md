@@ -10,5 +10,7 @@ The main doc is [`userspace/herd/README.md`](../../userspace/herd/README.md)
 [`userspace/herd/docs/`](../../userspace/herd/docs/):
 - `CORE_AWARE_SCHEDULING.md` — multikernel core pinning.
 - `SIGNAL_EXIT_HANDLING.md` — signal deaths vs clean exits, and real `kill`.
+- `ISSUES_2026_11_16.md` — review findings: one boolean spelling, inline comments, the
+  control-socket token, reload behaviour, box `workdir`.
 
 See also: [`../reference/subsystems/containers.md`](../reference/subsystems/containers.md) "herd — the supervisor".

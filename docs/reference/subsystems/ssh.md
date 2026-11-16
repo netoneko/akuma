@@ -53,6 +53,19 @@ property, not a size trade — see
 - **`yield_now()` helper** — **must** be used instead of `sleep_ms` inside
   session futures (`sleep_ms` parks the entire OS thread, starving all other
   sessions).
+- **Every message is checked against the transport phase before it is
+  handled** (`sshd::transport::message_allowed`). Only an authenticated
+  session reaches the connection protocol (80–100). Each pre-auth phase admits
+  exactly its one message, plus DISCONNECT/IGNORE/UNIMPLEMENTED/DEBUG, and
+  anything else disconnects. A new message arm in `handle_message` is
+  reachable only where that table allows it, and that table is the
+  authentication boundary
+  ([`userspace/sshd/docs/ISSUES_2026_11_16.md`](../../../userspace/sshd/docs/ISSUES_2026_11_16.md) S1).
+  Re-keying is not supported: a post-auth KEXINIT disconnects.
+- Packets are bounded before buffering (`MAX_PACKET_LEN`, 256 KiB). Unsupported
+  channel types and requests are refused (`CHANNEL_OPEN_FAILURE`,
+  `CHANNEL_FAILURE`), never confirmed, and channel data respects the client's
+  window.
 - Used by **every profile**. There is no other sshd.
 - **Started two different ways.** Normally herd launches it from
   `/etc/herd/enabled/sshd.conf` (`--port 22` since 2026-08-10, so host `2222` as

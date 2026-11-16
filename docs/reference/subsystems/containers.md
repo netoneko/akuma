@@ -273,6 +273,15 @@ image directory holds metadata only:
 /var/lib/box/containers/<id>/upper         one container's writable layer
 ```
 
+Every digest in a manifest must be canonical `sha256:<64 hex>` before it
+names a path (`boxlib::manifest::check_digests`), and extraction never leaves
+the layer's directory: tar resolves parent components inside the root with
+chroot semantics, so a symlink in the layer cannot redirect a later entry onto
+the host (`akuma_tar::format::resolve_in_root`). A layer with an entry that
+could not be written fails the pull rather than being cached. See
+[`userspace/box/docs/ISSUES_2026_11_16.md`](../../../userspace/box/docs/ISSUES_2026_11_16.md)
+B1, B2 and B5.
+
 A layer already present is not re-downloaded. Extraction stages in
 `<digest>.tmp` and renames into place, so an interrupted pull cannot leave a
 directory that looks complete. Whiteout entries are left **as files** — they
