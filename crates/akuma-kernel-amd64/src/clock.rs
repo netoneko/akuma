@@ -141,7 +141,7 @@ pub fn utc_seconds() -> Option<u64> {
 /// the reason stands on its own: a caller asking for the epoch is reporting a
 /// failure as a time, and storing it would make [`is_synced`] answer true for
 /// a machine that does not know what year it is.
-pub fn set_unix_us(us: u64) {
+pub fn set_unix_us(_root: akuma_primitives::HostRoot, us: u64) {
     if us == 0 {
         return;
     }
@@ -171,7 +171,7 @@ pub fn seed_from_rtc() {
     match akuma_cmos_rtc::read(&mut Ports) {
         Ok(dt) => {
             if let Some(secs) = akuma_cmos_rtc::unix_seconds(&dt) {
-                set_unix_us(secs * 1_000_000);
+                set_unix_us(akuma_primitives::HostRoot::kernel_boot(), secs * 1_000_000);
                 RTC_ONLY.store(true, Ordering::Relaxed);
                 serial::puts("  clock: seeded from the CMOS RTC (");
                 put_date(&dt);

@@ -41,27 +41,38 @@ fn open(path: &str, flags: u32) -> Option<u64> {
         if akuma_exec::process::current_process_shared().is_some_and(|p| p.box_id != 0) {
             return None;
         }
-        if control && !akuma_exec::process::caller_is_host_root() {
-            return Some(errno::EACCES);
+        if control {
+            // The machine's control nodes are the host root's; the opens below take the proof.
+            let Some(root) = akuma_exec::process::host_root() else {
+                return Some(errno::EACCES);
+            };
+            return open_control(root, path, flags);
         }
     }
     Some(match path {
         // The screen's owner is decided here (`fbdev::open`, `EBUSY` for a
         // second process). A machine with no boot framebuffer has no node.
         "/dev/fb0" => open_framebuffer(flags),
+        // The touchpad's pointer stream.
+        "/dev/input/mouse0" => open_mouse(flags),
+        _ => return None,
+    })
+}
+
+/// The nodes that control the machine, opened by the host root only (`root` is the proof; see `open`).
+fn open_control(root: akuma_primitives::HostRoot, path: &str, flags: u32) -> Option<u64> {
+    Some(match path {
         // The wireless driver's control node (`drivers::Wireless`).
-        "/dev/wifi0" => open_wifi(flags),
+        "/dev/wifi0" => open_wifi(root, flags),
         // The power daemon's control device (`crate::power`), on every machine:
         // a box with no EC and no screen still has idle facts.
-        "/dev/power" => open_power(flags),
+        "/dev/power" => open_power(root, flags),
         // The hypervisor's control device (`drivers::Hypervisor`), when armed.
-        "/dev/kvm0" => open_kvm(flags),
+        "/dev/kvm0" => open_kvm(root, flags),
         // The census stub, only with the `kvmapi` boot flag.
         "/dev/kvm" if crate::drivers::hypervisor_api_enabled() => crate::drivers::hypervisor_api_open(flags),
         // The tap for a userspace VMM's NIC, behind the hypervisor's gateway.
         "/dev/net/tun" if crate::drivers::hypervisor_present() => crate::drivers::hypervisor_tun_open(flags),
-        // The touchpad's pointer stream.
-        "/dev/input/mouse0" => open_mouse(flags),
         _ => return None,
     })
 }
@@ -91,18 +102,18 @@ fn open_framebuffer(flags: u32) -> u64 {
     install(FileDescriptor::DevFb, flags)
 }
 
-fn open_wifi(flags: u32) -> u64 {
+fn open_wifi(_root: akuma_primitives::HostRoot, flags: u32) -> u64 {
     if !crate::drivers::wireless_present() {
         return errno::ENOENT;
     }
     install(FileDescriptor::DevWifi, flags)
 }
 
-fn open_power(flags: u32) -> u64 {
+fn open_power(_root: akuma_primitives::HostRoot, flags: u32) -> u64 {
     install(FileDescriptor::DevPower, flags)
 }
 
-fn open_kvm(flags: u32) -> u64 {
+fn open_kvm(_root: akuma_primitives::HostRoot, flags: u32) -> u64 {
     if !crate::drivers::hypervisor_armed() {
         return errno::ENOENT;
     }

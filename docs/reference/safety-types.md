@@ -52,12 +52,13 @@ struct (no padding) at compile time, with no `unsafe` at the call site. No chang
 ### `HostRoot`, `BoxId`, `CallerBox`, `SpawnBox` — §4
 `HostRoot` (`akuma-primitives::privilege`) is zero-sized and `Copy`. Its two mint sites, by name: `vouch_checked()`, called
 only from `akuma_exec::process::host_root()` after it has tested the caller's box and uid; and `kernel_boot()`, for kernel
-code with no caller (the boot-time mounts). Effects that demand one: `akuma_boot::{system_reset, system_off}`,
-`akuma_vfs_glue::{mount_with, unmount, mount_in_namespace}`, `akuma_primitives::clock::set_wall_clock`. The syscall layer no
-longer names the unchecked `set_utc_time_us`; that is a review rule, not a type. **It is not unforgeable**: kernel code can
-mint one. Its value is that forgetting the check stops compiling, and forging one is a grep. Decision-only sites (raw block
-open, the amd64 `/dev/kvm0` and `/dev/power` control devices, the cloud-metadata gate) still call `caller_is_host_root()`
-because they have no effect function to hand a token to.
+code with no caller (the boot-time mounts). Effects that demand one: `akuma_boot::{system_reset, system_off}`, `akuma_vfs_glue::{mount_with, unmount, mount_in_namespace}`,
+`akuma_primitives::clock::set_wall_clock`, glue's `install_block_device` (a raw `/dev/vdX` descriptor), the amd64 kernel's
+`open_control` / `open_wifi` / `open_power` / `open_kvm` (the machine's control nodes) and its `clock::set_unix_us`
+(`settimeofday`). The syscall layer no longer names the unchecked `set_utc_time_us`; that is a review rule, not a type. **It is
+not unforgeable**: kernel code can mint one. Its value is that forgetting the check stops compiling, and forging one is a grep.
+The one remaining caller of the bool form, `caller_is_host_root()`, is glue's `egress_allowed` (the cloud-metadata address): it
+decides on a destination, it has no effect function to hand a token to, and it is a predicate by nature.
 
 ### `FileKey` (`akuma-primitives::file_key`) — §6
 `FileKey { mount: MountId, ino: Ino }`, built from a record's two fields with `FileKey::from_raw(mount_id, inode)`.
@@ -174,8 +175,6 @@ host ports are unprivileged, and the active toolchain's `rust-objcopy` on `PATH`
 
 ## Open work (what the report listed that is not done)
 
-2. **§4** decision-only privilege sites (raw block open, amd64 `/dev/kvm0`, `/dev/power`) call `caller_is_host_root()`;
-   they have no effect function to take a token.
 3. **§5** the 60 `slot: usize` functions in `akuma-threading`; a distinct `Pid` type; a real `with_live` that holds the slot
    state lock. Without it, a generation check followed by an action is a race with a one-load window.
 4. **§8** the 189 untyped user-pointer parameters (classified below; the other 21 matches are validators or not user pointers). And deleting `BYPASS_VALIDATION` outright: it is compiled out of `no-tests`

@@ -136,6 +136,22 @@ fn trace_read_ebadf(reason: &str, fd: u64, buf_ptr: UserAddr) {
     }
 }
 
+/// Hand out a descriptor on a raw block device. A raw read sees every file on the disk whatever its mode bits, so the effect
+/// takes the proof that the caller is the host root.
+fn install_block_device(
+    _root: akuma_primitives::HostRoot,
+    proc: &akuma_exec::process::Process,
+    idx: u32,
+    writable: bool,
+    flags: u32,
+) -> u32 {
+    let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::BlockDev { idx, pos: 0, writable });
+    if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
+        proc.set_cloexec(fd);
+    }
+    fd
+}
+
 pub fn fs_error_to_errno(e: akuma_vfs_glue::FsError) -> Errno {
     use akuma_vfs_glue::FsError;
     match e {
@@ -2388,9 +2404,9 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     {
         // A raw device read sees every file on the disk whatever its mode bits,
         // so it is uid 0's alone (Linux: the node is `0660 root:disk`).
-        if !akuma_exec::process::caller_is_host_root() {
+        let Some(root) = akuma_exec::process::host_root() else {
             return Err(Errno::EACCES);
-        }
+        };
         let Some(idx) = akuma_virtio::block::device_index_by_name(node.name) else {
             return Err(Errno::ENODEV);
         };
@@ -2407,14 +2423,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             return Err(Errno::EBUSY);
         }
         if let Some(proc) = akuma_exec::process::current_process_shared() {
-            let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::BlockDev {
-                idx: idx as u32,
-                pos: 0,
-                writable: wants_write,
-            });
-            if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
-                proc.set_cloexec(fd);
-            }
+            let fd = install_block_device(root, proc, idx as u32, wants_write, flags);
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
             }

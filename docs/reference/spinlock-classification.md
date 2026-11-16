@@ -26,7 +26,7 @@ Each unmasked site of the 13 was read (`--unmasked`). None is a demonstrated dea
 | `VFORK_WAITERS` | two `*_for_test` helpers | test-only |
 | `TIMERFD_TABLE` | 4 of 5 sites unmasked | syscall context only: nothing in an interrupt takes it; inconsistent, not wrong |
 | `ALARM_QUEUE` | `on_timer_interrupt` | already in the timer interrupt, masked by being there; the other two sites are guarded |
-| **`KEYS`** (amd64 xhci) | `keyboard_getb`, `keyboard_has_byte` (reader side) vs `kbd_event` (producer) | **the one to look at**: if `kbd_event` can run from an interrupt, the unmasked readers can self-deadlock on one core. amd64 devices are polled (`docs/reference/…` build notes), so probably not today; it is the only mixed lock whose unmasked sites are not setup, test or comment |
+| **`KEYS`** (amd64 xhci) | `keyboard_getb`, `keyboard_has_byte` (reader side) vs `kbd_event` (producer) | **the one to look at**: if `kbd_event` can run from an interrupt, the unmasked readers can self-deadlock on one core. amd64 routes no device interrupt through a line table (its devices are polled; see `register_handler`'s doc in `crates/akuma-kernel-core/src/irq.rs`), so probably not today; it is the only mixed lock whose unmasked sites are not setup, test or comment |
 
 ## Never masked: three checked for interrupt reach
 
