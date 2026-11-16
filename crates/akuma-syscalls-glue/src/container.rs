@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
+    // Both lengths size a kernel buffer below.
+    if name_len > 256 || root_len > 4096 { return EINVAL; }
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
     if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
 
@@ -349,6 +351,7 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         return Err(EPERM);
     }
 
+    if target_len > 4096 || fstype_len > 64 { return Err(EINVAL); }
     if !validate_user_ptr(target_ptr, target_len) { return Err(EFAULT); }
     if !validate_user_ptr(fstype_ptr, fstype_len) { return Err(EFAULT); }
 
