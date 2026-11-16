@@ -104,7 +104,7 @@ pub fn x86_seed_entry(slot: &mut SlotClaim, stack_top: usize, entry: extern "C" 
 bootable under HVF locally). `claim_fixed` is the open question; if (1) shows the fixed slots are never `FREE`, add a `FixedSlot` constructor whose doc states the weaker argument and `debug_assert`s the state is not `READY`.
 
 `update_thread_context` (execve/fork, a *live* slot) is not a claim; its own narrow fn (`set_user_entry` on a child's claim; `with_current_ctx_mut` for self) is in the context-table doc §3.2. `ThreadId`/`SlotId` newtypes
-(NEWTYPE_AUDIT "ruled out": no confusion bugs on record) stay out of scope; `SlotClaim` is a capability, not an id type.
+(NEWTYPE_AUDIT "ruled out": no confusion bugs on record) stay out of scope; `SlotClaim` is a capability, not an id type. **Correction, 2026-11-17:** "no confusion bugs on record" does not hold for thread ids: see the five stale-tid incidents listed in the correction in `NEWTYPE_AUDIT.md`, and `ThreadRef` / `OptTidCell::get_live` (`docs/reference/safety-types.md` §5), which are the generation-checked reference that was missing. `SlotClaim` is still a capability and not an id type.
 
 ## 4. Per-CPU state: `LocalCpu`
 

@@ -47,7 +47,7 @@ kvm = ["dep:akuma-kvm-amd64"]
 # every boot whether or not this is on.
 xhci = [
     "dep:akuma-xhci", "dep:akuma-usb", "dep:akuma-usb-storage", "dep:akuma-dma", "dep:akuma-pci",
-    "dep:akuma-primitives", "dep:akuma-selftest", "dep:spinning_top",
+    "dep:akuma-primitives", "dep:akuma-selftest", "dep:spinning_top", "dep:akuma-irq-lock",
 ]
 # NVMe: the bare-metal root disk (`root=/dev/nvme0n1pN`) and the hypervisor's guest partition.
 nvme = ["dep:akuma-nvme", "dep:akuma-dma", "dep:akuma-pci", "dep:akuma-primitives", "dep:spinning_top"]
@@ -90,3 +90,4 @@ akuma-virtio = { path = "../akuma-virtio", optional = true }
 akuma-wifi = { path = "../akuma-wifi", optional = true }
 akuma-wpa = { path = "../akuma-wpa", optional = true }
 spinning_top = { version = "0.3", optional = true }
+akuma-irq-lock = { path = "../akuma-irq-lock", optional = true }

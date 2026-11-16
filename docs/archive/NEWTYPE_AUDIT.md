@@ -103,6 +103,13 @@ arithmetic, not address math — excluded from the recommendation.
 - `fd`/`pid`/slot-index newtypes: tables are already fixed-size arrays with
   generation guards (see VEC_AUDIT's ruled-out list); no audit evidence of
   confusion bugs; defer until one appears.
+  **Correction, 2026-11-17:** the "no confusion bugs" half was wrong for thread ids. A tid is an index into a *recycled*
+  array, and five incidents are a stale or mixed-up tid acting on a slot's next occupant:
+  `KTG_STALE_TID_EXIT_STAMP_J4_HANG.md`, `STALE_THREAD_SLOT_KILL.md`, `AKUMA_STALE_TID_ZOMBIE_SLOT.md`,
+  `AKUMA_AMD64_SIGNAL_DELIVERY.md` (a recycled slot, and `gettid` answering the *pid*) and `SELFHOST_DEVBOX_SMOLTCP.md`
+  (`clone_thread` published the pid where the tid belonged). The fixed-size array with a generation counter exists, but
+  only `WakeHandle` used it. Since then: `ThreadRef` (`WakeHandle` generalised) and `OptTidCell::get_live`;
+  see `docs/reference/safety-types.md` §5. The pid/fd/uid half of the sentence still stands.
 
 ## Suggested next step
 

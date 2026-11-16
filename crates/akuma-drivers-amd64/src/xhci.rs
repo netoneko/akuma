@@ -2029,7 +2029,11 @@ impl KeyFifo {
     }
 }
 
-static KEYS: Spinlock<KeyFifo> = Spinlock::new(KeyFifo::new());
+// An `IrqSpinlock`, not a `Spinlock`: the producer (`kbd_event`) runs from the console pump and the disk path, both under the
+// IRQ-masked controller lock, while the readers (`keyboard_getb`, `keyboard_has_byte`) run in task context. A tick landing
+// while a reader held a plain lock could switch to the pump, which would then spin on it with IRQs masked, with the holder
+// unable to run again: on one core, for ever (the hazard `keyboard_poll`'s own comment describes for `XHCI`).
+static KEYS: akuma_irq_lock::IrqSpinlock<KeyFifo> = akuma_irq_lock::IrqSpinlock::new(KeyFifo::new());
 static KBD_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 impl Xhci {

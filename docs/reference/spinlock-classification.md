@@ -26,7 +26,7 @@ Each unmasked site of the 13 was read (`--unmasked`). None is a demonstrated dea
 | `VFORK_WAITERS` | two `*_for_test` helpers | test-only |
 | `TIMERFD_TABLE` | 4 of 5 sites unmasked | syscall context only: nothing in an interrupt takes it; inconsistent, not wrong |
 | `ALARM_QUEUE` | `on_timer_interrupt` | already in the timer interrupt, masked by being there; the other two sites are guarded |
-| **`KEYS`** (amd64 xhci) | `keyboard_getb`, `keyboard_has_byte` (reader side) vs `kbd_event` (producer) | **the one to look at**: if `kbd_event` can run from an interrupt, the unmasked readers can self-deadlock on one core. amd64 routes no device interrupt through a line table (its devices are polled; see `register_handler`'s doc in `crates/akuma-kernel-core/src/irq.rs`), so probably not today; it is the only mixed lock whose unmasked sites are not setup, test or comment |
+| **`KEYS`** (amd64 xhci) | `keyboard_getb`, `keyboard_has_byte` (readers, task context, IRQs on) vs `kbd_event` (producer, under the IRQ-masked controller lock) | **a real hazard, fixed 2026-11-17**: on one core a tick landing while a reader held `KEYS` could switch to the pump, which spins on `KEYS` with IRQs masked while the holder cannot run again. It is an `IrqSpinlock` now. Builds on amd64; not exercised at runtime (QEMU's microvm has no xHCI keyboard) |
 
 ## Never masked: three checked for interrupt reach
 
@@ -43,8 +43,7 @@ graph; none is claimed here.
    twice. The correct migration removes the outer `with_irqs_disabled` at every site of that lock in the same change, which is a
    per-lock edit (about 150 sites) and deserves a run of both boot suites per batch. **`POOL` was migrated without doing that**
    (its sites still wrap), so the scheduler pays a second mask; worth measuring, and worth removing those wrappers.
-2. **Read `KEYS`** (amd64 xhci): decide whether `kbd_event` is interrupt-driven. If it is, mask the readers (or make it an
-   `IrqSpinlock`).
+2. **`KEYS`** is done (above).
 3. **Leave the 49** unless an interrupt handler is shown to reach one; add them to a list of "taken only from task context" so
    the next audit starts from a decision, not a re-scan.
 4. A true classification needs a call graph from the registered handlers (`IRQ_HANDLERS` entries, the timer tick, the amd64
