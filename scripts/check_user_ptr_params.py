@@ -27,12 +27,41 @@ base = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(base)
 
 base.NAME = re.compile(r"^(?:\w+_)?ptr$|^\w+_ptr$")
+
+# Not user pointers, and the boundary primitives that are *where* a raw address becomes a checked one. Classified by hand on
+# 2026-11-16 (docs/reference/safety-types.md "Untyped pointer classification"); everything else that matches is a real user
+# pointer that should become `UserAddr`.
+NOT_USER_COMPONENTS = {
+    "crates/akuma-alloc",       # `ptr` is a kernel heap pointer (allocation tracking)
+    "crates/akuma-switch",      # `closure_ptr`: a kernel pointer to a boxed closure
+    "crates/akuma-kernel",      # `dtb_ptr`: the device-tree blob the bootloader handed over
+    "crates/akuma-kernel-glue", # `dtb_ptr`
+    "crates/akuma-threading",   # a test helper's `ptr`
+}
+BOUNDARY_FILES = {
+    "crates/akuma-user-access/src/lib.rs",           # the validators and the cstr walk: raw in, proof out
+    "crates/akuma-kernel-amd64/src/uaccess.rs",      # amd64's range checks and byte copies, the same layer
+}
+
+_walk = base.walk
+
+
+def walk():
+    res = _walk()
+    out = {}
+    for comp, rows in res.items():
+        if comp in NOT_USER_COMPONENTS:
+            continue
+        rows = [r for r in rows if r[0] not in BOUNDARY_FILES]
+        if rows:
+            out[comp] = rows
+    return out
 BUDGET = os.path.join(base.ROOT, "docs", "reference", "user-ptr-params-budget.json")
 KEY = "untyped_user_ptr_params"
 
 
 def main(argv):
-    res = base.walk()
+    res = walk()
     now = {k: len(v) for k, v in res.items()}
     if "--list" in argv:
         want = [a for a in argv if not a.startswith("--")]

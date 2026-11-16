@@ -98,8 +98,8 @@ IRQ handler or the scheduler takes"; `grep -rn 'static [A-Z_]*: Spinlock<'` list
 `UserSlice` proof. Used at the two pointer-arithmetic sites the report named, and as the parameter type of eight
 `akuma-syscalls-time` handlers (the template conversion: change the parameter, wrap the raw argument once at dispatch, let
 the compiler find the rest). `scripts/check_user_ptr_params.py` (pre-commit) ratchets the remaining untyped `*_ptr`
-parameters per component; `--list <crate>` prints the sites. **Open:** ~210 parameters, 169 of them in
-`akuma-syscalls-glue`.
+parameters per component; `--list <crate>` prints the sites. **Open:** 189 parameters, 169 of them in
+`akuma-syscalls-glue`; classified in "Untyped pointer classification" below.
 
 ### The self-test validation bypass (`BYPASS_VALIDATION`) — audit M7
 Sealed before init since `ed65401d`; now also **compiled out** of any image built with `--features no-tests`
@@ -111,6 +111,45 @@ default image, which carries the boot suite, it is still present and sealed.
 
 ### `!Send` guards — §11
 `IrqGuard`, `PreemptGuard`, `BypassValidationGuard`.
+
+## Untyped pointer classification (2026-11-16)
+
+`scripts/check_user_ptr_params.py` matched 210 parameters named `ptr` or `*_ptr` and typed `u64`/`usize`. Each was read by
+function body (how the pointer is used) and by crate. They are not one problem.
+
+| Class | Count | What it is | Decision |
+|---|---|---|---|
+| **Real user pointers** | **189** | 169 in `akuma-syscalls-glue`, 14 in the amd64 kernel's handlers (`usermode.rs`, `fd.rs`), 4 in `akuma-exec` (`clone_thread`'s two tid pointers and the fork/vfork `stack_ptr` value), 1 each in `akuma-syscalls-ipc` and `akuma-syscalls-time` | convert to `UserAddr` |
+| **Boundary primitives** | 12 | the validators (`user_range_ok`, `validate_user_range`, `upper_half_range_ok`), the cstr walk and byte read in `akuma-user-access`, and amd64's `range_ok`/`read_bytes`/`write_bytes`/`read_val`/`write_val`/`read_cstr` | keep raw: this is the layer where a raw address becomes a checked one |
+| **Not user pointers** | 9 | kernel heap pointers (`akuma-alloc`), a boxed-closure pointer (`akuma-switch`), the device-tree `dtb_ptr` (`akuma-kernel`, `akuma-kernel-glue`), a test helper (`akuma-threading`) | false positives of the name match |
+
+The last two classes are now excluded from the ratchet (with the reasons in the script), so its budget, **189**, counts only
+what is actionable.
+
+**How the 189 are used inside their functions** (a heuristic on the body): about 130 only copy through the pointer
+(`copy_from_user*`, `read_user_into`, `write_user_val`, `validate_user_ptr`); about 35 of those also test it against `0` first
+(a NULL "optional out-parameter", e.g. `accept`'s address); about 55 only pass it to another handler or helper (the AF_INET
+and AF_UNIX `dispatch_*`/`sys_*` pairs, `execve`/`spawn` and the amd64 twins, `pselect6`/`ppoll`), which therefore convert as
+a chain; 3 are unused (`_addr_len_ptr`, `_sigmask_ptr`, `_data_ptr`, kept for ABI shape); and the rest are one-offs
+(`trace_*` debug helpers, `sys_core_init`'s program pointer).
+
+**Why convert, since none of this is a bug today.** 128 functions take these pointers, and 95 of them also take another bare
+`u64`/`usize` (a length, a flag, an fd): a pointer and a length swapped at a call still compiles. 17 take four or more. A
+`UserAddr` makes the pointer a different type from the integers beside it, gives `offset_of`/`add` instead of raw `+`, and
+makes `slice()` the one validation. The previous defects in this family (validate-then-ignore, wrapping `iov + i * 16`) are
+already fixed at their sites; what remains is preventing the next one.
+
+**Conversion order** (each step compiles on its own; the `akuma-syscalls-time` conversion is the template): the amd64 twins
+convert with their glue counterparts, because both call the same handlers.
+
+1. `unixsock.rs` (12) and the matching `net.rs` `dispatch_*` (33): the largest pass-through chain, and the one with the most
+   same-typed neighbours (`addr_ptr`, `len_ptr`, `addrlen_ptr`).
+2. `fs.rs` (43): the most call sites; mostly `buf_ptr` + `count`.
+3. `proc.rs` + `execve.rs` + amd64 `usermode.rs` (28 + 5): `execve`/`spawn`/`wait4`, converted with the amd64 twins.
+4. `poll.rs`, `signal.rs`, `container.rs`, and the remaining small files (about 50).
+
+Each step is one crate-local sweep with the pattern: change the parameter to `UserAddr`, wrap `args[n]` once at dispatch, let
+the compiler find the rest, run both boot suites, lower the budget with `--update`.
 
 ## Tests
 
@@ -131,7 +170,7 @@ host ports are unprivileged, and the active toolchain's `rust-objcopy` on `PATH`
    they have no effect function to take a token.
 3. **§5** the 60 `slot: usize` functions in `akuma-threading`; a distinct `Pid` type; a real `with_live` that holds the slot
    state lock. Without it, a generation check followed by an action is a race with a one-load window.
-4. **§8** the ~210 untyped `*_ptr` parameters. And deleting `BYPASS_VALIDATION` outright: it is compiled out of `no-tests`
+4. **§8** the 189 untyped user-pointer parameters (classified below; the other 21 matches are validators or not user pointers). And deleting `BYPASS_VALIDATION` outright: it is compiled out of `no-tests`
    images now (below), but the boot self-tests still use it at ~125 sites that pass kernel buffers as user pointers; each needs
    a real user mapping instead (`proposals/FUTURE_WORK.md`).
 5. **§9** classifying and migrating the other static spinlocks.
