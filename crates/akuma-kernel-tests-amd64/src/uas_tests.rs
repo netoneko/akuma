@@ -602,6 +602,114 @@ fn range_walk_test(t: &mut Suite, uas: &mut UserAddressSpace) {
     }
 }
 
+/// One process cannot reach another's memory, except through a copy-on-write share.
+///
+/// `A` and `B` are unrelated spaces with private pages at the **same** virtual addresses; `C` is `A`'s fork child, built
+/// with the sequence `usermode.rs`'s fork walk uses (take a CoW reference, track the frame in the child, map it read-only
+/// with the CoW marker, reprotect the parent). The only isolation a process has is its page table, so the test reads the
+/// tables and the frames behind them: unrelated spaces share no frame and hold their own bytes; a page only `A` mapped is
+/// unreachable from `B`; and after the fork every frame visible in two spaces is read-only in each, carries the CoW
+/// marker and has a share count of at least 2, while `B` is untouched. The aarch64 counterpart is
+/// `process_tests::test_process_memory_isolated_except_cow`.
+pub fn isolation_except_cow_test(t: &mut Suite) {
+    use akuma_mmu::{Leaf, LeafAction, PteProt};
+
+    const PAGES: usize = 6;
+    const A_ONLY: usize = TEST_VA + (PAGES + 4) * 4096;
+    const A_BYTES: [u8; 8] = [0xA1; 8];
+    const B_BYTES: [u8; 8] = [0xB2; 8];
+
+    fn private_space(bytes: &[u8; 8]) -> Option<UserAddressSpace> {
+        let mut uas = UserAddressSpace::new()?;
+        for i in 0..PAGES {
+            let va = TEST_VA + i * 4096;
+            uas.alloc_and_map(va, user_flags::RW_NO_EXEC).ok()?;
+            if !uas.write_page_bytes(va, 0, bytes) {
+                return None;
+            }
+        }
+        Some(uas)
+    }
+    fn leaves(uas: &UserAddressSpace) -> alloc::vec::Vec<Leaf> {
+        let mut v = alloc::vec::Vec::new();
+        uas.for_each_leaf_in_range(TEST_VA, A_ONLY + 4096, |l| v.push(l));
+        v
+    }
+    fn first_byte(pa: usize) -> u8 {
+        // SAFETY: a frame an address space in this test still owns, inside the physmap.
+        unsafe { phys_ptr::<u8>(pa as u64).read_volatile() }
+    }
+
+    let (Some(mut a), Some(b)) = (private_space(&A_BYTES), private_space(&B_BYTES)) else {
+        t.check("isolation: setup", false);
+        return;
+    };
+    if a.alloc_and_map(A_ONLY, user_flags::RW_NO_EXEC).is_err() || !a.write_page_bytes(A_ONLY, 0, &A_BYTES) {
+        t.check("isolation: setup", false);
+        return;
+    }
+    t.check("isolation: setup", true);
+
+    // 1. Private: same VAs, disjoint frames, each holding its owner's bytes.
+    let (la, lb) = (leaves(&a), leaves(&b));
+    t.check_eq("isolation: A maps the pages it was given", la.len() as u64, PAGES as u64 + 1);
+    t.check_eq("isolation: B maps the pages it was given", lb.len() as u64, PAGES as u64);
+    t.check("isolation: unrelated spaces share no frame", la.iter().all(|x| lb.iter().all(|y| x.pa != y.pa)));
+    t.check("isolation: A's frames hold A's bytes", la.iter().all(|l| first_byte(l.pa) == A_BYTES[0]));
+    t.check("isolation: B's frames hold B's bytes", lb.iter().all(|l| first_byte(l.pa) == B_BYTES[0]));
+    t.check("isolation: a page only A mapped is unreachable from B", !b.is_mapped(A_ONLY) && b.translate(A_ONLY).is_none());
+    t.check("isolation: private pages are writable and not CoW", la.iter().chain(lb.iter()).all(|l| l.prot.write && !l.cow));
+
+    // 2. Fork A into C the way the fork walk does.
+    let Some(mut c) = UserAddressSpace::new() else {
+        t.check("isolation: child space", false);
+        return;
+    };
+    let mut shared = 0u64;
+    let mut ok = true;
+    a.rewrite_leaves_in_range(TEST_VA, TEST_VA + PAGES * 4096, |_ledger, leaf: Leaf| {
+        let frame = akuma_mmap::PhysFrame::new(leaf.pa);
+        let demoted = PteProt { write: false, ..leaf.prot };
+        akuma_pmm::cow_ref_inc(leaf.pa);
+        c.track_user_frame(frame);
+        if !c.map_page_pte(leaf.va, leaf.pa, demoted, true) {
+            ok = false;
+            return LeafAction::Keep;
+        }
+        shared += 1;
+        LeafAction::Reprotect(demoted, true)
+    });
+    t.check("isolation: the fork walk mapped every page", ok && shared == PAGES as u64);
+
+    let (la, lb, lc) = (leaves(&a), leaves(&b), leaves(&c));
+    t.check("isolation: the child maps exactly the parent's shared frames",
+        lc.len() == PAGES && lc.iter().all(|x| la.iter().any(|y| y.pa == x.pa)));
+    t.check("isolation: the child did not get the page the parent did not share", c.translate(A_ONLY).is_none());
+    // The invariant: a frame visible in two spaces is read-only in each, CoW-marked and counted as shared.
+    let spaces = [&la, &lb, &lc];
+    let mut sharing_is_safe = true;
+    for (i, mine) in spaces.iter().enumerate() {
+        for l in mine.iter() {
+            let elsewhere = spaces.iter().enumerate().any(|(j, o)| j != i && o.iter().any(|x| x.pa == l.pa));
+            if elsewhere && (l.prot.write || !l.cow || akuma_pmm::cow_ref_get(l.pa) < 2) {
+                sharing_is_safe = false;
+            }
+        }
+    }
+    t.check("isolation: every frame in two spaces is read-only, CoW-marked and counted", sharing_is_safe);
+
+    // 3. The unrelated process is untouched, and the parent's bytes survive.
+    t.check("isolation: B shares nothing with A or C",
+        lb.iter().all(|x| la.iter().chain(lc.iter()).all(|y| y.pa != x.pa)));
+    t.check("isolation: B's memory is unchanged", lb.len() == PAGES && lb.iter().all(|l| l.prot.write && !l.cow && first_byte(l.pa) == B_BYTES[0]));
+    t.check("isolation: A's bytes survive the fork", la.iter().all(|l| first_byte(l.pa) == A_BYTES[0]));
+
+    // Child first (each shared frame 2 -> 1, nothing freed), then the parent frees them; B frees its own.
+    drop(c);
+    drop(a);
+    drop(b);
+}
+
 /// The per-core live-L0 registry `UserAddressSpace::drop` gates on.
 ///
 /// **This is the prerequisite for letting an address space drop at all on this

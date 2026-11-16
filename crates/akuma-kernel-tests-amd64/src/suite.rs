@@ -83,6 +83,7 @@ fn run(t: &mut Suite, cx: &SuiteCtx) -> Verdict {
     // because the two are the same job done twice, and a divergence between
     // them is easiest to read when their results are adjacent.
     crate::uas_tests::smoke_test(t);
+    crate::uas_tests::isolation_except_cow_test(t);
     k::idt::smoke_test(t);
     k::idt::user_copy_smoke_test(t);
     k::uaccess::smoke_test(t, cx.smap);
