@@ -924,6 +924,21 @@ pub fn current_creds() -> super::Creds {
     current_process_shared().map_or(super::Creds::ROOT, |p| p.creds.get())
 }
 
+/// Whether the caller may do something that affects the whole machine: it is
+/// uid 0 **and** in the host box (box 0). A kernel thread, which has no
+/// process, counts as both.
+///
+/// This is the one gate for `reboot`, `mount`, setting the clock, opening a raw
+/// block device and opening a hardware control device. Before 2026-11-16 those
+/// checked the box only, or nothing (`docs/archive/SECURITY_AUDIT_2026_11_16.md`
+/// H2, M9), so a process that had dropped to an unprivileged uid kept all of
+/// them. There are no capabilities in this kernel; uid 0 in box 0 is what
+/// "privileged" means, and a root inside a box is root over that box only.
+#[must_use]
+pub fn caller_is_host_root() -> bool {
+    current_process_shared().is_none_or(|p| p.box_id == 0 && p.creds.get().is_root())
+}
+
 pub fn current_process_shared() -> Option<&'static Process> {
     // Identity cache fast path (own-process half): the map value's `Process`
     // in two validated loads — same resolution, same fallbacks.

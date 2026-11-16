@@ -11,7 +11,9 @@ use super::*;
 /// so the same restriction applies here. `is_none_or` matches that helper: no
 /// current process (host-side/early-boot caller) is treated as box 0.
 fn caller_may_reboot() -> bool {
-    akuma_exec::process::current_process_shared().is_none_or(|p| p.box_id == 0)
+    // And uid 0: Linux asks for `CAP_SYS_BOOT`, and a host process that dropped
+    // to an ordinary uid has no business taking the machine down.
+    akuma_exec::process::caller_is_host_root()
 }
 
 pub(super) fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> u64 {

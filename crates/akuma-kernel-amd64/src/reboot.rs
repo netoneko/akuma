@@ -217,6 +217,11 @@ mod trace {
 /// `arg` (the `LINUX_REBOOT_CMD_RESTART2` string) is ignored: there is no
 /// bootloader command to hand it to.
 pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> u64 {
+    // Host box and uid 0, as glue's `sys_reboot` asks on AArch64. This had no
+    // gate at all: any process in any box could reset the machine.
+    if !akuma_exec::process::caller_is_host_root() {
+        return errno::EPERM;
+    }
     let decoded = decode(magic1 as u32, magic2 as u32, cmd as u32);
     // Only a request that will actually act is worth a record: a rejected or
     // no-op call neither resets nor halts.

@@ -2336,6 +2336,11 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     if let Some(node) = akuma_vfs_glue::dev_node(&path)
         && node.is_block
     {
+        // A raw device read sees every file on the disk whatever its mode bits,
+        // so it is uid 0's alone (Linux: the node is `0660 root:disk`).
+        if !akuma_exec::process::caller_is_host_root() {
+            return Err(EACCES);
+        }
         let Some(idx) = akuma_virtio::block::device_index_by_name(node.name) else {
             return Err(ENODEV);
         };

@@ -127,6 +127,10 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
             if a1 == 0 {
                 return 0;
             }
+            // Same gate as glue's `clock_settime`: the wall clock is the host root's.
+            if !akuma_exec::process::caller_is_host_root() {
+                return errno::EPERM;
+            }
             let Some(tv) = crate::uaccess::read_val::<akuma_syscalls_linux::time::Timeval>(a1)
             else {
                 return errno::EFAULT;
