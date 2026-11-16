@@ -2,7 +2,6 @@
   "untyped_user_ptr_params": {
     "crates/akuma-exec": 4,
     "crates/akuma-kernel-amd64": 14,
-    "crates/akuma-syscalls-glue": 24,
     "crates/akuma-syscalls-ipc": 1,
     "crates/akuma-syscalls-time": 1
   }

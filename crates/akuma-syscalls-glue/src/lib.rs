@@ -805,8 +805,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(all(feature = "akuma-native", not(feature = "smoltcp")))]
         nr::RESOLVE_HOST => net_enetdown(),
         nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, UserAddr::new(args[1]), args[2] as usize),
-        nr::PSELECT6 => flat(poll::sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5])),
-        nr::PPOLL => flat(poll::sys_ppoll(args[0], args[1] as usize, args[2], args[3])),
+        nr::PSELECT6 => flat(poll::sys_pselect6(args[0] as usize, UserAddr::new(args[1]), UserAddr::new(args[2]), UserAddr::new(args[3]), UserAddr::new(args[4]), UserAddr::new(args[5]))),
+        nr::PPOLL => flat(poll::sys_ppoll(UserAddr::new(args[0]), args[1] as usize, UserAddr::new(args[2]), args[3])),
         nr::MKDIRAT => flat(fs::sys_mkdirat(args[0] as i32, UserAddr::new(args[1]), args[2] as u32)),
         nr::UNLINKAT => flat(fs::sys_unlinkat(args[0] as i32, UserAddr::new(args[1]), args[2] as u32)),
         nr::SYMLINKAT => flat(fs::sys_symlinkat(UserAddr::new(args[0]), args[1] as i32, UserAddr::new(args[2]))),
@@ -854,7 +854,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "akuma-native")]
         nr::CORE_INIT => proc::sys_core_init(args[0] as usize, UserAddr::new(args[1])),
         #[cfg(feature = "sc-containers")]
-        nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
+        nr::REGISTER_BOX => container::sys_register_box(args[0], UserAddr::new(args[1]), args[2] as usize, UserAddr::new(args[3]), args[4] as usize, args[5] as u32),
         #[cfg(feature = "sc-containers")]
         nr::KILL_BOX => container::sys_kill_box(args[0]),
         #[cfg(feature = "sc-containers")]
@@ -1013,7 +1013,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             // glibc asks with up to 128 bytes and grows on `EINVAL`; nothing needs
             // more than a page, and the size is a kernel allocation.
             let cpusetsize = (args[1] as usize).min(4096);
-            if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr((mask_ptr as u64), cpusetsize) {
+            if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
                 // CPUs the process may run on: the kernel's `probed_core_count`
                 // hook. The AArch64 shared-kernel SMP build answers the
@@ -1075,13 +1075,13 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-epoll")]
         nr::EPOLL_CREATE1 => poll::sys_epoll_create1(args[0] as u32),
         #[cfg(feature = "sc-epoll")]
-        nr::EPOLL_CTL => poll::sys_epoll_ctl(args[0] as u32, args[1] as i32, args[2] as u32, args[3] as usize),
+        nr::EPOLL_CTL => poll::sys_epoll_ctl(args[0] as u32, args[1] as i32, args[2] as u32, UserAddr::new((args[3] as usize) as u64)),
         #[cfg(feature = "sc-epoll")]
         nr::EPOLL_PWAIT => {
             if akuma_config::SYSCALL_DEBUG_NET_ENABLED && (args[4] != 0 || args[5] != 0) {
                 akuma_primitives::safe_print!(128, "[epoll_pwait] sigmask=0x{:x} sigsetsize={}\n", args[4], args[5]);
             }
-            poll::sys_epoll_pwait(args[0] as u32, args[1] as usize, args[2] as i32, args[3] as i32)
+            poll::sys_epoll_pwait(args[0] as u32, UserAddr::new((args[1] as usize) as u64), args[2] as i32, args[3] as i32)
         }
         #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_CREATE => timerfd::sys_timerfd_create(args[0] as i32, args[1] as i32),
@@ -1126,11 +1126,11 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             ENOSYS
         }
         #[cfg(feature = "sc-containers")]
-        nr::MOUNT => flat(container::sys_mount(args[0], args[1], args[2], args[3], args[4])),
+        nr::MOUNT => flat(container::sys_mount(UserAddr::new(args[0]), UserAddr::new(args[1]), UserAddr::new(args[2]), args[3], UserAddr::new(args[4]))),
         #[cfg(feature = "sc-containers")]
-        nr::UMOUNT2 => flat(container::sys_umount2(args[0], args[1] as i32)),
+        nr::UMOUNT2 => flat(container::sys_umount2(UserAddr::new(args[0]), args[1] as i32)),
         #[cfg(feature = "sc-containers")]
-        nr::MOUNT_IN_NS => flat(container::sys_mount_in_ns(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5])),
+        nr::MOUNT_IN_NS => flat(container::sys_mount_in_ns(args[0], UserAddr::new(args[1]), args[2] as usize, UserAddr::new(args[3]), args[4] as usize, UserAddr::new(args[5]))),
         _ => {
             if akuma_config::SYSCALL_ENOSYS_DIAG {
                 akuma_primitives::safe_print!(128,

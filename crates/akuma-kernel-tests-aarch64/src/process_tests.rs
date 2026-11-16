@@ -8002,9 +8002,9 @@ fn test_rt_sigtimedwait_timeout() {
     // 4. Call sigtimedwait
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
     let res = flat(sys_rt_sigtimedwait(
-        crate::syscall::UserAddr::new((&raw mut mask as u64)),
+        crate::syscall::UserAddr::new(&raw mut mask as u64),
         crate::syscall::UserAddr::new(0),
-        crate::syscall::UserAddr::new((&raw const ts as u64)),
+        crate::syscall::UserAddr::new(&raw const ts as u64),
         8
     ));
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
@@ -8117,7 +8117,7 @@ fn test_rt_sigtimedwait() {
     // 3. Call sigtimedwait (bypass validation since we use kernel stack)
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
     let mut mask_val = wait_mask;
-    let res = flat(sys_rt_sigtimedwait(crate::syscall::UserAddr::new((&raw mut mask_val as u64)), crate::syscall::UserAddr::new(0), crate::syscall::UserAddr::new(0), 8));
+    let res = flat(sys_rt_sigtimedwait(crate::syscall::UserAddr::new(&raw mut mask_val as u64), crate::syscall::UserAddr::new(0), crate::syscall::UserAddr::new(0), 8));
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
 
     // Cleanup
@@ -13308,7 +13308,7 @@ fn test_epoll_socket_waker() {
 
     // Register socket for EPOLLIN
     let mut ev = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 0xDEADBEEF };
-    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd, &raw mut ev as usize);
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd, crate::syscall::UserAddr::new((&raw mut ev as usize) as u64));
 
     // In a background thread, wait 5ms then simulate data arrival
     akuma_exec::threading::spawn_user_thread_fn(move || {
@@ -13331,7 +13331,7 @@ fn test_epoll_socket_waker() {
     // Wait for event with a large timeout (1s)
     let mut out_events = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
     let start = crate::timer::uptime_us();
-    let nready = sys_epoll_pwait(epfd as u32, out_events.as_mut_ptr() as usize, 1, 1000);
+    let nready = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out_events.as_mut_ptr() as usize) as u64), 1, 1000);
     let end = crate::timer::uptime_us();
     
     let elapsed = end - start;
@@ -13517,27 +13517,27 @@ fn test_epoll_edge_rearm_symmetry() {
 
     // ---- write edge -------------------------------------------------------
     let mut evw = crate::syscall::poll::EpollEvent { events: EPOLLET | EPOLLOUT, _pad: 0, data: 1 };
-    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_w, &raw mut evw as usize);
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_w, crate::syscall::UserAddr::new((&raw mut evw as usize) as u64));
 
     // Pass 1: an empty pipe is writable, so the edge fires and is recorded.
-    let first = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let first = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
     // Pass 2: still writable, but already reported — an edge must NOT repeat.
-    let second = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let second = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
     // The syscall a blocked writer makes on a short write / EAGAIN. Before the
     // fix nothing called this and the next pass stayed silent forever.
     crate::syscall::poll::epoll_on_fd_write_blocked(fd_w);
-    let third = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let third = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
 
-    sys_epoll_ctl(epfd as u32, 2 /* DEL */, fd_w, core::ptr::null_mut::<u8>() as usize);
+    sys_epoll_ctl(epfd as u32, 2 /* DEL */, fd_w, crate::syscall::UserAddr::new((core::ptr::null_mut::<u8>() as usize) as u64));
 
     // ---- read edge (the half that already worked — guard the refactor) -----
     let mut evr = crate::syscall::poll::EpollEvent { events: EPOLLET | EPOLLIN, _pad: 0, data: 2 };
-    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_r, &raw mut evr as usize);
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_r, crate::syscall::UserAddr::new((&raw mut evr as usize) as u64));
     let _ = pipe_write(pipe_id, b"x");
-    let r_first = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
-    let r_second = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let r_first = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
+    let r_second = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
     crate::syscall::poll::epoll_on_fd_drained(fd_r);
-    let r_third = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let r_third = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
 
     // Close through `sys_close`, NOT by dropping the fds on the floor. An fd
     // left in the fd table is closed AGAIN when the process is reaped, and that
@@ -13603,15 +13603,15 @@ fn test_pipe_read_nonblock_returns_eagain() {
 
     // Empty pipe, writer still open: EAGAIN. Before the fix this call never
     // returned and the test suite hung here instead of failing.
-    let empty = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
+    let empty = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new(buf.as_mut_ptr() as u64), buf.len());
 
     // Data present: a normal short read, unaffected by O_NONBLOCK.
     let _ = pipe_write(pipe_id, b"hi");
-    let with_data = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
+    let with_data = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new(buf.as_mut_ptr() as u64), buf.len());
 
     // Writer gone: EOF (0), which must NOT be reported as EAGAIN.
     let _ = crate::syscall::fs::sys_close(fd_w);
-    let at_eof = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
+    let at_eof = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new(buf.as_mut_ptr() as u64), buf.len());
 
     let _ = crate::syscall::fs::sys_close(fd_r);
     unregister_thread_pid(tid);
@@ -13674,23 +13674,23 @@ fn test_epoll_pipe_eof_edge_after_partial_drain() {
     let epfd = sys_epoll_create1(0);
     let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 2];
     let mut ev = crate::syscall::poll::EpollEvent { events: EPOLLET | EPOLLIN, _pad: 0, data: 7 };
-    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_r, &raw mut ev as usize);
+    sys_epoll_ctl(epfd as u32, 1 /* ADD */, fd_r, crate::syscall::UserAddr::new((&raw mut ev as usize) as u64));
 
     // 1. data arrives -> the edge fires.
     let _ = pipe_write(pipe_id, b"EARLY");
-    let fired = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let fired = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
 
     // 2. the watcher drains through the real syscall (this is what re-arms).
     let mut buf = [0u8; 16];
-    let drained = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
+    let drained = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new(buf.as_mut_ptr() as u64), buf.len());
 
     // 3. drained with the writer still open -> genuinely nothing ready.
-    let quiet = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let quiet = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
 
     // 4. the writer closes -> the EOF edge MUST arrive. This returned 0 forever
     //    before the fix, which is exactly where tokio parked.
     let _ = crate::syscall::fs::sys_close(fd_w);
-    let eof_edge = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);
+    let eof_edge = sys_epoll_pwait(epfd as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 2, 0);
     let eof_bits = out[0].events;
 
     let _ = crate::syscall::fs::sys_close(fd_r);
@@ -13748,9 +13748,9 @@ fn test_epoll_multi_poller_pipe() {
 
     // Register pipe for EPOLLIN in both
     let mut ev1 = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 1 };
-    sys_epoll_ctl(epfd1 as u32, 1 /* ADD */, fd_r, &raw mut ev1 as usize);
+    sys_epoll_ctl(epfd1 as u32, 1 /* ADD */, fd_r, crate::syscall::UserAddr::new((&raw mut ev1 as usize) as u64));
     let mut ev2 = crate::syscall::poll::EpollEvent { events: 0x001 /* EPOLLIN */, _pad: 0, data: 2 };
-    sys_epoll_ctl(epfd2 as u32, 1 /* ADD */, fd_r, &raw mut ev2 as usize);
+    sys_epoll_ctl(epfd2 as u32, 1 /* ADD */, fd_r, crate::syscall::UserAddr::new((&raw mut ev2 as usize) as u64));
 
     static WOKEN_COUNT: AtomicU32 = AtomicU32::new(0);
     WOKEN_COUNT.store(0, Ordering::SeqCst);
@@ -13783,7 +13783,7 @@ fn test_epoll_multi_poller_pipe() {
         let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
         let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
         TH_PHASE[0].store(3, Ordering::SeqCst);
-        let rc = sys_epoll_pwait(epfd1 as u32, out.as_mut_ptr() as usize, 1, 5000);
+        let rc = sys_epoll_pwait(epfd1 as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 1, 5000);
         TH_RC[0].store(rc, Ordering::SeqCst);
         TH_RET_US[0].store(crate::timer::uptime_us(), Ordering::SeqCst);
         TH_PHASE[0].store(4, Ordering::SeqCst);
@@ -13804,7 +13804,7 @@ fn test_epoll_multi_poller_pipe() {
         let _bypass = akuma_exec::process::user_access::BypassValidationGuard::new();
         let mut out = [crate::syscall::poll::EpollEvent { events: 0, _pad: 0, data: 0 }; 1];
         TH_PHASE[1].store(3, Ordering::SeqCst);
-        let rc = sys_epoll_pwait(epfd2 as u32, out.as_mut_ptr() as usize, 1, 5000);
+        let rc = sys_epoll_pwait(epfd2 as u32, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 1, 5000);
         TH_RC[1].store(rc, Ordering::SeqCst);
         TH_RET_US[1].store(crate::timer::uptime_us(), Ordering::SeqCst);
         TH_PHASE[1].store(4, Ordering::SeqCst);
@@ -17202,7 +17202,7 @@ fn test_epoll_pipe_close_write_triggers_epollin() {
     #[derive(Copy, Clone)]
     struct EpollEvent { events: u32, _pad: u32, data: u64 }
     let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: u64::from(read_fd) };
-    let ctl_ret = sys_epoll_ctl(epfd, EPOLL_CTL_ADD, read_fd, &raw const ev as usize);
+    let ctl_ret = sys_epoll_ctl(epfd, EPOLL_CTL_ADD, read_fd, crate::syscall::UserAddr::new((&raw const ev as usize) as u64));
     if ctl_ret != 0 {
         crate::safe_print!(96, "[Test] epoll_pipe_close_write FAILED: ctl ADD err={:#x}\n", ctl_ret);
         unregister_process(pid);
@@ -17214,13 +17214,13 @@ fn test_epoll_pipe_close_write_triggers_epollin() {
 
     // Before close: epoll should return 0 events (no data, write end open)
     let mut out = [EpollEvent { events: 0, _pad: 0, data: 0 }; 4];
-    let before = sys_epoll_pwait(epfd, out.as_mut_ptr() as usize, 4, 0);
+    let before = sys_epoll_pwait(epfd, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 4, 0);
 
     // Close write end → EOF on read end
     pipe_close_write(pipe_id);
 
     // After close: epoll should return EPOLLIN (EOF)
-    let after = sys_epoll_pwait(epfd, out.as_mut_ptr() as usize, 4, 0);
+    let after = sys_epoll_pwait(epfd, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 4, 0);
 
     unregister_process(pid);
     unregister_thread_pid(tid);
@@ -17266,17 +17266,17 @@ fn test_epoll_eventfd_write_triggers_event() {
     #[derive(Copy, Clone)]
     struct EpollEvent { events: u32, _pad: u32, data: u64 }
     let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: u64::from(efd_num) };
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, &raw const ev as usize);
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, crate::syscall::UserAddr::new((&raw const ev as usize) as u64));
 
     // Before write: no events
     let mut out = [EpollEvent { events: 0, _pad: 0, data: 0 }; 4];
-    let before = sys_epoll_pwait(epfd, out.as_mut_ptr() as usize, 4, 0);
+    let before = sys_epoll_pwait(epfd, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 4, 0);
 
     // Write to eventfd
     let _ = eventfd_write(efd_id, 1);
 
     // After write: should see EPOLLIN
-    let after = sys_epoll_pwait(epfd, out.as_mut_ptr() as usize, 4, 0);
+    let after = sys_epoll_pwait(epfd, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 4, 0);
 
     unregister_process(pid);
     unregister_thread_pid(tid);
@@ -17324,21 +17324,21 @@ fn test_epoll_del_removes_interest() {
     #[derive(Copy, Clone)]
     struct EpollEvent { events: u32, _pad: u32, data: u64 }
     let ev = EpollEvent { events: EPOLLIN, _pad: 0, data: u64::from(efd_num) };
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, &raw const ev as usize);
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, efd_num, crate::syscall::UserAddr::new((&raw const ev as usize) as u64));
 
     // Write so event is pending
     let _ = eventfd_write(efd_id, 1);
 
     // Verify event is reported
     let mut out = [EpollEvent { events: 0, _pad: 0, data: 0 }; 4];
-    let with_interest = sys_epoll_pwait(epfd, out.as_mut_ptr() as usize, 4, 0);
+    let with_interest = sys_epoll_pwait(epfd, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 4, 0);
 
     // Remove from interest set
-    let del_ret = sys_epoll_ctl(epfd, EPOLL_CTL_DEL, efd_num, 0);
+    let del_ret = sys_epoll_ctl(epfd, EPOLL_CTL_DEL, efd_num, crate::syscall::UserAddr::new(0));
 
     // After DEL: no events should be reported
     let mut out2 = [EpollEvent { events: 0, _pad: 0, data: 0 }; 4];
-    let without_interest = sys_epoll_pwait(epfd, out2.as_mut_ptr() as usize, 4, 0);
+    let without_interest = sys_epoll_pwait(epfd, crate::syscall::UserAddr::new((out2.as_mut_ptr() as usize) as u64), 4, 0);
 
     unregister_process(pid);
     unregister_thread_pid(tid);
@@ -17383,15 +17383,15 @@ fn test_epoll_multiple_ready_events() {
 
     let ev1 = EpollEvent { events: EPOLLIN, _pad: 0, data: 0xAA };
     let ev2 = EpollEvent { events: EPOLLIN, _pad: 0, data: 0xBB };
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd1, &raw const ev1 as usize);
-    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd2, &raw const ev2 as usize);
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd1, crate::syscall::UserAddr::new((&raw const ev1 as usize) as u64));
+    sys_epoll_ctl(epfd, EPOLL_CTL_ADD, fd2, crate::syscall::UserAddr::new((&raw const ev2 as usize) as u64));
 
     // Make both ready
     let _ = eventfd_write(efd1, 1);
     let _ = eventfd_write(efd2, 1);
 
     let mut out = [EpollEvent { events: 0, _pad: 0, data: 0 }; 4];
-    let nready = sys_epoll_pwait(epfd, out.as_mut_ptr() as usize, 4, 0);
+    let nready = sys_epoll_pwait(epfd, crate::syscall::UserAddr::new((out.as_mut_ptr() as usize) as u64), 4, 0);
 
     unregister_process(pid);
     unregister_thread_pid(tid);

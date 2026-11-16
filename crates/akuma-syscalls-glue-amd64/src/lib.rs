@@ -212,7 +212,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> u64 {
         return 0;
     }
     if len > MAX_IO && (is_regular_file(fd) || is_fill_device(fd)) {
-        return read_chunked(len, |done, n| glue::fs::sys_read(fd, akuma_syscalls_glue::UserAddr::new((buf + done)), n));
+        return read_chunked(len, |done, n| glue::fs::sys_read(fd, akuma_syscalls_glue::UserAddr::new(buf + done), n));
     }
     glue::fs::sys_read(fd, akuma_syscalls_glue::UserAddr::new(buf), len.min(MAX_IO) as usize)
 }
@@ -225,7 +225,7 @@ pub fn pread64(fd: u64, buf: u64, len: u64, off: u64) -> u64 {
     }
     if len > MAX_IO && (is_regular_file(fd) || is_fill_device(fd)) {
         return read_chunked(len, |done, n| {
-            glue::fs::sys_pread64(fd as u32, akuma_syscalls_glue::UserAddr::new((buf + done)), n, off.cast_signed().wrapping_add(done.cast_signed()))
+            glue::fs::sys_pread64(fd as u32, akuma_syscalls_glue::UserAddr::new(buf + done), n, off.cast_signed().wrapping_add(done.cast_signed()))
         });
     }
     glue::fs::sys_pread64(fd as u32, akuma_syscalls_glue::UserAddr::new(buf), len.min(MAX_IO) as usize, off.cast_signed())
@@ -341,7 +341,7 @@ pub fn poll(fds: u64, nfds: u64, timeout_ms: u64) -> u64 {
         ms if ms < 0 => None,
         ms => Some((ms as u64).saturating_mul(1_000)),
     };
-    glue::flat(glue::poll::ppoll_timeout_us(fds, nfds as usize, timeout))
+    glue::flat(glue::poll::ppoll_timeout_us(akuma_syscalls_glue::UserAddr::new(fds), nfds as usize, timeout))
 }
 
 /// `select(nfds, r, w, e, timeval*)`: a NULL `timeval` waits forever; a
@@ -361,7 +361,7 @@ pub fn select(nfds: u64, readfds: u64, writefds: u64, exceptfds: u64, timeout: u
             None => return EINVAL,
         }
     };
-    glue::flat(glue::poll::pselect6_timeout_us(nfds as usize, readfds, writefds, exceptfds, deadline))
+    glue::flat(glue::poll::pselect6_timeout_us(nfds as usize, akuma_syscalls_glue::UserAddr::new(readfds), akuma_syscalls_glue::UserAddr::new(writefds), akuma_syscalls_glue::UserAddr::new(exceptfds), deadline))
 }
 
 /// `gettimeofday(tv, tz)`: the wall clock glue's `clock_gettime(CLOCK_REALTIME)`

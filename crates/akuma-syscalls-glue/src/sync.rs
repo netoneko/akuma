@@ -655,7 +655,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: UserAddr, 
     // `akuma_syscalls_sync::decode`, host-tested. `validate_user_ptr` is passed
     // in as an already-resolved fact rather than called from the crate: it can
     // demand-page, and the crate performs no effects.
-    let action = akuma_syscalls_sync::decode(op, val3, uaddr, validate_user_ptr((uaddr as u64), 4));
+    let action = akuma_syscalls_sync::decode(op, val3, uaddr, validate_user_ptr(uaddr as u64, 4));
 
     match action {
         Action::Return(v) => {
@@ -870,7 +870,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: UserAddr, 
                 }
             }
 
-            if uaddr2 != 0 && !validate_user_ptr((uaddr2 as u64), 4) {
+            if uaddr2 != 0 && !validate_user_ptr(uaddr2 as u64, 4) {
                 return EFAULT;
             }
 
@@ -891,7 +891,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: UserAddr, 
             let val2 = timeout_ptr as u32;
             let tgid = futex_key_tgid(is_private, uaddr);
 
-            if uaddr2 == 0 || uaddr2 & 3 != 0 || !validate_user_ptr((uaddr2 as u64), 4) {
+            if uaddr2 == 0 || uaddr2 & 3 != 0 || !validate_user_ptr(uaddr2 as u64, 4) {
                 return EFAULT;
             }
 

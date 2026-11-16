@@ -346,7 +346,8 @@ pub fn sys_epoll_create1(flags: u32) -> u64 {
 /// AArch64 **`epoll_event`** — see **`docs/GO_FORKTEST_DEBUG.md`** if
 /// **`x8==EPOLL_CTL`** at SIGSEGV.
 #[cfg(feature = "sc-epoll")]
-pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: usize) -> u64 {
+pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: UserAddr) -> u64 {
+    let event_ptr = event_ptr.get() as usize;
     let epoll_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
         _ => return EBADF,
@@ -906,7 +907,8 @@ const _: () = assert!(core::mem::size_of::<EpollEventX86>() == 12);
 akuma_pod::pod!(EpollEventX86 { events: u32, data: u64 });
 
 #[cfg(feature = "sc-epoll")]
-pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {
+pub fn sys_epoll_pwait(epfd: u32, events_ptr: UserAddr, maxevents: i32, timeout: i32) -> u64 {
+    let events_ptr = events_ptr.get() as usize;
     // 12 on x86_64 (packed ABI), 16 everywhere else (natural layout, the
     // asm-generic/aarch64 shape `EpollEvent` itself uses) — see
     // `EpollEventX86`'s doc comment for why the two differ.
@@ -918,7 +920,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
     if maxevents <= 0 { return EINVAL; }
     let maxevents = maxevents as usize;
     let out_size = maxevents * EPOLL_EVENT_SIZE;
-    if !validate_user_ptr((events_ptr as u64), out_size) { return EFAULT; }
+    if !validate_user_ptr(events_ptr as u64, out_size) { return EFAULT; }
 
     let epoll_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,
@@ -1210,15 +1212,19 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
 /// failed with `[7] Could not connect to server` about one RTT into a connection
 /// that had in fact succeeded. `poll(2)` callers were unaffected, which is why
 /// apk cargo and `/bin/curl` always worked.
-pub fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_ptr: u64, timeout_ptr: u64, _sigmask_ptr: u64) -> SysResult {
+pub fn sys_pselect6(nfds: usize, readfds_ptr: UserAddr, writefds_ptr: UserAddr, exceptfds_ptr: UserAddr, timeout_ptr: UserAddr, _sigmask_ptr: UserAddr) -> SysResult {
+    let readfds_ptr = readfds_ptr.get();
+    let writefds_ptr = writefds_ptr.get();
+    let exceptfds_ptr = exceptfds_ptr.get();
+    let timeout_ptr = timeout_ptr.get();
     // Timeout first, for [`sys_ppoll`]'s reason: it is Linux's order and it is
     // what lets `select(2)`'s own `struct timeval` spelling — the amd64 kernel's
     // x86_64 `23` — share this loop through [`pselect6_timeout_us`].
     pselect6_timeout_us(
         nfds,
-        readfds_ptr,
-        writefds_ptr,
-        exceptfds_ptr,
+        UserAddr::new(readfds_ptr),
+        UserAddr::new(writefds_ptr),
+        UserAddr::new(exceptfds_ptr),
         time::read_timeout_us(timeout_ptr)?,
     )
 }
@@ -1229,11 +1235,14 @@ pub fn sys_pselect6(nfds: usize, readfds_ptr: u64, writefds_ptr: u64, exceptfds_
 /// of the call share.
 pub fn pselect6_timeout_us(
     nfds: usize,
-    readfds_ptr: u64,
-    writefds_ptr: u64,
-    exceptfds_ptr: u64,
+    readfds_ptr: UserAddr,
+    writefds_ptr: UserAddr,
+    exceptfds_ptr: UserAddr,
     timeout_us: Option<u64>,
 ) -> SysResult {
+    let readfds_ptr = readfds_ptr.get();
+    let writefds_ptr = writefds_ptr.get();
+    let exceptfds_ptr = exceptfds_ptr.get();
     if nfds == 0 { return Ok(0); }
     // The cap, the word arithmetic and the bit marshalling are
     // `akuma_syscalls_poll::fdset` — pure, and untested until it existed. The
@@ -1453,11 +1462,11 @@ pub fn run_pselect6_exceptfds_test() {
     let mut eset = bit(wfd);
     let rc_ready = flat(sys_pselect6(
         (wfd + 1) as usize,
-        0,
-        &raw mut wset as u64,
-        &raw mut eset as u64,
-        &raw mut ts as u64,
-        0,
+        UserAddr::new(0),
+        UserAddr::new(&raw mut wset as u64),
+        UserAddr::new(&raw mut eset as u64),
+        UserAddr::new(&raw mut ts as u64),
+        UserAddr::new(0),
     ));
     let ready_ok = rc_ready > 0 && wset[(wfd / 64) as usize] & (1u64 << (wfd % 64)) != 0;
     let ready_except_cleared = eset[(wfd / 64) as usize] & (1u64 << (wfd % 64)) == 0;
@@ -1468,11 +1477,11 @@ pub fn run_pselect6_exceptfds_test() {
     let mut eset2 = bit(rfd);
     let rc_timeout = flat(sys_pselect6(
         (rfd + 1) as usize,
-        &raw mut rset as u64,
-        0,
-        &raw mut eset2 as u64,
-        &raw mut ts as u64,
-        0,
+        UserAddr::new(&raw mut rset as u64),
+        UserAddr::new(0),
+        UserAddr::new(&raw mut eset2 as u64),
+        UserAddr::new(&raw mut ts as u64),
+        UserAddr::new(0),
     ));
     let timeout_ok = rc_timeout == 0;
     let timeout_except_cleared = eset2[(rfd / 64) as usize] & (1u64 << (rfd % 64)) == 0;
@@ -1536,11 +1545,11 @@ pub fn run_pselect6_registers_waker_test() {
     let mut ts = Timespec { tv_sec: 0, tv_nsec: 0 };
     let rc = flat(sys_pselect6(
         (rfd + 1) as usize,
-        &raw mut rset as u64,
-        0,
-        0,
-        &raw mut ts as u64,
-        0,
+        UserAddr::new(&raw mut rset as u64),
+        UserAddr::new(0),
+        UserAddr::new(0),
+        UserAddr::new(&raw mut ts as u64),
+        UserAddr::new(0),
     ));
 
     let after = super::pipe::pipe_poller_count(pipe_id);
@@ -1618,11 +1627,11 @@ pub fn run_pselect6_eintr_test() {
     let started = akuma_primitives::clock::uptime_us();
     let rc = flat(sys_pselect6(
         (rfd + 1) as usize,
-        &raw mut rset as u64,
-        0,
-        0,
-        &raw mut ts as u64,
-        0,
+        UserAddr::new(&raw mut rset as u64),
+        UserAddr::new(0),
+        UserAddr::new(0),
+        UserAddr::new(&raw mut ts as u64),
+        UserAddr::new(0),
     ));
     let elapsed = akuma_primitives::clock::uptime_us().saturating_sub(started);
 
@@ -1653,7 +1662,9 @@ pub fn run_pselect6_eintr_test() {
     }
 }
 
-pub fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> SysResult {
+pub fn sys_ppoll(fds_ptr: UserAddr, nfds: usize, timeout_ptr: UserAddr, _sigmask: u64) -> SysResult {
+    let fds_ptr = fds_ptr.get();
+    let timeout_ptr = timeout_ptr.get();
     // The timeout is read **first**, before `fds_ptr` is validated and before
     // `nfds` is range-checked. That is Linux's order (`do_ppoll` calls
     // `get_timespec64` at the top, ahead of `do_sys_poll`), and it is what makes
@@ -1662,7 +1673,7 @@ pub fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> 
     // `int` of milliseconds and has no `struct timespec` to point at — reaches
     // the loop through [`ppoll_timeout_us`] without fabricating a user pointer
     // for one. Both spellings then share one wait loop.
-    ppoll_timeout_us(fds_ptr, nfds, time::read_timeout_us(timeout_ptr)?)
+    ppoll_timeout_us(UserAddr::new(fds_ptr), nfds, time::read_timeout_us(timeout_ptr)?)
 }
 
 /// [`sys_ppoll`] with the timeout already decoded: `None` blocks forever.
@@ -1672,7 +1683,8 @@ pub fn sys_ppoll(fds_ptr: u64, nfds: usize, timeout_ptr: u64, _sigmask: u64) -> 
 /// `poll(2)` says it with a negative `int` millisecond count. Neither is
 /// representable as a plain `timeout_us`, and a sentinel would be a third
 /// spelling to get wrong.
-pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> SysResult {
+pub fn ppoll_timeout_us(fds_ptr: UserAddr, nfds: usize, timeout_us: Option<u64>) -> SysResult {
+    let fds_ptr = fds_ptr.get();
     // **The allocation below is sized by a ring-3 register**, so it needs a
     // bound before it, not after. `nfds` arrives as a `usize` from userspace and
     // `alloc::vec![PollFd; nfds]` is 8 bytes each, so a `poll` with `nfds =

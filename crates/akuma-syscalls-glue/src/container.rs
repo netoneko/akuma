@@ -1,7 +1,9 @@
 use super::*;
 use akuma_exec::process::box_access::{BoxId, CallerBox};
 
-pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
+pub(super) fn sys_register_box(id: u64, name_ptr: UserAddr, name_len: usize, root_ptr: UserAddr, root_len: usize, primary_pid: u32) -> u64 {
+    let name_ptr = name_ptr.get();
+    let root_ptr = root_ptr.get();
     // Both lengths size a kernel buffer below.
     if name_len > 256 || root_len > 4096 { return EINVAL; }
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
@@ -176,12 +178,15 @@ fn mount_errno(e: akuma_vfs_glue::FsError) -> Errno {
 }
 
 pub(super) fn sys_mount(
-    source_ptr: u64,
-    target_ptr: u64,
-    fstype_ptr: u64,
+    source_ptr: UserAddr,
+    target_ptr: UserAddr,
+    fstype_ptr: UserAddr,
     flags: u64,
-    _data_ptr: u64,
+    _data_ptr: UserAddr,
 ) -> SysResult {
+    let source_ptr = source_ptr.get();
+    let target_ptr = target_ptr.get();
+    let fstype_ptr = fstype_ptr.get();
     let Some(root) = mount_permit() else {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
@@ -274,7 +279,8 @@ pub(super) fn sys_mount(
 /// - the **global** `/` is never unmountable (`EBUSY`, like Linux);
 /// - this arm only ever touches the global table — a box's namespace mounts
 ///   are composed from outside via `MOUNT_IN_NS` and torn down with the box.
-pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
+pub(super) fn sys_umount2(target_ptr: UserAddr, _flags: i32) -> SysResult {
+    let target_ptr = target_ptr.get();
     let Some(root) = mount_permit() else {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
@@ -300,7 +306,8 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
 /// silently produced an empty layer would surface much later as a missing file
 /// inside the container, with nothing pointing back here.
 #[cfg(feature = "sc-containers")]
-fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem>, Errno> {
+fn build_overlay(data_ptr: UserAddr) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem>, Errno> {
+    let data_ptr = data_ptr.get();
     use akuma_isolation::overlay_fs::{OverlayFs, parse_options};
 
     if data_ptr == 0 {
@@ -340,7 +347,10 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
     Ok(alloc::sync::Arc::new(OverlayFs::new(upper, layers)))
 }
 
-pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize, data_ptr: u64) -> SysResult {
+pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: UserAddr, target_len: usize, fstype_ptr: UserAddr, fstype_len: usize, data_ptr: UserAddr) -> SysResult {
+    let target_ptr = target_ptr.get();
+    let fstype_ptr = fstype_ptr.get();
+    let data_ptr = data_ptr.get();
     let Some(root) = akuma_exec::process::host_root() else {
         return Err(Errno::EPERM);
     };
@@ -359,7 +369,7 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
     let fs: alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem> = match fstype {
         "proc" => alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
-        "overlay" => build_overlay(data_ptr)?,
+        "overlay" => build_overlay(UserAddr::new(data_ptr))?,
         _ => return Err(Errno::ENODEV),
     };
 

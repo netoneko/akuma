@@ -21,7 +21,7 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: UserAddr, oldact_ptr: UserAddr
 
     let idx = (sig - 1) as usize;
 
-    if oldact_ptr != 0 && validate_user_ptr((oldact_ptr as u64), 32) {
+    if oldact_ptr != 0 && validate_user_ptr(oldact_ptr as u64, 32) {
         let actions = proc.signal_actions.actions.lock();
         let old = &actions[idx];
         let handler_val = match old.handler {
@@ -40,7 +40,7 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: UserAddr, oldact_ptr: UserAddr
         }
     }
 
-    if act_ptr != 0 && validate_user_ptr((act_ptr as u64), 32) {
+    if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
         let mut sa = KernelSigaction::default();
         if read_user_into(&mut sa, act_ptr as u64).is_err() {
             return EFAULT;

@@ -1350,7 +1350,7 @@ pub(super) fn sys_sysinfo(info_ptr: UserAddr) -> u64 {
     // `akuma_syscalls_linux::Sysinfo`'s now, asserted there. Every field the
     // old code left at zero still is — `Default` zeroes the struct exactly as
     // the array did.
-    if !validate_user_ptr((info_ptr as u64), core::mem::size_of::<Sysinfo>()) { return EFAULT; }
+    if !validate_user_ptr(info_ptr as u64, core::mem::size_of::<Sysinfo>()) { return EFAULT; }
     let info = Sysinfo {
         uptime: (akuma_primitives::clock::uptime_us() / 1_000_000).cast_signed(),
         totalram: akuma_exec::pmm::total_count() as u64 * 4096,
