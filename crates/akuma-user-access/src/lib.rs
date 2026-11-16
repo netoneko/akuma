@@ -514,6 +514,8 @@ pub fn seal_bypass() {
 #[must_use]
 pub struct BypassValidationGuard {
     prev: bool,
+    /// Restores *this* core's/thread's state on drop, so it must drop where it was made: `!Send`.
+    _not_send: core::marker::PhantomData<*mut ()>,
 }
 
 impl BypassValidationGuard {
@@ -521,7 +523,7 @@ impl BypassValidationGuard {
     pub fn new() -> Self {
         let prev = BYPASS_VALIDATION.load(Ordering::Acquire);
         BYPASS_VALIDATION.store(true, Ordering::Release);
-        Self { prev }
+        Self { prev, _not_send: core::marker::PhantomData }
     }
 }
 

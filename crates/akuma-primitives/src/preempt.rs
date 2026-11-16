@@ -397,6 +397,8 @@ pub struct PreemptGuard {
     /// Saved DAIF to restore on drop (see type doc).
     #[cfg(kernel_bkl_smp)]
     saved_daif: u64,
+    /// Restores *this* core's/thread's state on drop, so it must drop where it was made: `!Send`.
+    _not_send: core::marker::PhantomData<*mut ()>,
 }
 
 impl PreemptGuard {
@@ -411,10 +413,10 @@ impl PreemptGuard {
             disable_preemption();
             // Mask IRQs AFTER disabling preemption so drop's reverse order
             // re-enables preemption only once IRQs are live again.
-            Self { active: true, saved_daif: crate::irq::irq_save_mask() }
+            Self { active: true, saved_daif: crate::irq::irq_save_mask(), _not_send: core::marker::PhantomData }
         }
         #[cfg(not(kernel_bkl_smp))]
-        Self {}
+        Self { _not_send: core::marker::PhantomData }
     }
 }
 

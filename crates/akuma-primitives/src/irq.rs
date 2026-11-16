@@ -170,6 +170,8 @@ pub const DAIF_I_MASKED: u64 = 0x80;
 pub struct IrqGuard {
     #[cfg(target_os = "none")]
     saved_daif: u64,
+    /// Restores *this* core's/thread's state on drop, so it must drop where it was made: `!Send`.
+    _not_send: core::marker::PhantomData<*mut ()>,
 }
 
 impl IrqGuard {
@@ -181,10 +183,10 @@ impl IrqGuard {
         {
             let saved_daif = irq_save_mask();
             akuma_cpu::barrier::isb();
-            Self { saved_daif }
+            Self { saved_daif, _not_send: core::marker::PhantomData }
         }
         #[cfg(not(target_os = "none"))]
-        Self {}
+        Self { _not_send: core::marker::PhantomData }
     }
 }
 
