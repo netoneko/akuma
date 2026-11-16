@@ -6533,6 +6533,9 @@ fn test_process_memory_isolated_except_cow() {
     drop(a);
     drop(b);
 
+    // One line per distinct failure, not one per frame.
+    fails.sort_unstable();
+    fails.dedup();
     if fails.is_empty() {
         console::print("[Test] process_memory_isolated_except_cow PASSED\n");
     } else {
