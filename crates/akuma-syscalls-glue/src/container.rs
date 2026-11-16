@@ -1,6 +1,8 @@
 use super::*;
 
 pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
+    // Both lengths size a kernel buffer below.
+    if name_len > 256 || root_len > 4096 { return EINVAL; }
     if !validate_user_ptr(name_ptr, name_len) { return EFAULT; }
     if !validate_user_ptr(root_ptr, root_len) { return EFAULT; }
 
@@ -159,7 +161,9 @@ pub(super) fn sys_reattach(pid: u32, force: u32) -> u64 {
 /// exist — they are process/network grouping — but nested OCI images do not.
 #[cfg(feature = "sc-containers")]
 fn caller_may_mount() -> bool {
-    akuma_exec::process::current_process_shared().is_none_or(|p| p.box_id == 0)
+    // Host box and uid 0: a host process that dropped privileges cannot
+    // rearrange the mount table either.
+    akuma_exec::process::caller_is_host_root()
 }
 
 /// Map a mount-table error to its Linux errno. The arms used to fold
@@ -343,12 +347,11 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
 }
 
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize, data_ptr: u64) -> SysResult {
-    let caller_box = akuma_exec::process::current_process_shared()
-        .map_or(0, |p| p.box_id);
-    if caller_box != 0 {
+    if !akuma_exec::process::caller_is_host_root() {
         return Err(EPERM);
     }
 
+    if target_len > 4096 || fstype_len > 64 { return Err(EINVAL); }
     if !validate_user_ptr(target_ptr, target_len) { return Err(EFAULT); }
     if !validate_user_ptr(fstype_ptr, fstype_len) { return Err(EFAULT); }
 

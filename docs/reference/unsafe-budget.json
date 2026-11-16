@@ -112,7 +112,7 @@
     "crates/akuma-alloc": 21,
     "crates/akuma-boot-aarch64": 6,
     "crates/akuma-boot-amd64": 14,
-    "crates/akuma-cpu": 76,
+    "crates/akuma-cpu": 78,
     "crates/akuma-dma": 14,
     "crates/akuma-el0-entry": 4,
     "crates/akuma-entry": 10,

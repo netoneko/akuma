@@ -635,6 +635,63 @@ pub mod rng {
         #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
         None
     }
+
+    /// Whether this AArch64 core implements `RNDR` (`FEAT_RNG`, ARMv8.5):
+    /// `ID_AA64ISAR0_EL1.RNDR`, bits 63:60, non-zero. `false` everywhere else.
+    #[must_use]
+    pub fn has_rndr() -> bool {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            let isar0: u64;
+            // SAFETY: a read of a read-only identification register: no memory
+            // access, no side effect, readable at EL1 on every ARMv8 core.
+            unsafe {
+                core::arch::asm!(
+                    "mrs {}, id_aa64isar0_el1",
+                    out(reg) isar0,
+                    options(nomem, nostack, preserves_flags),
+                );
+            }
+            isar0 >> 60 != 0
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        false
+    }
+
+    /// One word from `RNDR`, or `None` without the feature or out of entropy.
+    ///
+    /// Ten retries. The AArch64 counterpart of [`rdrand`], and the only
+    /// entropy source on a machine with no virtio-rng (an EC2 Graviton).
+    #[must_use]
+    pub fn rndr() -> Option<u64> {
+        #[cfg(all(target_os = "none", target_arch = "aarch64"))]
+        {
+            if !has_rndr() {
+                return None;
+            }
+            for _ in 0..10 {
+                let value: u64;
+                let ok: u64;
+                // SAFETY: `RNDR` (`s3_3_c2_c4_0`) writes a general register and
+                // NZCV (`Z` set means failure); it reads no memory and is
+                // undefined only on a core without `FEAT_RNG`, which the check
+                // above excludes. `preserves_flags` is omitted on purpose.
+                unsafe {
+                    core::arch::asm!(
+                        "mrs {v}, s3_3_c2_c4_0", "cset {ok}, ne",
+                        v = out(reg) value, ok = out(reg) ok,
+                        options(nomem, nostack),
+                    );
+                }
+                if ok != 0 {
+                    return Some(value);
+                }
+            }
+            None
+        }
+        #[cfg(not(all(target_os = "none", target_arch = "aarch64")))]
+        None
+    }
 }
 
 /// x86_64 `RFLAGS.AC` housekeeping for SMAP: `clac`, the half that is safe.

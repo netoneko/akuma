@@ -540,6 +540,8 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
         None => return EBADF,
     };
 
+    // Input events are a few bytes each; a short read is the normal case.
+    let buf_len = buf_len.min(4096);
     let mut kernel_buf = alloc::vec![0u8; buf_len];
     let bytes_read;
 

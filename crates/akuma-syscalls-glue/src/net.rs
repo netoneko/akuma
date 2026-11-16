@@ -1433,9 +1433,16 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
             _ => return EBADF,
         }
     };
-    let total_len: usize = iovs.iter().map(|v| v.iov_len).sum();
+    // Checked, and bounded: the sum of caller-chosen lengths wrapped silently
+    // (release builds do not check overflow) and then sized a kernel buffer.
+    let Some(total_len) = iovs.iter().try_fold(0usize, |acc, v| acc.checked_add(v.iov_len)) else {
+        return EMSGSIZE;
+    };
     if total_len == 0 { return 0; }
-    let mut buf = alloc::vec![0u8; total_len];
+    if total_len > (1 << 20) { return EMSGSIZE; }
+    let mut buf = alloc::vec::Vec::new();
+    if buf.try_reserve_exact(total_len).is_err() { return ENOMEM; }
+    buf.resize(total_len, 0u8);
     let mut off = 0usize;
     for iov in &iovs {
         let len = iov.iov_len;
@@ -1765,6 +1772,8 @@ pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
 #[cfg(all(feature = "smoltcp", feature = "akuma-native"))]
 pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
     let _net_bkl = NetBklGuard::new();
+    // A host name is at most 253 bytes; the length sizes a kernel buffer.
+    if path_len > 255 { return EINVAL; }
     if !validate_user_ptr(path_ptr, path_len) { return EFAULT; }
     let mut kernel_path = alloc::vec![0u8; path_len];
     if copy_from_user(&mut kernel_path, path_ptr).is_err() {

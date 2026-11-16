@@ -532,7 +532,21 @@ pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
         // otherwise answer `EFAULT` for a path in an image's `.rodata`. A page
         // that cannot be filled is left to the byte read to refuse.
         if (len == 0 || addr.trailing_zeros() >= 12) && !BYPASS_VALIDATION.load(Ordering::Acquire) {
-            let _ = validate_user_ptr(addr, 1);
+            let page_ok = validate_user_ptr(addr, 1);
+            // On AArch64 the answer is binding. The kernel's own RAM is mapped
+            // below `USER_VA_LIMIT` in every address space as EL1-only blocks,
+            // and the byte read below runs at EL1: it does not fault on them. A
+            // discarded `false` here let any path argument name a kernel address
+            // (`symlinkat(<kernel va>, ..)` then `readlink` read it back). The
+            // validator's walk tests EL0 access, so `false` is `EFAULT`.
+            //
+            // x86_64 keeps the old shape: its kernel half is above the limit
+            // checked at the top of the loop, SMAP faults a ring-0 read of a
+            // supervisor page into the fixup, and its lazy pages are filled by
+            // the fault the byte read takes, which this walk does not model.
+            if cfg!(target_arch = "aarch64") && !page_ok {
+                return Err(EFAULT);
+            }
         }
         let c = copy_from_user_byte(addr)?;
         if c == 0 { break; }
@@ -1064,7 +1078,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MSGSND => msgqueue::sys_msgsnd(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
         nr::SCHED_GETAFFINITY => {
             let mask_ptr = args[2] as usize;
-            let cpusetsize = args[1] as usize;
+            // glibc asks with up to 128 bytes and grows on `EINVAL`; nothing needs
+            // more than a page, and the size is a kernel allocation.
+            let cpusetsize = (args[1] as usize).min(4096);
             if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr(mask_ptr as u64, cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
                 // CPUs the process may run on: the kernel's `probed_core_count`

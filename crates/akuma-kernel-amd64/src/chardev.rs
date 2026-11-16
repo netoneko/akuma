@@ -27,6 +27,24 @@ pub fn register() {
 
 /// `open` of a resolved path: this kernel's device nodes, or `None`.
 fn open(path: &str, flags: u32) -> Option<u64> {
+    // Who may have a hardware node. These are the machine's devices, so:
+    //
+    // * a boxed process has none of them. `None` rather than an errno, so the
+    //   path resolves in the box's own filesystem like any other name;
+    // * the nodes that *control* the machine (the hypervisor, power, the radio,
+    //   a tap into the hypervisor's network) are the host root's, `EACCES` to
+    //   any other uid. The screen and the pointer stay open to host users.
+    //
+    // There was no check here at all (`SECURITY_AUDIT_2026_11_16.md` H2).
+    let control = matches!(path, "/dev/wifi0" | "/dev/power" | "/dev/kvm0" | "/dev/kvm" | "/dev/net/tun");
+    if control || matches!(path, "/dev/fb0" | "/dev/input/mouse0") {
+        if akuma_exec::process::current_process_shared().is_some_and(|p| p.box_id != 0) {
+            return None;
+        }
+        if control && !akuma_exec::process::caller_is_host_root() {
+            return Some(errno::EACCES);
+        }
+    }
     Some(match path {
         // The screen's owner is decided here (`fbdev::open`, `EBUSY` for a
         // second process). A machine with no boot framebuffer has no node.

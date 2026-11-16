@@ -315,6 +315,48 @@ fn dev_urandom_fill(buf: &mut [u8]) -> bool {
     }
 }
 
+/// The largest kernel buffer one `read`/`write`-family call bounces through.
+///
+/// A count above it is served short (pipes, ttys, sockets: a short read is
+/// what they do anyway) or in chunks (files, `/dev/zero`, `/dev/urandom`).
+const USER_BOUNCE_MAX: usize = 64 * 1024;
+
+/// A zeroed kernel buffer of exactly `len` bytes, or `None` if the heap cannot
+/// supply it.
+///
+/// **Never `alloc::vec![0u8; n]` with a length userspace chose.** That
+/// allocation is infallible: a failure is `handle_alloc_error`, which under
+/// `panic = "abort"` halts the kernel, and above `isize::MAX` it is a
+/// "capacity overflow" panic before the allocator is even asked. Either way
+/// one unprivileged `read(fd, buf, huge)` took the machine down. The caller
+/// caps `len` first (`USER_BOUNCE_MAX`) and answers `ENOMEM` on `None`.
+/// `net::alloc_net_bounce` is the same rule with a one-page fallback.
+fn user_bounce(len: usize) -> Option<Vec<u8>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(len).ok()?;
+    v.resize(len, 0);
+    Some(v)
+}
+
+/// Fill `count` bytes at `buf_ptr` from `source`, one page at a time, and
+/// return `count`: `/dev/zero` and `/dev/urandom`, which answer in full however
+/// much is asked (`dd bs=1M` depends on it) without a kernel buffer that size.
+fn fill_user(buf_ptr: u64, count: usize, mut source: impl FnMut(&mut [u8]) -> bool) -> u64 {
+    let Some(mut page) = user_bounce(count.min(4096)) else { return ENOMEM };
+    let mut done = 0usize;
+    while done < count {
+        let n = (count - done).min(page.len());
+        if !source(&mut page[..n]) {
+            return if done > 0 { done as u64 } else { EIO };
+        }
+        if copy_to_user(buf_ptr + done as u64, &page[..n]).is_err() {
+            return if done > 0 { done as u64 } else { EFAULT };
+        }
+        done += n;
+    }
+    count as u64
+}
+
 pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // Per-stage fixed-cost attribution (`read-profile`; ZST otherwise). Created
     // before the first line of real work and committed only on the `File` arm —
@@ -388,7 +430,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::Stdin
         | akuma_exec::process::FileDescriptor::DevTty => {
             if akuma_exec::process::current_channel().is_none() {
-                let mut temp = alloc::vec![0u8; count];
+                let count = count.min(USER_BOUNCE_MAX);
+                let Some(mut temp) = user_bounce(count) else { return ENOMEM };
                 let Some(proc) = akuma_exec::process::current_process_shared() else { return EBADF };
                 let n = proc.read_stdin(&mut temp);
                 if n > 0
@@ -401,7 +444,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 return n as u64;
             }
 
-            let mut kernel_buf = alloc::vec![0u8; count];
+            let count = count.min(USER_BOUNCE_MAX);
+            let Some(mut kernel_buf) = user_bounce(count) else { return ENOMEM };
             // The `VTIME` timer of a non-canonical `VMIN == 0` read, armed on
             // the first pass that finds nothing.
             let mut vtime_deadline: Option<u64> = None;
@@ -752,7 +796,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         }
         akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
             if let Some(ch) = akuma_exec::process::get_child_channel(child_pid) {
-                let mut temp = alloc::vec![0u8; count];
+                let count = count.min(USER_BOUNCE_MAX);
+                let Some(mut temp) = user_bounce(count) else { return ENOMEM };
                 let nonblock = super::net::fd_is_nonblock(fd_num as u32);
                 loop {
                     let n = ch.read(&mut temp);
@@ -781,7 +826,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         // PipeRead: forktest_parent drains child stdout; correlate **`[pipe-read]`** / EFAULT with
         // **`[sigsegv-syscall] x8=63`** (`read`) — **`GO_FORKTEST_DEBUG.md`** Pattern 2.
         akuma_exec::process::FileDescriptor::PipeRead(pipe_id) => {
-            let mut temp = alloc::vec![0u8; count];
+            let count = count.min(USER_BOUNCE_MAX);
+            let Some(mut temp) = user_bounce(count) else { return ENOMEM };
             if akuma_config::SYSCALL_DEBUG_PIPE_READ {
                 use core::sync::atomic::{AtomicU64, Ordering};
                 static PIPE_READ_TRACE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -863,7 +909,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             if count == 0 {
                 return 0; // recv with no buffer would consume a whole record
             }
-            let mut temp = alloc::vec![0u8; count];
+            let count = count.min(1 << 20);
+            let Some(mut temp) = user_bounce(count) else { return ENOMEM };
             let (n, _truncated) = super::unixsock::unix_recv(fd_num as u32, &mut temp, false, false);
             if (n as i64) > 0 && copy_to_user(buf_ptr, &temp[..n as usize]).is_err() {
                 return EFAULT;
@@ -873,7 +920,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         // A pre-table pipe pair (`sock == 0`): raw bytes from the `rx` pipe.
         akuma_exec::process::FileDescriptor::UnixSocket { rx, .. } => {
             let nonblock = super::net::fd_is_nonblock(fd_num as u32);
-            let mut temp = alloc::vec![0u8; count];
+            let count = count.min(USER_BOUNCE_MAX);
+            let Some(mut temp) = user_bounce(count) else { return ENOMEM };
             loop {
                 let (n, eof) = super::pipe::pipe_read(rx, &mut temp);
                 if n > 0 {
@@ -927,23 +975,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevZero => {
             // /dev/zero: fill the user buffer with zero bytes and return count.
-            let temp = alloc::vec![0u8; count];
-            if copy_to_user(buf_ptr, &temp).is_err() {
-                return EFAULT;
-            }
-            count as u64
+            fill_user(buf_ptr, count, |_| true)
         }
         akuma_exec::process::FileDescriptor::DevUrandom => {
-            let mut temp = alloc::vec![0u8; count];
             let _drv_bkl = DriverBklGuard::new();
-            if dev_urandom_fill(&mut temp) {
-                if copy_to_user(buf_ptr, &temp).is_err() {
-                    return EFAULT;
-                }
-                count as u64
-            } else {
-                EIO
-            }
+            fill_user(buf_ptr, count, dev_urandom_fill)
         }
         #[cfg(feature = "rump")]
         akuma_exec::process::FileDescriptor::Tap { nonblock } => {
@@ -952,7 +988,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // frame arrives — so the rump virtif RX thread does a plain blocking
             // read() with no busy-wait. Akuma's net is poll-based (no RX IRQ), so
             // this mirrors how socket recv blocks (akuma-net wait_until).
-            let mut temp = alloc::vec![0u8; count];
+            let count = count.min(USER_BOUNCE_MAX);
+            let Some(mut temp) = user_bounce(count) else { return ENOMEM };
             let got = if nonblock {
                 akuma_net::rump_tap::read_frame(&mut temp)
             } else {
@@ -1049,23 +1086,11 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevZero => {
-            let temp = alloc::vec![0u8; count];
-            if copy_to_user(buf_ptr, &temp).is_err() {
-                return EFAULT;
-            }
-            count as u64
+            fill_user(buf_ptr, count, |_| true)
         }
         akuma_exec::process::FileDescriptor::DevUrandom => {
-            let mut temp = alloc::vec![0u8; count];
             let _drv_bkl = DriverBklGuard::new();
-            if dev_urandom_fill(&mut temp) {
-                if copy_to_user(buf_ptr, &temp).is_err() {
-                    return EFAULT;
-                }
-                count as u64
-            } else {
-                EIO
-            }
+            fill_user(buf_ptr, count, dev_urandom_fill)
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
@@ -1124,16 +1149,25 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
     match fd {
         akuma_exec::process::FileDescriptor::File(ref f) => {
             let _vfs_bkl = VfsBklGuard::new();
-            let mut buf = alloc::vec![0u8; count];
-            if copy_from_user(&mut buf, buf_ptr).is_err() {
-                return EFAULT;
+            // 64 KiB at a time: `count` is the caller's number, and one kernel
+            // buffer of that size is an allocation the kernel cannot survive failing.
+            let mut done = 0usize;
+            while done < count {
+                let Some(mut buf) = user_bounce((count - done).min(USER_BOUNCE_MAX)) else {
+                    return if done > 0 { done as u64 } else { ENOMEM };
+                };
+                if copy_from_user(&mut buf, buf_ptr + done as u64).is_err() {
+                    return if done > 0 { done as u64 } else { EFAULT };
+                }
+                // By inode, like `sys_pread64`: a file unlinked after `open` has no
+                // path to write through.
+                match akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, f.mount_id(), f.inode(), offset as usize + done, &buf) {
+                    Ok(0) => break,
+                    Ok(n) => done += n,
+                    Err(e) => return if done > 0 { done as u64 } else { fs_error_to_errno(e) },
+                }
             }
-            // By inode, like `sys_pread64`: a file unlinked after `open` has no
-            // path to write through.
-            match akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, f.mount_id(), f.inode(), offset as usize, &buf) {
-                Ok(n) => n as u64,
-                Err(e) => fs_error_to_errno(e)
-            }
+            done as u64
         }
         akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevUrandom | akuma_exec::process::FileDescriptor::DevZero => count as u64,
         // At `offset`, position untouched; at most 64 KiB, a short write like `read`'s.
@@ -2336,6 +2370,11 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     if let Some(node) = akuma_vfs_glue::dev_node(&path)
         && node.is_block
     {
+        // A raw device read sees every file on the disk whatever its mode bits,
+        // so it is uid 0's alone (Linux: the node is `0660 root:disk`).
+        if !akuma_exec::process::caller_is_host_root() {
+            return Err(EACCES);
+        }
         let Some(idx) = akuma_virtio::block::device_index_by_name(node.name) else {
             return Err(ENODEV);
         };
@@ -3989,7 +4028,8 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
             None
         };
 
-    let mut kernel_buf = alloc::vec![0u8; size];
+    let size = size.min(USER_BOUNCE_MAX);
+    let Some(mut kernel_buf) = user_bounce(size) else { return ENOMEM };
     // One in-place pass over the live fd entry: store the first-call snapshot
     // (moved — no clone), fill records from the stored snapshot by borrow, and
     // advance the cursor. The record layout — offsets, the 8-byte `d_reclen`

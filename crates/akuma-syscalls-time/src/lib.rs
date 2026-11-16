@@ -50,7 +50,7 @@ pub use akuma_sntp::{boot, sntp};
 use akuma_primitives::clock::{realtime_us, set_utc_time_us, uptime_us, utc_time_us};
 use akuma_exec::process::user_access::{read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;
-use akuma_primitives::errno::negated::{EFAULT, EINVAL};
+use akuma_primitives::errno::negated::{EFAULT, EINVAL, EPERM};
 // The four `Local*` ABI structs this module used to declare — `LocalTimespec`,
 // `LocalTimeval`, `LocalItimerval`, `LocalTimex` — moved to
 // `akuma-syscalls-linux` on 2026-08-27. The `Local` in their names was the
@@ -366,6 +366,11 @@ pub fn sys_clock_settime(clock_id: u32, tp_ptr: u64) -> u64 {
     if clock_id != CLOCK_REALTIME {
         return EINVAL;
     }
+    // The wall clock is one per machine: every box, every certificate check and
+    // every timestamp reads it. Linux asks for `CAP_SYS_TIME`.
+    if !akuma_exec::process::caller_is_host_root() {
+        return EPERM;
+    }
     let mut ts = Timespec::default();
     if read_user_into(&mut ts, tp_ptr).is_err() {
         return EFAULT;
@@ -407,6 +412,11 @@ pub fn sys_clock_adjtime(clock_id: u32, buf_ptr: u64) -> u64 {
     }
 
     let nano = tx.modes & ADJ_NANO != 0;
+    // Reading the clock state (`modes == 0`, what `ntpd -q` and `adjtimex -p`
+    // do) is open to everyone; stepping the clock is the host root's.
+    if tx.modes & (ADJ_SETOFFSET | ADJ_OFFSET) != 0 && !akuma_exec::process::caller_is_host_root() {
+        return EPERM;
+    }
     if tx.modes & ADJ_SETOFFSET != 0 {
         // `time` holds a delta to add to the current time, applied immediately.
         let delta_us = if nano {

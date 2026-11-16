@@ -1504,6 +1504,11 @@ pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
     len as u64
 }
 
+/// The most initial stdin a `spawn` may hand its child. The bytes are copied
+/// into a kernel buffer sized by the caller's length, so it has a ceiling.
+#[cfg(feature = "exec")]
+const SPAWN_STDIN_MAX: usize = 1 << 20;
+
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct SpawnOptions {
@@ -1666,6 +1671,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     // the list where it stood.
     let req = super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
     let stdin_data = if stdin_ptr != 0 {
+        if stdin_len > SPAWN_STDIN_MAX { return Err(E2BIG); }
         if !BYPASS_VALIDATION.load(Ordering::Acquire)
             && !validate_user_ptr(stdin_ptr, stdin_len) { return Err(EFAULT); }
         let mut data = alloc::vec![0u8; stdin_len];
@@ -1780,6 +1786,10 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     }
 
     let cwd = if o.cwd_ptr != 0 {
+        // Both lengths below come from the caller's `SpawnOptions` and size a
+        // kernel buffer; unbounded, `cwd_len = usize::MAX` was a capacity-overflow
+        // panic, which halts the kernel.
+        if o.cwd_len > 4096 { return Err(EINVAL); }
         let mut kernel_cwd = alloc::vec![0u8; o.cwd_len];
         if copy_from_user(&mut kernel_cwd, o.cwd_ptr).is_err() {
             return Err(EFAULT);
@@ -1801,6 +1811,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
     let stdin_data = if o.stdin_ptr != 0 {
+        if o.stdin_len > SPAWN_STDIN_MAX { return Err(E2BIG); }
         let mut data = alloc::vec![0u8; o.stdin_len];
         if copy_from_user(&mut data, o.stdin_ptr).is_err() {
             return Err(EFAULT);
