@@ -7354,12 +7354,12 @@ fn test_copy_from_user_str_fault() -> bool {
     let res = crate::syscall::copy_from_user_str(invalid_addr, 1024);
     
     let ok = match res {
-        Err(e) if e == 14 || e == 18446744073709551602 => {
+        Err(e) if e == akuma_primitives::errno::Errno::EFAULT => {
             console::print("  OK: copy_from_user_str returned EFAULT for invalid addr\n");
             true
         }
         Err(e) => {
-            crate::safe_print!(128, "  FAILED: expected EFAULT (14 or -14), got {}\n", e);
+            crate::safe_print!(128, "  FAILED: expected EFAULT (14), got {}\n", e.code());
             false
         }
         Ok(s) => {

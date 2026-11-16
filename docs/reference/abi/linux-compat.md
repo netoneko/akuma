@@ -37,36 +37,21 @@ Linux). The central helper is `neg_errno(i32) -> u64` (`src/syscall/mod.rs`).
 - `ENOSYS` (-38) is returned for every undispatched number — decode the log
   line against the asm-generic table.
 
-### Two `Result<_, u64>` families, opposite signs
+### One error type: `Errno`
 
-**The sign is not uniform across the crate boundary, and getting it wrong is
-silent.** Two families of fallible helper meet in `src/syscall/`:
-
-| helper | lives in | `Err` carries |
-|---|---|---|
-| `copy_from_user_str` | `akuma-syscalls-glue` | **negated** (`-14`) |
-| `copy_from_user`, `copy_to_user`, `read_user_into`, `write_user_val`, … | `akuma_exec::mmu::user_access` | **positive** (`14`) |
-
-The second is deliberate and documented at its definition — *"`x0 = -errno`
-happens at the syscall boundary, not here"* — because that crate is used off the
-syscall path too.
-
-Since 2026-08-28 a syscall arm may return `syscall::SysResult`
-(`Result<u64, u64>`, `Err` = negated) and use `?`. That makes the mismatch
-reachable: `read_user_into(&mut v, p)?` compiles and returns `Err(14)`, which
-userspace decodes as **a syscall that succeeded and returned 14** — a wrong
-answer, not a fault. Every call site instead spells it:
+Every fallible helper a syscall arm calls (`copy_from_user_str`, `copy_from_user`, `read_user_into`, `write_user_val`,
+`fs_error_to_errno`, the `perm::check*` family, …) returns `Result<_, akuma_primitives::errno::Errno>`, and a
+`SysResult` is `Result<u64, Errno>`. So `?` composes across all of them and is correct by construction:
 
 ```rust
-if read_user_into(&mut v, p).is_err() {
-    return Err(EFAULT);          // this module's EFAULT: negated
-}
+read_user_into(&mut v, p)?;      // Err(Errno::EFAULT) on a bad pointer
 ```
 
-`scripts/check_errno_sign.py` (pre-commit) fails the build on the `?` form.
-Audited 2026-08-28: zero violations at the time `SysResult` was introduced. The
-`flat` helper in `src/syscall/mod.rs` carries the same explanation next to the
-code.
+`Errno` has no conversion to `u64`; the one place it becomes the ABI's `x0` (`-errno`) is `Errno::ret()`, which
+`flat()` calls. Before 2026-11-16 the user-copy helpers carried a *positive* `u64` and `SysResult` a *negated* one, so the
+same `?` compiled and returned `Err(14)`, which userspace decodes as a successful call returning 14; a pre-commit script
+(`check_errno_sign.py`) was the guard, and it is deleted with the trap. A plain `-> u64` arm still returns the negated
+constants (`EINVAL`, ...); `Errno::from_negated` / `akuma_syscalls_glue::errno_of` decode one back.
 
 ## Pointer validation
 

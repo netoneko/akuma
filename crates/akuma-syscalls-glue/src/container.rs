@@ -164,14 +164,14 @@ fn mount_permit() -> Option<akuma_primitives::HostRoot> {
 /// everything into `EINVAL`, which made `mount` report nonsense for the two
 /// cases scripts actually branch on: table full (`ENOMEM`) and target already
 /// mounted (`EBUSY`) — `docs/archive/MOUNT_MISSING_SYSCALLS.md` §3.11.
-fn mount_errno(e: akuma_vfs_glue::FsError) -> u64 {
+fn mount_errno(e: akuma_vfs_glue::FsError) -> Errno {
     match e {
-        akuma_vfs_glue::FsError::NoSpace => ENOMEM,
-        akuma_vfs_glue::FsError::AlreadyExists => EBUSY,
-        akuma_vfs_glue::FsError::NotFound => ENOENT,
-        akuma_vfs_glue::FsError::NotADirectory => ENOTDIR,
-        akuma_vfs_glue::FsError::ReadOnly => EROFS,
-        _ => EINVAL,
+        akuma_vfs_glue::FsError::NoSpace => Errno::ENOMEM,
+        akuma_vfs_glue::FsError::AlreadyExists => Errno::EBUSY,
+        akuma_vfs_glue::FsError::NotFound => Errno::ENOENT,
+        akuma_vfs_glue::FsError::NotADirectory => Errno::ENOTDIR,
+        akuma_vfs_glue::FsError::ReadOnly => Errno::EROFS,
+        _ => Errno::EINVAL,
     }
 }
 
@@ -186,7 +186,7 @@ pub(super) fn sys_mount(
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
         }
-        return Err(EPERM);
+        return Err(Errno::EPERM);
     };
 
     let target = copy_from_user_str(target_ptr, 256)?;
@@ -217,7 +217,7 @@ pub(super) fn sys_mount(
     // bypass this arm entirely, so this never gates `/` or `/proc` at boot.
     match akuma_vfs_glue::metadata(&target) {
         Ok(m) if m.is_dir => {}
-        Ok(_) => return Err(ENOTDIR),
+        Ok(_) => return Err(Errno::ENOTDIR),
         Err(e) => return Err(mount_errno(e)),
     }
 
@@ -232,7 +232,7 @@ pub(super) fn sys_mount(
                 if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                     akuma_primitives::safe_print!(128, "[mount] no such device: {}\n", source);
                 }
-                return Err(ENODEV);
+                return Err(Errno::ENODEV);
             };
             // Runtime data disks get a small, fixed cache budget: the global
             // cap belongs to the root filesystem, and the cache never shrinks
@@ -240,14 +240,14 @@ pub(super) fn sys_mount(
             const DATA_DISK_CACHE_BYTES: usize = 16 * 1024 * 1024;
             match akuma_vfs_glue::ext2::mount_device(idx, Some(DATA_DISK_CACHE_BYTES)) {
                 Ok(fs) => fs,
-                Err(_) => return Err(ENODEV), // no ext2 magic on that device
+                Err(_) => return Err(Errno::ENODEV), // no ext2 magic on that device
             }
         }
         _ => {
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[mount] unsupported fstype: {}\n", fstype);
             }
-            return Err(ENODEV);
+            return Err(Errno::ENODEV);
         }
     };
 
@@ -279,12 +279,12 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
         }
-        return Err(EPERM);
+        return Err(Errno::EPERM);
     };
     let target = copy_from_user_str(target_ptr, 256)?;
     let target = akuma_vfs_glue::canonicalize_path(&target);
     if target == "/" {
-        return Err(EBUSY);
+        return Err(Errno::EBUSY);
     }
     match akuma_vfs_glue::unmount(root, &target) {
         Ok(()) => Ok(0),
@@ -300,11 +300,11 @@ pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
 /// silently produced an empty layer would surface much later as a missing file
 /// inside the container, with nothing pointing back here.
 #[cfg(feature = "sc-containers")]
-fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem>, u64> {
+fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem>, Errno> {
     use akuma_isolation::overlay_fs::{OverlayFs, parse_options};
 
     if data_ptr == 0 {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     let data = copy_from_user_str(data_ptr, 4096)?;
 
@@ -312,10 +312,10 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(192, "[mount] overlay options rejected: {}\n", reason);
         }
-        EINVAL
+        Errno::EINVAL
     })?;
 
-    let root_fs = akuma_vfs_glue::get_root_fs().ok_or(ENODEV)?;
+    let root_fs = akuma_vfs_glue::get_root_fs().ok_or(Errno::ENODEV)?;
 
     let mut dirs = alloc::vec::Vec::with_capacity(opts.lowerdirs.len() + 1);
     dirs.push(akuma_vfs_glue::canonicalize_path(&opts.upperdir));
@@ -329,7 +329,7 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(192, "[mount] overlay layer missing: {}\n", dir);
             }
-            return Err(ENOENT);
+            return Err(Errno::ENOENT);
         }
         layers.push(alloc::sync::Arc::new(
             akuma_isolation::subdir_fs::SubdirFs::new(root_fs.clone(), dir),
@@ -342,15 +342,15 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
 
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize, data_ptr: u64) -> SysResult {
     let Some(root) = akuma_exec::process::host_root() else {
-        return Err(EPERM);
+        return Err(Errno::EPERM);
     };
 
-    if target_len > 4096 || fstype_len > 64 { return Err(EINVAL); }
-    if !validate_user_ptr(target_ptr, target_len) { return Err(EFAULT); }
-    if !validate_user_ptr(fstype_ptr, fstype_len) { return Err(EFAULT); }
+    if target_len > 4096 || fstype_len > 64 { return Err(Errno::EINVAL); }
+    if !validate_user_ptr(target_ptr, target_len) { return Err(Errno::EFAULT); }
+    if !validate_user_ptr(fstype_ptr, fstype_len) { return Err(Errno::EFAULT); }
 
-    let Ok(target_buf) = read_user_vec(target_ptr, target_len, 4096) else { return Err(EFAULT) };
-    let Ok(fstype_buf) = read_user_vec(fstype_ptr, fstype_len, 64) else { return Err(EFAULT) };
+    let Ok(target_buf) = read_user_vec(target_ptr, target_len, 4096) else { return Err(Errno::EFAULT) };
+    let Ok(fstype_buf) = read_user_vec(fstype_ptr, fstype_len, 64) else { return Err(Errno::EFAULT) };
 
     // Same reason as sys_mount: mount points are matched literally.
     let target = akuma_vfs_glue::canonicalize_path(core::str::from_utf8(&target_buf).unwrap_or(""));
@@ -360,7 +360,7 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         "proc" => alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
         "overlay" => build_overlay(data_ptr)?,
-        _ => return Err(ENODEV),
+        _ => return Err(Errno::ENODEV),
     };
 
     // A box's namespace already has its `SubdirFs` jail at "/", and an overlay
@@ -380,11 +380,11 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(160, "[mount] refusing to re-root live box {}\n", box_id);
             }
-            return Err(EPERM);
+            return Err(Errno::EPERM);
         }
         return match akuma_vfs_glue::replace_box_root(box_id, fs) {
             Ok(()) => Ok(0),
-            Err(akuma_vfs_glue::FsError::PermissionDenied) => Err(EPERM),
+            Err(akuma_vfs_glue::FsError::PermissionDenied) => Err(Errno::EPERM),
             Err(e) => {
                 // Worth naming rather than folding silently into `EINVAL`:
                 // `FsError::NotFound` here means `register_box` never actually
@@ -396,13 +396,13 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
                 if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                     akuma_primitives::safe_print!(128, "[mount] replace_box_root box={} err={:?}\n", box_id, e);
                 }
-                Err(EINVAL)
+                Err(Errno::EINVAL)
             }
         };
     }
 
     match akuma_vfs_glue::mount_in_namespace(root, box_id, &target, fs) {
         Ok(()) => Ok(0),
-        Err(_) => Err(EINVAL),
+        Err(_) => Err(Errno::EINVAL),
     }
 }

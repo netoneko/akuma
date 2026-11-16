@@ -361,15 +361,15 @@ fn futex_check_and_enqueue(
     uaddr: usize,
     val: u32,
     first: bool,
-) -> Result<(), u64> {
+) -> Result<(), Errno> {
     let r = akuma_primitives::irq::with_irqs_disabled(|| {
         let mut waiters = FUTEX_WAITERS.lock();
         let mut current_val: u32 = 0;
         if read_user_into_with(&mut current_val, uaddr as u64, Prefault::No).is_err() {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         if current_val != val {
-            return Err(EAGAIN);
+            return Err(Errno::EAGAIN);
         }
         // `tid` is the enqueuing thread itself, so its handle is live by definition.
         waiters.enqueue(key, QueuedWaiter(akuma_exec::threading::wake_handle_for_thread(tid)), bitset);
@@ -675,7 +675,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
 
             if let Err(errno) = futex_check_and_enqueue(key, tid, waiter_bitset, uaddr, val, true) {
                 fe(tid, FE_RET, uaddr);
-                return errno;
+                return errno.ret();
             }
 
             let deadline = if timeout_ptr != 0 {
@@ -823,7 +823,7 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: u64, uaddr
                             futex_check_and_enqueue(key, tid, waiter_bitset, uaddr, val, false)
                         {
                             fe(tid, FE_RET, uaddr);
-                            return errno;
+                            return errno.ret();
                         }
                     }
                     // Moved by FUTEX_REQUEUE onto the target queue and correctly

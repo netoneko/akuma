@@ -186,7 +186,7 @@ pub fn pipe_poller_count(id: u32) -> usize {
 
 /// Write data to a pipe.
 ///
-/// Returns Ok(n) for the number of bytes accepted, or Err(EPIPE) if the pipe
+/// Returns Ok(n) for the number of bytes accepted, or Err(Errno::EPIPE) if the pipe
 /// has been destroyed (no readers left or pipe removed). On Linux, writing to a
 /// broken pipe delivers SIGPIPE and returns EPIPE; callers must replicate this.
 ///
@@ -247,7 +247,7 @@ fn write_inner(id: u32, data: &[u8], raise_sigpipe: bool) -> Result<usize, i32> 
 }
 
 /// Write **every** byte of `data`, sleeping while the pipe is full, and return
-/// `Err(EPIPE)` if the pipe breaks before that completes.
+/// `Err(Errno::EPIPE)` if the pipe breaks before that completes.
 ///
 /// For in-kernel callers that put framed messages on a pipe they own both ends of
 /// (the rump sysproxy request path and its `sys_sendmsg` reply path). Those protocols

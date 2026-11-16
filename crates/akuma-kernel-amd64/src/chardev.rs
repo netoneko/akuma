@@ -179,7 +179,7 @@ fn chr(ino: u64, mode: u32, major: u64, minor: u64) -> Stat {
     }
 }
 
-fn fstat(d: &FileDescriptor) -> Option<Result<Stat, u64>> {
+fn fstat(d: &FileDescriptor) -> Option<Result<Stat, akuma_primitives::errno::Errno>> {
     Some(Ok(match d {
         // A misc character device (10, 242), root-only.
         FileDescriptor::DevWifi => chr(19, 0o600, 10, 0xF2),

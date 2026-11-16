@@ -19,15 +19,13 @@
 //! the syscall; amd64 reads a head, maps every segment as it loads, and returns
 //! into the new image through its syscall exit path.
 
+use akuma_primitives::errno::Errno;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use akuma_syscalls_proc::exec::Budget;
 
-const EFAULT: u64 = (-14i64) as u64;
-const ENOENT: u64 = (-2i64) as u64;
-const E2BIG: u64 = (-7i64) as u64;
-const ENAMETOOLONG: u64 = (-36i64) as u64;
+use akuma_primitives::errno::negated::ENOENT;
 /// Linux's `PATH_MAX`.
 const PATH_MAX: usize = 4096;
 
@@ -55,13 +53,13 @@ pub fn read_request(
     max_argv: usize,
     max_envp: usize,
     budget: &mut Budget,
-) -> Result<Request, u64> {
-    let raw = read_cstr(path_ptr, PATH_MAX).map_err(|e| if e == E2BIG { ENAMETOOLONG } else { e })?;
+) -> Result<Request, Errno> {
+    let raw = read_cstr(path_ptr, PATH_MAX).map_err(|e| if e == Errno::E2BIG { Errno::ENAMETOOLONG } else { e })?;
     if raw.is_empty() {
-        return Err(ENOENT);
+        return Err(Errno::ENOENT);
     }
-    let raw = String::from_utf8(raw).map_err(|_| ENOENT)?;
-    let path = crate::fs::resolve_path_at(AT_FDCWD, &raw).map_err(|_| ENOENT)?;
+    let raw = String::from_utf8(raw).map_err(|_| Errno::ENOENT)?;
+    let path = crate::fs::resolve_path_at(AT_FDCWD, &raw).map_err(|_| Errno::ENOENT)?;
     let mut argv = read_vector(argv_ptr, max_argv, budget)?;
     if argv.is_empty() {
         argv.push(raw.into_bytes());
@@ -74,7 +72,7 @@ const AT_FDCWD: i32 = -100;
 
 /// A NULL-terminated array of string pointers: every string, or the whole call
 /// refused. Never a shorter list.
-fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>, u64> {
+fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>, Errno> {
     let mut out = Vec::new();
     if ptr == 0 {
         return Ok(out);
@@ -84,15 +82,15 @@ fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>
         akuma_exec::process::user_access::UserAddr::new(ptr)
             .offset_of::<u64>(i)
             .and_then(|at| crate::read_user_into(&mut p, at.get()))
-            .map_err(|_| EFAULT)?;
+            .map_err(|_| Errno::EFAULT)?;
         if p == 0 {
             return Ok(out);
         }
         if i == max {
-            return Err(E2BIG);
+            return Err(Errno::E2BIG);
         }
         let s = read_cstr(p, akuma_config::MAX_ARG_STRLEN)?;
-        budget.charge(s.len()).map_err(|_| E2BIG)?;
+        budget.charge(s.len()).map_err(|_| Errno::E2BIG)?;
         out.push(s);
     }
     Ok(out)
@@ -101,21 +99,21 @@ fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>
 /// One C string of at most `max` bytes (without the NUL), page by page so a
 /// string that ends just before an unmapped page reads cleanly. `E2BIG` when
 /// there is no NUL within `max`.
-fn read_cstr(ptr: u64, max: usize) -> Result<Vec<u8>, u64> {
+fn read_cstr(ptr: u64, max: usize) -> Result<Vec<u8>, Errno> {
     let mut out = Vec::new();
     let mut at = ptr;
     let mut buf = [0u8; 256];
     loop {
         let remaining = max + 1 - out.len();
         let want = akuma_exec::process::user_access::cstr_chunk_len(at, remaining, buf.len());
-        crate::copy_from_user(&mut buf[..want], at).map_err(|_| EFAULT)?;
+        crate::copy_from_user(&mut buf[..want], at).map_err(|_| Errno::EFAULT)?;
         if let Some(nul) = buf[..want].iter().position(|&b| b == 0) {
             out.extend_from_slice(&buf[..nul]);
             return Ok(out);
         }
         out.extend_from_slice(&buf[..want]);
         if out.len() > max {
-            return Err(E2BIG);
+            return Err(Errno::E2BIG);
         }
         at += want as u64;
     }
@@ -157,19 +155,19 @@ pub trait ExecArch {
 
     /// Read the executable at `path` (symlinks already resolved). `Err` is the
     /// syscall's errno.
-    fn read(&self, path: &str) -> Result<Self::Image, u64>;
+    fn read(&self, path: &str) -> Result<Self::Image, Errno>;
     /// The file's first bytes, for the `#!` check; empty when the kernel does
     /// not have them (AArch64's path load of a file it could not read whole).
     fn head<'a>(&self, image: &'a Self::Image) -> &'a [u8];
     /// Build the new image and its initial stack. Consumes `image`, so a
     /// whole-file buffer is freed here, before an `eret` abandons this frame.
-    fn load(&self, image: Self::Image, path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Self::Loaded, u64>;
+    fn load(&self, image: Self::Image, path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Self::Loaded, Errno>;
     /// POSIX: every other thread of the group dies. Past the point of no return.
     fn stop_siblings(&self);
     /// Run `f` on the process the new image goes to; `ESRCH` without one.
     fn with_target(&self, f: impl FnOnce(&akuma_exec::process::Process) -> u64) -> u64;
     /// Put `loaded` on `proc`, dropping the old image.
-    fn install(&self, proc: &akuma_exec::process::Process, loaded: Self::Loaded) -> Result<(), u64>;
+    fn install(&self, proc: &akuma_exec::process::Process, loaded: Self::Loaded) -> Result<(), Errno>;
     /// Start the installed image. AArch64's never returns; amd64's arms its
     /// syscall return and returns 0. Nothing in [`run`]'s frames owns heap by
     /// the time this is called, because a call that does not return leaks it.
@@ -187,7 +185,7 @@ pub fn run<A: ExecArch>(arch: &A, req: Request) -> u64 {
     // Execute permission (`EACCES`). Root passes on any file with some x bit;
     // see `akuma_isolation::dac::may`. Set-user-ID bits are never honoured.
     if let Err(e) = crate::perm::check(&resolved, akuma_isolation::dac::MAY_EXEC) {
-        return e;
+        return e.ret();
     }
     // Mark the file as being executed BEFORE its bytes are read, so it cannot
     // be rewritten between the read and the mark (`ETXTBSY`,
@@ -198,7 +196,7 @@ pub fn run<A: ExecArch>(arch: &A, req: Request) -> u64 {
     };
     let image = match arch.read(&resolved) {
         Ok(i) => i,
-        Err(e) => return e,
+        Err(e) => return e.ret(),
     };
 
     let head = arch.head(&image);
@@ -229,7 +227,7 @@ pub fn run<A: ExecArch>(arch: &A, req: Request) -> u64 {
 
     let loaded = match arch.load(image, &resolved, &argv, &envp) {
         Ok(l) => l,
-        Err(e) => return e,
+        Err(e) => return e.ret(),
     };
     drop(envp);
     arch.stop_siblings();
@@ -241,7 +239,7 @@ pub fn run<A: ExecArch>(arch: &A, req: Request) -> u64 {
     }
     arch.with_target(move |proc| {
         if let Err(e) = arch.install(proc, loaded) {
-            return e;
+            return e.ret();
         }
         // The new image's executable is busy for as long as it runs (the old
         // image's mark is released).

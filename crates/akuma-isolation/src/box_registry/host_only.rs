@@ -93,10 +93,12 @@ pub mod access {
 
     use super::BoxInfo;
 
+    pub use crate::box_registry::{BoxId, CallerBox, SpawnBox};
+
     /// Every caller is in box 0, and the host may act on any box (the live
     /// registry's first rule); a box other than 0 does not exist to act on.
     #[must_use]
-    pub fn can_access_box(_registry: &BTreeMap<u64, BoxInfo>, _source: super::CallerBox, _target: super::BoxId, _pid: Pid) -> bool {
+    pub fn can_access_box(_registry: &BTreeMap<u64, BoxInfo>, _source: crate::box_registry::CallerBox, _target: crate::box_registry::BoxId, _pid: Pid) -> bool {
         true
     }
 

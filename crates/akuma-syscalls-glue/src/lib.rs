@@ -387,48 +387,30 @@ akuma_pod::pod!(ThreadCpuStat {
 // See `akuma_primitives::errno` and TRIM_FAT_EMBARASSING_DUPLICATIONS.md §5.7.
 pub use akuma_primitives::errno::negated::*;
 pub use akuma_primitives::errno::neg_errno;
+pub use akuma_primitives::errno::Errno;
 
 /// A syscall arm that reports failure through `Err` instead of a bare `-errno`.
 ///
-/// `Ok` carries the success value, `Err` a **negated** errno — the same
-/// convention the plain-`u64` arms return, just typed. [`flat`] collapses the
-/// two back into `x0`.
-pub type SysResult = Result<u64, u64>;
+/// `Ok` carries the success value and `Err` an [`Errno`], the same type every user-copy helper returns, so `?` composes
+/// across all of them and is correct by construction. [`flat`] is the one place an `Errno` becomes the ABI's `x0`
+/// (`-errno`, via [`Errno::ret`]). Before 2026-11-16 this was `Result<u64, u64>` with a *negated* `Err` while the
+/// user-copy helpers carried a *positive* one, so `read_user_into(..)?` compiled and returned `Err(14)`, which userspace
+/// reads as a successful call; `scripts/check_errno_sign.py` was the guard and is deleted with the trap
+/// (`docs/archive/TYPE_SYSTEM_SAFETY_REPORT.md` §1).
+pub type SysResult = Result<u64, Errno>;
 
-/// Collapse a [`SysResult`] into the raw `x0` value the dispatch returns.
-///
-/// This is a type change, not a conversion: both halves are already in the
-/// ABI's return convention, so `Ok(v)` and `Err(v)` produce the same `x0`.
-/// That property is why converting an arm to `SysResult` cannot change
-/// behaviour even if a value is classified into the "wrong" variant — the
-/// worst case is a misleading type, not a different syscall result.
-///
-/// # The sign trap this exists next to
-///
-/// **Two families of `Result<_, u64>` meet in this module and their `Err`
-/// values have opposite signs.**
-///
-/// - This module's own helpers — [`copy_from_user_str`]
-///   — carry the **negated** form, because they are written for syscall arms.
-/// - `akuma_exec::process::user_access`'s helpers (`copy_from_user`,
-///   `read_user_into`, `write_user_val`, …) carry the **positive** form. That
-///   is deliberate and documented at its definition: *"`x0 = -errno` happens at
-///   the syscall boundary, not here"*, because that crate is also used off the
-///   syscall path.
-///
-/// That used to mean `read_user_into(&mut ts, ptr)?` inside a `SysResult` arm
-/// compiled and returned `Err(14)`, which userspace reads as a successful call.
-/// The user-copy helpers now return `akuma_primitives::errno::Errno`, which has no
-/// conversion to `u64`, so that `?` does not compile; spell the failure out with
-/// `.is_err()` and this module's `EFAULT`, or `Errno::ret()` to convert once.
-/// (`TYPE_SYSTEM_SAFETY_REPORT.md` §1.) Audited
-/// 2026-08-28: zero violations, and `scripts/check_errno_sign.py` keeps it
-/// that way — the risk is new, because before `SysResult` there was no `?` in
-/// these functions for the mistake to hide in.
+/// Decode a negated-errno `u64` (what a plain `-> u64` arm returns) into an [`Errno`], for the few helpers that still
+/// produce one. A value that is not in the ABI's error range is a bug in the helper; it reports `EIO`.
+pub fn errno_of(ret: u64) -> Errno {
+    Errno::from_negated(ret).unwrap_or(Errno::EIO)
+}
+
+/// Collapse a [`SysResult`] into the raw `x0` value the dispatch returns: `Ok(v)` is `v`, `Err(e)` is `-errno`.
 #[must_use]
 pub const fn flat(r: SysResult) -> u64 {
     match r {
-        Ok(v) | Err(v) => v,
+        Ok(v) => v,
+        Err(e) => e.ret(),
     }
 }
 
@@ -502,16 +484,16 @@ pub mod utils;
 ///
 /// The walk lives in `akuma_user_access::read_user_cstr`, which is the crate that owns user-memory access and the only
 /// caller of the byte read; see there for the per-page validation it must honour.
-pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {
-    let s = akuma_exec::process::user_access::read_user_cstr(ptr, max_len).map_err(akuma_primitives::errno::Errno::ret)?;
+pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, Errno> {
+    let s = akuma_exec::process::user_access::read_user_cstr(ptr, max_len)?;
     if !s.terminated {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     if let Ok(s) = String::from_utf8(s.bytes) { Ok(s) } else {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(64, "[syscall] copy_from_user_str: invalid UTF-8\n");
         }
-        Err(EINVAL)
+        Err(Errno::EINVAL)
     }
 }
 

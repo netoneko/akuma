@@ -686,7 +686,7 @@ fn sys_memfd_create(flags: u64) -> u64 {
             let _ = akuma_vfs_glue::fs::remove_file(p);
             fd
         }
-        Err(e) => e,
+        Err(e) => e.ret(),
     }
 }
 
@@ -2456,7 +2456,7 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
         &mut budget,
     ) {
         Ok(r) => r,
-        Err(r) => return r,
+        Err(r) => return r.ret(),
     };
     akuma_syscalls_glue::execve::run(&Amd64Exec { entered: core::cell::Cell::new((0, 0, 0)) }, req)
 }
@@ -2477,7 +2477,7 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
     type Image = crate::fs::ImageHead;
     type Loaded = (Image, loader::LoadedImage);
 
-    fn read(&self, path: &str) -> Result<Self::Image, u64> {
+    fn read(&self, path: &str) -> Result<Self::Image, akuma_primitives::errno::Errno> {
         // BKL-free (`EXEC_BKL_DROP_ENABLED`): on a USB disk whose transfer
         // stalled this read was the multi-second BKL hold behind the `[BKL]
         // stuck` storm of 2026-09-11 (`exec_runtime.rs` § "The exec-side BKL
@@ -2493,12 +2493,12 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
         image.head()
     }
 
-    fn load(&self, image: Self::Image, _path: &str, argv: &[alloc::vec::Vec<u8>], envp: &[alloc::vec::Vec<u8>]) -> Result<Self::Loaded, u64> {
+    fn load(&self, image: Self::Image, _path: &str, argv: &[alloc::vec::Vec<u8>], envp: &[alloc::vec::Vec<u8>]) -> Result<Self::Loaded, akuma_primitives::errno::Errno> {
         Image::from_elf_path_argv_envp(&image.resolved, argv, envp).map_err(|e| {
             serial::puts("  [execve] load failed: ");
             serial::puts(e);
             serial::puts("\n");
-            exec_load_errno(e)
+            akuma_syscalls_glue::errno_of(exec_load_errno(e))
         })
     }
 
@@ -2535,7 +2535,7 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
         }
     }
 
-    fn install(&self, proc: &akuma_exec::process::Process, (next, ld): Self::Loaded) -> Result<(), u64> {
+    fn install(&self, proc: &akuma_exec::process::Process, (next, ld): Self::Loaded) -> Result<(), akuma_primitives::errno::Errno> {
         let root = next.space.ttbr0();
         self.entered.set((next.entry, next.stack, root));
         let stack_bottom = (ELF_STACK_TOP - (elf_stack_max_pages() as u64 * 4096)) as usize;
@@ -2556,7 +2556,7 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
             serial::puts("  [execve] install failed: ");
             serial::puts(&e);
             serial::puts("\n");
-            return Err(crate::fd::errno::ENOMEM);
+            return Err(akuma_primitives::errno::Errno::ENOMEM);
         }
         // `install_image` cleared the region list; the stack's demand-grown
         // part is one region, registered as at first exec (`Image::with_stack`).
@@ -2805,7 +2805,7 @@ pub fn sys_spawn(
         &mut budget,
     ) {
         Ok(r) => r,
-        Err(r) => return r,
+        Err(r) => return r.ret(),
     };
     // A child that writes its own channel — every spawn but the console's — is
     // made by the shared spawn (`akuma-exec`, through glue's `spawn_request`),
@@ -2818,7 +2818,7 @@ pub fn sys_spawn(
         };
         let pid = match akuma_syscalls_glue::proc::spawn_request(req, seed.as_deref(), pty, true, None) {
             Ok(pid) => pid,
-            Err(e) => return e,
+            Err(e) => return e.ret(),
         };
         let stdout_fd = crate::fd::install_child_stdout(pid);
         if crate::fd::errno::is_err(stdout_fd) {
@@ -2847,7 +2847,7 @@ pub fn sys_spawn(
     let attach = akuma_exec::process::Attach { channel, terminal, pid: None };
     let pid = match akuma_syscalls_glue::proc::spawn_request(req, None, false, false, Some(attach)) {
         Ok(pid) => pid,
-        Err(e) => return e,
+        Err(e) => return e.ret(),
     };
     crate::console::set_attached_pid(pid);
     // The console shell exists, so the framebuffer is its now: from here the TV
@@ -3082,7 +3082,7 @@ pub fn run_init(init: akuma_params::init::Init<'_>) {
     let req = akuma_syscalls_glue::execve::Request { path: alloc::string::String::from(path), argv, envp: alloc::vec::Vec::new() };
     let attach = akuma_exec::process::Attach { channel, terminal, pid: Some(1) };
     if let Err(e) = akuma_syscalls_glue::proc::spawn_request(req, None, false, false, Some(attach)) {
-        akuma_primitives::safe_print!(64, "  [init] failed to start: errno {}\n", e.cast_signed());
+        akuma_primitives::safe_print!(64, "  [init] failed to start: errno {}\n", e.code());
         return;
     }
     crate::console::set_attached_pid(1);

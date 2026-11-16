@@ -135,27 +135,27 @@ fn trace_read_ebadf(reason: &str, fd: u64, buf_ptr: u64) {
     }
 }
 
-pub fn fs_error_to_errno(e: akuma_vfs_glue::FsError) -> u64 {
+pub fn fs_error_to_errno(e: akuma_vfs_glue::FsError) -> Errno {
     use akuma_vfs_glue::FsError;
     match e {
-        FsError::NotFound => ENOENT,
+        FsError::NotFound => Errno::ENOENT,
         // Linux uses EACCES for filesystem permission errors on open/access/etc.;
         // EPERM is reserved for capability-style "operation not permitted".
-        FsError::PermissionDenied => EACCES,
-        FsError::AlreadyExists => EEXIST,
-        FsError::NotADirectory => ENOTDIR,
-        FsError::NotAFile => EISDIR,
-        FsError::DirectoryNotEmpty => ENOTEMPTY,
-        FsError::NoSpace => ENOSPC,
-        FsError::ReadOnly => EROFS,
-        FsError::InvalidPath => EINVAL,
-        FsError::IoError => EIO,
-        FsError::Internal => EIO,
-        FsError::TooManyOpenFiles => EMFILE,
-        FsError::CrossDevice => EXDEV,
-        FsError::TooManyLinks => EMLINK,
-        FsError::TextBusy => ETXTBSY,
-        _ => EIO,
+        FsError::PermissionDenied => Errno::EACCES,
+        FsError::AlreadyExists => Errno::EEXIST,
+        FsError::NotADirectory => Errno::ENOTDIR,
+        FsError::NotAFile => Errno::EISDIR,
+        FsError::DirectoryNotEmpty => Errno::ENOTEMPTY,
+        FsError::NoSpace => Errno::ENOSPC,
+        FsError::ReadOnly => Errno::EROFS,
+        FsError::InvalidPath => Errno::EINVAL,
+        FsError::IoError => Errno::EIO,
+        FsError::Internal => Errno::EIO,
+        FsError::TooManyOpenFiles => Errno::EMFILE,
+        FsError::CrossDevice => Errno::EXDEV,
+        FsError::TooManyLinks => Errno::EMLINK,
+        FsError::TextBusy => Errno::ETXTBSY,
+        _ => Errno::EIO,
     }
 }
 
@@ -199,7 +199,7 @@ pub fn fs_error_to_errno(e: akuma_vfs_glue::FsError) -> u64 {
 ///   a kernel thread has no `Process` and still opens relative paths.
 /// * **A real `dirfd` with no current process is `EBADF`**, because there *is* an
 ///   fd and it cannot be resolved.
-pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, u64> {
+pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, Errno> {
     use akuma_syscalls_linux::flags::at::AT_FDCWD;
 
     if raw_path.starts_with('/') {
@@ -212,14 +212,14 @@ pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, u
         ));
     }
     if dirfd < 0 {
-        return Err(EBADF);
+        return Err(Errno::EBADF);
     }
     let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return Err(EBADF);
+        return Err(Errno::EBADF);
     };
     match proc.get_fd(dirfd as u32) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => Ok(Some(f.path)),
-        _ => Err(EBADF),
+        _ => Err(Errno::EBADF),
     }
 }
 
@@ -270,7 +270,7 @@ fn expand_own_proc_fd_prefix(path: &str) -> Option<String> {
 /// own refusals have to be asked of the path [`openat_path`] will open, and a
 /// second `AT_FDCWD` ladder in another kernel is exactly the drift this
 /// function was written to end.
-pub fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, u64> {
+pub fn resolve_path_at(dirfd: i32, raw_path: &str) -> Result<String, Errno> {
     if let Some(expanded) = expand_own_proc_fd_prefix(raw_path) {
         return Ok(akuma_vfs_glue::canonicalize_path(&expanded));
     }
@@ -712,7 +712,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             }
             rec.lap(crate::utils::read_profile::S_FS);
             if total == 0 && let Some(e) = failure {
-                return fs_error_to_errno(e);
+                return fs_error_to_errno(e).ret();
             }
             if total > 0 {
                 rec.lap(crate::utils::read_profile::S_COPY);
@@ -741,7 +741,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                     n as u64
                 }
-                Err(e) => e,
+                Err(e) => e.ret(),
             }
         }
         #[cfg(feature = "smoltcp")]
@@ -1077,7 +1077,7 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
                 }
             }
             if total == 0 && let Some(e) = failure {
-                return fs_error_to_errno(e);
+                return fs_error_to_errno(e).ret();
             }
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] pread64(fd={}, file={}, off={}, req={}) = {}\n", fd_num, &f.path, offset, count, total);
@@ -1098,7 +1098,7 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
         // read at it.
         akuma_exec::process::FileDescriptor::BlockDev { idx, .. } => {
             let _vfs_bkl = VfsBklGuard::new();
-            blockdev_read_at(idx, offset as u64, buf_ptr, count).map_or_else(|e| e, |n| n as u64)
+            blockdev_read_at(idx, offset as u64, buf_ptr, count).map_or_else(|e| e.ret(), |n| n as u64)
         }
         _ => ESPIPE
     }
@@ -1108,29 +1108,29 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
 /// or past its end (`dd` reading off the end). The caller holds the VFS BKL: this
 /// is the disk I/O `akuma_vfs_glue::ext2` drives (`docs/archive/RAW_BLOCK_DEVICE_FD.md`).
 /// The bounce buffer is allocated fallibly (`ENOMEM`).
-fn blockdev_read_at(idx: u32, pos: u64, buf_ptr: u64, count: usize) -> Result<usize, u64> {
+fn blockdev_read_at(idx: u32, pos: u64, buf_ptr: u64, count: usize) -> Result<usize, Errno> {
     let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
     if pos >= capacity {
         return Ok(0);
     }
     let to_read = count.min(usize::try_from(capacity - pos).unwrap_or(usize::MAX)).min(64 * 1024);
     let mut temp = alloc::vec::Vec::new();
-    temp.try_reserve_exact(to_read).map_err(|_| ENOMEM)?;
+    temp.try_reserve_exact(to_read).map_err(|_| Errno::ENOMEM)?;
     temp.resize(to_read, 0u8);
-    akuma_virtio::block::read_bytes_at(idx as usize, pos, &mut temp).map_err(|_| EIO)?;
-    copy_to_user(buf_ptr, &temp).map_err(|_| EFAULT)?;
+    akuma_virtio::block::read_bytes_at(idx as usize, pos, &mut temp).map_err(|_| Errno::EIO)?;
+    copy_to_user(buf_ptr, &temp).map_err(|_| Errno::EFAULT)?;
     Ok(to_read)
 }
 
 /// `data` onto block device `idx` at byte `pos`, cut short at its end; `ENOSPC` at
 /// or past it. The caller holds the VFS BKL, as for [`blockdev_read_at`].
-fn blockdev_write_at(idx: u32, pos: u64, data: &[u8]) -> Result<usize, u64> {
+fn blockdev_write_at(idx: u32, pos: u64, data: &[u8]) -> Result<usize, Errno> {
     let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
     if pos >= capacity {
-        return Err(ENOSPC);
+        return Err(Errno::ENOSPC);
     }
     let clamped = data.len().min(usize::try_from(capacity - pos).unwrap_or(usize::MAX));
-    akuma_virtio::block::write_bytes_at(idx as usize, pos, &data[..clamped]).map_err(|_| EIO)?;
+    akuma_virtio::block::write_bytes_at(idx as usize, pos, &data[..clamped]).map_err(|_| Errno::EIO)?;
     Ok(clamped)
 }
 
@@ -1164,7 +1164,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
                 match akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), offset as usize + done, &buf) {
                     Ok(0) => break,
                     Ok(n) => done += n,
-                    Err(e) => return if done > 0 { done as u64 } else { fs_error_to_errno(e) },
+                    Err(e) => return if done > 0 { done as u64 } else { fs_error_to_errno(e).ret() },
                 }
             }
             done as u64
@@ -1185,7 +1185,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
             if copy_from_user(&mut buf, buf_ptr).is_err() {
                 return EFAULT;
             }
-            blockdev_write_at(idx, offset as u64, &buf).map_or_else(|e| e, |n| n as u64)
+            blockdev_write_at(idx, offset as u64, &buf).map_or_else(|e| e.ret(), |n| n as u64)
         }
         _ => ESPIPE
     }
@@ -1424,7 +1424,7 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     }
                     Err(e) => {
                         if total_written > 0 { return total_written as u64; }
-                        return fs_error_to_errno(e);
+                        return fs_error_to_errno(e).ret();
                     }
                 }
             }
@@ -1437,7 +1437,7 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                     Ok(n) => n,
                     Err(e) => {
                         if total_written > 0 { return total_written as u64; }
-                        return e;
+                        return e.ret();
                     }
                 };
                 write_pos += clamped;
@@ -1855,7 +1855,7 @@ pub fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
     let path = fd_path.unwrap_or_else(|| String::from("/"));
     match akuma_vfs_glue::stats_for_path(&path) {
         Ok(view) => statfs_into(&view, buf_ptr),
-        Err(e) => fs_error_to_errno(e),
+        Err(e) => fs_error_to_errno(e).ret(),
     }
 }
 
@@ -2074,7 +2074,7 @@ pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult
 /// - `O_DIRECTORY` on anything but a directory is `ENOTDIR`.
 ///
 /// No lookup at all unless one of those flags is set.
-fn open_refusal(path: &str, flags: u32) -> Result<(), u64> {
+fn open_refusal(path: &str, flags: u32) -> Result<(), Errno> {
     use akuma_exec::process::open_flags::{O_CREAT, O_DIRECTORY, O_EXCL, O_NOFOLLOW, O_PATH};
     let nofollow = flags & (O_NOFOLLOW | O_PATH) == O_NOFOLLOW;
     let creating = flags & O_CREAT != 0;
@@ -2084,20 +2084,20 @@ fn open_refusal(path: &str, flags: u32) -> Result<(), u64> {
     }
     let _vfs_bkl = VfsBklGuard::new();
     if nofollow && akuma_vfs_glue::is_symlink(path) {
-        return Err(ELOOP);
+        return Err(Errno::ELOOP);
     }
     if !(creating || wants_dir) {
         return Ok(());
     }
     let Ok(md) = akuma_vfs_glue::metadata(path) else { return Ok(()) };
     if creating && flags & O_EXCL != 0 {
-        return Err(EEXIST);
+        return Err(Errno::EEXIST);
     }
     if creating && md.is_dir {
-        return Err(EISDIR);
+        return Err(Errno::EISDIR);
     }
     if wants_dir && !md.is_dir {
-        return Err(ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     Ok(())
 }
@@ -2131,7 +2131,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(128, "[syscall] openat({:?}): O_TMPFILE unsupported -> EINVAL\n", raw_path);
         }
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     // An empty path names nothing (`openat` has no `AT_EMPTY_PATH`). Resolved,
@@ -2139,7 +2139,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     // checks this when it copies the name in: after the flag checks above,
     // before the descriptor is allocated.
     if raw_path.is_empty() {
-        return Err(ENOENT);
+        return Err(Errno::ENOENT);
     }
 
     // `RLIMIT_NOFILE`: Linux allocates the descriptor before it looks the path
@@ -2149,7 +2149,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     if let Some(proc) = akuma_exec::process::current_process_shared()
         && fd_table_full(proc)
     {
-        return Err(EMFILE);
+        return Err(Errno::EMFILE);
     }
 
     // Was an eighth copy of the `AT_FDCWD` ladder, and one of the two that
@@ -2159,7 +2159,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     let path = match resolve_path_at(dirfd, raw_path) {
         Ok(p) => p,
         Err(e) => {
-            if akuma_config::SYSCALL_DEBUG_IO_ENABLED && e == EBADF {
+            if akuma_config::SYSCALL_DEBUG_IO_ENABLED && e == Errno::EBADF {
                 akuma_primitives::safe_print!(128, "[syscall] openat: bad dirfd={}\n", dirfd);
             }
             return Err(e);
@@ -2170,7 +2170,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
 
     // A device its kernel serves itself (`chardev`): the resolved path names it.
     if let Some(r) = super::chardev::open(&path, flags) {
-        return if (r as i64) < 0 { Err(r) } else { Ok(r) };
+        return if (r as i64) < 0 { Err(errno_of(r)) } else { Ok(r) };
     }
 
     // `open("/proc/self/fd/N")` is a *magic* link on Linux: it reopens the file
@@ -2264,7 +2264,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             }
             return Ok(u64::from(fd));
         }
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     if path == "/dev/urandom" || path == "/dev/random" {
@@ -2278,7 +2278,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             }
             return Ok(u64::from(fd));
         }
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     if path == "/dev/zero" {
@@ -2292,7 +2292,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             }
             return Ok(u64::from(fd));
         }
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     // /dev/tty — the calling process's controlling terminal. Pagers (`less`,
@@ -2306,12 +2306,12 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     // "no controlling terminal"): a non-terminal channel is the exec bridge's
     // command stream, and letting a pager read it would corrupt the stream.
     if path == "/dev/tty" {
-        let Some(proc) = akuma_exec::process::current_process_shared() else { return Err(ESRCH) };
+        let Some(proc) = akuma_exec::process::current_process_shared() else { return Err(Errno::ESRCH) };
         if !akuma_exec::process::current_channel().is_some_and(|ch| ch.is_terminal()) {
             // Linux says ENXIO for "no controlling terminal"; this errno set
             // has no ENXIO (see akuma-primitives/src/errno.rs header note), and
             // ENODEV is the nearest "device not attached" answer.
-            return Err(ENODEV);
+            return Err(Errno::ENODEV);
         }
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::DevTty);
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
@@ -2337,7 +2337,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             }
             return Ok(u64::from(fd));
         }
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     // /dev/net/tap0 — raw L2 packet device for the rump kernel feature. Only
@@ -2347,7 +2347,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
     #[cfg(feature = "rump")]
     if path == "/dev/net/tap0" {
         if !akuma_net::rump_tap::is_ready() {
-            return Err(ENODEV);
+            return Err(Errno::ENODEV);
         }
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Tap {
@@ -2361,7 +2361,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             }
             return Ok(u64::from(fd));
         }
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     // Raw block device open (`/dev/vdX`) — `docs/archive/RAW_BLOCK_DEVICE_FD.md`.
@@ -2373,10 +2373,10 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         // A raw device read sees every file on the disk whatever its mode bits,
         // so it is uid 0's alone (Linux: the node is `0660 root:disk`).
         if !akuma_exec::process::caller_is_host_root() {
-            return Err(EACCES);
+            return Err(Errno::EACCES);
         }
         let Some(idx) = akuma_virtio::block::device_index_by_name(node.name) else {
-            return Err(ENODEV);
+            return Err(Errno::ENODEV);
         };
         let accmode = flags & 0x3; // O_RDONLY=0, O_WRONLY=1, O_RDWR=2
         let wants_write = accmode != akuma_exec::process::open_flags::O_RDONLY;
@@ -2388,7 +2388,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] openat({}) EBUSY (mounted, write requested)\n", &path);
             }
-            return Err(EBUSY);
+            return Err(Errno::EBUSY);
         }
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::BlockDev {
@@ -2404,7 +2404,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             }
             return Ok(u64::from(fd));
         }
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     }
 
     // Every device with `open()` behavior has returned by now. Anything still in
@@ -2417,7 +2417,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(256, "[syscall] openat({}) ENODEV (no fd behavior)\n", &path);
         }
-        return Err(ENODEV);
+        return Err(Errno::ENODEV);
     }
 
     // `/proc/self/exe` used to be intercepted here, mapping the path to
@@ -2443,7 +2443,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(256, "[syscall] openat({}) ENOENT flags=0x{:x}\n", &path, flags);
             }
-            return Err(ENOENT);
+            return Err(Errno::ENOENT);
         }
 
         let (parent_raw, _) = akuma_vfs_glue::split_path(&path);
@@ -2457,7 +2457,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
                 if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                     akuma_primitives::safe_print!(256, "[syscall] openat({}) parent {} not found flags=0x{:x}\n", &path, &parent_path, flags);
                 }
-                return Err(ENOENT);
+                return Err(Errno::ENOENT);
             }
             // A parent that exists and is not a directory: Linux refuses the
             // open with `ENOTDIR`. This used to hand out a descriptor for
@@ -2465,7 +2465,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             // call, which is how a tar extraction through a file-typed path
             // component reported a write error instead of a create error.
             if parent_path != "/" && akuma_vfs_glue::metadata(&parent_path).is_ok_and(|m| !m.is_dir) {
-                return Err(ENOTDIR);
+                return Err(Errno::ENOTDIR);
             }
         }
         super::perm::check_create(&path)?;
@@ -2491,7 +2491,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] openat({:?}): write open of directory -> EISDIR\n", path);
             }
-            return Err(EISDIR);
+            return Err(Errno::EISDIR);
         }
 
         // Linux (`deny_write_access`): a file some process is executing cannot be opened for writing or truncated. The filesystem refuses
@@ -2506,7 +2506,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
                 != 0
             && akuma_vfs_glue::file_identity(&path).is_some_and(|(fs, inode)| akuma_primitives::text_busy::is_busy(fs, inode))
         {
-            return Err(ETXTBSY);
+            return Err(Errno::ETXTBSY);
         }
 
         if !file_existed && (flags & akuma_exec::process::open_flags::O_CREAT != 0) {
@@ -2561,7 +2561,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
             akuma_primitives::safe_print!(256, "[syscall] openat({}) = fd {} flags=0x{:x}\n", &path, fd, flags);
         }
         Ok(u64::from(fd))
-    } else { Err(ESRCH) }
+    } else { Err(Errno::ESRCH) }
 }
 
 pub fn sys_close(fd: u32) -> u64 {
@@ -2773,8 +2773,8 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
 /// x86_64 layout before writing it — the same seam batch 2d drew for
 /// `sys_openat`/`openat_path`. `pub`, and the caller does the `validate_user_ptr`
 /// + `write_user_val` its own layout needs.
-pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
-    let proc = akuma_exec::process::current_process_shared().ok_or(ESRCH)?;
+pub fn fstat_fill(fd: u32) -> Result<Stat, Errno> {
+    let proc = akuma_exec::process::current_process_shared().ok_or(Errno::ESRCH)?;
 
     let mut stat = Stat::default();
     let entry = proc.get_fd(fd);
@@ -2875,7 +2875,7 @@ akuma_exec::process::FileDescriptor::RumpSocket { .. }) => {
         _ => EBADF,
     };
 
-    if res == 0 { Ok(stat) } else { Err(res) }
+    if res == 0 { Ok(stat) } else { Err(errno_of(res)) }
 }
 
 pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
@@ -2884,7 +2884,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
         Ok(stat) => {
             if write_user_val(stat_ptr, &stat).is_err() { EFAULT } else { 0 }
         }
-        Err(e) => e,
+        Err(e) => e.ret(),
     }
 }
 
@@ -2892,7 +2892,7 @@ pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
 ///
 /// `path` is already in kernel memory and is resolved against `dirfd` here;
 /// `AT_EMPTY_PATH` is the caller's to handle (it redirects to [`fstat_fill`]).
-pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, u64> {
+pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, Errno> {
     let _flags = flags;
     let resolved_path = resolve_path_at(dirfd, path)?;
 
@@ -2992,25 +2992,25 @@ pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, u64> 
         ENOENT
     })();
 
-    if res == 0 { Ok(stat) } else { Err(res) }
+    if res == 0 { Ok(stat) } else { Err(errno_of(res)) }
 }
 
 pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, flags: u32) -> SysResult {
     const AT_EMPTY_PATH: u32 = 0x1000;
     let path = copy_from_user_str(path_ptr, 512)?;
-    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return Err(EFAULT); }
+    if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return Err(Errno::EFAULT); }
 
     let stat = if path.is_empty() {
         if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
             fstat_fill(dirfd as u32)?
         } else {
-            return Err(ENOENT);
+            return Err(Errno::ENOENT);
         }
     } else {
         newfstatat_fill(dirfd, &path, flags)?
     };
 
-    if write_user_val(stat_ptr, &stat).is_err() { return Err(EFAULT); }
+    if write_user_val(stat_ptr, &stat).is_err() { return Err(Errno::EFAULT); }
     Ok(0)
 }
 
@@ -3020,11 +3020,11 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             let mode = match super::perm::check_chmod(&f.path, mode) {
                 Ok(m) => m,
-                Err(e) => return e,
+                Err(e) => return e.ret(),
             };
             match akuma_vfs_glue::chmod(&f.path, mode) {
                 Ok(()) => 0,
-                Err(e) => fs_error_to_errno(e),
+                Err(e) => fs_error_to_errno(e).ret(),
             }
         }
         Some(akuma_exec::process::FileDescriptor::DevNull) => 0,
@@ -3036,14 +3036,14 @@ pub(super) fn sys_fchmod(fd: u32, mode: u32) -> u64 {
 /// node accepts and ignores it, as `chmod` does. A filesystem that stores no
 /// owner refuses with `EPERM` — what Linux answers from one — rather than the
 /// old silent 0, which told `tar` an ownership was recorded when nothing was.
-fn chown_path(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<u64, u64> {
+fn chown_path(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<u64, Errno> {
     if akuma_vfs_glue::dev_node(path).is_some() || akuma_vfs_glue::is_pty_slave(path) {
         return Ok(0);
     }
     super::perm::check_chown(path, uid, gid)?;
     match akuma_vfs_glue::chown(path, uid, gid) {
         Ok(()) => Ok(0),
-        Err(akuma_vfs_glue::FsError::NotSupported) => Err(EPERM),
+        Err(akuma_vfs_glue::FsError::NotSupported) => Err(Errno::EPERM),
         Err(e) => Err(fs_error_to_errno(e)),
     }
 }
@@ -3059,14 +3059,14 @@ fn chown_id(raw: u64) -> Option<u32> {
 pub(super) fn sys_fchownat(dirfd: i32, path_ptr: u64, uid: u64, gid: u64, flags: u32) -> SysResult {
     use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     let raw_path = copy_from_user_str(path_ptr, 512)?;
     if raw_path.is_empty() {
         if flags & AT_EMPTY_PATH != 0 && dirfd >= 0 {
             return Ok(sys_fchown(dirfd as u32, uid, gid));
         }
-        return Err(ENOENT);
+        return Err(Errno::ENOENT);
     }
     let base: Option<String> = dirfd_base(dirfd, &raw_path)?;
     let _vfs_bkl = VfsBklGuard::new();
@@ -3083,7 +3083,7 @@ pub(super) fn sys_fchownat(dirfd: i32, path_ptr: u64, uid: u64, gid: u64, flags:
         return Ok(0);
     }
     if !akuma_vfs_glue::exists(&path) && !akuma_vfs_glue::is_symlink(&path) {
-        return Err(ENOENT);
+        return Err(Errno::ENOENT);
     }
     chown_path(&path, chown_id(uid), chown_id(gid))
 }
@@ -3094,7 +3094,7 @@ pub(super) fn sys_fchown(fd: u32, uid: u64, gid: u64) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
-            chown_path(&f.path, chown_id(uid), chown_id(gid)).unwrap_or_else(|e| e)
+            chown_path(&f.path, chown_id(uid), chown_id(gid)).unwrap_or_else(|e| e.ret())
         }
         Some(_) => 0,
         None => EBADF,
@@ -3146,7 +3146,7 @@ pub(super) fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> u64 {
             // By inode once the name is gone — see `sys_ftruncate`.
             match akuma_vfs_glue::fallocate_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), mode, offset as u64, len as u64) {
                 Ok(()) => 0,
-                Err(e) => fs_error_to_errno(e),
+                Err(e) => fs_error_to_errno(e).ret(),
             }
         }
         Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero) => 0,
@@ -3173,7 +3173,7 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
             // memory after unlinking it, and by path that was `ENOENT`.
             match akuma_vfs_glue::truncate_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), length as u64) {
                 Ok(()) => 0,
-                Err(e) => fs_error_to_errno(e),
+                Err(e) => fs_error_to_errno(e).ret(),
             }
         }
         Some(akuma_exec::process::FileDescriptor::DevNull | akuma_exec::process::FileDescriptor::DevZero) => 0,
@@ -3231,7 +3231,7 @@ fn fsync_fd(fd: u32) -> u64 {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             match akuma_vfs_glue::sync_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode())) {
                 Ok(()) => 0,
-                Err(e) => fs_error_to_errno(e),
+                Err(e) => fs_error_to_errno(e).ret(),
             }
         }
         // Nothing of the descriptor's reaches media; success is the honest
@@ -3253,7 +3253,7 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
     } else if let Some(proc) = akuma_exec::process::current_process_shared() {
         akuma_vfs_glue::resolve_path(&proc.cwd.get(), &path)
     } else {
-        return Err(EBADF);
+        return Err(Errno::EBADF);
     };
     super::perm::check(&resolved, akuma_isolation::dac::MAY_WRITE)?;
     match akuma_vfs_glue::truncate(&resolved, length as u64) {
@@ -3265,7 +3265,7 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
 pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> SysResult {
     // Early-out before any fs work; the copy at the end validates again for real. Sized
     // from the struct so the two can no longer disagree.
-    if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statx>()) { return Err(EFAULT); }
+    if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statx>()) { return Err(Errno::EFAULT); }
 
     let path = copy_from_user_str(path_ptr, 512)?;
 
@@ -3284,13 +3284,13 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
                     fd_mount = f.mount_id();
                     f.path
                 } else {
-                    return Err(EBADF);
+                    return Err(Errno::EBADF);
                 }
             } else {
-                return Err(EBADF);
+                return Err(Errno::EBADF);
             }
         } else {
-            return Err(ENOENT);
+            return Err(Errno::ENOENT);
         }
     } else {
         resolve_path_at(dirfd, &path)?
@@ -3324,7 +3324,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
                 let target = akuma_vfs_glue::read_symlink(&final_path).unwrap_or_default();
                 (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0, 0, 0)
             } else {
-                return Err(ENOENT);
+                return Err(Errno::ENOENT);
             }
         };
 
@@ -3360,7 +3360,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
     };
 
     if write_user_val(buf_ptr, &statx).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     Ok(0)
 }
@@ -3404,7 +3404,7 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
     use akuma_syscalls_linux::flags::utimensat::{UTIME_NOW, UTIME_OMIT};
 
     if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     // A NULL `times` means "both to now" and needs no read. Otherwise it is two
@@ -3429,12 +3429,12 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
         // `read_user_into` reports a POSITIVE errno; `?` here would hand
         // userspace a success-looking 14. See `flat` in mod.rs.
         if read_user_into(&mut times, times_ptr).is_err() {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         for t in &times {
             let ns = t.tv_nsec;
             if ns != UTIME_NOW && ns != UTIME_OMIT && !(0..1_000_000_000).contains(&ns) {
-                return Err(EINVAL);
+                return Err(Errno::EINVAL);
             }
         }
         // `times[0]` is atime, `times[1]` mtime. `UTIME_OMIT` -> leave alone
@@ -3455,12 +3455,12 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
     // itself, so there is no path to resolve and `AT_FDCWD` is not meaningful.
     if path_ptr == 0 {
         if dirfd < 0 {
-            return Err(EBADF);
+            return Err(Errno::EBADF);
         }
         let Some(proc) = akuma_exec::process::current_process_shared() else {
-            return Err(EBADF);
+            return Err(Errno::EBADF);
         };
-        return if proc.get_fd(dirfd as u32).is_some() { Ok(0) } else { Err(EBADF) };
+        return if proc.get_fd(dirfd as u32).is_some() { Ok(0) } else { Err(Errno::EBADF) };
     }
 
     let raw_path = copy_from_user_str(path_ptr, 512)?;
@@ -3475,7 +3475,7 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
     // `vfs::exists` already covers the device table, `/dev` itself and mtab, so
     // `touch /dev/null` succeeds the way it does on Linux.
     if !akuma_vfs_glue::exists(&target) {
-        return Err(ENOENT);
+        return Err(Errno::ENOENT);
     }
     super::perm::check_set_times(&target, to_now)?;
     // Existence is already established above, so the two "there is no inode to
@@ -3520,7 +3520,7 @@ pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: u32, _flags: u32) -> SysR
         if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
             akuma_primitives::safe_print!(128, "[syscall] faccessat: ENOENT {}\n", final_path);
         }
-        Err(ENOENT)
+        Err(Errno::ENOENT)
     }
 }
 
@@ -3769,7 +3769,7 @@ pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpa
 
 /// The permission side of a rename: removing the old name (sticky rules
 /// included) and either adding the new one or replacing what is there.
-fn check_rename(oldpath: &str, newpath: &str) -> Result<(), u64> {
+fn check_rename(oldpath: &str, newpath: &str) -> Result<(), Errno> {
     super::perm::check_delete(oldpath)?;
     if akuma_vfs_glue::exists(newpath) {
         super::perm::check_delete(newpath)
@@ -3783,10 +3783,10 @@ const RENAME_EXCHANGE: u32 = 2;
 
 pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> SysResult {
     if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 {
-        return Err(super::EINVAL);
+        return Err(Errno::EINVAL);
     }
     if flags & RENAME_NOREPLACE != 0 && flags & RENAME_EXCHANGE != 0 {
-        return Err(super::EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let raw_old = copy_from_user_str(oldpath_ptr, 512)?;
@@ -3801,7 +3801,7 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
     let newpath = resolve_path_at(newdirfd, &raw_new)?;
 
     if flags & RENAME_NOREPLACE != 0 && akuma_vfs_glue::exists(&newpath) {
-        return Err(super::EEXIST);
+        return Err(Errno::EEXIST);
     }
 
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -3847,7 +3847,7 @@ pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -
 pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> SysResult {
     use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_FOLLOW};
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     let oldpath = copy_from_user_str(oldpath_ptr, 1024)?;
     let newpath = copy_from_user_str(newpath_ptr, 1024)?;
@@ -3855,12 +3855,12 @@ pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath
 
     let src = if oldpath.is_empty() {
         if flags & AT_EMPTY_PATH == 0 || olddirfd < 0 {
-            return Err(ENOENT);
+            return Err(Errno::ENOENT);
         }
         match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(olddirfd as u32)) {
             Some(akuma_exec::process::FileDescriptor::File(f)) => f.path,
-            Some(_) => return Err(EPERM),
-            None => return Err(EBADF),
+            Some(_) => return Err(Errno::EPERM),
+            None => return Err(Errno::EBADF),
         }
     } else {
         let p = resolve_path_at(olddirfd, &oldpath)?;
@@ -3869,10 +3869,10 @@ pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath
     let dst = resolve_path_at(newdirfd, &newpath)?;
 
     if !akuma_vfs_glue::exists(&src) && !akuma_vfs_glue::is_symlink(&src) {
-        return Err(ENOENT);
+        return Err(Errno::ENOENT);
     }
     if akuma_vfs_glue::metadata(&src).is_ok_and(|m| m.is_dir) {
-        return Err(EPERM);
+        return Err(Errno::EPERM);
     }
     super::perm::check_create(&dst)?;
     super::perm::check_link_source(&src)?;
@@ -3880,7 +3880,7 @@ pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath
     match akuma_vfs_glue::link(&src, &dst) {
         Ok(()) => Ok(0),
         // A filesystem without hard links, and a directory, are both `EPERM`.
-        Err(akuma_vfs_glue::FsError::NotSupported | akuma_vfs_glue::FsError::PermissionDenied) => Err(EPERM),
+        Err(akuma_vfs_glue::FsError::NotSupported | akuma_vfs_glue::FsError::PermissionDenied) => Err(Errno::EPERM),
         Err(e) => Err(fs_error_to_errno(e)),
     }
 }
@@ -3903,19 +3903,19 @@ pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: u
         .or_else(|| akuma_vfs_glue::proc::proc_fd_description(&path));
 
     if let Some(target) = target {
-        if !validate_user_ptr(buf_ptr, bufsize) { return Err(EFAULT); }
+        if !validate_user_ptr(buf_ptr, bufsize) { return Err(Errno::EFAULT); }
         let bytes = target.as_bytes();
         let copy_len = bytes.len().min(bufsize);
         if copy_to_user(buf_ptr, &bytes[..copy_len]).is_err() {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         return Ok(copy_len as u64);
     }
 
     if akuma_vfs_glue::exists(&path) {
-        Err(EINVAL)
+        Err(Errno::EINVAL)
     } else {
-        Err(ENOENT)
+        Err(Errno::ENOENT)
     }
 }
 
@@ -3990,7 +3990,7 @@ pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
         if missing {
             let dir_entries = match akuma_vfs_glue::fs::list_dir(&path) {
                 Ok(e) => e,
-                Err(e) => return fs_error_to_errno(e),
+                Err(e) => return fs_error_to_errno(e).ret(),
             };
             // `DirEntry` carries only is_dir/is_symlink, so a device node would
             // otherwise report DT_REG. Only `/dev` can hold one, so the check
@@ -4126,17 +4126,17 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
 /// needs none of that.
 pub(super) fn sys_chroot(ptr: u64) -> SysResult {
     if !akuma_exec::process::current_creds().is_root() {
-        return Err(EPERM);
+        return Err(Errno::EPERM);
     }
     let path = copy_from_user_str(ptr, 512)?;
     let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     };
     // In the caller's own view, symlinks followed (chroot follows them).
     let view = akuma_vfs_glue::resolve_symlinks(&akuma_vfs_glue::resolve_path(&proc.cwd.get(), &path));
-    let meta = akuma_vfs_glue::metadata(&view).map_err(|_| ENOENT)?;
+    let meta = akuma_vfs_glue::metadata(&view).map_err(|_| Errno::ENOENT)?;
     if !meta.is_dir {
-        return Err(ENOTDIR);
+        return Err(Errno::ENOTDIR);
     }
     super::perm::check(&view, akuma_isolation::dac::MAY_EXEC)?;
     // The real directory: this view placed under the current root.
@@ -4160,9 +4160,9 @@ pub(super) fn sys_chdir(ptr: u64) -> SysResult {
                     akuma_exec::process::with_current_process(|p| p.cwd.set(new_cwd));
                     return Ok(0);
                 }
-        return Err(ENOENT);
+        return Err(Errno::ENOENT);
     }
-    Err(ESRCH)
+    Err(Errno::ESRCH)
 }
 
 #[cfg(test)]

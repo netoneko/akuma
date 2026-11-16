@@ -485,7 +485,7 @@ fn test_fs_error_to_errno_mapping() -> bool {
 
     let mut ok = true;
     for (error, expected, label) in cases {
-        let actual = crate::syscall::fs::fs_error_to_errno(*error);
+        let actual = crate::syscall::fs::fs_error_to_errno(*error).ret();
         if actual != *expected {
             log(&format!("  FAILED: {} — got {} expected {}\n", label, actual as i64, *expected as i64));
             ok = false;

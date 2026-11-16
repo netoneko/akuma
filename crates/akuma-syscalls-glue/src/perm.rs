@@ -47,17 +47,17 @@ fn subject(want: u32) -> Option<Creds> {
 
 /// May the caller access `path` for `want` (`MAY_*` bits)? `EACCES` if not.
 /// A path with no metadata passes: the operation itself will report ENOENT.
-pub fn check(path: &str, want: u32) -> Result<(), u64> {
+pub fn check(path: &str, want: u32) -> Result<(), Errno> {
     let Some(c) = subject(want) else { return Ok(()) };
     match attr_of(path) {
-        Some(a) if !dac::may(&c, &a, want) => Err(EACCES),
+        Some(a) if !dac::may(&c, &a, want) => Err(Errno::EACCES),
         _ => Ok(()),
     }
 }
 
 /// The check `open(2)` makes on an existing object: read and/or write by
 /// access mode, write for `O_TRUNC`.
-pub fn check_open(path: &str, flags: u32) -> Result<(), u64> {
+pub fn check_open(path: &str, flags: u32) -> Result<(), Errno> {
     use akuma_exec::process::open_flags::{O_RDWR, O_TRUNC, O_WRONLY};
     let mut want = match flags & 3 {
         x if x == O_WRONLY => MAY_WRITE,
@@ -72,7 +72,7 @@ pub fn check_open(path: &str, flags: u32) -> Result<(), u64> {
 
 /// May the caller add an entry to `path`'s parent directory (create, mkdir,
 /// symlink, link, bind)? Write and search on the parent.
-pub fn check_create(path: &str) -> Result<(), u64> {
+pub fn check_create(path: &str) -> Result<(), Errno> {
     check(parent_of(path), MAY_WRITE | MAY_EXEC)
 }
 
@@ -81,16 +81,16 @@ pub fn check_create(path: &str) -> Result<(), u64> {
 /// Write and search on the parent (`EACCES`), plus the sticky-directory rule
 /// (`EPERM`, as Linux reports it) — the one that keeps a shared `/tmp` from
 /// being a free-for-all.
-pub fn check_delete(path: &str) -> Result<(), u64> {
+pub fn check_delete(path: &str) -> Result<(), Errno> {
     let Some(c) = subject(0) else { return Ok(()) };
     let (Some(dir), Some(victim)) = (attr_of(parent_of(path)), attr_of(path)) else {
         return Ok(());
     };
     if !dac::may(&c, &dir, MAY_WRITE | MAY_EXEC) {
-        return Err(EACCES);
+        return Err(Errno::EACCES);
     }
     if !dac::sticky_allows(&c, &dir, &victim) {
-        return Err(EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(())
 }
@@ -100,40 +100,40 @@ pub fn check_delete(path: &str) -> Result<(), u64> {
 /// On by default everywhere that matters. A caller that does not own the file may
 /// link it only if it could also read and write it — otherwise anyone could
 /// pin someone else's setuid binary or log file under a name of their own.
-pub fn check_link_source(path: &str) -> Result<(), u64> {
+pub fn check_link_source(path: &str) -> Result<(), Errno> {
     let Some(c) = subject(0) else { return Ok(()) };
     match attr_of(path) {
-        Some(a) if c.uid() != a.uid && !dac::may(&c, &a, MAY_READ | MAY_WRITE) => Err(EPERM),
+        Some(a) if c.uid() != a.uid && !dac::may(&c, &a, MAY_READ | MAY_WRITE) => Err(Errno::EPERM),
         _ => Ok(()),
     }
 }
 
 /// `chmod`: root or the owner, else `EPERM`. Returns the mode to store — a
 /// non-root caller outside the file's group loses `S_ISGID`, as on Linux.
-pub fn check_chmod(path: &str, mode: u32) -> Result<u32, u64> {
+pub fn check_chmod(path: &str, mode: u32) -> Result<u32, Errno> {
     let Some(c) = subject(0) else { return Ok(mode) };
     let Some(a) = attr_of(path) else { return Ok(mode) };
     if !dac::may_chmod(&c, &a) {
-        return Err(EPERM);
+        return Err(Errno::EPERM);
     }
     Ok(dac::chmod_mode(&c, &a, mode))
 }
 
 /// `chown`: see `dac::may_chown`. `EPERM` if refused.
-pub fn check_chown(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), u64> {
+pub fn check_chown(path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), Errno> {
     let Some(c) = subject(0) else { return Ok(()) };
     match attr_of(path) {
-        Some(a) if !dac::may_chown(&c, &a, uid, gid) => Err(EPERM),
+        Some(a) if !dac::may_chown(&c, &a, uid, gid) => Err(Errno::EPERM),
         _ => Ok(()),
     }
 }
 
 /// `utimensat`: ownership, or write access when setting "now".
-pub fn check_set_times(path: &str, to_now: bool) -> Result<(), u64> {
+pub fn check_set_times(path: &str, to_now: bool) -> Result<(), Errno> {
     let Some(c) = subject(0) else { return Ok(()) };
     match attr_of(path) {
         Some(a) if !dac::may_set_times(&c, &a, to_now) => {
-            Err(if to_now { EACCES } else { EPERM })
+            Err(if to_now { Errno::EACCES } else { Errno::EPERM })
         }
         _ => Ok(()),
     }

@@ -176,7 +176,7 @@ fn signal_pgrp(pgid: u32, signo: u32) {
 // ---- open --------------------------------------------------------------------
 
 fn install(entry: akuma_exec::process::FileDescriptor, flags: u32) -> SysResult {
-    let Some(proc) = akuma_exec::process::current_process_shared() else { return Err(ESRCH) };
+    let Some(proc) = akuma_exec::process::current_process_shared() else { return Err(Errno::ESRCH) };
     let fd = proc.alloc_fd(entry);
     if flags & O_CLOEXEC != 0 {
         proc.set_cloexec(fd);
@@ -191,7 +191,7 @@ fn install(entry: akuma_exec::process::FileDescriptor, flags: u32) -> SysResult 
 pub fn open_ptmx(flags: u32) -> SysResult {
     // The buffers are allocated outside the lock (and fallibly); the table is
     // then asked for a free slot. A full table drops the pair again.
-    let Some(pair) = PtyPair::try_new() else { return Err(ENOMEM) };
+    let Some(pair) = PtyPair::try_new() else { return Err(Errno::ENOMEM) };
     let n = with_table(|t| {
         let (n, slot) = t.iter_mut().enumerate().find(|(_, s)| s.pair.is_none())?;
         slot.generation = (slot.generation + 1) & 0x00FF_FFFF;
@@ -203,7 +203,7 @@ pub fn open_ptmx(flags: u32) -> SysResult {
         Some(n as u32)
     });
     // `ENOSPC` is what Linux's devpts says when it runs out of indices.
-    let Some(n) = n else { return Err(ENOSPC) };
+    let Some(n) = n else { return Err(Errno::ENOSPC) };
     let r = install(akuma_exec::process::FileDescriptor::PtyMaster(n), flags);
     if r.is_err() {
         pty_close(n, true);
@@ -216,11 +216,11 @@ pub fn open_ptmx(flags: u32) -> SysResult {
 
 /// Take a slave reference on pair `n` as an *open*: refused while locked or
 /// after the master closed.
-fn slave_open_ref(n: u32) -> Result<(), u64> {
+fn slave_open_ref(n: u32) -> Result<(), Errno> {
     match with_pair(n, PtyPair::slave_open) {
-        None => Err(ENOENT),
+        None => Err(Errno::ENOENT),
         Some(Ok(())) => Ok(()),
-        Some(Err(SlaveOpenError::Locked | SlaveOpenError::MasterGone)) => Err(EIO),
+        Some(Err(SlaveOpenError::Locked | SlaveOpenError::MasterGone)) => Err(Errno::EIO),
     }
 }
 
@@ -478,10 +478,10 @@ fn put<T: akuma_pod::Pod>(arg: u64, v: &T) -> u64 {
     if write_user_val(arg, v).is_err() { EFAULT } else { 0 }
 }
 
-fn get_i32(arg: u64) -> Result<i32, u64> {
+fn get_i32(arg: u64) -> Result<i32, Errno> {
     let mut v: i32 = 0;
     if read_user_into(&mut v, arg).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     Ok(v)
 }
@@ -538,20 +538,21 @@ pub fn ioctl(n: u32, master: bool, cmd: u32, arg: u64) -> Option<u64> {
         return None;
     }
     Some(match ioctl_inner(n, master, cmd, arg) {
-        Ok(v) | Err(v) => v,
+        Ok(v) => v,
+        Err(e) => e.ret(),
     })
 }
 
 fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
     match cmd {
         req::TCGETS => {
-            let w = with_pair(n, |p| p.termios().to_wire()).ok_or(EIO)?;
-            copy_to_user(arg, &w).map_err(|_| EFAULT)?;
+            let w = with_pair(n, |p| p.termios().to_wire()).ok_or(Errno::EIO)?;
+            copy_to_user(arg, &w).map_err(|_| Errno::EFAULT)?;
             Ok(0)
         }
         req::TCSETS | req::TCSETSW | req::TCSETSF => {
             let mut w = [0u8; Termios::WIRE_LEN];
-            copy_from_user(&mut w, arg).map_err(|_| EFAULT)?;
+            copy_from_user(&mut w, arg).map_err(|_| Errno::EFAULT)?;
             let t = Termios::from_wire(&w);
             with_pair(n, |p| {
                 if cmd == req::TCSETSF {
@@ -559,49 +560,49 @@ fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
                 }
                 p.set_termios(t);
             })
-            .ok_or(EIO)?;
+            .ok_or(Errno::EIO)?;
             Ok(0)
         }
         req::TIOCGWINSZ => {
-            let w = with_pair(n, |p| p.winsize.to_wire()).ok_or(EIO)?;
-            copy_to_user(arg, &w).map_err(|_| EFAULT)?;
+            let w = with_pair(n, |p| p.winsize.to_wire()).ok_or(Errno::EIO)?;
+            copy_to_user(arg, &w).map_err(|_| Errno::EFAULT)?;
             Ok(0)
         }
         req::TIOCSWINSZ => {
             let mut w = [0u8; Winsize::WIRE_LEN];
-            copy_from_user(&mut w, arg).map_err(|_| EFAULT)?;
+            copy_from_user(&mut w, arg).map_err(|_| Errno::EFAULT)?;
             let ws = Winsize::from_wire(&w);
-            let (changed, fg) = with_pair(n, |p| (p.set_winsize(ws), p.fg_pgid)).ok_or(EIO)?;
+            let (changed, fg) = with_pair(n, |p| (p.set_winsize(ws), p.fg_pgid)).ok_or(Errno::EIO)?;
             if changed {
                 signal_pgrp(fg, sig::SIGWINCH);
             }
             Ok(0)
         }
         req::TIOCGPGRP => {
-            let fg = with_pair(n, |p| p.fg_pgid).ok_or(EIO)?;
+            let fg = with_pair(n, |p| p.fg_pgid).ok_or(Errno::EIO)?;
             Ok(put(arg, &(fg as i32)))
         }
         req::TIOCSPGRP => {
             let pgid = get_i32(arg)?;
             if pgid <= 0 {
-                return Err(EINVAL);
+                return Err(Errno::EINVAL);
             }
-            with_pair(n, |p| p.fg_pgid = pgid as u32).ok_or(EIO)?;
+            with_pair(n, |p| p.fg_pgid = pgid as u32).ok_or(Errno::EIO)?;
             Ok(0)
         }
         req::TIOCGSID => {
-            let sid = with_pair(n, |p| p.session).ok_or(EIO)?;
+            let sid = with_pair(n, |p| p.session).ok_or(Errno::EIO)?;
             if sid == 0 {
-                return Err(ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             Ok(put(arg, &(sid as i32)))
         }
         req::TIOCSCTTY => set_ctty(n, arg == 1),
         req::TIOCNOTTY => {
-            let proc = akuma_exec::process::current_process_shared().ok_or(ESRCH)?;
+            let proc = akuma_exec::process::current_process_shared().ok_or(Errno::ESRCH)?;
             let id = proc.ctty.load(Ordering::Relaxed);
             if ctty_slot(id) != Some(n) {
-                return Err(ENOTTY);
+                return Err(Errno::ENOTTY);
             }
             proc.ctty.store(0, Ordering::Relaxed);
             let pid = proc.pid;
@@ -614,11 +615,11 @@ fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
             Ok(0)
         }
         req::FIONREAD => {
-            let q = with_pair(n, |p| if master { p.output_queued() } else { p.input_queued() }).ok_or(EIO)?;
+            let q = with_pair(n, |p| if master { p.output_queued() } else { p.input_queued() }).ok_or(Errno::EIO)?;
             Ok(put(arg, &(q as i32)))
         }
         req::TIOCOUTQ => {
-            let q = with_pair(n, |p| if master { p.input_queued() } else { p.output_queued() }).ok_or(EIO)?;
+            let q = with_pair(n, |p| if master { p.input_queued() } else { p.output_queued() }).ok_or(Errno::EIO)?;
             Ok(put(arg, &(q as i32)))
         }
         req::TCFLSH => {
@@ -627,10 +628,10 @@ fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
                 req::TCIFLUSH => (true, false),
                 req::TCOFLUSH => (false, true),
                 req::TCIOFLUSH => (true, true),
-                _ => return Err(EINVAL),
+                _ => return Err(Errno::EINVAL),
             };
             let (input, output) = if master { (output, input) } else { (input, output) };
-            with_pair(n, |p| p.flush(input, output)).ok_or(EIO)?;
+            with_pair(n, |p| p.flush(input, output)).ok_or(Errno::EIO)?;
             Ok(0)
         }
         // `tcdrain` (`TCSBRK` with 1), breaks, and flow control: there is no
@@ -638,16 +639,16 @@ fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
         req::TCSBRK | req::TCSBRKP | req::TCXONC => Ok(0),
         req::TIOCPKT => {
             // Packet mode is not implemented; turning it off is a no-op.
-            if get_i32(arg)? == 0 { Ok(0) } else { Err(EINVAL) }
+            if get_i32(arg)? == 0 { Ok(0) } else { Err(Errno::EINVAL) }
         }
         req::TIOCGPTN if master => Ok(put(arg, &n)),
         req::TIOCSPTLCK if master => {
             let v = get_i32(arg)?;
-            with_pair(n, |p| p.set_locked(v != 0)).ok_or(EIO)?;
+            with_pair(n, |p| p.set_locked(v != 0)).ok_or(Errno::EIO)?;
             Ok(0)
         }
         req::TIOCGPTLCK if master => {
-            let locked = with_pair(n, |p| p.is_locked()).ok_or(EIO)?;
+            let locked = with_pair(n, |p| p.is_locked()).ok_or(Errno::EIO)?;
             Ok(put(arg, &i32::from(locked)))
         }
         req::TIOCGPTPEER if master => {
@@ -656,7 +657,7 @@ fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
             // kernels for those three bits.
             open_pts(n, arg as u32)
         }
-        _ => Err(ENOTTY),
+        _ => Err(Errno::ENOTTY),
     }
 }
 
@@ -668,7 +669,7 @@ fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
 /// protects anybody: a terminal that already controls a *live* session is
 /// refused (`EPERM`) unless `steal` (arg 1) is asked for.
 fn set_ctty(n: u32, steal: bool) -> SysResult {
-    let proc = akuma_exec::process::current_process_shared().ok_or(ESRCH)?;
+    let proc = akuma_exec::process::current_process_shared().ok_or(Errno::ESRCH)?;
     let pid = proc.pid;
     let pgid = proc.pgid.get();
     let (generation, owner) = with_table(|t| {
@@ -676,20 +677,20 @@ fn set_ctty(n: u32, steal: bool) -> SysResult {
         let p = s.pair.as_ref()?;
         Some((s.generation, p.session))
     })
-    .ok_or(EIO)?;
+    .ok_or(Errno::EIO)?;
     let id = ctty_id(n, generation);
     if owner != 0 && owner != pid && !steal {
         let owner_live = akuma_exec::process::lookup_process_shared(owner)
             .is_some_and(|o| o.ctty.load(Ordering::Relaxed) == id);
         if owner_live {
-            return Err(EPERM);
+            return Err(Errno::EPERM);
         }
     }
     with_pair(n, |p| {
         p.session = pid;
         p.fg_pgid = pgid;
     })
-    .ok_or(EIO)?;
+    .ok_or(Errno::EIO)?;
     proc.ctty.store(id, Ordering::Relaxed);
     Ok(0)
 }

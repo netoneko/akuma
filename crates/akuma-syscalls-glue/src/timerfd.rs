@@ -26,19 +26,19 @@ pub fn timerfd_add_poller(id: u32, tid: usize) {
 // `use super::*`. The `bits()`/`from_bits()` pair below is what keeps this
 // path's arithmetic unsigned, exactly as it was — see that type's doc comment.
 
-fn timespec_to_us_safe(ptr: usize) -> Result<u64, u64> {
+fn timespec_to_us_safe(ptr: usize) -> Result<u64, Errno> {
     if ptr == 0 { return Ok(0); }
     let mut ts = Timespec::default();
     if read_user_into(&mut ts, ptr as u64).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     Ok(ts.to_us())
 }
 
-fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), u64> {
+fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), Errno> {
     let ts = Timespec::from_bits(us / 1_000_000, (us % 1_000_000) * 1_000);
     if write_user_val(ptr as u64, &ts).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     Ok(())
 }
@@ -71,7 +71,7 @@ pub(super) fn sys_timerfd_create(clockid: i32, flags: i32) -> u64 {
 pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old_value: usize) -> SysResult {
     let timer_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_num)) {
         Some(akuma_exec::process::FileDescriptor::TimerFd(id)) => id,
-        _ => return Err(EBADF),
+        _ => return Err(Errno::EBADF),
     };
 
     let mut table = TIMERFD_TABLE.lock();
@@ -82,12 +82,12 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
             // struct itimerspec { it_interval at 0, it_value at 16 }
-            if us_to_timespec_safe(state.interval_us, old_value).is_err() { return Err(EFAULT); }      // it_interval
-            if us_to_timespec_safe(remaining, old_value + 16).is_err() { return Err(EFAULT); }         // it_value (remaining time)
+            if us_to_timespec_safe(state.interval_us, old_value).is_err() { return Err(Errno::EFAULT); }      // it_interval
+            if us_to_timespec_safe(remaining, old_value + 16).is_err() { return Err(Errno::EFAULT); }         // it_value (remaining time)
         } else {
             let zero = [0u8; 32];
             if copy_to_user(old_value as u64, &zero).is_err() {
-                return Err(EFAULT);
+                return Err(Errno::EFAULT);
             }
         }
     }

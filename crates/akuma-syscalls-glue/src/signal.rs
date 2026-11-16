@@ -282,19 +282,19 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 /// sigsetsize: size of signal set (must be 8)
 pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigsetsize: usize) -> SysResult {
     if sigsetsize != 8 {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
 
     let _proc = match akuma_exec::process::current_process_shared() {
         Some(p) => p,
-        None => return Err(ENOSYS),
+        None => return Err(Errno::ENOSYS),
     };
 
     let mut wait_mask: u64 = 0;
     // `read_user_into` reports a POSITIVE errno — see `flat` in mod.rs. `?` here
     // would return a success-looking 14.
     if read_user_into(&mut wait_mask, set_ptr).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     // A NULL timeout is `rt_sigtimedwait`'s "wait forever", which this loop
@@ -320,11 +320,11 @@ pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigset
         let now = akuma_primitives::clock::uptime_us();
         let elapsed = now.saturating_sub(start_time);
         if timeout_ptr != 0 && elapsed >= timeout_us {
-            return Err(EAGAIN); // Timeout
+            return Err(Errno::EAGAIN); // Timeout
         }
 
         if akuma_exec::process::should_interrupt_blocking_syscall() {
-            return Err(EINTR);
+            return Err(Errno::EINTR);
         }
 
         // Sleep until next tick or timeout

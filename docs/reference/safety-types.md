@@ -33,9 +33,11 @@ existed, and are noted as such below.
 ### `Errno` (`akuma-primitives::errno`) — report §1
 `NonZeroU16`, `repr(transparent)`. The user-copy helpers in `akuma-user-access` return `Result<_, Errno>`. Before, they
 carried a positive errno in a bare `u64` while `SysResult` carries a negated one, so `read_user_into(..)?` compiled and
-returned `Err(14)`, which userspace reads as a successful call. `scripts/check_errno_sign.py` was the guard and had
-scanned nothing since `src/syscall/` moved; it now scans the syscall crates. **Open:** `SysResult`'s `Err` is still a
-negated `u64`; making it `Errno` is a wider sweep and would let the script be deleted.
+returned `Err(14)`, which userspace reads as a successful call. `SysResult` is now `Result<u64, Errno>` too, along with
+the ~45 glue helpers that carried a negated `u64` (`fs_error_to_errno`, `perm::check*`, `read_vector`, `mount_errno`, the
+`ExecArch` trait both kernels implement, ...), so `?` is correct everywhere and `flat()` is the one place an `Errno` becomes
+`x0`. `scripts/check_errno_sign.py` is deleted. `Errno::NAME` constants are generated from the errno table;
+`Errno::from_negated` decodes a negated `u64`. A plain `-> u64` arm still returns the negated constants.
 
 ### `read_user_cstr`, `read_user_vec` (`akuma-user-access`) — §2
 The report's defects A (a path argument naming kernel memory on AArch64) and B (an unbounded `vec!` from a user length)
@@ -125,7 +127,6 @@ host ports are unprivileged, and the active toolchain's `rust-objcopy` on `PATH`
 
 ## Open work (what the report listed that is not done)
 
-1. **§1** `SysResult`'s `Err` is still a negated `u64`; making it `Errno` would let `check_errno_sign.py` go.
 2. **§4** decision-only privilege sites (raw block open, amd64 `/dev/kvm0`, `/dev/power`) call `caller_is_host_root()`;
    they have no effect function to take a token.
 3. **§5** the 60 `slot: usize` functions in `akuma-threading`; a distinct `Pid` type; a real `with_live` that holds the slot

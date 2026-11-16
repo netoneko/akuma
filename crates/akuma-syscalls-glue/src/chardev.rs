@@ -14,6 +14,7 @@
 //! of every fd arm in its own dispatcher, which is what kept its fd layer a
 //! separate copy (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "Slice 4: fd").
 
+use akuma_primitives::errno::Errno;
 use akuma_exec::process::FileDescriptor;
 use akuma_syscalls_linux::Stat;
 
@@ -35,7 +36,7 @@ pub struct CharDevOps {
     /// `ioctl(fd, req, arg)` on a device descriptor `d`.
     pub ioctl: fn(fd: u32, d: &FileDescriptor, req: u32, arg: u64) -> Option<u64>,
     /// The `struct stat` of a device descriptor, or an errno.
-    pub fstat: fn(d: &FileDescriptor) -> Option<Result<Stat, u64>>,
+    pub fstat: fn(d: &FileDescriptor) -> Option<Result<Stat, Errno>>,
     /// Release whatever the device holds for `fd`, after it left the table.
     pub close: fn(fd: u32, d: &FileDescriptor),
 }
@@ -103,7 +104,7 @@ pub(crate) fn ioctl(fd: u32, d: &FileDescriptor, req: u32, arg: u64) -> Option<u
 }
 
 /// `fstat`'s hook; see [`read`].
-pub(crate) fn fstat(d: &FileDescriptor) -> Option<Result<Stat, u64>> {
+pub(crate) fn fstat(d: &FileDescriptor) -> Option<Result<Stat, Errno>> {
     if !is_chardev(d) {
         return None;
     }

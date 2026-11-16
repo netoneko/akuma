@@ -167,22 +167,22 @@ fn current_creds() -> Ucred {
 /// `addrlen` is taken from the caller and used as the delimiter, which is what
 /// makes abstract names work at all — but it is also a userspace-controlled
 /// length, so it is clamped to `sizeof(sockaddr_un)` before anything reads it.
-fn read_sockaddr(addr_ptr: u64, addrlen: usize) -> Result<UnixName, u64> {
+fn read_sockaddr(addr_ptr: u64, addrlen: usize) -> Result<UnixName, Errno> {
     if addrlen < 2 {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     let len = addrlen.min(SOCKADDR_UN_LEN);
     if !validate_user_ptr(addr_ptr, len) {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     // Stack, not heap: `sockaddr_un` is 110 bytes and `addrlen` is already
     // clamped to it above, so there is nothing here the heap is needed for.
     // Every bind and every connect goes through this function.
     let mut raw = [0u8; SOCKADDR_UN_LEN];
     if copy_from_user(&mut raw[..len], addr_ptr).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
-    SockAddrUn::decode(&raw[..len]).map_err(neg_errno)
+    SockAddrUn::decode(&raw[..len]).map_err(Errno::new)
 }
 
 /// Write a name back out as `sockaddr_un` + `addrlen`, truncating to the
@@ -336,13 +336,13 @@ fn passable(entry: &FileDescriptor) -> bool {
 /// Take a reference to each of the caller's `fds` for an `SCM_RIGHTS` send.
 /// `EBADF` for a closed fd, `EINVAL` for one that cannot be passed; either
 /// way the references already taken are released.
-pub fn scm_take(fds: &[i32]) -> Result<InFlight, u64> {
-    let proc = akuma_exec::process::current_process_shared().ok_or(ENOSYS)?;
+pub fn scm_take(fds: &[i32]) -> Result<InFlight, Errno> {
+    let proc = akuma_exec::process::current_process_shared().ok_or(Errno::ENOSYS)?;
     let mut out = InFlight(Vec::with_capacity(fds.len()));
     for &fd in fds {
-        let entry = u32::try_from(fd).ok().and_then(|fd| proc.get_fd(fd)).ok_or(EBADF)?;
+        let entry = u32::try_from(fd).ok().and_then(|fd| proc.get_fd(fd)).ok_or(Errno::EBADF)?;
         if !passable(&entry) {
-            return Err(EINVAL);
+            return Err(Errno::EINVAL);
         }
         akuma_exec::process::clone_fd_refs(&entry);
         let token = with_in_flight(|m| {
@@ -516,7 +516,7 @@ pub fn socketpair_rollback(a: u32, b: u32) {
 /// stale node that makes the *next* daemon start look like a live conflict.
 pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
     let Some(sock) = fd_sock(fd) else {
-        return if fd_parts(fd).is_some() { Err(EOPNOTSUPP) } else { Err(ENOTSOCK) };
+        return if fd_parts(fd).is_some() { Err(Errno::EOPNOTSUPP) } else { Err(Errno::ENOTSOCK) };
     };
     let name = read_sockaddr(addr_ptr, addrlen)?;
     // Binding a path creates a directory entry, so it needs write and search on
@@ -531,7 +531,7 @@ pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
     // daemon to unlink first, so a client sees a node it cannot connect to
     // rather than silently talking to the wrong process.
     if let Err(e) = with_table(|t| t.bind(sock, name.clone())) {
-        return Err(neg_errno(e));
+        return Err(Errno::new(e));
     }
     if let Some(path) = name.path_bytes()
         && let Ok(p) = core::str::from_utf8(path)
@@ -603,7 +603,7 @@ pub fn sys_listen(fd: u32, backlog: i32) -> u64 {
 /// lose every byte written in between.
 pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
     let Some(sock) = fd_sock(fd) else {
-        return if fd_parts(fd).is_some() { Err(EOPNOTSUPP) } else { Err(ENOTSOCK) };
+        return if fd_parts(fd).is_some() { Err(Errno::EOPNOTSUPP) } else { Err(Errno::ENOTSOCK) };
     };
     let name = read_sockaddr(addr_ptr, addrlen)?;
     let creds = current_creds();
@@ -659,7 +659,7 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
             Err(e) if e == libc_errno::EAGAIN && !nonblock => {
                 akuma_exec::threading::schedule_blocking(10_000);
             }
-            Err(e) => return Err(neg_errno(e)),
+            Err(e) => return Err(Errno::new(e)),
         }
     }
 }
@@ -1137,7 +1137,7 @@ fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool, mut anc: InFlight) 
 /// `Ok(None)` means "no destination given", which for a connected socket is
 /// normal and for an unconnected datagram socket becomes `EDESTADDRREQ` further
 /// down — a distinction the caller must not collapse.
-pub fn read_dest(addr_ptr: u64, addrlen: usize) -> Result<Option<UnixName>, u64> {
+pub fn read_dest(addr_ptr: u64, addrlen: usize) -> Result<Option<UnixName>, Errno> {
     if addr_ptr == 0 || addrlen == 0 {
         return Ok(None);
     }

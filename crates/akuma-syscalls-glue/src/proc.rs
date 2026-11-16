@@ -862,7 +862,7 @@ pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // and their pointer arrays do not fit the eager stack.
     let req = match super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget()) {
         Ok(r) => r,
-        Err(e) => return e,
+        Err(e) => return e.ret(),
     };
     // Gated 2026-08-30: once per `execve` at up to 2048 bytes, a `cargo build`
     // prints a full rustc/ld command line per compilation unit. Turn
@@ -943,7 +943,7 @@ impl super::execve::ExecArch for NativeExec {
     type Image = NativeImage;
     type Loaded = akuma_exec::process::LoadedExec;
 
-    fn read(&self, path: &str) -> Result<NativeImage, u64> {
+    fn read(&self, path: &str) -> Result<NativeImage, Errno> {
         // M5c hold-shortening: the BKL is DROPPED around the whole-file read so
         // peer cores can enter the kernel while this core waits on disk
         // (execve's dominant BKL-held window). Safe: nothing has touched the
@@ -979,7 +979,7 @@ impl super::execve::ExecArch for NativeExec {
         }
     }
 
-    fn load(&self, image: NativeImage, path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Self::Loaded, u64> {
+    fn load(&self, image: NativeImage, path: &str, argv: &[Vec<u8>], envp: &[Vec<u8>]) -> Result<Self::Loaded, Errno> {
         let r = match image {
             // The whole-file buffer is freed as this arm ends, success or not:
             // a heap buffer still owned when `enter` `eret`s is leaked (~1.1 MB
@@ -993,11 +993,11 @@ impl super::execve::ExecArch for NativeExec {
             // (no PT_LOAD, bad magic) — Linux's `ENOEXEC`. "do not fit" is the
             // stack builder refusing argv/envp.
             if e.contains("do not fit") {
-                E2BIG
+                Errno::E2BIG
             } else if e.contains("Failed to load ELF") {
-                ENOEXEC
+                Errno::ENOEXEC
             } else {
-                ENOMEM
+                Errno::ENOMEM
             }
         })
     }
@@ -1015,10 +1015,10 @@ impl super::execve::ExecArch for NativeExec {
         akuma_exec::process::with_own_process_exclusive(f).unwrap_or(ESRCH)
     }
 
-    fn install(&self, proc: &akuma_exec::process::Process, loaded: Self::Loaded) -> Result<(), u64> {
+    fn install(&self, proc: &akuma_exec::process::Process, loaded: Self::Loaded) -> Result<(), Errno> {
         proc.install_loaded(loaded, &[]).map_err(|e| {
             akuma_primitives::safe_print!(128, "[syscall] execve: install failed: {}\n", e);
-            ENOMEM
+            Errno::ENOMEM
         })
     }
 
@@ -1601,22 +1601,22 @@ const _: () = {
 /// The credentials a `SPAWN_EXT` asks for, checked against the caller's: the
 /// caller's own, lowered by `setgroups`/`setgid`/`setuid` in the order a
 /// privilege-dropping wrapper makes them. `None` = not requested (inherit).
-fn spawn_creds(o: &SpawnOptions) -> Result<Option<akuma_isolation::creds::Creds>, u64> {
+fn spawn_creds(o: &SpawnOptions) -> Result<Option<akuma_isolation::creds::Creds>, Errno> {
     use akuma_isolation::creds::{CredError, NGROUPS};
     if o.cred_flags & SPAWN_CREDS_SET == 0 {
         return Ok(None);
     }
     let n = o.ngroups as usize;
     if n > NGROUPS {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     let mut buf = [0u8; NGROUPS * 4];
     if n > 0 {
         if !validate_user_ptr(o.groups_ptr, n * 4) {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         if copy_from_user(&mut buf[..n * 4], o.groups_ptr).is_err() {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
     }
     let mut groups = [0u32; NGROUPS];
@@ -1625,8 +1625,8 @@ fn spawn_creds(o: &SpawnOptions) -> Result<Option<akuma_isolation::creds::Creds>
     }
     let mut c = akuma_exec::process::current_creds();
     let errno = |e| match e {
-        CredError::Perm => EPERM,
-        CredError::Inval => EINVAL,
+        CredError::Perm => Errno::EPERM,
+        CredError::Inval => Errno::EINVAL,
     };
     c.set_groups(&groups[..n]).map_err(errno)?;
     c.set_gid(o.gid).map_err(errno)?;
@@ -1672,17 +1672,17 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     // the list where it stood.
     let req = super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
     let stdin_data = if stdin_ptr != 0 {
-        if stdin_len > SPAWN_STDIN_MAX { return Err(E2BIG); }
+        if stdin_len > SPAWN_STDIN_MAX { return Err(Errno::E2BIG); }
         // Bounded above, then validated and copied in one step. The explicit `validate_user_ptr` that used to precede
         // this skipped itself under the self-tests' bypass, and `copy_from_user` validates anyway.
-        let Ok(data) = read_user_vec(stdin_ptr, stdin_len, SPAWN_STDIN_MAX) else { return Err(EFAULT) };
+        let Ok(data) = read_user_vec(stdin_ptr, stdin_len, SPAWN_STDIN_MAX) else { return Err(Errno::EFAULT) };
         Some(data)
     } else {
         None
     };
     let pid = spawn_request(req, stdin_data.as_deref(), pty, false, None)?;
     let Some(proc) = akuma_exec::process::current_process_shared() else {
-        return Err(ESRCH);
+        return Err(Errno::ESRCH);
     };
     Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32))
 }
@@ -1705,7 +1705,7 @@ pub fn spawn_request(
     pty: bool,
     own_terminal: bool,
     attach: Option<akuma_exec::process::Attach>,
-) -> Result<u32, u64> {
+) -> Result<u32, Errno> {
     let super::execve::Request { path, argv, envp } = req;
     if let Err(e) = akuma_vfs_glue::file_size(&akuma_vfs_glue::resolve_symlinks(&path)) {
         return Err(super::fs::fs_error_to_errno(e));
@@ -1725,7 +1725,7 @@ pub fn spawn_request(
         }
         Err(e) => {
             akuma_primitives::safe_print!(128, "[spawn] path={} failed: {}\n", path, e);
-            Err(ENOMEM)
+            Err(Errno::ENOMEM)
         }
     }
 }
@@ -1750,7 +1750,7 @@ const SPAWN_OPTIONS_V1_SIZE: usize = 72;
 pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64, _a4: u64, _a5: u64) -> SysResult {
     let path = copy_from_user_str(path_ptr, 512)?;
 
-    if options_ptr == 0 { return Err(EINVAL); }
+    if options_ptr == 0 { return Err(Errno::EINVAL); }
     // Zeroed, then filled only as far as the caller actually wrote: every field
     // the caller does not know about reads as 0, which is each one's "unset".
     let mut o = SpawnOptions::default();
@@ -1761,12 +1761,12 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
         (options_len as usize).min(known)
     };
     if supplied < SPAWN_OPTIONS_V1_SIZE {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     {
         let bytes = as_user_bytes_mut(core::slice::from_mut(&mut o));
         if copy_from_user(&mut bytes[..supplied], options_ptr).is_err() {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
     }
 
@@ -1779,7 +1779,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
         let (caller_box, caller_pid) = super::caller_box_and_pid();
         let registry = akuma_exec::process::registry_snapshot();
         if !akuma_exec::process::box_access::can_access_box(&registry, CallerBox(BoxId(caller_box)), target_box, caller_pid) {
-            return Err(EPERM);
+            return Err(Errno::EPERM);
         }
     }
 
@@ -1787,8 +1787,8 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
         // Both lengths below come from the caller's `SpawnOptions` and size a
         // kernel buffer; unbounded, `cwd_len = usize::MAX` was a capacity-overflow
         // panic, which halts the kernel.
-        if o.cwd_len > 4096 { return Err(EINVAL); }
-        let Ok(kernel_cwd) = read_user_vec(o.cwd_ptr, o.cwd_len, 4096) else { return Err(EFAULT) };
+        if o.cwd_len > 4096 { return Err(Errno::EINVAL); }
+        let Ok(kernel_cwd) = read_user_vec(o.cwd_ptr, o.cwd_len, 4096) else { return Err(Errno::EFAULT) };
         Some(alloc::string::String::from_utf8(kernel_cwd).unwrap_or_else(|_| String::from("/")))
     } else {
         None
@@ -1806,8 +1806,8 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
     let stdin_data = if o.stdin_ptr != 0 {
-        if o.stdin_len > SPAWN_STDIN_MAX { return Err(E2BIG); }
-        let Ok(data) = read_user_vec(o.stdin_ptr, o.stdin_len, SPAWN_STDIN_MAX) else { return Err(EFAULT) };
+        if o.stdin_len > SPAWN_STDIN_MAX { return Err(Errno::E2BIG); }
+        let Ok(data) = read_user_vec(o.stdin_ptr, o.stdin_len, SPAWN_STDIN_MAX) else { return Err(Errno::EFAULT) };
         Some(data)
     } else {
         None
@@ -1842,7 +1842,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
             return Ok(u64::from(pid) | (u64::from(proc.alloc_fd(akuma_exec::process::FileDescriptor::ChildStdout(pid))) << 32));
         }
     }
-    Err(ENOMEM)
+    Err(Errno::ENOMEM)
 }
 
 /// `SET_BOX_STACK(box_id, stack)` — select a box's network stack.

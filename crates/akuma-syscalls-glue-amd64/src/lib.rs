@@ -281,7 +281,7 @@ fn put_stat(buf: u64, g: &akuma_syscalls_linux::Stat) -> u64 {
 pub fn fstat(fd: u64, buf: u64) -> u64 {
     match glue::fs::fstat_fill(fd as u32) {
         Ok(g) => put_stat(buf, &g),
-        Err(e) => e,
+        Err(e) => e.ret(),
     }
 }
 
@@ -298,7 +298,7 @@ pub fn newfstatat(dirfd: u64, path: u64, buf: u64, flags: u64) -> u64 {
     }
     match glue::fs::newfstatat_fill(dirfd as i32, &raw, flags as u32) {
         Ok(g) => put_stat(buf, &g),
-        Err(e) => e,
+        Err(e) => e.ret(),
     }
 }
 

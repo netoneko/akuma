@@ -1239,7 +1239,7 @@ pub fn pselect6_timeout_us(
     // `akuma_syscalls_poll::fdset` — pure, and untested until it existed. The
     // buffers stay here: they are stack storage the copy-in/copy-out below
     // reads and writes, which is a user-memory access, not arithmetic.
-    if !fdset::nfds_ok(nfds) { return Err(EINVAL); }
+    if !fdset::nfds_ok(nfds) { return Err(Errno::EINVAL); }
     let fd_set_bytes = fdset::bytes(nfds);
 
     let mut orig_read = [0u64; fdset::MAX_WORDS];
@@ -1249,13 +1249,13 @@ pub fn pselect6_timeout_us(
         && copy_from_user(&mut as_user_bytes_mut(&mut orig_read)[..fd_set_bytes], readfds_ptr)
             .is_err()
     {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     if writefds_ptr != 0
         && copy_from_user(&mut as_user_bytes_mut(&mut orig_write)[..fd_set_bytes], writefds_ptr)
             .is_err()
     {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
@@ -1340,19 +1340,19 @@ pub fn pselect6_timeout_us(
             if readfds_ptr != 0
                 && copy_to_user(readfds_ptr, &as_user_bytes(&out_read)[..fd_set_bytes]).is_err()
             {
-                return Err(EFAULT);
+                return Err(Errno::EFAULT);
             }
             if writefds_ptr != 0
                 && copy_to_user(writefds_ptr, &as_user_bytes(&out_write)[..fd_set_bytes]).is_err()
             {
-                return Err(EFAULT);
+                return Err(Errno::EFAULT);
             }
             // No exceptional conditions exist here, but the set still has to be
             // written — see this function's doc comment.
             if exceptfds_ptr != 0 {
                 let cleared = [0u8; fdset::MAX_FDS / 8];
                 if copy_to_user(exceptfds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                    return Err(EFAULT);
+                    return Err(Errno::EFAULT);
                 }
             }
             return Ok(ready_count);
@@ -1364,13 +1364,13 @@ pub fn pselect6_timeout_us(
             // function's doc comment and `run_pselect6_exceptfds_test`.
             let cleared = [0u8; fdset::MAX_FDS / 8];
             if readfds_ptr != 0 && copy_to_user(readfds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                return Err(EFAULT);
+                return Err(Errno::EFAULT);
             }
             if writefds_ptr != 0 && copy_to_user(writefds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                return Err(EFAULT);
+                return Err(Errno::EFAULT);
             }
             if exceptfds_ptr != 0 && copy_to_user(exceptfds_ptr, &cleared[..fd_set_bytes]).is_err() {
-                return Err(EFAULT);
+                return Err(Errno::EFAULT);
             }
             return Ok(0);
         }
@@ -1389,7 +1389,7 @@ pub fn pselect6_timeout_us(
         // EINTR, and that is what ppoll does too.
         match step {
             // Linux leaves the fd sets unmodified on EINTR, and so does ppoll.
-            WaitStep::Failed(WaitError::Interrupted) => return Err(EINTR),
+            WaitStep::Failed(WaitError::Interrupted) => return Err(Errno::EINTR),
             WaitStep::Park { deadline_us, .. } => {
                 akuma_exec::threading::schedule_blocking(deadline_us);
             }
@@ -1684,7 +1684,7 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
     // the `MAX_FDS`-is-a-lookup-bound rule in
     // `docs/archive/AKUMA_AMD64_4B_FOLD_BATCH2D.md`.
     if !fdset::nfds_ok(nfds) {
-        return Err(EINVAL);
+        return Err(Errno::EINVAL);
     }
     // nfds == 0 is NOT "nothing to do, return immediately" — Linux blocks until
     // the timeout (or forever, if timeout is NULL) or a signal, and musl's
@@ -1693,7 +1693,7 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
     // instantly instead of blocking. fds_ptr/fds_size stay unvalidated/unused
     // below when nfds == 0, matching musl passing a NULL fds pointer.
     let fds_size = nfds * core::mem::size_of::<PollFd>();
-    if nfds > 0 && !validate_user_ptr(fds_ptr, fds_size) { return Err(EFAULT); }
+    if nfds > 0 && !validate_user_ptr(fds_ptr, fds_size) { return Err(Errno::EFAULT); }
 
     // NULL timeout = block indefinitely. `infinite`/`timeout_us` stay two
     // locals because the wait loops below read them separately; the pair is
@@ -1712,7 +1712,7 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
     let start_time = akuma_primitives::clock::uptime_us();
     let mut kernel_fds = alloc::vec![PollFd { fd: 0, events: 0, revents: 0 }; nfds];
     if nfds > 0 && copy_from_user(as_user_bytes_mut(&mut kernel_fds), fds_ptr).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
 
     // Register the calling thread as a waker on each polled fd's underlying
@@ -1795,7 +1795,7 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
         match machine.lap_end(&obs) {
             WaitStep::Ready => {
                 if nfds > 0 && copy_to_user(fds_ptr, as_user_bytes(&kernel_fds)).is_err() {
-                    return Err(EFAULT);
+                    return Err(Errno::EFAULT);
                 }
                 return Ok(ready_count as u64);
             }
@@ -1807,14 +1807,14 @@ pub fn ppoll_timeout_us(fds_ptr: u64, nfds: usize, timeout_us: Option<u64>) -> S
             // (`docs/archive/FIRECRACKER_GUEST_HANG.md`).
             WaitStep::Failed(WaitError::TimedOut) => {
                 if nfds > 0 && copy_to_user(fds_ptr, as_user_bytes(&kernel_fds)).is_err() {
-                    return Err(EFAULT);
+                    return Err(Errno::EFAULT);
                 }
                 return Ok(0);
             }
             // The signal is delivered by the syscall-return path; without
             // returning to it the wake is consumed and ppoll sleeps through
             // its own SIGALRM.
-            WaitStep::Failed(WaitError::Interrupted) => return Err(EINTR),
+            WaitStep::Failed(WaitError::Interrupted) => return Err(Errno::EINTR),
             WaitStep::Relap(_) => {}
             WaitStep::Park { deadline_us, .. } => {
                 akuma_exec::threading::schedule_blocking(deadline_us);

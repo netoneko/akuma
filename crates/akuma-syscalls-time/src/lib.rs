@@ -347,14 +347,12 @@ pub fn sys_clock_gettime(clock_id_arg: u64, tp: UserAddr) -> u64 {
 ///
 /// The NULL check is deliberately *not* folded into `read_user_into`'s EFAULT:
 /// address 0 is a legal "no timeout" argument here, not a bad pointer.
-pub fn read_timeout_us(ptr: u64) -> Result<Option<u64>, u64> {
+pub fn read_timeout_us(ptr: u64) -> Result<Option<u64>, akuma_primitives::errno::Errno> {
     if ptr == 0 {
         return Ok(None);
     }
     let mut ts = Timespec::default();
-    if read_user_into(&mut ts, ptr).is_err() {
-        return Err(EFAULT);
-    }
+    read_user_into(&mut ts, ptr)?;
     Ok(Some(ts.to_us()))
 }
 

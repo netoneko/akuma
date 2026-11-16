@@ -67,9 +67,6 @@ pub const fn neg_errno(e: i32) -> u64 {
 pub struct Errno(core::num::NonZeroU16);
 
 impl Errno {
-    /// Bad user address; what every failed user copy reports.
-    pub const EFAULT: Errno = Errno::new(EFAULT);
-
     /// An errno from its positive value. Panics (at compile time in a `const`) on zero or a value over `u16::MAX`.
     #[must_use]
     pub const fn new(code: i32) -> Errno {
@@ -85,6 +82,14 @@ impl Errno {
     #[must_use]
     pub const fn from_raw(code: u64) -> Errno {
         if code == 0 || code > u16::MAX as u64 { Errno::EFAULT } else { Errno::new(code as i32) }
+    }
+
+    /// Decode a syscall return value in the ABI's error form (`x0 = -errno`, a value in `-4095..=-1`). `None` for
+    /// anything else, which is a success value and not an error.
+    #[must_use]
+    pub const fn from_negated(ret: u64) -> Option<Errno> {
+        let v = ret as i64;
+        if v >= -4095 && v <= -1 { Some(Errno::new((-v) as i32)) } else { None }
     }
 
     /// The positive value (`14` for `EFAULT`).
@@ -114,6 +119,10 @@ macro_rules! errno_table {
         /// so these cannot drift from their positive counterparts.
         pub mod negated {
             $($(#[$doc])* pub const $name: u64 = super::neg_errno(super::$name);)*
+        }
+
+        impl Errno {
+            $($(#[$doc])* pub const $name: Errno = Errno::new($name);)*
         }
 
         /// Every (name, positive value) pair, for the table-wide invariant tests.
@@ -157,6 +166,8 @@ errno_table! {
     EMLINK = 31;
     EPIPE = 32;
     ERANGE = 34;
+    /// A path component or the whole path is too long.
+    ENAMETOOLONG = 36;
     ENOSYS = 38;
     ENOTEMPTY = 39;
     /// Too many levels of symbolic links, and `open(O_NOFOLLOW)` on a symlink.
@@ -214,6 +225,17 @@ errno_table! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn from_negated_decodes_only_the_abi_error_range() {
+        for &(name, value) in ALL {
+            assert_eq!(Errno::from_negated(neg_errno(value)).map(Errno::code), Some(value), "{name}");
+        }
+        assert_eq!(Errno::from_negated(0), None, "0 is success");
+        assert_eq!(Errno::from_negated(14), None, "a positive 14 is a success value, not EFAULT");
+        assert_eq!(Errno::from_negated(neg_errno(4096)), None, "past the ABI's error range");
+        assert_eq!(Errno::from_negated(u64::MAX), Some(Errno::new(1)), "-1 is EPERM");
+    }
 
     #[test]
     fn errno_type_round_trips_and_negates_once() {
@@ -291,6 +313,7 @@ mod tests {
             ("ENFILE", ENFILE, 23),
             ("EMFILE", EMFILE, 24),
             ("ETXTBSY", ETXTBSY, 26),
+            ("ENAMETOOLONG", ENAMETOOLONG, 36),
             ("EADDRINUSE", EADDRINUSE, 98),
             ("ETIMEDOUT", ETIMEDOUT, 110),
             ("EINPROGRESS", EINPROGRESS, 115),

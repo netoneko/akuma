@@ -528,14 +528,14 @@ fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32, dest_addr: u64,
         return Ok(super::unixsock::unix_sendto(fd, &[], dest.as_ref(), dontwait));
     }
     if !validate_user_ptr(buf_ptr, len) {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     let mut kbuf = match alloc_net_bounce(len) {
         Some(b) => b,
-        None => return Err(ENOMEM),
+        None => return Err(Errno::ENOMEM),
     };
     if copy_from_user(&mut kbuf, buf_ptr).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     Ok(super::unixsock::unix_sendto(fd, &kbuf, dest.as_ref(), dontwait))
 }
@@ -1070,14 +1070,14 @@ pub(super) fn sys_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, opt
 // It was ungated while this file lived in the binary and the workspace's
 // `dead_code = "deny"` did not catch it; as a crate it does.
 #[cfg(feature = "smoltcp")]
-fn gather_iovecs(iovs: &[super::fs::IoVec]) -> Result<alloc::vec::Vec<u8>, u64> {
+fn gather_iovecs(iovs: &[super::fs::IoVec]) -> Result<alloc::vec::Vec<u8>, Errno> {
     let total = iovs.iter().fold(0usize, |a, v| a.saturating_add(v.iov_len));
     if total == 0 {
         return Ok(alloc::vec::Vec::new());
     }
     let mut buf = match alloc_net_bounce(total) {
         Some(b) => b,
-        None => return Err(ENOMEM),
+        None => return Err(Errno::ENOMEM),
     };
     // `alloc_net_bounce` may hand back a single page instead of the full size
     // under memory pressure; copy only as much as it actually gave us and let
@@ -1092,11 +1092,11 @@ fn gather_iovecs(iovs: &[super::fs::IoVec]) -> Result<alloc::vec::Vec<u8>, u64> 
             continue;
         }
         if !validate_user_ptr(iov.iov_base, iov.iov_len) {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         let n = iov.iov_len.min(cap - off);
         if copy_from_user(&mut buf[off..off + n], iov.iov_base).is_err() {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         off += n;
     }
@@ -1110,7 +1110,7 @@ fn gather_iovecs(iovs: &[super::fs::IoVec]) -> Result<alloc::vec::Vec<u8>, u64> 
 /// filled `iovs[0]` only, so a caller that split a fixed header from a payload
 /// buffer — the normal way to read a framed protocol — got the header and
 /// nothing else.
-fn scatter_iovecs(iovs: &[super::fs::IoVec], data: &[u8]) -> Result<usize, u64> {
+fn scatter_iovecs(iovs: &[super::fs::IoVec], data: &[u8]) -> Result<usize, Errno> {
     let mut off = 0usize;
     for iov in iovs {
         if off >= data.len() {
@@ -1120,11 +1120,11 @@ fn scatter_iovecs(iovs: &[super::fs::IoVec], data: &[u8]) -> Result<usize, u64> 
             continue;
         }
         if !validate_user_ptr(iov.iov_base, iov.iov_len) {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         let n = iov.iov_len.min(data.len() - off);
         if copy_to_user(iov.iov_base, &data[off..off + n]).is_err() {
-            return Err(EFAULT);
+            return Err(Errno::EFAULT);
         }
         off += n;
     }
@@ -1243,19 +1243,19 @@ const MAX_CONTROL: u64 = 20480;
 /// The `SCM_RIGHTS` descriptors in a `sendmsg` control buffer, referenced and
 /// ready to ride on the message. No control buffer is no descriptors.
 #[cfg(feature = "smoltcp")]
-fn read_scm_rights(msg: &MsgHdr) -> Result<super::unixsock::InFlight, u64> {
+fn read_scm_rights(msg: &MsgHdr) -> Result<super::unixsock::InFlight, Errno> {
     if msg.msg_control == 0 || msg.msg_controllen == 0 {
         return Ok(super::unixsock::InFlight::none());
     }
     if msg.msg_controllen > MAX_CONTROL {
-        return Err(ENOBUFS);
+        return Err(Errno::ENOBUFS);
     }
     let len = msg.msg_controllen as usize;
     if !validate_user_ptr(msg.msg_control, len) {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
-    let Ok(control) = read_user_vec(msg.msg_control, len, MAX_CONTROL as usize) else { return Err(EFAULT) };
-    let fds = akuma_net_unix::scm::parse_rights(&control).map_err(neg_errno)?;
+    let Ok(control) = read_user_vec(msg.msg_control, len, MAX_CONTROL as usize) else { return Err(Errno::EFAULT) };
+    let fds = akuma_net_unix::scm::parse_rights(&control).map_err(Errno::new)?;
     if fds.is_empty() {
         return Ok(super::unixsock::InFlight::none());
     }
@@ -1271,7 +1271,7 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
     } else {
         match alloc_net_bounce(capacity) {
             Some(b) => b,
-            None => return Err(ENOMEM),
+            None => return Err(Errno::ENOMEM),
         }
     };
     let (ret, truncated, mut anc, creds) = super::unixsock::unix_recv_anc(
@@ -1308,7 +1308,7 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
         if cap >= scm::CREDS_SPACE {
             if copy_to_user(msg.msg_control, &scm::encode_creds(c)).is_err() {
                 super::unixsock::scm_release(anc);
-                return Err(EFAULT);
+                return Err(Errno::EFAULT);
             }
             creds_used = scm::CREDS_SPACE;
         } else {
@@ -1322,12 +1322,12 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
     let fds = super::unixsock::scm_install(anc, flags & scm::MSG_CMSG_CLOEXEC != 0);
     let (control, used) = scm::encode_rights(&fds, cap_rights);
     if used > 0 && copy_to_user(msg.msg_control + creds_used as u64, &control).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     msg.msg_controllen = (creds_used + used) as u64;
     msg.msg_flags = if truncated { MSG_TRUNC } else { 0 } | if ctrunc { scm::MSG_CTRUNC } else { 0 };
     if write_user_val(msg_ptr, msg).is_err() {
-        return Err(EFAULT);
+        return Err(Errno::EFAULT);
     }
     Ok(written as u64)
 }
@@ -1366,7 +1366,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // kernel's own `sendmsg` — which gathered — folded into it (2026-11-11).
     let kernel_buf = match gather_iovecs(&iovs) {
         Ok(b) => b,
-        Err(e) => return e,
+        Err(e) => return e.ret(),
     };
     if kernel_buf.is_empty() { return 0; }
 
@@ -1553,7 +1553,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 }
                 let n = match scatter_iovecs(&iovs, &kernel_buf[..n]) {
                     Ok(n) => n,
-                    Err(e) => return e,
+                    Err(e) => return e.ret(),
                 };
                 if msg.msg_name != 0 && msg.msg_namelen >= core::mem::size_of::<SockAddrIn>() as u32
                     && validate_user_ptr(msg.msg_name, core::mem::size_of::<SockAddrIn>()) {
@@ -1582,7 +1582,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
                 }
                 let n = match scatter_iovecs(&iovs, &kernel_buf[..n]) {
                     Ok(n) => n,
-                    Err(e) => return e,
+                    Err(e) => return e.ret(),
                 };
                 msg.msg_controllen = 0;
                 msg.msg_flags = 0;
