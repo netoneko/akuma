@@ -28,8 +28,11 @@ use alloc::format;
 use akuma_wifi::cmd::{self, Command};
 use akuma_wifi::status::{Link, Status};
 use akuma_wifi::{IfName, Ssid};
-use libakuma::{arg, argc, chmod, close, exit, mkdir_p, open, open_flags, print, read, read_dir, sleep_ms, unlink, write};
-use wifi::{AutoStep, CONFIG_DIR, Network, auto_backoff, auto_step, choose, derive_psk, parse_config, printable_ssid, valid_name, valid_passphrase};
+use libakuma::{arg, argc, chmod, close, exit, mkdir_p, open, open_flags, print, read, read_dir, rename, sleep_ms, syscall, unlink, write};
+use wifi::{
+    AutoStep, CONFIG_DIR, Network, auto_backoff, auto_step, choose, derive_psk, parse_config, printable_ssid, replacing,
+    scan_mark, valid_name, valid_passphrase,
+};
 
 const DEVICE: &str = "/dev/wifi0";
 const IFACE: &[u8] = b"wlan0";
@@ -169,26 +172,73 @@ fn load(name: &str) -> Network {
 }
 
 /// Write `/etc/wifi/<name>`, root-only before any byte of the key is in it.
+///
+/// Written to `.<name>.tmp` (a dot-name, which [`known`] never reads) and
+/// renamed over the real file, so a crash or a full disk mid-write leaves the
+/// old file intact rather than a truncated one that `wifi auto` then skips as
+/// unparseable - which on a box reached over wifi is the box gone.
 fn save(n: &Network) {
     if !mkdir_p(CONFIG_DIR) {
         fail(&format!("cannot create {CONFIG_DIR}"));
     }
-    chmod(CONFIG_DIR, 0o700);
-    let path = format!("{CONFIG_DIR}/{}", n.name);
-    let fd = open(&path, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-    if fd < 0 {
-        fail(&format!("{path}: cannot create ({fd})"));
+    if chmod(CONFIG_DIR, 0o700) < 0 {
+        fail(&format!("{CONFIG_DIR}: cannot make it root-only; not writing a key into it"));
     }
-    if chmod(&path, 0o600) < 0 {
+    let path = format!("{CONFIG_DIR}/{}", n.name);
+    let tmp = format!("{CONFIG_DIR}/.{}.tmp", n.name);
+    unlink(&tmp);
+    let fd = open(&tmp, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
+    if fd < 0 {
+        fail(&format!("{tmp}: cannot create ({fd})"));
+    }
+    if chmod(&tmp, 0o600) < 0 {
         close(fd);
-        unlink(&path);
-        fail(&format!("{path}: cannot make it root-only; not writing the key"));
+        unlink(&tmp);
+        fail(&format!("{tmp}: cannot make it root-only; not writing the key"));
     }
     let text = n.to_config();
     let w = write(fd, text.as_bytes());
     close(fd);
     if w < 0 || w as usize != text.len() {
-        fail(&format!("{path}: write failed ({w})"));
+        unlink(&tmp);
+        fail(&format!("{tmp}: write failed ({w})"));
+    }
+    let r = rename(&tmp, &path);
+    if r < 0 {
+        unlink(&tmp);
+        fail(&format!("{path}: cannot replace it ({r})"));
+    }
+}
+
+/// Linux `TCGETS`/`TCSETS` (the same numbers on x86_64 and aarch64) and the
+/// 36-byte kernel `struct termios` they move: four `u32` flag words, then
+/// `c_line` and `c_cc`. `c_lflag` is the fourth word.
+const TCGETS: u64 = 0x5401;
+const TCSETS: u64 = 0x5402;
+const LFLAG_OFFSET: usize = 12;
+const ECHO: u32 = 0o10;
+
+/// Turn terminal echo off on stdin, returning the settings to put back, or
+/// `None` when stdin is not a terminal (a redirected file needs nothing).
+fn echo_off() -> Option<[u8; 36]> {
+    let mut saved = [0u8; 36];
+    if (syscall(syscall::IOCTL, 0, TCGETS, saved.as_mut_ptr() as u64, 0, 0, 0) as i64) < 0 {
+        return None;
+    }
+    let mut quiet = saved;
+    let mut lflag = [0u8; 4];
+    lflag.copy_from_slice(&quiet[LFLAG_OFFSET..LFLAG_OFFSET + 4]);
+    let lflag = u32::from_ne_bytes(lflag) & !ECHO;
+    quiet[LFLAG_OFFSET..LFLAG_OFFSET + 4].copy_from_slice(&lflag.to_ne_bytes());
+    if (syscall(syscall::IOCTL, 0, TCSETS, quiet.as_ptr() as u64, 0, 0, 0) as i64) < 0 {
+        return None;
+    }
+    Some(saved)
+}
+
+fn echo_restore(saved: Option<[u8; 36]>) {
+    if let Some(t) = saved {
+        syscall(syscall::IOCTL, 0, TCSETS, t.as_ptr() as u64, 0, 0, 0);
     }
 }
 
@@ -228,7 +278,7 @@ fn cmd_scan() {
     let mut rows: Vec<_> = s.results().to_vec();
     rows.sort_by_key(|b| core::cmp::Reverse(b.signal));
     for b in rows {
-        let mark = if known.iter().any(|n| n.ssid == b.ssid) { '*' } else { ' ' };
+        let mark = scan_mark(&known, &b);
         out(&format!(" {mark} {:>4}  {:>4} {:<9} {} {}\n", b.signal, b.chan, b.security.name(), mac(&b.bssid), printable_ssid(&b.ssid)));
     }
 }
@@ -262,8 +312,12 @@ fn cmd_add(open_net: bool) {
     let psk = if open_net {
         None
     } else {
-        // One line on stdin. Not echo-suppressed yet: pipe it in
-        // (`wifi add home < file`) rather than typing it at a shared screen.
+        // One line on stdin. On a terminal, echo is off while it is typed, so
+        // the passphrase is not left on the screen (or in a console log).
+        let saved = echo_off();
+        if saved.is_some() {
+            out("passphrase: ");
+        }
         let mut buf = [0u8; 128];
         let mut len = 0;
         while len < buf.len() {
@@ -276,6 +330,10 @@ fn cmd_add(open_net: bool) {
                 break;
             }
         }
+        echo_restore(saved);
+        if saved.is_some() {
+            out("\n");
+        }
         let line = buf[..len].split(|&c| c == b'\n').next().unwrap_or(&[]);
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if !valid_passphrase(line) {
@@ -286,8 +344,13 @@ fn cmd_add(open_net: bool) {
         buf.fill(0);
         Some(k)
     };
-    save(&Network { name: String::from(name), ssid, psk, priority: 0, autoconnect: true, bssid: None });
-    out(&format!("added {name} ({CONFIG_DIR}/{name}, {})\n", if open_net { "open" } else { "psk" }));
+    // Re-adding a network keeps what was set on it (see `wifi::replacing`).
+    let path = format!("{CONFIG_DIR}/{name}");
+    let old = read_file(&path).and_then(|t| parse_config(name, &t).ok());
+    let verb = if old.is_some() { "updated" } else { "added" };
+    let fresh = Network { name: String::from(name), ssid, psk, priority: 0, autoconnect: true, bssid: None };
+    save(&replacing(fresh, old.as_ref()));
+    out(&format!("{verb} {name} ({path}, {})\n", if open_net { "open" } else { "psk" }));
 }
 
 fn cmd_connect() {
@@ -310,8 +373,16 @@ fn cmd_connect() {
 
 fn cmd_forget() {
     let name = arg(2).unwrap_or_else(|| usage());
-    let n = load(name);
-    if let Ok(s) = read_status()
+    if !valid_name(name) {
+        fail("network names are 1-64 of [A-Za-z0-9._-], not starting with a dot");
+    }
+    let path = format!("{CONFIG_DIR}/{name}");
+    // A file that no longer parses must still be removable: `forget` used to
+    // `load` it first and stop at the parse error, so the only way to drop a
+    // broken file was `rm`. Disconnect only when it parses and is the link.
+    let text = read_file(&path).unwrap_or_else(|| fail(&format!("no such network: {path}")));
+    if let Ok(n) = parse_config(name, &text)
+        && let Ok(s) = read_status()
         && s.link == Link::Connected
         && s.ssid == n.ssid
     {
