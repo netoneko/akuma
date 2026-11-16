@@ -30,16 +30,20 @@ Still open:
 - **H1, partly:** `dac=1` on the boot line now enforces mode bits from init (`467af9ff`), but
   it is not the default, sshd still logs every user in as uid 0, and services still run as root.
   Intermediate-directory search permission is still unchecked.
-- **H3, partly:** the program base, stack top and `mmap` area are randomized (`8a7fe7b0`). Not
-  randomized: the dynamic linker (so libc in dynamic programs), non-PIE programs, the brk heap
-  relative to its image, the amd64 stack top, and the kernel.
-- **H4, partly:** the AWS image carries no host key (`ee9670d0`) and the metadata address is
-  closed to everything but host root (`2e906d33`). Still missing: a first-boot service that
-  fetches the launch key, so `authorized_keys` is still whatever the image was built with.
+- **H3:** the program base, the dynamic linker, the stack top and the `mmap` area are randomized
+  (`8a7fe7b0`, `25bc71ab`). Not randomized: non-PIE programs, the brk heap relative to its image,
+  the amd64 stack top, and the kernel.
+- **H4:** the AWS image carries no host key (`ee9670d0`), the metadata address is closed to
+  everything but host root (`2e906d33`), and `/sbin/instance-key` (a herd oneshot in the AWS
+  image) installs each instance's launch key at boot. The script is tested against a stand-in
+  metadata service in a container (ten cases) and inside an Akuma guest; it has **not** run
+  against real EC2 or Firecracker MMDS, and the image with the service in it has not been built.
+  A builder who wants no baked key at all passes a `--pubkey` file that does not exist.
 - **H5:** done as an opt-in. `net.allow=` installs the ingress filter (`2e906d33`); without the
   parameter nothing is filtered. There is no egress filter beyond the metadata address.
-- **H6:** done in the scripts (`ee9670d0`) but **no image has been built with it**: docker was
-  not available where the change was made.
+- **H6:** done (`ee9670d0`). The exact `apk add --keys-dir` command was run in an arm64 Alpine
+  container: it installs with the container's keys and refuses with an empty key directory. The
+  whole image build was not run.
 - **M1** sshd rekeying, per-source limits, key file modes; **M3** quotas; **M4** panic triage;
   **M5** speculative-execution mitigations; **M6** AArch64 PAN; **M8** build the AMI with `server`.
 - Every host key generated before `41559adb` must be regenerated; the fix does not rotate them.
@@ -52,6 +56,10 @@ Still open:
   measured change. `akuma-pagetable`'s amd64 `read_user`/`write_user` can move into `akuma-phys`
   (which already depends on `akuma-pagetable`) for one site fewer; left because only the
   Taoxichuan kernels call them and they could not be boot-tested here.
+- Found while testing H4 and left alone: a descriptor is copied by value across `fork`, so
+  `{ cmd1; cmd2; } > file` keeps only the last command's bytes (three external `echo`s wrote one
+  line). It is `fdtable.md`'s pinned divergence 1, with its fix designed in
+  `AKUMA_FDTABLE_EXTRACTION.md`; shell scripts written for Linux lose data on it silently.
 - No boot-suite test pins the host-root gate or the bounded allocations yet; both were checked
   by hand over ssh.
 

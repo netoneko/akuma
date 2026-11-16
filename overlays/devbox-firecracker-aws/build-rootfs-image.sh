@@ -108,6 +108,12 @@ if [ "$PROFILE" = devbox ]; then
   cp -a overlays/devbox/rootfs/etc "$ROOT/etc"
   [ -d overlays/devbox/rootfs/root ] && cp -a overlays/devbox/rootfs/root "$ROOT/root"
 
+  # What only a cloud image has: /sbin/instance-key and its herd oneshot, which
+  # install the launch key of each instance at boot (the script says why).
+  say "sbin/instance-key + its herd service (overlays/devbox-firecracker-aws/rootfs)"
+  cp -a overlays/devbox-firecracker-aws/rootfs/. "$ROOT/"
+  chmod 755 "$ROOT/sbin/instance-key"
+
   # This profile takes /etc from the overlay ALONE, and the overlay carries no TLS
   # trust store -- so `curl https://...` in the guest could not verify any peer.
   # The bundle is arch-independent and lives in bootstrap/etc/ssl, which this
@@ -231,7 +237,8 @@ if [ "${DEVBOX_APK_PACKAGES:-true}" = "true" ]; then
     || die "apk staging needs docker (set DEVBOX_APK_PACKAGES=false to skip, but the
        guest will have no apk database, no git and no C toolchain)"
 
-  PKGS="ca-certificates-bundle musl git"
+  # curl: /sbin/instance-key needs it for IMDSv2 (busybox wget cannot PUT).
+  PKGS="ca-certificates-bundle musl git curl"
   [ "${DEVBOX_RUST_TOOLCHAIN:-true}" = "true" ] && PKGS="$PKGS clang lld gcc binutils make musl-dev"
   [ "${DEVBOX_STABLE_RUST:-false}" = "true" ]   && PKGS="$PKGS rust cargo"
 
