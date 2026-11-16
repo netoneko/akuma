@@ -463,13 +463,13 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
     // check below needs both** — see `slot_still_owned_by`.
     let mut all_tids = [(0usize, 0 as Pid); table::MAX_PROCESSES];
     let mut tid_count = 0;
-    if let Some(tid) = proc.thread_id.get() {
+    if let Some(tid) = proc.thread_id.get_live() {
         all_tids[tid_count] = (tid, pid);
         tid_count += 1;
     }
     table::for_each_process(|p| {
         if p.pid != pid && p.tgid == tgid
-            && let Some(tid) = p.thread_id.get()
+            && let Some(tid) = p.thread_id.get_live()
             && tid_count < all_tids.len() {
                 all_tids[tid_count] = (tid, p.pid);
                 tid_count += 1;

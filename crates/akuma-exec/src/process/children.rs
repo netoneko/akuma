@@ -95,7 +95,7 @@ fn sigchld_target_thread(tgid: Pid) -> Option<usize> {
 
     crate::process::table::for_each_process(|p| {
         if p.tgid != tgid { return; }
-        let Some(tid) = p.thread_id.get() else { return; };
+        let Some(tid) = p.thread_id.get_live() else { return; };
         if p.pid == tgid { leader_tid = Some(tid); }
         let blocks_sigchld = crate::threading::thread_signal_mask_of(tid) & SIGCHLD_BIT != 0;
         if !blocks_sigchld {

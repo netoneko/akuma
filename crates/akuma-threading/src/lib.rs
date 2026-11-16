@@ -132,7 +132,6 @@ use akuma_switch::{CtxField, ON_CPU, PER_CORE_OFFCPU, peek};
 use akuma_primitives::once::Registered;
 use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 use akuma_primitives::safe_print;
-use spinning_top::Spinlock;
 
 // `akuma-exec` compatibility aliases: these paths resolved to `crate::…` while
 // this module lived inside that crate.
@@ -3680,7 +3679,7 @@ fn check_stack_canary(stack_base: usize) -> bool {
 // Global Thread Pool
 // ============================================================================
 
-static POOL: Spinlock<ThreadPool> = Spinlock::new(ThreadPool::new());
+static POOL: akuma_irq_lock::IrqSpinlock<ThreadPool> = akuma_irq_lock::IrqSpinlock::new(ThreadPool::new());
 
 /// Initialize the thread pool
 pub fn init() {

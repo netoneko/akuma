@@ -367,7 +367,7 @@ pub fn group_cpu_time_us(tgid: Pid) -> u64 {
     let mut total = 0u64;
     for_each_process(|p| {
         if p.tgid == tgid
-            && let Some(tid) = p.thread_id.get()
+            && let Some(tid) = p.thread_id.get_live()
         {
             total = total.saturating_add(crate::threading::get_thread_cpu_time(tid));
         }

@@ -413,11 +413,11 @@ fn proc_stat_of<'a>(
         // The same per-thread microsecond counter `top`'s CORE column reads via
         // `sys_get_cpu_stats`. We do not split user from system time, so all of
         // it lands in `utime` and `stime` stays 0.
-        cpu_time_us: p.thread_id.get().map_or(0, threading::get_thread_cpu_time),
+        cpu_time_us: p.thread_id.get_live().map_or(0, threading::get_thread_cpu_time),
         uid: creds.uid(),
         gid: creds.gid(),
         groups: creds.groups(),
-        processor: p.thread_id.get().map_or(0, |t| match threading::get_thread_last_core(t) { 0xFF => 0, c => u32::from(c) }),
+        processor: p.thread_id.get_live().map_or(0, |t| match threading::get_thread_last_core(t) { 0xFF => 0, c => u32::from(c) }),
     }
 }
 

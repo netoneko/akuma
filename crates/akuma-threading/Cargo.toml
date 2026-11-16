@@ -24,6 +24,7 @@ akuma-stack = { path = "../akuma-stack" }
 akuma-trap-aarch64 = { path = "../akuma-trap-aarch64" }
 akuma-switch = { path = "../akuma-switch" }
 spinning_top = "0.3"
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 
 [features]
 bkl-smp = ["akuma-primitives/bkl-smp", "akuma-bkl/bkl-smp", "akuma-mmu/bkl-smp"]
