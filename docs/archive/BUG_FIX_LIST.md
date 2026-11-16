@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1594
-- **Docs contributing at least one fix:** 475
+- **Total distinct fixes counted:** 1662
+- **Docs contributing at least one fix:** 482
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 256 | 16.1% | 38 |
-| Memory & Virtual Memory | 201 | 12.6% | 72 |
-| Scheduler & Process Management | 154 | 9.7% | 50 |
-| SMP & Locking | 141 | 8.8% | 60 |
-| Networking | 104 | 6.5% | 38 |
-| Userspace Apps & Libraries | 42 | 2.6% | 23 |
+| Syscall / ABI Compatibility Audits | 257 | 15.5% | 39 |
+| Memory & Virtual Memory | 201 | 12.1% | 72 |
+| Scheduler & Process Management | 154 | 9.3% | 50 |
+| SMP & Locking | 141 | 8.5% | 60 |
+| Networking | 104 | 6.3% | 38 |
+| Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.6% | 6 |
-| Toolchain & Self-Hosting | 94 | 5.9% | 14 |
-| SSH | 44 | 2.8% | 22 |
-| VFS & Filesystem | 149 | 9.3% | 48 |
-| Boot & Drivers | 144 | 9.0% | 25 |
-| Signals & Exceptions | 50 | 3.1% | 20 |
-| Misc / Cross-cutting | 70 | 4.4% | 26 |
-| Console & Terminal | 63 | 4.0% | 22 |
-| Containers | 57 | 3.6% | 12 |
-| **Total** | **1594** | **100.0%** | **475** |
+| Toolchain & Self-Hosting | 94 | 5.7% | 14 |
+| SSH | 56 | 3.4% | 23 |
+| VFS & Filesystem | 149 | 9.0% | 48 |
+| Boot & Drivers | 144 | 8.7% | 25 |
+| Signals & Exceptions | 50 | 3.0% | 20 |
+| Misc / Cross-cutting | 95 | 5.7% | 27 |
+| Console & Terminal | 63 | 3.8% | 22 |
+| Containers | 69 | 4.2% | 13 |
+| **Total** | **1662** | **100.0%** | **482** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -55,7 +55,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (256 fixes, 38 docs)
+## Syscall / ABI Compatibility Audits (257 fixes, 39 docs)
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)
@@ -330,6 +330,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/DUP_LOST_O_NONBLOCK.md
 - glue's `sys_dup` and `F_DUPFD`/`F_DUPFD_CLOEXEC` (and `akuma-fdtable`'s `dup`/`dup_min`) did not copy the old number's `O_NONBLOCK` bit to the new one, as `dup3` did, so tokio's signal driver drained a blocking `try_clone()` of its non-blocking socketpair and parked forever on the second read, stopping the whole runtime; every kernel on glue had it, Taoxichuan's signal delivery was the first to run the drain
+
+### docs/archive/FORKED_DESCRIPTORS_DID_NOT_SHARE_AN_OFFSET.md
+- `KernelFile`'s offset was a plain `usize` copied by value at `dup`, `fork` and fd passing, so every copy of a descriptor had its own cursor: `{ cmd1; cmd2; } > file` kept only the last command's bytes (each forked child wrote from the offset it was forked with) and two `head -c 3` on one redirected file read the same bytes; the offset is an `Arc<AtomicUsize>` behind `pos`/`set_pos`/`advance` now, so copies share it and a second `open` still gets its own (host fd-table tests, amd64 boot suite under QEMU 832 passed, AArch64 devbox grouped output and input checked; concurrent writers through copies of one descriptor still race on the offset, and a directory's `getdents` snapshot, a block device's position and `nonblock` are still per copy)
 
 ### docs/archive/TAOXICHUAN_B9_MADVISE_PIDFD_SIGSUSPEND.md
 - glue's `pidfd_open` accepted `O_CLOEXEC` and made the fd close-on-exec only on request; Linux accepts only `PIDFD_NONBLOCK`, answers `EINVAL` for anything else and makes every pidfd close-on-exec (found by `pidfdprobe` on Linux 6.17 first; fixed for all three kernels)
@@ -1416,7 +1419,7 @@ aren't recorded anywhere else.)
 - `msg_iovlen` was unbounded into an infallible `vec!` (up to 64 GiB); over `UIO_MAXIOV` is `EMSGSIZE`
 - UDP blocking `recv` ignored `SO_RCVTIMEO` (a fixed 10 s), and socket timeouts expired as `ETIMEDOUT` instead of `EAGAIN`
 
-## Userspace Apps & Libraries (42 fixes, 23 docs)
+## Userspace Apps & Libraries (59 fixes, 25 docs)
 
 ### docs/archive/DOOM.md
 - SIGSEGV in `R_Init` — `strncpy` stub off-by-one corrupted an adjacent struct field
@@ -1505,6 +1508,27 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - herd restarted a service that failed at once every `restart_delay` forever (69 times a minute on `server`); `backoff = true` doubles the delay up to 60 s
+
+### userspace/herd/docs/ISSUES_2026_11_16.md
+- `backoff` and `console` accepted `yes` but `boxed` and `oneshot` did not, and `restart` was true for anything except `false`/`0`/`no`, so `oneshot = yes` made a service that restarts forever; `parse_bool` gives every key `true/yes/on/1` and `false/no/off/0`, and anything else keeps the default with a warning (verified on a QEMU guest)
+- ` # comment` after a value became part of it, so `restart_delay = 5000  # five seconds` silently gave the one-second default (the README's own `1000 # ms` worked only because 1000 is the default); `strip_inline_comment` drops it on every key except `env`, and a number that does not parse keeps the default and says so (verified live)
+- unknown config keys were skipped without a word, so a typo was invisible; they are still skipped, so a newer config loads on an older herd, but with a warning (verified live)
+- a `.conf` that could not be read on one reload was left out of the list, so the removal pass treated its service as disabled and stopped it; unreadable files are kept in the list and their services left as they were (not run live)
+- every 20 s herd printed `[herd] Reloading config...` and re-parsed every file, so a bad line's warning repeated forever; each service keeps the text it was parsed from, a reload re-parses only changed files and logs `Config changed: <svc>` once (verified live: one line over two quiet reloads)
+- `spawn_in_box` hard-coded `cwd = "/"`, so `workdir` on a boxed or `join_box` service and an OCI bundle's `process.cwd` did nothing; it takes `workdir`, else `process.cwd`, else `/` (an unboxed `workdir` was checked live, the boxed path was not)
+- when `core_init` was unavailable (every shared-kernel SMP boot) a service pinned with `core = N` fell back to a bare `spawn` that dropped `env`, `workdir`, `console` and `cpus` and never set `started_at_ms`, so every exit counted as a quick failure for `backoff`; the fallback calls `start_service` again with `core = 0` (not run live)
+- `log_size` started at 0 on every herd start, so a log could grow another `MAX_LOG_SIZE` past the limit, and rotation read the whole log into memory on the supervisor's thread before writing `.old`; the size starts from the file and rotation is a `rename` (not run live)
+- `write_file` issued one `write` and returned true whatever happened and `append_file` returned nothing, so a short write was reported as success; both loop over short writes and report failure, and `herd enable` removes a half-written copy
+- CLI service names went straight into paths (`herd add ../x` wrote outside `/etc/herd/available`) and every CLI command exited 0 on failure, and read-only commands created the directory tree as a side effect; `valid_service_name` guards the CLI and the control socket, failures exit 1 (verified live)
+- `start`/`stop` on the loopback control socket needed no credential, so any process that could reach loopback could stop any service; the daemon writes a random 128-bit token to `/var/run/herd/control.token` (0600, temp file and rename), `start`/`stop` must carry it, `status` stays open, and request lines are no longer logged because they carry it (verified live; the kernel does not yet enforce file modes, so until it does the token keeps out only what cannot see the host's `/var/run`)
+- `read_request_line` waited up to 1 s per connection for a silent control client while nothing else was supervised; the timeout is 250 ms and `serve_control` stops taking connections after 500 ms in one tick
+
+### userspace/wifi/docs/ISSUES_2026_11_16.md
+- `save` opened `/etc/wifi/<name>` with `O_TRUNC` and wrote into it, so a crash or full disk left a file that would not parse, which `wifi auto` refuses to use; it writes `.<name>.tmp`, makes it 0600 before the key goes in and renames it over the real file, and a failed `chmod` of `/etc/wifi` stops the save
+- `wifi add` read the passphrase with terminal echo on; it clears `ECHO` for the read and restores it, and does nothing when stdin is not a terminal
+- `wifi forget` loaded the file first and stopped at the parse error, so a broken network file could only be removed with `rm`; it validates the name and unlinks whatever the contents, disconnecting only when the file parses and names the current link
+- re-adding a known network wrote a default `Network`, so changing a password also reset its priority, autoconnect and bssid; `replacing(new, old)` keeps the first two and the bssid only if the SSID is unchanged
+- `wifi scan` marked a network `*` whenever its SSID matched a saved one, so an open twin of a saved WPA2 network looked the same; `scan_mark` gives `*` only when a saved network can join that BSS and `!` when the SSID is known but the security differs (the wifi fixes are host-tested; no `wifisim` boot was done)
 
 ## Rump Kernel & Syscall Proxy (26 fixes, 6 docs)
 
@@ -1673,7 +1697,7 @@ aren't recorded anywhere else.)
 - A cargo-cached ELF is uplifted without relinking, so the wrapper never runs and the gate's aarch64 control kernel booted the middleware `.bin`; `mw_gate.sh` runs `mkbin.sh` on the ELF after every build
 - `shanghai/build.rs` was amd64-only (no `BOOT_STACK_SIZE` branch), so Shanghai did not build for aarch64
 
-## SSH (44 fixes, 22 docs)
+## SSH (56 fixes, 23 docs)
 
 ### userspace/sshd/docs/PROCESS_PER_SESSION.md
 - Every SSH session ran as one future inside a single `sshd` process, so `panic = "abort"` — which is process-wide, not future- or thread-scoped — meant *any* panic on *any* connection dropped every other live session with it. `PROTOCOL_UNDER_LOAD.md` fixed the one known trigger (a malformed pre-KEX packet) while explicitly noting the blast radius itself remained; this closes that. Each accepted connection is now served by its own `fork()`ed child, which inherits the socket through the fd-table copy (`FdTable::clone_deep_for_fork` → `socket_clone_ref`, refcounted on close by `remove_socket` — machinery that already existed and was already correct for this case). Zero kernel changes were needed: `docs/MISSING_SOCKET_MACHINERY.md` had concluded the handoff was unbuildable, having surveyed `sys_spawn`, `SCM_RIGHTS` and procfs but not `fork()`, where the fd is never handed over at all. Verified by SIGKILLing one live session under load — exactly one peer ended, three ran to completion, the server kept serving. Bounded by a new `max_sessions` (default 24) against the global `MAX_PROCESSES = 64`, since a fully-occupied session now costs two process slots. On by default (`fork-sessions`); `SSHD_FORK_SESSIONS=0` reverts to the cooperative executor for memory-constrained images
@@ -1764,6 +1788,20 @@ aren't recorded anywhere else.)
 
 ### docs/archive/SSHD_DEAD_CLIENT_TEARDOWN.md
 - A client that vanished mid-command left its server-side shell running for about two minutes
+
+### userspace/sshd/docs/ISSUES_2026_11_16.md
+- `handle_message` dispatched on the message number alone, so `CHANNEL_OPEN` and `CHANNEL_REQUEST exec` were served in every transport phase and an unauthenticated client (a version line and two plaintext packets, no key exchange) ran a command as root; `transport::message_allowed(phase, msg)` admits one message per phase and the connection protocol only once authenticated, anything else is a disconnect (S1; reproduced on a QEMU guest, the fixed build closes the connection and creates no file; every earlier build on both architectures was exposed)
+- `packet_length` came off the wire and sized the input buffer before any check, so a client could make sshd buffer gigabytes; it is capped at `MAX_PACKET_LEN` (256 KiB) first (S2)
+- a padding length that left no payload made `packet[1 .. packet_length - padding_length]` panic and took the session down; `transport::payload_len` rejects it (S3)
+- a packet with a bad MAC was dropped and the connection kept waiting for data that would never verify; it is `PacketError::BadMac` and the connection closes (S4)
+- the version line had no length cap, and a client that sent its version line and KEXINIT in one segment had the KEXINIT dropped; the line is capped at 255 bytes (RFC 4253 4.2) and the rest of the buffer is parsed (S5)
+- `CHANNEL_REQUEST` answered `CHANNEL_SUCCESS` to every request type, so `subsystem sftp` was accepted and then nothing answered and `sftp`/`scp` hung forever; only `shell`, `exec`, `pty-req`, `env` and `window-change` are supported and the rest get `CHANNEL_FAILURE` (S6; verified live: `sftp` fails in 0.1 s)
+- every `CHANNEL_OPEN` was confirmed whatever its type, so `ssh -W`/`-L` "succeeded" and hung; a non-`session` type gets `OPEN_UNKNOWN_CHANNEL_TYPE` and a second channel `OPEN_RESOURCE_SHORTAGE` (S7; verified live: `ssh -W` fails at once)
+- the client's initial window and `WINDOW_ADJUST` were never read, so sshd could send more than the client allowed (RFC 4254 5.2); `remote_window` is tracked, stdout reads are sized by `transport::stdout_read_budget` (half the window when `\n` becomes `\r\n`) and the final drain waits for an adjust (S8)
+- an `exec` command that was not UTF-8 ran `/bin/sh -c ""` and reported success; it reports why and exits 127 (S9)
+- the log line carried the whole `exec` command line, which can hold secrets passed as arguments; it keeps the first 120 bytes, cut on a character boundary (S10)
+- `--port 22x` silently served on the default, unknown flags and config keys were dropped without a word, and `--help` started a server; these print a warning with the default that applies (deliberately not fatal, so a remote-only box stays reachable) and `--help` prints usage and exits (S11)
+- `SERVICE_REQUEST` accepted any service name; it must be `ssh-userauth` (S12)
 
 ## VFS & Filesystem (149 fixes, 48 docs)
 
@@ -2305,7 +2343,7 @@ aren't recorded anywhere else.)
 - Every group `SIGKILL` cost 2 s on AArch64: each thread's `kill_thread_group` grace-waited for siblings in their own grace waits; `claim_group_exit` makes the first caller do the teardown
 - amd64 `kill` could return `EINTR` without sending (glue's dispatch prologue), orphaning a child; signal senders are exempt from the gate
 
-## Misc / Cross-cutting (70 fixes, 26 docs)
+## Misc / Cross-cutting (95 fixes, 27 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2451,6 +2489,34 @@ aren't recorded anywhere else.)
 ### docs/archive/DENVER_BRANCH_FIXES.md
 - `akuma-exec`'s `/proc/<pid>/maps` leaf walk (moved there by the denver loop) called `UserAddressSpace::for_each_user_leaf`, which only the amd64 struct has, so the default AArch64 kernel failed with E0599; the walk is gated to x86_64 with an AArch64 stub returning region rows only
 
+### docs/archive/SECURITY_AUDIT_2026_11_16.md
+(The audit's open findings are not counted: `dac=1` and the `net.allow=` ingress filter are opt-in and off by default, so H1 and H5 stay partly open; M1, M3 to M6 and M8 are open. The fixes below are the ones that landed, each as verified in its commit and in the audit's Status section.)
+- sshd's X25519 server secret and the KEXINIT cookie were consecutive outputs of one xorshift64 generator, so the cleartext cookie revealed the secret and with it every session key; both come from `getrandom` now and the connection is refused if there is no entropy (C1; AArch64 QEMU: three OpenSSH public-key logins on the rebuilt sshd, the refusal path was not exercised)
+- sshd's Ed25519 host key came from an 8-byte seed, and from the constant `0xDEAD_BEEF_CAFE_BABE` when `getrandom` failed, so every such machine shared one key; it is generated from 32 bytes of `getrandom` and sshd refuses to start without them (C2; keys generated earlier are not rotated and must be regenerated)
+- `getrandom` handed out raw device bytes with no pool, and AArch64 without virtio-rng (a Nitro instance) returned `EIO` and gave every process the same sixteen-byte `AT_RANDOM`, so one stack canary; one lock-free ChaCha20 pool in `akuma-primitives` (RFC 8439 vector pinned) is seeded from the registered source and `RNDR`, mixed with a fresh read per call, ratcheted after each and refuses while unseeded (C3; AArch64 QEMU: `/dev/urandom` differs per read)
+- amd64 without `RDRAND` returned `weak_fill` (SplitMix64 of a counter and the TSC) as a successful `getrandom`; it fails closed now (C3; built, not booted on amd64)
+- smoltcp's `random_seed` was the uptime and ephemeral ports counted up from 49152, so TCP sequence numbers and DNS source ports were predictable; both come from the pool (M2)
+- the AArch64 net RNG hook panicked when no RNG was present; it no longer does
+- `reboot`, `mount`/`umount2`/`mount_in_ns` and the raw block-device open checked box membership only, so any uid in the host box could reset the machine, mount filesystems and write `/dev/vda`; one gate, `caller_is_host_root` (box 0 and uid 0), covers them (H2; AArch64 QEMU: root keeps clock and mount, uid 1000 is refused `date -s`, `mount`, `/dev/vda` and `reboot -f`)
+- `clock_settime`, `adjtimex` steps and amd64 `settimeofday` checked nothing, not even the box, so a boxed process could move the host clock; they use the same gate (M9; AArch64 QEMU: `date -s` refused for uid 1000)
+- amd64 `reboot` had no gate at all, so any boxed process could reset the machine; it uses the same gate (built, not booted on amd64)
+- the amd64 hardware nodes `/dev/kvm0`, `/dev/kvm`, `/dev/power`, `/dev/wifi0` and `/dev/net/tun` had no check at the open site; a boxed process gets none of them and a non-root uid gets `EACCES` (H2; built, not booted on amd64)
+- `copy_from_user_str` discarded the per-page validation result, and on AArch64 the kernel's RAM is mapped EL1-only below `USER_VA_LIMIT` and the byte read runs at EL1, so a path argument could name a kernel address and be read back through `symlinkat`/`readlink`; a failed validation is `EFAULT` on AArch64 (boot suite and path syscalls checked; the exploit probe itself was not run)
+- caller-chosen lengths sized `vec![0u8; n]`, and a capacity overflow or allocation failure halts a `panic = "abort"` kernel, so any unprivileged process could halt the machine: `spawn_ext` cwd/stdin lengths and `read` on ttys, pipes, child stdout, unix sockets, the tap, `/dev/zero` and `/dev/urandom`, `pwrite`, `getdents64`, `sendmsg`, `resolve_host`, `register_box`, `mount_in_ns`, `poll_input_event` and `sched_getaffinity` are now capped and fallible (`fs::user_bounce`), served short or in 64 KiB chunks (`dd` from `/dev/zero` and `/dev/urandom`, pipes and `getdents` checked on AArch64 QEMU; the halt was not reproduced first)
+- `sendmsg`'s iovec length sum wrapped; it is bounded in the same change
+- `BYPASS_VALIDATION`, which lets a boot self-test pass a kernel address as a user pointer, stayed live for the whole uptime, and a slot left on by an abnormal exit from a hand-paired window stayed on; `seal_bypass()` is one-way, `load()` is false for every thread after it and both kernels call it immediately before init (M7; AArch64 boot suite unchanged)
+- every process had the same layout on every boot; with the kernel entropy pool a position-independent program slides up to 64 MiB, a computed stack top down up to 16 MiB and the `mmap` area up to 1 GiB, and on AArch64 the area starts above the kernel hole first so the slide is not swallowed (H3; on by default once a kernel enables it before init, `aslr=0` turns it off, no entropy means no slide; AArch64 QEMU: addresses differ per run, rustc, cargo, git and a fork burst run clean; non-PIE programs, the brk heap relative to its image, the amd64 stack top and the kernel are not randomized; amd64 built, not booted)
+- the dynamic linker (libc for every dynamically linked program) stayed at `0x3000_0000` because fork found its pages by scanning from that literal; the loader reports where it put the linker, `ProcessMemory` records `interp_base` (set at exec, inherited across fork), fork scans from the record and the base slides up to 128 MiB (H3; AArch64 QEMU: a fork inside a fork in a dynamic program runs libc correctly; amd64 built, not booted)
+- `bind()` to a port below 1024 needed no privilege; it needs uid 0 and is `EACCES` otherwise (H5; AArch64 QEMU: uid 1000 cannot bind 80 and can bind 8081, root can bind both; amd64 built, not booted)
+- the cloud metadata address `169.254.169.254` was reachable by every process, so a compromised service or a boxed program could fetch the instance's IAM credentials; `connect`/`sendto`/`sendmsg` to it need uid 0 in the host box (H4; AArch64 QEMU: uid 1000 refused, root allowed; amd64 built, not booted)
+- the image scripts ran `apk add --root` on a fresh root with `--allow-untrusted`, so package signatures were never checked; they pass `--keys-dir /etc/apk/keys` (the Alpine keys of the build container) and the AWS image installs those keys so `apk` in the guest verifies too (H6; the exact `apk add --keys-dir` command was run in an arm64 Alpine container, the whole image build was not run)
+- the AWS image could be captured with an sshd host key, so every instance launched from it shared one; the build deletes any host key from the tree and one is generated per instance on first boot (H4; the image was not built)
+- the AWS image had no per-instance launch key, so a public AMI would carry the builder's; `/sbin/instance-key`, a herd oneshot, fetches the launch public key from the metadata service (IMDSv2 with curl, v1 through busybox `wget`) and adds it to `authorized_keys` (ed25519 only, added never substituted, written beside the old file and renamed) (H4; tested against a stand-in metadata service in a container and inside an Akuma guest, not against real EC2 or MMDS, and the image with the service in it was not built)
+- `akuma-slot-table::with_active_mut` handed out `&mut Process` while `active_ref` and `ref_if_current` handed out `&T` borrows that outlive their IRQ mask and live on other cores, so every `with_process` write aliased them; it is gone, `with_process`/`with_current_process` take `FnOnce(&Process)` and the ten fields they wrote (`parent_pid`, `pgid`, `thread_id`, `delegate_pid`, `grabbed_by`, `robust_list_head`/`len`, `channel`, `cwd`, `root`) are atomics or sit inside a lock (nine kernel configurations build, AArch64 boot suite unchanged, cwd, job control, wait and pipes checked over ssh)
+- the amd64 GRUB (multiboot2) boot path started init without sealing the self-test pointer bypass, without ASLR and ignoring `dac=1`, because all three sat beside the PVH path's `run_init` only, so on the ryzen every address was identical across runs; they are `boot::before_init`, called by both paths (built, not yet re-run on the ryzen)
+- amd64 clamped a read of `/dev/zero` or `/dev/urandom` to one 64 KiB chunk, so `dd bs=1M count=8` wrote 512 KiB; they are served whole, in chunks, like a regular file (built, not yet booted)
+- `--features no-tests` did not compile on amd64: a doubled `cfg` sat on one test function and none on `proc_consistency_check` (built for the default, `headless` and `no-tests` sets)
+
 ## Console & Terminal (63 fixes, 22 docs)
 
 ### docs/archive/VEC_AUDIT.md
@@ -2562,7 +2628,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - amd64 `setpgid` outside a pty session was a no-op, so `^C` on the serial console reached an empty foreground group; the shared spawn gives each child a group and amd64 uses glue's `setpgid`/`getpgid`
 
-## Containers (57 fixes, 12 docs)
+## Containers (69 fixes, 13 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -2647,6 +2713,20 @@ aren't recorded anywhere else.)
 ### docs/archive/MSGQUEUE_BOX_TEARDOWN.md
 - `cleanup_box_queues` had no caller, so SysV message queues outlived their box and a same-named restart inherited them; `sys_kill_box` calls it
 
+### userspace/box/docs/ISSUES_2026_11_16.md
+- tar created each entry at `<root>/<entry path>` with ordinary path resolution, so an earlier entry that made a parent a symlink redirected later ones: a layer holding `etc -> /etc` and then `etc/passwd` replaced the host's `/etc/passwd` as root during `box pull`; `format::resolve_in_root` resolves every parent inside the root with chroot semantics (`..` stops at the root, an absolute link is re-rooted, more than 40 hops is refused), a symlink at the final component is replaced rather than followed, and hardlink targets resolve the same way (B1; reproduced on a QEMU guest, the fixed tar lands the file under the extraction root and leaves the host's `/tmp/outside` empty)
+- manifest layer and config digests were joined into store paths unchecked, so a digest of `../../..` made the "already present" check succeed and stacked a host directory under the container root; `manifest::check_digests` requires canonical `sha256:<64 lowercase hex>` straight after `fetch_manifest` (B2; a pure function with host tests, a full `box pull` was not run)
+- the container name is a directory under `/var/lib/box/containers` and `--rm` runs `remove_tree` on it, so `--name ../../..` removed a host directory tree; `paths::valid_container_name` enforces Docker's rule (`[a-zA-Z0-9][a-zA-Z0-9_.-]*`, at most 128 bytes) in `box run` and `box commit` (B3)
+- `sanitize_name` kept `.` and `..`, so `box rmi ..` removed the image store's parent, all of `/var/lib/box`; a leading `.` becomes `_` and an empty name becomes `_` (B4)
+- a failed `open` or `write` during extraction was printed and ignored, so `tar` exited 0 and `box pull` cached the half-written layer as content-addressed and complete (a full disk was enough); failures are counted in `Stats::failed`, `tar` exits 1, `box pull` fails the layer and clears its staging directory, and short writes are retried (B5; verified live)
+- after one failed write in the streaming path tar `break`s out of the copy loop before counting the bytes it had read, skips the wrong amount of padding and fails the next header's checksum, so the rest of the archive was silently dropped; an archive of `plain.txt`, `plain.txt/x` and `good.txt` left only `plain.txt` with exit 0, and the new tar extracts both files, reports `failed 1` and exits 1 (B6; verified live)
+- layer downloads used a fixed `/tmp/oci-layer-<i>.tar.gz` and staging directories were reused, so two pulls collided and a failed pull left debris for the next; temp names carry the pid and are unlinked on error and staging is cleared before extraction and after a failure (B7)
+- `fetch_config` read at most 64 KiB, so a larger image config failed to parse; it reads to EOF (B8)
+- `/proc/boxes` was read with a single 2 KiB `read`, so a long list was cut short; it is read to EOF (B9)
+- `box grab` built the pid from the digits only, so `12a3` meant pid 123 (another process) and a string with no digits fell back to the box's main process; anything but a positive decimal number is an error (B10)
+- `box cp` followed symlinks, lost modes, held whole files in memory and exited 0 on failure; it uses `lstat`, recreates symlinks, keeps modes, streams through `fsx::copy_file`, counts failures and exits 1 on any (B11)
+- the deprecated `waitpid` folded a signal death into status 0, so `box run img cmd && next` carried on after a crash; `box run`, `open`, `use` and `grab` use `waitpid_status` with the shell convention (128 plus the signal) (B12)
+
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
 Also scanned 2026-11-13 (closing `akuma-multiarch-attempt-0`: one kernel package for both architectures, the shared mm/fd/exec/signal paths, the hooked scheduler, safe guest entry and the amd64 `unsafe` cleanup; 165 archive docs added or edited). AKUMA_MULTIARCH_ATTEMPT_0 is the branch's running log; its inline fixes are counted under ten categories and every fix with its own archive doc is counted there instead. No counted fix: AKUMA_ONE_MUNMAP and AKUMA_ONE_VA_PLACER (convergence steps whose divergences are placement policy, pinned); AMD64_RING0_PREEMPTION and HOOKED_EL1_PREEMPTION's preemption itself (capabilities; the latter's TTBR0 publication is counted); FPCACHE_UNDERSIZED_AT_LOW_RAM (open by its own header); SGI_SCHEDULER_RESIDUE (dead-code removal, behaviours measured and accepted); AMD64_KERNEL_UNSAFE_AUDIT (`unsafe` reduction; the `deliver_pending` `&mut UserCtx` alias it removed was not UB in practice, and the `sysretq` canonical-`rip` refusal is hardening); the archived proposals B12_AARCH64_SLOT_TABLE, B15_TOKIO_KERNEL_KIT, B21_TOKIO_KERNEL_AARCH64, INSTALL_SCRIPT, INSTALL_SCRIPT_QWEN_EXPERIMENT, LIBAKUMA_LINUX_COMPAT and LINUX_COMPAT_PUSH. Not counted, open by the log's own text: an amd64 `ssh host cmd` session prints nothing on stderr, and `altstackexec`'s two AArch64 rungs. The three test-harness bugs behind the amd64 RAM-floor measurement (`a4f3051e`) and W5a's thread-probe flake are test fixes, uncounted.
@@ -2708,3 +2788,5 @@ Also scanned 2026-11-02 (closing `rust-org-il-experiment`, 536 commits and about
 Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). Counted above: EXT2_DIRENT_TYPE_WITHOUT_FILETYPE, KVM_GUEST_4GIB_PVH_HANDOFF, UNIX_SOCKET_READ_WRITE_BYPASSED_RECORDS, SSHD_SESSION_WITHOUT_PATH and the one shared-glue bullet of TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES. The rest of INFINITY_ON_TAOXICHUAN, TAOXICHUAN_EXEC_ARGV_LIMIT, TAOXICHUAN_EXEC_SHEBANG and TAOXICHUAN_LAZY_MMAP are Taoxichuan's and are counted there. KVM_GUEST_RAM_CAP_LIFTED's new paragraph corrects two of its statements and points at KVM_GUEST_4GIB_PVH_HANDOFF, where those fixes are counted. The edits to MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG, TAOXICHUAN_CLEANUP_PLAN, TAOXICHUAN_FIXED_POINT and RUST_ORG_IL_TALK add no fix. A second pass the same day (shared mappings, the lazy image, the ext2 cap) counts EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES and the one glue bullet of TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE; the rest of that doc is Taoxichuan's. The dated notes added to TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES, TAOXICHUAN_LAZY_MMAP and INFINITY_ON_TAOXICHUAN point at those two docs and add no fix. The ENOSPC inconsistencies EXT2_TRIPLE_INDIRECT_AND_LARGE_FILES records are open. A third pass counts INODE_PIN_CONGESTED_WINDOW (`akuma-primitives`, so every kernel); the partial build measurement added to TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE and the dated note in TAOXICHUAN_PROT_NONE_AND_SHARED_FILE_PAGES add no fix. A fourth pass counts the ext2 drain of UNLINKED_FILE_SPACE_RETURNED_LATE; its Taoxichuan pin range is Taoxichuan's, counted there.
 
 Also scanned 2026-11-08 (closing `post-release-improvements`, 136 commits, the Shanghai middleware work, the unsafe-reduction rounds and the ETXTBSY and signal fixes). Counted above: COW_FRESHFRAME_STAGING, ETXTBSY_TEXT_BUSY, HVF_BOOT_TEST_STAGE2_FAULT, LINK_KERNEL_BIN_LAYOUT and SIGNAL_FATAL_DEFAULT_LINUX. The tokio kernels' fixes from the same branch (TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK, TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE, TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE, INFINITY_ON_TAOXICHUAN's stack growth, TAOXICHUAN_B21_AARCH64's build break) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: NEWTYPE_AUDIT, VEC_SENSITIVE_LAYERS_AUDIT, UNSAFE_KERNEL_AUDIT, UNSAFE_CONTEXT_TABLE_DESIGN, UNSAFE_OWNERSHIP_TYPES_DESIGN, UNSAFE_FORBID_THREE_CRATES_PLAN and GLM_BRIEF_UNSAFE_CPU_STEP (audits, designs and a brief); UNSAFE_KERNEL_CPU_STEP (a refactor; the seven missing `unsafe` blocks in a model's aarch64-only change were fixed in the merge, before they built anywhere); BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING (an experiment log; its harness fixes are rig changes); RTW89_WIFI_DORMANCY_AUDIT (root cause of the ryzen link drops; the Pop fix is host configuration and the Akuma fixes are planned, not landed, so the `u64` underflow in the `[rtw] link:` gap line stays open); AKUMA_KVM_DEV_CYCLE's new Ports section (a port-allocation note). Fix-shaped commits with no archive doc, uncounted: `0fdf7a7f` (two `akuma-primitives` test fixtures shared a table and raced), `72ff4d3e` (`check_addr_params` truncated at the first `cfg(test)`), `c662d795` (follow-up inside COW_FRESHFRAME_STAGING), `616f704d` (clippy), the `install.sh` and ssh-client `-y` commits (tooling), and the `shanghai` gate commits (rig).
+
+Also scanned 2026-11-16 (closing `ouch`, 29 commits ahead of main, 27 of them not merges: the pre-AMI security audit and its fixes, the userspace review of sshd, box and tar, herd and wifi, the unsafe-site reduction and the shared file offset; 4 archive docs added and 4 per-binary review reports). Counted above: SECURITY_AUDIT_2026_11_16 (Misc / Cross-cutting, 25 bullets), FORKED_DESCRIPTORS_DID_NOT_SHARE_AN_OFFSET (Syscall / ABI), and the four `ISSUES_2026_11_16` reports, sshd under SSH, box and tar under Containers, herd and wifi under Userspace Apps. The sshd review's C1 and C2 are not in that report (it lists them as the audit's) and are counted once, under SECURITY_AUDIT_2026_11_16. No counted fix: UNSAFE_SITE_REDUCTION (a refactor, 367 to 329 `unsafe` sites and the `Pod` rule; the `with_active_mut` aliasing it leaves alone is counted under SECURITY_AUDIT_2026_11_16, and the unaligned canary reads in `talc_dealloc`/`talc_realloc` and the unaligned trailing canary write in `talc_alloc` are dead behind `ENABLE_CANARIES = false`, so no live defect) and TYPE_SYSTEM_SAFETY_REPORT (ranked proposals; its Defects A and B, the AArch64 path read of kernel memory and the unbounded user length reaching `vec!`, are counted under SECURITY_AUDIT_2026_11_16, and its other findings, such as `mremap::plan` not bounding `new_size`, are open). Not counted because they are opt-in and off by default: `dac=1` on the boot line, which turns on mode-bit enforcement before init, and `net.allow=`, which installs the ingress filter; the audit leaves H1 and H5 partly open, and the privileged-port and metadata-address checks from the same commit are counted. Open by their own text: box's B13 (`read_in_container` follows symlinks when it reads the image's `/etc/passwd`), wifi's W6 (a hand-written `passphrase =` value is trimmed; documented, not changed), the audit's H1 remainder, M1, M3 to M6 and M8, the `akuma_switch` functions whose obligations are doc-only, and sshd's missing re-keying and one-channel limit. Fix-shaped commit with no archive doc to cite, not counted: `d1a91089` (`open("file/x", O_CREAT)` with a regular file as the parent returned a descriptor and failed at the first write, so it is `ENOTDIR` at the open, and a failed create fails the open instead of dropping `write_file`'s result; box's review report records the divergence as not fixed and was written before the fix, and a trailing slash on a regular file still resolves to the file). Docs-only and merge commits carry no fix.
