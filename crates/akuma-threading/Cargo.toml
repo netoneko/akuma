@@ -12,6 +12,7 @@ workspace = true
 # `akuma-exec-core`, and the seven process-layer callbacks are `ProcessHooks`,
 # registered from `akuma_exec::init`. No dependency reaches back to `akuma-exec`.
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-exec-core = { path = "../akuma-exec-core" }
 akuma-cpu = { path = "../akuma-cpu" }

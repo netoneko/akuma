@@ -17,3 +17,4 @@ akuma-affinity = { path = "../akuma-affinity" }
 # The hook table `hooks::<P>()` builds, and the user-context type it carries.
 akuma-threading = { path = "../akuma-threading" }
 akuma-exec-core = { path = "../akuma-exec-core" }
+akuma-pod = { path = "../akuma-pod" }

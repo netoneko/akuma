@@ -171,6 +171,7 @@ sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-contain
 no-tests = ["akuma-kernel-core/no-tests", "akuma-exec/no-tests", "akuma-syscalls-glue/no-tests"]
 
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }
 # Stage A of the amd64 bring-up: the kernel's own memory management, running on
 # x86_64. Both of these already built for `x86_64-unknown-none` before this
 # target existed — they are neutral code, and wiring them up is the test of that

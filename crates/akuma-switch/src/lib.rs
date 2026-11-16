@@ -598,15 +598,6 @@ pub fn read_stack_word(addr: usize) -> u64 {
     unsafe { (addr as *const u64).read_volatile() }
 }
 
-/// The bytes of a `#[repr(C)]` plain-data value, for tests that pin a wire layout.
-#[doc(hidden)]
-#[must_use]
-pub fn bytes_of<T: Copy, const N: usize>(v: &T) -> [u8; N] {
-    assert_eq!(core::mem::size_of::<T>(), N, "bytes_of: size mismatch");
-    // SAFETY: sizes match; the caller passes integer-only `repr(C)` data with no padding it asserts on.
-    unsafe { core::mem::transmute_copy(v) }
-}
-
 /// Set up a fake IRQ frame on a new thread's stack and return the SP that points at it (aarch64 SGI path).
 ///
 /// `[sp+0]` x30 = `exit_stub`, `[sp+80]` x20, `[sp+88]` x21, `[sp+104]` x19, `ELR`/`SPSR` through the
@@ -681,19 +672,6 @@ pub fn call_boxed_closure<F: FnOnce() -> !>(ptr: *mut ()) -> ! {
 pub fn drop_boxed_closure<F>(ptr: *mut ()) {
     // SAFETY: as [`call_boxed_closure`]: an unconsumed `Box<F>`.
     drop(unsafe { Box::from_raw(ptr.cast::<F>()) });
-}
-
-/// A `&'static Location` from the address `note_park_site` stored, or `None` for 0.
-///
-/// The only writer stores `Location::caller()` as an address; a `Location` is in the binary's read-only data
-/// and lives for the whole program, so the pointer never dangles.
-#[must_use]
-pub fn static_location(addr: usize) -> Option<&'static core::panic::Location<'static>> {
-    if addr == 0 {
-        return None;
-    }
-    // SAFETY: see the doc.
-    Some(unsafe { &*(addr as *const core::panic::Location<'static>) })
 }
 
 /// Copy the `T` a thread published at `addr` (its EL0 trap frame on its own kernel stack), or `None` for 0.

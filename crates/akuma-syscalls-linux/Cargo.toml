@@ -8,3 +8,4 @@ description = "The Linux/aarch64 syscall ABI: numbers, repr(C) wire structs and 
 workspace = true
 
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }

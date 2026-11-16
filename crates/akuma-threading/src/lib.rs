@@ -4318,17 +4318,14 @@ pub fn untimed_park_backstop_wakes() -> u64 {
 /// per-call-site bookkeeping: every existing caller is covered, including the
 /// twenty-odd blocking arms in `akuma-syscalls-glue` that never go through a
 /// target's own `sched` module.
-static PARK_SITES: [AtomicUsize; MAX_THREADS] = {
-    const INIT: AtomicUsize = AtomicUsize::new(0);
-    [INIT; MAX_THREADS]
-};
+static PARK_SITES: [akuma_primitives::cell::LocationCell; MAX_THREADS] =
+    [const { akuma_primitives::cell::LocationCell::new() }; MAX_THREADS];
 
 /// Record the caller of a park entry point against `tid`. See [`PARK_SITES`].
 #[track_caller]
 fn note_park_site(tid: usize) {
     if tid < MAX_THREADS {
-        let loc: &'static core::panic::Location<'static> = core::panic::Location::caller();
-        PARK_SITES[tid].store(core::ptr::from_ref(loc) as usize, Ordering::Relaxed);
+        PARK_SITES[tid].set(core::panic::Location::caller());
     }
 }
 
@@ -4338,7 +4335,7 @@ pub fn park_site(tid: usize) -> Option<(&'static str, u32)> {
     if tid >= MAX_THREADS {
         return None;
     }
-    let loc = akuma_switch::static_location(PARK_SITES[tid].load(Ordering::Relaxed))?;
+    let loc = PARK_SITES[tid].get()?;
     Some((loc.file(), loc.line()))
 }
 

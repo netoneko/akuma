@@ -19,6 +19,7 @@ pub struct StackT {
     pub _pad: i32,
     pub size: u64,
 }
+akuma_pod::pod!(StackT { sp: u64, flags: i32, _pad: i32, size: u64 });
 
 /// The `siginfo_t` prefix `rt_sigtimedwait` fills. 128 bytes, matching Linux.
 ///
@@ -34,6 +35,7 @@ pub struct Siginfo {
     pub si_code: i32,
     pub _pad: [i32; 29],
 }
+akuma_pod::pod!(Siginfo { si_signo: i32, si_errno: i32, si_code: i32, _pad: [i32; 29] });
 
 /// The `SIGCHLD` view of `siginfo_t`, as `waitid(2)` fills it.
 ///
@@ -52,6 +54,15 @@ pub struct SigChld {
     pub si_uid: u32,
     pub si_status: i32,
 }
+akuma_pod::pod!(SigChld {
+    si_signo: u32,
+    si_errno: u32,
+    si_code: i32,
+    __pad0: u32,
+    si_pid: u32,
+    si_uid: u32,
+    si_status: i32,
+});
 
 /// The *kernel's* `struct sigaction` — the layout `rt_sigaction(2)` actually
 /// takes, which is not libc's.
@@ -63,6 +74,7 @@ pub struct KernelSigaction {
     pub sa_restorer: usize,
     pub sa_mask: u64,
 }
+akuma_pod::pod!(KernelSigaction { sa_handler: usize, sa_flags: u64, sa_restorer: usize, sa_mask: u64 });
 
 /// `SIG_DFL` — a null handler pointer means "default action".
 pub const SIG_DFL: usize = 0;

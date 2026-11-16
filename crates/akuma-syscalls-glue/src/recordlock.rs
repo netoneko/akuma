@@ -46,6 +46,7 @@ struct Flock {
     l_pid: i32,
     _pad1: i32,
 }
+akuma_pod::pod!(Flock { l_type: i16, l_whence: i16, _pad0: i32, l_start: i64, l_len: i64, l_pid: i32, _pad1: i32 });
 
 /// Drop `holder`'s locks on `path` — called from `flock_release`.
 pub(super) fn release_file(path: &str, holder: usize) {

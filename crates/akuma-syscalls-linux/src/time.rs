@@ -33,6 +33,7 @@ pub struct Timespec {
     pub tv_sec: i64,
     pub tv_nsec: i64,
 }
+akuma_pod::pod!(Timespec { tv_sec: i64, tv_nsec: i64 });
 
 impl Timespec {
     /// The two fields reinterpreted as unsigned, for the call sites that did
@@ -122,6 +123,7 @@ pub struct Timeval {
     pub tv_sec: i64,
     pub tv_usec: i64,
 }
+akuma_pod::pod!(Timeval { tv_sec: i64, tv_usec: i64 });
 
 impl Timeval {
     /// See [`Timespec::bits`].
@@ -157,6 +159,7 @@ pub struct Itimerval {
     pub it_interval: Timeval,
     pub it_value: Timeval,
 }
+akuma_pod::pod!(Itimerval { it_interval: Timeval, it_value: Timeval });
 
 /// Linux `struct rusage` (144 bytes), the `getrusage(2)` / `wait4(2)` buffer.
 ///
@@ -172,6 +175,7 @@ pub struct Rusage {
     /// `ru_maxrss` .. `ru_nivcsw`: fourteen `long`s, all unaccounted.
     pub counters: [i64; 14],
 }
+akuma_pod::pod!(Rusage { ru_utime: Timeval, ru_stime: Timeval, counters: [i64; 14] });
 
 impl Rusage {
     /// `getrusage(2)` `who` values.
@@ -205,6 +209,7 @@ pub struct Tms {
     pub tms_cutime: i64,
     pub tms_cstime: i64,
 }
+akuma_pod::pod!(Tms { tms_utime: i64, tms_stime: i64, tms_cutime: i64, tms_cstime: i64 });
 
 impl Tms {
     /// `sysconf(_SC_CLK_TCK)` as `times(2)` reports it: 100 Hz.
@@ -259,6 +264,33 @@ pub struct Timex {
     pub tai: i32,
     pub _reserved: [i32; 11],
 }
+akuma_pod::pod!(Timex {
+    modes: u32,
+    _pad0: u32,
+    offset: i64,
+    freq: i64,
+    maxerror: i64,
+    esterror: i64,
+    status: i32,
+    _pad1: u32,
+    constant: i64,
+    precision: i64,
+    tolerance: i64,
+    time_sec: i64,
+    time_usec: i64,
+    tick: i64,
+    ppsfreq: i64,
+    jitter: i64,
+    shift: i32,
+    _pad2: u32,
+    stabil: i64,
+    jitcnt: i64,
+    calcnt: i64,
+    errcnt: i64,
+    stbcnt: i64,
+    tai: i32,
+    _reserved: [i32; 11],
+});
 
 // The layout claims the doc comments above make. `sync_tests.rs` asserted the
 // first two at boot; they are compile-time facts, so they are asserted here

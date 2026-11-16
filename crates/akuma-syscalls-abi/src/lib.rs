@@ -997,6 +997,26 @@ pub mod stat {
         pub st_ctime_nsec: i64,
         pub __unused: [i64; 3],
     }
+    akuma_pod::pod!(X8664 {
+        st_dev: u64,
+        st_ino: u64,
+        st_nlink: u64,
+        st_mode: u32,
+        st_uid: u32,
+        st_gid: u32,
+        __pad0: u32,
+        st_rdev: u64,
+        st_size: i64,
+        st_blksize: i64,
+        st_blocks: i64,
+        st_atime: i64,
+        st_atime_nsec: i64,
+        st_mtime: i64,
+        st_mtime_nsec: i64,
+        st_ctime: i64,
+        st_ctime_nsec: i64,
+        __unused: [i64; 3],
+    });
 
     /// Re-lay a shared (aarch64) `struct stat` in the x86_64 layout.
     ///

@@ -196,3 +196,47 @@ mod tests {
         assert_eq!(c.with(|a| a.0[0]), 5);
     }
 }
+
+/// A recorded call site: a `&'static Location` stored and loaded atomically.
+///
+/// For diagnostics that note *where* something happened (`#[track_caller]` on
+/// a park or a preemption disable) and print it later from another context.
+/// It used to be an `AtomicUsize` holding the pointer plus an `unsafe` cast back
+/// at every reader, where the cast trusted whatever integer it was given; here
+/// the only way in is a `&'static Location`, so reading it back is sound by
+/// construction. Relaxed throughout: a `Location` is immutable static data, so
+/// no ordering is needed for what the pointer names.
+pub struct LocationCell(core::sync::atomic::AtomicPtr<core::panic::Location<'static>>);
+
+impl LocationCell {
+    /// Empty.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(core::sync::atomic::AtomicPtr::new(core::ptr::null_mut()))
+    }
+
+    /// Record `loc`.
+    pub fn set(&self, loc: &'static core::panic::Location<'static>) {
+        self.0.store(core::ptr::from_ref(loc).cast_mut(), Ordering::Relaxed);
+    }
+
+    /// Forget the recorded site.
+    pub fn clear(&self) {
+        self.0.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// The recorded site, or `None` if none is.
+    #[must_use]
+    pub fn get(&self) -> Option<&'static core::panic::Location<'static>> {
+        // SAFETY: the pointer is null or was stored by `set` from a
+        // `&'static Location`, which lives for the whole program and is never
+        // written through.
+        unsafe { self.0.load(Ordering::Relaxed).as_ref() }
+    }
+}
+
+impl Default for LocationCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}

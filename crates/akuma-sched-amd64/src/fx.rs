@@ -17,6 +17,7 @@ pub const XCR0_ENABLED: u64 = akuma_fpu_amd64::XCR0_ENABLED;
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
 pub struct FxArea([u8; akuma_fpu_amd64::XSAVE_SIZE]);
+akuma_pod::pod!(FxArea { 0: [u8; akuma_fpu_amd64::XSAVE_SIZE] });
 
 impl Default for FxArea {
     fn default() -> Self {

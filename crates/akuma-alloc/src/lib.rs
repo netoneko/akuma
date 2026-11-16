@@ -618,7 +618,8 @@ mod leak_instr {
     /// Exact-size live counts for class 2^8 (sizes 129..=256), where the build-
     /// churn leak lives. Index `size - 128`. Temporary instrumentation.
     pub(super) static LIVE_COUNT_8: [AtomicU32; 128] = [const { AtomicU32::new(0) }; 128];
-    pub(super) static SYSCALL_NR_HOOK: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static SYSCALL_NR_HOOK: akuma_not_even_once::OnceCopy<fn() -> u64> =
+        akuma_not_even_once::OnceCopy::new();
 
     // ── Temporary leak attribution: live objects by allocating call chain ──────
     //
@@ -773,7 +774,7 @@ mod leak_instr {
     /// Register the `current_syscall_nr` hook so leak attribution can name the
     /// syscall family a surviving allocation came from. Called once at kernel init.
     pub fn register_syscall_nr_hook(f: fn() -> u64) {
-        SYSCALL_NR_HOOK.store(f as usize, Ordering::Release);
+        SYSCALL_NR_HOOK.set(f);
     }
 
     /// Register the `current_pid` hook for leak attribution.
@@ -782,19 +783,15 @@ mod leak_instr {
     /// freed) surviving objects. Called once at kernel init; the hook returns 0
     /// when no process context exists.
     pub fn register_current_pid_hook(f: fn() -> u64) {
-        CURRENT_PID_HOOK.store(f as usize, Ordering::Release);
+        CURRENT_PID_HOOK.set(f);
     }
 
-    pub(super) static CURRENT_PID_HOOK: AtomicUsize = AtomicUsize::new(0);
+    pub(super) static CURRENT_PID_HOOK: akuma_not_even_once::OnceCopy<fn() -> u64> =
+        akuma_not_even_once::OnceCopy::new();
 
     #[inline]
     pub(super) fn hook_current_pid() -> u64 {
-        let f = CURRENT_PID_HOOK.load(Ordering::Acquire);
-        if f == 0 {
-            0
-        } else {
-            (unsafe { core::mem::transmute::<usize, fn() -> u64>(f) })()
-        }
+        CURRENT_PID_HOOK.get().map_or(0, |f| f())
     }
 
     #[inline]
@@ -871,12 +868,7 @@ mod leak_instr {
 
     #[inline]
     pub(super) fn hook_syscall_nr() -> u64 {
-        let f = SYSCALL_NR_HOOK.load(Ordering::Acquire);
-        if f == 0 {
-            0
-        } else {
-            (unsafe { core::mem::transmute::<usize, fn() -> u64>(f) })()
-        }
+        SYSCALL_NR_HOOK.get().map_or(0, |f| f())
     }
 
     /// Print one line per nonzero size class. Alloc-free (safe_print), safe from
@@ -1043,17 +1035,16 @@ pub struct KernelAllocator;
 
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { talc_alloc(layout) }
+        talc_alloc(layout)
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        unsafe {
-            let ptr = talc_alloc(layout);
-            if !ptr.is_null() {
-                ptr::write_bytes(ptr, 0, layout.size());
-            }
-            ptr
+        let ptr = talc_alloc(layout);
+        if !ptr.is_null() {
+            // SAFETY: a fresh, non-null allocation of `layout.size()` bytes.
+            unsafe { ptr::write_bytes(ptr, 0, layout.size()) };
         }
+        ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
@@ -1069,7 +1060,12 @@ unsafe impl GlobalAlloc for KernelAllocator {
 // Talc-based allocator (original implementation)
 // ============================================================================
 
-unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
+/// Allocate `layout` (with canaries when configured), or null. A zero-size
+/// layout gets null: `GlobalAlloc` never asks for one, and talc must not be.
+fn talc_alloc(layout: Layout) -> *mut u8 {
+    if layout.size() == 0 {
+        return ptr::null_mut();
+    }
     with_irqs_disabled(|| {
         // Calculate actual allocation size with canaries
         let user_size = layout.size();
@@ -1085,9 +1081,9 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
             (layout, 0)
         };
 
-        let result = TALC
-            .lock()
-            .malloc(actual_layout)
+        // SAFETY: `actual_layout` is at least `layout`, whose size is non-zero
+        // (checked on entry): talc's one precondition.
+        let result = unsafe { TALC.lock().malloc(actual_layout) }
             .map_or(ptr::null_mut(), core::ptr::NonNull::as_ptr);
 
         if result.is_null() {
@@ -1111,18 +1107,18 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
 
         // Set up canaries and calculate user pointer
         let user_ptr = if ENABLE_ALLOCATION_REGISTRY && ENABLE_CANARIES {
-            // Write canary before
-            let canary_before_ptr = result.cast::<u64>();
-            core::ptr::write_volatile(canary_before_ptr, CANARY_BEFORE);
-
-            // Calculate user pointer (after the before-canary)
-            let user = result.add(CANARY_SIZE);
-
-            // Write canary after
-            let canary_after_ptr = user.add(user_size).cast::<u64>();
-            core::ptr::write_volatile(canary_after_ptr, CANARY_AFTER);
-
-            user
+            // SAFETY: `result` is a fresh block of `CANARY_SIZE + user_size +
+            // CANARY_SIZE` bytes aligned to at least 8, so both canaries and the
+            // user pointer between them are inside it. The after-canary starts at
+            // `user_size`, which need not be a multiple of 8, so it is an unaligned
+            // store (the block escapes to the caller, so it cannot be elided); the
+            // before-canary is at the 8-aligned base.
+            unsafe {
+                core::ptr::write_volatile(result.cast::<u64>(), CANARY_BEFORE);
+                let user = result.add(CANARY_SIZE);
+                core::ptr::write_unaligned(user.add(user_size).cast::<u64>(), CANARY_AFTER);
+                user
+            }
         } else {
             result
         };
@@ -1162,7 +1158,7 @@ unsafe fn talc_alloc(layout: Layout) -> *mut u8 { unsafe {
 
         user_ptr
     })
-}}
+}
 
 unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
     with_irqs_disabled(|| {

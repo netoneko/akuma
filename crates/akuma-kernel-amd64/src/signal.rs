@@ -178,6 +178,36 @@ struct SigContext {
     fpstate: u64,
     reserved: [u64; 8],
 }
+akuma_pod::pod!(SigContext {
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rdi: u64,
+    rsi: u64,
+    rbp: u64,
+    rbx: u64,
+    rdx: u64,
+    rax: u64,
+    rcx: u64,
+    rsp: u64,
+    rip: u64,
+    eflags: u64,
+    cs: u16,
+    gs: u16,
+    fs: u16,
+    ss: u16,
+    err: u64,
+    trapno: u64,
+    oldmask: u64,
+    cr2: u64,
+    fpstate: u64,
+    reserved: [u64; 8],
+});
 
 /// `stack_t`, as the kernel writes it into `uc_stack`.
 #[repr(C)]
@@ -188,6 +218,7 @@ struct StackT {
     _pad: u32,
     ss_size: u64,
 }
+akuma_pod::pod!(StackT { ss_sp: u64, ss_flags: i32, _pad: u32, ss_size: u64 });
 
 /// `struct ucontext`, **the kernel's** (`arch/x86/include/asm/ucontext.h`), whose
 /// `uc_sigmask` is the 8-byte kernel `sigset_t` and not musl's 128-byte one.
@@ -207,6 +238,7 @@ struct UContext {
     uc_mcontext: SigContext,
     uc_sigmask: u64,
 }
+akuma_pod::pod!(UContext { uc_flags: u64, uc_link: u64, uc_stack: StackT, uc_mcontext: SigContext, uc_sigmask: u64 });
 
 /// `siginfo_t`'s kernel form: three ints, then a 112-byte union. Written as a
 /// byte array with the two fields this kernel fills placed by hand, because the
@@ -223,6 +255,7 @@ struct SigInfo {
     /// `SI_USER`; `si_addr` at its first word for `SIGSEGV`/`SIGBUS`.
     fields: [u64; 14],
 }
+akuma_pod::pod!(SigInfo { si_signo: i32, si_errno: i32, si_code: i32, _pad: i32, fields: [u64; 14] });
 
 /// `struct rt_sigframe` — what `%rsp` points at when the handler starts.
 ///
@@ -237,6 +270,7 @@ struct RtSigFrame {
     uc: UContext,
     info: SigInfo,
 }
+akuma_pod::pod!(RtSigFrame { pretcode: u64, uc: UContext, info: SigInfo });
 
 /// **The offsets a handler and a debugger index by hand.**
 ///

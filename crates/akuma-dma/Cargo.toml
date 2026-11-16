@@ -8,3 +8,7 @@ description = "Statically allocated DMA memory the CPU and a device both touch: 
 workspace = true
 
 [dependencies]
+
+# `clflush` and the fence behind `DmaArray::flush`, which is amd64-only.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+akuma-cpu = { path = "../akuma-cpu" }

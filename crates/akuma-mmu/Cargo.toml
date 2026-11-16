@@ -39,6 +39,7 @@ bkl-smp = ["akuma-bkl/bkl-smp", "akuma-primitives/bkl-smp"]
 lazy-release-sweep = []
 
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }
 # The amd64 entry format (bits, encoder, PteProt/MemAttr) and the table accessor
 # + 4-level walker over it. Unconditional: both are pure data / `no_std`, and the
 # x86 section of this crate is also compiled under `cfg(test)` on any host.

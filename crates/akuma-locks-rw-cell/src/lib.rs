@@ -100,50 +100,47 @@ impl<T> RecoverableCell<T> {
         self.value.into_inner()
     }
 
+    /// Shared access under `ticket`, which **must be one `self.lock` minted** -
+    /// every caller below passes the ticket it just took from `self.lock`.
+    fn read_guard<'a>(&'a self, ticket: ReadTicket<'a>) -> ReadGuard<'a, T> {
+        // SAFETY: the ticket is live for this guard's whole lifetime and proves
+        // shared admission to `self.lock` — `WBIT` was clear at the acquiring CAS
+        // and no writer can acquire while the reader count is non-zero, so no
+        // `&mut T` to this value exists.
+        ReadGuard { value: unsafe { &*self.value.get() }, _ticket: ticket }
+    }
+
+    /// Exclusive access under `ticket`, which **must be one `self.lock` minted**.
+    fn write_guard<'a>(&'a self, ticket: WriteTicket<'a>) -> WriteGuard<'a, T> {
+        // SAFETY: the ticket is live for this guard's whole lifetime and proves
+        // exclusive admission to `self.lock` — it exists only because this thread
+        // won `CAS(0 -> WBIT)` with the reader count zero, and the lock admits no
+        // other writer and no reader until it is released. So this is the only
+        // reference of any kind to the value.
+        WriteGuard { value: unsafe { &mut *self.value.get() }, _ticket: ticket }
+    }
+
     /// Shared access under `tid`, or `None` if a writer holds or waits.
     pub fn try_read_as(&self, tid: usize) -> Option<ReadGuard<'_, T>> {
-        self.lock.try_read(tid).map(|ticket| ReadGuard {
-            // SAFETY: the ticket is live for this guard's whole lifetime and
-            // proves shared admission — `WBIT` was clear at the acquiring CAS
-            // and no writer can acquire while the reader count is non-zero, so
-            // no `&mut T` to this value exists.
-            value: unsafe { &*self.value.get() },
-            _ticket: ticket,
-        })
+        self.lock.try_read(tid).map(|ticket| self.read_guard(ticket))
     }
 
     /// Exclusive access under `tid`, or `None` if the lock is not instantly
     /// writable.
     pub fn try_write_as(&self, tid: usize) -> Option<WriteGuard<'_, T>> {
-        self.lock.try_write(tid).map(|ticket| WriteGuard {
-            // SAFETY: the ticket is live for this guard's whole lifetime and
-            // proves exclusive admission — it exists only because this thread
-            // won `CAS(0 -> WBIT)` with the reader count zero, and the lock
-            // admits no other writer and no reader until it is released. So
-            // this is the only reference of any kind to the value.
-            value: unsafe { &mut *self.value.get() },
-            _ticket: ticket,
-        })
+        self.lock.try_write(tid).map(|ticket| self.write_guard(ticket))
     }
 
     /// Block until shared access is admitted under `tid`.
     pub fn read_as(&self, tid: usize) -> ReadGuard<'_, T> {
         let ticket = self.lock.read_as(tid);
-        ReadGuard {
-            // SAFETY: as `try_read_as`.
-            value: unsafe { &*self.value.get() },
-            _ticket: ticket,
-        }
+        self.read_guard(ticket)
     }
 
     /// Block until exclusive access is admitted under `tid`.
     pub fn write_as(&self, tid: usize) -> WriteGuard<'_, T> {
         let ticket = self.lock.write_as(tid);
-        WriteGuard {
-            // SAFETY: as `try_write_as`.
-            value: unsafe { &mut *self.value.get() },
-            _ticket: ticket,
-        }
+        self.write_guard(ticket)
     }
 
     /// [`Self::try_read_as`] with the current thread's tid.
@@ -171,11 +168,7 @@ impl<T> RecoverableCell<T> {
     /// try and the resulting hold, never the wait.
     pub fn read_as_holding<H>(&self, tid: usize, hold: impl Fn() -> H) -> (ReadGuard<'_, T>, H) {
         let (ticket, h) = self.lock.read_as_holding(tid, hold);
-        let guard = ReadGuard {
-            // SAFETY: as `try_read_as`.
-            value: unsafe { &*self.value.get() },
-            _ticket: ticket,
-        };
+        let guard = self.read_guard(ticket);
         (guard, h)
     }
 
@@ -183,11 +176,7 @@ impl<T> RecoverableCell<T> {
     /// [`RecoverableRwLock::write_as_holding`].
     pub fn write_as_holding<H>(&self, tid: usize, hold: impl Fn() -> H) -> (WriteGuard<'_, T>, H) {
         let (ticket, h) = self.lock.write_as_holding(tid, hold);
-        let guard = WriteGuard {
-            // SAFETY: as `try_write_as`.
-            value: unsafe { &mut *self.value.get() },
-            _ticket: ticket,
-        };
+        let guard = self.write_guard(ticket);
         (guard, h)
     }
 

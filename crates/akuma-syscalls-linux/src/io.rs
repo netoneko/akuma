@@ -12,6 +12,7 @@ pub struct IoVec {
     pub iov_base: u64,
     pub iov_len: usize,
 }
+akuma_pod::pod!(IoVec { iov_base: u64, iov_len: usize });
 
 /// Linux `struct pollfd`.
 #[repr(C)]
@@ -21,6 +22,7 @@ pub struct PollFd {
     pub events: i16,
     pub revents: i16,
 }
+akuma_pod::pod!(PollFd { fd: i32, events: i16, revents: i16 });
 
 /// Linux `struct epoll_event`.
 ///
@@ -36,6 +38,7 @@ pub struct EpollEvent {
     pub _pad: u32,
     pub data: u64,
 }
+akuma_pod::pod!(EpollEvent { events: u32, _pad: u32, data: u64 });
 
 /// The `struct aio_ring` header `io_setup(2)` maps into userspace.
 ///
@@ -55,6 +58,16 @@ pub struct AioRingHeader {
     pub incompat_features: u32,
     pub header_length: u32,
 }
+akuma_pod::pod!(AioRingHeader {
+    id: u32,
+    nr: u32,
+    head: u32,
+    tail: u32,
+    magic: u32,
+    compat_features: u32,
+    incompat_features: u32,
+    header_length: u32,
+});
 
 /// `AIO_RING_MAGIC` — what glibc checks before it will read `head`/`tail` out
 /// of the ring itself instead of calling `io_getevents`.

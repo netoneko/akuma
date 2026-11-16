@@ -1735,10 +1735,10 @@ pub fn copy_phys_page(dst_pa: usize, src_pa: usize) -> bool {
 /// Write a plain `#[repr(C)]` value into the physical frame at `pa`.
 ///
 /// For a struct the kernel drops into a frame it owns and has not mapped yet —
-/// `ProcessInfo` at fork/exec. `T` must be `Copy` plain-old-data; `false` if
+/// `ProcessInfo` at fork/exec. `T: Pod`, so no padding reaches the frame; `false` if
 /// `size_of::<T>()` bytes from `pa` leave PMM RAM.
 #[must_use]
-pub fn write_phys<T: Copy>(pa: usize, val: &T) -> bool {
+pub fn write_phys<T: akuma_pod::Pod>(pa: usize, val: &T) -> bool {
     akuma_mmu_raw::write_phys(pa, val)
 }
 
@@ -4696,7 +4696,7 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
 /// function — an infinite recursion. The AP-gated presence check above is the
 /// whole precondition the read needs.
 #[must_use]
-pub fn read_current_user_val<T: Copy>(va: usize) -> Option<T> {
+pub fn read_current_user_val<T: akuma_pod::Pod>(va: usize) -> Option<T> {
     if !is_current_user_range_mapped(va, core::mem::size_of::<T>()) {
         return None;
     }
@@ -5033,7 +5033,7 @@ pub fn is_current_user_range_writable(va_start: usize, len: usize) -> bool {
 /// `process::clone_thread`. Those callers have already validated the clone
 /// flags that guarantee a writable page and need one `str`, not a loop.
 #[must_use]
-pub fn write_current_user_val<T: Copy>(va: usize, val: &T) -> bool {
+pub fn write_current_user_val<T: akuma_pod::Pod>(va: usize, val: &T) -> bool {
     if !is_current_user_range_writable(va, core::mem::size_of::<T>()) {
         return false;
     }

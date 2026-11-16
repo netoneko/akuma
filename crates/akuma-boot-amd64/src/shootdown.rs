@@ -7,23 +7,19 @@
 //! `forbid(unsafe_code)`: the `global_asm!`, the `#[unsafe(no_mangle)]` and the `unsafe extern` are all
 //! link-level constructs.
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-
-static HANDLER: AtomicUsize = AtomicUsize::new(0);
+static HANDLER: akuma_not_even_once::OnceCopy<fn()> = akuma_not_even_once::OnceCopy::new();
 
 /// Register the function the stub runs (service a pending shootdown, send the EOI). Call before the vector is
-/// installed in the IDT.
+/// installed in the IDT. The first registration wins; a kernel registers one handler, and calling this again
+/// with it (once per CPU that asks for the entry address) changes nothing.
 pub fn set_handler(f: fn()) {
-    HANDLER.store(f as usize, Ordering::Release);
+    HANDLER.set(f);
 }
 
 /// The vector body (called from `shootdown_entry`).
 #[unsafe(no_mangle)]
 extern "C" fn shootdown_dispatch(_frame: *const u8) {
-    let h = HANDLER.load(Ordering::Acquire);
-    if h != 0 {
-        // SAFETY: `h` was stored from a `fn()` by `set_handler` (the only writer) and is never any other value.
-        let f: fn() = unsafe { core::mem::transmute::<usize, fn()>(h) };
+    if let Some(f) = HANDLER.get() {
         f();
     }
 }

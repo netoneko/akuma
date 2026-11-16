@@ -30,6 +30,27 @@ pub struct Stat {
     pub st_ctime_nsec: i64,
     pub __unused: [i32; 2],
 }
+akuma_pod::pod!(Stat {
+    st_dev: u64,
+    st_ino: u64,
+    st_mode: u32,
+    st_nlink: u32,
+    st_uid: u32,
+    st_gid: u32,
+    st_rdev: u64,
+    __pad1: u64,
+    st_size: i64,
+    st_blksize: i32,
+    __pad2: i32,
+    st_blocks: i64,
+    st_atime: i64,
+    st_atime_nsec: i64,
+    st_mtime: i64,
+    st_mtime_nsec: i64,
+    st_ctime: i64,
+    st_ctime_nsec: i64,
+    __unused: [i32; 2],
+});
 
 /// `struct statx_timestamp` — 16 bytes, and the `__reserved` word is why it is
 /// not just a pair.
@@ -44,6 +65,7 @@ pub struct StatxTimestamp {
     pub tv_nsec: u32,
     pub __reserved: i32,
 }
+akuma_pod::pod!(StatxTimestamp { tv_sec: i64, tv_nsec: u32, __reserved: i32 });
 
 /// `struct statx` (256 bytes), the `statx(2)` buffer.
 ///
@@ -79,6 +101,32 @@ pub struct Statx {
     pub stx_dio_offset_align: u32,
     pub __spare3: [u64; 12],
 }
+akuma_pod::pod!(Statx {
+    stx_mask: u32,
+    stx_blksize: u32,
+    stx_attributes: u64,
+    stx_nlink: u32,
+    stx_uid: u32,
+    stx_gid: u32,
+    stx_mode: u16,
+    __spare0: u16,
+    stx_ino: u64,
+    stx_size: u64,
+    stx_blocks: u64,
+    stx_attributes_mask: u64,
+    stx_atime: StatxTimestamp,
+    stx_btime: StatxTimestamp,
+    stx_ctime: StatxTimestamp,
+    stx_mtime: StatxTimestamp,
+    stx_rdev_major: u32,
+    stx_rdev_minor: u32,
+    stx_dev_major: u32,
+    stx_dev_minor: u32,
+    stx_mnt_id: u64,
+    stx_dio_mem_align: u32,
+    stx_dio_offset_align: u32,
+    __spare3: [u64; 12],
+});
 
 /// `struct statfs` as `fstatfs`/`statfs` fill it on aarch64 (120 bytes).
 ///
@@ -100,6 +148,20 @@ pub struct Statfs {
     pub f_flags: i64,
     pub f_spare: [i64; 4],
 }
+akuma_pod::pod!(Statfs {
+    f_type: i64,
+    f_bsize: i64,
+    f_blocks: i64,
+    f_bfree: i64,
+    f_bavail: i64,
+    f_files: i64,
+    f_ffree: i64,
+    f_fsid: [i32; 2],
+    f_namelen: i64,
+    f_frsize: i64,
+    f_flags: i64,
+    f_spare: [i64; 4],
+});
 
 /// Linux's `makedev` for the values that cross this ABI: an 8-bit minor packed
 /// under the major.

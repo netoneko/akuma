@@ -124,6 +124,18 @@ impl<T, const N: usize> SlotTable<T, N> {
         N
     }
 
+    /// The occupant behind a pointer loaded from `slots[i]` while slot `i` was
+    /// `ACTIVE` (or had just been moved to `RETIRED` by the caller), or `None`
+    /// for null. **Every shared borrow of an occupant is made here.**
+    #[allow(clippy::unused_self, reason = "`&self` is what bounds the borrow to the table's lifetime")]
+    fn occupant(&self, ptr: *mut T) -> Option<&T> {
+        // SAFETY: the crate contract - a pointer read from an `ACTIVE` slot names
+        // a `Box<T>` from `try_claim` that only `reclaim_retired` drops, after a
+        // cooldown no live borrow outlasts; within a generation it is immutable.
+        // Every caller passes a pointer it read from `self.slots` under that state.
+        unsafe { ptr.as_ref() }
+    }
+
     // ── claiming ────────────────────────────────────────────────────────────
 
     /// Claim the first `FREE` slot for `val`: CAS `FREE → ACTIVE`, then publish
@@ -194,13 +206,9 @@ impl<T, const N: usize> SlotTable<T, N> {
         if self.generations[i].load(Ordering::Acquire) != expected_gen {
             return Err(SlotMiss::StaleGen);
         }
-        let ptr = self.slots[i].load(Ordering::Acquire);
-        if ptr.is_null() {
-            return Err(SlotMiss::Null);
-        }
-        // SAFETY: state is ACTIVE and the generation matches, so within this
-        // generation the pointer is immutable and non-null (crate contract).
-        Ok(unsafe { &*ptr })
+        // State ACTIVE and the generation matched, so within this generation the
+        // pointer is immutable: `occupant`'s contract.
+        self.occupant(self.slots[i].load(Ordering::Acquire)).ok_or(SlotMiss::Null)
     }
 
     // ── scans: caller already holds the mask ────────────────────────────────
@@ -215,9 +223,7 @@ impl<T, const N: usize> SlotTable<T, N> {
                 continue;
             }
             let ptr = self.slots[i].load(Ordering::Acquire);
-            // SAFETY: state is ACTIVE and, per the crate contract, the caller
-            // holds the mask that keeps this slot's pointer live for the scan.
-            if !ptr.is_null() && pred(unsafe { &*ptr }) {
+            if self.occupant(ptr).is_some_and(&pred) {
                 return Some(ptr);
             }
         }
@@ -231,12 +237,10 @@ impl<T, const N: usize> SlotTable<T, N> {
             if self.states[i].load(Ordering::Relaxed) != state::ACTIVE {
                 continue;
             }
-            let ptr = self.slots[i].load(Ordering::Acquire);
-            if ptr.is_null() {
+            let Some(occupant) = self.occupant(self.slots[i].load(Ordering::Acquire)) else {
                 continue;
-            }
-            // SAFETY: as `active_ptr_locked`.
-            if let Some(r) = f(i, unsafe { &*ptr }) {
+            };
+            if let Some(r) = f(i, occupant) {
                 return Some(r);
             }
         }
@@ -259,10 +263,9 @@ impl<T, const N: usize> SlotTable<T, N> {
     /// consumer's cooldown (crate contract).
     pub fn active_ref(&self, pred: impl Fn(&T) -> bool) -> Option<&T> {
         with_irqs_disabled(|| {
-            let ptr = self.active_ptr_locked(pred)?;
-            // SAFETY: found ACTIVE under the mask; crate contract covers the
-            // lifetime past the mask.
-            Some(unsafe { &*ptr })
+            // Found ACTIVE under the mask; the crate contract covers the lifetime
+            // past the mask.
+            self.occupant(self.active_ptr_locked(pred)?)
         })
     }
 
@@ -320,12 +323,11 @@ impl<T, const N: usize> SlotTable<T, N> {
             if self.states[i].load(Ordering::Relaxed) != state::ACTIVE {
                 continue;
             }
-            let ptr = self.slots[i].load(Ordering::Acquire);
-            if ptr.is_null() {
+            // ACTIVE; the caller excludes reclaim (crate contract).
+            let Some(occupant) = self.occupant(self.slots[i].load(Ordering::Acquire)) else {
                 continue;
-            }
-            // SAFETY: ACTIVE; caller excludes reclaim (crate contract).
-            if !pred(unsafe { &*ptr }) {
+            };
+            if !pred(occupant) {
                 continue;
             }
             if self.states[i]
@@ -340,9 +342,9 @@ impl<T, const N: usize> SlotTable<T, N> {
                 continue;
             }
             self.retire_time[i].store(retire_at(), Ordering::Release);
-            // SAFETY: state is RETIRED and the cooldown has not started
-            // elapsing against any freer, so the occupant is provably live.
-            on_retired(i, unsafe { &*ptr });
+            // This call just moved the slot to RETIRED, and the cooldown has not
+            // started elapsing against any freer, so the occupant is still live.
+            on_retired(i, occupant);
             return true;
         }
         false

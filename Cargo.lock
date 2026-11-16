@@ -85,6 +85,7 @@ version = "0.1.0"
 name = "akuma-alloc"
 version = "0.1.0"
 dependencies = [
+ "akuma-not-even-once",
  "akuma-pmm",
  "akuma-primitives",
  "spinning_top",
@@ -126,6 +127,7 @@ dependencies = [
  "akuma-machine-facts",
  "akuma-mem-policy",
  "akuma-multiboot2",
+ "akuma-not-even-once",
  "akuma-pagetable",
  "akuma-phys",
  "akuma-pmm",
@@ -164,6 +166,9 @@ version = "0.1.0"
 [[package]]
 name = "akuma-dma"
 version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+]
 
 [[package]]
 name = "akuma-dmesg"
@@ -330,6 +335,7 @@ name = "akuma-exec-core"
 version = "0.1.0"
 dependencies = [
  "akuma-mmap",
+ "akuma-pod",
  "akuma-primitives",
  "akuma-syscalls-linux",
 ]
@@ -512,6 +518,7 @@ dependencies = [
  "akuma-pipe",
  "akuma-pipes",
  "akuma-pmm",
+ "akuma-pod",
  "akuma-port",
  "akuma-power",
  "akuma-primitives",
@@ -744,6 +751,7 @@ dependencies = [
  "akuma-mmu-raw",
  "akuma-pagetable",
  "akuma-pmm",
+ "akuma-pod",
  "akuma-primitives",
  "akuma-pte-amd64",
  "akuma-user-space",
@@ -757,7 +765,9 @@ version = "0.1.0"
 dependencies = [
  "akuma-fdt",
  "akuma-pagetable",
+ "akuma-phys",
  "akuma-pmm",
+ "akuma-pod",
  "akuma-primitives",
 ]
 
@@ -790,6 +800,7 @@ dependencies = [
  "akuma-dns",
  "akuma-net-nic",
  "akuma-net-yarn",
+ "akuma-pod",
  "akuma-primitives",
  "akuma-rump",
  "akuma-virtio",
@@ -895,6 +906,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-pod"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-port"
 version = "0.1.0"
 
@@ -981,6 +996,7 @@ dependencies = [
  "akuma-cpu",
  "akuma-exec-core",
  "akuma-fpu-amd64",
+ "akuma-pod",
  "akuma-primitives",
  "akuma-threading",
 ]
@@ -1056,6 +1072,7 @@ dependencies = [
 name = "akuma-syscalls-abi"
 version = "0.1.0"
 dependencies = [
+ "akuma-pod",
  "akuma-syscalls-linux",
 ]
 
@@ -1081,6 +1098,7 @@ dependencies = [
  "akuma-net-yarn",
  "akuma-pipes",
  "akuma-pmm",
+ "akuma-pod",
  "akuma-primitives",
  "akuma-reclock",
  "akuma-syscalls",
@@ -1131,6 +1149,9 @@ dependencies = [
 [[package]]
 name = "akuma-syscalls-linux"
 version = "0.1.0"
+dependencies = [
+ "akuma-pod",
+]
 
 [[package]]
 name = "akuma-syscalls-log"
@@ -1205,6 +1226,7 @@ dependencies = [
  "akuma-mmap",
  "akuma-mmu",
  "akuma-pmm",
+ "akuma-pod",
  "akuma-primitives",
  "akuma-stack",
  "akuma-switch",
@@ -1398,6 +1420,7 @@ name = "akuma-user-access"
 version = "0.1.0"
 dependencies = [
  "akuma-mmu",
+ "akuma-pod",
  "akuma-primitives",
 ]
 

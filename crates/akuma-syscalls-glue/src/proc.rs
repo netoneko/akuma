@@ -1543,6 +1543,24 @@ pub struct SpawnOptions {
     pub ngroups: u32,
     pub cred_flags: u32,
 }
+akuma_pod::pod!(SpawnOptions {
+    cwd_ptr: u64,
+    cwd_len: usize,
+    root_dir_ptr: u64,
+    root_dir_len: usize,
+    args_ptr: u64,
+    args_len: usize,
+    stdin_ptr: u64,
+    stdin_len: usize,
+    box_id: u64,
+    env_ptr: u64,
+    env_len: usize,
+    uid: u32,
+    gid: u32,
+    groups_ptr: u64,
+    ngroups: u32,
+    cred_flags: u32,
+});
 
 /// `SpawnOptions::cred_flags`: apply `uid`/`gid`/`groups` to the child.
 pub const SPAWN_CREDS_SET: u32 = 1;

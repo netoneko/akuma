@@ -1628,10 +1628,10 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
         };
         sf.info.si_code = si_code;
         // si_uid = 0: every process here runs as root.
-        sf.info.fields.chld = sigframe::SigchldFields::new(child_pid, 0, si_status);
+        sf.info.fields.set_chld(sigframe::SigchldFields::new(child_pid, 0, si_status));
     } else {
         sf.info.si_code = i32::from(is_fault); // SEGV_MAPERR=1, SI_USER=0
-        sf.info.fields.fault = sigframe::SigfaultFields { si_addr: fault_addr };
+        sf.info.fields.set_fault(sigframe::SigfaultFields { si_addr: fault_addr });
     }
 
     // ucontext.uc_stack (stack_t) — Go runtime reads this to determine

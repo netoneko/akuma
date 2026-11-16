@@ -8,6 +8,8 @@ description = "The amd64 boot kit, extracted from crates/akuma-kernel-amd64/src:
 workspace = true
 
 [dependencies]
+# The shootdown handler's registration cell.
+akuma-not-even-once = { path = "../akuma-not-even-once" }
 # `PHYSMAP_LIMIT` (the one value `boot.s`'s page-directory count and `phys.rs`
 # both derive from), the `MmioWindow` `paging::map_device_window` hands out, and
 # `safe_print!` — the crate's diagnostics go through the registered print hook

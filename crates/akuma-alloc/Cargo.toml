@@ -10,13 +10,15 @@ description = "The kernel heap: Talc plus the on-demand PMM growth/backoff/recla
 # attribution. OFF by default — `livehist_add`/`pc_track_alloc` sit on every
 # allocation, and the chain capture walks x29 (which also wants
 # `-C force-frame-pointers=yes`). See docs/archive/SELFHOST_KERNEL_HEAP_LEAK.md.
-leak-instr = []
+leak-instr = ["dep:akuma-not-even-once"]
 
 [dependencies]
 talc = "4"
 spinning_top = "0.3"
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-pmm = { path = "../akuma-pmm" }
+# The leak-instr hooks' registration cells.
+akuma-not-even-once = { path = "../akuma-not-even-once", optional = true }
 
 [lints]
 workspace = true

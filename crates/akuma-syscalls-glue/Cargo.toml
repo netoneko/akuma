@@ -5,6 +5,7 @@ edition = "2024"
 description = "The Linux syscall dispatcher and its per-family implementations"
 
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }
 akuma-bkl = { path = "../akuma-bkl" }
 akuma-config = { path = "../akuma-config" }
 akuma-cow = { path = "../akuma-cow" }

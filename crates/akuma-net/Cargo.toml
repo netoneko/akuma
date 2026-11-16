@@ -39,6 +39,7 @@ rtl8169 = ["akuma-net-nic/rtl8169"]
 workspace = true
 
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }
 # Host-testable rump tap orchestration; pulled in only by the `rump` feature.
 akuma-rump = { path = "../akuma-rump", optional = true }
 # `PreemptGuard`, which this crate re-exports. It started life HERE, was lifted to

@@ -474,7 +474,7 @@ pub fn poll_state(n: u32, master: bool, register_tid: Option<usize>) -> FdState 
 
 // ---- ioctl ----------------------------------------------------------------------
 
-fn put<T: Copy>(arg: u64, v: &T) -> u64 {
+fn put<T: akuma_pod::Pod>(arg: u64, v: &T) -> u64 {
     if write_user_val(arg, v).is_err() { EFAULT } else { 0 }
 }
 

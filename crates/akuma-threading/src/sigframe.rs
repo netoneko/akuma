@@ -51,6 +51,7 @@ pub struct SigchldFields {
     pub si_status: i32,
     _pad: u32,
 }
+akuma_pod::pod!(SigchldFields { si_pid: u32, si_uid: u32, si_status: i32, _pad: u32 });
 
 impl SigchldFields {
     /// The three fields a `SIGCHLD` delivery fills; the union's remaining bytes stay
@@ -68,16 +69,43 @@ impl SigchldFields {
 pub struct SigfaultFields {
     pub si_addr: u64,
 }
+akuma_pod::pod!(SigfaultFields { si_addr: u64 });
 
-/// `siginfo_t::_sifields`. A union, because that is what it is: the two arms below
-/// overlap in C and the old code open-coded that by writing `si_pid` at +16 for
-/// `SIGCHLD` and `si_addr` at +16 for everything else.
+/// `siginfo_t::_sifields`: 112 bytes the two arms below overlap in.
+///
+/// A C union, held here as plain words rather than a Rust `union`. The frame is
+/// copied to user space as bytes, so every byte must be initialised; a Rust
+/// `union` built from its 8-byte `fault` arm leaves the other 104 uninitialised,
+/// and the type could not say otherwise. Words plus the two setters keep the same
+/// layout and make the frame [`akuma_pod::Pod`]. A setter overwrites only its arm's
+/// bytes, exactly as assigning a union field did.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub union SiFields {
-    pub chld: SigchldFields,
-    pub fault: SigfaultFields,
-    _pad: [u8; 112],
+pub struct SiFields {
+    words: [u64; 14],
+}
+akuma_pod::pod!(SiFields { words: [u64; 14] });
+
+impl SiFields {
+    /// All zero.
+    #[must_use]
+    pub const fn zeroed() -> Self {
+        Self { words: [0; 14] }
+    }
+
+    fn put(&mut self, arm: &[u8]) {
+        akuma_pod::bytes_of_mut(&mut self.words)[..arm.len()].copy_from_slice(arm);
+    }
+
+    /// Fill the `_sigchld` arm.
+    pub fn set_chld(&mut self, chld: SigchldFields) {
+        self.put(akuma_pod::bytes_of(&chld));
+    }
+
+    /// Fill the `_sigfault` arm.
+    pub fn set_fault(&mut self, fault: SigfaultFields) {
+        self.put(akuma_pod::bytes_of(&fault));
+    }
 }
 
 /// `siginfo_t` (128 bytes).
@@ -92,6 +120,7 @@ pub struct SigInfo {
     _pad0: u32,
     pub fields: SiFields,
 }
+akuma_pod::pod!(SigInfo { si_signo: i32, si_errno: i32, si_code: i32, _pad0: u32, fields: SiFields });
 
 /// `stack_t` (24 bytes), `ucontext_t::uc_stack`. Go reads it to decide whether the
 /// signal arrived on the sigaltstack.
@@ -103,6 +132,7 @@ pub struct StackT {
     _pad: u32,
     pub ss_size: u64,
 }
+akuma_pod::pod!(StackT { ss_sp: u64, ss_flags: i32, _pad: u32, ss_size: u64 });
 
 /// `SS_ONSTACK` — the signal was delivered on the alternate stack.
 pub const SS_ONSTACK: i32 = 1;
@@ -118,6 +148,7 @@ pub struct SigContext {
     pub pc: u64,
     pub pstate: u64,
 }
+akuma_pod::pod!(SigContext { fault_address: u64, regs: [u64; 31], sp: u64, pc: u64, pstate: u64 });
 
 /// `ucontext_t` header + `uc_mcontext` (176 + 280 bytes).
 #[repr(C)]
@@ -134,6 +165,15 @@ pub struct UContext {
     _pad_mcontext_align: [u8; 8],
     pub uc_mcontext: SigContext,
 }
+akuma_pod::pod!(UContext {
+    uc_flags: u64,
+    uc_link: u64,
+    uc_stack: StackT,
+    uc_sigmask: u64,
+    _unused: [u8; 120],
+    _pad_mcontext_align: [u8; 8],
+    uc_mcontext: SigContext,
+});
 
 /// `struct fpsimd_context` (528 bytes).
 ///
@@ -150,6 +190,7 @@ pub struct FpsimdContext {
     pub fpcr: u32,
     pub vregs: [u64; 64],
 }
+akuma_pod::pod!(FpsimdContext { magic: u32, size: u32, fpsr: u32, fpcr: u32, vregs: [u64; 64] });
 
 /// The whole `rt_sigframe` as userspace sees it, 1120 bytes at the new `sp`.
 #[repr(C)]
@@ -162,6 +203,7 @@ pub struct RtSigFrame {
     pub end_magic: u32,
     pub end_size: u32,
 }
+akuma_pod::pod!(RtSigFrame { info: SigInfo, uc: UContext, fpsimd: FpsimdContext, end_magic: u32, end_size: u32 });
 
 /// Size of the frame pushed onto the user stack.
 pub const SIGFRAME_SIZE: usize = size_of::<RtSigFrame>();
@@ -207,8 +249,7 @@ const _: () = assert!(offset_of!(FpsimdContext, vregs) == 16);
 impl RtSigFrame {
     /// An all-zero frame, matching the `write_bytes(base, 0, SIGFRAME_SIZE)` the
     /// hand-written builder opened with. `const` and unsafe-free: every field is an
-    /// integer or an array of them, and the union's zero is spelled explicitly because
-    /// a union has no `Default`.
+    /// integer or an array of them.
     #[must_use]
     pub const fn zeroed() -> Self {
         Self {
@@ -217,7 +258,7 @@ impl RtSigFrame {
                 si_errno: 0,
                 si_code: 0,
                 _pad0: 0,
-                fields: SiFields { _pad: [0; 112] },
+                fields: SiFields::zeroed(),
             },
             uc: UContext {
                 uc_flags: 0,
@@ -417,7 +458,7 @@ mod tests {
     #[test]
     fn siginfo_union_arms_overlap_at_16() {
         let mut sf = RtSigFrame::zeroed();
-        sf.info.fields.fault = SigfaultFields { si_addr: 0x1234_5678_9ABC_DEF0 };
+        sf.info.fields.set_fault(SigfaultFields { si_addr: 0x1234_5678_9ABC_DEF0 });
         // Both arms are plain integers over the same 112 bytes: where the `SIGCHLD` arm's `si_pid` and `si_uid`
         // sit is a layout fact (`offset_of!`), and the bytes at those offsets are the fault address's halves.
         let bytes = frame_bytes(&sf);
@@ -463,7 +504,7 @@ mod tests {
     }
 
     fn frame_bytes(sf: &RtSigFrame) -> [u8; SIGFRAME_SIZE] {
-        akuma_switch::bytes_of::<RtSigFrame, SIGFRAME_SIZE>(sf)
+        akuma_pod::bytes_of(sf).try_into().expect("the frame is SIGFRAME_SIZE bytes")
     }
 
     // The `expect`s below cannot fire — the ranges are constant and in bounds — and a

@@ -849,6 +849,21 @@ pub mod cache {
         let _ = va;
     }
 
+    /// `clflush` — write back and invalidate the data cache line holding `va`
+    /// (amd64; the clean+invalidate counterpart of [`dc_cvac`]). For DMA to a
+    /// device that does not snoop. Off amd64 bare metal, a no-op.
+    #[inline(always)]
+    pub fn clflush(va: usize) {
+        #[cfg(all(target_os = "none", target_arch = "x86_64"))]
+        // SAFETY: as `dc_cvau` - cache maintenance by address writes back what the
+        // line already holds and changes no value the program can observe.
+        unsafe {
+            core::arch::asm!("clflush [{}]", in(reg) va, options(nostack, preserves_flags));
+        };
+        #[cfg(not(all(target_os = "none", target_arch = "x86_64")))]
+        let _ = va;
+    }
+
     /// `ic ivau` — invalidate one instruction cache line by VA.
     #[inline(always)]
     pub fn ic_ivau(va: usize) {

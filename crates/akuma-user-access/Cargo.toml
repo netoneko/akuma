@@ -18,5 +18,6 @@ workspace = true
 # space lock and lazy regions, so its body stays in `akuma-exec` and is reached
 # through `set_prefault_hook`.
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-mmu = { path = "../akuma-mmu" }

@@ -2093,7 +2093,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             if robust_head != 0 {
                 use akuma_user_access::{read_user_into_with, write_user_val_with, Prefault};
                 /// `Ok(v)` or `None` if the read faulted.
-                fn ru<T: Copy + Default>(addr: u64) -> Option<T> {
+                fn ru<T: akuma_user_access::Pod + Default>(addr: u64) -> Option<T> {
                     let mut v = T::default();
                     read_user_into_with(&mut v, addr, Prefault::No).ok().map(|()| v)
                 }

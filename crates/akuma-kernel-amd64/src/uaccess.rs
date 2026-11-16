@@ -301,21 +301,20 @@ pub fn write_bytes(ptr: u64, src: &[u8]) -> bool {
 
 /// Read one plain-ABI value from user memory.
 ///
-/// `T` must be integers or arrays of integers — see the module note. Alignment
-/// is not required of `ptr`: the copy is byte-granular. The value starts as
-/// `T::default()` and the copy overwrites its bytes in place
-/// (`akuma_user_access::as_user_bytes_mut`, which carries the "any byte pattern
-/// is a `T`" obligation for every caller in the tree).
+/// `T: Pod` (integers, arrays, structs admitted with `akuma_pod::pod!`), so any
+/// byte pattern user space sends is a valid `T`. Alignment is not required of
+/// `ptr`: the copy is byte-granular. The value starts as `T::default()` and the
+/// copy overwrites its bytes in place.
 #[must_use]
-pub fn read_val<T: Copy + Default>(ptr: u64) -> Option<T> {
+pub fn read_val<T: akuma_user_access::Pod + Default>(ptr: u64) -> Option<T> {
     let mut v = T::default();
     read_bytes(ptr, akuma_user_access::as_user_bytes_mut(core::slice::from_mut(&mut v))).then_some(v)
 }
 
-/// Write one plain-ABI value to user memory. Same `T` requirement as
-/// [`read_val`].
+/// Write one plain-ABI value to user memory. `T: Pod` has no padding, so no
+/// uninitialised kernel bytes go out.
 #[must_use]
-pub fn write_val<T: Copy>(ptr: u64, v: T) -> bool {
+pub fn write_val<T: akuma_user_access::Pod>(ptr: u64, v: T) -> bool {
     write_bytes(ptr, akuma_user_access::as_user_bytes(core::slice::from_ref(&v)))
 }
 

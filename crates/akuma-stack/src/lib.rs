@@ -44,6 +44,41 @@ impl StackRegion {
         self.base.saturating_add(self.size)
     }
 
+    /// Whether `[addr, addr + len)` lies inside the region.
+    fn holds(&self, addr: usize, len: usize) -> bool {
+        addr >= self.base && addr.checked_add(len).is_some_and(|end| end <= self.top())
+    }
+
+    /// The word at `addr`. Every word read of the region is this one.
+    ///
+    /// # Panics
+    /// If `addr` is not an 8-aligned word inside the region.
+    fn read_word(&self, addr: usize) -> u64 {
+        assert!(addr.is_multiple_of(8) && self.holds(addr, 8), "stack word {addr:#x} outside the region");
+        // SAFETY: an aligned word inside the region `new` vouched for (checked above).
+        unsafe { (addr as *const u64).read_volatile() }
+    }
+
+    /// Store the word at `addr`. Every word write of the region is this one.
+    ///
+    /// # Panics
+    /// As [`Self::read_word`].
+    fn write_word(&self, addr: usize, value: u64) {
+        assert!(addr.is_multiple_of(8) && self.holds(addr, 8), "stack word {addr:#x} outside the region");
+        // SAFETY: as `read_word`, for a store.
+        unsafe { (addr as *mut u64).write_volatile(value) };
+    }
+
+    /// Store the byte at `addr`.
+    ///
+    /// # Panics
+    /// If `addr` is outside the region.
+    fn write_byte(&self, addr: usize, value: u8) {
+        assert!(self.holds(addr, 1), "stack byte {addr:#x} outside the region");
+        // SAFETY: a byte inside the region `new` vouched for (checked above).
+        unsafe { (addr as *mut u8).write_volatile(value) };
+    }
+
     /// First 8-aligned address at least `skip_bytes` above the base (clamped to the top).
     fn scan_start(&self, skip_bytes: usize) -> usize {
         let start = self.base.saturating_add(skip_bytes).saturating_add(7) & !7;
@@ -58,9 +93,7 @@ impl StackRegion {
         let mut addr = self.scan_start(skip_bytes);
         let end = end.min(self.top());
         while addr + 8 <= end {
-            // SAFETY: `addr..addr+8` is inside `[start, end) ⊆ [base, top)`, 8-aligned, in the region
-            // `new` vouched for.
-            unsafe { (addr as *mut u64).write_volatile(SENTINEL) };
+            self.write_word(addr, SENTINEL);
             addr += 8;
         }
     }
@@ -72,8 +105,7 @@ impl StackRegion {
         let top = self.top();
         let mut addr = self.scan_start(skip_bytes);
         while addr + 8 <= top {
-            // SAFETY: `addr..addr+8` is inside `[base, top)`, 8-aligned.
-            if unsafe { (addr as *const u64).read_volatile() } != SENTINEL {
+            if self.read_word(addr) != SENTINEL {
                 return top - addr;
             }
             addr += 8;
@@ -92,8 +124,7 @@ impl StackRegion {
             return false;
         }
         for off in 0..len {
-            // SAFETY: `start + off < start + len <= top`, and `start >= base`: inside the vouched region.
-            unsafe { ((start + off) as *mut u8).write_volatile(0) };
+            self.write_byte(start + off, 0);
         }
         true
     }
@@ -106,8 +137,7 @@ impl StackRegion {
         if addr < self.base || addr.saturating_add(8) > self.top() || !addr.is_multiple_of(8) {
             return false;
         }
-        // SAFETY: `[addr, addr + 8)` is inside the vouched region and 8-aligned.
-        unsafe { (addr as *mut u64).write_volatile(value) };
+        self.write_word(addr, value);
         true
     }
 
@@ -117,8 +147,7 @@ impl StackRegion {
             return;
         }
         for i in 0..words {
-            // SAFETY: `base + 8*i + 8 <= base + 8*words <= top`; the base is 8-aligned by contract of a stack.
-            unsafe { ((self.base + i * 8) as *mut u64).write_volatile(value) };
+            self.write_word(self.base + i * 8, value);
         }
     }
 
@@ -129,10 +158,7 @@ impl StackRegion {
         if words.saturating_mul(8) > self.size {
             return false;
         }
-        (0..words).all(|i| {
-            // SAFETY: as in `write_canary`.
-            unsafe { ((self.base + i * 8) as *const u64).read_volatile() == value }
-        })
+        (0..words).all(|i| self.read_word(self.base + i * 8) == value)
     }
 }
 

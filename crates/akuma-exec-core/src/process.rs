@@ -89,6 +89,7 @@ pub struct ProcessInfo {
     #[allow(clippy::pub_underscore_fields)]
     pub _reserved: [u8; 1008],
 }
+akuma_pod::pod!(ProcessInfo { pid: u32, ppid: u32, box_id: u64, _reserved: [u8; 1008] });
 
 impl ProcessInfo {
     #[must_use]

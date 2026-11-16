@@ -50,13 +50,41 @@ pub struct FrameHandle {
     _not_send: PhantomData<*mut ()>,
 }
 
+/// Word index of a `UserTrapFrame` field: its byte offset over 8.
+macro_rules! word_of {
+    ($field:ident) => {
+        core::mem::offset_of!(UserTrapFrame, $field) / 8
+    };
+}
+
+/// Words in the whole frame, register block and save area together.
+const FRAME_WORDS: usize = FRAME_BYTES / 8;
+const X0: usize = word_of!(x0);
+const X8: usize = word_of!(x8);
+const SP_EL0: usize = word_of!(sp_el0);
+const ELR_EL1: usize = word_of!(elr_el1);
+const SPSR_EL1: usize = word_of!(spsr_el1);
+const TPIDR_EL0: usize = word_of!(tpidr_el0);
+
+// What the word indexing relies on: every field is one 8-aligned `u64`, `x0`..`x30`
+// are the first 31 words in order, and the register block fits in the frame.
+const _: () = {
+    assert!(X0 == 0 && word_of!(x30) == GPRS - 1);
+    assert!(core::mem::offset_of!(UserTrapFrame, x30) == (GPRS - 1) * 8);
+    assert!(core::mem::offset_of!(UserTrapFrame, sp_el0).is_multiple_of(8));
+    assert!(core::mem::offset_of!(UserTrapFrame, tpidr_el0).is_multiple_of(8));
+    assert!(core::mem::size_of::<UserTrapFrame>() <= FRAME_BYTES);
+    assert!(core::mem::align_of::<UserTrapFrame>() >= 8);
+};
+
 impl FrameHandle {
     /// Name the frame at `frame`.
     ///
     /// # Safety
     /// `frame` is the frame the vector asm just pushed for this handler on the
-    /// current thread's kernel stack, and stays live and unaliased by any other
-    /// writer until the handler returns to the asm epilogue.
+    /// current thread's kernel stack - all [`FRAME_BYTES`] of it, register block
+    /// and save area - and stays live and unaliased by any other writer until the
+    /// handler returns to the asm epilogue.
     ///
     /// # Panics
     /// If `frame` is null - a boot-order bug, not a state to degrade through.
@@ -72,43 +100,59 @@ impl FrameHandle {
         self.ptr.as_ptr()
     }
 
+    /// Word `i` of the frame: one volatile, aligned `u64` load. Every read below
+    /// is this one.
+    #[inline]
+    #[track_caller]
+    fn word(self, i: usize) -> u64 {
+        assert!(i < FRAME_WORDS, "trap-frame word out of range");
+        // SAFETY: `new`'s contract makes `ptr` a live frame of `FRAME_BYTES` that
+        // only this handler touches; `i < FRAME_WORDS` keeps the word inside it, and
+        // the frame's 8-byte alignment (asserted above for the type, 16 from the
+        // asm) makes it aligned.
+        unsafe { self.ptr.as_ptr().cast::<u64>().add(i).read_volatile() }
+    }
+
+    /// Store word `i`: the write half of [`Self::word`], and every write below.
+    #[inline]
+    #[track_caller]
+    fn set_word(self, i: usize, v: u64) {
+        assert!(i < FRAME_WORDS, "trap-frame word out of range");
+        // SAFETY: as [`Self::word`], for a store.
+        unsafe { self.ptr.as_ptr().cast::<u64>().add(i).write_volatile(v) }
+    }
+
     /// `x0`: the syscall's first argument on entry, its return value on exit.
     #[must_use]
     pub fn x0(self) -> u64 {
-        // SAFETY: the module contract; one aligned u64 field.
-        unsafe { core::ptr::addr_of!((*self.ptr.as_ptr()).x0).read_volatile() }
+        self.word(X0)
     }
 
     /// Store `x0`.
     pub fn set_x0(self, v: u64) {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of_mut!((*self.ptr.as_ptr()).x0).write_volatile(v) }
+        self.set_word(X0, v);
     }
 
     /// `x8`: the syscall number.
     #[must_use]
     pub fn x8(self) -> u64 {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of!((*self.ptr.as_ptr()).x8).read_volatile() }
+        self.word(X8)
     }
 
     /// `ELR_EL1` as saved at exception entry.
     #[must_use]
     pub fn elr(self) -> u64 {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of!((*self.ptr.as_ptr()).elr_el1).read_volatile() }
+        self.word(ELR_EL1)
     }
 
     /// Store the saved `ELR_EL1` (what `eret` returns to).
     pub fn set_elr(self, v: u64) {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of_mut!((*self.ptr.as_ptr()).elr_el1).write_volatile(v) }
+        self.set_word(ELR_EL1, v);
     }
 
     /// Store the user's `TPIDR_EL0` (its TLS base) for the `eret` to restore.
     pub fn set_tpidr_el0(self, v: u64) {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of_mut!((*self.ptr.as_ptr()).tpidr_el0).write_volatile(v) }
+        self.set_word(TPIDR_EL0, v);
     }
 
     /// Store general register `n` (`0..=30`) - the signal path sets `x1`, `x2` and
@@ -119,14 +163,12 @@ impl FrameHandle {
     #[track_caller]
     pub fn set_reg(self, n: usize, v: u64) {
         assert!(n < GPRS, "general register number out of range");
-        // SAFETY: as [`Self::reg`].
-        unsafe { self.ptr.as_ptr().cast::<u64>().add(n).write_volatile(v) }
+        self.set_word(X0 + n, v);
     }
 
     /// Store `SP_EL0`, the user stack pointer the `eret` restores.
     pub fn set_sp_el0(self, v: u64) {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of_mut!((*self.ptr.as_ptr()).sp_el0).write_volatile(v) }
+        self.set_word(SP_EL0, v);
     }
 
     /// General register `n` (`0..=30`), for a handler that emulates the trapped
@@ -138,9 +180,7 @@ impl FrameHandle {
     #[track_caller]
     pub fn reg(self, n: usize) -> u64 {
         assert!(n < GPRS, "general register number out of range");
-        // SAFETY: `UserTrapFrame` is `repr(C)` with `x0`..`x30` as its first 31
-        // `u64` fields, contiguous; `n < 31` stays inside them.
-        unsafe { self.ptr.as_ptr().cast::<u64>().add(n).read_volatile() }
+        self.word(X0 + n)
     }
 
     /// A by-value copy of the whole frame, read field by field.
@@ -149,31 +189,21 @@ impl FrameHandle {
     /// frame do not change the copy, and no reference into it outlives the call.
     #[must_use]
     pub fn snapshot(self) -> UserTrapFrame {
-        let p = self.ptr.as_ptr();
-        // SAFETY: the module contract; `repr(C)` plain `u64` fields, so a
-        // volatile read of each is a valid value of the whole.
-        unsafe {
-            let mut regs = [0u64; GPRS];
-            let mut i = 0;
-            while i < GPRS {
-                regs[i] = p.cast::<u64>().add(i).read_volatile();
-                i += 1;
-            }
-            UserTrapFrame {
-                x0: regs[0], x1: regs[1], x2: regs[2], x3: regs[3],
-                x4: regs[4], x5: regs[5], x6: regs[6], x7: regs[7],
-                x8: regs[8], x9: regs[9], x10: regs[10], x11: regs[11],
-                x12: regs[12], x13: regs[13], x14: regs[14], x15: regs[15],
-                x16: regs[16], x17: regs[17], x18: regs[18], x19: regs[19],
-                x20: regs[20], x21: regs[21], x22: regs[22], x23: regs[23],
-                x24: regs[24], x25: regs[25], x26: regs[26], x27: regs[27],
-                x28: regs[28], x29: regs[29], x30: regs[30],
-                sp_el0: core::ptr::addr_of!((*p).sp_el0).read_volatile(),
-                elr_el1: core::ptr::addr_of!((*p).elr_el1).read_volatile(),
-                spsr_el1: core::ptr::addr_of!((*p).spsr_el1).read_volatile(),
-                tpidr_el0: core::ptr::addr_of!((*p).tpidr_el0).read_volatile(),
-                _padding: 0,
-            }
+        let regs: [u64; GPRS] = core::array::from_fn(|i| self.word(X0 + i));
+        UserTrapFrame {
+            x0: regs[0], x1: regs[1], x2: regs[2], x3: regs[3],
+            x4: regs[4], x5: regs[5], x6: regs[6], x7: regs[7],
+            x8: regs[8], x9: regs[9], x10: regs[10], x11: regs[11],
+            x12: regs[12], x13: regs[13], x14: regs[14], x15: regs[15],
+            x16: regs[16], x17: regs[17], x18: regs[18], x19: regs[19],
+            x20: regs[20], x21: regs[21], x22: regs[22], x23: regs[23],
+            x24: regs[24], x25: regs[25], x26: regs[26], x27: regs[27],
+            x28: regs[28], x29: regs[29], x30: regs[30],
+            sp_el0: self.word(SP_EL0),
+            elr_el1: self.word(ELR_EL1),
+            spsr_el1: self.word(SPSR_EL1),
+            tpidr_el0: self.word(TPIDR_EL0),
+            _padding: 0,
         }
     }
 
@@ -193,17 +223,7 @@ impl FrameHandle {
     #[track_caller]
     pub fn read_save_words<const N: usize>(self, off: usize) -> [u64; N] {
         Self::check_save_range(off, N);
-        let mut out = [0u64; N];
-        let base = self.ptr.as_ptr().cast::<u64>();
-        let mut i = 0;
-        while i < N {
-            // SAFETY: the module contract makes `base` an 832-byte live frame; the
-            // range check above keeps word `i` inside it past the register block,
-            // 8-aligned (`off % 8 == 0`, frame 16-aligned by the asm).
-            out[i] = unsafe { base.add(off / 8 + i).read_volatile() };
-            i += 1;
-        }
-        out
+        core::array::from_fn(|i| self.word(off / 8 + i))
     }
 
     /// Store `words` at byte offset `off` of the save area: the other half of
@@ -211,12 +231,8 @@ impl FrameHandle {
     #[track_caller]
     pub fn write_save_words<const N: usize>(self, off: usize, words: &[u64; N]) {
         Self::check_save_range(off, N);
-        let base = self.ptr.as_ptr().cast::<u64>();
-        let mut i = 0;
-        while i < N {
-            // SAFETY: as [`Self::read_save_words`]; one aligned `u64` store.
-            unsafe { base.add(off / 8 + i).write_volatile(words[i]) };
-            i += 1;
+        for (i, &w) in words.iter().enumerate() {
+            self.set_word(off / 8 + i, w);
         }
     }
 
@@ -236,33 +252,25 @@ impl FrameHandle {
             f.x14, f.x15, f.x16, f.x17, f.x18, f.x19, f.x20, f.x21, f.x22, f.x23, f.x24, f.x25,
             f.x26, f.x27, f.x28, f.x29, f.x30,
         ];
-        let p = self.ptr.as_ptr();
-        // SAFETY: as [`Self::snapshot`]; each store is one aligned `u64` field.
-        unsafe {
-            let mut i = 0;
-            while i < GPRS {
-                p.cast::<u64>().add(i).write_volatile(regs[i]);
-                i += 1;
-            }
-            core::ptr::addr_of_mut!((*p).sp_el0).write_volatile(f.sp_el0);
-            core::ptr::addr_of_mut!((*p).elr_el1).write_volatile(f.elr_el1);
-            core::ptr::addr_of_mut!((*p).spsr_el1).write_volatile(f.spsr_el1);
-            core::ptr::addr_of_mut!((*p).tpidr_el0).write_volatile(f.tpidr_el0);
+        for (i, &r) in regs.iter().enumerate() {
+            self.set_word(X0 + i, r);
         }
+        self.set_word(SP_EL0, f.sp_el0);
+        self.set_word(ELR_EL1, f.elr_el1);
+        self.set_word(SPSR_EL1, f.spsr_el1);
+        self.set_word(TPIDR_EL0, f.tpidr_el0);
     }
 
     /// `SP_EL0` as saved at exception entry.
     #[must_use]
     pub fn sp_el0(self) -> u64 {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of!((*self.ptr.as_ptr()).sp_el0).read_volatile() }
+        self.word(SP_EL0)
     }
 
     /// `SPSR_EL1` as saved at exception entry.
     #[must_use]
     pub fn spsr(self) -> u64 {
-        // SAFETY: as [`Self::x0`].
-        unsafe { core::ptr::addr_of!((*self.ptr.as_ptr()).spsr_el1).read_volatile() }
+        self.word(SPSR_EL1)
     }
 }
 
@@ -322,19 +330,33 @@ pub mod irq_frame {
             Self { sp: sp as usize }
         }
 
+        /// The `u64` at byte `off` of the frame: one volatile, aligned load.
+        #[inline]
+        fn word(self, off: usize) -> u64 {
+            assert!(off.is_multiple_of(8) && off < SIZE, "IRQ-frame offset out of range");
+            // SAFETY: `at`'s contract places `SIZE` bytes of frame at `sp`, which
+            // the IRQ vector keeps 16-aligned; `off` is an aligned word inside it.
+            unsafe { core::ptr::read_volatile((self.sp + off) as *const u64) }
+        }
+
+        /// Store the `u64` at byte `off`: the write half of [`Self::word`].
+        #[inline]
+        fn set_word(self, off: usize, v: u64) {
+            assert!(off.is_multiple_of(8) && off < SIZE, "IRQ-frame offset out of range");
+            // SAFETY: as [`Self::word`], for a store.
+            unsafe { core::ptr::write_volatile((self.sp + off) as *mut u64, v) }
+        }
+
         /// The saved `ELR_EL1` — where the frame's `eret` resumes.
         #[must_use]
         pub fn elr(self) -> u64 {
-            // SAFETY: `at`'s contract places `SIZE` bytes of frame at `sp`; `ELR`
-            // is one aligned `u64` inside it.
-            unsafe { core::ptr::read_volatile((self.sp + ELR) as *const u64) }
+            self.word(ELR)
         }
 
         /// The saved `SPSR_EL1`.
         #[must_use]
         pub fn spsr(self) -> u64 {
-            // SAFETY: as [`Self::elr`].
-            unsafe { core::ptr::read_volatile((self.sp + SPSR) as *const u64) }
+            self.word(SPSR)
         }
 
         /// Does the frame's `eret` return to EL0 (userspace)?
@@ -350,15 +372,13 @@ pub mod irq_frame {
         /// (`setup_fake_irq_frame` plants the thread's entry point here), kept in
         /// this module so the synthetic frame and the readers share one layout.
         pub fn write_elr(self, v: u64) {
-            // SAFETY: as [`Self::elr`], mirrored to a write.
-            unsafe { core::ptr::write_volatile((self.sp + ELR) as *mut u64, v) }
+            self.set_word(ELR, v);
         }
 
         /// Overwrite the saved `SPSR_EL1` — the writer half (`setup_fake_irq_frame`
         /// plants the EL/IRQ-mask state the first `eret` enters with).
         pub fn write_spsr(self, v: u64) {
-            // SAFETY: as [`Self::elr`], mirrored to a write.
-            unsafe { core::ptr::write_volatile((self.sp + SPSR) as *mut u64, v) }
+            self.set_word(SPSR, v);
         }
     }
 }

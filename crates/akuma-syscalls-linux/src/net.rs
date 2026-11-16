@@ -52,6 +52,18 @@ pub struct MsgHdr {
     /// these four bytes existed either way. Added 2026-08-30.
     pub _pad3: u32,
 }
+akuma_pod::pod!(MsgHdr {
+    msg_name: u64,
+    msg_namelen: u32,
+    _pad1: u32,
+    msg_iov: u64,
+    msg_iovlen: u32,
+    _pad2: u32,
+    msg_control: u64,
+    msg_controllen: u64,
+    msg_flags: i32,
+    _pad3: u32,
+});
 
 /// Linux `struct ucred` — what `SO_PEERCRED` returns.
 #[repr(C)]
@@ -61,6 +73,7 @@ pub struct Ucred {
     pub uid: u32,
     pub gid: u32,
 }
+akuma_pod::pod!(Ucred { pid: u32, uid: u32, gid: u32 });
 
 /// The `sockaddr` shape `SIOCGIFHWADDR` writes: `sa_family = ARPHRD_ETHER` (1)
 /// plus the 6-byte MAC, zero-padded to the same 16 bytes as a `sockaddr_in`.
@@ -81,6 +94,7 @@ pub struct IfConfHdr {
     pub _pad: i32,
     pub buf: u64,
 }
+akuma_pod::pod!(IfConfHdr { len: i32, _pad: i32, buf: u64 });
 
 /// `ARPHRD_ETHER`, the `sa_family` of a `SIOCGIFHWADDR` reply.
 pub const ARPHRD_ETHER: u16 = 1;

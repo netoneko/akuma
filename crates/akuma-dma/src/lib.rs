@@ -164,8 +164,9 @@ impl<E: DmaElem, const N: usize, A> DmaArray<E, N, A> {
 
     fn cell_ptr(&self, i: usize) -> *mut E {
         assert!(i < N, "DMA cell index out of range");
-        // SAFETY: `i < N`, so the offset stays inside the array.
-        unsafe { self.cells.get().cast::<E>().add(i) }
+        // `i < N` keeps the offset inside the array, so the wrapping form is the
+        // in-bounds one.
+        self.cells.get().cast::<E>().wrapping_add(i)
     }
 
     fn acquire_read(&self) -> bool {
@@ -346,14 +347,13 @@ impl<E: DmaElem, const N: usize, A> DmaArray<E, N, A> {
         let end = start + len;
         let mut a = start & !63;
         while a < end {
-            // SAFETY: `a` is a cache line inside this array (storage is 64-byte
-            // aligned, so rounding down cannot leave it) and `clflush` writes
-            // no memory the program can observe.
-            unsafe { core::arch::x86_64::_mm_clflush(a as *const u8) };
+            // A cache line inside this array (storage is 64-byte aligned, so
+            // rounding down cannot leave it).
+            akuma_cpu::cache::clflush(a);
             a += 64;
         }
-        // SAFETY: a fence has no memory-safety requirements.
-        unsafe { core::arch::x86_64::_mm_mfence() };
+        // `mfence` on amd64: the flushes complete before anything after them.
+        akuma_cpu::barrier::dsb_ish();
     }
 }
 

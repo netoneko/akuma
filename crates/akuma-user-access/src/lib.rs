@@ -69,6 +69,10 @@ use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_arch = "aarch64")]
 use akuma_primitives::preempt::set_user_copy_fault_handler;
 
+/// The bound on every typed user copy; re-exported so callers admit their wire
+/// structs with `akuma_user_access::pod!` without naming `akuma-pod` themselves.
+pub use akuma_pod::{Pod, pod};
+
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 unsafe extern "C" {
     fn __arch_copy_user_memory(dst: *mut u8, src: *const u8, len: usize) -> u64;
@@ -745,24 +749,20 @@ pub fn read_user_byte(ptr: u64) -> Result<u8, u64> {
 /// Write one ABI value out to user memory. The length is `size_of::<T>()`, which
 /// kills the `(&raw const v).cast::<u8>()` + separately-written-size pairing.
 ///
-/// `T` must be a plain ABI type — `#[repr(C)]` integers and arrays thereof, which
-/// is what every call site passes.
-pub fn write_user_val<T: Copy>(dst_user: u64, val: &T) -> Result<(), u64> {
+/// `T: Pod` (integers, arrays, and structs admitted with `akuma_pod::pod!`): no
+/// padding, so no uninitialised kernel bytes reach user space.
+pub fn write_user_val<T: Pod>(dst_user: u64, val: &T) -> Result<(), u64> {
     write_user_val_with(dst_user, val, Prefault::Yes)
 }
 
 /// [`write_user_val`] with an explicit prefault choice. See [`Prefault`] — the
 /// callers that need [`Prefault::No`] are holding a spinlock with IRQs masked.
-pub fn write_user_val_with<T: Copy>(
+pub fn write_user_val_with<T: Pod>(
     dst_user: u64,
     val: &T,
     prefault: Prefault,
 ) -> Result<(), u64> {
-    // SAFETY: reading `size_of::<T>()` bytes out of a live `&T` is in bounds.
-    let bytes = unsafe {
-        core::slice::from_raw_parts((val as *const T).cast::<u8>(), core::mem::size_of::<T>())
-    };
-    copy_to_user_with(dst_user, bytes, prefault)
+    copy_to_user_with(dst_user, akuma_pod::bytes_of(val), prefault)
 }
 
 /// Byte view of a slice of plain ABI values, for copying an *array* out to user
@@ -773,36 +773,27 @@ pub fn write_user_val_with<T: Copy>(
 /// happens once here instead of at every call site. Slice it before passing it on:
 /// `copy_to_user(p, &as_user_bytes(&events)[..n * SIZE])`.
 #[must_use]
-pub fn as_user_bytes<T: Copy>(vals: &[T]) -> &[u8] {
-    // SAFETY: `size_of::<T>() * len` bytes of a live slice, read-only, and `u8` has
-    // no alignment requirement.
-    unsafe {
-        core::slice::from_raw_parts(
-            vals.as_ptr().cast::<u8>(),
-            core::mem::size_of_val(vals),
-        )
-    }
+pub fn as_user_bytes<T: Pod>(vals: &[T]) -> &[u8] {
+    akuma_pod::as_bytes(vals)
 }
 
 /// Mutable byte view of a slice of plain ABI values, for copying an array in.
 ///
-/// Same requirement as [`read_user_into`]: `T` must be plain ABI data, since user
-/// bytes land on it verbatim.
+/// `T: Pod`, as [`read_user_into`]: user bytes land on it verbatim, so every bit
+/// pattern must be a valid `T`.
 #[must_use]
-pub fn as_user_bytes_mut<T: Copy>(vals: &mut [T]) -> &mut [u8] {
-    let len = core::mem::size_of_val(vals);
-    // SAFETY: `len` bytes of a live mutable slice; `u8` has no alignment requirement
-    // and the borrow is exclusive for the lifetime of the returned slice.
-    unsafe { core::slice::from_raw_parts_mut(vals.as_mut_ptr().cast::<u8>(), len) }
+pub fn as_user_bytes_mut<T: Pod>(vals: &mut [T]) -> &mut [u8] {
+    akuma_pod::as_bytes_mut(vals)
 }
 
 /// Read one ABI value in from user memory, over an existing `T`.
 ///
 /// Takes `&mut T` rather than returning `T` so no value has to be fabricated from
 /// user bytes: the caller's `T` is already valid, and on `Err` it is unmodified
-/// only up to the byte the fault hit — check the result before trusting it. Same
-/// plain-ABI-type requirement as [`write_user_val`].
-pub fn read_user_into<T: Copy>(dst: &mut T, src_user: u64) -> Result<(), u64> {
+/// only up to the byte the fault hit — check the result before trusting it.
+/// `T: Pod`: every bit pattern user space can send must be a valid `T` (a `bool`,
+/// an enum or a reference is not).
+pub fn read_user_into<T: Pod>(dst: &mut T, src_user: u64) -> Result<(), u64> {
     read_user_into_with(dst, src_user, Prefault::Yes)
 }
 
@@ -813,16 +804,12 @@ pub fn read_user_into<T: Copy>(dst: &mut T, src_user: u64) -> Result<(), u64> {
 /// `src/syscall/msgqueue.rs`'s in-hold message copies. Both rely on the range
 /// having been prefaulted *before* the lock was taken; the range check itself is a
 /// read-only page-table walk and is safe to run under the hold.
-pub fn read_user_into_with<T: Copy>(
+pub fn read_user_into_with<T: Pod>(
     dst: &mut T,
     src_user: u64,
     prefault: Prefault,
 ) -> Result<(), u64> {
-    // SAFETY: writing `size_of::<T>()` bytes into a live `&mut T` is in bounds.
-    let bytes = unsafe {
-        core::slice::from_raw_parts_mut((dst as *mut T).cast::<u8>(), core::mem::size_of::<T>())
-    };
-    copy_from_user_with(bytes, src_user, prefault)
+    copy_from_user_with(akuma_pod::bytes_of_mut(dst), src_user, prefault)
 }
 
 /// Copy from user memory to kernel memory safely.

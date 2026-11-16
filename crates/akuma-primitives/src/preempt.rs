@@ -177,12 +177,9 @@ static PREEMPTION_DISABLED_SINCE: [AtomicU64; MAX_THREADS] = {
 
 /// Diagnostic: `core::panic::Location` pointer of the `disable_preemption()` call
 /// that took each thread's count 0→1, so a long-disabled thread's watchdog line
-/// names the culprit call site instead of just the tid. A `&'static Location`, so
-/// a relaxed store of the pointer is fine.
-static PREEMPTION_DISABLED_AT: [AtomicU64; MAX_THREADS] = {
-    const INIT: AtomicU64 = AtomicU64::new(0);
-    [INIT; MAX_THREADS]
-};
+/// names the culprit call site instead of just the tid.
+static PREEMPTION_DISABLED_AT: [crate::cell::LocationCell; MAX_THREADS] =
+    [const { crate::cell::LocationCell::new() }; MAX_THREADS];
 
 /// Last time the watchdog ran, for detecting host sleep/wake time jumps.
 static LAST_WATCHDOG_CHECK_US: AtomicU64 = AtomicU64::new(0);
@@ -239,13 +236,10 @@ pub fn clear_user_copy_fault_handler(i: usize) {
 /// transition), if it is still disabled.
 #[must_use]
 pub fn preemption_disabled_at(tid: usize) -> Option<&'static core::panic::Location<'static>> {
-    let ptr = PREEMPTION_DISABLED_AT[tid].load(Ordering::Relaxed) as usize;
-    if ptr == 0 || PREEMPTION_DISABLED[tid].load(Ordering::Relaxed) == 0 {
-        None
-    } else {
-        // SAFETY: only ever stores `Location::caller()` pointers, which are &'static.
-        Some(unsafe { &*(ptr as *const core::panic::Location<'static>) })
+    if PREEMPTION_DISABLED[tid].load(Ordering::Relaxed) == 0 {
+        return None;
     }
+    PREEMPTION_DISABLED_AT[tid].get()
 }
 
 /// Disable preemption for the current thread.
@@ -266,8 +260,7 @@ pub fn disable_preemption() {
         // in both, and `akuma-ext2`'s host tests reach here through its
         // `no-bkl-vfs` guard once `smp-shared` is in the default feature set.
         PREEMPTION_DISABLED_SINCE[tid].store(uptime_us(), Ordering::Release);
-        PREEMPTION_DISABLED_AT[tid]
-            .store(core::ptr::from_ref(core::panic::Location::caller()) as u64, Ordering::Relaxed);
+        PREEMPTION_DISABLED_AT[tid].set(core::panic::Location::caller());
     }
 }
 
@@ -313,7 +306,7 @@ pub fn scrub_slot(i: usize) {
     }
     PREEMPTION_DISABLED[i].store(0, Ordering::Release);
     PREEMPTION_DISABLED_SINCE[i].store(0, Ordering::Release);
-    PREEMPTION_DISABLED_AT[i].store(0, Ordering::Release);
+    PREEMPTION_DISABLED_AT[i].clear();
 }
 
 /// Watchdog: has preemption been disabled too long? Called from the timer IRQ.

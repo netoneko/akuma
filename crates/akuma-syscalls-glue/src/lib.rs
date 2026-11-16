@@ -361,6 +361,16 @@ pub struct ThreadCpuStat {
     pub _reserved: [u8; 6],
     pub name: [u8; 16],
 }
+akuma_pod::pod!(ThreadCpuStat {
+    tid: u32,
+    pid: u32,
+    box_id: u64,
+    total_time_us: u64,
+    state: u8,
+    last_core: u8,
+    _reserved: [u8; 6],
+    name: [u8; 16],
+});
 
 // The negated errno values every syscall arm returns (`x0 = -errno`; userspace
 // decodes via `if ((long)ret < 0) errno = -(int)ret`). These used to be 29

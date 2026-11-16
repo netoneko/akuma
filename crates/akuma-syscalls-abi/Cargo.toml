@@ -8,6 +8,7 @@ description = "Which syscall a number means, on which architecture: the neutral 
 workspace = true
 
 [dependencies]
+akuma-pod = { path = "../akuma-pod" }
 # The asm-generic (aarch64) table. This crate deliberately does NOT copy those
 # numbers — it reads them, so the two can never drift.
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

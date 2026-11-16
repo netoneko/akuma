@@ -102,6 +102,7 @@ pub struct SockAddrIn {
     pub sin_addr: u32,      // Network byte order (big-endian)
     pub sin_zero: [u8; 8],  // Padding
 }
+akuma_pod::pod!(SockAddrIn { sin_family: u16, sin_port: u16, sin_addr: u32, sin_zero: [u8; 8] });
 
 impl SockAddrIn {
     /// Convert to `SocketAddrV4`.

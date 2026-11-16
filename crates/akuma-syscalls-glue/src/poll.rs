@@ -902,6 +902,8 @@ struct EpollEventX86 {
 }
 #[cfg(all(feature = "sc-epoll", target_arch = "x86_64"))]
 const _: () = assert!(core::mem::size_of::<EpollEventX86>() == 12);
+#[cfg(all(feature = "sc-epoll", target_arch = "x86_64"))]
+akuma_pod::pod!(EpollEventX86 { events: u32, data: u64 });
 
 #[cfg(feature = "sc-epoll")]
 pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i32) -> u64 {

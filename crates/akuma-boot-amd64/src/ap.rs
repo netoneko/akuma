@@ -70,14 +70,9 @@ pub fn ap_boot_root(kernel_root: u64) -> u64 {
     root
 }
 
-/// Copy the trampoline to its page. Returns `false` if it does not fit below the mailbox, which is a build error
-/// surfacing at run time.
-///
-/// # Safety
-/// The page at [`AP_TRAMPOLINE_PA`] must be ordinary RAM that belongs to no one: the caller has checked that the
-/// machine's map and the loader's own structures leave it free ([`TrampolinePage::claim`], or
-/// the fixed layouts of the two VMMs named at [`AP_TRAMPOLINE_PA`]). This overwrites up to 3.75 KiB of it.
-pub unsafe fn install_trampoline() -> bool {
+/// Copy the trampoline to the page `_page` proves free. Returns `false` if it does not fit below the mailbox,
+/// which is a build error surfacing at run time. Overwrites up to 3.75 KiB of the page.
+fn copy_trampoline(_page: TrampolinePage) -> bool {
     // Two linker-visible symbols bracketing a `.rodata` blob in the kernel image; the difference is its length.
     let (src, len) = {
         let s = &raw const ap_trampoline_start;
@@ -87,14 +82,15 @@ pub unsafe fn install_trampoline() -> bool {
     if len > (AP_MB_CR3 - AP_TRAMPOLINE_PA) as usize {
         return false;
     }
-    // SAFETY: the destination page is RAM inside the physmap, owned by bring-up (the caller's contract), and the
-    // blob is `len` bytes of kernel image that fit below the mailbox.
+    // SAFETY: holding a `TrampolinePage` means the page at `AP_TRAMPOLINE_PA` is RAM inside the physmap that
+    // bring-up owns (its constructors' contract), and the blob is `len` bytes of kernel image that fit below the
+    // mailbox.
     unsafe { core::ptr::copy_nonoverlapping(src, phys_ptr::<u8>(AP_TRAMPOLINE_PA), len) };
     true
 }
 
-/// The trampoline page, proven free: made only by [`TrampolinePage::claim`], so holding one means the check
-/// that makes [`install_trampoline`] sound has passed.
+/// The trampoline page, proven free: made by [`TrampolinePage::claim`]'s check, or taken on the word of the two
+/// VMM layouts named at [`AP_TRAMPOLINE_PA`] - so holding one is what makes copying the trampoline sound.
 #[derive(Clone, Copy, Debug)]
 pub struct TrampolinePage(());
 
@@ -124,14 +120,22 @@ impl TrampolinePage {
     /// (one core at a time through one mailbox), so no AP is executing the blob while it is rewritten.
     #[must_use]
     pub fn install(self) -> bool {
-        // SAFETY: `claim` proved the page is RAM no one else owns (its contract above).
-        unsafe { install_trampoline() }
+        copy_trampoline(self)
+    }
+
+    /// The page, for the two VMM layouts named at [`AP_TRAMPOLINE_PA`], without a map to check it against.
+    ///
+    /// # Safety
+    /// The machine is one of those VMMs: the page is RAM below 1 MiB, clear of the PVH block and owned by AP
+    /// bring-up for its duration.
+    unsafe fn vmm_layout() -> Self {
+        Self(())
     }
 }
 
 /// Copy the trampoline to its page, **once**, for the two VMM layouts named at [`AP_TRAMPOLINE_PA`].
 ///
-/// The safe form of [`install_trampoline`]. The claim that makes the copy sound - the page at
+/// The claim that makes the copy sound - the page at
 /// [`AP_TRAMPOLINE_PA`] is RAM no one else owns - is a property of that constant (the fixed layouts of the
 /// two VMMs this kernel runs under, documented where the constant is defined), so it is stated here beside
 /// the constant instead of at each caller. A second call changes nothing and returns `true`: the blob is
@@ -144,10 +148,10 @@ pub fn install_trampoline_once() -> bool {
     if DONE.swap(true, Ordering::AcqRel) {
         return true;
     }
-    // SAFETY: the page is RAM below 1 MiB, clear of the PVH block and owned by AP bring-up for its duration
-    // (the layouts named at `AP_TRAMPOLINE_PA`); the once-guard above keeps a second copy from running
-    // under an AP that is already executing the blob.
-    unsafe { install_trampoline() }
+    // SAFETY: the layouts named at `AP_TRAMPOLINE_PA` - this entry point serves exactly those two VMMs - make
+    // the page RAM below 1 MiB, clear of the PVH block and owned by AP bring-up; the once-guard above keeps a
+    // second copy from running under an AP that is already executing the blob.
+    copy_trampoline(unsafe { TrampolinePage::vmm_layout() })
 }
 
 /// Write one mailbox word the trampoline will read. `pa` must be one of the `AP_MB_*` addresses.
@@ -160,6 +164,6 @@ pub fn mailbox_write(pa: u64, v: u64) {
         "mailbox_write outside the trampoline mailbox"
     );
     // SAFETY: `pa` is one of the four aligned 8-byte mailbox slots inside the trampoline page, which bring-up
-    // owns (`install_trampoline`'s contract); the physmap bounds check covers the address.
+    // owns (`TrampolinePage`'s contract); the physmap bounds check covers the address.
     unsafe { phys_ptr::<u64>(pa).write_volatile(v) };
 }

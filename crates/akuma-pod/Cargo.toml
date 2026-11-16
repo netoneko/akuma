@@ -1,0 +1,13 @@
+[package]
+name = "akuma-pod"
+version = "0.1.0"
+edition = "2024"
+description = "Plain-old-data: the types whose bytes may cross the user boundary in either direction (every bit pattern valid, no padding), the checked pod! macro that admits a struct, and the safe byte views over them."
+
+[lints]
+workspace = true
+
+[dependencies]
+# None, on purpose: the wire-struct crates (`akuma-syscalls-linux` and friends)
+# admit their types here, so anything this crate depended on would become a
+# dependency of the ABI layer.

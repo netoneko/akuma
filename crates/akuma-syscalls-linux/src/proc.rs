@@ -24,6 +24,16 @@ pub struct CloneArgs {
     pub stack_size: u64,
     pub tls: u64,
 }
+akuma_pod::pod!(CloneArgs {
+    flags: u64,
+    pidfd: u64,
+    child_tid: u64,
+    parent_tid: u64,
+    exit_signal: u64,
+    stack: u64,
+    stack_size: u64,
+    tls: u64,
+});
 
 /// Linux `struct rlimit` (the 64-bit one — `prlimit64`/`getrlimit` on aarch64
 /// share it, there is no 32-bit variant on this target).
@@ -33,6 +43,7 @@ pub struct Rlimit {
     pub rlim_cur: u64,
     pub rlim_max: u64,
 }
+akuma_pod::pod!(Rlimit { rlim_cur: u64, rlim_max: u64 });
 
 /// Linux `struct sysinfo` on a 64-bit target — 112 bytes.
 ///
@@ -72,6 +83,23 @@ pub struct Sysinfo {
     /// kernel stack. Naming the field is what keeps `Default` zeroing them.
     pub _f: [u8; 4],
 }
+akuma_pod::pod!(Sysinfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    _align: u32,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+    _f: [u8; 4],
+});
 
 impl Sysinfo {
     /// The wire image, byte for byte what `copy_to_user(&info, 112)` would send.
