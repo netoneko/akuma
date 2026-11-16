@@ -488,7 +488,7 @@ pub fn init_vfs() {
     // session (2026-09-10): first that the metal's persistent root could not
     // mount procfs at all, then that the RAM-image rigs differed from it.
     // `/proc` mounts everywhere, at the first call.
-    match akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs) {
+    match akuma_vfs_glue::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/proc", Some("proc"), 0, proc_fs) {
         Ok(()) | Err(akuma_vfs::FsError::AlreadyExists) => {}
         Err(_) => {
             crate::serial::puts("[FS] WARN: /proc mount failed; falling back to fd.rs's synthetic view\n");
@@ -569,7 +569,7 @@ pub fn mount_root_on(device: RootDevice, name: &str) -> bool {
     // shows under `Filesystem`. It is also what enrols this filesystem in the
     // orphaned-lock sweep — see `install_reap_hooks`.
     let fs = Arc::new(fs);
-    if let Err(e) = akuma_vfs_glue::mount_with("/", Some(name), 0, fs.clone()) {
+    if let Err(e) = akuma_vfs_glue::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/", Some(name), 0, fs.clone()) {
         serial::puts("  fs:   could not mount ");
         serial::puts(name);
         serial::puts(" at /: ");

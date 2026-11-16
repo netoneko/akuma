@@ -130,13 +130,13 @@ pub fn init() -> Result<(), FsError> {
 
     // Mount ext2 filesystem at root
     let ext2_fs = crate::ext2::mount()?;
-    crate::mount_with("/", Some("/dev/vda"), 0, ext2_fs)?;
+    crate::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/", Some("/dev/vda"), 0, ext2_fs)?;
 
     log("[FS] Ext2 filesystem mounted at /\n");
 
     // Mount procfs at /proc
     let proc_fs = alloc::sync::Arc::new(crate::proc::ProcFilesystem::new());
-    crate::mount_with("/proc", Some("proc"), 0, proc_fs)?;
+    crate::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/proc", Some("proc"), 0, proc_fs)?;
 
     log("[FS] Procfs mounted at /proc\n");
 

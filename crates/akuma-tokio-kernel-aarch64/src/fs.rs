@@ -103,7 +103,7 @@ pub fn root_fs() -> &'static dyn Filesystem {
 /// Mount `fs` at `/` and `/proc` beside it; arm the file-page cache and the
 /// shared-page table. `false` when the root could not be mounted.
 pub fn mount_root(fs: Arc<dyn Filesystem>) -> bool {
-    if akuma_vfs_glue::mount_with("/", Some("/dev/vda"), 0, fs.clone()).is_err() {
+    if akuma_vfs_glue::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/", Some("/dev/vda"), 0, fs.clone()).is_err() {
         safe_print!(96, "  [FATAL] could not mount the root into the shared mount table\n");
         return false;
     }
@@ -113,7 +113,7 @@ pub fn mount_root(fs: Arc<dyn Filesystem>) -> bool {
     akuma_fpcache::init(akuma_pmm::total_count() * 4096);
     akuma_tokio_kernel_core::shmpages::init();
     let proc_fs = Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new());
-    if akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs).is_err() {
+    if akuma_vfs_glue::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/proc", Some("proc"), 0, proc_fs).is_err() {
         safe_print!(64, "  fs:   /proc mount failed\n");
     }
     // The mount lives for the rest of the boot: one `Arc` leaked to a `'static` borrow.

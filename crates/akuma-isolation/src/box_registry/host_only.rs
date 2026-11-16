@@ -96,7 +96,7 @@ pub mod access {
     /// Every caller is in box 0, and the host may act on any box (the live
     /// registry's first rule); a box other than 0 does not exist to act on.
     #[must_use]
-    pub fn can_access_box(_registry: &BTreeMap<u64, BoxInfo>, _source: u64, _target: u64, _pid: Pid) -> bool {
+    pub fn can_access_box(_registry: &BTreeMap<u64, BoxInfo>, _source: super::CallerBox, _target: super::BoxId, _pid: Pid) -> bool {
         true
     }
 

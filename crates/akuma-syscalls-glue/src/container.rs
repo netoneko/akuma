@@ -1,4 +1,5 @@
 use super::*;
+use akuma_exec::process::box_access::{BoxId, CallerBox};
 
 pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr: u64, root_len: usize, primary_pid: u32) -> u64 {
     // Both lengths size a kernel buffer below.
@@ -52,7 +53,7 @@ pub(super) fn sys_register_box(id: u64, name_ptr: u64, name_len: usize, root_ptr
 pub(super) fn sys_kill_box(box_id: u64) -> u64 {
     let (caller_box, caller_pid) = caller_box_and_pid();
     let registry = akuma_exec::process::registry_snapshot();
-    if !akuma_exec::process::box_access::can_kill_box(&registry, caller_box, box_id, caller_pid) {
+    if !akuma_exec::process::box_access::can_kill_box(&registry, CallerBox(BoxId(caller_box)), BoxId(box_id), caller_pid) {
         return EPERM;
     }
 
@@ -153,10 +154,10 @@ pub(super) fn sys_reattach(pid: u32, force: u32) -> u64 {
 /// needs an overlay mount, and no box can mount at all. Nested **boxes** still
 /// exist — they are process/network grouping — but nested OCI images do not.
 #[cfg(feature = "sc-containers")]
-fn caller_may_mount() -> bool {
+fn mount_permit() -> Option<akuma_primitives::HostRoot> {
     // Host box and uid 0: a host process that dropped privileges cannot
-    // rearrange the mount table either.
-    akuma_exec::process::caller_is_host_root()
+    // rearrange the mount table either. The token is what the mount effects take.
+    akuma_exec::process::host_root()
 }
 
 /// Map a mount-table error to its Linux errno. The arms used to fold
@@ -181,12 +182,12 @@ pub(super) fn sys_mount(
     flags: u64,
     _data_ptr: u64,
 ) -> SysResult {
-    if !caller_may_mount() {
+    let Some(root) = mount_permit() else {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
         }
         return Err(EPERM);
-    }
+    };
 
     let target = copy_from_user_str(target_ptr, 256)?;
     let fstype = copy_from_user_str(fstype_ptr, 64)?;
@@ -255,7 +256,7 @@ pub(super) fn sys_mount(
     } else {
         source.as_str()
     };
-    match akuma_vfs_glue::mount_with(&target, Some(recorded_source), flags, fs) {
+    match akuma_vfs_glue::mount_with(root, &target, Some(recorded_source), flags, fs) {
         Ok(()) => Ok(0),
         Err(e) => Err(mount_errno(e)),
     }
@@ -264,7 +265,7 @@ pub(super) fn sys_mount(
 /// Unmount a global mount. Real since 2026-08-24 (before, every caller got
 /// `EPERM`, host included).
 ///
-/// Box policy is unchanged — see [`caller_may_mount`]: a box may not take
+/// Box policy is unchanged — see [`mount_permit`]: a box may not take
 /// mounts away any more than it may add them; the specific hazard for `/` is
 /// that emptying a box's namespace makes `with_fs` fall back to the GLOBAL
 /// mount table, handing the box the whole host filesystem. Two guards keep
@@ -274,18 +275,18 @@ pub(super) fn sys_mount(
 /// - this arm only ever touches the global table — a box's namespace mounts
 ///   are composed from outside via `MOUNT_IN_NS` and torn down with the box.
 pub(super) fn sys_umount2(target_ptr: u64, _flags: i32) -> SysResult {
-    if !caller_may_mount() {
+    let Some(root) = mount_permit() else {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
         }
         return Err(EPERM);
-    }
+    };
     let target = copy_from_user_str(target_ptr, 256)?;
     let target = akuma_vfs_glue::canonicalize_path(&target);
     if target == "/" {
         return Err(EBUSY);
     }
-    match akuma_vfs_glue::unmount(&target) {
+    match akuma_vfs_glue::unmount(root, &target) {
         Ok(()) => Ok(0),
         Err(e) => Err(mount_errno(e)),
     }
@@ -340,9 +341,9 @@ fn build_overlay(data_ptr: u64) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::F
 }
 
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, fstype_ptr: u64, fstype_len: usize, data_ptr: u64) -> SysResult {
-    if !akuma_exec::process::caller_is_host_root() {
+    let Some(root) = akuma_exec::process::host_root() else {
         return Err(EPERM);
-    }
+    };
 
     if target_len > 4096 || fstype_len > 64 { return Err(EINVAL); }
     if !validate_user_ptr(target_ptr, target_len) { return Err(EFAULT); }
@@ -400,7 +401,7 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: u64, target_len: usize, f
         };
     }
 
-    match akuma_vfs_glue::mount_in_namespace(box_id, &target, fs) {
+    match akuma_vfs_glue::mount_in_namespace(root, box_id, &target, fs) {
         Ok(()) => Ok(0),
         Err(_) => Err(EINVAL),
     }

@@ -117,6 +117,16 @@ pub fn set_utc_time_us(unix_epoch_us: u64, boot_uptime_us: u64) {
     UTC_OFFSET_US.store(unix_epoch_us.saturating_sub(boot_uptime_us), Ordering::Release);
 }
 
+/// [`set_utc_time_us`] for a caller that has proved it may set the machine's clock.
+///
+/// The syscall layer (`clock_settime`, `adjtimex`) calls this one and never the unchecked primitive: the wall clock is
+/// one per machine, and a [`HostRoot`](crate::privilege::HostRoot) is the evidence the caller is uid 0 in the host
+/// box. Boot-time sources (SNTP, the RTC seed) keep calling [`set_utc_time_us`] in their own crates.
+#[inline]
+pub fn set_wall_clock(_root: crate::privilege::HostRoot, unix_epoch_us: u64, boot_uptime_us: u64) {
+    set_utc_time_us(unix_epoch_us, boot_uptime_us);
+}
+
 /// Current UTC in microseconds since the epoch, or `None` if never set.
 ///
 /// `None` and not a plausible-looking `0`: at epoch 0 every TLS certificate on

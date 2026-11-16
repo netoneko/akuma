@@ -8,6 +8,8 @@ use super::BoxInfo;
 use super::hierarchy;
 use akuma_primitives::Pid;
 
+pub use super::{BoxId, CallerBox, SpawnBox};
+
 /// Check if a process in `source_box` can access/create boxes in `target_box`.
 ///
 /// Rules:
@@ -18,10 +20,11 @@ use akuma_primitives::Pid;
 #[must_use]
 pub fn can_access_box(
     registry: &BTreeMap<u64, BoxInfo>,
-    source_box_id: u64,
-    target_box_id: u64,
+    source: CallerBox,
+    target: BoxId,
     source_pid: Pid,
 ) -> bool {
+    let (source_box_id, target_box_id) = (source.0.0, target.0);
     if source_box_id == 0 {
         return true;
     }
@@ -49,11 +52,11 @@ pub fn can_access_box(
 #[must_use]
 pub fn can_kill_box(
     registry: &BTreeMap<u64, BoxInfo>,
-    killer_box_id: u64,
-    target_box_id: u64,
+    killer: CallerBox,
+    target: BoxId,
     killer_pid: Pid,
 ) -> bool {
-    can_access_box(registry, killer_box_id, target_box_id, killer_pid)
+    can_access_box(registry, killer, target, killer_pid)
 }
 
 /// Decide whether a process may (re)register box `target_box_id` rooted at
@@ -87,7 +90,7 @@ pub fn can_register_box(
         // is kept: a box must never be able to re-parent itself out from under
         // its creator and inherit the creator's reach.
         Some(existing) => {
-            if !can_access_box(registry, caller_box_id, target_box_id, caller_pid) {
+            if !can_access_box(registry, CallerBox(BoxId(caller_box_id)), BoxId(target_box_id), caller_pid) {
                 return Err("Box is outside the caller's hierarchy");
             }
             validate_root_under_caller(registry, caller_box_id, canonical_root_dir)?;
@@ -138,6 +141,14 @@ pub fn cascade_kill_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spawn_box_zero_is_inherit_not_host() {
+        assert_eq!(SpawnBox::from_raw(0), SpawnBox::Inherit);
+        assert_eq!(SpawnBox::from_raw(7), SpawnBox::Into(BoxId(7)));
+        assert_eq!(BoxId::HOST, BoxId(0));
+    }
+
     // The registry fixture both this module and its sibling assert against lives
     // one level up, in `box_mod` itself — see `make_test_registry`'s doc comment.
     use super::super::make_test_registry;
@@ -145,30 +156,30 @@ mod tests {
     #[test]
     fn test_can_access_box_host_accesses_any() {
         let reg = make_test_registry();
-        assert!(can_access_box(&reg, 0, 1, 0));
-        assert!(can_access_box(&reg, 0, 2, 0));
-        assert!(can_access_box(&reg, 0, 3, 0));
+        assert!(can_access_box(&reg, CallerBox(BoxId(0)), BoxId(1), 0));
+        assert!(can_access_box(&reg, CallerBox(BoxId(0)), BoxId(2), 0));
+        assert!(can_access_box(&reg, CallerBox(BoxId(0)), BoxId(3), 0));
     }
 
     #[test]
     fn test_can_access_box_self() {
         let reg = make_test_registry();
-        assert!(can_access_box(&reg, 1, 1, 101));
-        assert!(can_access_box(&reg, 2, 2, 103));
+        assert!(can_access_box(&reg, CallerBox(BoxId(1)), BoxId(1), 101));
+        assert!(can_access_box(&reg, CallerBox(BoxId(2)), BoxId(2), 103));
     }
 
     #[test]
     fn test_can_access_box_parent_accesses_child() {
         let reg = make_test_registry();
-        assert!(can_access_box(&reg, 1, 2, 101)); // box1 can access its child box2
-        assert!(can_access_box(&reg, 0, 3, 1));   // host can access box3
+        assert!(can_access_box(&reg, CallerBox(BoxId(1)), BoxId(2), 101)); // box1 can access its child box2
+        assert!(can_access_box(&reg, CallerBox(BoxId(0)), BoxId(3), 1));   // host can access box3
     }
 
     #[test]
     fn test_can_access_box_child_cannot_access_parent() {
         let reg = make_test_registry();
-        assert!(!can_access_box(&reg, 2, 1, 103)); // box2 cannot access box1
-        assert!(!can_access_box(&reg, 1, 0, 101)); // box1 cannot access host
+        assert!(!can_access_box(&reg, CallerBox(BoxId(2)), BoxId(1), 103)); // box2 cannot access box1
+        assert!(!can_access_box(&reg, CallerBox(BoxId(1)), BoxId(0), 101)); // box1 cannot access host
     }
 
     #[test]
@@ -177,16 +188,16 @@ mod tests {
         // Box 3 created by pid 200 (not in any box's primary)
         reg.get_mut(&3).unwrap().creator_pid = 200;
         // Process 200 in box 1 can access box 3 via creator fallback
-        assert!(can_access_box(&reg, 1, 3, 200));
+        assert!(can_access_box(&reg, CallerBox(BoxId(1)), BoxId(3), 200));
     }
 
     #[test]
     fn test_can_kill_box_same_rules_as_access() {
         let reg = make_test_registry();
-        assert!(can_kill_box(&reg, 0, 1, 0));
-        assert!(can_kill_box(&reg, 1, 1, 101));
-        assert!(can_kill_box(&reg, 1, 2, 101));
-        assert!(!can_kill_box(&reg, 2, 1, 103));
+        assert!(can_kill_box(&reg, CallerBox(BoxId(0)), BoxId(1), 0));
+        assert!(can_kill_box(&reg, CallerBox(BoxId(1)), BoxId(1), 101));
+        assert!(can_kill_box(&reg, CallerBox(BoxId(1)), BoxId(2), 101));
+        assert!(!can_kill_box(&reg, CallerBox(BoxId(2)), BoxId(1), 103));
     }
 
     #[test]

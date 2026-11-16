@@ -109,7 +109,7 @@ pub fn get_box_namespace(box_id: u64) -> Option<Arc<Namespace>> {
 
 /// Mount a filesystem into a specific box's namespace.
 #[cfg(feature = "sc-containers")]
-pub fn mount_in_namespace(box_id: u64, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
+pub fn mount_in_namespace(_root: akuma_primitives::HostRoot, box_id: u64, path: &str, fs: Arc<dyn Filesystem>) -> Result<(), FsError> {
     let namespaces = BOX_NAMESPACES.lock();
     let ns = namespaces.get(&box_id).ok_or(FsError::NotFound)?;
     ns.mount.lock().mount(path, fs)
@@ -311,6 +311,7 @@ pub fn reap_dead_thread(tid: usize) {
 /// `MS_*` flags. Only `MS_RDONLY` is stored; the kernel's write chokepoints
 /// enforce it as `FsError::ReadOnly`.
 pub fn mount_with(
+    _root: akuma_primitives::HostRoot,
     path: &str,
     source: Option<&str>,
     flags: u64,
@@ -342,7 +343,7 @@ pub fn remount(path: &str, flags: u64) -> Result<(), FsError> {
 ///
 /// Only consumed by `syscall::container::sys_umount2`, so it follows the same gate.
 #[cfg(feature = "sc-containers")]
-pub fn unmount(path: &str) -> Result<(), FsError> {
+pub fn unmount(_root: akuma_primitives::HostRoot, path: &str) -> Result<(), FsError> {
     let normalized = canonicalize_path(path);
     if normalized == "/" {
         return Err(FsError::PermissionDenied);

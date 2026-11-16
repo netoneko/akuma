@@ -219,7 +219,7 @@ mod trace {
 pub fn sys_reboot(magic1: u64, magic2: u64, cmd: u64, _arg: u64) -> u64 {
     // Host box and uid 0, as glue's `sys_reboot` asks on AArch64. This had no
     // gate at all: any process in any box could reset the machine.
-    if !akuma_exec::process::caller_is_host_root() {
+    if akuma_exec::process::host_root().is_none() {
         return errno::EPERM;
     }
     let decoded = decode(magic1 as u32, magic2 as u32, cmd as u32);

@@ -982,7 +982,7 @@ fn install_surface() {
 /// failure: a root the shared arms cannot resolve answers `ENOENT` for every path, silently
 /// (`AKUMA_AMD64_C1_STEP4A_VFS_ADOPTION.md` § 1).
 fn mount_root(fs: alloc::sync::Arc<dyn Filesystem>) {
-    if akuma_vfs_glue::mount_with("/", Some("/dev/vda"), 0, fs.clone()).is_err() {
+    if akuma_vfs_glue::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/", Some("/dev/vda"), 0, fs.clone()).is_err() {
         console::puts("  [FATAL] could not mount the root into the shared mount table\n");
         halt();
     }
@@ -1006,7 +1006,7 @@ fn mount_root(fs: alloc::sync::Arc<dyn Filesystem>) {
     // table (`<pid>/exe`, which musl's `$ORIGIN` expansion reads; `meminfo`;
     // `<pid>/fd`). Glue's `readlinkat` and friends answer through it.
     let proc_fs = alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new());
-    if akuma_vfs_glue::mount_with("/proc", Some("proc"), 0, proc_fs).is_err() {
+    if akuma_vfs_glue::mount_with(akuma_primitives::HostRoot::kernel_boot(), "/proc", Some("proc"), 0, proc_fs).is_err() {
         console::puts("  fs:   /proc mount failed\n");
     }
     // The mount lives for the rest of the boot: leak one `Arc` to a `'static` borrow.

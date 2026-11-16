@@ -46,6 +46,38 @@ use alloc::string::String;
 
 use akuma_primitives::Pid;
 
+/// A box's id. `0` is the host, and only that: spawn's "inherit the caller's box" is [`SpawnBox::Inherit`], never a
+/// `BoxId`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord, Hash)]
+pub struct BoxId(pub u64);
+
+impl BoxId {
+    pub const HOST: BoxId = BoxId(0);
+}
+
+/// The box a *caller* is in, as distinct from the box it is acting on. The access rule is directional (an ancestor may
+/// act on a descendant, not the reverse), so `can_access_box(source, target)` with its two ids swapped used to compile
+/// and silently invert the policy; they are different types now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct CallerBox(pub BoxId);
+
+/// Where a spawn puts the child: the caller's own box, or a named one. `SpawnOptions::box_id == 0` means the first;
+/// before this type it was the same `0` that means "the host" everywhere else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SpawnBox {
+    Inherit,
+    Into(BoxId),
+}
+
+impl SpawnBox {
+    /// Decode the raw `box_id` field of a spawn request.
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        if raw == 0 { Self::Inherit } else { Self::Into(BoxId(raw)) }
+    }
+}
+
+
 /// Information about an active box (container)
 #[derive(Debug, Clone)]
 pub struct BoxInfo {

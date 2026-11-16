@@ -93,7 +93,7 @@ pub fn decode(magic1: u32, magic2: u32, cmd: u32) -> Result<Option<Action>, BadM
 ///
 /// Callers should sync filesystems first; this does not return.
 #[cfg(feature = "psci")]
-pub fn system_reset() -> ! {
+pub fn system_reset(_root: akuma_primitives::HostRoot) -> ! {
     // Discarded deliberately: on success this does not return at all, so a
     // returned status can only mean the call failed — which the loop below
     // already handles. There is no caller left to report it to.
@@ -110,7 +110,7 @@ pub fn system_reset() -> ! {
 /// Whole-machine PSCI `SYSTEM_OFF`. See [`system_reset`] for the shared
 /// reasoning; likewise does not return.
 #[cfg(feature = "psci")]
-pub fn system_off() -> ! {
+pub fn system_off(_root: akuma_primitives::HostRoot) -> ! {
     let _ = akuma_psci::call(akuma_psci::SYSTEM_OFF, 0, 0, 0);
     loop {
         core::hint::spin_loop();

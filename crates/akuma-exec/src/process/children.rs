@@ -936,7 +936,16 @@ pub fn current_creds() -> super::Creds {
 /// "privileged" means, and a root inside a box is root over that box only.
 #[must_use]
 pub fn caller_is_host_root() -> bool {
-    current_process_shared().is_none_or(|p| p.box_id == 0 && p.creds.get().is_root())
+    host_root().is_some()
+}
+
+/// [`caller_is_host_root`] as evidence: the token the whole-machine effects (`reboot`, mount, the wall clock) take.
+/// The only place a [`HostRoot`](akuma_primitives::HostRoot) is minted for a caller.
+#[must_use]
+pub fn host_root() -> Option<akuma_primitives::HostRoot> {
+    current_process_shared()
+        .is_none_or(|p| p.box_id == 0 && p.creds.get().is_root())
+        .then(akuma_primitives::HostRoot::vouch_checked)
 }
 
 pub fn current_process_shared() -> Option<&'static Process> {

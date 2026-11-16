@@ -47,7 +47,7 @@ pub use akuma_sntp::{boot, sntp};
 // the boot-registered monotonic hook (the AArch64 kernel registers
 // `akuma_timer::uptime_us` itself, so nothing changed there); the UTC anchor
 // is the one static both kernels write.
-use akuma_primitives::clock::{realtime_us, set_utc_time_us, uptime_us, utc_time_us};
+use akuma_primitives::clock::{realtime_us, uptime_us, utc_time_us};
 use akuma_exec::process::user_access::{read_user_into, write_user_val};
 use akuma_exec::threading::MAX_THREADS;
 use akuma_primitives::errno::negated::{EFAULT, EINVAL, EPERM};
@@ -368,14 +368,14 @@ pub fn sys_clock_settime(clock_id: u32, tp_ptr: u64) -> u64 {
     }
     // The wall clock is one per machine: every box, every certificate check and
     // every timestamp reads it. Linux asks for `CAP_SYS_TIME`.
-    if !akuma_exec::process::caller_is_host_root() {
+    let Some(root) = akuma_exec::process::host_root() else {
         return EPERM;
-    }
+    };
     let mut ts = Timespec::default();
     if read_user_into(&mut ts, tp_ptr).is_err() {
         return EFAULT;
     }
-    set_utc_time_us(ts.to_us(), uptime_us());
+    akuma_primitives::clock::set_wall_clock(root, ts.to_us(), uptime_us());
     0
 }
 
@@ -414,21 +414,25 @@ pub fn sys_clock_adjtime(clock_id: u32, buf_ptr: u64) -> u64 {
     let nano = tx.modes & ADJ_NANO != 0;
     // Reading the clock state (`modes == 0`, what `ntpd -q` and `adjtimex -p`
     // do) is open to everyone; stepping the clock is the host root's.
-    if tx.modes & (ADJ_SETOFFSET | ADJ_OFFSET) != 0 && !akuma_exec::process::caller_is_host_root() {
+    let stepping = tx.modes & (ADJ_SETOFFSET | ADJ_OFFSET) != 0;
+    let root = akuma_exec::process::host_root();
+    if stepping && root.is_none() {
         return EPERM;
     }
-    if tx.modes & ADJ_SETOFFSET != 0 {
-        // `time` holds a delta to add to the current time, applied immediately.
-        let delta_us = if nano {
-            tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec / 1000)
+    if let Some(root) = root.filter(|_| stepping) {
+        if tx.modes & ADJ_SETOFFSET != 0 {
+            // `time` holds a delta to add to the current time, applied immediately.
+            let delta_us = if nano {
+                tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec / 1000)
+            } else {
+                tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec)
+            };
+            step_utc_by(root, delta_us);
         } else {
-            tx.time_sec.saturating_mul(1_000_000).saturating_add(tx.time_usec)
-        };
-        step_utc_by(delta_us);
-    } else if tx.modes & ADJ_OFFSET != 0 {
-        // `offset` is in usec unless ADJ_NANO, then nsec.
-        let offset_us = if nano { tx.offset / 1000 } else { tx.offset };
-        step_utc_by(offset_us);
+            // `offset` is in usec unless ADJ_NANO, then nsec.
+            let offset_us = if nano { tx.offset / 1000 } else { tx.offset };
+            step_utc_by(root, offset_us);
+        }
     }
 
     // Report current state back. No leap-second/frequency tracking, so every
@@ -456,11 +460,11 @@ pub fn sys_adjtimex(buf_ptr: u64) -> u64 {
 /// No-ops if the clock has never been set — there is nothing to offset from,
 /// and guessing an anchor would fabricate a wrong absolute time instead of
 /// leaving it honestly unset.
-fn step_utc_by(delta_us: i64) {
+fn step_utc_by(root: akuma_primitives::HostRoot, delta_us: i64) {
     let uptime = uptime_us();
     if let Some(now_us) = utc_time_us(uptime) {
         let new_us = now_us.cast_signed().saturating_add(delta_us).max(0).cast_unsigned();
-        set_utc_time_us(new_us, uptime);
+        akuma_primitives::clock::set_wall_clock(root, new_us, uptime);
     }
 }
 

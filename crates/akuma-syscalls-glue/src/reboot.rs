@@ -5,21 +5,12 @@
 
 use super::*;
 
-/// Whole-machine PSCI `SYSTEM_RESET`/`SYSTEM_OFF` takes every box down with it,
-/// not just the caller's — strictly worse than the mount-table tampering
-/// `caller_may_mount` (`src/syscall/container.rs`) already restricts to box 0,
-/// so the same restriction applies here. `is_none_or` matches that helper: no
-/// current process (host-side/early-boot caller) is treated as box 0.
-fn caller_may_reboot() -> bool {
-    // And uid 0: Linux asks for `CAP_SYS_BOOT`, and a host process that dropped
-    // to an ordinary uid has no business taking the machine down.
-    akuma_exec::process::caller_is_host_root()
-}
-
 pub(super) fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> u64 {
-    if !caller_may_reboot() {
+    // Whole-machine PSCI `SYSTEM_RESET`/`SYSTEM_OFF` takes every box down with it, and Linux asks for `CAP_SYS_BOOT`:
+    // uid 0 in the host box. The token is what `system_reset`/`system_off` take.
+    let Some(root) = akuma_exec::process::host_root() else {
         return EPERM;
-    }
+    };
     match akuma_boot::decode(magic1, magic2, cmd) {
         Ok(Some(akuma_boot::Action::Restart)) => {
             akuma_primitives::safe_print!(48, "[reboot] PSCI SYSTEM_RESET requested\n");
@@ -30,14 +21,14 @@ pub(super) fn sys_reboot(magic1: u32, magic2: u32, cmd: u32) -> u64 {
             if akuma_vfs_glue::sync_all_filesystems().is_err() {
                 akuma_primitives::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
             }
-            akuma_boot::system_reset();
+            akuma_boot::system_reset(root);
         }
         Ok(Some(akuma_boot::Action::PowerOff)) => {
             akuma_primitives::safe_print!(48, "[reboot] PSCI SYSTEM_OFF requested\n");
             if akuma_vfs_glue::sync_all_filesystems().is_err() {
                 akuma_primitives::safe_print!(48, "[reboot] fs sync failed; disk may need e2fsck\n");
             }
-            akuma_boot::system_off();
+            akuma_boot::system_off(root);
         }
         Ok(Some(akuma_boot::Action::Noop)) => 0,
         Ok(None) | Err(akuma_boot::BadMagic) => EINVAL,

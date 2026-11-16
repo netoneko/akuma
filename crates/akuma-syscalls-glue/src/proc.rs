@@ -1,4 +1,5 @@
 use super::*;
+use akuma_exec::process::box_access::{BoxId, CallerBox, SpawnBox};
 
 // Maps child PID → the parent thread's generation-tagged WakeHandle for processes
 // created with CLONE_VFORK. The parent blocks after fork until the child calls
@@ -1777,10 +1778,10 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     // context"). Unchecked, a boxed process spawns straight into box 0's
     // namespace — or into a sibling's — and reads whatever that box can see.
     // `box_id == 0` means "inherit the caller's box" and needs no check.
-    if o.box_id != 0 {
+    if let SpawnBox::Into(target_box) = SpawnBox::from_raw(o.box_id) {
         let (caller_box, caller_pid) = super::caller_box_and_pid();
         let registry = akuma_exec::process::registry_snapshot();
-        if !akuma_exec::process::box_access::can_access_box(&registry, caller_box, o.box_id, caller_pid) {
+        if !akuma_exec::process::box_access::can_access_box(&registry, CallerBox(BoxId(caller_box)), target_box, caller_pid) {
             return Err(EPERM);
         }
     }
@@ -1860,7 +1861,7 @@ pub fn sys_set_box_stack(box_id: u64, stack: u64) -> u64 {
     // route a box it does not own at a rump server it does.
     let (caller_box, caller_pid) = super::caller_box_and_pid();
     let registry = akuma_exec::process::registry_snapshot();
-    if !akuma_exec::process::box_access::can_access_box(&registry, caller_box, box_id, caller_pid) {
+    if !akuma_exec::process::box_access::can_access_box(&registry, CallerBox(BoxId(caller_box)), BoxId(box_id), caller_pid) {
         return EPERM;
     }
 

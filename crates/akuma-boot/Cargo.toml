@@ -5,6 +5,7 @@ edition = "2024"
 description = "Boot/reboot logic: reboot(2) ABI decode plus the PSCI SYSTEM_RESET/SYSTEM_OFF actions; a natural home for src/boot.rs's logic later."
 
 [dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
 # The conduit that actually issues the call. A separate crate so this one keeps
 # `#![forbid(unsafe_code)]` — the `smc`/`hvc` asm lives there, not here.
 # Optional so the amd64 kernel can reach `decode` (pure) without dragging in
