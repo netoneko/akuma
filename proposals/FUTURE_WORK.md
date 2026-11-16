@@ -45,7 +45,15 @@ buffers as user pointers (`process_tests.rs` 69, `sync_tests.rs` 49, `pthread_te
 and four self-tests inside `akuma-syscalls-glue`). To delete it each test needs a real user mapping in a test process
 (a `with_user_buffer(|va| ...)` helper) so it exercises real validation. Some need redesign (the futex test with two
 syscalls in one window). Do it a test file at a time; when the last user is gone, delete the flag, the guard, `seal_bypass`
-and the `kernel_tests` plumbing in `akuma-user-access`. **Closes when** `grep -rn BYPASS_VALIDATION crates src` is empty.
+and the `kernel_tests` plumbing in `akuma-user-access`. **What a conversion needs (found 2026-11-17 by reading, not by trying):** validation asks whether the range is mapped in the
+*currently active* user address space (`is_current_user_range_mapped`), so a test that maps a page for itself must also make
+that address space the active one while the syscall body runs (and restore the boot one after), on aarch64 `TTBR0_EL1` and on
+amd64 `CR3`. So the helper is `with_user_pages(|va| ...)`: create a `UserAddressSpace`, map and zero the pages, activate it,
+run the closure, deactivate, free. The tests then copy their structures in and out through `va` instead of passing a
+kernel-stack address. `pthread_tests.rs` alone has about 20 `set_bypass(true/false)` pairs (signal sets, `sigaltstack`, timespecs
+passed from the stack); `process_tests.rs` 69 and `sync_tests.rs` 49 uses are mostly `BypassValidationGuard`. A kernel thread
+running the suite with a user address space active has not been tried here; the kernel's own identity map is shared into every
+user space on aarch64, which is why it is expected to work. **Closes when** `grep -rn BYPASS_VALIDATION crates src` is empty.
 
 ### Problems met while doing the above (existing before it, not caused by it)
 
