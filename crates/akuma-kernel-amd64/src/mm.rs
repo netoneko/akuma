@@ -771,7 +771,7 @@ fn fill_file_pages(
         if !region_pte.write
             && let Some(owner) = usermode::current_mm_process()
         {
-            let key = akuma_fpcache_rw::Key::new(file.mount_id, file.inode, offset);
+            let key = akuma_fpcache_rw::Key::new(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset);
             if let Some(ok) = akuma_exec::shm::map_existing(owner, va, akuma_exec::mmu::user_flags::to_pte(prot), key) {
                 if ok {
                     FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
@@ -822,7 +822,7 @@ fn fill_file_pages(
             if v.try_reserve(want).is_ok() {
                 v.resize(want, 0);
                 let (window_offset, _) = file.page_source(first);
-                match crate::fd::file_bytes_by_inode(file.mount_id, file.inode, window_offset, &mut v) {
+                match crate::fd::file_bytes_by_inode(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), window_offset, &mut v) {
                     // The file is gone, or was never readable by inode. Fall back
                     // to the per-page path, which fails the same way and one page
                     // at a time.
@@ -866,7 +866,7 @@ fn fill_file_pages(
                 // page first). That is not an error and needs no undo: the
                 // frame stays private with exactly the one reference this
                 // mapping holds, which teardown balances.
-                akuma_fpcache::insert(file.mount_id, file.inode, offset, frame, true);
+                akuma_fpcache::insert(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset, frame, true);
             }
         }
         // `Raced` is a success with nothing to publish: the page is present,
@@ -980,7 +980,7 @@ fn fill_shared_write_pages(
             continue;
         }
         let (offset, _) = file.page_source(idx);
-        let key = akuma_fpcache_rw::Key::new(file.mount_id, file.inode, offset);
+        let key = akuma_fpcache_rw::Key::new(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset);
         let ok = shared_write_page(va, prot, key);
         if ok {
             FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
@@ -1028,7 +1028,7 @@ fn populate_file_page_by_inode(
         if want == 0 {
             return Some(0);
         }
-        crate::fd::file_bytes_by_inode(file.mount_id, file.inode, offset, &mut page[..want])
+        crate::fd::file_bytes_by_inode(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset, &mut page[..want])
     })
     .flatten();
     if want > 0 {

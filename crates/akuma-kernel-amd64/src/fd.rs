@@ -133,6 +133,7 @@
 //! free fd is 3" divergence — POSIX's "lowest available" includes a closed
 //! 0/1/2. [`bind_stdio`] writes the three slots directly for that reason.
 
+use akuma_primitives::FileKey;
 use akuma_exec_core::process::FileDescriptor;
 use akuma_syscalls_abi::Syscall;
 // Named by this module's doc links and by nothing else since 4b batch 2d took
@@ -847,7 +848,8 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
 /// end at the same `read_at_open_file`; the difference is only where the
 /// identity comes from, and that is the whole point — see [`file_identity`].
 #[must_use]
-pub fn file_bytes_by_inode(mount_id: u32, inode: u32, offset: usize, dst: &mut [u8]) -> Option<usize> {
+pub fn file_bytes_by_inode(key: FileKey, offset: usize, dst: &mut [u8]) -> Option<usize> {
+    let (mount_id, inode) = key.parts();
     if inode == 0 {
         return None;
     }

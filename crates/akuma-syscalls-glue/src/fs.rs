@@ -696,7 +696,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             let mut failure = None;
             while total < count {
                 let want = (count - total).min(limit);
-                match akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), f.pos() + total, &mut temp[..want]) {
+                match akuma_vfs_glue::fs::read_at_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), f.pos() + total, &mut temp[..want]) {
                     Ok(n) => {
                         if n > 0 {
                             if copy_to_user(buf_ptr + total as u64, &temp[..n]).is_err() {
@@ -1062,7 +1062,7 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
             let mut failure = None;
             while total < count {
                 let want = (count - total).min(limit);
-                match akuma_vfs_glue::fs::read_at_open_file(&f.path, f.mount_id(), f.inode(), offset as usize + total, &mut temp[..want]) {
+                match akuma_vfs_glue::fs::read_at_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), offset as usize + total, &mut temp[..want]) {
                     Ok(n) => {
                         if n > 0 {
                             if copy_to_user(buf_ptr + total as u64, &temp[..n]).is_err() {
@@ -1161,7 +1161,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
                 }
                 // By inode, like `sys_pread64`: a file unlinked after `open` has no
                 // path to write through.
-                match akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, f.mount_id(), f.inode(), offset as usize + done, &buf) {
+                match akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), offset as usize + done, &buf) {
                     Ok(0) => break,
                     Ok(n) => done += n,
                     Err(e) => return if done > 0 { done as u64 } else { fs_error_to_errno(e) },
@@ -1369,14 +1369,14 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
                 // `>>` loops of 150 lines left 298
                 // (`docs/archive/AKUMA_AMD64_EXT2_CROSS_FILE_CORRUPTION.md` §5).
                 let result = if is_append {
-                    akuma_vfs_glue::fs::append_open_file(&f.path, f.mount_id(), f.inode(), buf_slice).map(|(at, n)| {
+                    akuma_vfs_glue::fs::append_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), buf_slice).map(|(at, n)| {
                         write_pos = at;
                         n
                     })
                 } else {
                     // By inode, like `sys_pread64`: a file unlinked after `open`
                     // (Chromium's temp and shared-memory files) has no path.
-                    akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, f.mount_id(), f.inode(), write_pos, buf_slice)
+                    akuma_vfs_glue::fs::write_at_open_file_or_path(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), write_pos, buf_slice)
                 };
                 match result {
                     Ok(0) => {
@@ -2189,7 +2189,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         && f.inode() != 0
         && akuma_vfs_glue::metadata(&f.path).is_err()
     {
-        let file = akuma_exec::process::KernelFile::new(f.path.clone(), flags).with_inode(f.mount_id(), f.inode());
+        let file = akuma_exec::process::KernelFile::new(f.path.clone(), flags).with_inode(akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()));
         let nfd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(file));
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
             proc.set_cloexec(nfd);
@@ -2550,7 +2550,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         // the `SELFHOST_ZERO_PAGE_HUNT` defect with an fd in place of an mmap.
         let file = akuma_exec::process::KernelFile::new(path.clone(), flags);
         let file = match akuma_vfs_glue::open_file_ids(&path) {
-            Some((mount_id, inode)) => file.with_inode(mount_id, inode),
+            Some((mount_id, inode)) => file.with_inode(akuma_primitives::FileKey::from_raw(mount_id, inode)),
             None => file,
         };
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(file));
@@ -2724,7 +2724,7 @@ pub fn sys_lseek(fd: u32, offset: i64, whence: i32) -> u64 {
                     // the file is after its name is gone, instead of silently
                     // treating an unlinked-but-open fd as a zero-length file and
                     // seeking to `offset`.
-                    let size = akuma_vfs_glue::fs::metadata_open_file(&f.path, f.mount_id(), f.inode())
+                    let size = akuma_vfs_glue::fs::metadata_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()))
                         .map_or(0, |m| m.size) as i64;
                     new_pos = match whence { 0 => offset, 1 => f.pos() as i64 + offset, 2 => size + offset, _ => -1 };
                     if new_pos >= 0 {
@@ -2787,7 +2787,7 @@ pub fn fstat_fill(fd: u32) -> Result<Stat, u64> {
             // Only this arm reaches the on-disk VFS; every other arm below synthesizes a
             // Stat from constants (or forwards cross-core, which must keep the BKL).
             let _vfs_bkl = VfsBklGuard::new();
-            if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&f.path, f.mount_id(), f.inode()) {
+            if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode())) {
                 stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: meta.nlink(), st_uid: meta.uid, st_gid: meta.gid, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                     akuma_primitives::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
@@ -3144,7 +3144,7 @@ pub(super) fn sys_fallocate(fd: u32, mode: i32, offset: i64, len: i64) -> u64 {
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
             // By inode once the name is gone — see `sys_ftruncate`.
-            match akuma_vfs_glue::fallocate_open_file(&f.path, f.mount_id(), f.inode(), mode, offset as u64, len as u64) {
+            match akuma_vfs_glue::fallocate_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), mode, offset as u64, len as u64) {
                 Ok(()) => 0,
                 Err(e) => fs_error_to_errno(e),
             }
@@ -3171,7 +3171,7 @@ pub(super) fn sys_ftruncate(fd: u32, length: i64) -> u64 {
             }
             // By inode once the name is gone: Chromium sizes its shared
             // memory after unlinking it, and by path that was `ENOENT`.
-            match akuma_vfs_glue::truncate_open_file(&f.path, f.mount_id(), f.inode(), length as u64) {
+            match akuma_vfs_glue::truncate_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode()), length as u64) {
                 Ok(()) => 0,
                 Err(e) => fs_error_to_errno(e),
             }
@@ -3229,7 +3229,7 @@ fn fsync_fd(fd: u32) -> u64 {
         // By inode and mount id, like `read` — an unlinked-but-open fd's
         // filesystem must stay flushable after the name is gone.
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
-            match akuma_vfs_glue::sync_open_file(&f.path, f.mount_id(), f.inode()) {
+            match akuma_vfs_glue::sync_open_file(&f.path, akuma_primitives::FileKey::from_raw(f.mount_id(), f.inode())) {
                 Ok(()) => 0,
                 Err(e) => fs_error_to_errno(e),
             }
@@ -3313,7 +3313,7 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
             (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0, 0, 0)
         } else {
             let final_path = if follow { akuma_vfs_glue::resolve_symlinks(&resolved_path) } else { resolved_path };
-            if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&final_path, fd_mount, fd_inode) {
+            if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&final_path, akuma_primitives::FileKey::from_raw(fd_mount, fd_inode)) {
                 (meta.mode as u16, meta.inode, meta.size,
                  meta.nlink(),
                  meta.accessed.unwrap_or(0) as i64,

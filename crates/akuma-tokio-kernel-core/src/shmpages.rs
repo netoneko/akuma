@@ -27,6 +27,7 @@
 //! pays. Bounded by residency: an entry exists only while a frame for it is
 //! mapped somewhere.
 
+use akuma_primitives::FileKey;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use akuma_fpcache_rw::{Generations, Key, Publish, Refs, Table, write_span, zero_span};
@@ -193,7 +194,8 @@ fn active() -> bool {
 /// overlaps, as Linux's page cache would show it. A span whose source is the
 /// frame itself (a write-back handing `write_at` the physmap) is skipped:
 /// copying it onto itself could undo a peer's store landing in between.
-fn wrote(mount_id: u32, inode: u32, offset: usize, data: &[u8]) {
+fn wrote(key: FileKey, offset: usize, data: &[u8]) {
+    let (mount_id, inode) = key.parts();
     GENS.bump(inode);
     with_table(|t| {
         t.for_each_in(mount_id, inode, offset, offset.saturating_add(data.len()), |page_off, pa| {
@@ -213,7 +215,8 @@ fn wrote(mount_id: u32, inode: u32, offset: usize, data: &[u8]) {
 
 /// `MappedFileHooks::zeroed`: bytes `[from, to)` of the file read zero now
 /// (truncate, hole punch), and so must the mapped frames.
-fn zeroed(mount_id: u32, inode: u32, from: usize, to: usize) {
+fn zeroed(key: FileKey, from: usize, to: usize) {
+    let (mount_id, inode) = key.parts();
     static ZEROS: [u8; 4096] = [0; 4096];
     GENS.bump(inode);
     with_table(|t| {

@@ -93,6 +93,7 @@
 
 extern crate alloc;
 
+use akuma_primitives::FileKey;
 use akuma_trap_aarch64::{FrameHandle, irq_frame::IrqFrame};
 
 // `safe_print!` resolves unqualified throughout this crate — the same move
@@ -787,7 +788,7 @@ fn demand_page_lazy_region(
                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                     akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                     let file_off = file_offset + (cur_va - segment_va);
-                    akuma_fpcache::mark_icache_clean(mount_id, inode, file_off, pf);
+                    akuma_fpcache::mark_icache_clean(FileKey::from_raw(mount_id, inode), file_off, pf);
                 }
                 filled.push((cur_va, pf, owns_ref));
                 cur_va += 0x1000;
@@ -867,7 +868,7 @@ fn demand_page_lazy_region(
             {
                 if fill_complete {
                     let file_off = file_offset + (cur_va - segment_va);
-                    akuma_fpcache::insert(mount_id, inode, file_off, pf, is_exec);
+                    akuma_fpcache::insert(FileKey::from_raw(mount_id, inode), file_off, pf, is_exec);
                 } else {
                     akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_UNPUBLISHED, 1);
                 }

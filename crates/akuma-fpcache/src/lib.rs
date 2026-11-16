@@ -70,6 +70,7 @@ extern crate alloc;
 /// travel; the two differ only in the timestamp prefix.)
 pub use akuma_primitives::safe_print;
 
+use akuma_primitives::FileKey;
 use akuma_exec::PhysFrame;
 use akuma_primitives::irq::with_irqs_disabled;
 use alloc::collections::BTreeMap;
@@ -352,7 +353,8 @@ pub fn lookup_and_ref(
 }
 
 /// Record that `frame` has had I-cache maintenance, so later `RX` mappers can skip it.
-pub fn mark_icache_clean(mount_id: u32, inode: u32, file_off: usize, frame: PhysFrame) {
+pub fn mark_icache_clean(key: FileKey, file_off: usize, frame: PhysFrame) {
+    let (mount_id, inode) = key.parts();
     if !enabled() {
         return;
     }
@@ -370,7 +372,8 @@ pub fn mark_icache_clean(mount_id: u32, inode: u32, file_off: usize, frame: Phys
 /// Call this only for a page that satisfies every eligibility rule in the module
 /// docs; `frame` must be fully filled (and I-cache-maintained if `icache_done`)
 /// *before* publishing, since a peer core can map it the instant it lands.
-pub fn insert(mount_id: u32, inode: u32, file_off: usize, frame: PhysFrame, icache_done: bool) {
+pub fn insert(key: FileKey, file_off: usize, frame: PhysFrame, icache_done: bool) {
+    let (mount_id, inode) = key.parts();
     if !enabled() || inode == 0 || mount_id == 0 {
         return;
     }

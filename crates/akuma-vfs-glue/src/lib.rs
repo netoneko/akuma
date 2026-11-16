@@ -27,6 +27,7 @@ pub mod ext2;
 pub mod fs;
 pub mod proc;
 
+use akuma_primitives::FileKey;
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
@@ -696,7 +697,8 @@ pub fn read_at_open_file(
 ///
 /// [`read_at_open_file`] without its by-path fallback: a region records no
 /// path, so `inode == 0` or an unknown mount is an error, never a guess.
-pub fn read_at_by_mount_inode(mount_id: u32, inode: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+pub fn read_at_by_mount_inode(key: FileKey, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+    let (mount_id, inode) = key.parts();
     if inode == 0 {
         return Err(FsError::NotFound);
     }
@@ -715,7 +717,8 @@ pub fn read_at_by_mount_inode(mount_id: u32, inode: u32, offset: usize, buf: &mu
 ///
 /// Inherits [`read_at_open_file`]'s mount-aliasing caveat verbatim: the path
 /// still selects the filesystem.
-pub fn metadata_open_file(path: &str, mount_id: u32, inode: u32) -> Result<Metadata, FsError> {
+pub fn metadata_open_file(path: &str, key: FileKey) -> Result<Metadata, FsError> {
+    let (mount_id, inode) = key.parts();
     if inode == 0 {
         return metadata(path);
     }
@@ -744,7 +747,8 @@ pub fn metadata_open_file(path: &str, mount_id: u32, inode: u32) -> Result<Metad
 /// serving the bytes from before the write - to an unlinked file's readers,
 /// whose path-keyed invalidation in [`write_at_open_file_or_path`] resolves to
 /// nothing, and after every shared-mapping write-back.
-pub fn write_at_open_file(mount_id: u32, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+pub fn write_at_open_file(key: FileKey, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+    let (mount_id, inode) = key.parts();
     if inode == 0 {
         return Err(FsError::NotFound);
     }
@@ -775,7 +779,7 @@ pub fn write_at_open_file_or_path(
     if inode == 0 || is_mtab(path) {
         return write_at(path, offset, data);
     }
-    let r = write_at_open_file(mount_id, inode, offset, data);
+    let r = write_at_open_file(FileKey::from_raw(mount_id, inode), offset, data);
     invalidate_file_pages(path);
     if let Ok(n) = r {
         notify_mapped_write(path, offset, &data[..n.min(data.len())]);
@@ -811,7 +815,7 @@ pub fn append_open_file(
 ) -> Result<(usize, usize), FsError> {
     match append(path, data) {
         Err(FsError::NotFound) if inode != 0 => {
-            let size = metadata_open_file(path, mount_id, inode)?.size as usize;
+            let size = metadata_open_file(path, FileKey::from_raw(mount_id, inode))?.size as usize;
             let n = write_at_open_file_or_path(path, mount_id, inode, size, data)?;
             Ok((size, n))
         }
@@ -845,7 +849,8 @@ pub fn create_dir(path: &str) -> Result<(), FsError> {
 /// [`metadata_open_file`] does: an fd's own filesystem must keep answering
 /// after the name is unlinked, and that is the case that matters — `sqlite`
 /// journals and `cargo`'s package database fsync an fd they still hold open.
-pub fn sync_open_file(path: &str, mount_id: u32, inode: u32) -> Result<(), FsError> {
+pub fn sync_open_file(path: &str, key: FileKey) -> Result<(), FsError> {
+    let (mount_id, inode) = key.parts();
     if inode == 0 {
         return sync_path(path);
     }
@@ -965,7 +970,8 @@ pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
 /// notification runs as before), by inode once it does not — `ftruncate` on an
 /// unlinked-but-open file, which is how Chromium sizes its shared memory
 /// (create, unlink, then size).
-pub fn truncate_open_file(path: &str, mount_id: u32, inode: u32, length: u64) -> Result<(), FsError> {
+pub fn truncate_open_file(path: &str, key: FileKey, length: u64) -> Result<(), FsError> {
+    let (mount_id, inode) = key.parts();
     if inode == 0 || resolve_file_id(path) == Some((mount_id, inode)) {
         return truncate(path, length);
     }
@@ -978,7 +984,8 @@ pub fn truncate_open_file(path: &str, mount_id: u32, inode: u32, length: u64) ->
 }
 
 /// [`fallocate`] for an open file description — see [`truncate_open_file`].
-pub fn fallocate_open_file(path: &str, mount_id: u32, inode: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+pub fn fallocate_open_file(path: &str, key: FileKey, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+    let (mount_id, inode) = key.parts();
     if inode == 0 || resolve_file_id(path) == Some((mount_id, inode)) {
         return fallocate(path, mode, offset, len);
     }
@@ -1756,10 +1763,10 @@ pub struct MappedFileHooks {
     /// resolution per write.
     pub active: fn() -> bool,
     /// `data` was written at byte `offset` of `(mount_id, inode)`.
-    pub wrote: fn(mount_id: u32, inode: u32, offset: usize, data: &[u8]),
+    pub wrote: fn(key: FileKey, offset: usize, data: &[u8]),
     /// Bytes `[from, to)` of `(mount_id, inode)` now read as zero (truncate:
     /// `to == usize::MAX`; a punched hole otherwise).
-    pub zeroed: fn(mount_id: u32, inode: u32, from: usize, to: usize),
+    pub zeroed: fn(key: FileKey, from: usize, to: usize),
 }
 
 static MAPPED_FILE_HOOKS: akuma_primitives::OnceCopy<MappedFileHooks> = akuma_primitives::OnceCopy::new();
@@ -1802,7 +1809,7 @@ fn notify_mapped_write(path: &str, offset: usize, data: &[u8]) {
     if let Some(h) = mapped_file_hooks()
         && let Some((mount_id, inode)) = resolve_file_id(path)
     {
-        (h.wrote)(mount_id, inode, offset, data);
+        (h.wrote)(FileKey::from_raw(mount_id, inode), offset, data);
     }
 }
 
@@ -1811,7 +1818,7 @@ fn notify_mapped_zeroed(path: &str, from: usize, to: usize) {
     if let Some(h) = mapped_file_hooks()
         && let Some((mount_id, inode)) = resolve_file_id(path)
     {
-        (h.zeroed)(mount_id, inode, from, to);
+        (h.zeroed)(FileKey::from_raw(mount_id, inode), from, to);
     }
 }
 

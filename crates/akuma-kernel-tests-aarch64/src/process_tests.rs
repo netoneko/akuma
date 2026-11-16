@@ -10040,8 +10040,8 @@ fn test_demand_paging_merged_body_policy() {
     if let (Some(dirty), Some(clean)) =
         (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
     {
-        crate::file_page_cache::insert(FAKE_MOUNT, FAKE_INODE, OFF_DIRTY, dirty, false);
-        crate::file_page_cache::insert(FAKE_MOUNT, FAKE_INODE, OFF_CLEAN, clean, true);
+        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, dirty, false);
+        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE), OFF_CLEAN, clean, true);
 
         // Published without maintenance → an executable mapper must be told to run it.
         if let Some((pf, needs_ic)) =
@@ -10069,7 +10069,7 @@ fn test_demand_paging_merged_body_policy() {
             crate::pmm::free_page(pf);
         }
         // Recording the maintenance retires the request for every later mapper.
-        crate::file_page_cache::mark_icache_clean(FAKE_MOUNT, FAKE_INODE, OFF_DIRTY, dirty);
+        crate::file_page_cache::mark_icache_clean(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, dirty);
         if let Some((pf, needs_ic)) =
             crate::file_page_cache::lookup_and_ref(FAKE_MOUNT, FAKE_INODE, OFF_DIRTY, true)
         {
@@ -10112,14 +10112,14 @@ fn test_demand_paging_merged_body_policy() {
     if let (Some(winner), Some(loser)) =
         (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
     {
-        crate::file_page_cache::insert(FAKE_MOUNT, FAKE_INODE2, OFF_RACE, winner, false);
+        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE2), OFF_RACE, winner, false);
         if crate::pmm::cow_ref_get(winner.addr) != 2 {
             fails += 1;
             crate::safe_print!(128,
                 "[Test] dp_merged_body: winner cow_ref={} after insert (want 2)\n",
                 crate::pmm::cow_ref_get(winner.addr));
         }
-        crate::file_page_cache::insert(FAKE_MOUNT, FAKE_INODE2, OFF_RACE, loser, false); // lost race
+        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE2), OFF_RACE, loser, false); // lost race
         if crate::pmm::cow_ref_get(loser.addr) != 0 {
             fails += 1;
             crate::safe_print!(128,
@@ -10160,7 +10160,7 @@ fn test_demand_paging_merged_body_policy() {
     const SHARED_INODE: u32 = u32::MAX - 4;
     const OFF_ALIAS: usize = 0x8000_2000;
     if let Some(page_a) = crate::pmm::alloc_page_zeroed() {
-        crate::file_page_cache::insert(MOUNT_A, SHARED_INODE, OFF_ALIAS, page_a, false);
+        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(MOUNT_A, SHARED_INODE), OFF_ALIAS, page_a, false);
 
         // The other mount's identically-numbered inode must not find it.
         if let Some((pf, _)) =

@@ -459,7 +459,7 @@ fn runtime() -> ExecRuntime {
         resolve_file_id: |path| bkl_free_io(|| akuma_vfs_glue::resolve_file_id(path).ok_or(-1)),
         text_pin: akuma_vfs_glue::text_pin,
         read_at_by_inode: |mount_id, inode, off, buf| {
-            bkl_free_io(|| akuma_vfs_glue::read_at_by_mount_inode(mount_id, inode, off, buf).map_err(|_| -1))
+            bkl_free_io(|| akuma_vfs_glue::read_at_by_mount_inode(akuma_primitives::FileKey::from_raw(mount_id, inode), off, buf).map_err(|_| -1))
         },
 
         // `akuma-exec` calls this from `clear_child_tid` on process exit — the

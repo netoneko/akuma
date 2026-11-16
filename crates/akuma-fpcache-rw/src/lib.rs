@@ -56,6 +56,7 @@
 
 extern crate alloc;
 
+use akuma_primitives::FileKey;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -82,7 +83,8 @@ pub struct Key {
 
 impl Key {
     #[must_use]
-    pub const fn new(mount_id: u32, inode: u32, offset: usize) -> Self {
+    pub const fn new(key: FileKey, offset: usize) -> Self {
+        let (mount_id, inode) = key.parts();
         Self { inode, mount_id, offset }
     }
 
@@ -218,12 +220,13 @@ impl Table {
 
     /// Visit every cached page of `(mount_id, inode)` that overlaps the byte
     /// range `[from, to)`, as `(page_offset, pa)`, ascending.
-    pub fn for_each_in(&self, mount_id: u32, inode: u32, from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
+    pub fn for_each_in(&self, key: FileKey, from: usize, to: usize, mut f: impl FnMut(usize, usize)) {
+        let (mount_id, inode) = key.parts();
         if to <= from {
             return;
         }
-        let lo = Key::new(mount_id, inode, from & !(PAGE_SIZE - 1));
-        let hi = Key::new(mount_id, inode, usize::MAX);
+        let lo = Key::new(FileKey::from_raw(mount_id, inode), from & !(PAGE_SIZE - 1));
+        let hi = Key::new(FileKey::from_raw(mount_id, inode), usize::MAX);
         for (k, &pa) in self.map.range(lo..=hi) {
             if k.offset >= to {
                 break;
@@ -240,8 +243,8 @@ impl Table {
     /// mapping can remain — a mapping pins its inode — so this only collects
     /// what a missed reap left behind. Returns how many entries went.
     pub fn detach_inode(&mut self, inode: u32, mut f: impl FnMut(usize)) -> usize {
-        let lo = Key::new(0, inode, 0);
-        let hi = Key::new(u32::MAX, inode, usize::MAX);
+        let lo = Key::new(FileKey::from_raw(0, inode), 0);
+        let hi = Key::new(FileKey::from_raw(u32::MAX, inode), usize::MAX);
         let mut n = 0;
         while let Some((&k, &pa)) = self.map.range(lo..=hi).next() {
             self.map.remove(&k);
@@ -384,7 +387,7 @@ mod tests {
         }
     }
 
-    const K: Key = Key::new(1, 12, 0x8000);
+    const K: Key = Key::new(FileKey::from_raw(1, 12), 0x8000);
 
     #[test]
     fn first_mapper_publishes_and_the_count_is_mapping_plus_table() {
@@ -400,7 +403,7 @@ mod tests {
         t.publish(K, 0x1000, &r);
         assert_eq!(t.lookup_and_ref(K, &r), Some(0x1000));
         assert_eq!(r.get(0x1000), 3);
-        assert_eq!(t.lookup_and_ref(Key::new(1, 12, 0x9000), &r), None);
+        assert_eq!(t.lookup_and_ref(Key::new(FileKey::from_raw(1, 12), 0x9000), &r), None);
     }
 
     /// The race `akuma-fpcache` lets the loser lose privately. Here the loser
@@ -420,7 +423,7 @@ mod tests {
     #[test]
     fn the_sweep_drops_only_entries_nobody_maps() {
         let (mut t, r) = (Table::new(), FakeRefs::default());
-        let k2 = Key::new(1, 12, 0x9000);
+        let k2 = Key::new(FileKey::from_raw(1, 12), 0x9000);
         t.publish(K, 0x1000, &r);
         t.publish(k2, 0x2000, &r);
         assert_eq!(t.lookup_and_ref(k2, &r), Some(0x2000));
@@ -439,7 +442,7 @@ mod tests {
     #[test]
     fn unshareable_keys_are_refused_without_a_reference() {
         let (mut t, r) = (Table::new(), FakeRefs::default());
-        for k in [Key::new(0, 12, 0), Key::new(1, 0, 0), Key::new(1, 12, 100)] {
+        for k in [Key::new(FileKey::from_raw(0, 12), 0), Key::new(FileKey::from_raw(1, 0), 0), Key::new(FileKey::from_raw(1, 12), 100)] {
             assert_eq!(t.publish(k, 0x1000, &r), Publish::Refused);
         }
         assert!(t.is_empty());
@@ -483,7 +486,7 @@ mod tests {
         t.publish(K, 0x1000, &r);
         r.dec(0x1000);
         assert!(!t.reap(K, 0x2000, &r));
-        assert!(!t.reap(Key::new(2, 12, 0x8000), 0x1000, &r), "same inode, other mount");
+        assert!(!t.reap(Key::new(FileKey::from_raw(2, 12), 0x8000), 0x1000, &r), "same inode, other mount");
         assert_eq!(t.len(), 1);
     }
 
@@ -491,27 +494,27 @@ mod tests {
     fn for_each_in_visits_only_the_overlapping_pages_of_one_file() {
         let (mut t, r) = (Table::new(), FakeRefs::default());
         for (i, off) in [0usize, 0x1000, 0x2000, 0x5000].iter().enumerate() {
-            t.publish(Key::new(1, 12, *off), 0x10_000 * (i + 1), &r);
+            t.publish(Key::new(FileKey::from_raw(1, 12), *off), 0x10_000 * (i + 1), &r);
         }
-        t.publish(Key::new(2, 12, 0x1000), 0xa0_000, &r); // same inode, other mount
-        t.publish(Key::new(1, 13, 0x1000), 0xb0_000, &r); // other inode
+        t.publish(Key::new(FileKey::from_raw(2, 12), 0x1000), 0xa0_000, &r); // same inode, other mount
+        t.publish(Key::new(FileKey::from_raw(1, 13), 0x1000), 0xb0_000, &r); // other inode
         let mut seen = Vec::new();
-        t.for_each_in(1, 12, 0x1800, 0x2001, |off, pa| seen.push((off, pa)));
+        t.for_each_in(FileKey::from_raw(1, 12), 0x1800, 0x2001, |off, pa| seen.push((off, pa)));
         assert_eq!(seen, vec![(0x1000, 0x20_000), (0x2000, 0x30_000)]);
         seen.clear();
-        t.for_each_in(1, 12, 0x3000, usize::MAX, |off, pa| seen.push((off, pa)));
+        t.for_each_in(FileKey::from_raw(1, 12), 0x3000, usize::MAX, |off, pa| seen.push((off, pa)));
         assert_eq!(seen, vec![(0x5000, 0x40_000)]);
         seen.clear();
-        t.for_each_in(1, 12, 0x3000, 0x3000, |off, pa| seen.push((off, pa)));
+        t.for_each_in(FileKey::from_raw(1, 12), 0x3000, 0x3000, |off, pa| seen.push((off, pa)));
         assert!(seen.is_empty(), "an empty range visits nothing");
     }
 
     #[test]
     fn detach_inode_takes_every_mount_and_nothing_else() {
         let (mut t, r) = (Table::new(), FakeRefs::default());
-        t.publish(Key::new(1, 12, 0), 0x1000, &r);
-        t.publish(Key::new(2, 12, 0x1000), 0x2000, &r);
-        t.publish(Key::new(1, 13, 0), 0x3000, &r);
+        t.publish(Key::new(FileKey::from_raw(1, 12), 0), 0x1000, &r);
+        t.publish(Key::new(FileKey::from_raw(2, 12), 0x1000), 0x2000, &r);
+        t.publish(Key::new(FileKey::from_raw(1, 13), 0), 0x3000, &r);
         let mut freed = Vec::new();
         assert_eq!(t.detach_inode(12, |pa| freed.push(pa)), 2);
         freed.sort_unstable();

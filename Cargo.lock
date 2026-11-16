@@ -400,6 +400,9 @@ dependencies = [
 [[package]]
 name = "akuma-fpcache-rw"
 version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
 
 [[package]]
 name = "akuma-fpu-amd64"

@@ -48,6 +48,8 @@ pub mod rng;
 pub mod cpu;
 pub mod console;
 pub mod errno;
+pub mod file_key;
+pub use file_key::{FileKey, Ino, MountId};
 pub mod inode_pin;
 pub mod text_busy;
 pub mod irq;

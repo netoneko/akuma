@@ -8,3 +8,4 @@ description = "The writable sibling of akuma-fpcache: one physical frame per (mo
 workspace = true
 
 [dependencies]
+akuma-primitives = { path = "../akuma-primitives" }

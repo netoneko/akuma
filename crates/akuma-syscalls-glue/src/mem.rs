@@ -202,7 +202,7 @@ fn snapshot_shared_write(proc: &akuma_exec::process::Process, start: usize, end:
 /// out before the write, so no page-table lock is held across I/O.
 fn flush_shared_write(proc: &akuma_exec::process::Process, w: &WriteBack, lo: usize, hi: usize) {
     let rec = &w.rec;
-    let Ok(meta) = akuma_vfs_glue::fs::metadata_open_file(&rec.path, rec.mount_id, rec.inode) else { return };
+    let Ok(meta) = akuma_vfs_glue::fs::metadata_open_file(&rec.path, akuma_primitives::FileKey::from_raw(rec.mount_id, rec.inode)) else { return };
     let size = meta.size as usize;
     if size <= rec.offset {
         return;
@@ -222,7 +222,7 @@ fn flush_shared_write(proc: &akuma_exec::process::Process, w: &WriteBack, lo: us
                 if by_path {
                     akuma_vfs_glue::write_at(&rec.path, off, bytes).is_ok()
                 } else {
-                    akuma_vfs_glue::fs::write_at_open_file(rec.mount_id, rec.inode, off, bytes).is_ok()
+                    akuma_vfs_glue::fs::write_at_open_file(akuma_primitives::FileKey::from_raw(rec.mount_id, rec.inode), off, bytes).is_ok()
                 }
             });
             failed += usize::from(ok != Some(true));
@@ -256,7 +256,7 @@ pub(super) fn release_shared_write(proc: &akuma_exec::process::Process, start: u
         let mut pas: Vec<usize> = released.iter().map(|f| f.addr).collect();
         pas.sort_unstable();
         let from = w.rec.offset + (lo - w.start_va);
-        akuma_exec::shm::reap_released(w.rec.mount_id, w.rec.inode, from, from + (hi - lo), &pas);
+        akuma_exec::shm::reap_released(akuma_primitives::FileKey::from_raw(w.rec.mount_id, w.rec.inode), from, from + (hi - lo), &pas);
     }
 }
 
@@ -375,7 +375,7 @@ fn resolve_file_extent(path: &str, fd_mount: u32, fd_inode: u32, offset: usize, 
     // shared-memory file, never reached the renderer (`shmregionprobe.c`,
     // ryzen 2026-10-08).
     if fd_inode != 0
-        && let Ok(m) = akuma_vfs_glue::metadata_open_file(path, fd_mount, fd_inode)
+        && let Ok(m) = akuma_vfs_glue::metadata_open_file(path, akuma_primitives::FileKey::from_raw(fd_mount, fd_inode))
     {
         return (fd_mount, fd_inode, core::cmp::min(len, (m.size as usize).saturating_sub(offset)));
     }
@@ -692,7 +692,7 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
                 // nothing can observe the intermediate state.
                 let page_buf = &mut fill_buf[..chunk];
                 // By inode when the fd has one (a `/proc` file renders by path).
-                match akuma_vfs_glue::fs::read_at_open_file(path, *mount_id, *inode, file_off, page_buf) {
+                match akuma_vfs_glue::fs::read_at_open_file(path, akuma_primitives::FileKey::from_raw(*mount_id, *inode), file_off, page_buf) {
                     Ok(n) => {
                         if !akuma_exec::mmu::copy_to_phys(frame.addr, &fill_buf[..n]) {
                             break; // the PMM just handed us this frame; cannot happen

@@ -58,6 +58,7 @@ pub use akuma_primitives::{safe_print, tprint};
 pub use akuma_alloc as allocator;
 // Ditto for the exception-path registration calls in `kernel_main`.
 #[cfg(target_os = "none")]
+use akuma_primitives::FileKey;
 use akuma_exceptions as exceptions;
 
 // The leaf re-exports `akuma-kernel-core` itself provides (config, fs, vfs
@@ -305,7 +306,7 @@ pub(crate) fn build_exec_runtime(
         // `akuma_pmm::DP_PREFAULT_FILL_SHORT` and
         // `docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`.
         read_at_by_inode: |mount_id, inode, off, buf| {
-            akuma_vfs_glue::read_at_by_mount_inode(mount_id, inode, off, buf).map_err(|_| -1)
+            akuma_vfs_glue::read_at_by_mount_inode(FileKey::from_raw(mount_id, inode), off, buf).map_err(|_| -1)
         },
         on_process_exit: |_pid| {},
         remove_socket: akuma_net::socket::remove_socket,

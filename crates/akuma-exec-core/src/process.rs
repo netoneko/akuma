@@ -3,6 +3,7 @@
 //! These types have no architecture-specific or runtime dependencies
 //! and can be compiled and tested on the host.
 
+use akuma_primitives::FileKey;
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::future::Future;
@@ -404,7 +405,8 @@ impl KernelFile {
     /// The two are set together and never separately: an inode number applied to
     /// the wrong filesystem is the aliasing this pair exists to prevent.
     #[must_use]
-    pub fn with_inode(mut self, mount_id: u32, inode: u32) -> Self {
+    pub fn with_inode(mut self, key: FileKey) -> Self {
+        let (mount_id, inode) = key.parts();
         self.inode = inode;
         self.mount_id = mount_id;
         self.pin = akuma_primitives::InodePin::new(inode);
