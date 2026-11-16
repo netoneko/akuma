@@ -13,7 +13,7 @@ use alloc::vec::Vec;
 use ed25519_dalek::{SECRET_KEY_LENGTH, SigningKey, VerifyingKey};
 use spinning_top::Spinlock;
 
-use super::crypto::new_seeded_rng;
+use super::crypto::secure_random;
 use libakuma::*;
 
 // Re-export the host-testable SSH wire-format helpers instead of keeping a
@@ -53,12 +53,18 @@ pub fn get_host_key() -> Option<SigningKey> {
 // Key Loading and Generation
 // ============================================================================
 
-/// Generate a new Ed25519 keypair
-fn generate_keypair() -> SigningKey {
-    let mut rng = new_seeded_rng();
+/// Generate a new Ed25519 keypair from 32 bytes of kernel entropy.
+///
+/// `None` when the kernel cannot supply them. The host key is this machine's
+/// identity for as long as the file lives, so there is no weaker source to fall
+/// back to: until 2026-11-16 it came from an 8-byte seed, and from a *constant*
+/// when that read failed (`docs/archive/SECURITY_AUDIT_2026_11_16.md` C2).
+fn generate_keypair() -> Option<SigningKey> {
     let mut key_bytes = [0u8; SECRET_KEY_LENGTH];
-    rng.fill_bytes(&mut key_bytes);
-    SigningKey::from_bytes(&key_bytes)
+    if !secure_random(&mut key_bytes) {
+        return None;
+    }
+    Some(SigningKey::from_bytes(&key_bytes))
 }
 
 /// Helper to read file to Vec<u8>
@@ -118,7 +124,13 @@ pub async fn load_or_generate_host_key() -> SigningKey {
 
     // Generate new keypair
     println("[SSH Keys] Generating new host key...");
-    let key = generate_keypair();
+    let Some(key) = generate_keypair() else {
+        println(
+            "[SSH Keys] FATAL: the kernel has no entropy (getrandom failed) -- \
+             refusing to generate a host key; sshd will not start",
+        );
+        exit(1);
+    };
 
     // Save private key
     let _ = write_vec_to_file(HOST_KEY_PATH, key.as_bytes());

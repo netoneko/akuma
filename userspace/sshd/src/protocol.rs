@@ -133,7 +133,7 @@ impl SshSession {
     fn new(config: SshdConfig) -> Self {
         Self {
             state: SshState::AwaitingVersion,
-            rng: super::crypto::new_seeded_rng(),
+            rng: super::crypto::new_padding_rng(),
             client_version: Vec::new(),
             server_version: SSH_VERSION[..SSH_VERSION.len() - 2].to_vec(),
             client_kexinit: Vec::new(),
@@ -1337,16 +1337,25 @@ async fn handle_message(
             let mut full = vec![SSH_MSG_KEXINIT];
             full.extend_from_slice(payload);
             session.client_kexinit = full;
-            let kexinit = build_kexinit(&mut session.rng);
+            // The cookie comes straight from the kernel, never from `session.rng`.
+            let mut cookie = [0u8; 16];
+            if !super::crypto::secure_random(&mut cookie) {
+                return Err(kex_failed());
+            }
+            let kexinit = build_kexinit(&cookie);
             session.server_kexinit = kexinit.clone();
             send_unencrypted_packet(stream, &kexinit, session).await?;
             session.state = SshState::AwaitingKexEcdhInit;
         }
         SSH_MSG_KEX_ECDH_INIT => {
             let mut offset = 0;
-            if let Some(client_pubkey) = read_string(payload, &mut offset)
-                && let Some(reply) = handle_kex_ecdh_init(session, client_pubkey)
-            {
+            if let Some(client_pubkey) = read_string(payload, &mut offset) {
+                // A key exchange that cannot complete (no entropy, no host key, a
+                // malformed client key) ends the connection instead of leaving it
+                // parked until the grace timer.
+                let Some(reply) = handle_kex_ecdh_init(session, client_pubkey) else {
+                    return Err(kex_failed());
+                };
                 send_unencrypted_packet(stream, &reply, session).await?;
                 let newkeys = vec![SSH_MSG_NEWKEYS];
                 send_unencrypted_packet(stream, &newkeys, session).await?;
@@ -1445,12 +1454,16 @@ async fn handle_message(
 // Packet Helpers
 // ============================================================================
 
-fn build_kexinit(rng: &mut SimpleRng) -> Vec<u8> {
+/// The error that ends a connection whose key exchange could not be completed.
+fn kex_failed() -> NetError {
+    println("[SSHD] Closing connection: key exchange failed (no entropy, no host key, or a bad client key)");
+    NetError::new(NetErrorKind::Other, "key exchange failed")
+}
+
+fn build_kexinit(cookie: &[u8; 16]) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.push(SSH_MSG_KEXINIT);
-    let mut cookie = [0u8; 16];
-    rng.fill_bytes(&mut cookie);
-    payload.extend_from_slice(&cookie);
+    payload.extend_from_slice(cookie);
     write_namelist(&mut payload, &[KEX_ALGO]);
     write_namelist(&mut payload, &[HOST_KEY_ALGO]);
     write_namelist(&mut payload, &[CIPHER_ALGO]);
@@ -1467,8 +1480,12 @@ fn build_kexinit(rng: &mut SimpleRng) -> Vec<u8> {
 }
 
 fn handle_kex_ecdh_init(session: &mut SshSession, client_pubkey: &[u8]) -> Option<Vec<u8>> {
+    // 32 bytes from the kernel, or no key exchange at all: `None` makes the
+    // caller end the connection. Never `session.rng` — see `new_padding_rng`.
     let mut secret_bytes = [0u8; 32];
-    session.rng.fill_bytes(&mut secret_bytes);
+    if !super::crypto::secure_random(&mut secret_bytes) {
+        return None;
+    }
     let server_secret = x25519_dalek::StaticSecret::from(secret_bytes);
     let server_public = X25519PublicKey::from(&server_secret);
     let server_pubkey = server_public.as_bytes();
