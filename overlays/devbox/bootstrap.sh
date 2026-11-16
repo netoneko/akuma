@@ -188,7 +188,7 @@ if [ "${DEVBOX_CA_CERTS:-true}" = "true" ]; then
             set -e
             mkdir -p /mnt/disk
             mount -o loop /disk.img /mnt/disk
-            apk add --root /mnt/disk --initdb --no-cache --allow-untrusted \
+            apk add --root /mnt/disk --initdb --no-cache --keys-dir /etc/apk/keys \
                 --repository http://dl-cdn.alpinelinux.org/alpine/latest-stable/main \
                 ca-certificates-bundle
             ls -la /mnt/disk/etc/ssl/certs/ca-certificates.crt

@@ -241,9 +241,15 @@ if [ "${DEVBOX_APK_PACKAGES:-true}" = "true" ]; then
     sh -c '
       set -e
       [ -n "$PKGS" ] || { echo "package list did not reach the container" >&2; exit 1; }
-      apk add --root /target --initdb --no-cache --no-scripts --allow-untrusted \
+      # Signatures are checked against the Alpine keys this container trusts
+      # (--keys-dir): a fresh --root has no keys of its own, which is why this
+      # used to say --allow-untrusted and verified nothing. The keys are then
+      # installed in the image so apk inside the guest verifies too.
+      # (No apostrophes or backticks here: this is inside a single-quoted sh -c.)
+      apk add --root /target --initdb --no-cache --no-scripts --keys-dir /etc/apk/keys \
         --repository https://dl-cdn.alpinelinux.org/alpine/latest-stable/main \
         $PKGS
+      mkdir -p /target/etc/apk/keys && cp /etc/apk/keys/* /target/etc/apk/keys/
       # Replace the base tree symlink git -> scratch. scratch stays reachable at
       # /bin/scratch; it is simply no longer what `git` means.
       [ -x /target/usr/bin/git ] && ln -sf /usr/bin/git /target/bin/git
@@ -330,6 +336,15 @@ if [ -f "$PUBKEY" ]; then
 else
   say "WARNING: $PUBKEY not found. sshd will reject every login unless"
   say "         disable_key_verification is set back to true."
+fi
+
+# An image never carries a host key. sshd generates one on first start, so each
+# instance gets its own; a key left in the tree here (from an overlay, or from a
+# rootfs that was booted once) would be shared by every instance launched from
+# the image, and anyone with the image could impersonate all of them.
+if [ -d "$ROOT/etc/sshd" ]; then
+  rm -f "$ROOT/etc/sshd/id_ed25519" "$ROOT/etc/sshd/id_ed25519.pub" "$ROOT/etc/sshd/host_key"
+  say "etc/sshd: no host key in the image (generated per instance on first boot)"
 fi
 
 GITREV="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"

@@ -192,7 +192,7 @@ if [ "${SIMPLE_KERNEL_CA_CERTS:-true}" = "true" ]; then
             set -e
             mkdir -p /mnt/disk
             mount -o loop /disk.img /mnt/disk
-            apk add --root /mnt/disk --initdb --no-cache --allow-untrusted \
+            apk add --root /mnt/disk --initdb --no-cache --keys-dir /etc/apk/keys \
                 --repository http://dl-cdn.alpinelinux.org/alpine/latest-stable/main \
                 ca-certificates-bundle
             ls -la /mnt/disk/etc/ssl/certs/ca-certificates.crt
@@ -221,7 +221,7 @@ if [ "${SIMPLE_KERNEL_RUST_TOOLCHAIN:-true}" = "true" ]; then
             set -e
             mkdir -p /mnt/disk
             mount -o loop /disk.img /mnt/disk
-            apk add --root /mnt/disk --no-cache --no-scripts --allow-untrusted \
+            apk add --root /mnt/disk --no-cache --no-scripts --keys-dir /etc/apk/keys \
                 --repository https://dl-cdn.alpinelinux.org/alpine/latest-stable/main \
                 clang lld gcc binutils make musl-dev
             for tool in clang ld.lld gcc make; do
