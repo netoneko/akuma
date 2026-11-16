@@ -40,7 +40,7 @@ bits are enforced **when the switch is on** — it starts off.
 | `kill`/`tkill`/`tgkill`/`pidfd_send_signal` | `akuma_exec::process::check_signal` (both kernels) |
 | Ownership storage | `Metadata.{uid,gid}`, `Filesystem::chown`; ext2 (incl. `osd2` high halves), memfs, overlay, `SubdirFs` |
 | `/proc/<pid>/status` `Uid`/`Gid`/`Groups`/`Cap*` | `crates/akuma-procfs` |
-| The switch | `/proc/dac` (host root only): `echo 1 > /proc/dac` |
+| The switch | `/proc/dac` (host root only): `echo 1 > /proc/dac`; or `dac=1` on the boot line, which turns it on before init |
 
 ## What is checked
 

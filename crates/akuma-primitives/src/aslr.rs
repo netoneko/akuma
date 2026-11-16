@@ -2,8 +2,9 @@
 //!
 //! The loader (`akuma-elf`) and the mapping cursor (`akuma-exec`'s
 //! `ProcessMemory`) each add a random, aligned offset to an address they used
-//! to place at a constant: the static-PIE base, the dynamic linker's base, the
-//! top of the stack and the start of the `mmap` area. Without it every process
+//! to place at a constant: the static-PIE base, the top of the stack and the
+//! start of the `mmap` area. (The dynamic linker's base is not randomized yet;
+//! `akuma-elf`'s `load_interpreter` says why.) Without it every process
 //! has the same layout on every boot, so one leaked or guessed address is every
 //! address (`docs/archive/SECURITY_AUDIT_2026_11_16.md` H3).
 //!

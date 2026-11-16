@@ -217,6 +217,20 @@ unbalances the BKL ticket FIFO).
 | `HVF` | `1` (on Apple Silicon) | `0` forces QEMU TCG (slower but faithful PC reporting; HVF gdbstub misreports PC as exception-vector entry). |
 | `GDB` | unset | `1` starts QEMU gdbstub on `:1234` for `lldb -p :1234`. |
 
+## Boot-line security parameters
+
+Read from the kernel command line on both kernels (`APPEND="..."` with `scripts/cargo_runner.sh`).
+
+| Word | Effect | Default without it |
+|---|---|---|
+| `dac=1` | owner/group/other mode bits are enforced from the first user program (`permissions.md`) | off; `/proc/dac` can still switch it on later |
+| `net.allow=22,tcp:443,udp:53` | default-deny filter on frames from the wire: only the listed ports accept new connections or datagrams (`akuma_net::ingress`). `net.allow=none` admits nothing. A list that does not parse admits nothing | no filter |
+| `aslr=0` | no address-space randomization, so addresses compare between boots when debugging (`akuma_primitives::aslr`) | randomized from init on |
+
+Always on, with no switch: binding a port below 1024 needs uid 0; the cloud metadata address
+(169.254.169.254) is reachable by uid 0 in the host box only; `reboot`, `mount`, setting the
+clock and raw block devices need uid 0 in the host box.
+
 ## Debug knobs (`src/config.rs`)
 
 These are **compile-time** `pub const bool` — toggle in source and rebuild.

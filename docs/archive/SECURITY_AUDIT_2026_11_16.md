@@ -19,16 +19,27 @@ Fixed on branch `ouch` (each verified as stated in its commit message):
 | `akuma-slot-table::with_active_mut` aliasing (`UNSAFE_SITE_REDUCTION.md` §3) | `7f35af4f` | nine kernel configurations build; AArch64 boot suite unchanged |
 | Allocator canary unaligned reads (same §3) | `7f35af4f` | build only; the code is dead while canaries are off |
 
+A deployable image must put `dac=1 net.allow=22` (plus whatever else it serves) on its boot line:
+both are off without it.
+
 Not verified anywhere yet: every amd64 change above has been built but not booted, and nothing
 has run on the ryzen (the sanity run found it booted into another OS and stopped).
 
 Still open:
 
-- **H1** one privilege level (DAC default, sshd user switching, services off uid 0).
-- **H3** no ASLR.
-- **H4** instance identity (first-boot key fetch, no baked host key, metadata service).
-- **H5** no packet filter; no privileged-port check on `bind`.
-- **H6** `apk add --allow-untrusted` in the AWS image build.
+- **H1, partly:** `dac=1` on the boot line now enforces mode bits from init (`467af9ff`), but
+  it is not the default, sshd still logs every user in as uid 0, and services still run as root.
+  Intermediate-directory search permission is still unchecked.
+- **H3, partly:** the program base, stack top and `mmap` area are randomized (`8a7fe7b0`). Not
+  randomized: the dynamic linker (so libc in dynamic programs), non-PIE programs, the brk heap
+  relative to its image, the amd64 stack top, and the kernel.
+- **H4, partly:** the AWS image carries no host key (`ee9670d0`) and the metadata address is
+  closed to everything but host root (`2e906d33`). Still missing: a first-boot service that
+  fetches the launch key, so `authorized_keys` is still whatever the image was built with.
+- **H5:** done as an opt-in. `net.allow=` installs the ingress filter (`2e906d33`); without the
+  parameter nothing is filtered. There is no egress filter beyond the metadata address.
+- **H6:** done in the scripts (`ee9670d0`) but **no image has been built with it**: docker was
+  not available where the change was made.
 - **M1** sshd rekeying, per-source limits, key file modes; **M3** quotas; **M4** panic triage;
   **M5** speculative-execution mitigations; **M6** AArch64 PAN; **M8** build the AMI with `server`.
 - Every host key generated before `41559adb` must be regenerated; the fix does not rotate them.
