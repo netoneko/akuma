@@ -1,0 +1,101 @@
+#!/bin/sh
+# instance-key: install the launch key of THIS instance as an sshd authorized key.
+#
+# An image must not decide who may log in to the machines started from it: a key
+# baked in at build time is the builder's, on every instance, forever. EC2 (and
+# Firecracker's MMDS, which speaks the same protocol) hands each instance the
+# public key it was launched with, over the link-local metadata service. This
+# fetches it once per boot and adds it to /etc/sshd/authorized_keys.
+#
+# Run by herd as a oneshot (etc/herd/enabled/instance-key.conf), as root in the
+# host box: the kernel refuses the metadata address to everyone else.
+#
+#   - IMDSv2 (session token) with curl when the image has it; IMDSv1 through
+#     busybox wget otherwise. An instance that requires v2 needs curl.
+#   - Only an `ssh-ed25519` key is installed: sshd implements no other type,
+#     and a key it cannot parse would look installed and admit nobody.
+#   - The key is ADDED, never substituted: a failed or empty fetch leaves the
+#     file exactly as it was, so a metadata outage cannot lock the machine.
+#   - Exit 0 when the key is present afterwards (already or newly), 1 otherwise.
+#
+# METADATA_URL overrides the endpoint (tests point it at a local server).
+
+MD="${METADATA_URL:-http://169.254.169.254}"
+KEYS="${AUTHORIZED_KEYS:-/etc/sshd/authorized_keys}"
+TRIES="${INSTANCE_KEY_TRIES:-30}"
+
+say() { echo "[instance-key] $*"; }
+
+fetch_key() {
+    if command -v curl >/dev/null 2>&1; then
+        token=$(curl -sf -m 3 -X PUT "$MD/latest/api/token" \
+            -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null)
+        if [ -n "$token" ]; then
+            curl -sf -m 3 -H "X-aws-ec2-metadata-token: $token" \
+                "$MD/latest/meta-data/public-keys/0/openssh-key" 2>/dev/null
+            return
+        fi
+        curl -sf -m 3 "$MD/latest/meta-data/public-keys/0/openssh-key" 2>/dev/null
+        return
+    fi
+    wget -q -T 3 -O - "$MD/latest/meta-data/public-keys/0/openssh-key" 2>/dev/null
+}
+
+key=""
+n=0
+while [ "$n" -lt "$TRIES" ]; do
+    # First line only, carriage returns stripped: the endpoint may answer with
+    # a trailing newline or CRLF.
+    key=$(fetch_key | tr -d '\r' | head -n 1)
+    [ -n "$key" ] && break
+    n=$((n + 1))
+    sleep 1
+done
+
+if [ -z "$key" ]; then
+    say "no launch key from $MD after $TRIES tries; $KEYS left as it was"
+    exit 1
+fi
+
+case "$key" in
+    "ssh-ed25519 "*) ;;
+    *)
+        say "the launch key is not ssh-ed25519 (sshd accepts nothing else); not installed"
+        exit 1
+        ;;
+esac
+
+# Exactly `type base64 [comment]`: anything else is not a key line.
+fields=$(echo "$key" | wc -w)
+blob=$(echo "$key" | cut -d' ' -f2)
+if [ "$fields" -lt 2 ] || [ -z "$blob" ] || echo "$blob" | grep -q '[^A-Za-z0-9+/=]'; then
+    say "the launch key is malformed; not installed"
+    exit 1
+fi
+
+dir=$(dirname "$KEYS")
+mkdir -p "$dir"
+if [ -f "$KEYS" ] && awk -v key="$blob" '$1 == "ssh-ed25519" && $2 == key { found = 1 } END { exit !found }' "$KEYS"; then
+    say "launch key already authorized"
+    exit 0
+fi
+
+# Write a complete new file beside the old one and rename it into place, so a
+# crash mid-write cannot leave sshd a truncated list.
+#
+# Two separate opens, the second in append mode, and NOT `{ cat; echo; } > tmp`:
+# Akuma's fd table copies a descriptor by value across fork, so a child's writes
+# do not advance the parent's offset and the group form keeps only the last
+# writer's bytes (docs/reference/subsystems/fdtable.md, pinned divergence 1).
+tmp="$KEYS.new.$$"
+: > "$tmp" || { say "cannot write $tmp"; exit 1; }
+if [ -f "$KEYS" ]; then
+    cat "$KEYS" >> "$tmp" || { rm -f "$tmp"; say "cannot copy $KEYS"; exit 1; }
+    # An existing file without a final newline must not swallow the new key.
+    [ -n "$(tail -c 1 "$tmp")" ] && echo >> "$tmp"
+fi
+echo "$key" >> "$tmp" || { rm -f "$tmp"; say "cannot write $tmp"; exit 1; }
+chmod 600 "$tmp"
+mv "$tmp" "$KEYS" || { rm -f "$tmp"; say "cannot replace $KEYS"; exit 1; }
+say "launch key installed in $KEYS"
+exit 0
