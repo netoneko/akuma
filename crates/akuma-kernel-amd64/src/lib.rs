@@ -410,6 +410,11 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
             boot::apply_runtime_flags(cmdline);
             // The self-tests are over; their user-pointer bypass is closed for good.
             akuma_user_access::seal_bypass();
+            // Randomize every image from init on unless the boot line says
+            // `aslr=0`; off until here because the self-tests assert addresses.
+            akuma_primitives::aslr::set_enabled(
+                akuma_params::Params::new(akuma_params::line(), "").value("aslr") != Some("0"),
+            );
             usermode::run_init(init);
         }
     }

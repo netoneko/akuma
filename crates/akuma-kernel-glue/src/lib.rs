@@ -1740,6 +1740,14 @@ fn run_async_main() -> ! {
     // Every boot self-test has run. From here on user pointers are always
     // validated: the tests' bypass cannot be opened again.
     akuma_exec::process::user_access::seal_bypass();
+    // Address-space randomization for every program from init on, unless the
+    // boot line says `aslr=0`. Off until here on purpose: the self-tests above
+    // assert exact addresses (`akuma_primitives::aslr`).
+    let aslr = akuma_params::Params::new(akuma_params::line(), "").value("aslr") != Some("0");
+    akuma_primitives::aslr::set_enabled(aslr);
+    if !aslr {
+        console::print("[Main] aslr=0: address-space randomization is OFF\n");
+    }
 
     // Init: what `init=`/`initargs=` on the boot line name (`akuma_params::init`, the reader
     // amd64 uses too), and `herd daemon` when it names nothing, which is what this kernel has

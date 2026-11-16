@@ -209,7 +209,11 @@ pub fn setup_linux_stack<A: UserPages, S: AsRef<[u8]>>(
 /// Go tries up to 128 hints and panics with "out of memory".  At 512 KB the
 /// threshold sits safely between tiny C programs (< 200 KB) and the smallest
 /// possible Go binary (> 1 MB).
-fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
+/// The address range reserved for the dynamic linker above its base.
+const INTERP_SPAN: usize = 0x10_0000;
+
+fn compute_stack_top(brk: usize, interp_end: Option<usize>) -> usize {
+    let has_interp = interp_end.is_some();
     const DEFAULT: usize = 0x4000_0000; // 1 GB — for truly tiny static binaries
     const SMALL_STATIC_THRESHOLD: usize = 0x8_0000; // 512 KB
 
@@ -217,13 +221,14 @@ fn compute_stack_top(brk: usize, has_interp: bool) -> usize {
         return DEFAULT;
     }
 
-    const INTERP_END: usize = 0x3010_0000;
+    // Where the dynamic linker ends: 1 MiB past wherever it was loaded.
+    let interp_end_va = interp_end.unwrap_or(0);
     const MIN_MMAP_SPACE: usize = 0x20_0000_0000; // 128GB for large/dynamic binaries (JSC gigacage needs 128GB)
     const MAX_STACK_TOP: usize = 0x40_0000_0000; // 256GB — well within 48-bit VA (T0SZ=16)
 
     let base_mmap = (brk + 0x1000_0000) & !0xFFFF; // brk + 256MB gap
     let mmap_start = if has_interp {
-        core::cmp::max(base_mmap, INTERP_END)
+        core::cmp::max(base_mmap, interp_end_va)
     } else {
         base_mmap
     };
@@ -300,9 +305,14 @@ pub fn attach_stack<A: UserPages, S: AsRef<[u8]>>(
     stack_size: usize,
     hwcap: u64,
 ) -> Result<LoadedWithStack<A>, ElfError> {
-    let has_interp = loaded.interp.is_some();
-    let stack_top = stack_top.unwrap_or_else(|| compute_stack_top(loaded.brk, has_interp));
-    let mmap_floor = if has_interp { 0x3010_0000 } else { 0 };
+    // The interpreter's end (it is about 1 MiB) follows its randomized base.
+    let interp_end = loaded.interp.as_ref().map(|i| i.base_addr + INTERP_SPAN);
+    // A computed stack top slides down by up to 16 MiB in pages; a top the
+    // caller fixed (amd64 registers its lazy stack at a constant) stays put.
+    let stack_top = stack_top.unwrap_or_else(|| {
+        compute_stack_top(loaded.brk, interp_end) - akuma_primitives::aslr::slide(16 << 20, PAGE_SIZE)
+    });
+    let mmap_floor = interp_end.unwrap_or(0);
     let total_size = stack_size + PAGE_SIZE;
     let guard_page = (stack_top - total_size) & !(PAGE_SIZE - 1);
     let stack_bottom = guard_page + PAGE_SIZE;

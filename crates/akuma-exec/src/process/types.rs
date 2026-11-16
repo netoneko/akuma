@@ -59,8 +59,8 @@ impl Clone for ProcessMemory {
 impl ProcessMemory {
     pub fn new(code_end: usize, stack_bottom: usize, stack_top: usize, mmap_floor: usize) -> Self {
         let base = (code_end + 0x1000_0000) & !0xFFFF;
-        let mmap_start = core::cmp::max(base, mmap_floor);
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000);
+        let mmap_start = Self::slid_mmap_start(core::cmp::max(base, mmap_floor), mmap_limit);
 
         Self {
             code_end: AtomicUsize::new(code_end),
@@ -77,8 +77,8 @@ impl ProcessMemory {
     /// equivalent of `*self = ProcessMemory::new(…)`, minus the `&mut`.
     pub fn reset(&self, code_end: usize, stack_bottom: usize, stack_top: usize, mmap_floor: usize) {
         let base = (code_end + 0x1000_0000) & !0xFFFF;
-        let mmap_start = core::cmp::max(base, mmap_floor);
         let mmap_limit = stack_bottom.saturating_sub(0x10_0000);
+        let mmap_start = Self::slid_mmap_start(core::cmp::max(base, mmap_floor), mmap_limit);
         self.code_end.store(code_end, Ordering::Relaxed);
         self.brk.store(code_end, Ordering::Relaxed);
         self.stack_bottom.store(stack_bottom, Ordering::Relaxed);
@@ -86,6 +86,27 @@ impl ProcessMemory {
         self.next_mmap.store(mmap_start, Ordering::Relaxed);
         self.mmap_base.store(mmap_start, Ordering::Relaxed);
         self.mmap_limit.store(mmap_limit, Ordering::Relaxed);
+    }
+
+    /// Where the `mmap` area starts: `start`, moved up by a random multiple of
+    /// 64 KiB (`akuma_primitives::aslr`; `0` with `aslr=0` and during the boot
+    /// self-tests). The slide takes at most an eighth of the room below the
+    /// stack and at most 1 GiB, so a small address space keeps nearly all of
+    /// it. `place` keeps mappings out of the kernel hole wherever this lands.
+    fn slid_mmap_start(start: usize, limit: usize) -> usize {
+        if !akuma_primitives::aslr::enabled() {
+            return start;
+        }
+        // On AArch64 the kernel's identity map occupies the user half from
+        // 1 GiB up, and `place` moves anything that lands in it to its end. A
+        // start below or inside the hole would therefore end up at the hole's
+        // end whatever the slide was (measured: every dynamic program's first
+        // mapping at exactly 4 GiB on a 3 GiB machine). Start above it, when
+        // the area reaches that far, so the slide is the address.
+        let hole = Self::kernel_hole();
+        let start = if limit > hole.end && start < hole.end { hole.end } else { start };
+        let room = limit.saturating_sub(start);
+        start + akuma_primitives::aslr::slide(core::cmp::min(room / 8, 1 << 30), 0x1_0000)
     }
 
     pub fn overlaps_stack(&self, addr: usize, size: usize) -> bool {

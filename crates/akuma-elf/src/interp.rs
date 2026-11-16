@@ -107,6 +107,13 @@ fn load_interpreter<A: UserPages>(
         return Err(ElfError::InvalidFormat("Interpreter has no program headers"));
     }
 
+    // NOT randomized yet, unlike the program, the stack and the `mmap` area
+    // (`akuma_primitives::aslr`). The dynamic linker is also libc for every
+    // dynamically linked program, so this constant is a constant gadget set;
+    // but `fork_process` finds the interpreter's pages by scanning 2 MiB from
+    // this literal address (`akuma-exec`, both fork arms), so sliding it here
+    // alone would fork children with no dynamic linker mapped. Record the base
+    // in `ProcessMemory` and scan from that, then slide it.
     let base = INTERP_BASE;
     let entry_point = base + headers.ehdr.e_entry as usize;
 

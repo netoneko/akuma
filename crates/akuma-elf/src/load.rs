@@ -34,8 +34,22 @@ use super::types::{
     R_AARCH64_ABS64, R_AARCH64_GLOB_DAT, R_AARCH64_JUMP_SLOT, R_AARCH64_RELATIVE,
 };
 
-/// Static-PIE binaries have `p_vaddr` starting near 0; load them at a fixed base.
+/// Static-PIE binaries have `p_vaddr` starting near 0; load them from this base,
+/// plus [`pie_slide`].
 const PIE_BASE: usize = 0x1000_0000;
+
+/// How far a position-independent program may slide up from [`PIE_BASE`].
+///
+/// 64 MiB in 64 KiB steps (1024 positions). It cannot be much more on AArch64:
+/// the image has to end below the dynamic linker at `INTERP_BASE` (0x3000_0000),
+/// and the largest programs this runs are hundreds of megabytes.
+const PIE_SLIDE_SPAN: usize = 64 << 20;
+
+/// This load's slide for a position-independent program: `0` with `aslr=0`,
+/// during the boot self-tests, or with no entropy (`akuma_primitives::aslr`).
+fn pie_slide() -> usize {
+    akuma_primitives::aslr::slide(PIE_SLIDE_SPAN, 0x1_0000)
+}
 
 /// Result of loading an ELF binary
 pub struct LoadedElf<A: UserPages> {
@@ -173,7 +187,7 @@ fn load_image<A: UserPages>(
         return Err(ElfError::NotExecutable);
     }
 
-    let base = if is_pie { PIE_BASE } else { 0 };
+    let base = if is_pie { PIE_BASE + pie_slide() } else { 0 };
     let entry_point = base + ehdr.e_entry as usize;
 
     // Both strategies walk the segment list more than once; parse it once.
