@@ -5782,6 +5782,38 @@ mod state_transition_guard_tests {
         WAKE_TIMES[tid].store(0, Ordering::SeqCst);
         release_test_thread_slot(tid);
     }
+
+    /// `ThreadRef` packs (generation, slot) into one word that an atomic cell can hold (`OptTidCell`), so the packed form has
+    /// to round-trip, name the same slot, and never collide with the cell's `None` sentinel.
+    #[test]
+    fn a_thread_ref_round_trips_through_its_packed_word() {
+        crate::test_support::ensure_test_runtime();
+        let r = ThreadRef::of_live_tid(3);
+        assert_eq!(r.tid(), 3);
+        let back = ThreadRef::from_raw(r.raw());
+        assert_eq!(back, r);
+        assert_eq!(back.tid(), 3);
+        assert_ne!(r.raw(), u64::MAX, "u64::MAX is the OptTidCell's None");
+        assert!(r.is_current());
+    }
+
+    /// The property `OptTidCell::get_live` rests on: a reference minted before a slot's rebirth names the slot but is no
+    /// longer current afterwards, and a reference minted after is.
+    #[test]
+    fn a_thread_ref_minted_before_a_rebirth_is_not_current_after_it() {
+        crate::test_support::ensure_test_runtime();
+        let tid = claim_free_slot(38, 39).expect("slot 38 is this test's");
+        let before = ThreadRef::of_live_tid(tid);
+        release_test_thread_slot(tid);
+        let tid2 = claim_free_slot(38, 39).expect("re-claim of slot 38");
+        assert_eq!(tid, tid2);
+        let after = ThreadRef::of_live_tid(tid2);
+        assert_eq!(before.tid(), after.tid(), "same slot, different incarnation");
+        assert!(!before.is_current());
+        assert!(after.is_current());
+        assert_ne!(before, after);
+        release_test_thread_slot(tid);
+    }
 }
 
 /// Phase 7d: real-concurrency proof for `SyncContext`'s SAFETY comment above

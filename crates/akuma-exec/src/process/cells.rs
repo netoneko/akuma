@@ -218,3 +218,29 @@ impl StrCell {
         drop(old);
     }
 }
+
+#[cfg(test)]
+mod opt_tid_cell_tests {
+    use super::OptTidCell;
+
+    #[test]
+    fn get_and_get_live_agree_while_the_slot_has_not_been_reborn() {
+        let c = OptTidCell::new_live(Some(5));
+        assert_eq!(c.get(), Some(5));
+        assert_eq!(c.get_live(), Some(5));
+        c.set(None);
+        assert_eq!(c.get(), None);
+        assert_eq!(c.get_live(), None);
+        c.set(Some(7));
+        assert_eq!((c.get(), c.get_live()), (Some(7), Some(7)));
+    }
+
+    #[test]
+    fn a_cell_built_with_new_names_the_slot_and_is_live_for_a_never_recycled_slot() {
+        // `new` records generation 0, which is what a slot that never recycles carries.
+        let c = OptTidCell::new(Some(9));
+        assert_eq!(c.get(), Some(9));
+        assert_eq!(c.get_live(), Some(9));
+        assert_eq!(OptTidCell::new(None).get_live(), None);
+    }
+}

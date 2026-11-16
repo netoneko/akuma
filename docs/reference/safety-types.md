@@ -167,7 +167,10 @@ cannot be swapped with a length or an fd) and the call sites, not the arithmetic
   unreachable from the other, and after a fork every frame visible in two spaces is read-only, CoW-marked/counted ≥ 2, while an
   unrelated third process is untouched. These read page tables and frames; they do not execute a user read from a second
   process.
-- Host unit tests: `Errno`, `FileKey`, `Pages`, `IrqSpinlock`, `SpawnBox`, `munmap_len`, `mremap::plan`.
+- Host unit tests: `Errno` (incl. `from_negated`), `FileKey`, `Pages`/`PageRange`, `IrqSpinlock`, `SpawnBox`, `munmap_len`,
+  `mremap::plan`, `ThreadRef` (packed round trip; stale after a slot's rebirth) and `OptTidCell` (`get` vs `get_live`). The crates
+  above `akuma-mmu` build for the host since 2026-11-17 (`akuma-exec`: 112 of 114 pass; the two failures are old, see
+  `proposals/FUTURE_WORK.md` E3).
 
 How they were run: aarch64 under QEMU/TCG (`cargo build --release`, then `scripts/cargo_runner.sh` with `INSTANCE=10` so the
 host ports are unprivileged, and the active toolchain's `rust-objcopy` on `PATH`); amd64 under QEMU with KVM
