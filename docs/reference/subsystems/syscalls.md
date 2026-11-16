@@ -128,6 +128,15 @@ See [`../../runbooks/add-syscall-feature.md`](../../runbooks/add-syscall-feature
   structs. All safe `fn`s: they range-check, demand-page the range, then copy, so
   **a separate `validate_user_ptr` call is no longer needed** at a site that only
   copies. The syscall modules see them through `use super::*`.
+  - **The typed forms take `T: Pod`** (`akuma_pod`, re-exported as `akuma_user_access::Pod`):
+    integers, arrays, and structs admitted with `pod!(Name { field: Type, .. })`, which
+    checks at compile time that every field is `Pod` and that the fields tile the struct
+    with no padding. A wire struct needs explicit `_pad` fields; a C union becomes a
+    word array with setters (`akuma_threading::sigframe::SiFields`). The bound is the
+    whole guarantee that user bytes cannot become a `bool`, an enum or a reference, and
+    that no uninitialised kernel byte is copied out; **never widen it back to
+    `T: Copy`**, and never write an `unsafe impl Pod` outside `akuma-pod`
+    ([`UNSAFE_SITE_REDUCTION.md`](../../archive/UNSAFE_SITE_REDUCTION.md) §1).
   - **Inside a lock, or in an exception handler:** use the `*_with(..., Prefault::No)`
     forms. Prefaulting allocates frames, takes `as_lock` and can read a file, none
     of which may happen under an IRQ-masked spinlock or on the fault path.

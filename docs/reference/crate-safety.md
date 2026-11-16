@@ -1,9 +1,17 @@
 # Crate safety: which crates forbid `unsafe`
 
-**Grade: A** — regenerated 2026-11-13 with `python3 scripts/cloc_akuma.py src crates`:
-**106 of 144 crates** forbid `unsafe`. 126045 of 127201 production lines (99.1%) sit outside any
-`unsafe` block; 367 production sites across `crates/` (465 with tests), 0 inside enforced crates.
-The new one is `akuma-kernel-amd64`, the amd64 machine half, which went 37 -> 0 and now carries
+**Grade: A** — regenerated 2026-11-16 with `python3 scripts/cloc_akuma.py src crates`:
+**107 of 146 crates** forbid `unsafe`. 127459 of 128467 production lines (99.2%) sit outside any
+`unsafe` block; **329 production sites** across `crates/` (427 with tests), 0 inside enforced crates.
+367 -> 329 is a consolidation pass: where several blocks each vouched for the same fact, one checked
+primitive now does and the callers are safe (`akuma-trap-aarch64` 21 -> 6, `akuma-slot-table` 9 -> 4,
+`akuma-locks-rw-cell` 8 -> 4, `akuma-mmu-raw` 15 -> 11 through `akuma_phys::Frame`, ...). The one
+new crate, `akuma-pod` (6), is the `Pod` bound every typed user copy now takes: `T: Copy` had let
+user bytes become a `bool`, an enum or a reference, and let padding reach user space. Per-crate
+table and what is left: [`UNSAFE_SITE_REDUCTION.md`](../archive/UNSAFE_SITE_REDUCTION.md).
+
+The run before, 2026-11-13: **106 of 144 crates**, 126045 of 127201 production lines (99.1%), 367
+production sites (465 with tests). The new one then was `akuma-kernel-amd64`, the amd64 machine half, which went 37 -> 0 and now carries
 `#![cfg_attr(feature = "no-tests", forbid(unsafe_code))]`: the shipped image forbids it, and with
 the boot suite linked the lint is `deny`, with an `allow` on each of the six suite functions whose
 probes touch raw memory on purpose (20 test sites). `cloc_akuma.py` counts that form as a ban,

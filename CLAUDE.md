@@ -115,8 +115,8 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   `sysreg::set_tpidr_el0` (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md` §6). To time a code path use
   `sysreg::cntvct_el0_ordered()` — a bare counter read is unordered against the
   work it measures and once made an 8 KB copy measure as 0 ns.
-  **79 of the 108 carry `#![forbid(unsafe_code)]`** (2026-10-31) — which crates, and why the
-  other 29 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
+  **107 of the 146 carry `#![forbid(unsafe_code)]`** (2026-11-16; 329 production `unsafe` sites
+  tree-wide) — which crates, and why the other 39 cannot, is `docs/reference/crate-safety.md` (regenerate its numbers
   with `python3 scripts/cloc_akuma.py src crates`, never increment them by hand).
   **`src/syscall/` carries the ban too** (2026-08-31), as a module attribute in
   its `mod.rs` — the first one outside `crates/`, and the reason the crate tally
@@ -127,10 +127,19 @@ no editor and no cryptography (all removed 2026-08-10 — `docs/archive/BUILTIN_
   which is the point; put the operation behind a named function in the crate that
   owns what it pokes, and state the obligation there
   (`docs/archive/SYSCALL_UNSAFE_CLEANUP.md`).
+  `akuma-pod` is **what may cross the user boundary as bytes** (2026-11-16): the `Pod` trait
+  (every bit pattern valid, no padding) that every typed user copy takes —
+  `read_user_into`/`write_user_val`/`as_user_bytes{,_mut}`, `akuma-mmu`'s
+  `{read,write}_current_user_val`, amd64 `uaccess::{read,write}_val` — and the `pod!` macro that
+  admits a struct after checking at compile time that its fields are `Pod` and tile it exactly.
+  Zero dependencies, so the wire-struct crates can admit their own types, `forbid` and all.
+  **Never bound a user copy on `T: Copy`** (it let user bytes become a `bool` or a reference and
+  copied padding out) **and never write `unsafe impl Pod` outside it**
+  (`docs/archive/UNSAFE_SITE_REDUCTION.md`).
   The **syscall family** is three layers, leaf-first and named so the
   layering is visible — an ABI crate, a shape crate, and one crate per syscall
   family (four of those so far): `akuma-syscalls-linux` is the ABI (numbers, `repr(C)`
-  wire structs and their layout assertions, flag tables — zero dependencies);
+  wire structs and their layout assertions, flag tables — its one dependency is `akuma-pod`);
   `akuma-syscalls` is the *shape* of an excursion (which counter bucket, which
   hooks run, where the epilogue's identity comes from) and depends only on the
   ABI crate; `akuma-syscalls-time` is one syscall *family* implementation —
