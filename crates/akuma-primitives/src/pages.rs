@@ -10,7 +10,7 @@
 //! [`Pages`] is bounded by the 48-bit user address space, checked **once**, where a user length becomes a count.
 //! After that [`Pages::bytes`] is infallible.
 
-use crate::addr_types::PAGE_SIZE;
+use crate::addr_types::{PAGE_SIZE, VirtAddr};
 
 /// A number of 4 KiB pages no larger than the 48-bit user space.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -40,6 +40,61 @@ impl Pages {
     }
 }
 
+/// A page-aligned range of user addresses: the start is aligned, the page count is a [`Pages`], and the end does not pass
+/// the 48-bit space, all checked at construction. `end()` and `bytes()` are then infallible.
+///
+/// The architecture's own user limit (47 bits on amd64) is a narrower, per-kernel check the caller still makes against
+/// `end()`; this type only guarantees that the arithmetic cannot wrap.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PageRange {
+    start: VirtAddr,
+    pages: Pages,
+}
+
+impl PageRange {
+    /// `pages` pages from `start`; `None` if `start` is not page-aligned or the range would pass `2^48`.
+    #[must_use]
+    pub const fn new(start: VirtAddr, pages: Pages) -> Option<PageRange> {
+        if !start.is_page_aligned() {
+            return None;
+        }
+        match start.get().checked_add(pages.bytes()) {
+            Some(end) if end as u64 <= (1u64 << 48) => Some(PageRange { start, pages }),
+            _ => None,
+        }
+    }
+
+    /// The range a syscall's `(addr, len)` names: `addr` aligned, `len` rounded up to whole pages.
+    #[must_use]
+    pub const fn from_user(addr: usize, len: usize) -> Option<PageRange> {
+        match Pages::from_len_ceil(len) {
+            Some(p) => PageRange::new(VirtAddr::new(addr), p),
+            None => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn start(self) -> VirtAddr {
+        self.start
+    }
+
+    #[must_use]
+    pub const fn pages(self) -> Pages {
+        self.pages
+    }
+
+    #[must_use]
+    pub const fn bytes(self) -> usize {
+        self.pages.bytes()
+    }
+
+    /// One past the last byte. Cannot overflow: checked at construction.
+    #[must_use]
+    pub const fn end(self) -> usize {
+        self.start.get() + self.pages.bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +105,16 @@ mod tests {
         assert_eq!(Pages::from_len_ceil(1).map(Pages::bytes), Some(4096));
         assert_eq!(Pages::from_len_ceil(4096).map(Pages::bytes), Some(4096));
         assert_eq!(Pages::from_len_ceil(4097).map(Pages::bytes), Some(8192));
+    }
+
+    #[test]
+    fn page_range_checks_alignment_and_the_end() {
+        assert_eq!(PageRange::from_user(0x1000, 4097).map(PageRange::end), Some(0x3000));
+        assert!(PageRange::from_user(0x1001, 4096).is_none(), "unaligned start");
+        assert!(PageRange::from_user(usize::MAX - 4095, 4096).is_none(), "start + len wraps");
+        assert!(PageRange::from_user((1usize << 48) - 4096, 8192).is_none(), "passes the 48-bit space");
+        assert_eq!(PageRange::from_user((1usize << 48) - 4096, 4096).map(PageRange::end), Some(1usize << 48));
+        assert!(PageRange::from_user(0x1000, usize::MAX).is_none());
     }
 
     #[test]

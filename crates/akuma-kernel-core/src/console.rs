@@ -25,7 +25,6 @@ use akuma_dmesg::Ring;
 use alloc::vec::Vec;
 #[cfg(kernel_console_lock)]
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use spinning_top::Spinlock;
 
 // ============================================================================
 // Console history (`dmesg`)
@@ -64,7 +63,7 @@ const DMESG_CAP: usize = 64 * 1024;
 /// bytes. History is best-effort by construction: the console write itself
 /// always happens, and losing a few bytes of *replay* on a contended line is
 /// categorically better than losing the live output, or the machine.
-static DMESG: Spinlock<Ring<DMESG_CAP>> = Spinlock::new(Ring::new());
+static DMESG: akuma_irq_lock::IrqSpinlock<Ring<DMESG_CAP>> = akuma_irq_lock::IrqSpinlock::new(Ring::new());
 
 /// Tee `bytes` into the history ring. Never blocks; see [`DMESG`].
 #[inline]
@@ -120,7 +119,7 @@ pub fn dmesg_total() -> u64 {
 // check short-circuits the acquire instead of self-deadlocking. Background:
 // docs/archive/UART_SMP_INTERLEAVE_FIX.md.
 #[cfg(kernel_console_lock)]
-static CONSOLE_LOCK: Spinlock<()> = Spinlock::new(());
+static CONSOLE_LOCK: akuma_irq_lock::IrqSpinlock<()> = akuma_irq_lock::IrqSpinlock::new(());
 /// `current_core_id() + 1` of the lock holder, or 0 if free. Per-core
 /// reentrancy guard for the panic / sync-exception path.
 #[cfg(kernel_console_lock)]

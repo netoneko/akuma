@@ -43,7 +43,10 @@ pub fn plan(old_addr: usize, old_size: usize, new_size: usize, flags: u32, va_li
     if old_addr >= va_limit {
         return Plan::Fail(EFAULT);
     }
-    let old_pages = old_size.div_ceil(4096);
+    // `old_size` is user-chosen too: `old_addr + old_size.div_ceil(4096) * 4096` wrapped for a size near `usize::MAX`.
+    let Some(old_pages) = akuma_primitives::Pages::from_len_ceil(old_size).map(akuma_primitives::Pages::get) else {
+        return Plan::Fail(EINVAL);
+    };
     // `new_size` is user-chosen and unbounded: `new_pages * 4096` used to wrap to 0 for a size near `usize::MAX`, and
     // only the placer refusing a zero length turned that into `ENOMEM`.
     let Some(new_pages) = akuma_primitives::Pages::from_len_ceil(new_size).map(akuma_primitives::Pages::get) else {
@@ -110,6 +113,12 @@ mod tests {
     #[test]
     fn diverge_shrink_is_in_place_and_leaves_the_tail_mapped() {
         assert_eq!(plan(0x1000, 16 * 4096, 4096, MREMAP_MAYMOVE, VA_LIMIT), Plan::InPlace);
+    }
+
+    /// An `old_size` that no address space can hold is `EINVAL`, not a wrapped end address.
+    #[test]
+    fn an_old_size_past_the_address_space_is_einval() {
+        assert_eq!(plan(0x1000, usize::MAX, 4096, MREMAP_MAYMOVE, VA_LIMIT), Plan::Fail(EINVAL));
     }
 
     /// A `new_size` that no address space can hold is `ENOMEM`, not a wrapped page count.

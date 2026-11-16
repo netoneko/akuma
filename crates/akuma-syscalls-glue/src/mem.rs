@@ -460,8 +460,8 @@ pub(super) fn sys_mmap(addr: usize, len: usize, prot: u32, flags: u32, fd: i32, 
     if akuma_syscalls_mem::mmap::len_too_large(len, user_va_limit() as usize) {
         return ENOMEM;
     }
-    let pages = len.div_ceil(4096);
-    let byte_len = pages * 4096;
+    let Some(len_pages) = akuma_primitives::Pages::from_len_ceil(len) else { return ENOMEM };
+    let (pages, byte_len) = (len_pages.get(), len_pages.bytes());
     // The region's neutral record and the page table's AArch64 encoding — one
     // `u64` until 2026-09-06, two vocabularies since. See `akuma_mmap::types`.
     let page_prot = akuma_exec::mmu::Prot::from_prot(prot);
@@ -790,7 +790,8 @@ pub(super) fn sys_mremap(old_addr: usize, old_size: usize, new_size: usize, flag
         akuma_syscalls_mem::mremap::Plan::InPlace => return old_addr as u64,
         akuma_syscalls_mem::mremap::Plan::Grow { new_pages, may_move } => (new_pages, may_move),
     };
-    let old_end = old_addr + old_size.div_ceil(4096) * 4096;
+    // `plan` refused an `old_size` past the address space, so this cannot wrap.
+    let old_end = old_addr + akuma_primitives::Pages::from_len_ceil(old_size).map_or(old_size, akuma_primitives::Pages::bytes);
     let proc = current_owner();
     let _mm_window = MmBklGuard::new();
 
@@ -1281,12 +1282,14 @@ pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if addr & 0xFFF != 0 { return EINVAL; }
     if len == 0 { return 0; }
     // `len.div_ceil(4096) * 4096` wrapped to 0 for a length near `usize::MAX`: the call changed nothing and succeeded.
-    let Some(byte_len) = akuma_primitives::Pages::from_len_ceil(len).map(akuma_primitives::Pages::bytes) else {
+    // A `PageRange` cannot wrap; the kernel's own user limit is still checked against its end.
+    let Some(range) = akuma_primitives::PageRange::from_user(addr, len) else {
         return ENOMEM;
     };
-    let Some(end) = addr.checked_add(byte_len).filter(|e| *e <= akuma_exec::mmu::USER_VA_END) else {
+    let (byte_len, end) = (range.bytes(), range.end());
+    if end > akuma_exec::mmu::USER_VA_END {
         return EINVAL;
-    };
+    }
     let new_prot = akuma_exec::mmu::Prot::from_prot(prot);
     let current_pid = akuma_exec::process::read_current_pid().unwrap_or(0);
     let owner_pid = akuma_exec::process::lookup_process_shared(current_pid).map_or(current_pid, |p| p.tgid);
