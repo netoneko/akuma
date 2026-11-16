@@ -13603,15 +13603,15 @@ fn test_pipe_read_nonblock_returns_eagain() {
 
     // Empty pipe, writer still open: EAGAIN. Before the fix this call never
     // returned and the test suite hung here instead of failing.
-    let empty = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+    let empty = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
 
     // Data present: a normal short read, unaffected by O_NONBLOCK.
     let _ = pipe_write(pipe_id, b"hi");
-    let with_data = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+    let with_data = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
 
     // Writer gone: EOF (0), which must NOT be reported as EAGAIN.
     let _ = crate::syscall::fs::sys_close(fd_w);
-    let at_eof = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+    let at_eof = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
 
     let _ = crate::syscall::fs::sys_close(fd_r);
     unregister_thread_pid(tid);
@@ -13682,7 +13682,7 @@ fn test_epoll_pipe_eof_edge_after_partial_drain() {
 
     // 2. the watcher drains through the real syscall (this is what re-arms).
     let mut buf = [0u8; 16];
-    let drained = crate::syscall::fs::sys_read(u64::from(fd_r), buf.as_mut_ptr() as u64, buf.len());
+    let drained = crate::syscall::fs::sys_read(u64::from(fd_r), crate::syscall::UserAddr::new((buf.as_mut_ptr() as u64)), buf.len());
 
     // 3. drained with the writer still open -> genuinely nothing ready.
     let quiet = sys_epoll_pwait(epfd as u32, out.as_mut_ptr() as usize, 2, 0);

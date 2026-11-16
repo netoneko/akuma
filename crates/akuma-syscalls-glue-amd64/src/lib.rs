@@ -158,7 +158,7 @@ pub fn to_glue(call: Syscall, a: [u64; 6]) -> u64 {
 #[must_use]
 pub fn openat(dirfd: u64, path: u64, flags_x86: u64, mode: u64) -> u64 {
     let flags = akuma_syscalls_abi::open_flags::x86_64_to_aarch64(flags_x86 as u32);
-    glue::flat(glue::fs::sys_openat(dirfd as i32, path, flags, mode as u32))
+    glue::flat(glue::fs::sys_openat(dirfd as i32, akuma_syscalls_glue::UserAddr::new(path), flags, mode as u32))
 }
 
 /// Whether `fd` names a regular file in the caller's table (not a directory,
@@ -212,9 +212,9 @@ pub fn read(fd: u64, buf: u64, len: u64) -> u64 {
         return 0;
     }
     if len > MAX_IO && (is_regular_file(fd) || is_fill_device(fd)) {
-        return read_chunked(len, |done, n| glue::fs::sys_read(fd, buf + done, n));
+        return read_chunked(len, |done, n| glue::fs::sys_read(fd, akuma_syscalls_glue::UserAddr::new((buf + done)), n));
     }
-    glue::fs::sys_read(fd, buf, len.min(MAX_IO) as usize)
+    glue::fs::sys_read(fd, akuma_syscalls_glue::UserAddr::new(buf), len.min(MAX_IO) as usize)
 }
 
 /// `pread64(fd, buf, len, off)`: as [`read`], at an explicit offset.
@@ -225,16 +225,16 @@ pub fn pread64(fd: u64, buf: u64, len: u64, off: u64) -> u64 {
     }
     if len > MAX_IO && (is_regular_file(fd) || is_fill_device(fd)) {
         return read_chunked(len, |done, n| {
-            glue::fs::sys_pread64(fd as u32, buf + done, n, off.cast_signed().wrapping_add(done.cast_signed()))
+            glue::fs::sys_pread64(fd as u32, akuma_syscalls_glue::UserAddr::new((buf + done)), n, off.cast_signed().wrapping_add(done.cast_signed()))
         });
     }
-    glue::fs::sys_pread64(fd as u32, buf, len.min(MAX_IO) as usize, off.cast_signed())
+    glue::fs::sys_pread64(fd as u32, akuma_syscalls_glue::UserAddr::new(buf), len.min(MAX_IO) as usize, off.cast_signed())
 }
 
 /// `write(fd, buf, len)`: glue's arm, in the shape [`vectored`] takes.
 #[must_use]
 pub fn write(fd: u64, buf: u64, len: u64) -> u64 {
-    glue::fs::sys_write(fd, buf, len as usize)
+    glue::fs::sys_write(fd, akuma_syscalls_glue::UserAddr::new(buf), len as usize)
 }
 
 /// `readv`/`writev`: one `read`/`write` per non-empty `iovec`, stopping at the

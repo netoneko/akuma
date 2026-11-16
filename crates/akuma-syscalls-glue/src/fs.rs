@@ -122,7 +122,8 @@ pub(super) type DriverBklGuard = ToggledGuard<DriverBkl>;
 /// legitimately probe closed fds. See `docs/RUST_TOOLCHAIN.md`.
 static READ_EBADF_TRACE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
-fn trace_read_ebadf(reason: &str, fd: u64, buf_ptr: u64) {
+fn trace_read_ebadf(reason: &str, fd: u64, buf_ptr: UserAddr) {
+    let buf_ptr = buf_ptr.get();
     use core::sync::atomic::Ordering;
     if READ_EBADF_TRACE.fetch_add(1, Ordering::Relaxed) < 32 {
         let pid = akuma_exec::process::read_current_pid().unwrap_or(0);
@@ -341,7 +342,8 @@ fn user_bounce(len: usize) -> Option<Vec<u8>> {
 /// Fill `count` bytes at `buf_ptr` from `source`, one page at a time, and
 /// return `count`: `/dev/zero` and `/dev/urandom`, which answer in full however
 /// much is asked (`dd bs=1M` depends on it) without a kernel buffer that size.
-fn fill_user(buf_ptr: u64, count: usize, mut source: impl FnMut(&mut [u8]) -> bool) -> u64 {
+fn fill_user(buf_ptr: UserAddr, count: usize, mut source: impl FnMut(&mut [u8]) -> bool) -> u64 {
+    let buf_ptr = buf_ptr.get();
     let Some(mut page) = user_bounce(count.min(4096)) else { return ENOMEM };
     let mut done = 0usize;
     while done < count {
@@ -357,7 +359,8 @@ fn fill_user(buf_ptr: u64, count: usize, mut source: impl FnMut(&mut [u8]) -> bo
     count as u64
 }
 
-pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+pub fn sys_read(fd_num: u64, buf_ptr: UserAddr, count: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     // Per-stage fixed-cost attribution (`read-profile`; ZST otherwise). Created
     // before the first line of real work and committed only on the `File` arm —
     // see `crate::utils::read_profile`.
@@ -387,11 +390,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     // be reached after a park. See BKL_PHASE7F_OPTOUT_LIST.md §4.2.
     let (pid, fd) = {
         let Some(proc) = akuma_exec::process::current_process_shared() else {
-            trace_read_ebadf("no-current-process", fd_num, buf_ptr);
+            trace_read_ebadf("no-current-process", fd_num, UserAddr::new(buf_ptr));
             return EBADF;
         };
         let Some(fd) = proc.get_fd(fd_num as u32) else {
-            trace_read_ebadf("fd-not-in-table", fd_num, buf_ptr);
+            trace_read_ebadf("fd-not-in-table", fd_num, UserAddr::new(buf_ptr));
             return EBADF;
         };
         (proc.pid, fd)
@@ -732,7 +735,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
             // discipline as the `File` arm above, since it's the same
             // underlying disk I/O `akuma_vfs_glue::ext2` drives.
             let _vfs_bkl = VfsBklGuard::new();
-            match blockdev_read_at(idx, pos, buf_ptr, count) {
+            match blockdev_read_at(idx, pos, UserAddr::new(buf_ptr), count) {
                 Ok(n) => {
                     if n > 0
                         && let Some(proc) = akuma_exec::process::current_process_shared()
@@ -975,11 +978,11 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevZero => {
             // /dev/zero: fill the user buffer with zero bytes and return count.
-            fill_user(buf_ptr, count, |_| true)
+            fill_user(UserAddr::new(buf_ptr), count, |_| true)
         }
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let _drv_bkl = DriverBklGuard::new();
-            fill_user(buf_ptr, count, dev_urandom_fill)
+            fill_user(UserAddr::new(buf_ptr), count, dev_urandom_fill)
         }
         #[cfg(feature = "rump")]
         akuma_exec::process::FileDescriptor::Tap { nonblock } => {
@@ -1027,7 +1030,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
         // reading its CLOEXEC handshake pipe should never land here; if it does,
         // it points at a wrong-direction/wrong-type fd (see RUST_TOOLCHAIN.md §4).
         other => {
-            trace_read_ebadf("fd-type-not-readable", fd_num, buf_ptr);
+            trace_read_ebadf("fd-type-not-readable", fd_num, UserAddr::new(buf_ptr));
             let _ = other;
             EBADF
         }
@@ -1041,7 +1044,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
 /// reading is `EBADF`, as on Linux (`userspace/forktest/c_stress/fdrefuse.c`).
 /// `pub` since amd64's `pread64` delegates to it, behind the one answer that
 /// kernel keeps: its unbound console descriptors, which are not in the table.
-pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
+pub fn sys_pread64(fd_num: u32, buf_ptr: UserAddr, count: usize, offset: i64) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
@@ -1086,11 +1090,11 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
         }
         akuma_exec::process::FileDescriptor::DevNull => 0,
         akuma_exec::process::FileDescriptor::DevZero => {
-            fill_user(buf_ptr, count, |_| true)
+            fill_user(UserAddr::new(buf_ptr), count, |_| true)
         }
         akuma_exec::process::FileDescriptor::DevUrandom => {
             let _drv_bkl = DriverBklGuard::new();
-            fill_user(buf_ptr, count, dev_urandom_fill)
+            fill_user(UserAddr::new(buf_ptr), count, dev_urandom_fill)
         }
         akuma_exec::process::FileDescriptor::TimerFd(_) => EAGAIN,
         akuma_exec::process::FileDescriptor::EpollFd(_) => EINVAL,
@@ -1098,7 +1102,7 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
         // read at it.
         akuma_exec::process::FileDescriptor::BlockDev { idx, .. } => {
             let _vfs_bkl = VfsBklGuard::new();
-            blockdev_read_at(idx, offset as u64, buf_ptr, count).map_or_else(|e| e.ret(), |n| n as u64)
+            blockdev_read_at(idx, offset as u64, UserAddr::new(buf_ptr), count).map_or_else(|e| e.ret(), |n| n as u64)
         }
         _ => ESPIPE
     }
@@ -1108,7 +1112,8 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 
 /// or past its end (`dd` reading off the end). The caller holds the VFS BKL: this
 /// is the disk I/O `akuma_vfs_glue::ext2` drives (`docs/archive/RAW_BLOCK_DEVICE_FD.md`).
 /// The bounce buffer is allocated fallibly (`ENOMEM`).
-fn blockdev_read_at(idx: u32, pos: u64, buf_ptr: u64, count: usize) -> Result<usize, Errno> {
+fn blockdev_read_at(idx: u32, pos: u64, buf_ptr: UserAddr, count: usize) -> Result<usize, Errno> {
+    let buf_ptr = buf_ptr.get();
     let capacity = akuma_virtio::block::with_device_at(idx as usize, |d| d.capacity_bytes()).unwrap_or(0);
     if pos >= capacity {
         return Ok(0);
@@ -1135,7 +1140,8 @@ fn blockdev_write_at(idx: u32, pos: u64, data: &[u8]) -> Result<usize, Errno> {
 }
 
 /// `pwrite64(fd, buf, count, offset)`: the refusals of [`sys_pread64`], for writing.
-pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64) -> u64 {
+pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: UserAddr, count: usize, offset: i64) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if offset < 0 { return EINVAL; }
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
@@ -1198,7 +1204,8 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: u64, count: usize, offset: i64)
 /// `Stdout`/`Stderr` arm writes through a `ProcessChannel`, and no process on
 /// that target has one) and the `O_ACCMODE` refusal the `File` arm below does
 /// **not** make.
-pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
+pub fn sys_write(fd_num: u64, buf_ptr: UserAddr, count: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if !validate_user_ptr(buf_ptr, count) { return EFAULT; }
     // Scoped for the same reason as `sys_read`'s: the Stdout/pipe/unix arms below park in
     // `schedule_blocking(u64::MAX)` inside the per-chunk loop, and a `&'static Process`
@@ -1629,7 +1636,8 @@ pub fn sys_write(fd_num: u64, buf_ptr: u64, count: usize) -> u64 {
     total_written as u64
 }
 
-pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+pub(super) fn sys_readv(fd_num: u64, iov_ptr: UserAddr, iov_cnt: usize) -> u64 {
+    let iov_ptr = iov_ptr.get();
     let iov_size = iov_cnt * core::mem::size_of::<IoVec>();
     if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
     
@@ -1641,7 +1649,7 @@ pub(super) fn sys_readv(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     let mut total_read: u64 = 0;
     for iov in kernel_iovs.iter().take(iov_cnt) {
         if iov.iov_len == 0 { continue; }
-        let n = sys_read(fd_num, iov.iov_base, iov.iov_len);
+        let n = sys_read(fd_num, UserAddr::new(iov.iov_base), iov.iov_len);
         if (n as i64) < 0 {
             if total_read == 0 { return n; }
             break;
@@ -1701,7 +1709,8 @@ pub fn run_writev_short_write_tests() {
     akuma_primitives::console::print_str("[Test] writev_stops_at_short_write PASSED\n");
 }
 
-pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
+pub(super) fn sys_writev(fd_num: u64, iov_ptr: UserAddr, iov_cnt: usize) -> u64 {
+    let iov_ptr = iov_ptr.get();
     let iov_size = iov_cnt * core::mem::size_of::<IoVec>();
     if !validate_user_ptr(iov_ptr, iov_size) { return EFAULT; }
     
@@ -1713,7 +1722,7 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
     let mut total_written: u64 = 0;
     for iov in kernel_iovs.iter().take(iov_cnt) {
         if iov.iov_len == 0 { continue; }
-        let written = sys_write(fd_num, iov.iov_base, iov.iov_len);
+        let written = sys_write(fd_num, UserAddr::new(iov.iov_base), iov.iov_len);
         if (written as i64) < 0 {
             if total_written == 0 { return written; }
             break;
@@ -1737,7 +1746,8 @@ pub(super) fn sys_writev(fd_num: u64, iov_ptr: u64, iov_cnt: usize) -> u64 {
 /// [`writev_stops_after`]). The difference here is that the offset advances by
 /// what was actually transferred rather than by the file position, so each
 /// chunk lands where the caller asked.
-fn pvec_at(fd_num: u64, iov_ptr: u64, iov_cnt: usize, offset: i64, write: bool) -> u64 {
+fn pvec_at(fd_num: u64, iov_ptr: UserAddr, iov_cnt: usize, offset: i64, write: bool) -> u64 {
+    let iov_ptr = iov_ptr.get();
     if offset < 0 {
         return EINVAL;
     }
@@ -1760,9 +1770,9 @@ fn pvec_at(fd_num: u64, iov_ptr: u64, iov_cnt: usize, offset: i64, write: bool) 
             continue;
         }
         let n = if write {
-            sys_pwrite64(fd_num as u32, iov.iov_base, iov.iov_len, at)
+            sys_pwrite64(fd_num as u32, UserAddr::new(iov.iov_base), iov.iov_len, at)
         } else {
-            sys_pread64(fd_num as u32, iov.iov_base, iov.iov_len, at)
+            sys_pread64(fd_num as u32, UserAddr::new(iov.iov_base), iov.iov_len, at)
         };
         if (n as i64) < 0 {
             // Report the error only if nothing has moved yet; otherwise the
@@ -1818,27 +1828,29 @@ const RWF_NOAPPEND: u32 = 0x20;
 /// argument" and stop a caller from retrying without the flag.
 pub(super) fn sys_pvec2(
     fd_num: u64,
-    iov_ptr: u64,
+    iov_ptr: UserAddr,
     iov_cnt: usize,
     pos_l: u64,
     flags: u32,
     write: bool,
 ) -> u64 {
+    let iov_ptr = iov_ptr.get();
     if flags & !RWF_NOAPPEND != 0 {
         return EOPNOTSUPP;
     }
     // -1 means "use the file position", which is exactly readv/writev.
     if pos_l as i64 == -1 {
         return if write {
-            sys_writev(fd_num, iov_ptr, iov_cnt)
+            sys_writev(fd_num, UserAddr::new(iov_ptr), iov_cnt)
         } else {
-            sys_readv(fd_num, iov_ptr, iov_cnt)
+            sys_readv(fd_num, UserAddr::new(iov_ptr), iov_cnt)
         };
     }
-    pvec_at(fd_num, iov_ptr, iov_cnt, pos_l as i64, write)
+    pvec_at(fd_num, UserAddr::new(iov_ptr), iov_cnt, pos_l as i64, write)
 }
 
-pub fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
+pub fn sys_fstatfs(fd: u32, buf_ptr: UserAddr) -> u64 {
+    let buf_ptr = buf_ptr.get();
     // Resolve the fd's path to the mount it sits on and report that mount's
     // real statistics. Before 2026-08-24 this returned hardcoded fiction
     // (f_type=0xEF53, 65536 blocks) for every fd, so `df`-style tools sized
@@ -1854,7 +1866,7 @@ pub fn sys_fstatfs(fd: u32, buf_ptr: u64) -> u64 {
     };
     let path = fd_path.unwrap_or_else(|| String::from("/"));
     match akuma_vfs_glue::stats_for_path(&path) {
-        Ok(view) => statfs_into(&view, buf_ptr),
+        Ok(view) => statfs_into(&view, UserAddr::new(buf_ptr)),
         Err(e) => fs_error_to_errno(e).ret(),
     }
 }
@@ -1876,7 +1888,8 @@ fn fs_magic(name: &str) -> i64 {
 /// Shared `statfs`/`fstatfs` writer: resolve a path to its mount's real
 /// statistics (the old `fstatfs` returned hardcoded fiction for every fd —
 /// `docs/archive/MOUNT_MISSING_SYSCALLS.md` §3.2).
-pub(super) fn statfs_into(view: &akuma_vfs_glue::FsView, buf_ptr: u64) -> u64 {
+pub(super) fn statfs_into(view: &akuma_vfs_glue::FsView, buf_ptr: UserAddr) -> u64 {
+    let buf_ptr = buf_ptr.get();
     // The `120` was a literal beside a function-local struct nothing could
     // check it against; it is `size_of::<Statfs>()` now, asserted in
     // `akuma-syscalls-linux`.
@@ -1907,10 +1920,12 @@ pub(super) fn statfs_into(view: &akuma_vfs_glue::FsView, buf_ptr: u64) -> u64 {
 /// `statfs(2)` (nr 43) — resolve `path` the way file operations do and report
 /// the mount it lands on. Undispatched before 2026-08-24, which is what broke
 /// busybox `df`.
-pub fn sys_statfs(path_ptr: u64, buf_ptr: u64) -> SysResult {
+pub fn sys_statfs(path_ptr: UserAddr, buf_ptr: UserAddr) -> SysResult {
+    let path_ptr = path_ptr.get();
+    let buf_ptr = buf_ptr.get();
     let path = copy_from_user_str(path_ptr, 256)?;
     match akuma_vfs_glue::stats_for_path(&path) {
-        Ok(view) => Ok(statfs_into(&view, buf_ptr)),
+        Ok(view) => Ok(statfs_into(&view, UserAddr::new(buf_ptr))),
         Err(e) => Err(fs_error_to_errno(e)),
     }
 }
@@ -2060,7 +2075,8 @@ fn own_proc_fd_number(path: &str) -> Option<u32> {
     tail.parse().ok()
 }
 
-pub fn sys_openat(dirfd: i32, path_ptr: u64, flags: u32, mode: u32) -> SysResult {
+pub fn sys_openat(dirfd: i32, path_ptr: UserAddr, flags: u32, mode: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
     let raw_path = copy_from_user_str(path_ptr, 1024)?;
     openat_path(dirfd, &raw_path, flags, mode)
 }
@@ -2878,7 +2894,8 @@ akuma_exec::process::FileDescriptor::RumpSocket { .. }) => {
     if res == 0 { Ok(stat) } else { Err(errno_of(res)) }
 }
 
-pub(super) fn sys_fstat(fd: u32, stat_ptr: u64) -> u64 {
+pub(super) fn sys_fstat(fd: u32, stat_ptr: UserAddr) -> u64 {
+    let stat_ptr = stat_ptr.get();
     if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
     match fstat_fill(fd) {
         Ok(stat) => {
@@ -2995,7 +3012,9 @@ pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, Errno
     if res == 0 { Ok(stat) } else { Err(errno_of(res)) }
 }
 
-pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: u64, stat_ptr: u64, flags: u32) -> SysResult {
+pub(super) fn sys_newfstatat(dirfd: i32, path_ptr: UserAddr, stat_ptr: UserAddr, flags: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
+    let stat_ptr = stat_ptr.get();
     const AT_EMPTY_PATH: u32 = 0x1000;
     let path = copy_from_user_str(path_ptr, 512)?;
     if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return Err(Errno::EFAULT); }
@@ -3056,7 +3075,8 @@ fn chown_id(raw: u64) -> Option<u32> {
 
 /// `fchownat(dirfd, path, uid, gid, flags)`. `AT_SYMLINK_NOFOLLOW` changes the
 /// link itself (`lchown`); `AT_EMPTY_PATH` with an empty path is `fchown`.
-pub(super) fn sys_fchownat(dirfd: i32, path_ptr: u64, uid: u64, gid: u64, flags: u32) -> SysResult {
+pub(super) fn sys_fchownat(dirfd: i32, path_ptr: UserAddr, uid: u64, gid: u64, flags: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
     use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
     if flags & !(AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) != 0 {
         return Err(Errno::EINVAL);
@@ -3101,7 +3121,8 @@ pub(super) fn sys_fchown(fd: u32, uid: u64, gid: u64) -> u64 {
     }
 }
 
-pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
+pub(super) fn sys_fchmodat(dirfd: i32, path_ptr: UserAddr, mode: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
     let raw_path = copy_from_user_str(path_ptr, 512)?;
 
     // Build the dirfd-relative base path (fd-table lookup only, no disk I/O) before
@@ -3246,7 +3267,8 @@ fn fsync_fd(fd: u32) -> u64 {
     }
 }
 
-pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
+pub(super) fn sys_truncate(path_ptr: UserAddr, length: i64) -> SysResult {
+    let path_ptr = path_ptr.get();
     let path = copy_from_user_str(path_ptr, 512)?;
     let resolved = if path.starts_with('/') {
         path
@@ -3262,7 +3284,9 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
     }
 }
 
-pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64) -> SysResult {
+pub fn sys_statx(dirfd: i32, path_ptr: UserAddr, flags: u32, _mask: u32, buf_ptr: UserAddr) -> SysResult {
+    let path_ptr = path_ptr.get();
+    let buf_ptr = buf_ptr.get();
     // Early-out before any fs work; the copy at the end validates again for real. Sized
     // from the struct so the two can no longer disagree.
     if !validate_user_ptr(buf_ptr, core::mem::size_of::<Statx>()) { return Err(Errno::EFAULT); }
@@ -3399,7 +3423,9 @@ pub fn sys_statx(dirfd: i32, path_ptr: u64, flags: u32, _mask: u32, buf_ptr: u64
 ///
 /// Reporting `ENOSYS` instead would be the honest alternative, and it is worse:
 /// it puts `touch` back to failing outright, which is the state this replaces.
-pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> SysResult {
+pub fn sys_utimensat(dirfd: i32, path_ptr: UserAddr, times_ptr: UserAddr, flags: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
+    let times_ptr = times_ptr.get();
     use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_NOFOLLOW};
     use akuma_syscalls_linux::flags::utimensat::{UTIME_NOW, UTIME_OMIT};
 
@@ -3505,7 +3531,8 @@ pub fn sys_utimensat(dirfd: i32, path_ptr: u64, times_ptr: u64, flags: u32) -> S
 /// `open`/`execve` would make. Real ids and effective ids are one value here,
 /// so `AT_EACCESS` changes nothing. Until 2026-10-14 `mode` was ignored and
 /// every existing path was "accessible".
-pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: u32, _flags: u32) -> SysResult {
+pub fn sys_faccessat2(dirfd: i32, path_ptr: UserAddr, mode: u32, _flags: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
     let path = copy_from_user_str(path_ptr, 512)?;
     
     let resolved_path = resolve_path_at(dirfd, &path)?;
@@ -3524,7 +3551,8 @@ pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: u32, _flags: u32) -> SysR
     }
 }
 
-pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
+pub(super) fn sys_getcwd(buf_ptr: UserAddr, size: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if !validate_user_ptr(buf_ptr, size) { return EFAULT; }
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let cwd = proc.cwd.get();
@@ -3648,7 +3676,8 @@ pub fn sys_fcntl(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 }
 
-pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
+pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: UserAddr, mode: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
     let raw_path = copy_from_user_str(path_ptr, 512)?;
     let raw_path = expand_own_proc_fd_prefix(&raw_path).unwrap_or(raw_path);
 
@@ -3691,7 +3720,8 @@ pub(super) fn sys_mkdirat(dirfd: i32, path_ptr: u64, mode: u32) -> SysResult {
     }
 }
 
-pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> SysResult {
+pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: UserAddr, flags: u32) -> SysResult {
+    let path_ptr = path_ptr.get();
     let path = copy_from_user_str(path_ptr, 512)?;
     let path = expand_own_proc_fd_prefix(&path).unwrap_or(path);
 
@@ -3744,7 +3774,9 @@ pub(super) fn sys_unlinkat(dirfd: i32, path_ptr: u64, flags: u32) -> SysResult {
     }
 }
 
-pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64) -> SysResult {
+pub(super) fn sys_renameat(olddirfd: i32, oldpath_ptr: UserAddr, newdirfd: i32, newpath_ptr: UserAddr) -> SysResult {
+    let oldpath_ptr = oldpath_ptr.get();
+    let newpath_ptr = newpath_ptr.get();
     let raw_old = copy_from_user_str(oldpath_ptr, 512)?;
     let raw_new = copy_from_user_str(newpath_ptr, 512)?;
 
@@ -3781,7 +3813,9 @@ fn check_rename(oldpath: &str, newpath: &str) -> Result<(), Errno> {
 const RENAME_NOREPLACE: u32 = 1;
 const RENAME_EXCHANGE: u32 = 2;
 
-pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> SysResult {
+pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: UserAddr, newdirfd: i32, newpath_ptr: UserAddr, flags: u32) -> SysResult {
+    let oldpath_ptr = oldpath_ptr.get();
+    let newpath_ptr = newpath_ptr.get();
     if flags & !(RENAME_NOREPLACE | RENAME_EXCHANGE) != 0 {
         return Err(Errno::EINVAL);
     }
@@ -3814,7 +3848,9 @@ pub(super) fn sys_renameat2(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newp
     }
 }
 
-pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -> SysResult {
+pub(super) fn sys_symlinkat(target_ptr: UserAddr, newdirfd: i32, linkpath_ptr: UserAddr) -> SysResult {
+    let target_ptr = target_ptr.get();
+    let linkpath_ptr = linkpath_ptr.get();
     let target = copy_from_user_str(target_ptr, 1024)?;
     let raw_link = copy_from_user_str(linkpath_ptr, 1024)?;
     let link_path = resolve_path_at(newdirfd, &raw_link)?;
@@ -3844,7 +3880,9 @@ pub(super) fn sys_symlinkat(target_ptr: u64, newdirfd: i32, linkpath_ptr: u64) -
 /// `oldpath` is not followed unless `AT_SYMLINK_FOLLOW` is set (Linux's
 /// default: a link to a symlink names the symlink). `AT_EMPTY_PATH` with an
 /// empty `oldpath` links the file `olddirfd` refers to.
-pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath_ptr: u64, flags: u32) -> SysResult {
+pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: UserAddr, newdirfd: i32, newpath_ptr: UserAddr, flags: u32) -> SysResult {
+    let oldpath_ptr = oldpath_ptr.get();
+    let newpath_ptr = newpath_ptr.get();
     use akuma_syscalls_linux::flags::at::{AT_EMPTY_PATH, AT_SYMLINK_FOLLOW};
     if flags & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
         return Err(Errno::EINVAL);
@@ -3885,7 +3923,9 @@ pub(super) fn sys_linkat(olddirfd: i32, oldpath_ptr: u64, newdirfd: i32, newpath
     }
 }
 
-pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: u64, buf_ptr: u64, bufsize: usize) -> SysResult {
+pub(super) fn sys_readlinkat(dirfd: i32, path_ptr: UserAddr, buf_ptr: UserAddr, bufsize: usize) -> SysResult {
+    let path_ptr = path_ptr.get();
+    let buf_ptr = buf_ptr.get();
     let raw_path = copy_from_user_str(path_ptr, 1024)?;
     let path = resolve_path_at(dirfd, &raw_path)?;
 
@@ -3951,7 +3991,8 @@ fn getdents_step(
 /// `pub` since the amd64 kernel forwards to it (4b batch 3a) — the dispatcher
 /// there hands the syscall to [`crate::handle_syscall`], and the forward exists
 /// for that kernel's own self-tests, which call it by name.
-pub fn sys_getdents64(fd: u32, ptr: u64, size: usize) -> u64 {
+pub fn sys_getdents64(fd: u32, ptr: UserAddr, size: usize) -> u64 {
+    let ptr = ptr.get();
     if !validate_user_ptr(ptr, size) { return EFAULT; }
     // Clamped rather than trusted, and the clamp is *below* the validation so
     // a caller with a partly-unmapped buffer still gets `EFAULT` for the range
@@ -4124,7 +4165,8 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
 /// there are no capabilities, only uid 0. The caller this exists for — OpenSSH's
 /// privilege-separation child: `chroot("/var/empty"); chdir("/"); setuid(sshd)` —
 /// needs none of that.
-pub(super) fn sys_chroot(ptr: u64) -> SysResult {
+pub(super) fn sys_chroot(ptr: UserAddr) -> SysResult {
+    let ptr = ptr.get();
     if !akuma_exec::process::current_creds().is_root() {
         return Err(Errno::EPERM);
     }
@@ -4145,7 +4187,8 @@ pub(super) fn sys_chroot(ptr: u64) -> SysResult {
     Ok(0)
 }
 
-pub(super) fn sys_chdir(ptr: u64) -> SysResult {
+pub(super) fn sys_chdir(ptr: UserAddr) -> SysResult {
+    let ptr = ptr.get();
     let path = copy_from_user_str(ptr, 512)?;
     
     if let Some(proc) = akuma_exec::process::current_process_shared() {

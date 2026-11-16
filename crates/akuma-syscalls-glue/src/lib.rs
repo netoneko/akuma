@@ -731,21 +731,21 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             proc::sys_exit(code);
             akuma_exec::process::return_to_kernel(code)
         }
-        nr::READ => fs::sys_read(args[0], args[1], args[2] as usize),
-        nr::WRITE => fs::sys_write(args[0], args[1], args[2] as usize),
-        nr::READV => fs::sys_readv(args[0], args[1], args[2] as usize),
-        nr::WRITEV => fs::sys_writev(args[0], args[1], args[2] as usize),
+        nr::READ => fs::sys_read(args[0], UserAddr::new(args[1]), args[2] as usize),
+        nr::WRITE => fs::sys_write(args[0], UserAddr::new(args[1]), args[2] as usize),
+        nr::READV => fs::sys_readv(args[0], UserAddr::new(args[1]), args[2] as usize),
+        nr::WRITEV => fs::sys_writev(args[0], UserAddr::new(args[1]), args[2] as usize),
         nr::IOCTL => term::sys_ioctl(args[0] as u32, args[1] as u32, args[2]),
         nr::DUP => fs::sys_dup(args[0] as u32),
-         nr::FSTATFS => fs::sys_fstatfs(args[0] as u32, args[1]),
-         nr::STATFS => flat(fs::sys_statfs(args[0], args[1])),
+         nr::FSTATFS => fs::sys_fstatfs(args[0] as u32, UserAddr::new(args[1])),
+         nr::STATFS => flat(fs::sys_statfs(UserAddr::new(args[0]), UserAddr::new(args[1]))),
         nr::DUP3 => fs::sys_dup3(args[0] as u32, args[1] as u32, args[2] as u32),
         nr::PIPE2 => pipe::sys_pipe2(args[0], args[1] as u32),
         nr::BRK => mem::sys_brk(args[0] as usize),
-        nr::OPENAT => flat(fs::sys_openat(args[0] as i32, args[1], args[2] as u32, args[3] as u32)),
+        nr::OPENAT => flat(fs::sys_openat(args[0] as i32, UserAddr::new(args[1]), args[2] as u32, args[3] as u32)),
         nr::CLOSE => fs::sys_close(args[0] as u32),
         nr::LSEEK => fs::sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
-        nr::FSTAT => fs::sys_fstat(args[0] as u32, args[1]),
+        nr::FSTAT => fs::sys_fstat(args[0] as u32, UserAddr::new(args[1])),
         nr::NANOSLEEP => time::sys_nanosleep(args[0], args[1]),
         nr::CLOCK_NANOSLEEP => time::sys_clock_nanosleep(args[0] as u32, args[1] as i32, UserAddr::new(args[2]), UserAddr::new(args[3])),
         // AF_INET socket ops. In a rump box these never reach here (the rump proxy
@@ -804,17 +804,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RESOLVE_HOST => net::sys_resolve_host(UserAddr::new(args[0]), args[1] as usize, UserAddr::new(args[2])),
         #[cfg(all(feature = "akuma-native", not(feature = "smoltcp")))]
         nr::RESOLVE_HOST => net_enetdown(),
-        nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as usize),
+        nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, UserAddr::new(args[1]), args[2] as usize),
         nr::PSELECT6 => flat(poll::sys_pselect6(args[0] as usize, args[1], args[2], args[3], args[4], args[5])),
         nr::PPOLL => flat(poll::sys_ppoll(args[0], args[1] as usize, args[2], args[3])),
-        nr::MKDIRAT => flat(fs::sys_mkdirat(args[0] as i32, args[1], args[2] as u32)),
-        nr::UNLINKAT => flat(fs::sys_unlinkat(args[0] as i32, args[1], args[2] as u32)),
-        nr::SYMLINKAT => flat(fs::sys_symlinkat(args[0], args[1] as i32, args[2])),
-        nr::LINKAT => flat(fs::sys_linkat(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32)),
-        nr::RENAMEAT => flat(fs::sys_renameat(args[0] as i32, args[1], args[2] as i32, args[3])),
-        nr::RENAMEAT2 => flat(fs::sys_renameat2(args[0] as i32, args[1], args[2] as i32, args[3], args[4] as u32)),
-        nr::STATX => flat(fs::sys_statx(args[0] as i32, args[1], args[2] as u32, args[3] as u32, args[4])),
-        nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, args[1], args[2], args[3] as usize)),
+        nr::MKDIRAT => flat(fs::sys_mkdirat(args[0] as i32, UserAddr::new(args[1]), args[2] as u32)),
+        nr::UNLINKAT => flat(fs::sys_unlinkat(args[0] as i32, UserAddr::new(args[1]), args[2] as u32)),
+        nr::SYMLINKAT => flat(fs::sys_symlinkat(UserAddr::new(args[0]), args[1] as i32, UserAddr::new(args[2]))),
+        nr::LINKAT => flat(fs::sys_linkat(args[0] as i32, UserAddr::new(args[1]), args[2] as i32, UserAddr::new(args[3]), args[4] as u32)),
+        nr::RENAMEAT => flat(fs::sys_renameat(args[0] as i32, UserAddr::new(args[1]), args[2] as i32, UserAddr::new(args[3]))),
+        nr::RENAMEAT2 => flat(fs::sys_renameat2(args[0] as i32, UserAddr::new(args[1]), args[2] as i32, UserAddr::new(args[3]), args[4] as u32)),
+        nr::STATX => flat(fs::sys_statx(args[0] as i32, UserAddr::new(args[1]), args[2] as u32, args[3] as u32, UserAddr::new(args[4]))),
+        nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as usize)),
         #[cfg(all(feature = "exec", feature = "akuma-native"))]
         nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
         #[cfg(feature = "akuma-native")]
@@ -826,8 +826,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETRANDOM => proc::sys_getrandom(args[0], args[1] as usize),
         #[cfg(feature = "akuma-native")]
         nr::TIME => time::sys_time(),
-        nr::CHDIR => flat(fs::sys_chdir(args[0])),
-        nr::CHROOT => flat(fs::sys_chroot(args[0])),
+        nr::CHDIR => flat(fs::sys_chdir(UserAddr::new(args[0]))),
+        nr::CHROOT => flat(fs::sys_chroot(UserAddr::new(args[0]))),
         nr::FCHDIR => fs::sys_fchdir(args[0] as u32),
         #[cfg(feature = "akuma-native")]
         nr::SET_TERMINAL_ATTRIBUTES => term::sys_set_terminal_attributes(args[0], args[1], args[2]),
@@ -872,15 +872,15 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::RT_SIGTIMEDWAIT => flat(signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize)),
         nr::RT_SIGRETURN => 0,
         nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
-        nr::GETCWD => fs::sys_getcwd(args[0], args[1] as usize),
+        nr::GETCWD => fs::sys_getcwd(UserAddr::new(args[0]), args[1] as usize),
         nr::FCNTL => fs::sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
-        nr::NEWFSTATAT => flat(fs::sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32)),
-        nr::FACCESSAT => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0)),
+        nr::NEWFSTATAT => flat(fs::sys_newfstatat(args[0] as i32, UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as u32)),
+        nr::FACCESSAT => flat(fs::sys_faccessat2(args[0] as i32, UserAddr::new(args[1]), args[2] as u32, 0)),
         nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0], UserAddr::new(args[1])),
         nr::CLOCK_SETTIME => time::sys_clock_settime(args[0] as u32, UserAddr::new(args[1])),
         nr::ADJTIMEX => time::sys_adjtimex(UserAddr::new(args[0])),
         nr::CLOCK_ADJTIME => time::sys_clock_adjtime(args[0] as u32, UserAddr::new(args[1])),
-        nr::FACCESSAT2 => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32)),
+        nr::FACCESSAT2 => flat(fs::sys_faccessat2(args[0] as i32, UserAddr::new(args[1]), args[2] as u32, args[3] as u32)),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
         #[cfg(feature = "akuma-native")]
@@ -903,16 +903,16 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SETDOMAINNAME => proc::sys_sethostname(args[0], args[1], true),
         nr::FLOCK => flock::sys_flock(args[0] as u32, args[1] as u32),
         nr::UMASK => cred::sys_umask(args[0]),
-        nr::UTIMENSAT => flat(fs::sys_utimensat(args[0] as i32, args[1], args[2], args[3] as u32)),
+        nr::UTIMENSAT => flat(fs::sys_utimensat(args[0] as i32, UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as u32)),
         nr::FDATASYNC => fs::sys_fsync(args[0] as u32),
         nr::FSYNC => fs::sys_fsync(args[0] as u32),
         nr::SYNC => fs::sys_sync(),
         nr::SYNCFS => fs::sys_syncfs(args[0] as u32),
         nr::FCHMOD => fs::sys_fchmod(args[0] as u32, args[1] as u32),
-        nr::FCHMODAT => flat(fs::sys_fchmodat(args[0] as i32, args[1], args[2] as u32)),
-        nr::FCHOWNAT => flat(fs::sys_fchownat(args[0] as i32, args[1], args[2], args[3], args[4] as u32)),
+        nr::FCHMODAT => flat(fs::sys_fchmodat(args[0] as i32, UserAddr::new(args[1]), args[2] as u32)),
+        nr::FCHOWNAT => flat(fs::sys_fchownat(args[0] as i32, UserAddr::new(args[1]), args[2], args[3], args[4] as u32)),
         nr::FCHOWN => fs::sys_fchown(args[0] as u32, args[1], args[2]),
-        nr::TRUNCATE => flat(fs::sys_truncate(args[0], args[1] as i64)),
+        nr::TRUNCATE => flat(fs::sys_truncate(UserAddr::new(args[0]), args[1] as i64)),
         nr::FTRUNCATE => fs::sys_ftruncate(args[0] as u32, args[1] as i64),
         // `posix_fadvise` — advisory by Linux's own contract; no readahead
         // state to tune, so success. The amd64 dispatcher got this arm
@@ -931,17 +931,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::PRLIMIT64 => proc::sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
         #[cfg(feature = "sc-eventfd")]
         nr::EVENTFD2 => eventfd::sys_eventfd2(args[0] as u32, args[1] as u32),
-        nr::PREAD64 => fs::sys_pread64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
-        nr::PWRITE64 => fs::sys_pwrite64(args[0] as u32, args[1], args[2] as usize, args[3] as i64),
+        nr::PREAD64 => fs::sys_pread64(args[0] as u32, UserAddr::new(args[1]), args[2] as usize, args[3] as i64),
+        nr::PWRITE64 => fs::sys_pwrite64(args[0] as u32, UserAddr::new(args[1]), args[2] as usize, args[3] as i64),
         // args[4] is `pos_h`, which carries nothing on a 64-bit kernel — see
         // `fs::sys_pvec2`. The `2` variants add the `RWF_*` flags word.
-        nr::PREADV => fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], 0, false),
-        nr::PWRITEV => fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], 0, true),
+        nr::PREADV => fs::sys_pvec2(args[0], UserAddr::new(args[1]), args[2] as usize, args[3], 0, false),
+        nr::PWRITEV => fs::sys_pvec2(args[0], UserAddr::new(args[1]), args[2] as usize, args[3], 0, true),
         nr::PREADV2 => {
-            fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], args[5] as u32, false)
+            fs::sys_pvec2(args[0], UserAddr::new(args[1]), args[2] as usize, args[3], args[5] as u32, false)
         }
         nr::PWRITEV2 => {
-            fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], args[5] as u32, true)
+            fs::sys_pvec2(args[0], UserAddr::new(args[1]), args[2] as usize, args[3], args[5] as u32, true)
         }
         nr::SETITIMER => {
             time::sys_setitimer(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2]))
