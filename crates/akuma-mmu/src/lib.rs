@@ -3104,10 +3104,16 @@ fn x86_read_cr3() -> u64 {
 /// # Safety
 /// As `load_cr3`: `root` maps everything the kernel executes from and touches
 /// before switching back.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn x86_write_cr3(root: u64) {
     akuma_mmu_raw::write_cr3(root);
 }
+
+/// A hosted x86_64 build (the unit tests) has no `CR3` to load: `akuma-mmu-raw` provides `write_cr3` only for
+/// `target_os = "none"`, so this is a no-op there. Without it the whole crate, and everything above it (`akuma-exec`,
+/// `akuma-fpcache`, `akuma-vfs-glue`, `akuma-user-access`), did not build for the host.
+#[cfg(all(not(target_os = "none"), target_arch = "x86_64"))]
+fn x86_write_cr3(_root: u64) {}
 
 /// Walk to the leaf slot for `va`, without allocating. `None` if any level is
 /// absent or a huge page (this walker never creates one, so a `PS` entry on the
