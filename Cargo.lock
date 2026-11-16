@@ -193,6 +193,7 @@ dependencies = [
  "akuma-hid",
  "akuma-i2c-hid",
  "akuma-ieee80211",
+ "akuma-irq-lock",
  "akuma-kernel-amd64",
  "akuma-kvm-amd64",
  "akuma-multiboot2",
