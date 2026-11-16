@@ -96,7 +96,7 @@ use spinning_top::Spinlock;
 // `use super::*`, which is how it already reached the raw pair.
 // `docs/archive/UNSAFE_AUDIT.md` §4 P0.
 pub use akuma_exec::process::user_access::{
-    Prefault, as_user_bytes, as_user_bytes_mut, copy_from_user, copy_to_user,
+    Prefault, UserAddr, as_user_bytes, as_user_bytes_mut, copy_from_user, copy_to_user,
     copy_to_user_with, read_user_into, read_user_vec, read_user_into_with,
     write_user_val, write_user_val_with,
 };
@@ -764,7 +764,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::LSEEK => fs::sys_lseek(args[0] as u32, args[1] as i64, args[2] as i32),
         nr::FSTAT => fs::sys_fstat(args[0] as u32, args[1]),
         nr::NANOSLEEP => time::sys_nanosleep(args[0], args[1]),
-        nr::CLOCK_NANOSLEEP => time::sys_clock_nanosleep(args[0] as u32, args[1] as i32, args[2], args[3]),
+        nr::CLOCK_NANOSLEEP => time::sys_clock_nanosleep(args[0] as u32, args[1] as i32, UserAddr::new(args[2]), UserAddr::new(args[3])),
         // AF_INET socket ops. In a rump box these never reach here (the rump proxy
         // short-circuits above); with the smoltcp native stack compiled out they
         // have no implementation, so a stray box-0 call gets a clean ENETDOWN
@@ -893,10 +893,10 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FCNTL => fs::sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
         nr::NEWFSTATAT => flat(fs::sys_newfstatat(args[0] as i32, args[1], args[2], args[3] as u32)),
         nr::FACCESSAT => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, 0)),
-        nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0], args[1]),
-        nr::CLOCK_SETTIME => time::sys_clock_settime(args[0] as u32, args[1]),
-        nr::ADJTIMEX => time::sys_adjtimex(args[0]),
-        nr::CLOCK_ADJTIME => time::sys_clock_adjtime(args[0] as u32, args[1]),
+        nr::CLOCK_GETTIME => time::sys_clock_gettime(args[0], UserAddr::new(args[1])),
+        nr::CLOCK_SETTIME => time::sys_clock_settime(args[0] as u32, UserAddr::new(args[1])),
+        nr::ADJTIMEX => time::sys_adjtimex(UserAddr::new(args[0])),
+        nr::CLOCK_ADJTIME => time::sys_clock_adjtime(args[0] as u32, UserAddr::new(args[1])),
         nr::FACCESSAT2 => flat(fs::sys_faccessat2(args[0] as i32, args[1], args[2] as u32, args[3] as u32)),
         nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
@@ -961,12 +961,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             fs::sys_pvec2(args[0], args[1], args[2] as usize, args[3], args[5] as u32, true)
         }
         nr::SETITIMER => {
-            time::sys_setitimer(args[0] as u32, args[1], args[2])
+            time::sys_setitimer(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2]))
         }
         nr::MEMBARRIER => mem::membarrier_cmd(args[0] as u32),
         nr::PRCTL => proc::sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
-        nr::TIMES => time::sys_times(args[0] as usize),
-        nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, args[1] as usize),
+        nr::TIMES => time::sys_times(UserAddr::new(args[0])),
+        nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, UserAddr::new(args[1])),
         nr::MSYNC => mem::sys_msync(args[0] as usize, args[1] as usize, args[2] as u32),
         nr::PROCESS_VM_READV => {
             if akuma_config::SYSCALL_ENOSYS_DIAG {
@@ -1088,7 +1088,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SETFSGID => cred::sys_setfsid(true),
         nr::SETGROUPS => cred::sys_setgroups(args[0], args[1]),
         nr::SYSINFO => proc::sys_sysinfo(args[0] as usize),
-        nr::CLOCK_GETRES => time::sys_clock_getres(args[0] as u32, args[1] as usize),
+        nr::CLOCK_GETRES => time::sys_clock_getres(args[0] as u32, UserAddr::new(args[1])),
         #[cfg(feature = "sc-epoll")]
         nr::EPOLL_CREATE1 => poll::sys_epoll_create1(args[0] as u32),
         #[cfg(feature = "sc-epoll")]

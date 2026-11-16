@@ -48,7 +48,7 @@ pub use akuma_sntp::{boot, sntp};
 // `akuma_timer::uptime_us` itself, so nothing changed there); the UTC anchor
 // is the one static both kernels write.
 use akuma_primitives::clock::{realtime_us, uptime_us, utc_time_us};
-use akuma_exec::process::user_access::{read_user_into, write_user_val};
+use akuma_exec::process::user_access::{read_user_into, write_user_val, UserAddr};
 use akuma_exec::threading::MAX_THREADS;
 use akuma_primitives::errno::negated::{EFAULT, EINVAL, EPERM};
 // The four `Local*` ABI structs this module used to declare — `LocalTimespec`,
@@ -173,7 +173,9 @@ fn wants_force_interrupt(tid: usize) -> bool {
 /// setitimer(ITIMER_REAL) — arms/disarms the real-time interval timer that
 /// delivers SIGALRM on expiration. musl's alarm() is a thin wrapper around this.
 #[must_use] 
-pub fn sys_setitimer(which: u32, new_ptr: u64, old_ptr: u64) -> u64 {
+pub fn sys_setitimer(which: u32, new: UserAddr, old: UserAddr) -> u64 {
+    let new_ptr = new.get();
+    let old_ptr = old.get();
     const ITIMER_REAL: u32 = 0;
     if which != ITIMER_REAL {
         // ITIMER_VIRTUAL (1) and ITIMER_PROF (2) are not implemented.
@@ -274,7 +276,8 @@ pub fn sys_alarm(seconds: u64) -> u64 {
 const CLOCK_REALTIME: u32 = 0;
 
 #[must_use] 
-pub fn sys_clock_gettime(clock_id_arg: u64, tp_ptr: u64) -> u64 {
+pub fn sys_clock_gettime(clock_id_arg: u64, tp: UserAddr) -> u64 {
+    let tp_ptr = tp.get();
     // Linux clock_id is a small integer or a compact CPU-clock encoding
     // (~(pid << 3) | CPUCLOCK_*).  Pointer-sized values in x0 (e.g. Go heap) are
     // EINVAL on Linux.  Do not copy out a timespec to such an x0: serial crash5.log
@@ -362,7 +365,8 @@ pub fn read_timeout_us(ptr: u64) -> Result<Option<u64>, u64> {
 /// `docs/archive/MISSING_NTP_SYSCALLS.md`'s "no way to set the clock at all"
 /// gap. `date -s`, `rdate`, and `ntpd`'s initial step all bottom out here.
 #[must_use] 
-pub fn sys_clock_settime(clock_id: u32, tp_ptr: u64) -> u64 {
+pub fn sys_clock_settime(clock_id: u32, tp: UserAddr) -> u64 {
+    let tp_ptr = tp.get();
     if clock_id != CLOCK_REALTIME {
         return EINVAL;
     }
@@ -402,7 +406,8 @@ const STA_UNSYNC: i32 = 0x0040;
 /// frequency/tick state to adjust, and rejecting them would just break a
 /// caller that sets several bits at once for a step it also wants.
 #[must_use] 
-pub fn sys_clock_adjtime(clock_id: u32, buf_ptr: u64) -> u64 {
+pub fn sys_clock_adjtime(clock_id: u32, buf: UserAddr) -> u64 {
+    let buf_ptr = buf.get();
     if clock_id != CLOCK_REALTIME {
         return EINVAL;
     }
@@ -452,8 +457,8 @@ pub fn sys_clock_adjtime(clock_id: u32, buf_ptr: u64) -> u64 {
 
 /// `adjtimex(2)` — always `CLOCK_REALTIME`, see [`sys_clock_adjtime`].
 #[must_use] 
-pub fn sys_adjtimex(buf_ptr: u64) -> u64 {
-    sys_clock_adjtime(CLOCK_REALTIME, buf_ptr)
+pub fn sys_adjtimex(buf: UserAddr) -> u64 {
+    sys_clock_adjtime(CLOCK_REALTIME, buf)
 }
 
 /// Step the wall clock by `delta_us` (positive or negative), immediately.
@@ -469,7 +474,8 @@ fn step_utc_by(root: akuma_primitives::HostRoot, delta_us: i64) {
 }
 
 #[must_use] 
-pub fn sys_clock_getres(clock_id: u32, res_ptr: usize) -> u64 {
+pub fn sys_clock_getres(clock_id: u32, res: UserAddr) -> u64 {
+    let res_ptr = res.get() as usize;
     let _ = clock_id;
     if res_ptr != 0 {
         let ts = Timespec { tv_sec: 0, tv_nsec: 1 };
@@ -527,7 +533,9 @@ pub fn sys_nanosleep(a0: u64, a1: u64) -> u64 {
 /// userspace libc wrapper detail (musl negates the raw syscall's `-errno` back to
 /// positive), not something this syscall itself needs to implement.
 #[must_use] 
-pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request_ptr: u64, remain_ptr: u64) -> u64 {
+pub fn sys_clock_nanosleep(clock_id: u32, flags: i32, request: UserAddr, remain: UserAddr) -> u64 {
+    let request_ptr = request.get();
+    let remain_ptr = remain.get();
     const TIMER_ABSTIME: i32 = 1;
     let _ = remain_ptr; // Linux only fills this on an interrupted *relative* sleep; sys_nanosleep doesn't either.
 
@@ -588,7 +596,8 @@ fn current_process_cpu_time_us() -> u64 {
 /// time is "user" — there is no user/kernel split); `tms_stime` and the children's
 /// fields are 0. The return value is uptime in ticks.
 #[must_use]
-pub fn sys_times(buf_ptr: usize) -> u64 {
+pub fn sys_times(buf: UserAddr) -> u64 {
+    let buf_ptr = buf.get() as usize;
     if buf_ptr != 0 {
         let tms = Tms::with_cpu_time_us(current_process_cpu_time_us());
         if write_user_val(buf_ptr as u64, &tms).is_err() { return EFAULT; }
@@ -605,7 +614,8 @@ pub fn sys_times(buf_ptr: usize) -> u64 {
 /// into their parent (`wait4`'s own `rusage` does report the child it reaps).
 /// Any other `who` is `EINVAL`, as on Linux.
 #[must_use]
-pub fn sys_getrusage(who: i32, usage_ptr: usize) -> u64 {
+pub fn sys_getrusage(who: i32, usage: UserAddr) -> u64 {
+    let usage_ptr = usage.get() as usize;
     let cpu_us = match who {
         Rusage::RUSAGE_SELF => current_process_cpu_time_us(),
         Rusage::RUSAGE_THREAD => akuma_exec::threading::get_thread_cpu_time(

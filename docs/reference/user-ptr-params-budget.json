@@ -8,7 +8,7 @@
     "crates/akuma-switch": 2,
     "crates/akuma-syscalls-glue": 169,
     "crates/akuma-syscalls-ipc": 1,
-    "crates/akuma-syscalls-time": 12,
+    "crates/akuma-syscalls-time": 1,
     "crates/akuma-threading": 1,
     "crates/akuma-user-access": 5
   }
