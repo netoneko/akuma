@@ -1588,7 +1588,6 @@ pub fn pid_map_rows(pid: u32) -> Option<Vec<akuma_exec::process::maps_rows::MapR
 }
 
 #[cfg(not(feature = "no-tests"))]
-#[cfg(not(feature = "no-tests"))]
 /// [`covered_by`] must answer exactly what the linear scan it replaced
 /// answered (the oracle test, kept with the suite that runs it; the fn it
 /// tests moved to `akuma-exec::process::maps_rows`, PHASE-2-PROCFS D27).
@@ -1622,6 +1621,7 @@ fn maps_skip_lookup_check(t: &mut Suite) {
     );
 }
 
+#[cfg(not(feature = "no-tests"))]
 /// `open`, `stat` and `access` must agree about every `/proc` path.
 ///
 /// # Why this is a self-test and not a comment

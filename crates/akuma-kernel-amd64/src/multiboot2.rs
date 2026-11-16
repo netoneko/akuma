@@ -584,6 +584,7 @@ fn boot_to_init(info: &BootInfo<'_>, have_net: bool, run_shell: bool) {
         if cmdline.split_ascii_whitespace().any(|t| t == "wdttest") {
             crate::watchdog::wedge_for_test();
         }
+        crate::boot::before_init();
         crate::usermode::run_init(init);
     }
 }

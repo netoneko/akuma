@@ -174,6 +174,17 @@ fn is_regular_file(fd: u64) -> bool {
     path.is_some_and(|p| !akuma_vfs_glue::metadata(&p).is_ok_and(|m| m.is_dir))
 }
 
+/// Whether `fd` is `/dev/zero` or `/dev/urandom`: devices that answer any length
+/// in full, so a large read is served whole (in chunks) like a regular file's.
+/// Clamped to one [`MAX_IO`] chunk, `dd if=/dev/zero bs=1M count=8` wrote
+/// 512 KiB on the ryzen (2026-11-16): eight short reads `dd` does not retry.
+fn is_fill_device(fd: u64) -> bool {
+    akuma_exec::process::current_process_shared().is_some_and(|p| {
+        p.with_fd(fd as u32, |d| matches!(d, FileDescriptor::DevZero | FileDescriptor::DevUrandom))
+            .unwrap_or(false)
+    })
+}
+
 /// Serve `len` bytes as consecutive [`MAX_IO`] chunks through `chunk(done, want)`,
 /// stopping at the first short or failed one. A failure after progress reports
 /// the progress, as `read(2)` does.
@@ -200,7 +211,7 @@ pub fn read(fd: u64, buf: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    if len > MAX_IO && is_regular_file(fd) {
+    if len > MAX_IO && (is_regular_file(fd) || is_fill_device(fd)) {
         return read_chunked(len, |done, n| glue::fs::sys_read(fd, buf + done, n));
     }
     glue::fs::sys_read(fd, buf, len.min(MAX_IO) as usize)
@@ -212,7 +223,7 @@ pub fn pread64(fd: u64, buf: u64, len: u64, off: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    if len > MAX_IO && is_regular_file(fd) {
+    if len > MAX_IO && (is_regular_file(fd) || is_fill_device(fd)) {
         return read_chunked(len, |done, n| {
             glue::fs::sys_pread64(fd as u32, buf + done, n, off.cast_signed().wrapping_add(done.cast_signed()))
         });

@@ -426,6 +426,32 @@ pub fn keep_cmdline(cmdline: &str) {
     }
 }
 
+/// What must hold before the first user program runs, for **both** entry points.
+///
+/// Until 2026-11-16 these three lived in the PVH path alone, so a machine booted
+/// through GRUB (the ryzen, every bare-metal box) ran init with none of them:
+/// no randomization, the self-tests' pointer bypass still openable, `dac=1`
+/// ignored. Found by booting it. Anything that is "from init on" goes here, not
+/// beside one of the two `run_init` calls.
+pub fn before_init() {
+    // The self-tests are over; their user-pointer bypass is closed for good.
+    akuma_user_access::seal_bypass();
+    let word = |key| akuma_params::Params::new(akuma_params::line(), "").value(key);
+    // `dac=1`: file permissions enforced from init on. Not the default: disks
+    // written while modes were ignored hold binaries with no execute bit.
+    if word("dac") == Some("1") {
+        akuma_isolation::dac::set_enforcing(true);
+        crate::serial::puts("  [boot] dac=1: file permissions are enforced\n");
+    }
+    // Randomize every image from init on unless the boot line says `aslr=0`;
+    // off until here because the self-tests assert exact addresses.
+    let aslr = word("aslr") != Some("0");
+    akuma_primitives::aslr::set_enabled(aslr);
+    if !aslr {
+        crate::serial::puts("  [boot] aslr=0: address-space randomization is OFF\n");
+    }
+}
+
 /// Apply the boot flags that steer the running kernel rather than the boot:
 /// `fbverbose`, `fbtrace`, `strace`, `strace_err`, `strace_pid=`, `strace_nr=`,
 /// `nopidfd`.
