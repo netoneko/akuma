@@ -1155,7 +1155,8 @@ pub(super) fn sys_madvise(addr: usize, len: usize, advice: i32) -> u64 {
             };
             let _mm_window = MmBklGuard::new();
             let aligned_addr = addr & !0xFFF;
-            let end = (addr.saturating_add(len) + 0xFFF) & !0xFFF;
+            // `range_fits_user_va` bounded `addr + len` above; the checked round-up keeps that true if the order of checks changes.
+            let Some(end) = addr.checked_add(len).and_then(akuma_primitives::page_ceil) else { return EINVAL };
 
             // Collect (va, flags) pairs for pages in lazy regions not yet mapped.
             //

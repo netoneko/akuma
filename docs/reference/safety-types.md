@@ -70,13 +70,23 @@ a fallible constructor would have changed each. `is_shareable()` is the one spel
 `recorded_prot()` (unrecorded denies nothing) are the two readers. Fork no longer patches a second field after building the
 child region.
 
-### `Pages`, `PageRange` (`akuma-primitives::pages`) — §10
-`Pages::from_len_ceil(len) -> Option<Pages>`, bounded by `2^48 / 4096`. Fixed four sites that wrapped in release:
-`munmap_len` (unmapped nothing and returned 0), `sys_mprotect` (changed nothing and returned 0; now `ENOMEM`, as Linux),
-and `mremap::plan` (unbounded `new_size` and `old_size`; `ENOMEM` and `EINVAL`). `PageRange` is an aligned start, a `Pages`
-count and an end within `2^48`, checked at construction; `sys_mprotect` uses it and `sys_mmap` takes its count from `Pages`.
-The architecture's own user limit (47 bits on amd64) is still the caller's check against `end()`. **Open:** the other ~90
-page-math sites (`akuma-mmap`, `akuma-mmu`, `akuma-exec`) belong to wave 4 of `typed-addresses.md`, not a second sweep.
+### `Pages`, `PageRange`, `page_ceil` (`akuma-primitives::pages`) — §10
+`Pages::from_len_ceil(len) -> Option<Pages>` is bounded by `2^48 / 4096`; `PageRange` is an aligned start, a `Pages` count and an
+end within `2^48`; `page_ceil(addr)` is `(addr + 0xFFF) & !0xFFF` that returns `None` instead of wrapping. The sweep (T7)
+went by *where the number comes from*, because most page arithmetic in the tree is on region data the kernel already bounded:
+
+| Site | Input | Was | Now |
+|---|---|---|---|
+| `Process::set_brk` | **user** `brk(addr)` | `(new_brk + 0xFFF) & !0xFFF` wrapped to page 0 for an address near the top, which read as a shrink: `drop_pages(0, old_top)` **unmapped the process's own image and heap** | `brk_tops` via `page_ceil`; a request it cannot honour returns the old break (as Linux) |
+| ELF loaders (`load_elf`, the interpreter) | **file** `p_vaddr`/`p_memsz`/`p_filesz` | `vaddr + memsz` unchecked in `segment_span`, the deferred path's `end_page`, relocation and boundary passes | `validate_load_segments` once, before any rounding: a `PT_LOAD` must end inside the 48-bit space, must not wrap, and `p_filesz <= p_memsz` (Linux's `EINVAL`) |
+| `akuma-mmu` range checks (4 sites) | user ranges, after `user_range_ok` | `(va_start + len + PAGE_SIZE - 1) & ...` | `page_span`: a range that wraps is "not mapped" |
+| `prefault_user_range`, `madvise(WILLNEED)` | user ranges | unchecked / saturating then `+ 0xFFF` | `checked_add` + `page_ceil` |
+| `munmap_len`, `sys_mprotect`, `sys_mmap`, `mremap::plan` (old and new size) | user lengths | wrapped to 0 | `Pages` / `PageRange` (earlier commit) |
+
+**Left as they are, on purpose:** the ~70 other `* PAGE_SIZE` / `/ PAGE_SIZE` sites (`akuma-mmap`'s region and placement code,
+the amd64 `mm.rs` region walks, `akuma-exec`'s fault paths). They compute on a region's recorded extent or a count already
+produced by `Pages`, not on a fresh user number; converting them is churn with no defect behind it. The cases above were found
+by asking, for each rounding, "can the caller choose this value?".
 
 ### `ThreadRef`, `with_live` and `OptTidCell` (`akuma-threading`, `akuma-exec`) — §5
 `WakeHandle` generalised and renamed (`WakeHandle` is an alias). `Process::thread_id` is stored as a packed `ThreadRef`, so slot
@@ -197,7 +207,6 @@ host ports are unprivileged, and the active toolchain's `rust-objcopy` on `PATH`
    images now (below), but the boot self-tests still use it at ~125 sites that pass kernel buffers as user pointers; each needs
    a real user mapping instead (`proposals/FUTURE_WORK.md`).
 5. **§9** classifying and migrating the other static spinlocks.
-6. **§10** the page-math sites in `akuma-mmap`/`akuma-mmu`/`akuma-exec` (wave 4 of the address plan).
 7. Mutation checks for the two isolation tests (break isolation on purpose, see them fail); they pass today, which is not
    the same as proving they would catch a break.
 

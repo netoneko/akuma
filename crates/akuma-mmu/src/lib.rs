@@ -206,6 +206,15 @@ use akuma_mmap::PhysFrame;
 use akuma_user_space::{FrameLedger, MappingPins};
 use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
 
+/// `(first page, page count)` covering `len` bytes from `va_start`, or `None` if `va_start + len` wraps. A range that wraps is
+/// not mapped: the old `(va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)` produced a small end page for one near the top
+/// of the address space, and a range check that then walked a handful of pages could answer `true` for it.
+fn page_span(va_start: usize, len: usize) -> Option<(usize, usize)> {
+    let start_page = va_start & !(PAGE_SIZE - 1);
+    let end_page = va_start.checked_add(len).and_then(akuma_primitives::page_ceil)?;
+    Some((start_page, (end_page - start_page) / PAGE_SIZE))
+}
+
 /// MMU initialization state
 static MMU_INITIALIZED: AtomicBool = AtomicBool::new(false);
 
@@ -2104,9 +2113,7 @@ impl UserAddressSpace {
 
     pub fn is_range_mapped(&self, va_start: usize, len: usize) -> bool {
         if len == 0 { return true; }
-        let start_page = va_start & !(PAGE_SIZE - 1);
-        let end_page = (va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-        let num_pages = (end_page - start_page) / PAGE_SIZE;
+        let Some((start_page, num_pages)) = page_span(va_start, len) else { return false };
         let l0 = table_phys(self.l0_frame.addr);
         for i in 0..num_pages {
             if !self.is_page_mapped(l0, start_page + i * PAGE_SIZE) { return false; }
@@ -3085,9 +3092,7 @@ fn x86_user_range_ok(va_start: usize, len: usize, need_write: bool) -> bool {
     if root == 0 {
         return false;
     }
-    let start_page = va_start & !(PAGE_SIZE - 1);
-    let end_page = (va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let num_pages = (end_page - start_page) / PAGE_SIZE;
+    let Some((start_page, num_pages)) = page_span(va_start, len) else { return false };
     (0..num_pages).all(|i| x86_user_page_ok(root, start_page + i * PAGE_SIZE, need_write))
 }
 
@@ -4680,9 +4685,7 @@ pub fn is_current_user_range_mapped(va_start: usize, len: usize) -> bool {
     let ttbr0 = get_current_ttbr0();
     if ttbr0 == 0 { return false; }
     let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
-    let start_page = va_start & !(PAGE_SIZE - 1);
-    let end_page = (va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let num_pages = (end_page - start_page) / PAGE_SIZE;
+    let Some((start_page, num_pages)) = page_span(va_start, len) else { return false };
     let l0 = table_phys(l0_addr);
     for i in 0..num_pages {
         if !is_page_user_accessible(l0, start_page + i * PAGE_SIZE) { return false; }
@@ -5020,9 +5023,7 @@ pub fn is_current_user_range_writable(va_start: usize, len: usize) -> bool {
     let ttbr0 = get_current_ttbr0();
     if ttbr0 == 0 { return false; }
     let l0_addr = ttbr0 & 0x0000_FFFF_FFFF_F000;
-    let start_page = va_start & !(PAGE_SIZE - 1);
-    let end_page = (va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
-    let num_pages = (end_page - start_page) / PAGE_SIZE;
+    let Some((start_page, num_pages)) = page_span(va_start, len) else { return false };
     let l0 = table_phys(l0_addr);
     (0..num_pages).all(|i| is_page_user_writable(l0, start_page + i * PAGE_SIZE))
     }
@@ -5288,5 +5289,25 @@ mod table_walk_characterization_tests {
                 (block_pa + ((i as u64) << 12)) | attrs | flags::VALID | flags::TABLE;
             assert_eq!(l3.get(i), expected, "page {i} of the block");
         }
+    }
+}
+
+#[cfg(test)]
+mod page_span_tests {
+    use super::{PAGE_SIZE, page_span};
+
+    #[test]
+    fn a_range_is_the_pages_that_cover_it() {
+        assert_eq!(page_span(0x1000, 1), Some((0x1000, 1)));
+        assert_eq!(page_span(0x1fff, 2), Some((0x1000, 2)));
+        assert_eq!(page_span(0x2000, 3 * PAGE_SIZE), Some((0x2000, 3)));
+        assert_eq!(page_span(0x2000, 0), Some((0x2000, 0)));
+    }
+
+    #[test]
+    fn a_range_that_wraps_is_none_not_a_short_range() {
+        assert_eq!(page_span(usize::MAX - 10, 100), None);
+        assert_eq!(page_span(usize::MAX, 1), None);
+        assert_eq!(page_span(0x1000, usize::MAX), None);
     }
 }

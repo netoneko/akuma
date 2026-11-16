@@ -116,6 +116,9 @@ fn load_interpreter<A: UserPages>(
     let base = INTERP_BASE + akuma_primitives::aslr::slide(128 << 20, 0x1_0000);
     let entry_point = base + headers.ehdr.e_entry as usize;
 
+    let interp_phdrs: alloc::vec::Vec<_> = headers.segments().iter().collect();
+    super::load::validate_load_segments(base, &interp_phdrs)?;
+
     let mut mapped_pages: BTreeMap<usize, usize> = BTreeMap::new();
     for phdr in headers.segments().iter() {
         if phdr.p_type != PT_LOAD {

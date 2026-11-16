@@ -1310,8 +1310,12 @@ impl Process {
         if new_brk < initial {
             return old;
         }
-        let top = (new_brk + 0xFFF) & !0xFFF;
-        let old_top = (old + 0xFFF) & !0xFFF;
+        // `(new_brk + 0xFFF) & !0xFFF` wrapped for a `new_brk` near the top of the space: the result was a small page, so
+        // `brk(usize::MAX - 5)` read as a shrink and `drop_pages(~0, old_top)` unmapped the process's own image and heap.
+        // Linux answers a request it cannot honour with the old break, and so does this.
+        let Some((top, old_top)) = brk_tops(new_brk, old) else {
+            return old;
+        };
         if top < old_top {
             self.drop_pages(top, old_top);
         } else if top > old_top && !self.grow_heap(old_top, top) {
@@ -4173,6 +4177,24 @@ mod grace_kill_tests {
 /// Unconditional rather than feature-gated: it is a `pub fn` in a library, so it
 /// is not dead code in a `no-tests` build, and LTO drops it when nothing calls
 /// it. Measured — `extreme-size` did not move.
+/// The page-rounded tops of a requested and a current program break, or `None` if either rounding would wrap.
+fn brk_tops(new_brk: usize, old: usize) -> Option<(usize, usize)> {
+    Some((akuma_primitives::page_ceil(new_brk)?, akuma_primitives::page_ceil(old)?))
+}
+
+#[cfg(test)]
+mod brk_tests {
+    use super::brk_tops;
+
+    #[test]
+    fn a_break_near_the_top_of_the_space_is_refused_not_read_as_a_shrink() {
+        assert_eq!(brk_tops(0x1000_0001, 0x1000_0000), Some((0x1000_1000, 0x1000_0000)));
+        assert_eq!(brk_tops(usize::MAX - 5, 0x1000_0000), None);
+        assert_eq!(brk_tops(usize::MAX, 0x1000_0000), None);
+        assert_eq!(brk_tops(0x1000_0000, usize::MAX), None);
+    }
+}
+
 pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
     use {Process, ProcessMemory, SharedFdTable, SharedSignalTable, ProcessSyscallStats};
     use crate::mmu::UserAddressSpace;

@@ -19,7 +19,10 @@ use core::sync::atomic::Ordering;
 #[must_use]
 pub fn prefault_user_range(start: usize, len: usize) -> bool {
     let page_start = start & !0xFFF;
-    let page_end = (start + len + 0xFFF) & !0xFFF;
+    // A range that wraps is not a range: refuse it rather than prefault pages near zero.
+    let Some(page_end) = start.checked_add(len).and_then(akuma_primitives::page_ceil) else {
+        return false;
+    };
     // The `as_lock` guarding THIS address space's page tables lives on the
     // thread-group leader that owns the L0 root — a CLONE_VM sibling gets a fresh
     // `as_lock` from `fork_process`, so holding the current thread's would exclude

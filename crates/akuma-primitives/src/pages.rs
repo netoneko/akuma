@@ -40,6 +40,19 @@ impl Pages {
     }
 }
 
+/// `addr` rounded up to the next 4 KiB boundary, or `None` if that would wrap past `usize::MAX`.
+///
+/// `(addr + 0xFFF) & !0xFFF` on an address near the top of the space wraps to a small number, which a caller that then
+/// compares it with another page boundary reads as "far below": `brk(usize::MAX - 5)` used to look like a shrink to page 0
+/// and unmapped the process's own heap and image (see `Process::set_brk`).
+#[must_use]
+pub const fn page_ceil(addr: usize) -> Option<usize> {
+    match addr.checked_add(PAGE_SIZE - 1) {
+        Some(v) => Some(v & !(PAGE_SIZE - 1)),
+        None => None,
+    }
+}
+
 /// A page-aligned range of user addresses: the start is aligned, the page count is a [`Pages`], and the end does not pass
 /// the 48-bit space, all checked at construction. `end()` and `bytes()` are then infallible.
 ///
@@ -105,6 +118,18 @@ mod tests {
         assert_eq!(Pages::from_len_ceil(1).map(Pages::bytes), Some(4096));
         assert_eq!(Pages::from_len_ceil(4096).map(Pages::bytes), Some(4096));
         assert_eq!(Pages::from_len_ceil(4097).map(Pages::bytes), Some(8192));
+    }
+
+    #[test]
+    fn page_ceil_rounds_up_and_refuses_a_wrap() {
+        assert_eq!(page_ceil(0), Some(0));
+        assert_eq!(page_ceil(1), Some(4096));
+        assert_eq!(page_ceil(4096), Some(4096));
+        assert_eq!(page_ceil(4097), Some(8192));
+        assert_eq!(page_ceil(usize::MAX), None);
+        assert_eq!(page_ceil(usize::MAX - 5), None);
+        assert_eq!(page_ceil(usize::MAX - 4095), Some(usize::MAX - 4095), "the last aligned address rounds to itself");
+        assert_eq!(page_ceil(usize::MAX - 4094), None, "one byte into the last page cannot round up");
     }
 
     #[test]

@@ -195,6 +195,7 @@ fn load_image<A: UserPages>(
     if phdrs.is_empty() {
         return Err(ElfError::InvalidFormat("No program headers"));
     }
+    validate_load_segments(base, &phdrs)?;
 
     let mut address_space = A::new_space().ok_or(ElfError::AddressSpaceFailed)?;
     let mut brk: usize = 0;
@@ -349,6 +350,31 @@ fn load_image<A: UserPages>(
 
 /// Page permissions for a PT_LOAD segment. Writable segments are never
 /// executable and vice versa — W^X, regardless of what `p_flags` asks for.
+/// Highest user virtual address the loader will accept a segment to reach: the 48-bit space (`akuma_primitives::Pages::MAX`).
+const USER_VA_SPACE: u64 = 1 << 48;
+
+/// Reject a `PT_LOAD` that cannot be mapped before any rounding is done on its numbers.
+///
+/// `p_vaddr`, `p_memsz` and `p_filesz` come straight from the file, and every page computation below them (`segment_span`,
+/// the deferred path's `end_page`, the relocation and boundary passes) adds them: `vaddr + memsz` wraps for a segment near
+/// the top of the space, and the wrapped value reads as a tiny, valid-looking range. A segment must end inside the 48-bit
+/// space, must not wrap, and must not claim more file bytes than memory (Linux refuses the same: `EINVAL`).
+pub(super) fn validate_load_segments(base: usize, phdrs: &[ProgramHeader]) -> Result<(), ElfError> {
+    for p in phdrs.iter().filter(|p| p.p_type == PT_LOAD) {
+        if p.p_filesz > p.p_memsz {
+            return Err(ElfError::InvalidFormat("PT_LOAD p_filesz exceeds p_memsz"));
+        }
+        let end = (base as u64)
+            .checked_add(p.p_vaddr)
+            .and_then(|start| start.checked_add(p.p_memsz));
+        match end {
+            Some(end) if end <= USER_VA_SPACE => {}
+            _ => return Err(ElfError::InvalidFormat("PT_LOAD segment outside the address space")),
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn segment_prot(p_flags: u32) -> SegProt {
     if (p_flags & PF_X) != 0 {
         SegProt::Code
@@ -749,5 +775,44 @@ mod window_tests {
     #[test]
     fn filesz_exactly_one_window() {
         check(0, 0x50_0000, SEGMENT_READ_WINDOW, SEGMENT_READ_WINDOW + PAGE_SIZE);
+    }
+}
+
+#[cfg(test)]
+mod segment_bound_tests {
+    use super::{USER_VA_SPACE, validate_load_segments};
+    use akuma_mmap::PAGE_SIZE;
+    use elf::abi::{PF_R, PT_LOAD, PT_NOTE};
+    use elf::segment::ProgramHeader;
+
+    fn seg(p_type: u32, vaddr: u64, filesz: u64, memsz: u64) -> ProgramHeader {
+        ProgramHeader { p_type, p_offset: 0, p_vaddr: vaddr, p_paddr: 0, p_filesz: filesz, p_memsz: memsz, p_flags: PF_R, p_align: PAGE_SIZE as u64 }
+    }
+
+    #[test]
+    fn an_ordinary_segment_passes() {
+        assert!(validate_load_segments(0, &[seg(PT_LOAD, 0x40_0000, 0x1000, 0x3000)]).is_ok());
+        assert!(validate_load_segments(0x7f00_0000_0000, &[seg(PT_LOAD, 0x1000, 0x10, 0x10)]).is_ok());
+    }
+
+    #[test]
+    fn a_segment_that_wraps_or_leaves_the_address_space_is_refused() {
+        // vaddr + memsz wraps u64 (the case that read as a tiny valid range after rounding).
+        assert!(validate_load_segments(0, &[seg(PT_LOAD, u64::MAX - 0x10, 0, 0x2000)]).is_err());
+        // Ends one byte past the 48-bit space; ends exactly at it.
+        assert!(validate_load_segments(0, &[seg(PT_LOAD, USER_VA_SPACE - 0x1000, 0, 0x1001)]).is_err());
+        assert!(validate_load_segments(0, &[seg(PT_LOAD, USER_VA_SPACE - 0x1000, 0, 0x1000)]).is_ok());
+        // A PIE base that pushes an otherwise fine segment out.
+        assert!(validate_load_segments(USER_VA_SPACE as usize - 0x1000, &[seg(PT_LOAD, 0x1000, 0, 0x2000)]).is_err());
+    }
+
+    #[test]
+    fn more_file_bytes_than_memory_is_refused() {
+        assert!(validate_load_segments(0, &[seg(PT_LOAD, 0x1000, 0x2000, 0x1000)]).is_err());
+    }
+
+    #[test]
+    fn only_load_segments_are_checked() {
+        assert!(validate_load_segments(0, &[seg(PT_NOTE, u64::MAX, u64::MAX, u64::MAX)]).is_ok());
     }
 }
