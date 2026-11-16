@@ -162,7 +162,8 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
 /// stream — message boundaries are not preserved. That is sufficient for
 /// libstd's single fixed-size handshake (and EOF-on-success) but is not a fully
 /// conformant SEQPACKET.
-pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: u64) -> u64 {
+pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: UserAddr) -> u64 {
+    let sv_ptr = sv_ptr.get();
     let base_type = sock_type & 0xFF;
     let cloexec = sock_type & 0x80000 != 0;
     let nonblock = sock_type & 0x800 != 0;
@@ -256,7 +257,8 @@ fn egress_allowed(ip: [u8; 4]) -> bool {
 const UNPRIVILEGED_PORT_START: u16 = 1024;
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+pub(super) fn sys_bind(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
+    let addr_ptr = addr_ptr.get();
     let _net_bkl = NetBklGuard::new();
     if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
@@ -315,7 +317,9 @@ pub(super) fn sys_listen(fd: u32, backlog: i32) -> u64 {
 /// `EPOLLET` edge — tokio's accept loop waits on that edge, and without the
 /// re-arm the next connection was never reported to it.
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
+pub(super) fn sys_accept4(fd: u32, addr_ptr: UserAddr, len_ptr: UserAddr, flags: u32) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let len_ptr = len_ptr.get();
     use akuma_syscalls_linux::net::sock_flags::{SOCK_CLOEXEC, SOCK_NONBLOCK};
     if flags & !(SOCK_CLOEXEC | SOCK_NONBLOCK) != 0 {
         return EINVAL;
@@ -358,7 +362,8 @@ pub(super) fn sys_accept4(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u
 }
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+pub(super) fn sys_connect(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
+    let addr_ptr = addr_ptr.get();
     let _net_bkl = NetBklGuard::new();
     if len < 16 { return EINVAL; }
     if !validate_user_ptr(addr_ptr, len) { return EFAULT; }
@@ -407,7 +412,9 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
 }
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+pub(super) fn sys_getsockname(fd: u32, addr_ptr: UserAddr, len_ptr: UserAddr) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let len_ptr = len_ptr.get();
     let _net_bkl = NetBklGuard::new();
     if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
@@ -444,7 +451,9 @@ pub(super) fn sys_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
 }
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+pub(super) fn sys_getpeername(fd: u32, addr_ptr: UserAddr, len_ptr: UserAddr) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let len_ptr = len_ptr.get();
     let _net_bkl = NetBklGuard::new();
     if addr_ptr == 0 || len_ptr == 0 { return EINVAL; }
     if !validate_user_ptr(len_ptr, 4) { return EFAULT; }
@@ -521,8 +530,9 @@ pub(super) const MSG_TRUNC: i32 = 0x20;
 /// **not** the same as passing an unnamed address: the first means "no
 /// destination given" (fine on a connected socket), the second is a malformed
 /// one. `read_dest` keeps them apart.
-fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32, dest_addr: u64, addr_len: usize) -> SysResult {
-    let dest = super::unixsock::read_dest(dest_addr, addr_len)?;
+fn unix_send_user(fd: u32, buf_ptr: UserAddr, len: usize, flags: i32, dest_addr: u64, addr_len: usize) -> SysResult {
+    let buf_ptr = buf_ptr.get();
+    let dest = super::unixsock::read_dest(UserAddr::new(dest_addr), addr_len)?;
     let dontwait = flags & MSG_DONTWAIT != 0;
     if len == 0 {
         return Ok(super::unixsock::unix_sendto(fd, &[], dest.as_ref(), dontwait));
@@ -541,7 +551,8 @@ fn unix_send_user(fd: u32, buf_ptr: u64, len: usize, flags: i32, dest_addr: u64,
 }
 
 /// Receive from a unix socket into a user buffer. Returns `(ret, truncated)`.
-fn unix_recv_user(fd: u32, buf_ptr: u64, len: usize, flags: i32) -> (u64, bool) {
+fn unix_recv_user(fd: u32, buf_ptr: UserAddr, len: usize, flags: i32) -> (u64, bool) {
+    let buf_ptr = buf_ptr.get();
     if len == 0 {
         return (0, false);
     }
@@ -568,13 +579,14 @@ fn unix_recv_user(fd: u32, buf_ptr: u64, len: usize, flags: i32) -> (u64, bool) 
 }
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
+pub(super) fn sys_sendto(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, dest_addr: u64, addr_len: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     // AF_UNIX socketpair endpoint: send == write to the tx pipe. Checked BEFORE
     // dropping the BKL: the pipe/fs paths take spinlocks that BKL-holding peers
     // also take, which must not happen in the BKL-free window (AB-BA with a
     // nested IRQ's enter_kernel — see NetBklGuard).
     if fd_is_unix_socket(fd) {
-        return flat(unix_send_user(fd, buf_ptr, len, _flags, dest_addr, addr_len));
+        return flat(unix_send_user(fd, UserAddr::new(buf_ptr), len, _flags, dest_addr, addr_len));
     }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
@@ -664,11 +676,13 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, dest_ad
 }
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_addr: u64, addr_len_ptr: u64) -> u64 {
+pub(super) fn sys_recvfrom(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, src_addr: u64, addr_len_ptr: UserAddr) -> u64 {
+    let buf_ptr = buf_ptr.get();
+    let addr_len_ptr = addr_len_ptr.get();
     // AF_UNIX socketpair endpoint: recv == read from the rx pipe. Checked BEFORE
     // dropping the BKL — see sys_sendto.
     if fd_is_unix_socket(fd) {
-        return unix_recv_user(fd, buf_ptr, len, _flags).0;
+        return unix_recv_user(fd, UserAddr::new(buf_ptr), len, _flags).0;
     }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
@@ -750,7 +764,8 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, src_a
 // handshake banner send fails and box 0's rump stack never comes up. A real AF_INET
 // socket cannot exist without smoltcp, so anything else is EBADF.
 #[cfg(not(feature = "smoltcp"))]
-pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _dest_addr: u64, _addr_len: usize) -> u64 {
+pub(super) fn sys_sendto(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, _dest_addr: u64, _addr_len: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if fd_is_unix_socket(fd) {
         return flat(unix_send_user(fd, buf_ptr, len, _flags, _dest_addr, _addr_len));
     }
@@ -758,7 +773,8 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _dest_a
 }
 
 #[cfg(not(feature = "smoltcp"))]
-pub(super) fn sys_recvfrom(fd: u32, buf_ptr: u64, len: usize, _flags: i32, _src_addr: u64, _addr_len_ptr: u64) -> u64 {
+pub(super) fn sys_recvfrom(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, _src_addr: u64, _addr_len_ptr: UserAddr) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if fd_is_unix_socket(fd) {
         return unix_recv_user(fd, buf_ptr, len, _flags).0;
     }
@@ -1199,7 +1215,8 @@ pub(super) fn unix_getsockopt(fd: u32, level: i32, optname: i32, optval: u64, op
 /// The `msghdr`/iovec unpacking used to live only inside the `smoltcp`-gated
 /// `sys_recvmsg`, so a rump-only build answered `ENETDOWN` for a unix socket.
 /// Factored out here so both dispatch paths share one implementation.
-pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
+pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: UserAddr, flags: i32) -> u64 {
+    let msg_ptr = msg_ptr.get();
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) {
         return EFAULT;
     }
@@ -1215,7 +1232,7 @@ pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
     if msg.msg_iovlen != 0 && copy_from_user(as_user_bytes_mut(&mut iovs), msg.msg_iov).is_err() {
         return EFAULT;
     }
-    flat(unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, flags))
+    flat(unix_recvmsg(fd, UserAddr::new(msg_ptr), &mut msg, &iovs, flags))
 }
 
 /// `sendmsg` on an AF_UNIX fd: gather every iovec, then one framed send.
@@ -1230,7 +1247,7 @@ pub(super) fn unix_recvmsg_entry(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
 // `dead_code = "deny"` did not catch it; as a crate it does.
 #[cfg(feature = "smoltcp")]
 fn unix_sendmsg(fd: u32, msg: &MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> SysResult {
-    let dest = super::unixsock::read_dest(msg.msg_name, msg.msg_namelen as usize)?;
+    let dest = super::unixsock::read_dest(UserAddr::new(msg.msg_name), msg.msg_namelen as usize)?;
     let buf = gather_iovecs(iovs)?;
     let anc = read_scm_rights(msg)?;
     Ok(super::unixsock::unix_sendto_anc(fd, &buf, dest.as_ref(), flags & MSG_DONTWAIT != 0, anc))
@@ -1264,7 +1281,8 @@ fn read_scm_rights(msg: &MsgHdr) -> Result<super::unixsock::InFlight, Errno> {
 
 /// `recvmsg` on an AF_UNIX fd: one framed receive, then scatter across the
 /// iovecs. Writes `msg_flags`/`msg_controllen` back through `msg_ptr`.
-fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> SysResult {
+fn unix_recvmsg(fd: u32, msg_ptr: UserAddr, msg: &mut MsgHdr, iovs: &[super::fs::IoVec], flags: i32) -> SysResult {
+    let msg_ptr = msg_ptr.get();
     let capacity: usize = iovs.iter().map(|v| v.iov_len).sum();
     let mut kbuf = if capacity == 0 {
         alloc::vec::Vec::new()
@@ -1333,7 +1351,8 @@ fn unix_recvmsg(fd: u32, msg_ptr: u64, msg: &mut MsgHdr, iovs: &[super::fs::IoVe
 }
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
+pub(super) fn sys_sendmsg(fd: u32, msg_ptr: UserAddr, _flags: i32) -> u64 {
+    let msg_ptr = msg_ptr.get();
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
     let mut msg = MsgHdr::default();
     if read_user_into(&mut msg, msg_ptr).is_err() {
@@ -1433,7 +1452,8 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 // handshake RESP — and all proxied-syscall replies — never arrive and box 0's rump
 // stack never comes up. A real AF_INET socket cannot exist without smoltcp → EBADF.
 #[cfg(not(feature = "smoltcp"))]
-pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
+pub(super) fn sys_sendmsg(fd: u32, msg_ptr: UserAddr, _flags: i32) -> u64 {
+    let msg_ptr = msg_ptr.get();
     if !fd_is_unix_socket(fd) {
         return EBADF;
     }
@@ -1496,7 +1516,8 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
 }
 
 #[cfg(feature = "smoltcp")]
-pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
+pub(super) fn sys_recvmsg(fd: u32, msg_ptr: UserAddr, _flags: i32) -> u64 {
+    let msg_ptr = msg_ptr.get();
     if !validate_user_ptr(msg_ptr, core::mem::size_of::<MsgHdr>()) { return EFAULT; }
     let mut msg = MsgHdr::default();
     if read_user_into(&mut msg, msg_ptr).is_err() {
@@ -1518,7 +1539,7 @@ pub(super) fn sys_recvmsg(fd: u32, msg_ptr: u64, _flags: i32) -> u64 {
     // other one untouched — so a caller reading a fixed header into iov[0] and
     // a payload into iov[1] got the header and silently nothing else.
     if fd_is_unix_socket(fd) {
-        return flat(unix_recvmsg(fd, msg_ptr, &mut msg, &iovs, _flags));
+        return flat(unix_recvmsg(fd, UserAddr::new(msg_ptr), &mut msg, &iovs, _flags));
     }
 
     // Every iovec's capacity, scattered back below: this filled `iovs[0]`
@@ -1803,7 +1824,9 @@ pub(super) fn socket_peer_closed_tcp(idx: usize) -> bool {
 }
 
 #[cfg(all(feature = "smoltcp", feature = "akuma-native"))]
-pub(super) fn sys_resolve_host(path_ptr: u64, path_len: usize, res_ptr: u64) -> u64 {
+pub(super) fn sys_resolve_host(path_ptr: UserAddr, path_len: usize, res_ptr: UserAddr) -> u64 {
+    let path_ptr = path_ptr.get();
+    let res_ptr = res_ptr.get();
     let _net_bkl = NetBklGuard::new();
     // A host name is at most 253 bytes; the length sizes a kernel buffer.
     if path_len > 255 { return EINVAL; }
@@ -2012,13 +2035,14 @@ pub(super) fn dispatch_socket(domain: i32, sock_type: i32, proto: i32) -> u64 {
 }
 
 /// `bind(2)`.
-pub(super) fn dispatch_bind(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+pub(super) fn dispatch_bind(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
+    let addr_ptr = addr_ptr.get();
     if fd_is_unix_socket(fd) {
-        return flat(super::unixsock::sys_bind(fd, addr_ptr, len));
+        return flat(super::unixsock::sys_bind(fd, UserAddr::new(addr_ptr), len));
     }
     #[cfg(feature = "smoltcp")]
     {
-        sys_bind(fd, addr_ptr, len)
+        sys_bind(fd, UserAddr::new(addr_ptr), len)
     }
     #[cfg(not(feature = "smoltcp"))]
     {
@@ -2045,13 +2069,15 @@ pub(super) fn dispatch_listen(fd: u32, backlog: i32) -> u64 {
 
 /// `accept(2)` / `accept4(2)`. `flags` is 0 for plain `accept`, which is
 /// exactly `accept4`'s contract, so the two share one path.
-pub(super) fn dispatch_accept(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) -> u64 {
+pub(super) fn dispatch_accept(fd: u32, addr_ptr: UserAddr, len_ptr: UserAddr, flags: u32) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let len_ptr = len_ptr.get();
     if fd_is_unix_socket(fd) {
-        return super::unixsock::sys_accept(fd, addr_ptr, len_ptr, flags);
+        return super::unixsock::sys_accept(fd, UserAddr::new(addr_ptr), UserAddr::new(len_ptr), flags);
     }
     #[cfg(feature = "smoltcp")]
     {
-        sys_accept4(fd, addr_ptr, len_ptr, flags)
+        sys_accept4(fd, UserAddr::new(addr_ptr), UserAddr::new(len_ptr), flags)
     }
     #[cfg(not(feature = "smoltcp"))]
     {
@@ -2061,13 +2087,14 @@ pub(super) fn dispatch_accept(fd: u32, addr_ptr: u64, len_ptr: u64, flags: u32) 
 }
 
 /// `connect(2)`.
-pub(super) fn dispatch_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
+pub(super) fn dispatch_connect(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
+    let addr_ptr = addr_ptr.get();
     if fd_is_unix_socket(fd) {
-        return flat(super::unixsock::sys_connect(fd, addr_ptr, len));
+        return flat(super::unixsock::sys_connect(fd, UserAddr::new(addr_ptr), len));
     }
     #[cfg(feature = "smoltcp")]
     {
-        sys_connect(fd, addr_ptr, len)
+        sys_connect(fd, UserAddr::new(addr_ptr), len)
     }
     #[cfg(not(feature = "smoltcp"))]
     {
@@ -2077,13 +2104,15 @@ pub(super) fn dispatch_connect(fd: u32, addr_ptr: u64, len: usize) -> u64 {
 }
 
 /// `getsockname(2)`.
-pub(super) fn dispatch_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+pub(super) fn dispatch_getsockname(fd: u32, addr_ptr: UserAddr, len_ptr: UserAddr) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let len_ptr = len_ptr.get();
     if fd_is_unix_socket(fd) {
-        return super::unixsock::sys_getsockname(fd, addr_ptr, len_ptr);
+        return super::unixsock::sys_getsockname(fd, UserAddr::new(addr_ptr), UserAddr::new(len_ptr));
     }
     #[cfg(feature = "smoltcp")]
     {
-        sys_getsockname(fd, addr_ptr, len_ptr)
+        sys_getsockname(fd, UserAddr::new(addr_ptr), UserAddr::new(len_ptr))
     }
     #[cfg(not(feature = "smoltcp"))]
     {
@@ -2093,13 +2122,15 @@ pub(super) fn dispatch_getsockname(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 
 }
 
 /// `getpeername(2)`.
-pub(super) fn dispatch_getpeername(fd: u32, addr_ptr: u64, len_ptr: u64) -> u64 {
+pub(super) fn dispatch_getpeername(fd: u32, addr_ptr: UserAddr, len_ptr: UserAddr) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let len_ptr = len_ptr.get();
     if fd_is_unix_socket(fd) {
-        return super::unixsock::sys_getpeername(fd, addr_ptr, len_ptr);
+        return super::unixsock::sys_getpeername(fd, UserAddr::new(addr_ptr), UserAddr::new(len_ptr));
     }
     #[cfg(feature = "smoltcp")]
     {
-        sys_getpeername(fd, addr_ptr, len_ptr)
+        sys_getpeername(fd, UserAddr::new(addr_ptr), UserAddr::new(len_ptr))
     }
     #[cfg(not(feature = "smoltcp"))]
     {
@@ -2219,13 +2250,14 @@ pub(super) fn dispatch_shutdown(fd: u32, how: i32) -> u64 {
 }
 
 /// `recvmsg(2)`.
-pub(super) fn dispatch_recvmsg(fd: u32, msg_ptr: u64, flags: i32) -> u64 {
+pub(super) fn dispatch_recvmsg(fd: u32, msg_ptr: UserAddr, flags: i32) -> u64 {
+    let msg_ptr = msg_ptr.get();
     if fd_is_unix_socket(fd) {
-        return unix_recvmsg_entry(fd, msg_ptr, flags);
+        return unix_recvmsg_entry(fd, UserAddr::new(msg_ptr), flags);
     }
     #[cfg(feature = "smoltcp")]
     {
-        sys_recvmsg(fd, msg_ptr, flags)
+        sys_recvmsg(fd, UserAddr::new(msg_ptr), flags)
     }
     #[cfg(not(feature = "smoltcp"))]
     {

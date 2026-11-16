@@ -763,29 +763,29 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         // channel already uses. See `net::dispatch_socket` and
         // docs/archive/UNIX_SOCKET_IMPROVEMENTS.md.
         nr::SOCKET => net::dispatch_socket(args[0] as i32, args[1] as i32, args[2] as i32),
-        nr::SOCKETPAIR => net::sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, args[3]),
-        nr::BIND => net::dispatch_bind(args[0] as u32, args[1], args[2] as usize),
+        nr::SOCKETPAIR => net::sys_socketpair(args[0] as i32, args[1] as i32, args[2] as i32, UserAddr::new(args[3])),
+        nr::BIND => net::dispatch_bind(args[0] as u32, UserAddr::new(args[1]), args[2] as usize),
         nr::LISTEN => net::dispatch_listen(args[0] as u32, args[1] as i32),
         // `accept` is `accept4` with flags == 0; one path serves both.
-        nr::ACCEPT => net::dispatch_accept(args[0] as u32, args[1], args[2], 0),
-        nr::ACCEPT4 => net::dispatch_accept(args[0] as u32, args[1], args[2], args[3] as u32),
-        nr::CONNECT => net::dispatch_connect(args[0] as u32, args[1], args[2] as usize),
+        nr::ACCEPT => net::dispatch_accept(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2]), 0),
+        nr::ACCEPT4 => net::dispatch_accept(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as u32),
+        nr::CONNECT => net::dispatch_connect(args[0] as u32, UserAddr::new(args[1]), args[2] as usize),
         // Always dispatched (both smoltcp and rump-only builds define these): the
         // rump-only variants handle a UnixSocket (pipe-backed) fd — the box-0
         // rump_server's fd-3 sysproxy channel uses send()/recv() on it — and EBADF
         // anything else. Gating these to net_enetdown() breaks the rump handshake.
-        nr::SENDTO => net::sys_sendto(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5] as usize),
-        nr::RECVFROM => net::sys_recvfrom(args[0] as u32, args[1], args[2] as usize, args[3] as i32, args[4], args[5]),
-        nr::GETSOCKNAME => net::dispatch_getsockname(args[0] as u32, args[1], args[2]),
-        nr::GETPEERNAME => net::dispatch_getpeername(args[0] as u32, args[1], args[2]),
+        nr::SENDTO => net::sys_sendto(args[0] as u32, UserAddr::new(args[1]), args[2] as usize, args[3] as i32, args[4], args[5] as usize),
+        nr::RECVFROM => net::sys_recvfrom(args[0] as u32, UserAddr::new(args[1]), args[2] as usize, args[3] as i32, args[4], UserAddr::new(args[5])),
+        nr::GETSOCKNAME => net::dispatch_getsockname(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2])),
+        nr::GETPEERNAME => net::dispatch_getpeername(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2])),
         nr::SETSOCKOPT => net::dispatch_setsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4] as u32),
         nr::GETSOCKOPT => net::dispatch_getsockopt(args[0] as u32, args[1] as i32, args[2] as i32, args[3], args[4]),
         nr::SHUTDOWN => net::dispatch_shutdown(args[0] as u32, args[1] as i32),
         // Always dispatched: the rump-only variant handles the box-0 rump_server's
         // fd-3 UnixSocket channel (dosend → sendmsg for the handshake RESP + all
         // proxied-syscall replies). Gating it to net_enetdown() breaks rump entirely.
-        nr::SENDMSG => net::sys_sendmsg(args[0] as u32, args[1], args[2] as i32),
-        nr::RECVMSG => net::dispatch_recvmsg(args[0] as u32, args[1], args[2] as i32),
+        nr::SENDMSG => net::sys_sendmsg(args[0] as u32, UserAddr::new(args[1]), args[2] as i32),
+        nr::RECVMSG => net::dispatch_recvmsg(args[0] as u32, UserAddr::new(args[1]), args[2] as i32),
         nr::MREMAP => mem::sys_mremap(args[0] as usize, args[1] as usize, args[2] as usize, args[3] as u32),
         nr::MMAP => mem::sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32, args[4] as i32, args[5] as usize),
         nr::MUNMAP => mem::sys_munmap(args[0] as usize, args[1] as usize),
@@ -801,7 +801,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "akuma-native")]
         nr::AKUMA_GET_VERSION => version::sys_akuma_get_version(),
         #[cfg(all(feature = "akuma-native", feature = "smoltcp"))]
-        nr::RESOLVE_HOST => net::sys_resolve_host(args[0], args[1] as usize, args[2]),
+        nr::RESOLVE_HOST => net::sys_resolve_host(UserAddr::new(args[0]), args[1] as usize, UserAddr::new(args[2])),
         #[cfg(all(feature = "akuma-native", not(feature = "smoltcp")))]
         nr::RESOLVE_HOST => net_enetdown(),
         nr::GETDENTS64 => fs::sys_getdents64(args[0] as u32, args[1], args[2] as usize),

@@ -167,7 +167,8 @@ fn current_creds() -> Ucred {
 /// `addrlen` is taken from the caller and used as the delimiter, which is what
 /// makes abstract names work at all — but it is also a userspace-controlled
 /// length, so it is clamped to `sizeof(sockaddr_un)` before anything reads it.
-fn read_sockaddr(addr_ptr: u64, addrlen: usize) -> Result<UnixName, Errno> {
+fn read_sockaddr(addr_ptr: UserAddr, addrlen: usize) -> Result<UnixName, Errno> {
+    let addr_ptr = addr_ptr.get();
     if addrlen < 2 {
         return Err(Errno::EINVAL);
     }
@@ -188,7 +189,9 @@ fn read_sockaddr(addr_ptr: u64, addrlen: usize) -> Result<UnixName, Errno> {
 /// Write a name back out as `sockaddr_un` + `addrlen`, truncating to the
 /// caller's buffer the way `getsockname(2)` specifies: the *untruncated*
 /// length is what gets reported, so a caller with a short buffer can tell.
-fn write_sockaddr(name: &UnixName, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
+fn write_sockaddr(name: &UnixName, addr_ptr: UserAddr, addrlen_ptr: UserAddr) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let addrlen_ptr = addrlen_ptr.get();
     if addr_ptr == 0 || addrlen_ptr == 0 {
         return 0;
     }
@@ -514,11 +517,12 @@ pub fn socketpair_rollback(a: u32, b: u32) {
 /// were created first and the table claim then failed with `EADDRINUSE`, the
 /// failed `bind` would have left a file behind that nothing owns — the exact
 /// stale node that makes the *next* daemon start look like a live conflict.
-pub fn sys_bind(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
+pub fn sys_bind(fd: u32, addr_ptr: UserAddr, addrlen: usize) -> SysResult {
+    let addr_ptr = addr_ptr.get();
     let Some(sock) = fd_sock(fd) else {
         return if fd_parts(fd).is_some() { Err(Errno::EOPNOTSUPP) } else { Err(Errno::ENOTSOCK) };
     };
-    let name = read_sockaddr(addr_ptr, addrlen)?;
+    let name = read_sockaddr(UserAddr::new(addr_ptr), addrlen)?;
     // Binding a path creates a directory entry, so it needs write and search on
     // the parent (`EACCES`), checked before the name is claimed in the table.
     if let Some(p) = name.path_bytes().and_then(|b| core::str::from_utf8(b).ok())
@@ -601,11 +605,12 @@ pub fn sys_listen(fd: u32, backlog: i32) -> u64 {
 /// client may write its request immediately and have it buffered. Linux behaves
 /// this way and clients rely on it — deferring the wiring to `accept` would
 /// lose every byte written in between.
-pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
+pub fn sys_connect(fd: u32, addr_ptr: UserAddr, addrlen: usize) -> SysResult {
+    let addr_ptr = addr_ptr.get();
     let Some(sock) = fd_sock(fd) else {
         return if fd_parts(fd).is_some() { Err(Errno::EOPNOTSUPP) } else { Err(Errno::ENOTSOCK) };
     };
-    let name = read_sockaddr(addr_ptr, addrlen)?;
+    let name = read_sockaddr(UserAddr::new(addr_ptr), addrlen)?;
     let creds = current_creds();
     let nonblock = super::net::fd_is_nonblock(fd);
 
@@ -669,7 +674,9 @@ pub fn sys_connect(fd: u32, addr_ptr: u64, addrlen: usize) -> SysResult {
 /// Blocking is a check-register-park loop with the table lock dropped across
 /// the park ([`accept_wait_slot`]); holding it would wedge every other core's
 /// AF_UNIX traffic for the duration of an idle server's wait.
-pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
+pub fn sys_accept(fd: u32, addr_ptr: UserAddr, addrlen_ptr: UserAddr, flags: u32) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let addrlen_ptr = addrlen_ptr.get();
     let Some(listener) = fd_sock(fd) else {
         return if fd_parts(fd).is_some() { EOPNOTSUPP } else { ENOTSOCK };
     };
@@ -740,7 +747,7 @@ pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
         proc.set_nonblock(new_fd);
     }
     if want_addr {
-        let r = write_sockaddr(&peer_name, addr_ptr, addrlen_ptr);
+        let r = write_sockaddr(&peer_name, UserAddr::new(addr_ptr), UserAddr::new(addrlen_ptr));
         if r != 0 {
             // The fd is already installed; tearing it down here would race a
             // concurrent dup. Report the fault and leave the connection —
@@ -761,7 +768,9 @@ pub fn sys_accept(fd: u32, addr_ptr: u64, addrlen_ptr: u64, flags: u32) -> u64 {
 /// `getsockname(2)`. An unbound socket — including every `socketpair`
 /// endpoint — reports `addrlen == 2` and no path, which is what Linux reports
 /// and what the pre-table code answered `EBADF` to.
-pub fn sys_getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
+pub fn sys_getsockname(fd: u32, addr_ptr: UserAddr, addrlen_ptr: UserAddr) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let addrlen_ptr = addrlen_ptr.get();
     let Some((_, _, sock)) = fd_parts(fd) else {
         return ENOTSOCK;
     };
@@ -770,18 +779,20 @@ pub fn sys_getsockname(fd: u32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
     } else {
         with_table(|t| t.get(sock).map_or(UnixName::Unnamed, |s| s.name.clone()))
     };
-    write_sockaddr(&name, addr_ptr, addrlen_ptr)
+    write_sockaddr(&name, UserAddr::new(addr_ptr), UserAddr::new(addrlen_ptr))
 }
 
 /// `getpeername(2)`. `ENOTCONN` for a socket with no peer — a distinction a
 /// client uses to tell "not connected yet" from "connected to an unnamed peer".
-pub fn sys_getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
+pub fn sys_getpeername(fd: u32, addr_ptr: UserAddr, addrlen_ptr: UserAddr) -> u64 {
+    let addr_ptr = addr_ptr.get();
+    let addrlen_ptr = addrlen_ptr.get();
     let Some((_, _, sock)) = fd_parts(fd) else {
         return ENOTSOCK;
     };
     if sock == 0 {
         // A pre-table socketpair endpoint: connected, peer unnamed.
-        return write_sockaddr(&UnixName::Unnamed, addr_ptr, addrlen_ptr);
+        return write_sockaddr(&UnixName::Unnamed, UserAddr::new(addr_ptr), UserAddr::new(addrlen_ptr));
     }
     let Some((state, name)) =
         with_table(|t| t.get(sock).map(|s| (s.state, s.peer_name.clone())))
@@ -791,7 +802,7 @@ pub fn sys_getpeername(fd: u32, addr_ptr: u64, addrlen_ptr: u64) -> u64 {
     if state != SockState::Connected {
         return ENOTCONN;
     }
-    write_sockaddr(&name, addr_ptr, addrlen_ptr)
+    write_sockaddr(&name, UserAddr::new(addr_ptr), UserAddr::new(addrlen_ptr))
 }
 
 // ============================================================================
@@ -1137,11 +1148,12 @@ fn deliver_datagram(queue: u32, data: &[u8], nonblock: bool, mut anc: InFlight) 
 /// `Ok(None)` means "no destination given", which for a connected socket is
 /// normal and for an unconnected datagram socket becomes `EDESTADDRREQ` further
 /// down — a distinction the caller must not collapse.
-pub fn read_dest(addr_ptr: u64, addrlen: usize) -> Result<Option<UnixName>, Errno> {
+pub fn read_dest(addr_ptr: UserAddr, addrlen: usize) -> Result<Option<UnixName>, Errno> {
+    let addr_ptr = addr_ptr.get();
     if addr_ptr == 0 || addrlen == 0 {
         return Ok(None);
     }
-    read_sockaddr(addr_ptr, addrlen).map(Some)
+    read_sockaddr(UserAddr::new(addr_ptr), addrlen).map(Some)
 }
 
 /// Write to a pipe honouring `O_NONBLOCK`, for the no-table-entry path.
