@@ -68,6 +68,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::arch::global_asm;
+#[cfg(kernel_tests)]
 use core::sync::atomic::{AtomicBool, Ordering};
 #[cfg(target_arch = "aarch64")]
 use akuma_primitives::preempt::set_user_copy_fault_handler;
@@ -446,10 +447,12 @@ pub const USER_VA_LIMIT: u64 = 0x0000_7FFF_FFFF_FFFF;
 /// thread's slot. **Still open** from that item: the pairs are hand-written, so an
 /// abnormal exit between a `store(true)` and its `store(false)` leaves that thread's
 /// slot on — an RAII guard is what closes it.
+#[cfg(kernel_tests)]
 pub struct BypassValidation {
     per_thread: [AtomicBool; akuma_primitives::preempt::MAX_THREADS],
 }
 
+#[cfg(kernel_tests)]
 impl BypassValidation {
     const fn new() -> Self {
         Self { per_thread: [const { AtomicBool::new(false) }; akuma_primitives::preempt::MAX_THREADS] }
@@ -485,9 +488,11 @@ impl BypassValidation {
     }
 }
 
+#[cfg(kernel_tests)]
 pub static BYPASS_VALIDATION: BypassValidation = BypassValidation::new();
 
 /// Set once, by [`seal_bypass`]; never cleared.
+#[cfg(kernel_tests)]
 static BYPASS_SEALED: AtomicBool = AtomicBool::new(false);
 
 /// End the boot self-tests' right to pass kernel addresses as user pointers,
@@ -500,8 +505,27 @@ static BYPASS_SEALED: AtomicBool = AtomicBool::new(false);
 /// from a hand-paired window included) and `store(true)` does nothing, so no
 /// later bug can turn a user-supplied kernel address into a kernel write
 /// (`docs/archive/SECURITY_AUDIT_2026_11_16.md` M7).
+#[cfg(kernel_tests)]
 pub fn seal_bypass() {
     BYPASS_SEALED.store(true, Ordering::Release);
+}
+
+/// Without the boot self-tests there is no bypass to seal: a no-op, so the kernels call it unconditionally.
+#[cfg(not(kernel_tests))]
+pub fn seal_bypass() {}
+
+/// Whether the calling thread is inside a bypass window. `false` forever in an image built without the self-tests
+/// (`no-tests`), where the flag itself does not exist and the checks below compile to nothing.
+#[cfg(kernel_tests)]
+#[inline]
+fn bypassed() -> bool {
+    BYPASS_VALIDATION.load(Ordering::Acquire)
+}
+
+#[cfg(not(kernel_tests))]
+#[inline(always)]
+const fn bypassed() -> bool {
+    false
 }
 
 /// RAII form of [`BYPASS_VALIDATION`]: on for the calling thread until dropped, and
@@ -512,12 +536,14 @@ pub fn seal_bypass() {
 /// panic between a pair leaves that thread's bypass on for whatever runs in the
 /// thread next. Prefer this at any new site.
 #[must_use]
+#[cfg(kernel_tests)]
 pub struct BypassValidationGuard {
     prev: bool,
     /// Restores *this* core's/thread's state on drop, so it must drop where it was made: `!Send`.
     _not_send: core::marker::PhantomData<*mut ()>,
 }
 
+#[cfg(kernel_tests)]
 impl BypassValidationGuard {
     /// Bypass user-pointer validation on this thread until the guard drops.
     pub fn new() -> Self {
@@ -527,12 +553,14 @@ impl BypassValidationGuard {
     }
 }
 
+#[cfg(kernel_tests)]
 impl Default for BypassValidationGuard {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(kernel_tests)]
 impl Drop for BypassValidationGuard {
     fn drop(&mut self) {
         BYPASS_VALIDATION.store(self.prev, Ordering::Release);
@@ -607,7 +635,7 @@ pub const fn cstr_chunk_len(at: u64, remaining: usize, buf_len: usize) -> usize 
 /// the copy helpers can call it, which is what makes the check unskippable.
 #[must_use]
 pub fn validate_user_range(ptr: u64, len: usize, prefault: Prefault) -> bool {
-    if BYPASS_VALIDATION.load(Ordering::Acquire) {
+    if bypassed() {
         return true;
     }
     if !user_range_ok(ptr, len) {
@@ -811,7 +839,7 @@ pub fn copy_from_user_with(dst: &mut [u8], src_user: u64, prefault: Prefault) ->
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
 fn upper_half_range_ok(ptr: u64, len: usize) -> bool {
     user_range_ok(ptr, len)
-        || (BYPASS_VALIDATION.load(Ordering::Acquire) && ptr.checked_add(len as u64).is_some())
+        || (bypassed() && ptr.checked_add(len as u64).is_some())
 }
 
 /// Copy from user memory at `src_user` into `dst` with **no page-table walk**: the range check, then the
@@ -901,7 +929,7 @@ pub struct UserCStr {
 ///
 /// `max_len` is a kernel-side bound the caller chose; the heap only grows as bytes are actually read.
 pub fn read_user_cstr(ptr: u64, max_len: usize) -> Result<UserCStr, Errno> {
-    let bypass = BYPASS_VALIDATION.load(Ordering::Acquire);
+    let bypass = bypassed();
     if ptr < 0x1000 || (!bypass && ptr >= USER_VA_LIMIT) {
         return Err(EFAULT);
     }
@@ -1234,6 +1262,7 @@ mod tests {
     /// shares slot 0 and two of these running on cargo's test threads would race
     /// each other on the very state they assert about.
     #[test]
+    #[cfg(kernel_tests)]
     fn bypass_guard_restores_and_nests() {
         assert!(!BYPASS_VALIDATION.load(Ordering::Acquire), "must start off");
 

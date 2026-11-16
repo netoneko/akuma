@@ -1673,12 +1673,9 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     let req = super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
     let stdin_data = if stdin_ptr != 0 {
         if stdin_len > SPAWN_STDIN_MAX { return Err(E2BIG); }
-        if !BYPASS_VALIDATION.load(Ordering::Acquire)
-            && !validate_user_ptr(stdin_ptr, stdin_len) { return Err(EFAULT); }
-        let mut data = alloc::vec![0u8; stdin_len];
-        if copy_from_user(&mut data, stdin_ptr).is_err() {
-            return Err(EFAULT);
-        }
+        // Bounded above, then validated and copied in one step. The explicit `validate_user_ptr` that used to precede
+        // this skipped itself under the self-tests' bypass, and `copy_from_user` validates anyway.
+        let Ok(data) = read_user_vec(stdin_ptr, stdin_len, SPAWN_STDIN_MAX) else { return Err(EFAULT) };
         Some(data)
     } else {
         None

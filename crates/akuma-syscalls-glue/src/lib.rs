@@ -328,6 +328,7 @@ pub mod syscall_counters {
 /// Re-export: the flag moved to `akuma_exec::process::user_access` with the check it
 /// disables, so the copy helpers can honour it. The ~50 boot-test call sites keep
 /// spelling it `crate::BYPASS_VALIDATION`.
+#[cfg(kernel_tests)]
 pub use akuma_exec::process::user_access::BYPASS_VALIDATION;
 
 /// Syscall numbers (Linux-compatible subset).

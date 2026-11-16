@@ -268,7 +268,15 @@ fn range_ok_or_bypassed(ptr: u64, len: u64) -> bool {
     if range_ok(ptr, len) {
         return true;
     }
-    akuma_user_access::BYPASS_VALIDATION.load(Ordering::Acquire) && ptr.checked_add(len).is_some()
+    // The bypass only exists in an image that carries the boot self-tests.
+    #[cfg(not(feature = "no-tests"))]
+    {
+        akuma_user_access::BYPASS_VALIDATION.load(Ordering::Acquire) && ptr.checked_add(len).is_some()
+    }
+    #[cfg(feature = "no-tests")]
+    {
+        false
+    }
 }
 
 /// Copy `dst.len()` bytes in from user address `ptr`. `false` on a bad range

@@ -21,3 +21,8 @@ workspace = true
 akuma-pod = { path = "../akuma-pod" }
 akuma-primitives = { path = "../akuma-primitives" }
 akuma-mmu = { path = "../akuma-mmu" }
+
+[features]
+# Opt-out of the boot self-tests' validation bypass (`BYPASS_VALIDATION`, `BypassValidationGuard`): with it, none of
+# that code is compiled. See `build.rs`.
+no-tests = []
