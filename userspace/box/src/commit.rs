@@ -212,6 +212,12 @@ pub fn cmd_commit(args: libakuma::Args) -> ! {
         print("Usage: box commit <container> <image>\n");
         exit(1);
     };
+    if !boxlib::paths::valid_container_name(container) {
+        print("box commit: invalid container name '");
+        print(container);
+        print("'\n");
+        exit(1);
+    }
     let Some(parent_store) = fsx::read_text(&images::container_image_file(container)) else {
         print("box commit: no container named '");
         print(container);

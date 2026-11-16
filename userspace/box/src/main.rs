@@ -31,7 +31,7 @@ mod tests;
 
 use boxlib::{boxes, spec};
 use boxlib::sys::{self, SpawnOptions, spawn_ext};
-use libakuma::{exit, print, args, open, read_fd, write_fd, close, open_flags, waitpid, println, read_dir, mkdir, fstat, mkdir_p, get_cpu_stats, ThreadCpuStat};
+use libakuma::{exit, print, args, waitpid_status, println, mkdir, mkdir_p, get_cpu_stats, ThreadCpuStat};
 use alloc::vec::Vec;
 use alloc::string::String;
 use alloc::format;
@@ -103,17 +103,10 @@ fn print_usage() {
 /// `/proc/boxes` in full, or an empty string if it cannot be read — which is
 /// the normal answer inside a box, where the file does not exist.
 pub(crate) fn read_proc_boxes() -> String {
-    let fd = open("/proc/boxes", open_flags::O_RDONLY);
-    if fd < 0 {
-        return String::new();
-    }
-    let mut buf = [0u8; 2048];
-    let n = read_fd(fd, &mut buf);
-    close(fd);
-    if n <= 0 {
-        return String::new();
-    }
-    String::from(core::str::from_utf8(&buf[..n as usize]).unwrap_or(""))
+    // Read to EOF: one 2 KiB read used to cut the table off after a couple of
+    // dozen boxes, and every box past the cut was "not found" to `use`,
+    // `grab`, `close` and `show`, and missing from `ps`.
+    fsx::read_text("/proc/boxes").unwrap_or_default()
 }
 
 /// Every thread slot the kernel will report, not the first 64 of them.
@@ -236,7 +229,7 @@ fn cmd_open(args: libakuma::Args) -> ! {
                 }
 
                 loop {
-                    if let Some((_, code)) = waitpid(res.pid) { exit(code); }
+                    if let Some(st) = waitpid_status(res.pid) { exit(st.shell_code()); }
                     libakuma::sleep_ms(100);
                 }
             }
@@ -305,7 +298,7 @@ fn cmd_use(args: libakuma::Args) -> ! {
                     exit(1);
                 }
                 loop {
-                    if let Some((_, code)) = waitpid(res.pid) { exit(code); }
+                    if let Some(st) = waitpid_status(res.pid) { exit(st.shell_code()); }
                     libakuma::sleep_ms(100);
                 }
             } else {
@@ -348,10 +341,14 @@ fn cmd_grab(mut args: libakuma::Args) -> ! {
         print("box grab: target box not found\n"); exit(1);
     });
 
-    let specific_pid = positional.next().and_then(|s| {
-        let mut p = 0u32;
-        for b in s.as_bytes() { if *b >= b'0' && *b <= b'9' { p = p * 10 + (*b - b'0') as u32; } }
-        if p > 0 { Some(p) } else { None }
+    // A pid is digits and nothing else: `12a3` used to read as 123, a
+    // different process, and an overlong one overflowed.
+    let specific_pid = positional.next().map(|s| match s.parse::<u32>() {
+        Ok(p) if p > 0 => p,
+        _ => {
+            print("box grab: not a pid: '"); print(s); print("'\n");
+            exit(1);
+        }
     });
 
     let pid_to_grab = if let Some(p) = specific_pid {
@@ -410,8 +407,8 @@ fn cmd_grab(mut args: libakuma::Args) -> ! {
     let rc = libakuma::reattach(pid_to_grab, detach);
     if rc == 0 {
         loop {
-            if let Some((_, code)) = waitpid(pid_to_grab) { exit(code); }
-            // `waitpid` only ever reports a real child's exit — the grabbed
+            if let Some(st) = waitpid_status(pid_to_grab) { exit(st.shell_code()); }
+            // `waitpid_status` only ever reports a real child's exit — the grabbed
             // process usually isn't one, so it always returns `None` here
             // regardless of whether the target is still alive. Fall back to
             // a plain existence probe (`kill(pid, 0)`) so this loop actually
@@ -435,54 +432,72 @@ fn cmd_grab(mut args: libakuma::Args) -> ! {
     }
 }
 
-fn copy_file(src: &str, dst: &str) -> bool {
-    let sfd = open(src, open_flags::O_RDONLY);
-    if sfd < 0 { return false; }
-    let mut success = false;
-    if let Ok(stat) = fstat(sfd) {
-        let size = stat.st_size as usize;
-        let mut buf = Vec::with_capacity(size);
-        buf.resize(size, 0);
-        
-        let mut total_read = 0;
-        while total_read < size {
-            let n = read_fd(sfd, &mut buf[total_read..]);
-            if n <= 0 { break; }
-            total_read += n as usize;
-        }
-
-        let dfd = open(dst, open_flags::O_WRONLY | open_flags::O_CREAT | open_flags::O_TRUNC);
-        if dfd >= 0 {
-            if total_read > 0 { let _ = write_fd(dfd, &buf[..total_read]); }
-            close(dfd);
-            success = total_read == size;
-        }
-    }
-    close(sfd);
-    success
-}
-
-fn copy_recursive(src: &str, dst: &str) {
-    if let Some(entries) = read_dir(src) {
-        for entry in entries {
-            let src_path = format!("{}/{}", src, entry.name);
-            let dst_path = format!("{}/{}", dst, entry.name);
-            if entry.is_dir {
+/// Copy the tree under `src` into `dst`, returning how many entries failed.
+///
+/// Types come from `lstat`, so a symlink is recreated as a symlink rather than
+/// followed (a link to `/` used to be descended into, copying the host into the
+/// target until something gave out), and permission bits are carried over (a
+/// copied binary used to land `0644` and could not be run). Files stream
+/// through `fsx::copy_file` rather than being read whole into memory.
+fn copy_recursive(src: &str, dst: &str) -> usize {
+    let mut failed = 0;
+    for (name, _) in fsx::list_sorted(src) {
+        let src_path = format!("{}/{}", src, name);
+        let dst_path = format!("{}/{}", dst, name);
+        let Ok(st) = fsx::lstat(&src_path) else {
+            print("box cp: cannot stat "); print(&src_path); print("\n");
+            failed += 1;
+            continue;
+        };
+        let mode = st.st_mode & 0o7777;
+        match st.st_mode & fsx::S_IFMT {
+            fsx::S_IFDIR => {
                 let _ = mkdir(&dst_path);
-                copy_recursive(&src_path, &dst_path);
-            } else {
-                copy_file(&src_path, &dst_path);
+                failed += copy_recursive(&src_path, &dst_path);
+                libakuma::chmod(&dst_path, mode);
+            }
+            fsx::S_IFLNK => match libakuma::readlink(&src_path) {
+                Some(target) if libakuma::symlink(&target, &dst_path) >= 0 => {}
+                _ => {
+                    print("box cp: cannot copy symlink "); print(&src_path); print("\n");
+                    failed += 1;
+                }
+            },
+            fsx::S_IFREG => match fsx::copy_file(&src_path, &dst_path) {
+                Ok(_) => {
+                    libakuma::chmod(&dst_path, mode);
+                }
+                Err(e) => {
+                    print("box cp: "); print(&e); print("\n");
+                    failed += 1;
+                }
+            },
+            // Devices, fifos, sockets: not something a rootfs copy can recreate here.
+            _ => {
+                print("box cp: skipping special file "); print(&src_path); print("\n");
             }
         }
     }
+    failed
 }
 
 fn cmd_cp(mut args: libakuma::Args) -> ! {
     let src = match args.next() { Some(s) => s, None => { print("Usage: box cp <src> <dest>\n"); exit(1); } };
     let dst = match args.next() { Some(d) => d, None => { print("Usage: box cp <src> <dest>\n"); exit(1); } };
+    if !images::dir_exists(src) {
+        print("box cp: "); print(src); print(" is not a directory\n");
+        exit(1);
+    }
     print("box: copying "); print(src); print(" to "); print(dst); print("...\n");
-    let _ = mkdir_p(dst);
-    copy_recursive(src, dst);
+    if !mkdir_p(dst) {
+        print("box cp: cannot create "); print(dst); print("\n");
+        exit(1);
+    }
+    let failed = copy_recursive(src, dst);
+    if failed > 0 {
+        print("box cp: "); libakuma::print_dec(failed); print(" entries could not be copied\n");
+        exit(1);
+    }
     exit(0);
 }
 

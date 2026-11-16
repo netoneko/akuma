@@ -352,6 +352,83 @@ pub fn strip_gzip_header(data: &[u8]) -> Option<&[u8]> {
     Some(&data[pos..end])
 }
 
+/// What the filesystem holds at a path under the extraction root, as far as
+/// [`resolve_in_root`] needs to know.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathState {
+    /// Absent, or anything but a symlink.
+    NotLink,
+    /// A symlink with this target.
+    Link(String),
+    /// A symlink whose target cannot be read (not UTF-8, too long).
+    Unreadable,
+}
+
+/// The most symlinks one path may pass through, Linux's `MAXSYMLINKS`.
+pub const MAX_SYMLINK_HOPS: usize = 40;
+
+/// Where entry `rel` (relative to the extraction root, already
+/// [`is_path_safe`]) really goes: its parent directories resolved the way a
+/// chroot at the root would resolve them, so the result is a path under the
+/// root with no symlink in any directory component. `None` for a symlink
+/// loop or an unreadable link: the entry is refused.
+///
+/// This is what keeps an archive from writing outside the target through a
+/// link it planted itself. `is_path_safe` alone checks only the entry's own
+/// name: a layer holding `etc -> /etc` and then `etc/passwd` passed it, and
+/// the second entry was written through the link onto the host's
+/// `/etc/passwd` — as root, by `box pull`
+/// (`userspace/box/docs/ISSUES_2026_11_16.md` B1). Docker resolves in-root
+/// links the same way (it extracts under a chroot), so an image whose later
+/// layer writes through `bin -> usr/bin` still lands where it should.
+///
+/// The final component is returned unresolved: the caller replaces a symlink
+/// there instead of writing through it.
+///
+/// `state(p)` reports what is at root-relative path `p`.
+pub fn resolve_in_root(rel: &str, mut state: impl FnMut(&str) -> PathState) -> Option<String> {
+    let comps: Vec<&str> = rel.split('/').filter(|c| !c.is_empty() && *c != ".").collect();
+    let Some((last, parents)) = comps.split_last() else {
+        return Some(String::new()); // the root itself (`.`)
+    };
+    let mut pending: Vec<String> = parents.iter().rev().map(|c| String::from(*c)).collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut hops = 0;
+    while let Some(c) = pending.pop() {
+        if c.is_empty() || c == "." {
+            continue;
+        }
+        if c == ".." {
+            out.pop(); // `..` at the root stays at the root, as under chroot
+            continue;
+        }
+        out.push(c);
+        let here = out.join("/");
+        match state(&here) {
+            PathState::NotLink => {}
+            PathState::Unreadable => return None,
+            PathState::Link(target) => {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return None;
+                }
+                out.pop();
+                if target.starts_with('/') {
+                    out.clear();
+                }
+                for t in target.split('/').rev() {
+                    pending.push(String::from(t));
+                }
+            }
+        }
+    }
+    if *last == ".." {
+        return None;
+    }
+    out.push(String::from(*last));
+    Some(out.join("/"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,5 +623,63 @@ mod tests {
         h[108..116].copy_from_slice(&[0x80, 0, 0, 0, 0, 0x01, 0x11, 0x70]);
         fix_checksum(&mut h);
         assert_eq!(parse_header(&h).unwrap().uid, 70_000);
+    }
+
+    fn fs<'a>(links: &'a [(&'a str, &'a str)]) -> impl FnMut(&str) -> PathState + 'a {
+        move |p| match links.iter().find(|(l, _)| *l == p) {
+            Some((_, t)) => PathState::Link(String::from(*t)),
+            None => PathState::NotLink,
+        }
+    }
+
+    #[test]
+    fn plain_paths_resolve_to_themselves() {
+        assert_eq!(resolve_in_root("usr/bin/env", fs(&[])).as_deref(), Some("usr/bin/env"));
+        assert_eq!(resolve_in_root("./a//b/./c", fs(&[])).as_deref(), Some("a/b/c"));
+        assert_eq!(resolve_in_root("file", fs(&[])).as_deref(), Some("file"));
+        assert_eq!(resolve_in_root(".", fs(&[])).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn an_absolute_link_is_rerooted_not_followed_out() {
+        // The 2026-11-16 escape: `etc -> /etc`, then `etc/passwd`. Re-rooted,
+        // that link names itself - a loop, as it is under chroot - so the
+        // entry is refused rather than written anywhere.
+        assert_eq!(resolve_in_root("etc/passwd", fs(&[("etc", "/etc")])), None);
+        assert_eq!(resolve_in_root("x/shadow", fs(&[("x", "/etc")])).as_deref(), Some("etc/shadow"));
+        assert_eq!(resolve_in_root("r/etc/passwd", fs(&[("r", "/")])).as_deref(), Some("etc/passwd"));
+    }
+
+    #[test]
+    fn a_relative_link_cannot_climb_above_the_root() {
+        let links = [("a", "../../../../.."), ("a/b", "x")];
+        assert_eq!(resolve_in_root("a/etc/passwd", fs(&links[..1])).as_deref(), Some("etc/passwd"));
+        assert_eq!(resolve_in_root("d/up/f", fs(&[("d/up", "../../..")])).as_deref(), Some("f"));
+    }
+
+    #[test]
+    fn merged_usr_links_land_inside() {
+        let links = [("bin", "usr/bin"), ("lib", "/usr/lib")];
+        assert_eq!(resolve_in_root("bin/sh", fs(&links)).as_deref(), Some("usr/bin/sh"));
+        assert_eq!(resolve_in_root("lib/x/y.so", fs(&links)).as_deref(), Some("usr/lib/x/y.so"));
+    }
+
+    #[test]
+    fn chained_links_resolve() {
+        let links = [("a", "b"), ("b", "c/d"), ("c/d", "/e")];
+        assert_eq!(resolve_in_root("a/f", fs(&links)).as_deref(), Some("e/f"));
+    }
+
+    #[test]
+    fn the_final_component_is_left_for_the_caller() {
+        // A link named by the entry itself is replaced, not followed.
+        assert_eq!(resolve_in_root("etc", fs(&[("etc", "/etc")])).as_deref(), Some("etc"));
+    }
+
+    #[test]
+    fn loops_and_unreadable_links_are_refused() {
+        assert_eq!(resolve_in_root("a/f", fs(&[("a", "a")])), None);
+        assert_eq!(resolve_in_root("a/f", fs(&[("a", "b"), ("b", "a")])), None);
+        assert_eq!(resolve_in_root("a/f", |_| PathState::Unreadable), None);
     }
 }

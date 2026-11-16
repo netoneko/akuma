@@ -125,9 +125,54 @@ pub fn sanitize_name(image_str: &str) -> String {
             s = rest;
         }
     }
-    s.chars()
+    let mut out: String = s
+        .chars()
         .map(|c| if c == '/' || c == ':' { '-' } else { c })
-        .collect()
+        .collect();
+    // The result is a directory name under `IMAGES_BASE`. `.` and `..` (and
+    // any dot-led name) are not image names Docker accepts, and `..` made
+    // `box rmi ..` remove the whole of `/var/lib/box`. A leading dot becomes
+    // `_`, and an empty name is `_` too, so the result is always one ordinary
+    // path component.
+    if out.starts_with('.') {
+        out.replace_range(..1, "_");
+    }
+    if out.is_empty() {
+        out.push('_');
+    }
+    out
+}
+
+/// The name `box run` gives a container it was not given one for:
+/// `<store>-<stamp>`, with anything [`valid_container_name`] would refuse
+/// mapped to `-` (a digest reference's `@`) and a `c` in front of a name that
+/// does not start with a letter or digit (a store name sanitized from `.x`).
+#[must_use]
+pub fn default_container_name(store: &str, stamp: u64) -> String {
+    let mut name: String = store
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '-' })
+        .collect();
+    if !name.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric) {
+        name.insert(0, 'c');
+    }
+    name.truncate(100);
+    alloc::format!("{name}-{stamp}")
+}
+
+/// Whether `name` may name a container (`box run --name`, `box commit`).
+///
+/// Docker's rule, `[a-zA-Z0-9][a-zA-Z0-9_.-]*`, capped at 128 bytes. The
+/// name is a directory under `CONTAINERS_BASE`, and `box run --rm` deletes
+/// that directory when the container ends: an unchecked `--name ../../..`
+/// pointed the delete at `/`.
+#[must_use]
+pub fn valid_container_name(name: &str) -> bool {
+    let b = name.as_bytes();
+    !b.is_empty()
+        && b.len() <= 128
+        && b[0].is_ascii_alphanumeric()
+        && b.iter().all(|&c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b'-'))
 }
 
 /// The `layers` file's contents: one digest per line, base-first, as the
@@ -286,5 +331,36 @@ mod tests {
         let digests = vec![String::from("sha256:only")];
         assert_eq!(lowerdirs(&digests), ["/var/lib/box/layers/sha256-only"]);
         assert!(lowerdirs(&[]).is_empty());
+    }
+
+    #[test]
+    fn store_names_are_one_ordinary_component() {
+        assert_eq!(sanitize_name(".."), "_.");
+        assert_eq!(sanitize_name("."), "_");
+        assert_eq!(sanitize_name(".hidden"), "_hidden");
+        assert_eq!(sanitize_name(""), "_");
+        assert_eq!(sanitize_name("../../x"), "_.-..-x");
+        assert_eq!(sanitize_name("busybox"), "busybox");
+    }
+
+    #[test]
+    fn container_names_follow_dockers_rule() {
+        for ok in ["web", "busybox-123456", "a.b_c-d", "0"] {
+            assert!(valid_container_name(ok), "{ok}");
+        }
+        for bad in ["", "..", ".", "../../..", "a/b", "-rm", "--rm", "_x", ".x", "a b", "é"] {
+            assert!(!valid_container_name(bad), "{bad:?}");
+        }
+        assert!(!valid_container_name(&"a".repeat(129)));
+    }
+
+    #[test]
+    fn default_container_names_are_valid() {
+        assert_eq!(default_container_name("busybox", 7), "busybox-7");
+        assert_eq!(default_container_name("alpine@sha256-ab", 1), "alpine-sha256-ab-1");
+        assert_eq!(default_container_name("_hidden", 2), "c_hidden-2");
+        for store in ["busybox", "alpine@sha256-ab", "_x", "", "ghcr.io-a-b-1.0", &"x".repeat(300)] {
+            assert!(valid_container_name(&default_container_name(store, u64::MAX)), "{store}");
+        }
     }
 }

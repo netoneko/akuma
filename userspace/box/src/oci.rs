@@ -83,27 +83,25 @@ fn fetch_config(image: &ImageRef, digest: &str, token: &str) -> Result<String, S
     print("  Fetching config...\n");
 
     let headers = auth_headers(token);
-    let tmp_path = "/tmp/oci-config.json";
-    download_file_with_headers(&image.blob_url(digest), tmp_path, &headers)
-        .map_err(|e| format!("config fetch failed: {:?}", e))?;
+    let tmp_path = format!("/tmp/oci-config-{}.json", libakuma::getpid());
+    let fetched = download_file_with_headers(&image.blob_url(digest), &tmp_path, &headers)
+        .map_err(|e| format!("config fetch failed: {:?}", e));
+    // Read whole: one 64 KiB `read` used to cut a bigger config (an image with
+    // a long history) short, which then failed verification as if corrupt.
+    let buf = fetched.and_then(|()| {
+        crate::fsx::read_file(&tmp_path).ok_or_else(|| String::from("failed to read downloaded config"))
+    });
+    unlink(&tmp_path);
+    let buf = buf?;
 
-    let fd = libakuma::open(tmp_path, 0);
-    if fd < 0 {
-        return Err(String::from("failed to open downloaded config"));
+    if buf.is_empty() {
+        return Err(String::from("empty config file"));
     }
-    let mut buf = alloc::vec![0u8; 64 * 1024];
-    let n = libakuma::read_fd(fd, &mut buf);
-    libakuma::close(fd);
-    unlink(tmp_path);
-
-    if n <= 0 {
-        return Err(String::from("failed to read config file"));
-    }
-    let got = boxlib::layer::sha256_digest(&buf[..n as usize]);
+    let got = boxlib::layer::sha256_digest(&buf);
     if got != digest {
         return Err(format!("config failed verification: got {}", got));
     }
-    let body_str = core::str::from_utf8(&buf[..n as usize])
+    let body_str = core::str::from_utf8(&buf)
         .map_err(|_| String::from("invalid config response"))?;
 
     Ok(String::from(body_str))
@@ -131,7 +129,15 @@ fn extract_layer(layer_path: &str, rootfs_path: &str) -> Result<(), String> {
     match akuma_tar::extract_file(layer_path, rootfs_path, &opts) {
         Ok(stats) => {
             if stats.rejected > 0 {
-                return Err(format!("layer contains {} entries outside the target directory", stats.rejected));
+                return Err(format!(
+                    "layer contains {} entries outside the target directory or behind a symlink loop",
+                    stats.rejected
+                ));
+            }
+            // A layer with entries that were not written is not that layer:
+            // caching it would serve the hole to every container from now on.
+            if stats.failed > 0 {
+                return Err(format!("{} layer entries could not be written (disk full?)", stats.failed));
             }
             Ok(())
         }
@@ -153,6 +159,8 @@ pub fn pull_image(image_str: &str, insecure: bool) -> Result<(), String> {
 
     let token = fetch_token(&image)?;
     let manifest = fetch_manifest(&image, &token)?;
+    // Digests become file names below: refuse anything that is not one.
+    boxlib::manifest::check_digests(&manifest)?;
 
     print("  Config: ");
     println(&manifest.config_digest);
@@ -190,8 +198,13 @@ pub fn pull_image(image_str: &str, insecure: bool) -> Result<(), String> {
         print(short);
         print(")...\n");
 
-        let tmp_path = format!("/tmp/oci-layer-{}.tar.gz", i);
-        download_layer(&image, digest, &token, &tmp_path)?;
+        // Per-process name: two pulls at once used to share
+        // `/tmp/oci-layer-<i>.tar.gz` and fail each other's verification.
+        let tmp_path = format!("/tmp/oci-layer-{}-{}.tar.gz", libakuma::getpid(), i);
+        if let Err(e) = download_layer(&image, digest, &token, &tmp_path) {
+            unlink(&tmp_path);
+            return Err(e);
+        }
 
         // A registry names a blob by its digest; take it at its word only after
         // hashing what actually arrived. The blob is also kept (below), so a
@@ -203,7 +216,10 @@ pub fn pull_image(image_str: &str, insecure: bool) -> Result<(), String> {
                 unlink(&tmp_path);
                 return Err(format!("layer {} failed verification: got sha256:{}", short, got));
             }
-            None => return Err(format!("cannot read back {}", tmp_path)),
+            None => {
+                unlink(&tmp_path);
+                return Err(format!("cannot read back {}", tmp_path));
+            }
         }
 
         print("  Extracting layer ");
@@ -216,10 +232,19 @@ pub fn pull_image(image_str: &str, insecure: bool) -> Result<(), String> {
         // interrupted pull can never leave a half-populated directory that the
         // check above would then accept as complete.
         let staging = format!("{}.tmp", dest);
+        // A staging directory left by an interrupted pull holds whatever that
+        // pull got through; extracting over it would publish its leftovers as
+        // part of this layer. Start empty.
+        crate::fsx::remove_tree(&staging);
         if !libakuma::mkdir_p(&staging) {
+            unlink(&tmp_path);
             return Err(format!("failed to create {}", staging));
         }
-        extract_layer(&tmp_path, &staging)?;
+        if let Err(e) = extract_layer(&tmp_path, &staging) {
+            unlink(&tmp_path);
+            crate::fsx::remove_tree(&staging);
+            return Err(e);
+        }
         // Keep the compressed blob for `box save`; fall back to deleting it if
         // it cannot be moved (a /tmp on another filesystem).
         let blob = images::blob_path(digest);

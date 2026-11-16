@@ -7,7 +7,7 @@
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
-use libakuma::{close, exit, mkdir_p, open, open_flags, print, println, read_fd, waitpid};
+use libakuma::{close, exit, mkdir_p, open, open_flags, print, println, read_fd, waitpid_status};
 
 use boxlib::spec::{self, ImageProcess, RunArgsError};
 use boxlib::sys::{self, SpawnOptions, spawn_ext_env};
@@ -146,7 +146,14 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     let container = parsed
         .name
         .clone()
-        .unwrap_or_else(|| format!("{}-{}", store, libakuma::uptime()));
+        .unwrap_or_else(|| boxlib::paths::default_container_name(&store, libakuma::uptime()));
+    // It becomes a directory that `--rm` deletes: never a path.
+    if !boxlib::paths::valid_container_name(&container) {
+        print("box run: invalid container name '");
+        print(&container);
+        print("' (letters, digits, '_', '.', '-'; starting with a letter or digit)\n");
+        exit(1);
+    }
     let box_id = spec::box_id_for(&container);
 
     // A second `run` under a live name used to register over the first box, fail
@@ -313,8 +320,10 @@ pub fn cmd_run(args: libakuma::Args) -> ! {
     }
 
     let code = loop {
-        if let Some((_, code)) = waitpid(res.pid) {
-            break code;
+        // `waitpid_status`, not `waitpid`: a container killed by a signal
+        // reported exit 0, so `box run img cmd && next` carried on after a crash.
+        if let Some(st) = waitpid_status(res.pid) {
+            break st.shell_code();
         }
         libakuma::sleep_ms(50);
     };
