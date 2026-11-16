@@ -23,8 +23,9 @@ python3 overlays/aws/tests/e2e_vm.py --disk /path/to/akuma-amd64.img
 The test copies the disk, installs this overlay, injects a metadata URL into
 the herd service, starts a host metadata server and boots QEMU. It checks SSH
 login with the metadata key and rejection of an unrelated key. The test server
-supports IMDSv1; the separate host tests cover IMDSv2. It exercises virtio-net,
-not ENA or EC2 firmware. It requires QEMU, debugfs, ssh and ssh-keygen.
+uses IMDSv1 by default; `--imds-v2` requires a token and checks apk and curl
+in the guest. It exercises virtio-net, not ENA or EC2 firmware. It requires
+QEMU, debugfs, ssh and ssh-keygen.
 
 ## Stage apk and curl
 
@@ -34,6 +35,20 @@ and CA certificates. It requires Docker and network access. The base must
 already contain Akuma's herd, sshd and shell. The destination must not exist.
 The script clears baked SSH keys. It stages a filesystem tree, not an
 EC2-bootable disk or AMI.
+
+```sh
+overlays/aws/stage-rootfs.sh /path/to/base-root /path/to/new-root x86_64
+truncate -s 1G /tmp/akuma-aws.img
+mkfs.ext2 -F -b 4096 -d /path/to/new-root /tmp/akuma-aws.img
+python3 overlays/aws/tests/e2e_vm.py --disk /tmp/akuma-aws.img --imds-v2
+```
+
+Choose a disk size large enough for the staged tree. On 2026-11-17 this path
+passed on an x86_64 QEMU guest using an existing amd64 base disk as the source
+tree: herd started, the guest obtained a launch key with an IMDSv2 token,
+accepted that key over SSH, rejected another key, and ran the two version
+commands. This does not establish that apk can install packages in the guest,
+or that the AArch64 staging or direct EC2 boot has been tested.
 
 Build an ext2 disk from the staged tree and add `--imds-v2` to the VM test to
 require a metadata token and execute `apk --version` and `curl --version`

@@ -6,6 +6,14 @@ metal host and uses virtio-net; it does not exercise an EC2 ENA device. This
 document records the decision to implement a small native Rust ENA driver for
 Akuma. It is a plan, not a claim that the driver or direct EC2 boot works.
 
+## Status (2026-11-17)
+
+`crates/akuma-net-ena` contains initial register, capability and ring-phase
+primitives with host tests. It does not yet initialize an ENA device or send
+packets and is not connected to the kernel. Direct-EC2 image staging and the
+QEMU metadata/SSH test are described in [`overlays/aws/README.md`](../../overlays/aws/README.md).
+The QEMU test uses virtio-net; it is not an ENA or EC2 boot test.
+
 ## Decision
 
 Write the driver in Rust against ENA's device interface, starting with the
@@ -20,7 +28,8 @@ Akuma use case requires.
 
 AWS's [ENA interface definitions](https://github.com/amzn/amzn-drivers/tree/77facd6719172a5f39ea5c810b126a8b40b7e4fe/kernel/fbsd/ena/ena-com/ena_defs)
 describe registers, administrative commands and packet descriptors. The BSD
-drivers show the operational sequence and edge cases. Check the license and
+drivers are potential background references, but the implementation on this
+branch is to use AWS's published definitions as requested. Check the license and
 copyright of each file used; if code is adapted, retain its notices, license
 conditions and disclaimer in source and binary distributions. Record the exact
 upstream revision for any adaptation.
