@@ -46,6 +46,39 @@ pub const fn dma_address_width(caps: u32) -> u8 {
     ((caps >> 8) & 0xff) as u8
 }
 
+/// Cursor for ENA rings whose entries carry a phase bit.
+///
+/// The caller must initialize the backing ring to zero, check the phase before
+/// consuming a completion, and synchronize DMA before reading its payload.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RingCursor {
+    depth: u16,
+    index: u16,
+    phase: bool,
+}
+
+impl RingCursor {
+    pub const fn new(depth: u16) -> Option<Self> {
+        if depth == 0 || !depth.is_power_of_two() {
+            None
+        } else {
+            Some(Self { depth, index: 0, phase: true })
+        }
+    }
+
+    pub const fn index(&self) -> u16 { self.index }
+
+    pub const fn phase(&self) -> bool { self.phase }
+
+    pub fn advance(&mut self) {
+        self.index += 1;
+        if self.index == self.depth {
+            self.index = 0;
+            self.phase = !self.phase;
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +94,19 @@ mod tests {
     #[test]
     fn dma_width_extracts_only_its_field() {
         assert_eq!(dma_address_width(0xabcd_30ef), 48);
+    }
+
+    #[test]
+    fn ring_phase_changes_only_on_wrap() {
+        assert_eq!(RingCursor::new(3), None);
+        let mut cursor = RingCursor::new(2).unwrap();
+        assert_eq!((cursor.index(), cursor.phase()), (0, true));
+        cursor.advance();
+        assert_eq!((cursor.index(), cursor.phase()), (1, true));
+        cursor.advance();
+        assert_eq!((cursor.index(), cursor.phase()), (0, false));
+        cursor.advance();
+        cursor.advance();
+        assert_eq!((cursor.index(), cursor.phase()), (0, true));
     }
 }
