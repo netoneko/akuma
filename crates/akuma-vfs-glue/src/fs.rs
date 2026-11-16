@@ -239,22 +239,20 @@ pub fn read_at(path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsErr
 
 /// Read for an open file description — by the inode `open(2)` resolved, when it
 /// resolved one. See [`crate::read_at_open_file`].
-pub fn read_at_open_file(path: &str, key: FileKey, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
-    let (mount_id, inode) = key.parts();
+pub fn read_at_open_file(path: &str, key: Option<FileKey>, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    crate::read_at_open_file(path, mount_id, inode, offset, buf)
+    crate::read_at_open_file(path, key, offset, buf)
 }
 
 /// `stat` for an open file description — by the inode `open(2)` resolved, when
 /// it resolved one. See [`crate::metadata_open_file`].
-pub fn metadata_open_file(path: &str, key: FileKey) -> Result<crate::Metadata, FsError> {
-    let (mount_id, inode) = key.parts();
+pub fn metadata_open_file(path: &str, key: Option<FileKey>) -> Result<crate::Metadata, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    crate::metadata_open_file(path, FileKey::from_raw(mount_id, inode))
+    crate::metadata_open_file(path, key)
 }
 
 /// Write data at a specific offset within a file
@@ -268,31 +266,28 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
 /// Write by inode, for a file that may have no name. See
 /// [`crate::write_at_open_file`].
 pub fn write_at_open_file(key: FileKey, offset: usize, data: &[u8]) -> Result<usize, FsError> {
-    let (mount_id, inode) = key.parts();
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    crate::write_at_open_file(FileKey::from_raw(mount_id, inode), offset, data)
+    crate::write_at_open_file(key, offset, data)
 }
 
 /// Write for an open file description — by inode when `open(2)` bound one. See
 /// [`crate::write_at_open_file_or_path`].
-pub fn write_at_open_file_or_path(path: &str, key: FileKey, offset: usize, data: &[u8]) -> Result<usize, FsError> {
-    let (mount_id, inode) = key.parts();
+pub fn write_at_open_file_or_path(path: &str, key: Option<FileKey>, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    crate::write_at_open_file_or_path(path, mount_id, inode, offset, data)
+    crate::write_at_open_file_or_path(path, key, offset, data)
 }
 
 /// `O_APPEND` write for an open file description, by inode once the name is
 /// gone. See [`crate::append_open_file`].
-pub fn append_open_file(path: &str, key: FileKey, data: &[u8]) -> Result<(usize, usize), FsError> {
-    let (mount_id, inode) = key.parts();
+pub fn append_open_file(path: &str, key: Option<FileKey>, data: &[u8]) -> Result<(usize, usize), FsError> {
     if !is_initialized() {
         return Err(FsError::NotInitialized);
     }
-    crate::append_open_file(path, mount_id, inode, data)
+    crate::append_open_file(path, key, data)
 }
 
 /// `O_APPEND` write, atomic against other appenders — see [`crate::append`].

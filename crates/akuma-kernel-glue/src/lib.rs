@@ -306,7 +306,9 @@ pub(crate) fn build_exec_runtime(
         // `akuma_pmm::DP_PREFAULT_FILL_SHORT` and
         // `docs/archive/PREFAULT_INODE_STUB_ZERO_PAGES.md`.
         read_at_by_inode: |mount_id, inode, off, buf| {
-            akuma_vfs_glue::read_at_by_mount_inode(FileKey::from_raw(mount_id, inode), off, buf).map_err(|_| -1)
+            // A region record with no resolved (mount, inode) has no file to read: the same `-1` a read failure gives.
+            let key = FileKey::try_from_raw(mount_id, inode).ok_or(-1)?;
+            akuma_vfs_glue::read_at_by_mount_inode(key, off, buf).map_err(|_| -1)
         },
         on_process_exit: |_pid| {},
         remove_socket: akuma_net::socket::remove_socket,

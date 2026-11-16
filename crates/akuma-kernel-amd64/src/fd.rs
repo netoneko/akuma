@@ -849,11 +849,7 @@ pub fn sys_pread64(fd: u64, buf: u64, len: u64, offset: u64) -> u64 {
 /// identity comes from, and that is the whole point — see [`file_identity`].
 #[must_use]
 pub fn file_bytes_by_inode(key: FileKey, offset: usize, dst: &mut [u8]) -> Option<usize> {
-    let (mount_id, inode) = key.parts();
-    if inode == 0 {
-        return None;
-    }
-    fs::read_at_open_file("", mount_id, inode, offset, dst).ok()
+    fs::read_at_open_file("", Some(key), offset, dst).ok()
 }
 
 /// `write(fd, buf, len)` on a **file** descriptor — **glue's arm** (4b batch

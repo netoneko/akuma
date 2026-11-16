@@ -668,9 +668,11 @@ fn demand_page_lazy_region(
                     // belongs to the mapping, not the file, so two mappers can
                     // legitimately disagree about its contents.
                     let full = va >= segment_va && va + 0x1000 <= segment_va + filesz;
-                    let hit = if full && shareable_mapping {
+                    let hit = if full && shareable_mapping
+                        && let Some(key) = FileKey::try_from_raw(mount_id, inode)
+                    {
                         let file_off = file_offset + (va - segment_va);
-                        akuma_fpcache::lookup_and_ref(mount_id, inode, file_off, is_exec)
+                        akuma_fpcache::lookup_and_ref(key, file_off, is_exec)
                     } else {
                         None
                     };
@@ -788,7 +790,9 @@ fn demand_page_lazy_region(
                     let kva = akuma_exec::mmu::phys_to_virt(pf.addr) as usize;
                     akuma_exec::mmu::sync_icache_range(kva, akuma_exec::mmu::PAGE_SIZE);
                     let file_off = file_offset + (cur_va - segment_va);
-                    akuma_fpcache::mark_icache_clean(FileKey::from_raw(mount_id, inode), file_off, pf);
+                    if let Some(key) = FileKey::try_from_raw(mount_id, inode) {
+                        akuma_fpcache::mark_icache_clean(key, file_off, pf);
+                    }
                 }
                 filled.push((cur_va, pf, owns_ref));
                 cur_va += 0x1000;
@@ -868,7 +872,9 @@ fn demand_page_lazy_region(
             {
                 if fill_complete {
                     let file_off = file_offset + (cur_va - segment_va);
-                    akuma_fpcache::insert(FileKey::from_raw(mount_id, inode), file_off, pf, is_exec);
+                    if let Some(key) = FileKey::try_from_raw(mount_id, inode) {
+                        akuma_fpcache::insert(key, file_off, pf, is_exec);
+                    }
                 } else {
                     akuma_pmm::dp_count(&akuma_pmm::DP_FILE_FILL_UNPUBLISHED, 1);
                 }

@@ -682,14 +682,15 @@ fn fs_for_mount_id(id: u32) -> Option<Arc<dyn Filesystem>> {
 /// have — so it is recorded here rather than papered over.
 pub fn read_at_open_file(
     path: &str,
-    mount_id: u32,
-    inode: u32,
+    key: Option<FileKey>,
     offset: usize,
     buf: &mut [u8],
 ) -> Result<usize, FsError> {
-    if inode == 0 {
+    // `None`: the descriptor has no resolved identity, and the path is all there is.
+    let Some(key) = key else {
         return read_at(path, offset, buf);
-    }
+    };
+    let (mount_id, inode) = key.parts();
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     fs.read_at_by_inode(inode, offset, buf)
 }
@@ -700,9 +701,6 @@ pub fn read_at_open_file(
 /// path, so `inode == 0` or an unknown mount is an error, never a guess.
 pub fn read_at_by_mount_inode(key: FileKey, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
     let (mount_id, inode) = key.parts();
-    if inode == 0 {
-        return Err(FsError::NotFound);
-    }
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     fs.read_at_by_inode(inode, offset, buf)
 }
@@ -718,11 +716,12 @@ pub fn read_at_by_mount_inode(key: FileKey, offset: usize, buf: &mut [u8]) -> Re
 ///
 /// Inherits [`read_at_open_file`]'s mount-aliasing caveat verbatim: the path
 /// still selects the filesystem.
-pub fn metadata_open_file(path: &str, key: FileKey) -> Result<Metadata, FsError> {
-    let (mount_id, inode) = key.parts();
-    if inode == 0 {
+/// `key` is `None` for a descriptor with no resolved identity: the path is all there is.
+pub fn metadata_open_file(path: &str, key: Option<FileKey>) -> Result<Metadata, FsError> {
+    let Some(key) = key else {
         return metadata(path);
-    }
+    };
+    let (mount_id, inode) = key.parts();
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     fs.metadata_by_inode(inode)
         // A filesystem that resolved an inode for this fd but cannot stat by one
@@ -750,9 +749,6 @@ pub fn metadata_open_file(path: &str, key: FileKey) -> Result<Metadata, FsError>
 /// nothing, and after every shared-mapping write-back.
 pub fn write_at_open_file(key: FileKey, offset: usize, data: &[u8]) -> Result<usize, FsError> {
     let (mount_id, inode) = key.parts();
-    if inode == 0 {
-        return Err(FsError::NotFound);
-    }
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     let r = fs.write_at_by_inode(inode, offset, data);
     if cfg_shared_file_pages_enabled() {
@@ -772,15 +768,14 @@ pub fn write_at_open_file(key: FileKey, offset: usize, data: &[u8]) -> Result<us
 /// that still has its name stays coherent with mappings and the page cache.
 pub fn write_at_open_file_or_path(
     path: &str,
-    mount_id: u32,
-    inode: u32,
+    key: Option<FileKey>,
     offset: usize,
     data: &[u8],
 ) -> Result<usize, FsError> {
-    if inode == 0 || is_mtab(path) {
+    let Some(key) = key.filter(|_| !is_mtab(path)) else {
         return write_at(path, offset, data);
-    }
-    let r = write_at_open_file(FileKey::from_raw(mount_id, inode), offset, data);
+    };
+    let r = write_at_open_file(key, offset, data);
     invalidate_file_pages(path);
     if let Ok(n) = r {
         notify_mapped_write(path, offset, &data[..n.min(data.len())]);
@@ -810,14 +805,13 @@ pub fn write_at(path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError
 /// the only way to reach the file.
 pub fn append_open_file(
     path: &str,
-    mount_id: u32,
-    inode: u32,
+    key: Option<FileKey>,
     data: &[u8],
 ) -> Result<(usize, usize), FsError> {
     match append(path, data) {
-        Err(FsError::NotFound) if inode != 0 => {
-            let size = metadata_open_file(path, FileKey::from_raw(mount_id, inode))?.size as usize;
-            let n = write_at_open_file_or_path(path, mount_id, inode, size, data)?;
+        Err(FsError::NotFound) if key.is_some() => {
+            let size = metadata_open_file(path, key)?.size as usize;
+            let n = write_at_open_file_or_path(path, key, size, data)?;
             Ok((size, n))
         }
         other => other,
@@ -850,11 +844,11 @@ pub fn create_dir(path: &str) -> Result<(), FsError> {
 /// [`metadata_open_file`] does: an fd's own filesystem must keep answering
 /// after the name is unlinked, and that is the case that matters — `sqlite`
 /// journals and `cargo`'s package database fsync an fd they still hold open.
-pub fn sync_open_file(path: &str, key: FileKey) -> Result<(), FsError> {
-    let (mount_id, inode) = key.parts();
-    if inode == 0 {
+pub fn sync_open_file(path: &str, key: Option<FileKey>) -> Result<(), FsError> {
+    let Some(key) = key else {
         return sync_path(path);
-    }
+    };
+    let (mount_id, _) = key.parts();
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     fs.sync()
 }
@@ -971,11 +965,11 @@ pub fn truncate(path: &str, length: u64) -> Result<(), FsError> {
 /// notification runs as before), by inode once it does not — `ftruncate` on an
 /// unlinked-but-open file, which is how Chromium sizes its shared memory
 /// (create, unlink, then size).
-pub fn truncate_open_file(path: &str, key: FileKey, length: u64) -> Result<(), FsError> {
-    let (mount_id, inode) = key.parts();
-    if inode == 0 || resolve_file_id(path) == Some((mount_id, inode)) {
+pub fn truncate_open_file(path: &str, key: Option<FileKey>, length: u64) -> Result<(), FsError> {
+    let Some(key) = key.filter(|k| resolve_file_id(path) != Some(k.parts())) else {
         return truncate(path, length);
-    }
+    };
+    let (mount_id, inode) = key.parts();
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     let r = fs.truncate_by_inode(inode, length);
     if crate::cfg_shared_file_pages_enabled() {
@@ -985,11 +979,11 @@ pub fn truncate_open_file(path: &str, key: FileKey, length: u64) -> Result<(), F
 }
 
 /// [`fallocate`] for an open file description — see [`truncate_open_file`].
-pub fn fallocate_open_file(path: &str, key: FileKey, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
-    let (mount_id, inode) = key.parts();
-    if inode == 0 || resolve_file_id(path) == Some((mount_id, inode)) {
+pub fn fallocate_open_file(path: &str, key: Option<FileKey>, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+    let Some(key) = key.filter(|k| resolve_file_id(path) != Some(k.parts())) else {
         return fallocate(path, mode, offset, len);
-    }
+    };
+    let (mount_id, inode) = key.parts();
     let fs = fs_for_mount_id(mount_id).ok_or(FsError::NotFound)?;
     let r = fs.fallocate_by_inode(inode, mode, offset, len);
     if crate::cfg_shared_file_pages_enabled() {
@@ -1809,8 +1803,9 @@ fn notify_mapped_write(path: &str, offset: usize, data: &[u8]) {
     }
     if let Some(h) = mapped_file_hooks()
         && let Some((mount_id, inode)) = resolve_file_id(path)
+        && let Some(key) = FileKey::try_from_raw(mount_id, inode)
     {
-        (h.wrote)(FileKey::from_raw(mount_id, inode), offset, data);
+        (h.wrote)(key, offset, data);
     }
 }
 
@@ -1818,8 +1813,9 @@ fn notify_mapped_write(path: &str, offset: usize, data: &[u8]) {
 fn notify_mapped_zeroed(path: &str, from: usize, to: usize) {
     if let Some(h) = mapped_file_hooks()
         && let Some((mount_id, inode)) = resolve_file_id(path)
+        && let Some(key) = FileKey::try_from_raw(mount_id, inode)
     {
-        (h.zeroed)(FileKey::from_raw(mount_id, inode), from, to);
+        (h.zeroed)(key, from, to);
     }
 }
 

@@ -770,8 +770,9 @@ fn fill_file_pages(
         // to one atomic load when no process maps a file shared-writable.
         if !region_pte.write
             && let Some(owner) = usermode::current_mm_process()
+            && let Some(file_key) = akuma_primitives::FileKey::try_from_raw(file.mount_id, file.inode)
         {
-            let key = akuma_fpcache_rw::Key::new(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset);
+            let key = akuma_fpcache_rw::Key::new(file_key, offset);
             if let Some(ok) = akuma_exec::shm::map_existing(owner, va, akuma_exec::mmu::user_flags::to_pte(prot), key) {
                 if ok {
                     FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
@@ -790,12 +791,8 @@ fn fill_file_pages(
         // PTE. This is the whole point of the cache, and on the self-host build
         // it is the common case from the second `rustc` onwards.
         if share_this
-            && let Some((frame, _needs_icache)) = akuma_fpcache::lookup_and_ref(
-                file.mount_id,
-                file.inode,
-                offset,
-                region_pte.exec,
-            )
+            && let Some(key) = akuma_primitives::FileKey::try_from_raw(file.mount_id, file.inode)
+            && let Some((frame, _needs_icache)) = akuma_fpcache::lookup_and_ref(key, offset, region_pte.exec)
         {
             // `_needs_icache`: x86 has coherent instruction caches, so there is
             // no `ic ivau` counterpart to perform. The AArch64 caller acts on
@@ -822,7 +819,9 @@ fn fill_file_pages(
             if v.try_reserve(want).is_ok() {
                 v.resize(want, 0);
                 let (window_offset, _) = file.page_source(first);
-                match crate::fd::file_bytes_by_inode(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), window_offset, &mut v) {
+                match akuma_primitives::FileKey::try_from_raw(file.mount_id, file.inode)
+                    .and_then(|key| crate::fd::file_bytes_by_inode(key, window_offset, &mut v))
+                {
                     // The file is gone, or was never readable by inode. Fall back
                     // to the per-page path, which fails the same way and one page
                     // at a time.
@@ -866,7 +865,9 @@ fn fill_file_pages(
                 // page first). That is not an error and needs no undo: the
                 // frame stays private with exactly the one reference this
                 // mapping holds, which teardown balances.
-                akuma_fpcache::insert(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset, frame, true);
+                if let Some(key) = akuma_primitives::FileKey::try_from_raw(file.mount_id, file.inode) {
+                    akuma_fpcache::insert(key, offset, frame, true);
+                }
             }
         }
         // `Raced` is a success with nothing to publish: the page is present,
@@ -980,8 +981,9 @@ fn fill_shared_write_pages(
             continue;
         }
         let (offset, _) = file.page_source(idx);
-        let key = akuma_fpcache_rw::Key::new(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset);
-        let ok = shared_write_page(va, prot, key);
+        // No resolved (mount, inode) means no table key, so no shared page: the fill fails as an unshareable key did.
+        let ok = akuma_primitives::FileKey::try_from_raw(file.mount_id, file.inode)
+            .is_some_and(|file_key| shared_write_page(va, prot, akuma_fpcache_rw::Key::new(file_key, offset)));
         if ok {
             FILE_PAGES_FILLED.fetch_add(1, Ordering::Relaxed);
         }
@@ -1028,7 +1030,8 @@ fn populate_file_page_by_inode(
         if want == 0 {
             return Some(0);
         }
-        crate::fd::file_bytes_by_inode(akuma_primitives::FileKey::from_raw(file.mount_id, file.inode), offset, &mut page[..want])
+        akuma_primitives::FileKey::try_from_raw(file.mount_id, file.inode)
+            .and_then(|key| crate::fd::file_bytes_by_inode(key, offset, &mut page[..want]))
     })
     .flatten();
     if want > 0 {

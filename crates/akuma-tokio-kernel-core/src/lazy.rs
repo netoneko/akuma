@@ -105,7 +105,8 @@ pub fn fill<M: Kernel>(root: u64, va: u64, files: bool) -> Fill {
     // the same eligibility - see `akuma_fpcache`'s module docs).
     let share = page.file.filter(|_| !page.write && akuma_fpcache::cap() > 0);
     if let Some(f) = share
-        && let Some((frame, _)) = akuma_fpcache::lookup_and_ref(FPCACHE_MOUNT, f.inode, f.index as usize * 4096, page.exec)
+        && let Some(key) = akuma_primitives::FileKey::try_from_raw(FPCACHE_MOUNT, f.inode)
+        && let Some((frame, _)) = akuma_fpcache::lookup_and_ref(key, f.index as usize * 4096, page.exec)
     {
         if M::map_user(root, va, frame.addr as u64, write, exec) {
             return Fill::Present;

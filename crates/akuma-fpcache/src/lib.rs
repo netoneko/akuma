@@ -321,12 +321,12 @@ pub fn is_shareable_mapping(map_flags: u64) -> bool {
 /// has never been through `ic ivau`, so an `RX` mapper needs to do that before
 /// executing from it. Returns `(frame, needs_icache_maintenance)`.
 pub fn lookup_and_ref(
-    mount_id: u32,
-    inode: u32,
+    key: FileKey,
     file_off: usize,
     want_exec: bool,
 ) -> Option<(PhysFrame, bool)> {
-    if !enabled() || inode == 0 || mount_id == 0 {
+    let (mount_id, inode) = key.parts();
+    if !enabled() {
         return None;
     }
     let hit = with_irqs_disabled(|| {
@@ -374,7 +374,7 @@ pub fn mark_icache_clean(key: FileKey, file_off: usize, frame: PhysFrame) {
 /// *before* publishing, since a peer core can map it the instant it lands.
 pub fn insert(key: FileKey, file_off: usize, frame: PhysFrame, icache_done: bool) {
     let (mount_id, inode) = key.parts();
-    if !enabled() || inode == 0 || mount_id == 0 {
+    if !enabled() {
         return;
     }
     // Re-derive the elastic cap on a coarse cadence. Placed before the read

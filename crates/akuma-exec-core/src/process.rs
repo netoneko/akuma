@@ -424,6 +424,13 @@ impl KernelFile {
     pub const fn mount_id(&self) -> u32 {
         self.mount_id
     }
+
+    /// This file's identity, or `None` when it has none: the inode `open(2)` resolved and the mount it lives on, both
+    /// non-zero. `None` is "read by path": the VFS functions that can fall back to the path take this as `Option<FileKey>`.
+    #[must_use]
+    pub const fn file_key(&self) -> Option<akuma_primitives::FileKey> {
+        akuma_primitives::FileKey::try_from_raw(self.mount_id, self.inode)
+    }
 }
 
 /// File open flags (Linux compatible).

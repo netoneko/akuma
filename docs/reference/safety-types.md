@@ -61,9 +61,21 @@ The one remaining caller of the bool form, `caller_is_host_root()`, is glue's `e
 decides on a destination, it has no effect function to hand a token to, and it is a predicate by nature.
 
 ### `FileKey` (`akuma-primitives::file_key`) — §6
-`FileKey { mount: MountId, ino: Ino }`, built from a record's two fields with `FileKey::from_raw(mount_id, inode)`.
-**Deviation from the report:** plain `u32`, not `NonZeroU32`. Zero is "none" in many callers that treat it as "do nothing";
-a fallible constructor would have changed each. `is_shareable()` is the one spelling of the zero check.
+`FileKey { mount: MountId, ino: Ino }`, both `NonZeroU32` (as the report proposed; `Option<FileKey>` is 8 bytes). A record's two
+fields become a key at one place, `FileKey::try_from_raw(mount_id, inode)`, which is `None` for "no stable identity" (no resolved
+inode, or no mount). That test used to be repeated inside the callee (`if inode == 0 { ... }`, thirteen times, with three
+different meanings); now:
+
+- a function that can fall back to the path takes **`Option<FileKey>`** (`metadata_open_file`, `read_at_open_file`,
+  `write_at_open_file_or_path`, `append_open_file`, `sync_open_file`, `truncate_open_file`, `fallocate_open_file`), and `None`
+  is the fallback;
+- a function that can only work by identity takes **`FileKey`** (`read_at_by_mount_inode`, `write_at_open_file`, the page
+  caches' `lookup_and_ref`/`insert`/`mark_icache_clean`, `shm::{wrote, zeroed, reap_released}`) and its caller handles the `None`
+  (skip, `-1`, or "not shareable", whichever the zero branch used to be);
+- `KernelFile::file_key()` is the accessor for a descriptor, so the glue no longer rebuilds the pair at each site.
+
+`akuma-fpcache-rw`'s ordered-map scans still need a key with a zero or `u32::MAX` mount for their range bounds, so `Key::bound`
+(private) builds one from raw ids; no `FileKey` can.
 
 ### `Protection` (`akuma-mmap`) — §7
 `Unrecorded | Stated(Prot)`. `MmapRegion`'s field is private; `grant_prot()` (unrecorded grants nothing) and

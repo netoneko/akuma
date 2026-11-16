@@ -174,15 +174,14 @@ pub fn reap(key: Key, pa: usize) {
 /// nobody maps may hold a killed mapper's unflushed stores, and the table is
 /// the only place they live. The caller wrote its own pages back first.
 pub fn reap_released(key: FileKey, from: usize, to: usize, released: &[usize]) {
-    let (mount_id, inode) = key.parts();
     if released.is_empty() || LEN.load(Ordering::SeqCst) == 0 {
         return;
     }
     let mut keys: alloc::vec::Vec<(Key, usize)> = alloc::vec::Vec::new();
     with_irqs_disabled(|| {
-        TABLE.lock().for_each_in(FileKey::from_raw(mount_id, inode), from, to, |page_off, pa| {
+        TABLE.lock().for_each_in(key, from, to, |page_off, pa| {
             if released.binary_search(&pa).is_ok() {
-                keys.push((Key::new(FileKey::from_raw(mount_id, inode), page_off), pa));
+                keys.push((Key::new(key, page_off), pa));
             }
         });
     });
@@ -204,11 +203,10 @@ pub fn active() -> bool {
 /// between the copy's load and its store would be undone — so a span whose
 /// source is the destination is skipped.
 pub fn wrote(key: FileKey, offset: usize, data: &[u8]) {
-    let (mount_id, inode) = key.parts();
-    GENS.bump(inode);
+    GENS.bump(key.parts().1);
     let mut copied = false;
     with_table(|t| {
-        t.for_each_in(FileKey::from_raw(mount_id, inode), offset, offset.saturating_add(data.len()), |page_off, pa| {
+        t.for_each_in(key, offset, offset.saturating_add(data.len()), |page_off, pa| {
             let Some(s) = write_span(page_off, offset, data.len()) else {
                 return;
             };
@@ -229,11 +227,10 @@ pub fn wrote(key: FileKey, offset: usize, data: &[u8]) {
 /// `akuma_vfs_glue::MappedFileHooks::zeroed`: bytes `[from, to)` of the file
 /// read zero now (truncate, hole punch) — and so must the mapped frames.
 pub fn zeroed(key: FileKey, from: usize, to: usize) {
-    let (mount_id, inode) = key.parts();
     static ZEROS: [u8; 4096] = [0; 4096];
-    GENS.bump(inode);
+    GENS.bump(key.parts().1);
     with_table(|t| {
-        t.for_each_in(FileKey::from_raw(mount_id, inode), from, to, |page_off, pa| {
+        t.for_each_in(key, from, to, |page_off, pa| {
             if let Some((a, b)) = zero_span(page_off, from, to) {
                 let _ = akuma_mmu::copy_to_phys(pa + a, &ZEROS[..b - a]);
             }
@@ -312,10 +309,11 @@ pub fn region_key(proc: &Process, va: usize) -> Option<(Key, bool)> {
         let reg = &r[crate::process::region_index_containing(r, va)?];
         let idx = (va - reg.start_va) / 4096;
         if let Some(sw) = &reg.shared_write {
-            return Some((Key::new(FileKey::from_raw(sw.mount_id, sw.inode), sw.offset + idx * 4096), true));
+            // A mapping with no resolved (mount, inode) has no table key: `None`, as an unshareable key used to behave.
+            return Some((Key::new(FileKey::try_from_raw(sw.mount_id, sw.inode)?, sw.offset + idx * 4096), true));
         }
         let f = reg.file.filter(|f| f.lead == 0)?;
-        Some((Key::new(FileKey::from_raw(f.mount_id, f.inode), f.page_source(idx).0), false))
+        Some((Key::new(FileKey::try_from_raw(f.mount_id, f.inode)?, f.page_source(idx).0), false))
     })
 }
 

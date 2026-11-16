@@ -9966,6 +9966,11 @@ fn test_icache_sync_whole_page_offsets() {
 /// end-to-end instead, and heavily: every process the boot suite and the acceptance
 /// binaries exec faults its text in through the instruction-abort entry point and its
 /// heap and data through the data-abort one, so a broken merge does not reach sshd.
+/// A `FileKey` for a boot test's fake file. The ids the tests pick are never zero.
+fn test_key(mount: u32, inode: u32) -> akuma_primitives::FileKey {
+    akuma_primitives::FileKey::try_from_raw(mount, inode).expect("test ids are non-zero")
+}
+
 fn test_demand_paging_merged_body_policy() {
     use akuma_exec::mmu::{lazy_map_flags, user_flags, FaultAccess};
 
@@ -10043,12 +10048,12 @@ fn test_demand_paging_merged_body_policy() {
     if let (Some(dirty), Some(clean)) =
         (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
     {
-        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, dirty, false);
-        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE), OFF_CLEAN, clean, true);
+        crate::file_page_cache::insert(test_key(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, dirty, false);
+        crate::file_page_cache::insert(test_key(FAKE_MOUNT, FAKE_INODE), OFF_CLEAN, clean, true);
 
         // Published without maintenance → an executable mapper must be told to run it.
         if let Some((pf, needs_ic)) =
-            crate::file_page_cache::lookup_and_ref(FAKE_MOUNT, FAKE_INODE, OFF_DIRTY, true)
+            crate::file_page_cache::lookup_and_ref(test_key(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, true)
         {
             if pf.addr != dirty.addr || !needs_ic {
                 fails += 1;
@@ -10062,7 +10067,7 @@ fn test_demand_paging_merged_body_policy() {
         }
         // …and a non-executable mapper of the same frame must not be.
         if let Some((pf, needs_ic)) =
-            crate::file_page_cache::lookup_and_ref(FAKE_MOUNT, FAKE_INODE, OFF_DIRTY, false)
+            crate::file_page_cache::lookup_and_ref(test_key(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, false)
         {
             if needs_ic {
                 fails += 1;
@@ -10072,9 +10077,9 @@ fn test_demand_paging_merged_body_policy() {
             crate::pmm::free_page(pf);
         }
         // Recording the maintenance retires the request for every later mapper.
-        crate::file_page_cache::mark_icache_clean(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, dirty);
+        crate::file_page_cache::mark_icache_clean(test_key(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, dirty);
         if let Some((pf, needs_ic)) =
-            crate::file_page_cache::lookup_and_ref(FAKE_MOUNT, FAKE_INODE, OFF_DIRTY, true)
+            crate::file_page_cache::lookup_and_ref(test_key(FAKE_MOUNT, FAKE_INODE), OFF_DIRTY, true)
         {
             if needs_ic {
                 fails += 1;
@@ -10085,7 +10090,7 @@ fn test_demand_paging_merged_body_policy() {
         }
         // Published with maintenance → never requested again.
         if let Some((pf, needs_ic)) =
-            crate::file_page_cache::lookup_and_ref(FAKE_MOUNT, FAKE_INODE, OFF_CLEAN, true)
+            crate::file_page_cache::lookup_and_ref(test_key(FAKE_MOUNT, FAKE_INODE), OFF_CLEAN, true)
         {
             if needs_ic {
                 fails += 1;
@@ -10115,21 +10120,21 @@ fn test_demand_paging_merged_body_policy() {
     if let (Some(winner), Some(loser)) =
         (crate::pmm::alloc_page_zeroed(), crate::pmm::alloc_page_zeroed())
     {
-        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE2), OFF_RACE, winner, false);
+        crate::file_page_cache::insert(test_key(FAKE_MOUNT, FAKE_INODE2), OFF_RACE, winner, false);
         if crate::pmm::cow_ref_get(winner.addr) != 2 {
             fails += 1;
             crate::safe_print!(128,
                 "[Test] dp_merged_body: winner cow_ref={} after insert (want 2)\n",
                 crate::pmm::cow_ref_get(winner.addr));
         }
-        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(FAKE_MOUNT, FAKE_INODE2), OFF_RACE, loser, false); // lost race
+        crate::file_page_cache::insert(test_key(FAKE_MOUNT, FAKE_INODE2), OFF_RACE, loser, false); // lost race
         if crate::pmm::cow_ref_get(loser.addr) != 0 {
             fails += 1;
             crate::safe_print!(128,
                 "[Test] dp_merged_body: lost-race insert touched the loser's refcount ({})\n",
                 crate::pmm::cow_ref_get(loser.addr));
         }
-        match crate::file_page_cache::lookup_and_ref(FAKE_MOUNT, FAKE_INODE2, OFF_RACE, false) {
+        match crate::file_page_cache::lookup_and_ref(test_key(FAKE_MOUNT, FAKE_INODE2), OFF_RACE, false) {
             Some((pf, _)) if pf.addr == winner.addr => crate::pmm::free_page(pf),
             Some((pf, _)) => {
                 fails += 1;
@@ -10163,11 +10168,11 @@ fn test_demand_paging_merged_body_policy() {
     const SHARED_INODE: u32 = u32::MAX - 4;
     const OFF_ALIAS: usize = 0x8000_2000;
     if let Some(page_a) = crate::pmm::alloc_page_zeroed() {
-        crate::file_page_cache::insert(akuma_primitives::FileKey::from_raw(MOUNT_A, SHARED_INODE), OFF_ALIAS, page_a, false);
+        crate::file_page_cache::insert(test_key(MOUNT_A, SHARED_INODE), OFF_ALIAS, page_a, false);
 
         // The other mount's identically-numbered inode must not find it.
         if let Some((pf, _)) =
-            crate::file_page_cache::lookup_and_ref(MOUNT_B, SHARED_INODE, OFF_ALIAS, false)
+            crate::file_page_cache::lookup_and_ref(test_key(MOUNT_B, SHARED_INODE), OFF_ALIAS, false)
         {
             fails += 1;
             crate::safe_print!(160,
@@ -10177,7 +10182,7 @@ fn test_demand_paging_merged_body_policy() {
         }
         // ...while its own mount still does, so this is a real key and not a
         // cache that simply stopped working.
-        match crate::file_page_cache::lookup_and_ref(MOUNT_A, SHARED_INODE, OFF_ALIAS, false) {
+        match crate::file_page_cache::lookup_and_ref(test_key(MOUNT_A, SHARED_INODE), OFF_ALIAS, false) {
             Some((pf, _)) if pf.addr == page_a.addr => crate::pmm::free_page(pf),
             _ => {
                 fails += 1;
@@ -10188,7 +10193,7 @@ fn test_demand_paging_merged_body_policy() {
         // An id-blind invalidation drops it whatever mount it came from — that
         // is what lets ext2's inode-freed hook stay identity-free.
         crate::file_page_cache::invalidate_inode(SHARED_INODE);
-        if crate::file_page_cache::lookup_and_ref(MOUNT_A, SHARED_INODE, OFF_ALIAS, false).is_some() {
+        if crate::file_page_cache::lookup_and_ref(test_key(MOUNT_A, SHARED_INODE), OFF_ALIAS, false).is_some() {
             fails += 1;
             crate::safe_print!(128,
                 "[Test] dp_merged_body: invalidate_inode left an entry behind\n");
