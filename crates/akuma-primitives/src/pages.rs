@@ -66,9 +66,9 @@ impl PageRange {
 
     /// The range a syscall's `(addr, len)` names: `addr` aligned, `len` rounded up to whole pages.
     #[must_use]
-    pub const fn from_user(addr: usize, len: usize) -> Option<PageRange> {
+    pub const fn from_user(start: usize, len: usize) -> Option<PageRange> {
         match Pages::from_len_ceil(len) {
-            Some(p) => PageRange::new(VirtAddr::new(addr), p),
+            Some(p) => PageRange::new(VirtAddr::new(start), p),
             None => None,
         }
     }
