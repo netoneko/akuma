@@ -1,0 +1,12 @@
+[package]
+name = "akuma-irq-lock"
+version = "0.1.0"
+edition = "2024"
+description = "IrqSpinlock: a spinlock whose lock() masks local IRQs as part of acquiring, so the lock and the mask cannot be split."
+
+[lints]
+workspace = true
+
+[dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
+spinning_top = "0.3"

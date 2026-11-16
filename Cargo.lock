@@ -105,6 +105,7 @@ dependencies = [
 name = "akuma-boot"
 version = "0.1.0"
 dependencies = [
+ "akuma-primitives",
  "akuma-psci",
 ]
 
@@ -449,6 +450,14 @@ name = "akuma-ieee80211"
 version = "0.1.0"
 
 [[package]]
+name = "akuma-irq-lock"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-isolation"
 version = "0.1.0"
 dependencies = [
@@ -568,6 +577,7 @@ dependencies = [
  "akuma-firecracker",
  "akuma-fpcache",
  "akuma-gic",
+ "akuma-irq-lock",
  "akuma-machine-facts",
  "akuma-net",
  "akuma-pmm",

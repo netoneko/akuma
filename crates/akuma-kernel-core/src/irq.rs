@@ -1,6 +1,5 @@
 // IRQ handler registration and dispatch
 
-use spinning_top::Spinlock;
 
 // ============================================================================
 // IRQ Guard - RAII guard for disabling interrupts
@@ -51,7 +50,7 @@ struct IrqHandlers {
     handlers: [Option<IrqHandler>; MAX_IRQ],
 }
 
-static IRQ_HANDLERS: Spinlock<IrqHandlers> = Spinlock::new(IrqHandlers {
+static IRQ_HANDLERS: akuma_irq_lock::IrqSpinlock<IrqHandlers> = akuma_irq_lock::IrqSpinlock::new(IrqHandlers {
     handlers: [None; MAX_IRQ],
 });
 
@@ -81,9 +80,8 @@ pub fn register_handler(irq: u32, handler: IrqHandler) {
     // 2. Masking keeps the hold atomic against this core's own interrupts, so an
     //    ALREADY-enabled line (the timer PPI is registered twice — probe handler,
     //    then the real one) cannot re-enter the lock mid-update either.
-    with_irqs_disabled(|| {
-        IRQ_HANDLERS.lock().handlers[idx] = Some(handler);
-    });
+    // `IrqSpinlock` masks local IRQs as part of `lock()`; the lock is dropped at the end of this statement.
+    IRQ_HANDLERS.lock().handlers[idx] = Some(handler);
 
     // Outside the lock: this can deliver `irq` on this core immediately.
     akuma_gic::enable_irq(irq);
