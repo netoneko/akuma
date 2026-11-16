@@ -148,7 +148,15 @@ pub const fn len_too_large(len: usize, va_limit: usize) -> bool {
 /// `EINVAL` for a zero length and unmaps nothing. Preserved, not fixed.
 #[must_use]
 pub const fn munmap_len(len: usize) -> usize {
-    if len > 0 { (len + 4095) & !4095 } else { 4096 }
+    if len == 0 {
+        return 4096;
+    }
+    match akuma_primitives::Pages::from_len_ceil(len) {
+        Some(p) => p.bytes(),
+        // Past the address space: `usize::MAX` so the caller's `addr + len` check refuses it (`EINVAL`) instead of
+        // the old `(len + 4095) & !4095` wrapping to 0 and unmapping nothing while reporting success.
+        None => usize::MAX,
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +341,12 @@ mod tests {
     }
 
     /// Non-zero lengths round up to a whole page.
+    #[test]
+    fn munmap_len_of_a_wrapping_length_is_refused_not_zero() {
+        assert_eq!(munmap_len(usize::MAX), usize::MAX);
+        assert_eq!(munmap_len(usize::MAX - 4094), usize::MAX);
+    }
+
     #[test]
     fn munmap_len_rounds_up_to_a_page() {
         assert_eq!(munmap_len(1), 4096);

@@ -1280,7 +1280,10 @@ pub fn membarrier_cmd(cmd: u32) -> u64 {
 pub(super) fn sys_mprotect(addr: usize, len: usize, prot: u32) -> u64 {
     if addr & 0xFFF != 0 { return EINVAL; }
     if len == 0 { return 0; }
-    let byte_len = len.div_ceil(4096) * 4096;
+    // `len.div_ceil(4096) * 4096` wrapped to 0 for a length near `usize::MAX`: the call changed nothing and succeeded.
+    let Some(byte_len) = akuma_primitives::Pages::from_len_ceil(len).map(akuma_primitives::Pages::bytes) else {
+        return ENOMEM;
+    };
     let Some(end) = addr.checked_add(byte_len).filter(|e| *e <= akuma_exec::mmu::USER_VA_END) else {
         return EINVAL;
     };

@@ -44,7 +44,11 @@ pub fn plan(old_addr: usize, old_size: usize, new_size: usize, flags: u32, va_li
         return Plan::Fail(EFAULT);
     }
     let old_pages = old_size.div_ceil(4096);
-    let new_pages = new_size.div_ceil(4096);
+    // `new_size` is user-chosen and unbounded: `new_pages * 4096` used to wrap to 0 for a size near `usize::MAX`, and
+    // only the placer refusing a zero length turned that into `ENOMEM`.
+    let Some(new_pages) = akuma_primitives::Pages::from_len_ceil(new_size).map(akuma_primitives::Pages::get) else {
+        return Plan::Fail(ENOMEM);
+    };
     if new_pages <= old_pages {
         return Plan::InPlace;
     }
@@ -106,6 +110,13 @@ mod tests {
     #[test]
     fn diverge_shrink_is_in_place_and_leaves_the_tail_mapped() {
         assert_eq!(plan(0x1000, 16 * 4096, 4096, MREMAP_MAYMOVE, VA_LIMIT), Plan::InPlace);
+    }
+
+    /// A `new_size` that no address space can hold is `ENOMEM`, not a wrapped page count.
+    #[test]
+    fn a_new_size_past_the_address_space_is_enomem() {
+        assert_eq!(plan(0x1000, 4096, usize::MAX, MREMAP_MAYMOVE, VA_LIMIT), Plan::Fail(ENOMEM));
+        assert_eq!(plan(0x1000, 4096, usize::MAX - 4094, MREMAP_MAYMOVE, VA_LIMIT), Plan::Fail(ENOMEM));
     }
 
     /// One byte past the page boundary is a real growth, and the page count is

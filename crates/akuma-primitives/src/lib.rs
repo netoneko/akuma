@@ -49,6 +49,8 @@ pub mod cpu;
 pub mod console;
 pub mod errno;
 pub mod file_key;
+pub mod pages;
+pub use pages::Pages;
 pub mod privilege;
 pub use privilege::HostRoot;
 pub use file_key::{FileKey, Ino, MountId};
