@@ -140,11 +140,10 @@ impl SshdConfig {
                 "shell" => {
                     self.shell = String::from(value);
                 }
-                "port" => {
-                    if let Ok(p) = value.parse::<u16>() {
-                        self.port = Some(p);
-                    }
-                }
+                "port" => match value.parse::<u16>() {
+                    Ok(p) if p != 0 => self.port = Some(p),
+                    _ => warn_bad(&key, value),
+                },
                 "banner" => {
                     self.banner = parse_bool(value);
                 }
@@ -152,10 +151,9 @@ impl SshdConfig {
                     // 0 is rejected rather than treated as "unlimited": a
                     // typo'd/empty value must not silently disable the cap that
                     // protects the global process table.
-                    if let Ok(n) = value.parse::<usize>()
-                        && n > 0
-                    {
-                        self.max_sessions = n;
+                    match value.parse::<usize>() {
+                        Ok(n) if n > 0 => self.max_sessions = n,
+                        _ => warn_bad(&key, value),
                     }
                 }
                 "login_grace_secs" => {
@@ -163,19 +161,32 @@ impl SshdConfig {
                     // `LoginGraceTime 0` = off): a timer whose failure mode is
                     // the leak must be disablable on purpose, and a parse
                     // failure just leaves the default.
-                    if let Ok(n) = value.parse::<u64>() {
-                        self.login_grace_secs = n;
+                    match value.parse::<u64>() {
+                        Ok(n) => self.login_grace_secs = n,
+                        Err(_) => warn_bad(&key, value),
                     }
                 }
                 "idle_timeout_secs" => {
-                    if let Ok(n) = value.parse::<u64>() {
-                        self.idle_timeout_secs = n;
+                    match value.parse::<u64>() {
+                        Ok(n) => self.idle_timeout_secs = n,
+                        Err(_) => warn_bad(&key, value),
                     }
                 }
-                _ => {}
+                // A misspelt key (`max_session`) used to vanish without a
+                // trace and leave the default in force.
+                _ => eprintln(&alloc::format!("[SSHD] WARNING: {CONFIG_PATH}: unknown key {key:?} ignored")),
             }
+        } else {
+            eprintln(&alloc::format!("[SSHD] WARNING: {CONFIG_PATH}: line without `=` ignored: {line:?}"));
         }
     }
+}
+
+/// A value that does not parse keeps the default, loudly.
+fn warn_bad(key: &str, value: &str) {
+    eprintln(&alloc::format!(
+        "[SSHD] WARNING: {CONFIG_PATH}: bad value {value:?} for {key}; keeping the default"
+    ));
 }
 
 fn parse_bool(s: &str) -> bool {
