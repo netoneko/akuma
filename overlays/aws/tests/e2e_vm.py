@@ -23,6 +23,7 @@ def main():
     p.add_argument('--disk', required=True, help='existing amd64 Akuma ext2 disk with herd, sshd and busybox')
     p.add_argument('--kernel', default=str(ROOT / 'target/x86_64-unknown-none/release/akuma'))
     p.add_argument('--timeout', type=int, default=180)
+    p.add_argument('--imds-v2', action='store_true', help='require a metadata token and verify apk and curl')
     a = p.parse_args()
     with tempfile.TemporaryDirectory(prefix='akuma-aws-e2e-') as tmp:
         tmp = Path(tmp)
@@ -37,10 +38,14 @@ def main():
             requests = 0
             def log_message(self, *args): pass
             def do_PUT(self):
-                self.send_error(404)
+                if not a.imds_v2 or self.path != '/latest/api/token':
+                    self.send_error(404); return
+                self.send_response(200); self.end_headers(); self.wfile.write(b'test-token')
             def do_GET(self):
                 if self.path != '/latest/meta-data/public-keys/0/openssh-key':
                     self.send_error(404); return
+                if a.imds_v2 and self.headers.get('X-aws-ec2-metadata-token') != 'test-token':
+                    self.send_error(401); return
                 type(self).requests += 1
                 self.send_response(200); self.end_headers(); self.wfile.write(public.encode())
         server = http.server.ThreadingHTTPServer(('0.0.0.0', 0), Metadata)
@@ -90,6 +95,14 @@ def main():
                                 'root@127.0.0.1', 'echo UNEXPECTED'], capture_output=True, text=True)
                             if rejected.returncode == 0 or 'UNEXPECTED' in rejected.stdout:
                                 raise RuntimeError('an unrelated key was accepted')
+                            if a.imds_v2:
+                                check = subprocess.run(['ssh', '-i', str(key), '-p', str(ssh_port),
+                                    '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=2',
+                                    '-o', 'StrictHostKeyChecking=no', '-o', 'UserKnownHostsFile=/dev/null',
+                                    'root@127.0.0.1', '/sbin/apk --version && /usr/bin/curl --version'],
+                                    capture_output=True, text=True)
+                                if check.returncode or 'apk-tools' not in check.stdout or 'curl ' not in check.stdout:
+                                    raise RuntimeError('guest apk/curl check failed: ' + check.stdout + check.stderr)
                             print('PASS: VM booted herd, fetched launch key, authenticated SSH, and rejected another key'); return
                         time.sleep(2)
                     raise RuntimeError('VM did not complete metadata-backed SSH login')
