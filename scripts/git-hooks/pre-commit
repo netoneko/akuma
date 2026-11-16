@@ -18,6 +18,12 @@ if [ -x scripts/check_errno_sign.py ]; then
     scripts/check_errno_sign.py || exit 1
 fi
 
+# user-pointer ratchet (TYPE_SYSTEM_SAFETY_REPORT.md section 8): a new handler takes `UserAddr`, not a bare u64.
+echo "user-pointer ratchet: no new untyped *_ptr parameters"
+if [ -x scripts/check_user_ptr_params.py ]; then
+    scripts/check_user_ptr_params.py || exit 1
+fi
+
 echo "console-print rule: no reimplemented core::fmt::Write writers"
 VIOLATIONS="$(grep -rnE 'impl(<[^>]*>)? core::fmt::Write for' src/ crates/*/src/ --include='*.rs' \
     | grep -v '^crates/akuma-primitives/src/console\.rs:')"

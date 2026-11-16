@@ -669,6 +669,104 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
 // The folded API: validate, prefault, copy. No `unsafe` at any call site.
 // ============================================================================
 
+/// A user virtual address as a syscall argument carried it: **not yet validated**, and not arithmetic-by-default.
+///
+/// A raw `u64` pointer is what every handler took, offset with plain `+` (`iov + i * 16`, `ptr + i * 8`): a wrap there
+/// names a different *user* address, which the next copy validates again, so it was a correctness defect and not a
+/// safety one, but it was a defect. [`UserAddr`] has no `Add`; the ways to move are [`UserAddr::offset_of`] and
+/// [`UserAddr::add`], both checked. [`UserAddr::slice`] is the validation, and its result [`UserSlice`] is the proof
+/// that one was made (`TYPE_SYSTEM_SAFETY_REPORT.md` §8: stage B of the user boundary, begun here).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(transparent)]
+pub struct UserAddr(u64);
+
+impl UserAddr {
+    /// A raw syscall argument. The only constructor.
+    #[must_use]
+    pub const fn new(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The raw address, for the helpers that still take a `u64`.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+
+    /// Whether this is `NULL`.
+    #[must_use]
+    pub const fn is_null(self) -> bool {
+        self.0 == 0
+    }
+
+    /// `self + bytes`, or `EFAULT` if the address wraps.
+    pub fn add(self, bytes: u64) -> Result<Self, Errno> {
+        self.0.checked_add(bytes).map(Self).ok_or(EFAULT)
+    }
+
+    /// The address of element `index` of an array of `T` that starts here, or `EFAULT` if it wraps. `T` is a [`Pod`]
+    /// because an element stride only means something for a type that has a fixed layout on the wire.
+    pub fn offset_of<T: Pod>(self, index: usize) -> Result<Self, Errno> {
+        let bytes = (index as u64).checked_mul(core::mem::size_of::<T>() as u64).ok_or(EFAULT)?;
+        self.add(bytes)
+    }
+
+    /// Validate `len` bytes starting here (faulting lazy pages in as `prefault` says) and return the proof.
+    pub fn slice(self, len: usize, prefault: Prefault) -> Result<UserSlice, Errno> {
+        if self.0.checked_add(len as u64).is_none() || !validate_user_range(self.0, len, prefault) {
+            return Err(EFAULT);
+        }
+        Ok(UserSlice { addr: self, len })
+    }
+}
+
+impl From<UserAddr> for u64 {
+    fn from(a: UserAddr) -> u64 {
+        a.0
+    }
+}
+
+/// A range of user memory that [`UserAddr::slice`] validated. A mapping can still go away before the copy (another
+/// thread unmaps it); that is safe, because the copy runs under fault recovery and answers `EFAULT`.
+#[derive(Clone, Copy, Debug)]
+pub struct UserSlice {
+    addr: UserAddr,
+    len: usize,
+}
+
+impl UserSlice {
+    #[must_use]
+    pub const fn addr(self) -> UserAddr {
+        self.addr
+    }
+
+    #[must_use]
+    pub const fn len(self) -> usize {
+        self.len
+    }
+
+    #[must_use]
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    /// Fill `dst` from this range. `EFAULT` if `dst` is not exactly this long: the length cannot silently disagree.
+    pub fn read_into(self, dst: &mut [u8]) -> Result<(), Errno> {
+        if dst.len() != self.len {
+            return Err(EFAULT);
+        }
+        copy_from_user_with(dst, self.addr.0, Prefault::No)
+    }
+
+    /// Write `src` to this range. `EFAULT` if `src` is not exactly this long.
+    pub fn write_from(self, src: &[u8]) -> Result<(), Errno> {
+        if src.len() != self.len {
+            return Err(EFAULT);
+        }
+        copy_to_user_with(self.addr.0, src, Prefault::No)
+    }
+}
+
 /// Copy `src` out to user memory at `dst_user`.
 ///
 /// The length comes from the slice, so it cannot disagree with the kernel-side

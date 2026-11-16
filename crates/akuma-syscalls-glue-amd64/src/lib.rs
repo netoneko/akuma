@@ -248,7 +248,10 @@ pub fn vectored(fd: u64, iov: u64, cnt: u64, one: fn(u64, u64, u64) -> u64) -> u
     let mut total = 0u64;
     for i in 0..cnt.min(1024) {
         let mut entry = [0u64; 2];
-        if akuma_user_access::read_user_into(&mut entry, iov + i * 16).is_err() {
+        if akuma_user_access::UserAddr::new(iov)
+            .offset_of::<[u64; 2]>(i as usize)
+            .and_then(|at| akuma_user_access::read_user_into(&mut entry, at.get()))
+            .is_err() {
             return if total == 0 { EFAULT } else { total };
         }
         let [base, len] = entry;

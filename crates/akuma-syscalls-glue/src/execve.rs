@@ -81,7 +81,10 @@ fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>
     }
     for i in 0..=max {
         let mut p = 0u64;
-        crate::read_user_into(&mut p, ptr + (i as u64) * 8).map_err(|_| EFAULT)?;
+        akuma_exec::process::user_access::UserAddr::new(ptr)
+            .offset_of::<u64>(i)
+            .and_then(|at| crate::read_user_into(&mut p, at.get()))
+            .map_err(|_| EFAULT)?;
         if p == 0 {
             return Ok(out);
         }
