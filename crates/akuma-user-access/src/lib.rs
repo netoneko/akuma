@@ -457,6 +457,11 @@ impl BypassValidation {
     /// per-thread table in the tree (`DroppedWindowLedger`, the thread-state arrays).
     #[inline]
     pub fn store(&self, on: bool, order: Ordering) {
+        // Once sealed, nothing can open a window again. Closing one is still
+        // allowed, so a guard that drops after the seal leaves its slot off.
+        if on && BYPASS_SEALED.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(slot) = self.per_thread.get(akuma_primitives::preempt::current_tid()) {
             slot.store(on, order);
         }
@@ -467,13 +472,33 @@ impl BypassValidation {
     #[inline]
     #[must_use]
     pub fn load(&self, order: Ordering) -> bool {
+        // The slot first: it is `false` on every production path, so the seal
+        // costs nothing there.
         self.per_thread
             .get(akuma_primitives::preempt::current_tid())
             .is_some_and(|slot| slot.load(order))
+            && !BYPASS_SEALED.load(Ordering::Acquire)
     }
 }
 
 pub static BYPASS_VALIDATION: BypassValidation = BypassValidation::new();
+
+/// Set once, by [`seal_bypass`]; never cleared.
+static BYPASS_SEALED: AtomicBool = AtomicBool::new(false);
+
+/// End the boot self-tests' right to pass kernel addresses as user pointers,
+/// for every thread, for good.
+///
+/// The bypass exists only for self-tests that drive syscall bodies with kernel
+/// buffers, and they all run before the first user program. A kernel calls this
+/// immediately before it starts init. From then on [`BypassValidation::load`]
+/// answers `false` whatever a slot holds (a slot left on by an abnormal exit
+/// from a hand-paired window included) and `store(true)` does nothing, so no
+/// later bug can turn a user-supplied kernel address into a kernel write
+/// (`docs/archive/SECURITY_AUDIT_2026_11_16.md` M7).
+pub fn seal_bypass() {
+    BYPASS_SEALED.store(true, Ordering::Release);
+}
 
 /// RAII form of [`BYPASS_VALIDATION`]: on for the calling thread until dropped, and
 /// **restoring what it found** rather than forcing `false`, so windows nest.

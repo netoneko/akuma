@@ -408,6 +408,8 @@ pub fn kmain(hvm_start_info: u64, before_main: fn()) -> ! {
                 lapic::start_timer();
             }
             boot::apply_runtime_flags(cmdline);
+            // The self-tests are over; their user-pointer bypass is closed for good.
+            akuma_user_access::seal_bypass();
             usermode::run_init(init);
         }
     }

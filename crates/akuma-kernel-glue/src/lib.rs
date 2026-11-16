@@ -1737,6 +1737,10 @@ fn run_async_main() -> ! {
     // Enable IRQs for the main loop
     akuma_primitives::irq::unmask_irqs();
 
+    // Every boot self-test has run. From here on user pointers are always
+    // validated: the tests' bypass cannot be opened again.
+    akuma_exec::process::user_access::seal_bypass();
+
     // Init: what `init=`/`initargs=` on the boot line name (`akuma_params::init`, the reader
     // amd64 uses too), and `herd daemon` when it names nothing, which is what this kernel has
     // always started. `config::AUTO_START_HERD` still switches init off altogether. Its stdout
