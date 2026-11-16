@@ -2851,7 +2851,8 @@ pub fn fork_share_parent_memory(
         // Lowest VA to scan for code/data pages — see `fork_code_start`, which
         // carries the three layouts and the Go-AArch64 regression it exists for.
         let code_start = fork_code_start(parent.memory.code_end.load(Ordering::Relaxed));
-        let interp_base = 0x3000_0000usize;
+        // Wherever this image's dynamic linker was loaded (random per exec).
+        let interp_base = parent.memory.interp_base.load(Ordering::Relaxed);
         let interp_scan_size = 2 * 1024 * 1024;
 
         // ── Collected BKL-held, BEFORE the dropped window opens ──
@@ -3068,7 +3069,8 @@ pub fn fork_share_parent_memory(
         }
 
         lifecycle_trace("[FORK-DBG] step4: copying interp\n");
-        let interp_base = 0x3000_0000usize;
+        // Wherever this image's dynamic linker was loaded (random per exec).
+        let interp_base = parent.memory.interp_base.load(Ordering::Relaxed);
         let interp_scan_size = 2 * 1024 * 1024;
         if mmu::translate_user_va(parent_l0, interp_base).is_some() {
             copy_range_phys(

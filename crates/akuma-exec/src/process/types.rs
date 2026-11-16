@@ -40,6 +40,11 @@ pub struct ProcessMemory {
     /// Bottom of the automatic-placement window, where the search wraps to.
     pub mmap_base: AtomicUsize,
     pub mmap_limit: AtomicUsize,
+    /// Where this image's dynamic linker is mapped. `fork` shares the linker's
+    /// pages by scanning from here; it was the literal `0x3000_0000` until the
+    /// base became random per exec. An image with no linker keeps the default,
+    /// where the scan finds nothing mapped.
+    pub interp_base: AtomicUsize,
 }
 
 impl Clone for ProcessMemory {
@@ -52,6 +57,7 @@ impl Clone for ProcessMemory {
             next_mmap: AtomicUsize::new(self.next_mmap.load(Ordering::Relaxed)),
             mmap_base: AtomicUsize::new(self.mmap_base.load(Ordering::Relaxed)),
             mmap_limit: AtomicUsize::new(self.mmap_limit.load(Ordering::Relaxed)),
+            interp_base: AtomicUsize::new(self.interp_base.load(Ordering::Relaxed)),
         }
     }
 }
@@ -70,7 +76,17 @@ impl ProcessMemory {
             next_mmap: AtomicUsize::new(mmap_start),
             mmap_base: AtomicUsize::new(mmap_start),
             mmap_limit: AtomicUsize::new(mmap_limit),
+            interp_base: AtomicUsize::new(Self::DEFAULT_INTERP_BASE),
         }
+    }
+
+    /// The linker's unslid base (`akuma_elf`'s `INTERP_BASE`).
+    pub const DEFAULT_INTERP_BASE: usize = 0x3000_0000;
+
+    /// Record where the loader put the dynamic linker (`0`: there is none).
+    pub fn set_interp_base(&self, base: usize) {
+        let base = if base == 0 { Self::DEFAULT_INTERP_BASE } else { base };
+        self.interp_base.store(base, Ordering::Relaxed);
     }
 
     /// Re-point every field for a new image, through `&self`. The `execve`

@@ -1062,6 +1062,9 @@ pub struct Image {
     /// walks; a second frame list in the region would be a second answer to the
     /// same question.
     pub regions: Vec<MmapRegion>,
+    /// Where the loader put the dynamic linker, or 0 for an image without one
+    /// (and for a `fork` child, which inherits the parent's record).
+    pub interp_base: usize,
 }
 
 impl Image {
@@ -1123,11 +1126,11 @@ impl Image {
             0,
         )
         .map_err(|e| loader::elf_err(&e))?;
-        let (space, stack) = (built.address_space, built.sp as u64);
+        let (space, stack, interp_base) = (built.address_space, built.sp as u64, built.interp_base);
 
         let entry = img.entry;
         let regions = alloc::vec![crate::mm::lazy_stack_region(ELF_STACK_TOP, ELF_STACK_PAGES, elf_stack_max_pages())];
-        Ok((Self { space, entry, stack, regions }, img))
+        Ok((Self { space, entry, stack, regions, interp_base }, img))
     }
 
     // Teardown is `Drop`, not a `free(self)` method.
@@ -2161,12 +2164,17 @@ pub fn register_exec_process(
         entry: image.entry as usize,
         sp: image.stack as usize,
         brk: image_top as usize,
-        memory: ProcessMemory::new(
-            image_top as usize,
-            stack_bottom as usize,
-            ELF_STACK_TOP as usize,
-            crate::mm::MMAP_BASE,
-        ),
+        memory: {
+            let memory = ProcessMemory::new(
+                image_top as usize,
+                stack_bottom as usize,
+                ELF_STACK_TOP as usize,
+                crate::mm::MMAP_BASE,
+            );
+            // Where this image's dynamic linker went, for `fork`'s scan.
+            memory.set_interp_base(image.interp_base);
+            memory
+        },
         // Stated decision, not a default: see the module header — the page is
         // never read on this target and mapping it would leak 4 KiB/process.
         process_info_phys: 0,
@@ -2539,6 +2547,7 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
             stack_bottom,
             stack_top: ELF_STACK_TOP as usize,
             mmap_floor: crate::mm::MMAP_BASE,
+            interp_base: next.interp_base,
             // `execve::commit` records the argv.
             args: &[],
             // Every segment is mapped eagerly (`loader::load_path`).

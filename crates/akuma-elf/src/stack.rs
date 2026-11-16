@@ -32,6 +32,10 @@ pub struct LoadedWithStack<A: UserPages> {
     pub stack_top: usize,
     /// Lowest VA `mmap` may hand out; non-zero only when an interpreter is loaded.
     pub mmap_floor: usize,
+    /// Where the dynamic linker was loaded, or 0 for an image without one. It
+    /// moves from exec to exec (`load_interpreter`), and `fork` needs it to
+    /// find the linker's pages.
+    pub interp_base: usize,
     /// Segments to register for demand paging. Empty unless the image was loaded
     /// with the deferred mapping strategy — see [`super::load::MapStrategy`].
     pub deferred_segments: Vec<DeferredLazySegment>,
@@ -313,6 +317,7 @@ pub fn attach_stack<A: UserPages, S: AsRef<[u8]>>(
         compute_stack_top(loaded.brk, interp_end) - akuma_primitives::aslr::slide(16 << 20, PAGE_SIZE)
     });
     let mmap_floor = interp_end.unwrap_or(0);
+    let interp_base = loaded.interp.as_ref().map_or(0, |i| i.base_addr);
     let total_size = stack_size + PAGE_SIZE;
     let guard_page = (stack_top - total_size) & !(PAGE_SIZE - 1);
     let stack_bottom = guard_page + PAGE_SIZE;
@@ -389,6 +394,7 @@ pub fn attach_stack<A: UserPages, S: AsRef<[u8]>>(
         stack_bottom,
         stack_top,
         mmap_floor,
+        interp_base,
         deferred_segments: loaded.deferred_segments,
     })
 }

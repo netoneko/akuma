@@ -202,6 +202,7 @@ impl TestImage for Image {
             entry: USER_CODE_VA as u64,
             stack: (USER_STACK_VA + 4096 - 16) as u64,
             regions: Vec::new(),
+            interp_base: 0,
         })
     }
 
@@ -1991,7 +1992,7 @@ pub fn identity_cost_test(t: &mut Suite) {
         t.check("identity: probe address space built", false);
         return;
     };
-    let image = Image { space, entry: 0, stack: 0, regions: Vec::new() };
+    let image = Image { space, entry: 0, stack: 0, regions: Vec::new(), interp_base: 0 };
     let pid = alloc_pid();
     let task = k::sched::current_task();
     let Some(table_slot) = akuma_exec::process::reserve_process_slot() else {

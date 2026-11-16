@@ -206,6 +206,8 @@ pub struct ImageInstall<'a> {
     pub stack_bottom: usize,
     pub stack_top: usize,
     pub mmap_floor: usize,
+    /// Where the loader put the dynamic linker, or 0 for an image without one.
+    pub interp_base: usize,
     /// The new `argv`, for `/proc/<pid>/cmdline`.
     pub args: &'a [String],
     /// Segments the loader chose not to map, to be demand-paged from lazy
@@ -277,6 +279,7 @@ impl Process {
             stack_bottom: loaded.stack_bottom,
             stack_top: loaded.stack_top,
             mmap_floor: loaded.mmap_floor,
+            interp_base: loaded.interp_base,
             args,
             deferred_segments: &loaded.deferred_segments,
         })
@@ -334,6 +337,7 @@ impl Process {
         self.brk.store(inst.brk, Ordering::Relaxed);
         self.initial_brk.store(inst.brk, Ordering::Relaxed);
         self.memory.reset(inst.brk, inst.stack_bottom, inst.stack_top, inst.mmap_floor);
+        self.memory.set_interp_base(inst.interp_base);
         // `dynamic_page_tables` is always empty in this tree (nothing pushes to
         // it), so there is nothing to clear — and `&self` could not anyway.
         self.clear_child_tid.store(0, Ordering::Relaxed);
@@ -481,6 +485,7 @@ impl Process {
         loaded.address_space.track_user_frame(process_info_frame);
 
         let memory = ProcessMemory::new(loaded.brk, loaded.stack_bottom, loaded.stack_top, loaded.mmap_floor);
+        memory.set_interp_base(loaded.interp_base);
 
         log::debug!("[Process] PID {} memory: code_end=0x{:x}, stack=0x{:x}-0x{:x}, mmap=0x{:x}-0x{:x}",
             pid, loaded.brk, loaded.stack_bottom, loaded.stack_top, memory.next_mmap.load(Ordering::Relaxed), memory.mmap_limit.load(Ordering::Relaxed));
