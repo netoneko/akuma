@@ -180,7 +180,14 @@ fn weak_fill(buf: &mut [u8]) {
 /// `pub` since Stage R: ring 3's `getrandom(2)` routes here, which is what
 /// `sshd`'s key exchange rests on.
 pub fn rng_fill(buf: &mut [u8]) {
-    let _ = rng_fill_checked(buf);
+    // The kernel pool (seeded from `rng_fill_checked` below, which is the
+    // registered source). Only when the pool cannot answer - a CPU without
+    // `RDRAND`, or one that never produced a seed - does the stack get
+    // `weak_fill`, so that sequence numbers still differ between boots.
+    // Nothing else is ever served from it: `getrandom` on such a machine fails.
+    if akuma_primitives::rng::fill_bytes(buf) != Some(true) {
+        weak_fill(buf);
+    }
 }
 
 /// [`rng_fill`], answering **whether the whole buffer was filled**.
@@ -197,11 +204,11 @@ pub fn rng_fill(buf: &mut [u8]) {
 /// initial-sequence-number caller genuinely has nothing to do with the answer.
 pub fn rng_fill_checked(buf: &mut [u8]) -> bool {
     if !has_rdrand() {
-        weak_fill(buf);
-        // Weak, but complete, and the degradation is stated at `weak_fill`.
-        // Reporting `false` here would make `getrandom` fail outright on a CPU
-        // without `RDRAND`, which is a worse answer than a stated-weak one.
-        return true;
+        // No hardware entropy is a failure, and the callers see it: `getrandom`
+        // is `EIO`, and sshd refuses to make a key. This returned `weak_fill`'s
+        // output as success until 2026-11-16, which handed a key exchange a
+        // counter mixed with the TSC (`SECURITY_AUDIT_2026_11_16.md` C3).
+        return false;
     }
     let mut i = 0;
     while i < buf.len() {

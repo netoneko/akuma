@@ -94,7 +94,22 @@ fn build(
     let timestamp = Instant::from_micros((runtime().uptime_us)() as i64);
 
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(mac)));
-    config.random_seed = (runtime().uptime_us)();
+    // smoltcp derives TCP initial sequence numbers and its own local ports from
+    // this. It was the uptime, which an off-path attacker can estimate; it is now
+    // eight bytes of the kernel's entropy, with the uptime mixed in so a runtime
+    // whose `rng_fill` wrote nothing still differs between boots.
+    let mut seed = [0u8; 8];
+    (runtime().rng_fill)(&mut seed);
+    config.random_seed = u64::from_le_bytes(seed) ^ (runtime().uptime_us)();
+    // Ephemeral ports still count up (a counter cannot hand out a port twice),
+    // but from a start nobody outside can know, so the first DNS query after
+    // boot no longer leaves from 49152.
+    let mut start = [0u8; 2];
+    (runtime().rng_fill)(&mut start);
+    super::consts::NEXT_EPHEMERAL_PORT.store(
+        super::consts::EPHEMERAL_PORT_START + u16::from_le_bytes(start) % 16000,
+        core::sync::atomic::Ordering::Relaxed,
+    );
 
     let mut iface = Interface::new(config, &mut device, timestamp);
 

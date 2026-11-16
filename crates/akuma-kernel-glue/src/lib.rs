@@ -134,6 +134,29 @@ const _: () = assert!(
 use akuma_exec::{mmu, process, threading};
 
 #[cfg(target_os = "none")]
+/// Fill `buf` from the core's `RNDR`; `false` if it has none or it ran dry.
+fn rndr_fill(buf: &mut [u8]) -> bool {
+    akuma_primitives::rng::fill_from_words(buf, akuma_cpu::rng::rndr).is_ok()
+}
+
+/// The network stack's randomness (`NetRuntime::rng_fill`): the kernel pool.
+///
+/// On a machine with no entropy source the pool answers nothing, and the stack
+/// still needs sequence numbers that differ from boot to boot, so that one case
+/// falls to a counter mixed with the timer. That is **not** unpredictable and
+/// is not used for anything else: `getrandom` on the same machine fails. It
+/// used to be `expect("RNG required for networking")`, a kernel panic.
+#[cfg(target_os = "none")]
+fn net_rng_fill(buf: &mut [u8]) {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static WEAK: AtomicU64 = AtomicU64::new(0);
+    if akuma_primitives::rng::fill_bytes(buf) != Some(true) {
+        let seed = WEAK.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+            ^ akuma_cpu::sysreg::cntvct_el0();
+        akuma_primitives::rng::splitmix_fill(seed, buf);
+    }
+}
+
 pub fn halt() -> ! {
     // Discarded deliberately: on success this does not return, so a status can
     // only mean "no PSCI conduit" — which the `wfi` below already handles.
@@ -1025,15 +1048,28 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
     // =========================================================================
     // Hardware RNG initialization
     // =========================================================================
+    // Two possible sources feed `akuma_primitives::rng`'s pool, which is what
+    // `getrandom`, `AT_RANDOM` and the network stack read: the VMM's virtio-rng
+    // device, and the core's own `RNDR` (ARMv8.5). A machine with neither has no
+    // entropy and says so; nothing substitutes a guessable value.
+    let rndr = akuma_cpu::rng::has_rndr();
     match rng::init() {
         Ok(()) => {
             console::print("[RNG] Hardware RNG initialized\n");
-            // The shared hook: `AT_RANDOM` on every exec
-            // (`akuma_elf::attach_stack`) and `getrandom`. Unset, both fall back.
             akuma_primitives::rng::set_rng_hook(|buf| rng::fill_bytes(buf).is_ok());
+            // The device is untrusted input; a second, independent seed means
+            // it cannot choose the pool's output on its own.
+            let mut seed = [0u8; 32];
+            if rndr && rndr_fill(&mut seed) {
+                akuma_primitives::rng::seed(&seed);
+            }
+        }
+        Err(_e) if rndr => {
+            console::print("[RNG] No virtio-rng; entropy from RNDR\n");
+            akuma_primitives::rng::set_rng_hook(rndr_fill);
         }
         Err(_e) => {
-            console::print("[RNG] Hardware RNG not available\n");
+            console::print("[RNG] NO ENTROPY SOURCE (no virtio-rng, no RNDR): getrandom will fail\n");
         }
     }
 
@@ -1558,7 +1594,7 @@ fn run_async_main() -> ! {
             // Combined Ctrl-C + pthread_kill check, so a socket read blocked in
             // `wait_until` honours `tkill` the same way pipe/wait loops do.
             is_current_interrupted: process::should_interrupt_blocking_syscall,
-            rng_fill: |buf| rng::fill_bytes(buf).expect("RNG required for networking"),
+            rng_fill: net_rng_fill,
             current_thread_id: || threading::current_thread_id() as u32,
             // Loopback frames never touch virtio, so they have no interrupt of
             // their own to end a parked core's `wfi`/`blocking_relax` — this is
