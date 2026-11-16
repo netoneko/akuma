@@ -836,6 +836,8 @@ pub fn run_all_tests() {
     test_as_drop_defers_while_core_on_l0();
     test_as_drop_defers_while_saved_ctx_on_l0();
     test_cow_break_declines_stale_old_pa();
+    // Unrelated processes share no frame; only a CoW fork does, read-only and counted
+    test_process_memory_isolated_except_cow();
     // Recycled-tid channel stamp forged an exit for a live process (-j4 hang)
     test_ktg_stale_tid_channel_not_stamped();
     test_mark_terminated_ignores_large_ids();
@@ -6369,6 +6371,174 @@ fn test_cow_break_declines_stale_old_pa() {
     } else {
         crate::safe_print!(160,
             "[Test] cow_break_declines_stale_old_pa FAILED: {}\n", msg);
+    }
+}
+
+/// One process cannot reach another's memory, except through a CoW share.
+///
+/// Three address spaces are built the way `fork` and `execve` build them: `A` and `B` are unrelated processes with
+/// private RW pages at the **same** virtual addresses, and `C` is `A`'s fork child, made by the real
+/// `cow_share_and_demote_range`. The only isolation a user process has is its page table, so the test reads the
+/// tables (the walker the fork test uses) and the frames behind them:
+///
+/// 1. **Private**: `A` and `B` share no physical frame, each frame holds its own owner's bytes, and `A`'s extra page
+///    (mapped in `A` only) is not reachable from `B` at that VA.
+/// 2. **CoW is the only exception**: after the fork, `C` maps exactly `A`'s frames, and every frame that is mapped
+///    in more than one space is read-only in all of them with a CoW refcount of at least 2. A shared frame that
+///    either side could write would be a window into the other process.
+/// 3. **The unrelated process is still sealed off**: `B` shares nothing with `A` or `C`, and `A`'s bytes are intact.
+fn test_process_memory_isolated_except_cow() {
+    use akuma_exec::mmu::{self, flags, user_flags};
+    use akuma_exec::process::{cow_share_and_demote_range, ProcAddressSpace, FORK_AS_CHUNK_PAGES};
+    use alloc::collections::BTreeSet;
+    use alloc::vec::Vec;
+
+    const PAGES: usize = FORK_AS_CHUNK_PAGES + 3;
+    // Same VA in every space: the point is that equal addresses name different memory.
+    const VA_BASE: usize = 0x12_0000_0000;
+    // Mapped in A only, one page past the shared range.
+    const A_ONLY_VA: usize = VA_BASE + (PAGES + 4) * 4096;
+    const A_BYTE: u8 = 0xA1;
+    const B_BYTE: u8 = 0xB2;
+
+    fn fill(frame_pa: usize, byte: u8) {
+        // SAFETY: a frame this test just allocated, mapped nowhere else yet.
+        unsafe { core::ptr::write_bytes(mmu::phys_to_virt(frame_pa), byte, 4096) };
+    }
+    fn first_byte(pa: usize) -> u8 {
+        // SAFETY: reads the first byte of a frame some address space in this test still owns.
+        unsafe { core::ptr::read(mmu::phys_to_virt(pa).cast_const()) }
+    }
+    fn private_space(pages: usize, byte: u8) -> Option<mmu::UserAddressSpace> {
+        let mut space = mmu::UserAddressSpace::new()?;
+        for i in 0..pages {
+            let frame = crate::pmm::alloc_page_zeroed()?;
+            if space.map_page(VA_BASE + i * 4096, frame.addr, user_flags::RW).is_err() {
+                crate::pmm::free_page(frame);
+                return None;
+            }
+            fill(frame.addr, byte);
+            space.track_user_frame(frame);
+        }
+        Some(space)
+    }
+
+    let (_total, _alloc, free) = crate::pmm::stats();
+    if free < PAGES * 4 + 128 {
+        console::print("[Test] process_memory_isolated_except_cow SKIPPED (low memory)\n");
+        return;
+    }
+    let (Some(mut a_space), Some(b_space)) = (private_space(PAGES, A_BYTE), private_space(PAGES, B_BYTE)) else {
+        console::print("[Test] process_memory_isolated_except_cow SKIPPED (allocation failed)\n");
+        return;
+    };
+    let Some(extra) = crate::pmm::alloc_page_zeroed() else {
+        console::print("[Test] process_memory_isolated_except_cow SKIPPED (allocation failed)\n");
+        return;
+    };
+    if a_space.map_page(A_ONLY_VA, extra.addr, user_flags::RW).is_err() {
+        crate::pmm::free_page(extra);
+        console::print("[Test] process_memory_isolated_except_cow SKIPPED (map failed)\n");
+        return;
+    }
+    fill(extra.addr, A_BYTE);
+    a_space.track_user_frame(extra);
+
+    let a = ProcAddressSpace::new(a_space);
+    let b = ProcAddressSpace::new(b_space);
+    let walk = |pas: &ProcAddressSpace, pages: usize| -> Vec<(usize, usize, u64)> {
+        mmu::collect_mapped_pages_with_flags(mmu::phys_to_virt(pas.l0_phys()) as *const u64, VA_BASE, pages)
+    };
+    let frames = |v: &[(usize, usize, u64)]| -> BTreeSet<usize> { v.iter().map(|&(_, pa, _)| pa).collect() };
+    let mut fails: Vec<&'static str> = Vec::new();
+
+    // ── 1. Private pages: same VAs, disjoint frames, each holding its owner's bytes ──────────────────────────────
+    let a_pages = walk(&a, PAGES + 8);
+    let b_pages = walk(&b, PAGES + 8);
+    let a_frames = frames(&a_pages);
+    let b_frames = frames(&b_pages);
+    if a_pages.len() != PAGES + 1 || b_pages.len() != PAGES {
+        fails.push("a space did not map exactly the pages it was given");
+    }
+    if !a_frames.is_disjoint(&b_frames) {
+        fails.push("two unrelated processes share a physical frame");
+    }
+    if a_pages.iter().any(|&(_, pa, _)| first_byte(pa) != A_BYTE) {
+        fails.push("A's frame does not hold A's bytes");
+    }
+    if b_pages.iter().any(|&(_, pa, _)| first_byte(pa) != B_BYTE) {
+        fails.push("B's frame does not hold B's bytes");
+    }
+    if b.translate(A_ONLY_VA).is_some() || b.is_mapped(A_ONLY_VA) {
+        fails.push("B can reach the page only A mapped");
+    }
+    if a_pages.iter().chain(b_pages.iter()).any(|&(_, _, f)| f & flags::AP_RO_ALL != flags::AP_RW_ALL) {
+        fails.push("a private page is not plain RW");
+    }
+
+    // ── 2. Fork A into C: the one sanctioned way two spaces name the same frame ──────────────────────────────────
+    let Some(mut c_space) = mmu::UserAddressSpace::new() else {
+        console::print("[Test] process_memory_isolated_except_cow SKIPPED (child allocation failed)\n");
+        return;
+    };
+    let mut scratch: Vec<(usize, usize, u64)> = Vec::with_capacity(FORK_AS_CHUNK_PAGES);
+    match cow_share_and_demote_range(&a, VA_BASE, PAGES * 4096, &mut c_space, &mut scratch, "isolation-test") {
+        Ok(n) if n == PAGES => {}
+        _ => fails.push("fork did not share every page"),
+    }
+    let c = ProcAddressSpace::new(c_space);
+    let a_after = walk(&a, PAGES + 8);
+    let b_after = walk(&b, PAGES + 8);
+    let c_after = walk(&c, PAGES + 8);
+    let c_frames = frames(&c_after);
+
+    if !c_frames.is_subset(&a_frames) || c_frames.len() != PAGES {
+        fails.push("the child maps something other than the parent's shared frames");
+    }
+    if c.translate(A_ONLY_VA).is_some() {
+        fails.push("the child got the page the parent did not share");
+    }
+    // The invariant itself: a frame visible in two spaces is read-only in each and counted as shared.
+    let spaces: [&Vec<(usize, usize, u64)>; 3] = [&a_after, &b_after, &c_after];
+    for (i, mine) in spaces.iter().enumerate() {
+        for &(_, pa, f) in mine.iter() {
+            let elsewhere = spaces.iter().enumerate().any(|(j, other)| j != i && other.iter().any(|&(_, p, _)| p == pa));
+            if elsewhere {
+                if f & flags::AP_RO_ALL != flags::AP_RO_ALL {
+                    fails.push("a frame mapped in two processes is writable in one of them");
+                }
+                if crate::pmm::cow_ref_get(pa) < 2 {
+                    fails.push("a frame mapped in two processes is not CoW-counted");
+                }
+            } else if f & flags::AP_RO_ALL != flags::AP_RW_ALL && a_frames.contains(&pa) && !c_frames.contains(&pa) {
+                fails.push("an unshared private page was demoted");
+            }
+        }
+    }
+
+    // ── 3. The unrelated process is untouched by the fork ────────────────────────────────────────────────────────
+    let b_frames_after = frames(&b_after);
+    if b_frames_after != b_frames || !b_frames_after.is_disjoint(&a_frames) || !b_frames_after.is_disjoint(&c_frames) {
+        fails.push("the fork changed what the unrelated process maps");
+    }
+    if b_after.iter().any(|&(_, pa, f)| first_byte(pa) != B_BYTE || f & flags::AP_RO_ALL != flags::AP_RW_ALL) {
+        fails.push("the unrelated process's memory changed");
+    }
+    if a_after.iter().any(|&(_, pa, _)| first_byte(pa) != A_BYTE) {
+        fails.push("the parent's bytes changed across the fork");
+    }
+
+    // Child first (each shared frame 2 -> 1), then the parent frees them; B frees its own.
+    drop(c);
+    drop(a);
+    drop(b);
+
+    if fails.is_empty() {
+        console::print("[Test] process_memory_isolated_except_cow PASSED\n");
+    } else {
+        for why in &fails {
+            crate::safe_print!(160, "[Test] process_memory_isolated_except_cow FAILED: {}\n", why);
+        }
     }
 }
 
