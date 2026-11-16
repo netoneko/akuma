@@ -394,7 +394,8 @@ pub fn user_copy_fixup(rip: u64) -> Option<u64> {
 
 /// `EFAULT`, as the byte loop's trampoline returns it and as the syscall ABI wants
 /// it (`x0 = -errno` happens at the syscall boundary, not here).
-const EFAULT: u64 = akuma_primitives::errno::EFAULT as u64;
+use akuma_primitives::errno::Errno;
+const EFAULT: Errno = Errno::EFAULT;
 
 /// The 48-bit user VA limit — the only necessary upper bound, because the kernel's
 /// own addresses live in the TTBR1 half (bit 63 set).
@@ -667,12 +668,12 @@ pub fn prefault_user_range(start: usize, len: usize) -> bool {
 ///
 /// The length comes from the slice, so it cannot disagree with the kernel-side
 /// buffer — the invariant the raw `(dst, src, len)` form left to the caller.
-pub fn copy_to_user(dst_user: u64, src: &[u8]) -> Result<(), u64> {
+pub fn copy_to_user(dst_user: u64, src: &[u8]) -> Result<(), Errno> {
     copy_to_user_with(dst_user, src, Prefault::Yes)
 }
 
 /// [`copy_to_user`] with an explicit prefault choice. See [`Prefault`].
-pub fn copy_to_user_with(dst_user: u64, src: &[u8], prefault: Prefault) -> Result<(), u64> {
+pub fn copy_to_user_with(dst_user: u64, src: &[u8], prefault: Prefault) -> Result<(), Errno> {
     if src.is_empty() {
         return Ok(());
     }
@@ -686,12 +687,12 @@ pub fn copy_to_user_with(dst_user: u64, src: &[u8], prefault: Prefault) -> Resul
 }
 
 /// Copy from user memory at `src_user` into `dst`, filling it exactly.
-pub fn copy_from_user(dst: &mut [u8], src_user: u64) -> Result<(), u64> {
+pub fn copy_from_user(dst: &mut [u8], src_user: u64) -> Result<(), Errno> {
     copy_from_user_with(dst, src_user, Prefault::Yes)
 }
 
 /// [`copy_from_user`] with an explicit prefault choice. See [`Prefault`].
-pub fn copy_from_user_with(dst: &mut [u8], src_user: u64, prefault: Prefault) -> Result<(), u64> {
+pub fn copy_from_user_with(dst: &mut [u8], src_user: u64, prefault: Prefault) -> Result<(), Errno> {
     if dst.is_empty() {
         return Ok(());
     }
@@ -718,7 +719,7 @@ fn upper_half_range_ok(ptr: u64, len: usize) -> bool {
 /// so a range below [`USER_VA_LIMIT`] cannot name kernel memory. (On AArch64 the kernel is identity-mapped
 /// low, which is why [`validate_user_range`] also walks the tables.)
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub fn copy_from_user_upper_half(dst: &mut [u8], src_user: u64) -> Result<(), u64> {
+pub fn copy_from_user_upper_half(dst: &mut [u8], src_user: u64) -> Result<(), Errno> {
     if dst.is_empty() {
         return Ok(());
     }
@@ -732,7 +733,7 @@ pub fn copy_from_user_upper_half(dst: &mut [u8], src_user: u64) -> Result<(), u6
 
 /// [`copy_from_user_upper_half`] in the other direction.
 #[cfg(all(target_os = "none", target_arch = "x86_64"))]
-pub fn copy_to_user_upper_half(dst_user: u64, src: &[u8]) -> Result<(), u64> {
+pub fn copy_to_user_upper_half(dst_user: u64, src: &[u8]) -> Result<(), Errno> {
     if src.is_empty() {
         return Ok(());
     }
@@ -760,7 +761,7 @@ pub fn copy_to_user_upper_half(dst_user: u64, src: &[u8]) -> Result<(), u64> {
 ///
 /// Lives here rather than in `src/syscall/` because this is the crate that owns
 /// user-memory access; the syscall layer re-exports it.
-pub fn read_user_byte(ptr: u64) -> Result<u8, u64> {
+pub fn read_user_byte(ptr: u64) -> Result<u8, Errno> {
     let mut b: u8 = 0;
     // SAFETY: the destination is one byte of a live local. The user side is covered
     // by the recovery trampoline, which turns a fault into `Err` instead of taking
@@ -776,7 +777,7 @@ pub fn read_user_byte(ptr: u64) -> Result<u8, u64> {
 ///
 /// `T: Pod` (integers, arrays, and structs admitted with `akuma_pod::pod!`): no
 /// padding, so no uninitialised kernel bytes reach user space.
-pub fn write_user_val<T: Pod>(dst_user: u64, val: &T) -> Result<(), u64> {
+pub fn write_user_val<T: Pod>(dst_user: u64, val: &T) -> Result<(), Errno> {
     write_user_val_with(dst_user, val, Prefault::Yes)
 }
 
@@ -786,7 +787,7 @@ pub fn write_user_val_with<T: Pod>(
     dst_user: u64,
     val: &T,
     prefault: Prefault,
-) -> Result<(), u64> {
+) -> Result<(), Errno> {
     copy_to_user_with(dst_user, akuma_pod::bytes_of(val), prefault)
 }
 
@@ -818,7 +819,7 @@ pub fn as_user_bytes_mut<T: Pod>(vals: &mut [T]) -> &mut [u8] {
 /// only up to the byte the fault hit — check the result before trusting it.
 /// `T: Pod`: every bit pattern user space can send must be a valid `T` (a `bool`,
 /// an enum or a reference is not).
-pub fn read_user_into<T: Pod>(dst: &mut T, src_user: u64) -> Result<(), u64> {
+pub fn read_user_into<T: Pod>(dst: &mut T, src_user: u64) -> Result<(), Errno> {
     read_user_into_with(dst, src_user, Prefault::Yes)
 }
 
@@ -833,7 +834,7 @@ pub fn read_user_into_with<T: Pod>(
     dst: &mut T,
     src_user: u64,
     prefault: Prefault,
-) -> Result<(), u64> {
+) -> Result<(), Errno> {
     copy_from_user_with(akuma_pod::bytes_of_mut(dst), src_user, prefault)
 }
 
@@ -844,7 +845,7 @@ pub fn read_user_into_with<T: Pod>(
 /// copy loop plus the fault trampoline. Every remaining caller is either the safe
 /// wrapper above or a path that documents why it validates differently.
 #[cfg(target_arch = "aarch64")]
-pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), u64> {
+pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), Errno> {
     set_user_copy_fault_handler(__arch_copy_user_fault as *const () as usize as u64);
 
     // Ensure compiler doesn't reorder these calls
@@ -861,7 +862,7 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
     if res == 0 {
         Ok(())
     } else {
-        Err(res)
+        Err(Errno::from_raw(res))
     }
 }
 
@@ -875,7 +876,7 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
 /// task to trip over. The compiler fences keep the copy from being moved across
 /// anything the caller sequences around it, matching the AArch64 arm.
 #[cfg(target_arch = "x86_64")]
-pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), u64> {
+pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), Errno> {
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
 
     // SAFETY: a fault inside `__arch_copy_user_memory` is redirected by the
@@ -889,7 +890,7 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
     if res == 0 {
         Ok(())
     } else {
-        Err(res)
+        Err(Errno::from_raw(res))
     }
 }
 
@@ -903,7 +904,7 @@ pub unsafe fn copy_from_user_safe(dst: *mut u8, src: *const u8, len: usize) -> R
 /// x86_64 had this stub until 2026-09-05; `docs/archive/AKUMA_USER_ACCESS_GATE_FIX.md`
 /// records the experiment that preceded the real arm above.
 #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
-pub unsafe fn copy_from_user_safe(_dst: *mut u8, _src: *const u8, _len: usize) -> Result<(), u64> {
+pub unsafe fn copy_from_user_safe(_dst: *mut u8, _src: *const u8, _len: usize) -> Result<(), Errno> {
     unimplemented!(
         "copy_from_user_safe: no fault-recovery copy exists for this target — \
          see proposals/AKUMA_USER_ACCESS_ARCH_PORTABILITY.md"
@@ -916,7 +917,7 @@ pub unsafe fn copy_from_user_safe(_dst: *mut u8, _src: *const u8, _len: usize) -
 /// **Raw primitive — prefer [`copy_to_user`].** Note this is literally the same
 /// routine as [`copy_from_user_safe`]: the loop is symmetric, so the direction lives
 /// only in the name and swapping the arguments compiles.
-pub unsafe fn copy_to_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), u64> {
+pub unsafe fn copy_to_user_safe(dst: *mut u8, src: *const u8, len: usize) -> Result<(), Errno> {
     // One routine serves both directions: the copy loop is symmetric, so this is
     // an argument swap and not a second implementation. Worth stating because it
     // is also what made widening that loop (64/16/8-byte chunks, 2026-08-27) a

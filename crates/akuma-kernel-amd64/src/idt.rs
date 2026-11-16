@@ -1583,7 +1583,7 @@ pub fn smoke_test(t: &mut Suite) {
 #[allow(unsafe_code)] // boot-suite probe; gated by `no-tests` (lib.rs)
 pub fn user_copy_smoke_test(t: &mut Suite) {
     use akuma_user_access::copy_from_user_safe;
-    const EFAULT: u64 = 14;
+    const EFAULT: akuma_primitives::errno::Errno = akuma_primitives::errno::Errno::EFAULT;
     /// Lower half, well clear of anything a user program or test maps.
     const UNMAPPED_VA: u64 = 0x10_0000_0000;
     /// One page mapped on purpose, with the next page left unmapped.
@@ -1611,13 +1611,13 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
     // SAFETY: the source is unmapped ON PURPOSE — the #PF handler must redirect
     // the copy loop to its trampoline. That redirection is what is under test.
     let r = unsafe { copy_from_user_safe(dst.as_mut_ptr(), UNMAPPED_VA as *const u8, 64) };
-    t.check_eq("user copy: unmapped source returns EFAULT", r.err().unwrap_or(0), EFAULT);
+    t.check_eq("user copy: unmapped source returns EFAULT", r.err().map_or(0, |e| e.code() as u64), EFAULT.code() as u64);
     t.check("user copy: unmapped source wrote nothing", dst.iter().all(|&b| b == 0xA5));
 
     // 3. unmapped destination
     // SAFETY: as above, with the store faulting instead of the load.
     let r = unsafe { copy_from_user_safe(UNMAPPED_VA as *mut u8, src.as_ptr(), 64) };
-    t.check_eq("user copy: unmapped destination returns EFAULT", r.err().unwrap_or(0), EFAULT);
+    t.check_eq("user copy: unmapped destination returns EFAULT", r.err().map_or(0, |e| e.code() as u64), EFAULT.code() as u64);
 
     // The kernel is still running — that is the point — and a copy after a
     // recovered fault behaves like one before it.
@@ -1664,7 +1664,7 @@ pub fn user_copy_smoke_test(t: &mut Suite) {
     // SAFETY: the source is unaddressable ON PURPOSE; the #GP handler must
     // redirect the copy loop to its trampoline.
     let r = unsafe { copy_from_user_safe(dst.as_mut_ptr(), NON_CANONICAL as *const u8, 8) };
-    t.check_eq("user copy: non-canonical source returns EFAULT via #GP", r.err().unwrap_or(0), EFAULT);
+    t.check_eq("user copy: non-canonical source returns EFAULT via #GP", r.err().map_or(0, |e| e.code() as u64), EFAULT.code() as u64);
     t.check(
         "uaccess: range check refuses non-canonical, null-page and wrapping ranges",
         !crate::uaccess::range_ok(NON_CANONICAL, 8)

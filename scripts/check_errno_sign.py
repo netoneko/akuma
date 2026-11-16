@@ -53,7 +53,13 @@ CALL_THEN_QUESTION = re.compile(
     r"\b(" + "|".join(POSITIVE_ERRNO_HELPERS) + r")\s*\((?:[^()]|\([^()]*\))*\)\s*\?"
 )
 
-ROOTS = ("src/syscall",)
+ROOTS = (
+    "crates/akuma-syscalls-glue/src",
+    "crates/akuma-syscalls-glue-amd64/src",
+    "crates/akuma-syscalls-time/src",
+    "crates/akuma-kernel-glue/src",
+    "crates/akuma-kernel-amd64/src",
+)
 
 # `//` to end of line, including `///` doc comments. Blanked rather than removed
 # so byte offsets — and therefore reported line numbers — stay correct. Without

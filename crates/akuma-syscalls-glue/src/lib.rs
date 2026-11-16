@@ -415,10 +415,12 @@ pub type SysResult = Result<u64, u64>;
 ///   the syscall boundary, not here"*, because that crate is also used off the
 ///   syscall path.
 ///
-/// So `read_user_into(&mut ts, ptr)?` inside a `SysResult` arm compiles and is
-/// **wrong**: it returns `Err(14)`, and userspace reads a positive 14 as a
-/// successful syscall returning 14. Every call site therefore uses
-/// `.is_err()` and returns this module's `EFAULT` explicitly. Audited
+/// That used to mean `read_user_into(&mut ts, ptr)?` inside a `SysResult` arm
+/// compiled and returned `Err(14)`, which userspace reads as a successful call.
+/// The user-copy helpers now return `akuma_primitives::errno::Errno`, which has no
+/// conversion to `u64`, so that `?` does not compile; spell the failure out with
+/// `.is_err()` and this module's `EFAULT`, or `Errno::ret()` to convert once.
+/// (`TYPE_SYSTEM_SAFETY_REPORT.md` §1.) Audited
 /// 2026-08-28: zero violations, and `scripts/check_errno_sign.py` keeps it
 /// that way — the risk is new, because before `SysResult` there was no `?` in
 /// these functions for the mistake to hide in.
@@ -508,7 +510,7 @@ pub mod utils;
 /// range to validate up front; the string reader supplies the bound (its own
 /// `max_len` and the VA limit) and the fault trampoline supplies the mapped-ness.
 pub fn copy_from_user_byte(ptr: u64) -> Result<u8, u64> {
-    read_user_byte(ptr)
+    read_user_byte(ptr).map_err(akuma_primitives::errno::Errno::ret)
 }
 
 pub fn copy_from_user_str(ptr: u64, max_len: usize) -> Result<String, u64> {

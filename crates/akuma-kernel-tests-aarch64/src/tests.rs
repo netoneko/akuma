@@ -7186,12 +7186,12 @@ fn test_safe_user_access_fault() -> bool {
     let res = unsafe { akuma_exec::process::user_access::copy_to_user_safe(invalid_addr, kernel_buf.as_ptr(), 16) };
     
     let ok = match res {
-        Err(14) => {
+        Err(e) if e == akuma_primitives::errno::Errno::EFAULT => {
             console::print("  OK: copy to invalid address returned EFAULT\n");
             true
         }
         Err(e) => {
-            crate::safe_print!(64, "  FAILED: expected EFAULT (14), got {}\n", e);
+            crate::safe_print!(64, "  FAILED: expected EFAULT (14), got {}\n", e.code());
             false
         }
         Ok(()) => {

@@ -55,6 +55,51 @@ pub const fn neg_errno(e: i32) -> u64 {
     (-(e as i64)) as u64
 }
 
+/// A positive errno that is **not** a `u64`, so it cannot be returned from a syscall arm by accident.
+///
+/// Two families of `Result<_, u64>` used to meet in the syscall glue with opposite signs (the user-copy helpers
+/// carried the positive form, `SysResult` the negated one), so `read_user_into(..)?` in a `SysResult` arm compiled and
+/// returned `Err(14)`, which userspace reads as a *successful* call returning 14. The user-copy helpers now return
+/// this type: there is no `From<Errno> for u64`, so that `?` is a compile error, and the one way out to the ABI is
+/// [`Errno::ret`]. See `docs/archive/TYPE_SYSTEM_SAFETY_REPORT.md` §1.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[repr(transparent)]
+pub struct Errno(core::num::NonZeroU16);
+
+impl Errno {
+    /// Bad user address; what every failed user copy reports.
+    pub const EFAULT: Errno = Errno::new(EFAULT);
+
+    /// An errno from its positive value. Panics (at compile time in a `const`) on zero or a value over `u16::MAX`.
+    #[must_use]
+    pub const fn new(code: i32) -> Errno {
+        assert!(code > 0 && code <= u16::MAX as i32, "errno must be a positive u16");
+        match core::num::NonZeroU16::new(code as u16) {
+            Some(n) => Errno(n),
+            None => unreachable!(),
+        }
+    }
+
+    /// An errno from a raw nonzero code that crossed an asm boundary (the copy trampoline's return). A value that is not
+    /// a valid errno becomes `EFAULT`, which is what the trampoline's nonzero return means.
+    #[must_use]
+    pub const fn from_raw(code: u64) -> Errno {
+        if code == 0 || code > u16::MAX as u64 { Errno::EFAULT } else { Errno::new(code as i32) }
+    }
+
+    /// The positive value (`14` for `EFAULT`).
+    #[must_use]
+    pub const fn code(self) -> i32 {
+        self.0.get() as i32
+    }
+
+    /// The syscall ABI's return value: `x0 = -errno`.
+    #[must_use]
+    pub const fn ret(self) -> u64 {
+        neg_errno(self.code())
+    }
+}
+
 /// Defines each errno once and derives both representations from it.
 ///
 /// Not exported: the table is meant to be *the* table, so there is no reason for
@@ -169,6 +214,19 @@ errno_table! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errno_type_round_trips_and_negates_once() {
+        assert_eq!(Errno::EFAULT.code(), 14);
+        assert_eq!(Errno::EFAULT.ret(), negated::EFAULT);
+        assert_eq!(Errno::new(EINVAL).ret(), negated::EINVAL);
+        // The trampoline's nonzero return, and anything that is not a valid errno, both mean EFAULT.
+        assert_eq!(Errno::from_raw(14), Errno::EFAULT);
+        assert_eq!(Errno::from_raw(0), Errno::EFAULT);
+        assert_eq!(Errno::from_raw(u64::MAX), Errno::EFAULT);
+        // The niche keeps `Result<(), Errno>` two bytes wide.
+        assert_eq!(core::mem::size_of::<Option<Errno>>(), 2);
+    }
 
     /// The property that makes the negated form safe to hand to userspace: musl
     /// decodes with `if ((long)ret < 0) errno = -(int)ret`, so every entry must

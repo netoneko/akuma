@@ -556,7 +556,7 @@ pub fn smoke_test(t: &mut Suite, st: SmapStatus) {
         akuma_user_access::set_smap_active(true);
         t.check_eq(
             "smap: with the brackets off, the same read is refused (EFAULT)",
-            unbracketed.err().unwrap_or(0),
+            unbracketed.err().map_or(0, |e| e.code() as u64),
             14,
         );
         t.check("smap: AC is clear after the refused read", !ac_set());
