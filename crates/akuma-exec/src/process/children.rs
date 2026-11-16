@@ -95,7 +95,7 @@ fn sigchld_target_thread(tgid: Pid) -> Option<usize> {
 
     crate::process::table::for_each_process(|p| {
         if p.tgid != tgid { return; }
-        let Some(tid) = p.thread_id else { return; };
+        let Some(tid) = p.thread_id.get() else { return; };
         if p.pid == tgid { leader_tid = Some(tid); }
         let blocks_sigchld = crate::threading::thread_signal_mask_of(tid) & SIGCHLD_BIT != 0;
         if !blocks_sigchld {
@@ -319,8 +319,8 @@ pub fn reparent_children_to(dying: Pid, new_parent: Pid) -> usize {
     // out `&Process`. The `Vec` is empty for a process with no children — nearly
     // all of them — and `Vec::new` does not allocate until something is pushed,
     // so the common exit path stays allocation-free.
-    for orphan in crate::process::collect_pids(|p| p.parent_pid == dying) {
-        crate::process::with_process(orphan, |p| p.parent_pid = new_parent);
+    for orphan in crate::process::collect_pids(|p| p.parent_pid.get() == dying) {
+        crate::process::with_process(orphan, |p| p.parent_pid.set(new_parent));
     }
     moved
 }
@@ -348,8 +348,8 @@ pub fn reparent_group_children_to(pid: Pid, new_parent: Pid) -> usize {
 /// Get channel for the current thread (used by syscall handlers)
 pub fn current_channel() -> Option<Arc<ProcessChannel>> {
     if let Some(proc) = current_process_shared() {
-        if let Some(ref ch) = proc.channel {
-            return Some(ch.clone());
+        if let Some(ch) = proc.channel.get() {
+            return Some(ch);
         }
     }
     
@@ -957,7 +957,7 @@ pub fn current_process_shared() -> Option<&'static Process> {
 /// letting the replaced value drop, is fine — deallocation cannot re-enter the
 /// OOM path). Use it for short plain-field writes and scalar copies; use
 /// [`current_process_shared`] for reads and `&self` methods.
-pub fn with_current_process<T>(f: impl FnOnce(&mut Process) -> T) -> Option<T> {
+pub fn with_current_process<T>(f: impl FnOnce(&Process) -> T) -> Option<T> {
     crate::process::table::with_process(current_pid()?, f)
 }
 
@@ -1712,7 +1712,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
         };
         Some(Info {
             pid: p.pid,
-            ppid: p.parent_pid,
+            ppid: p.parent_pid.get(),
             box_id: p.box_id,
             state: st,
             current_syscall: p.current_syscall.load(core::sync::atomic::Ordering::Relaxed),
@@ -1755,7 +1755,7 @@ pub fn list_processes() -> Vec<ProcessInfo2> {
 /// Find a process PID by thread ID (lock-free scan).
 pub fn find_pid_by_thread(thread_id: usize) -> Option<Pid> {
     crate::process::table::find_process(|p| {
-        if p.thread_id == Some(thread_id) { Some(p.pid) } else { None }
+        if p.thread_id.get() == Some(thread_id) { Some(p.pid) } else { None }
     })
 }
 

@@ -2854,8 +2854,8 @@ fn register_at_syscall_process(pid: u32, sub_dir: alloc::string::String) -> usiz
     use core::sync::atomic::Ordering;
 
     let tid = akuma_exec::threading::current_thread_id();
-    let mut proc = make_test_process(pid);
-    proc.cwd = "/tmp".to_string();
+    let proc = make_test_process(pid);
+    proc.cwd.set("/tmp".to_string());
     proc.fds.table.lock().insert(7, FileDescriptor::File(KernelFile::new(sub_dir, 0)));
     register_process(pid, proc);
     register_thread_pid(tid, pid);
@@ -7700,8 +7700,8 @@ fn register_parent_and_child() -> (u32, u32) {
     let parent_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, Ordering::SeqCst);
     let child_pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, Ordering::SeqCst);
     register_process(parent_pid, make_test_process(parent_pid));
-    let mut child = make_test_process(child_pid);
-    child.parent_pid = parent_pid;
+    let child = make_test_process(child_pid);
+    child.parent_pid.set(parent_pid);
     register_process(child_pid, child);
     (parent_pid, child_pid)
 }
@@ -8099,7 +8099,7 @@ fn test_rt_sigaction_after_exit_group_not_enosys() {
 
     // Create a fake "sibling" process
     let sib_pid = 1003;
-    let mut sib_proc = make_test_process(sib_pid);
+    let sib_proc = make_test_process(sib_pid);
     
     let shared_as = if let Some(as_space) = crate::mmu::UserAddressSpace::new_shared(l0_phys) { as_space } else {
         console::print("[Test] sigaction_after_exit: failed to create shared AS\n");
@@ -8110,7 +8110,7 @@ fn test_rt_sigaction_after_exit_group_not_enosys() {
     
     // Assign a fake thread ID to the sibling so we can impersonate it
     let sib_tid = 9999;
-    sib_proc.thread_id = Some(sib_tid);
+    sib_proc.thread_id.set(Some(sib_tid));
     register_process(sib_pid, sib_proc);
     register_thread_pid(sib_tid, sib_pid);
 
@@ -13902,7 +13902,7 @@ fn test_publish_child_exit_pends_sigchld_on_parent() {
     // Register the parent as a Process whose thread is THIS test thread, so
     // sigchld_target_thread resolves to parent_tid and we can observe the bit.
     let mut p = make_test_process(parent_pid);
-    p.thread_id = Some(parent_tid);
+    p.thread_id.set(Some(parent_tid));
     p.tgid = parent_pid;
     register_process(parent_pid, p);
 
@@ -14352,7 +14352,7 @@ fn test_kill_thread_group_reaps_futex_blocked_sibling() {
     if let Some(shared) = crate::mmu::UserAddressSpace::new_shared(l0) {
         sib.address_space.replace(shared);
     }
-    sib.thread_id = Some(sib_tid);
+    sib.thread_id.set(Some(sib_tid));
     register_process(sib_pid, sib);
     register_thread_pid(sib_tid, sib_pid);
 
@@ -14458,7 +14458,7 @@ fn test_fatal_fault_group_exit_precedes_parent_notify() {
     if let Some(shared) = crate::mmu::UserAddressSpace::new_shared(l0) {
         sib.address_space.replace(shared);
     }
-    sib.thread_id = Some(sib_tid);
+    sib.thread_id.set(Some(sib_tid));
     register_process(sib_pid, sib);
     register_thread_pid(sib_tid, sib_pid);
     threading::set_thread_state(sib_tid, threading::thread_state::WAITING);
@@ -14588,19 +14588,19 @@ fn test_kill_thread_group_terminates_before_cleanup() {
     // Create 3 siblings sharing the same address space (tgid).
     let mut sib1 = make_test_process(sib1_pid);
     sib1.tgid = owner_pid;
-    sib1.thread_id = Some(sib1_tid);
+    sib1.thread_id.set(Some(sib1_tid));
     sib1.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib1_pid, sib1);
 
     let mut sib2 = make_test_process(sib2_pid);
     sib2.tgid = owner_pid;
-    sib2.thread_id = Some(sib2_tid);
+    sib2.thread_id.set(Some(sib2_tid));
     sib2.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib2_pid, sib2);
 
     let mut sib3 = make_test_process(sib3_pid);
     sib3.tgid = owner_pid;
-    sib3.thread_id = Some(sib3_tid);
+    sib3.thread_id.set(Some(sib3_tid));
     sib3.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib3_pid, sib3);
 
@@ -14804,8 +14804,8 @@ fn test_kill_thread_group_no_channel_lock_contention() {
     let sib_tid = 131usize;
 
     // Create owner process with a channel.
-    let mut owner_proc = make_test_process(owner_pid);
-    owner_proc.thread_id = Some(owner_tid);
+    let owner_proc = make_test_process(owner_pid);
+    owner_proc.thread_id.set(Some(owner_tid));
     let l0_phys = owner_proc.address_space.l0_phys();
     register_process(owner_pid, owner_proc);
 
@@ -14815,7 +14815,7 @@ fn test_kill_thread_group_no_channel_lock_contention() {
     // Create sibling with a channel.
     let mut sib_proc = make_test_process(sib_pid);
     sib_proc.tgid = owner_pid;
-    sib_proc.thread_id = Some(sib_tid);
+    sib_proc.thread_id.set(Some(sib_tid));
     sib_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib_pid, sib_proc);
 
@@ -14873,21 +14873,21 @@ fn test_exit_group_kills_siblings_before_close_all() {
     let sib2_tid = claimed[2];
 
     // Create leader process
-    let mut leader_proc = make_test_process(leader_pid);
-    leader_proc.thread_id = Some(leader_tid);
+    let leader_proc = make_test_process(leader_pid);
+    leader_proc.thread_id.set(Some(leader_tid));
     let l0_phys = leader_proc.address_space.l0_phys();
     register_process(leader_pid, leader_proc);
 
     // Create two sibling processes (simulating goroutine threads)
     let mut sib1_proc = make_test_process(sib1_pid);
     sib1_proc.tgid = leader_pid;
-    sib1_proc.thread_id = Some(sib1_tid);
+    sib1_proc.thread_id.set(Some(sib1_tid));
     sib1_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib1_pid, sib1_proc);
 
     let mut sib2_proc = make_test_process(sib2_pid);
     sib2_proc.tgid = leader_pid;
-    sib2_proc.thread_id = Some(sib2_tid);
+    sib2_proc.thread_id.set(Some(sib2_tid));
     sib2_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sib2_pid, sib2_proc);
 
@@ -14962,14 +14962,14 @@ fn test_kill_thread_group_clears_thread_id() {
     let leader_tid = claimed[0];
     let sibling_tid = claimed[1];
 
-    let mut leader_proc = make_test_process(leader_pid);
-    leader_proc.thread_id = Some(leader_tid);
+    let leader_proc = make_test_process(leader_pid);
+    leader_proc.thread_id.set(Some(leader_tid));
     let l0_phys = leader_proc.address_space.l0_phys();
     register_process(leader_pid, leader_proc);
 
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = leader_pid;  // Same thread group
-    sib_proc.thread_id = Some(sibling_tid);
+    sib_proc.thread_id.set(Some(sibling_tid));
     sib_proc.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap());
     register_process(sibling_pid, sib_proc);
 
@@ -14980,7 +14980,7 @@ fn test_kill_thread_group_clears_thread_id() {
     let sibling_exists = lookup_process_shared(sibling_pid).is_some();
     let sibling_thread_state = get_thread_state(sibling_tid);
     // Leader should still exist with its thread_id intact
-    let leader_tid_after = lookup_process_shared(leader_pid).map(|p| p.thread_id);
+    let leader_tid_after = lookup_process_shared(leader_pid).map(|p| p.thread_id.get());
 
     clear_lazy_regions(leader_pid);
     let _ = unregister_process(leader_pid);
@@ -15018,21 +15018,21 @@ fn test_entry_point_trampoline_no_zombie_match() {
     let slot = 120usize;
 
     // Simulate a zombie left by kill_thread_group (thread_id cleared).
-    let mut zombie_proc = make_test_process(zombie_pid);
+    let zombie_proc = make_test_process(zombie_pid);
     zombie_proc.exited.store(true, core::sync::atomic::Ordering::Relaxed);
     zombie_proc.exit_code.store(137, core::sync::atomic::Ordering::Relaxed);
     zombie_proc.state.store(ProcessState::Zombie(137));
-    zombie_proc.thread_id = None; // cleared by fix
+    zombie_proc.thread_id.set(None); // cleared by fix
     register_process(zombie_pid, zombie_proc);
 
     // New child spawned on the same slot.
-    let mut child_proc = make_test_process(child_pid);
-    child_proc.thread_id = Some(slot);
+    let child_proc = make_test_process(child_pid);
+    child_proc.thread_id.set(Some(slot));
     register_process(child_pid, child_proc);
 
     // Replicate entry_point_trampoline's scan logic.
     let found_pid = akuma_exec::process::table::find_process(|p| {
-        if p.thread_id == Some(slot) { Some(p.pid) } else { None }
+        if p.thread_id.get() == Some(slot) { Some(p.pid) } else { None }
     });
 
     clear_lazy_regions(zombie_pid);
@@ -15079,20 +15079,20 @@ fn test_trampoline_resolves_via_thread_pid_map() {
 
     // A stale process that still records the slot — registered FIRST, so it occupies
     // the lower table index and wins `find_process`.
-    let mut stale = make_test_process(stale_pid);
-    stale.thread_id = Some(slot);
+    let stale = make_test_process(stale_pid);
+    stale.thread_id.set(Some(slot));
     register_process(stale_pid, stale);
 
     // The thread's real owner, published in THREAD_PID_MAP the way fork/vfork/clone do.
-    let mut live = make_test_process(live_pid);
-    live.thread_id = Some(slot);
+    let live = make_test_process(live_pid);
+    live.thread_id.set(Some(slot));
     register_process(live_pid, live);
     akuma_exec::runtime::with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(slot, live_pid);
     });
 
     let scan_pid = akuma_exec::process::table::find_process(|p| {
-        if p.thread_id == Some(slot) { Some(p.pid) } else { None }
+        if p.thread_id.get() == Some(slot) { Some(p.pid) } else { None }
     });
     let resolved = resolve_thread_process(slot);
 
@@ -15281,12 +15281,12 @@ fn test_unregister_skips_recycled_thread_slot() {
     // recycled and re-claimed by the unrelated `victim_pid`, which is running on it.
     let dead_pid = 63_100u32;
     let victim_pid = 63_101u32;
-    let mut dead = make_test_process(dead_pid);
-    dead.thread_id = Some(stolen_tid);
+    let dead = make_test_process(dead_pid);
+    dead.thread_id.set(Some(stolen_tid));
     register_process(dead_pid, dead);
 
-    let mut victim = make_test_process(victim_pid);
-    victim.thread_id = Some(stolen_tid);
+    let victim = make_test_process(victim_pid);
+    victim.thread_id.set(Some(stolen_tid));
     register_process(victim_pid, victim);
     akuma_exec::runtime::with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(stolen_tid, victim_pid);
@@ -15308,8 +15308,8 @@ fn test_unregister_skips_recycled_thread_slot() {
 
     // Half 2: nobody else claims the slot, so the terminate must still happen.
     let solo_pid = 63_102u32;
-    let mut solo = make_test_process(solo_pid);
-    solo.thread_id = Some(own_tid);
+    let solo = make_test_process(solo_pid);
+    solo.thread_id.set(Some(own_tid));
     register_process(solo_pid, solo);
     akuma_exec::runtime::with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(own_tid, solo_pid);
@@ -16521,8 +16521,8 @@ fn test_kill_child_processes_basic() {
     let parent_proc = make_test_process(parent_pid);
     register_process(parent_pid, parent_proc);
 
-    let mut child_proc = make_test_process(child_pid);
-    child_proc.parent_pid = parent_pid;
+    let child_proc = make_test_process(child_pid);
+    child_proc.parent_pid.set(parent_pid);
     register_process(child_pid, child_proc);
 
     kill_child_processes(parent_pid);
@@ -16556,12 +16556,12 @@ fn test_kill_child_processes_recursive() {
     let parent_proc = make_test_process(parent_pid);
     register_process(parent_pid, parent_proc);
 
-    let mut child_proc = make_test_process(child_pid);
-    child_proc.parent_pid = parent_pid;
+    let child_proc = make_test_process(child_pid);
+    child_proc.parent_pid.set(parent_pid);
     register_process(child_pid, child_proc);
 
-    let mut grandchild_proc = make_test_process(grandchild_pid);
-    grandchild_proc.parent_pid = child_pid;
+    let grandchild_proc = make_test_process(grandchild_pid);
+    grandchild_proc.parent_pid.set(child_pid);
     register_process(grandchild_pid, grandchild_proc);
 
     kill_child_processes(parent_pid);
@@ -16605,8 +16605,8 @@ fn test_kill_child_processes_thread_group_matches_fork_parent() {
     worker.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(worker_pid, worker);
 
-    let mut compile = make_test_process(compile_pid);
-    compile.parent_pid = worker_pid;
+    let compile = make_test_process(compile_pid);
+    compile.parent_pid.set(worker_pid);
     register_process(compile_pid, compile);
 
     kill_child_processes(main_pid);
@@ -17253,15 +17253,15 @@ fn test_kill_thread_group_sets_child_channel_exited() {
     let sibling_tid = 131usize;
 
     // Create leader
-    let mut leader_proc = make_test_process(leader_pid);
-    leader_proc.thread_id = Some(leader_tid);
+    let leader_proc = make_test_process(leader_pid);
+    leader_proc.thread_id.set(Some(leader_tid));
     let l0_phys = leader_proc.address_space.l0_phys();
     register_process(leader_pid, leader_proc);
 
     // Create sibling sharing address space (same thread group)
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = leader_pid;  // Same thread group
-    sib_proc.thread_id = Some(sibling_tid);
+    sib_proc.thread_id.set(Some(sibling_tid));
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
     sib_proc.address_space.replace(shared_as);
     register_process(sibling_pid, sib_proc);
@@ -17322,14 +17322,14 @@ fn test_epoll_pidfd_with_kill_thread_group() {
 
     // Create leader
     // Use fake thread IDs >= MAX_THREADS (64) so mark_thread_terminated ignores them
-    let mut leader_proc = make_test_process(leader_pid);
-    leader_proc.thread_id = Some(100);
+    let leader_proc = make_test_process(leader_pid);
+    leader_proc.thread_id.set(Some(100));
     let l0_phys = leader_proc.address_space.l0_phys();
 
     // Create sibling in same thread group
     let mut sib_proc = make_test_process(sibling_pid);
     sib_proc.tgid = leader_pid;  // Same thread group
-    sib_proc.thread_id = Some(101);
+    sib_proc.thread_id.set(Some(101));
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
     sib_proc.address_space.replace(shared_as);
 
@@ -18089,7 +18089,7 @@ fn test_normal_goroutine_exit_does_not_kill_group() {
     // Goroutine shares the leader's address space (is_shared == true).
     let mut goroutine = make_test_process(goroutine_pid);
     goroutine.tgid = leader_pid; // same thread group
-    goroutine.parent_pid = leader_pid;
+    goroutine.parent_pid.set(leader_pid);
     goroutine.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(leader_l0).unwrap());
     register_process(goroutine_pid, goroutine);
 
@@ -18157,8 +18157,8 @@ fn test_kill_thread_group_preserves_exit_code() {
     let goroutine_pid = 68_001u32;
 
     // Leader owns the address space; its I/O channel is what the shell reads.
-    let mut leader = make_test_process(leader_pid);
-    leader.thread_id = Some(leader_tid);
+    let leader = make_test_process(leader_pid);
+    leader.thread_id.set(Some(leader_tid));
     let l0 = leader.address_space.l0_phys();
     register_process(leader_pid, leader);
     let leader_ch = Arc::new(ProcessChannel::new());
@@ -18167,7 +18167,7 @@ fn test_kill_thread_group_preserves_exit_code() {
     // Goroutine sibling: same tgid, shared address space.
     let mut g = make_test_process(goroutine_pid);
     g.tgid = leader_pid;
-    g.thread_id = Some(goroutine_tid);
+    g.thread_id.set(Some(goroutine_tid));
     g.address_space.replace(akuma_exec::mmu::UserAddressSpace::new_shared(l0).unwrap());
     register_process(goroutine_pid, g);
 
@@ -18208,8 +18208,8 @@ fn test_crash_goroutine_exit_kills_group() {
     parent.image.get_mut().name = alloc::string::String::from("parent_survives");
     register_process(parent_pid, parent);
 
-    let mut child = make_test_process(child_pid);
-    child.parent_pid = parent_pid;
+    let child = make_test_process(child_pid);
+    child.parent_pid.set(parent_pid);
     register_process(child_pid, child);
 
     // Kill child with SIGSEGV signal
@@ -19029,7 +19029,7 @@ fn test_zombie_stays_for_wait4_reap() {
     let is_exited = lookup_process_shared(pid).is_some_and(|p| p.exited.load(core::sync::atomic::Ordering::Relaxed));
     let is_zombie_state = lookup_process_shared(pid).is_some_and(|p| matches!(p.state.load(), akuma_exec::process::ProcessState::Zombie(_)));
     let exit_code = lookup_process_shared(pid).map_or(0, |p| p.exit_code.load(core::sync::atomic::Ordering::Relaxed));
-    let tid_cleared = lookup_process_shared(pid).is_some_and(|p| p.thread_id.is_none());
+    let tid_cleared = lookup_process_shared(pid).is_some_and(|p| p.thread_id.get().is_none());
 
     // Simulate wait4 reaping
     let _ = unregister_process(pid);
@@ -19262,7 +19262,7 @@ fn test_external_kill_closes_shared_fds() {
     let leader = make_test_process(leader_pid);
     let mut sib = make_test_process(sib_pid);
     sib.tgid = leader_pid;          // CLONE_THREAD sibling of the leader
-    sib.parent_pid = leader_pid;
+    sib.parent_pid.set(leader_pid);
     sib.fds = leader.fds.clone();   // CLONE_FILES: one shared table
     let table_handle = leader.fds.clone(); // test's own extra Arc ref (see doc)
     leader.set_fd(3, FileDescriptor::PipeRead(pipe_id));
@@ -19314,8 +19314,8 @@ fn test_unregister_process_terminates_thread() {
     // Use a fake thread ID >= MAX_THREADS so we don't affect real threads
     let fake_tid = 200usize;
     
-    let mut proc = make_test_process(pid);
-    proc.thread_id = Some(fake_tid);
+    let proc = make_test_process(pid);
+    proc.thread_id.set(Some(fake_tid));
     register_process(pid, proc);
     
     // Unregister should try to mark thread terminated, but fake_tid >= MAX_THREADS
@@ -19338,8 +19338,8 @@ fn test_unregister_process_skips_current_thread() {
     let pid = akuma_exec::process::table::NEXT_PID.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
     let current_tid = current_thread_id();
     
-    let mut proc = make_test_process(pid);
-    proc.thread_id = Some(current_tid);
+    let proc = make_test_process(pid);
+    proc.thread_id.set(Some(current_tid));
     register_process(pid, proc);
     
     // Get state before unregister
@@ -19374,15 +19374,15 @@ fn test_kill_thread_group_two_phase() {
     let sibling_tid = 211usize;
     
     // Create leader
-    let mut leader = make_test_process(leader_pid);
-    leader.thread_id = Some(leader_tid);
+    let leader = make_test_process(leader_pid);
+    leader.thread_id.set(Some(leader_tid));
     let l0_phys = leader.address_space.l0_phys();
     register_process(leader_pid, leader);
     
     // Create sibling in same thread group
     let mut sibling = make_test_process(sibling_pid);
     sibling.tgid = leader_pid;
-    sibling.thread_id = Some(sibling_tid);
+    sibling.thread_id.set(Some(sibling_tid));
     // Share address space
     let shared_as = akuma_exec::mmu::UserAddressSpace::new_shared(l0_phys).unwrap();
     sibling.address_space.replace(shared_as);
@@ -19442,7 +19442,7 @@ fn test_execve_kills_thread_group_siblings() {
     let sibling_tid = MAX_THREADS + 42;
     let mut sibling = make_test_process(sibling_pid);
     sibling.tgid = leader_pid;
-    sibling.thread_id = Some(sibling_tid);
+    sibling.thread_id.set(Some(sibling_tid));
     sibling.address_space.replace(if let Some(a) = akuma_exec::mmu::UserAddressSpace::new_shared(leader.address_space.l0_phys()) {
         a
     } else {
@@ -19508,21 +19508,21 @@ fn test_ktg_stale_tid_channel_not_stamped() {
     let stale_tid = MAX_THREADS + 40;
     let owned_tid = MAX_THREADS + 41;
 
-    let mut leader = make_test_process(leader_pid);
-    leader.thread_id = None;
+    let leader = make_test_process(leader_pid);
+    leader.thread_id.set(None);
     let l0 = leader.address_space.l0_phys();
     register_process(leader_pid, leader);
 
     // Sibling that died earlier: its recorded slot has been recycled to victim.
     let mut dead_sib = make_test_process(dead_sib_pid);
     dead_sib.tgid = leader_pid;
-    dead_sib.thread_id = Some(stale_tid);
+    dead_sib.thread_id.set(Some(stale_tid));
     register_process(dead_sib_pid, dead_sib);
 
     // Sibling that still owns its slot (the stamp must keep working for it).
     let mut live_sib = make_test_process(live_sib_pid);
     live_sib.tgid = leader_pid;
-    live_sib.thread_id = Some(owned_tid);
+    live_sib.thread_id.set(Some(owned_tid));
     register_process(live_sib_pid, live_sib);
 
     register_thread_pid(stale_tid, victim_pid);

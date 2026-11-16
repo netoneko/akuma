@@ -208,7 +208,7 @@ pub(super) fn dirfd_base(dirfd: i32, raw_path: &str) -> Result<Option<String>, u
     if dirfd == AT_FDCWD {
         return Ok(Some(
             akuma_exec::process::current_process_shared()
-                .map_or_else(|| String::from("/"), |proc| proc.cwd.clone()),
+                .map_or_else(|| String::from("/"), |proc| proc.cwd.get()),
         ));
     }
     if dirfd < 0 {
@@ -3239,7 +3239,7 @@ pub(super) fn sys_truncate(path_ptr: u64, length: i64) -> SysResult {
     let resolved = if path.starts_with('/') {
         path
     } else if let Some(proc) = akuma_exec::process::current_process_shared() {
-        akuma_vfs_glue::resolve_path(&proc.cwd, &path)
+        akuma_vfs_glue::resolve_path(&proc.cwd.get(), &path)
     } else {
         return Err(EBADF);
     };
@@ -3515,7 +3515,8 @@ pub fn sys_faccessat2(dirfd: i32, path_ptr: u64, mode: u32, _flags: u32) -> SysR
 pub(super) fn sys_getcwd(buf_ptr: u64, size: usize) -> u64 {
     if !validate_user_ptr(buf_ptr, size) { return EFAULT; }
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        let cwd_bytes = proc.cwd.as_bytes();
+        let cwd = proc.cwd.get();
+        let cwd_bytes = cwd.as_bytes();
         if cwd_bytes.len() + 1 > size {
             return ERANGE;
         }
@@ -4086,7 +4087,7 @@ pub(super) fn sys_fchdir(fd: u32) -> u64 {
             // Move a pre-built String in; `with_current_process` runs IRQ-masked
             // and must not allocate (dropping the old cwd is fine).
             let new_cwd = path.clone();
-            akuma_exec::process::with_current_process(|p| p.cwd = new_cwd);
+            akuma_exec::process::with_current_process(|p| p.cwd.set(new_cwd));
             if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] fchdir(fd={}) -> \"{}\"\n", fd, path);
             }
@@ -4120,15 +4121,15 @@ pub(super) fn sys_chroot(ptr: u64) -> SysResult {
         return Err(ESRCH);
     };
     // In the caller's own view, symlinks followed (chroot follows them).
-    let view = akuma_vfs_glue::resolve_symlinks(&akuma_vfs_glue::resolve_path(&proc.cwd, &path));
+    let view = akuma_vfs_glue::resolve_symlinks(&akuma_vfs_glue::resolve_path(&proc.cwd.get(), &path));
     let meta = akuma_vfs_glue::metadata(&view).map_err(|_| ENOENT)?;
     if !meta.is_dir {
         return Err(ENOTDIR);
     }
     super::perm::check(&view, akuma_isolation::dac::MAY_EXEC)?;
     // The real directory: this view placed under the current root.
-    let real = akuma_vfs::under_root(&proc.root, &view).unwrap_or(view);
-    akuma_exec::process::with_current_process(|p| p.root = real);
+    let real = akuma_vfs::under_root(&proc.root.get(), &view).unwrap_or(view);
+    akuma_exec::process::with_current_process(|p| p.root.set(real));
     Ok(0)
 }
 
@@ -4136,7 +4137,7 @@ pub(super) fn sys_chdir(ptr: u64) -> SysResult {
     let path = copy_from_user_str(ptr, 512)?;
     
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        let new_cwd = akuma_vfs_glue::resolve_path(&proc.cwd, &path);
+        let new_cwd = akuma_vfs_glue::resolve_path(&proc.cwd.get(), &path);
         
         if akuma_vfs_glue::fs::exists(&new_cwd)
             && let Ok(meta) = akuma_vfs_glue::metadata(&new_cwd)
@@ -4144,7 +4145,7 @@ pub(super) fn sys_chdir(ptr: u64) -> SysResult {
                     // Search permission on the directory itself.
                     super::perm::check(&new_cwd, akuma_isolation::dac::MAY_EXEC)?;
                     // Pre-built String moved into the IRQ-masked closure (no alloc inside).
-                    akuma_exec::process::with_current_process(|p| p.cwd = new_cwd);
+                    akuma_exec::process::with_current_process(|p| p.cwd.set(new_cwd));
                     return Ok(0);
                 }
         return Err(ENOENT);

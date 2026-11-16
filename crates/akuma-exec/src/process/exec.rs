@@ -223,7 +223,7 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
     // 1. Validate hierarchy permissions
     let (caller_box_id, channel) = if let Some(pid) = caller_pid {
         let caller = lookup_process_shared(pid).ok_or("Caller not found")?;
-        (caller.box_id, caller.channel.clone())
+        (caller.box_id, caller.channel.get())
     } else {
         // Kernel caller (e.g. built-in SSH shell)
         // System threads use thread-ID based channel lookup
@@ -260,7 +260,7 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
     // value here, self-correcting on the next check rather than needing an
     // explicit clear on every exit path.
     let existing_grabber = lookup_process_shared(target_pid)
-        .and_then(|target| target.grabbed_by)
+        .and_then(|target| target.grabbed_by.get())
         .filter(|&existing| Some(existing) != caller_pid && lookup_process_shared(existing).is_some());
 
     if existing_grabber.is_some() && !force {
@@ -272,7 +272,7 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
 
     // 2. Perform the delegation
     if let Some(pid) = caller_pid {
-        crate::process::table::with_process(pid, |p| p.delegate_pid = Some(target_pid))
+        crate::process::table::with_process(pid, |p| p.delegate_pid.set(Some(target_pid)))
             .ok_or("Caller not found")?;
     } else {
         // For kernel caller, we don't have a 'Process' struct to set delegate_pid,
@@ -288,9 +288,8 @@ pub fn reattach_process_ext(caller_pid: Option<Pid>, target_pid: Pid, force: boo
     // The swap comes first so every later write lands in the new channel, and
     // the old one is drained after it — a once-per-grab copy, not a hot path.
     let previous = crate::process::table::with_process(target_pid, |p| {
-        let previous = p.channel.take();
-        p.channel.clone_from(&channel);
-        p.grabbed_by = caller_pid;
+        let previous = p.channel.replace(channel.clone());
+        p.grabbed_by.set(caller_pid);
         previous
     })
         .ok_or("Target not found")?;

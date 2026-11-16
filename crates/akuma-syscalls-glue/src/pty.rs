@@ -163,7 +163,7 @@ fn signal_pgrp(pgid: u32, signo: u32) {
     let mut targets = [0u32; akuma_exec::process::MAX_PROCESSES];
     let mut count = 0;
     akuma_exec::process::for_each_process(|p| {
-        if p.pgid == pgid && p.pid == p.tgid && p.pid > 1 && count < targets.len() {
+        if p.pgid.get() == pgid && p.pid == p.tgid && p.pid > 1 && count < targets.len() {
             targets[count] = p.pid;
             count += 1;
         }
@@ -670,7 +670,7 @@ fn ioctl_inner(n: u32, master: bool, cmd: u32, arg: u64) -> SysResult {
 fn set_ctty(n: u32, steal: bool) -> SysResult {
     let proc = akuma_exec::process::current_process_shared().ok_or(ESRCH)?;
     let pid = proc.pid;
-    let pgid = proc.pgid;
+    let pgid = proc.pgid.get();
     let (generation, owner) = with_table(|t| {
         let s = t.get(n as usize)?;
         let p = s.pair.as_ref()?;

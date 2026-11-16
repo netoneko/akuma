@@ -3554,28 +3554,28 @@ fn make_test_process(
         0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000,
     );
     alloc::boxed::Box::new(akuma_exec::process::Process {
-        pid, pgid: pid, tgid: pid,
+        pid, pgid: akuma_exec::process::PidCell::new(pid), tgid: pid,
         state: akuma_exec::process::AtomicProcessState::new(akuma_exec::process::ProcessState::Ready),
         address_space: akuma_exec::process::ProcAddressSpace::new(addr_space),
         image: spinning_top::Spinlock::new(akuma_exec::process::ProcessImage { name: String::from("test"), exe: String::from("test"), args: Vec::new(), context: akuma_exec::process::UserContext::new(0, 0), text: akuma_primitives::TextPin::none() }),
-        parent_pid: ppid, brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: core::sync::atomic::AtomicUsize::new(0x1000_0000),
+        parent_pid: akuma_exec::process::PidCell::new(ppid), brk: core::sync::atomic::AtomicUsize::new(0x1000_0000), initial_brk: core::sync::atomic::AtomicUsize::new(0x1000_0000),
         entry_point: core::sync::atomic::AtomicUsize::new(0), memory: mem, process_info_phys: core::sync::atomic::AtomicUsize::new(info_phys),
-        cwd: String::from("/"),
-        root: String::from("/"),
+        cwd: akuma_exec::process::StrCell::new(String::from("/")),
+        root: akuma_exec::process::StrCell::new(String::from("/")),
         stdin: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(akuma_exec::process::StdioBuffer::new())),
         exited: core::sync::atomic::AtomicBool::new(false), exit_code: core::sync::atomic::AtomicI32::new(0),
         dynamic_page_tables: Vec::new(), mmap_regions: akuma_exec::process::AssistedSpinlock::new(Vec::new()),
         fds: alloc::sync::Arc::new(akuma_exec::process::SharedFdTable::new()),
         fault_mutex: Spinlock::new(BTreeMap::new()),
-        thread_id: None, spawner_pid: None, ctty: core::sync::atomic::AtomicU32::new(0),
+        thread_id: akuma_exec::process::OptTidCell::new(None), spawner_pid: None, ctty: core::sync::atomic::AtomicU32::new(0),
         terminal_state: alloc::sync::Arc::new(Spinlock::new(
             akuma_tty::TerminalState::default(),
         )),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(akuma_exec::process::Creds::ROOT)),
-        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: core::sync::atomic::AtomicU64::new(0),
-        robust_list_head: 0, robust_list_len: 0,
+        channel: akuma_exec::process::ChannelCell::new(None), delegate_pid: akuma_exec::process::OptPidCell::new(None), grabbed_by: akuma_exec::process::OptPidCell::new(None), clear_child_tid: core::sync::atomic::AtomicU64::new(0),
+        robust_list_head: akuma_exec::process::U64Cell::new(0), robust_list_len: akuma_exec::process::UsizeCell::new(0),
         signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),
         signal_mask: 0,
         sigaltstack_sp: core::sync::atomic::AtomicU64::new(0), sigaltstack_flags: core::sync::atomic::AtomicI32::new(2), sigaltstack_size: core::sync::atomic::AtomicU64::new(0),
@@ -5528,12 +5528,12 @@ fn test_set_robust_list_stores_head() -> bool {
 
     let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
-    let mut proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
-    let initial_ok = proc.robust_list_head == 0;
+    let proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
+    let initial_ok = proc.robust_list_head.get() == 0;
 
-    proc.robust_list_head = 0xDEAD_BEEF_0000;
-    proc.robust_list_len = 24;
-    let stored_ok = proc.robust_list_head == 0xDEAD_BEEF_0000 && proc.robust_list_len == 24;
+    proc.robust_list_head.set(0xDEAD_BEEF_0000);
+    proc.robust_list_len.set(24);
+    let stored_ok = proc.robust_list_head.get() == 0xDEAD_BEEF_0000 && proc.robust_list_len.get() == 24;
 
     crate::pmm::free_page(info_frame);
 
@@ -5555,8 +5555,8 @@ fn test_robust_list_cleanup_wakes_futex() -> bool {
     let info_frame = if let Some(f) = crate::pmm::alloc_page_zeroed() { f } else { console::print("  OOM\n"); return false; };
 
     let proc = make_test_process(test_pid, 0, addr_space, info_frame.addr);
-    let head_zero = proc.robust_list_head == 0;
-    let len_zero = proc.robust_list_len == 0;
+    let head_zero = proc.robust_list_head.get() == 0;
+    let len_zero = proc.robust_list_len.get() == 0;
 
     crate::pmm::free_page(info_frame);
 

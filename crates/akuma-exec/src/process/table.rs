@@ -216,7 +216,7 @@ fn retire_process(pid: Pid) -> bool {
             // an entry naming a different pid proves the slot was stolen; a missing entry
             // means nobody has claimed it, and terminating it is still the right thing
             // (that is the orphaned-READY-thread case the paragraph above describes).
-            if let Some(tid) = p.thread_id {
+            if let Some(tid) = p.thread_id.get() {
                 let current_tid = crate::threading::current_thread_id();
                 let slot_owner = with_irqs_disabled(|| THREAD_PID_MAP.lock().get(&tid).copied());
                 let recycled = matches!(slot_owner, Some(owner) if owner != pid);
@@ -327,8 +327,8 @@ pub fn retired_process_count() -> usize {
 /// let exit_code = table::with_process(pid, |p| p.exit_code); // preferred for scalars
 /// ```
 #[inline]
-pub fn with_process<T, F: FnOnce(&mut Process) -> T>(pid: Pid, f: F) -> Option<T> {
-    PROCESS_TABLE.with_active_mut(|p| p.pid == pid, f)
+pub fn with_process<T, F: FnOnce(&Process) -> T>(pid: Pid, f: F) -> Option<T> {
+    PROCESS_TABLE.with_active(|p| p.pid == pid, f)
 }
 
 /// Shared `&'static Process` for `pid`, resolved under an IRQ mask.
@@ -367,7 +367,7 @@ pub fn group_cpu_time_us(tgid: Pid) -> u64 {
     let mut total = 0u64;
     for_each_process(|p| {
         if p.tgid == tgid
-            && let Some(tid) = p.thread_id
+            && let Some(tid) = p.thread_id.get()
         {
             total = total.saturating_add(crate::threading::get_thread_cpu_time(tid));
         }

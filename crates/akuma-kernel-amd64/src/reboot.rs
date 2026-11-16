@@ -151,7 +151,7 @@ mod trace {
         buf.push_str(" tgid=");
         buf.push_dec(u64::from(p.tgid));
         buf.push_str(" ppid=");
-        buf.push_dec(u64::from(p.parent_pid));
+        buf.push_dec(u64::from(p.parent_pid.get()));
         let img = p.image.lock();
         buf.push_str(" name=");
         buf.push_str(&img.name);
@@ -180,7 +180,7 @@ mod trace {
             Some(me) => {
                 buf.push_str(" caller:");
                 describe(&mut buf, me);
-                let mut ppid = me.parent_pid;
+                let mut ppid = me.parent_pid.get();
                 for _ in 0..TRACE_DEPTH {
                     if ppid == 0 {
                         break;
@@ -190,10 +190,10 @@ mod trace {
                     };
                     buf.push_str("\n[reboot-trace]   <-");
                     describe(&mut buf, par);
-                    if par.parent_pid == ppid {
+                    if par.parent_pid.get() == ppid {
                         break;
                     }
-                    ppid = par.parent_pid;
+                    ppid = par.parent_pid.get();
                 }
             }
         }

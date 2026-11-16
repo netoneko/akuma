@@ -3902,7 +3902,7 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                     let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
                     // Also check the parent PID - maybe lazy regions weren't cloned
                     let parent_pid = akuma_exec::process::lookup_process_shared(as_owner)
-                        .map_or(0, |p| p.parent_pid);
+                        .map_or(0, |p| p.parent_pid.get());
                     let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
                     let parent_has_va = akuma_exec::process::lazy_region_lookup_for_pid(parent_pid, far_usize).is_some();
                     crate::safe_print!(256, "[DA-MISS] pid={} ppid={} va=0x{:x} lr_count={} parent_lr={} parent_has_va={}\n",
@@ -4301,7 +4301,7 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                 if lazy_found.is_none() {
                     let lr_count = akuma_exec::process::lazy_region_count_for_pid(pid);
                     let parent_pid = akuma_exec::process::lookup_process_shared(as_owner)
-                        .map_or(0, |p| p.parent_pid);
+                        .map_or(0, |p| p.parent_pid.get());
                     let parent_lr_count = akuma_exec::process::lazy_region_count_for_pid(parent_pid);
                     let parent_has_va = akuma_exec::process::lazy_region_lookup_for_pid(parent_pid, far_usize).is_some();
                     crate::safe_print!(256, "[IA-MISS] pid={} ppid={} va=0x{:x} lr_count={} parent_lr={} parent_has_va={}\n",

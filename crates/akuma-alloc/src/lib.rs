@@ -1178,8 +1178,11 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
             // Check canaries if enabled
             if ENABLE_CANARIES {
                 // Check canary before
-                let canary_before_ptr = ptr.sub(CANARY_SIZE) as *const u64;
-                let canary_before = core::ptr::read_volatile(canary_before_ptr);
+                // Both canary words are read unaligned: the one after the user
+                // block sits at `ptr + user_size`, and `user_size` is any byte
+                // count, so an aligned `u64` read there is undefined behaviour.
+                // `talc_alloc` writes them the same way.
+                let canary_before = core::ptr::read_unaligned(ptr.sub(CANARY_SIZE).cast::<u64>());
                 if canary_before != CANARY_BEFORE {
                     CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
                     safe_print!(
@@ -1192,8 +1195,7 @@ unsafe fn talc_dealloc(ptr: *mut u8, layout: Layout) { unsafe {
                 }
 
                 // Check canary after
-                let canary_after_ptr = ptr.add(user_size) as *const u64;
-                let canary_after = core::ptr::read_volatile(canary_after_ptr);
+                let canary_after = core::ptr::read_unaligned(ptr.add(user_size).cast::<u64>());
                 if canary_after != CANARY_AFTER {
                     CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
                     safe_print!(
@@ -1254,8 +1256,8 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                     
                     // Check canaries before freeing
                     if ENABLE_CANARIES && !ptr.is_null() {
-                        let canary_before = core::ptr::read_volatile(ptr.sub(CANARY_SIZE) as *const u64);
-                        let canary_after = core::ptr::read_volatile(ptr.add(old_user_size) as *const u64);
+                        let canary_before = core::ptr::read_unaligned(ptr.sub(CANARY_SIZE).cast::<u64>());
+                        let canary_after = core::ptr::read_unaligned(ptr.add(old_user_size).cast::<u64>());
                         if canary_before != CANARY_BEFORE || canary_after != CANARY_AFTER {
                             CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
                             akuma_primitives::console::print_str("[ALLOC] CANARY CORRUPTION in realloc(0)\n");
@@ -1306,9 +1308,9 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
 
             // Set up canaries and get user pointer
             let new_user_ptr = if ENABLE_ALLOCATION_REGISTRY && ENABLE_CANARIES {
-                core::ptr::write_volatile(new_actual_ptr.cast::<u64>(), CANARY_BEFORE);
+                core::ptr::write_unaligned(new_actual_ptr.cast::<u64>(), CANARY_BEFORE);
                 let user = new_actual_ptr.add(CANARY_SIZE);
-                core::ptr::write_volatile(user.add(new_size).cast::<u64>(), CANARY_AFTER);
+                core::ptr::write_unaligned(user.add(new_size).cast::<u64>(), CANARY_AFTER);
                 user
             } else {
                 new_actual_ptr
@@ -1349,8 +1351,8 @@ unsafe fn talc_realloc(ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8
                     
                     // Check old canaries
                     if ENABLE_CANARIES {
-                        let canary_before = core::ptr::read_volatile(ptr.sub(CANARY_SIZE) as *const u64);
-                        let canary_after = core::ptr::read_volatile(ptr.add(old_user_size) as *const u64);
+                        let canary_before = core::ptr::read_unaligned(ptr.sub(CANARY_SIZE).cast::<u64>());
+                        let canary_after = core::ptr::read_unaligned(ptr.add(old_user_size).cast::<u64>());
                         if canary_before != CANARY_BEFORE || canary_after != CANARY_AFTER {
                             CANARY_CORRUPTION_COUNT.fetch_add(1, Ordering::Relaxed);
                             akuma_primitives::console::print_str("[ALLOC] CANARY CORRUPTION in realloc\n");

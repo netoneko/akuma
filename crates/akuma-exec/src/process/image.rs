@@ -386,7 +386,7 @@ impl Process {
         self.process_info_phys.store(process_info_phys, Ordering::Relaxed);
 
         if process_info_phys != 0 {
-            let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
+            let info = ProcessInfo::new(self.pid, self.parent_pid.get(), self.box_id);
             let wrote = mmu::write_phys(process_info_phys, &info);
             debug_assert!(wrote, "exec: ProcessInfo frame not in PMM RAM");
         }

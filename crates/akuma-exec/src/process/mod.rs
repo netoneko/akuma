@@ -22,6 +22,7 @@ pub mod lazy_prefault;
 pub mod address_space;
 pub mod maps_rows;
 pub mod types;
+pub mod cells;
 pub mod table;
 pub mod channel;
 pub mod children;
@@ -48,6 +49,7 @@ pub use address_space::{AddressSpaceGuard, AssistedSpinlock, ProcAddressSpace};
 pub use bkl_guard::{process_bkl_drop_enabled, set_process_bkl_drop_enabled, ProcessBklGuard};
 
 pub use types::*;
+pub use cells::{ChannelCell, OptPidCell, OptTidCell, PidCell, StrCell, U64Cell, UsizeCell};
 pub use table::*;
 pub use channel::*;
 pub use children::*;
@@ -505,7 +507,7 @@ fn intr_miss(pid: Pid, data: &[u8], why: &str, lflag: u32) {
 pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static str> {
     let proc = children::lookup_process_shared(pid).ok_or("Process not found")?;
 
-    if let Some(target_pid) = proc.delegate_pid {
+    if let Some(target_pid) = proc.delegate_pid.get() {
         return write_to_process_stdin(target_pid, data);
     }
 
@@ -525,7 +527,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
     // chunk with an INTR byte buried in real data falls back to owning a
     // filtered copy.
     enum Filtered<'a> { Unfiltered(&'a [u8]), Empty, Owned(alloc::vec::Vec<u8>) }
-    let filtered = if proc.channel.as_ref().is_some_and(|ch| ch.is_terminal()) {
+    let filtered = if proc.channel.get().is_some_and(|ch| ch.is_terminal()) {
         let ts = crate::sync::lock_bounded(&proc.terminal_state);
         if let Some(vintr) = ts.intr_char() {
             if data.contains(&vintr) {
@@ -633,7 +635,7 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
         return Ok(n + stripped_count);
     }
 
-    let Some(ref channel) = proc.channel else {
+    let Some(channel) = proc.channel.get() else {
         // No channel: the legacy buffer is the only sink, and it has always taken
         // everything (clearing itself on overflow), so report a full write.
         proc.stdin.lock().write_with_limit(data, config().proc_stdin_max_size);
@@ -668,11 +670,11 @@ pub fn write_to_process_stdin(pid: Pid, data: &[u8]) -> Result<usize, &'static s
 pub fn close_process_stdin(pid: Pid) -> Result<(), &'static str> {
     let proc = children::lookup_process_shared(pid).ok_or("Process not found")?;
 
-    if let Some(target_pid) = proc.delegate_pid {
+    if let Some(target_pid) = proc.delegate_pid.get() {
         return close_process_stdin(target_pid);
     }
 
-    if let Some(ref channel) = proc.channel {
+    if let Some(channel) = proc.channel.get() {
         channel.close_stdin();
 
         // Same per-attempt-guarded acquire as `write_to_process_stdin` above.
@@ -727,7 +729,7 @@ pub struct ProcessImage {
 /// A user process
 pub struct Process {
     pub pid: Pid,
-    pub pgid: Pid,
+    pub pgid: PidCell,
     /// Thread group leader PID (like Linux's tgid).
     /// For the group leader: tgid == pid.
     /// For clone_thread children: tgid == parent's tgid.
@@ -750,7 +752,8 @@ pub struct Process {
     /// `AsLockHold`). See [`ProcAddressSpace`] and
     /// `docs/archive/AKUMA_EXEC_AUDIT.md` §5-bis.
     pub address_space: ProcAddressSpace,
-    pub parent_pid: Pid,
+    /// Re-pointed on reparenting; see [`cells`].
+    pub parent_pid: PidCell,
     /// The program break.
     ///
     /// `AtomicUsize`, not `usize`: [`Process::set_brk`] takes `&self`, and the
@@ -779,13 +782,13 @@ pub struct Process {
     /// crosses `enter_user_mode_checked`'s `!`. See `AKUMA_EXEC_AUDIT.md`
     /// §6.E group 2b.
     pub image: Spinlock<ProcessImage>,
-    pub cwd: String,
+    pub cwd: StrCell,
     /// The directory this process (and, via fork, its children) treats as `/` —
     /// a **real** absolute path, `/` until `chroot(2)`. Applied exactly once, in
     /// `akuma_vfs_glue::resolve_mount`, after the path is canonicalized against
     /// the chroot's own `/`; `cwd` and every stored `File::path` stay in the
     /// process's own view. Mutated like `cwd`, under `with_current_process`.
-    pub root: String,
+    pub root: StrCell,
     pub stdin: Arc<Spinlock<StdioBuffer>>,
     pub stdout: Arc<Spinlock<StdioBuffer>>,
     /// `AtomicBool` / `AtomicI32`, same reasoning as [`Process::state`]:
@@ -819,7 +822,7 @@ pub struct Process {
     #[cfg(feature = "procfs-diag")]
     pub auxv: Option<Vec<(u64, u64)>>,
     pub fds: Arc<SharedFdTable>,
-    pub thread_id: Option<usize>,
+    pub thread_id: OptTidCell,
     pub spawner_pid: Option<Pid>,
     /// The pseudo-terminal this process's session controls, as the encoded
     /// id `akuma-syscalls-glue`'s pty table hands out (`0` = none — the
@@ -840,8 +843,8 @@ pub struct Process {
     /// `docs/archive/UNIX_PERMISSIONS.md` §4.
     pub creds: Arc<SharedCreds>,
     pub namespace: Arc<akuma_isolation::Namespace>,
-    pub channel: Option<Arc<ProcessChannel>>,
-    pub delegate_pid: Option<Pid>,
+    pub channel: ChannelCell,
+    pub delegate_pid: OptPidCell,
     /// The pid currently holding this process's I/O via `sys_reattach` (`box
     /// grab`/`box use -i`), so a second `reattach` can tell "nobody's watching"
     /// from "already attached" and refuse (or, with `force`, detach the
@@ -850,12 +853,12 @@ pub struct Process {
     /// grabber has since exited — checked for liveness at read time rather than
     /// cleared on the grabber's exit, so a stale pid here is self-correcting the
     /// next time anyone asks. See `reattach_process_ext`.
-    pub grabbed_by: Option<Pid>,
+    pub grabbed_by: OptPidCell,
     /// `AtomicU64` (§5a): written by `set_tid_address` and by `execve`'s reset,
     /// read at exit for the `CLONE_CHILD_CLEARTID` futex wake.
     pub clear_child_tid: AtomicU64,
-    pub robust_list_head: u64,
-    pub robust_list_len: usize,
+    pub robust_list_head: U64Cell,
+    pub robust_list_len: UsizeCell,
     pub signal_actions: Arc<SharedSignalTable>,
     pub signal_mask: u64,
     /// Per-page demand-paging serialization slots: `page_va -> holder_thread_id`.
@@ -1015,16 +1018,16 @@ impl Process {
             clear_child_tid: AtomicU64::new(o.clear_child_tid),
 
             // ── inherited verbatim from the parent ──
-            pgid: parent.pgid,
-            parent_pid: parent.pid,
+            pgid: PidCell::new(parent.pgid.get()),
+            parent_pid: PidCell::new(parent.pid),
             entry_point: AtomicUsize::new(parent.entry_point.load(Ordering::Relaxed)),
             brk: AtomicUsize::new(parent.brk.load(Ordering::Relaxed)),
             initial_brk: AtomicUsize::new(parent.initial_brk.load(Ordering::Relaxed)),
             memory: parent.memory.clone(),
             #[cfg(feature = "procfs-diag")]
             auxv: parent.auxv.clone(),
-            cwd: parent.cwd.clone(),
-            root: parent.root.clone(),
+            cwd: StrCell::new(parent.cwd.get()),
+            root: StrCell::new(parent.root.get()),
             stdin: parent.stdin.clone(),   // shared
             stdout: parent.stdout.clone(), // shared
             spawner_pid: parent.spawner_pid,
@@ -1035,7 +1038,7 @@ impl Process {
             // The child keeps the parent's I/O channel so its stdout lands on the
             // same SSH stream. Exit notification uses a *separate* channel, created
             // in `spawn_child_thread_and_publish`, to avoid contaminating this one.
-            channel: parent.channel.clone(),
+            channel: ChannelCell::new(parent.channel.get()),
             signal_mask: parent.signal_mask,
             sigaltstack_sp: AtomicU64::new(parent.sigaltstack_sp.load(Ordering::Relaxed)),
             sigaltstack_flags: AtomicI32::new(parent.sigaltstack_flags.load(Ordering::Relaxed)),
@@ -1064,11 +1067,11 @@ impl Process {
             // `vfork`/`clone_thread` leave it empty and see the parent's mappings
             // through the shared L0, and their faults resolve the leader's list.
             mmap_regions: AssistedSpinlock::new(Vec::new()),
-            thread_id: None,
-            delegate_pid: None,
-            grabbed_by: None,
-            robust_list_head: 0,
-            robust_list_len: 0,
+            thread_id: OptTidCell::new(None),
+            delegate_pid: OptPidCell::new(None),
+            grabbed_by: OptPidCell::new(None),
+            robust_list_head: U64Cell::new(0),
+            robust_list_len: UsizeCell::new(0),
 
             // The per-address-space locks are fresh for EVERY child, including the
             // two primitives whose child SHARES its parent's address space (the
@@ -1180,7 +1183,7 @@ impl Process {
 
     /// Set current working directory for this process
     pub fn set_cwd(&mut self, cwd: &str) {
-        self.cwd = String::from(cwd);
+        self.cwd.set(String::from(cwd));
     }
 
     /// Start executing this process (enters user mode)
@@ -1253,7 +1256,7 @@ impl Process {
         // Write process info to the physical page (before activating address
         // space). `write_phys` range-checks the frame against PMM RAM — same
         // helper `fork_process` uses for the identical write at its own site.
-        let info = ProcessInfo::new(self.pid, self.parent_pid, self.box_id);
+        let info = ProcessInfo::new(self.pid, self.parent_pid.get(), self.box_id);
         let wrote = crate::mmu::write_phys(self.process_info_phys.load(Ordering::Relaxed), &info);
         debug_assert!(wrote, "process_info_phys outside PMM RAM");
     }
@@ -1511,7 +1514,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     let mut siblings: Vec<(Pid, Option<usize>)> = Vec::new();
     table::for_each_process(|p| {
         if p.pid != my_pid && p.tgid == tgid {
-            siblings.push((p.pid, p.thread_id));
+            siblings.push((p.pid, p.thread_id.get()));
         }
     });
     // Who is tearing down which group, ungated. A group kill is rare and always
@@ -1823,7 +1826,7 @@ pub fn dump_orphan_processes() {
     // nested taker of both goes table -> map, and this keeps it that way.
     let mut candidates: Vec<(Pid, Pid, Option<usize>, bool)> = Vec::new();
     table::for_each_process(|p| {
-        candidates.push((p.pid, p.tgid, p.thread_id, p.exited.load(Ordering::Relaxed)));
+        candidates.push((p.pid, p.tgid, p.thread_id.get(), p.exited.load(Ordering::Relaxed)));
     });
     for (pid, tgid, thread_id, exited) in candidates {
         if exited || table::thread_for_pid(pid).is_some() {
@@ -1846,8 +1849,8 @@ fn kill_children_whose_parent_in(parents: &BTreeSet<Pid>) {
     // torn down here or `ps` shows zombies forever.
     let mut children: Vec<(Pid, Pid, Option<usize>, usize, bool, String)> = Vec::new();
     table::for_each_process(|p| {
-        if parents.contains(&p.parent_pid) {
-            children.push((p.pid, p.parent_pid, p.thread_id, p.address_space.l0_phys(),
+        if parents.contains(&p.parent_pid.get()) {
+            children.push((p.pid, p.parent_pid.get(), p.thread_id.get(), p.address_space.l0_phys(),
                 p.exited.load(Ordering::Relaxed), p.image.lock().name.clone()));
         }
     });
@@ -1886,7 +1889,7 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
     let mut members: Vec<(Pid, Option<usize>, bool)> = Vec::new();
     table::for_each_process(|p| {
         if p.address_space.l0_phys() == l0_phys {
-            members.push((p.pid, p.thread_id, p.address_space.is_shared()));
+            members.push((p.pid, p.thread_id.get(), p.address_space.is_shared()));
         }
     });
     if members.is_empty() {
@@ -1904,7 +1907,7 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
             p.exited.store(true, Ordering::Relaxed);
             p.exit_code.store(137, Ordering::Relaxed);
             p.state.store(ProcessState::Zombie(137));
-            p.thread_id = None;
+            p.thread_id.set(None);
         });
         // Same Arc as register_child_channel / notify_child_channel_exited /
         // return_to_kernel::remove_channel.  If the child already called
@@ -1937,7 +1940,7 @@ fn teardown_forked_process_thread_group(child_pid: Pid, l0_phys: usize) {
 fn kill_fork_subtree_recursive(child_pid: Pid, l0_phys: usize) {
     let mut nested: Vec<(Pid, usize)> = Vec::new();
     table::for_each_process(|p| {
-        if p.parent_pid == child_pid {
+        if p.parent_pid.get() == child_pid {
             nested.push((p.pid, p.address_space.l0_phys()));
         }
     });
@@ -2089,7 +2092,7 @@ pub extern "C" fn return_to_kernel(exit_code: i32) -> ! {
             // unmapped page into `Err` (via the copy fault trampoline) instead of
             // faulting the kernel. `Prefault::No` because we hold no lock the
             // reclaim path takes but must not demand-page a dying thread's list.
-            let robust_head = proc.robust_list_head;
+            let robust_head = proc.robust_list_head.get();
             if robust_head != 0 {
                 use akuma_user_access::{read_user_into_with, write_user_val_with, Prefault};
                 /// `Ok(v)` or `None` if the read faulted.
@@ -2569,7 +2572,7 @@ fn spawn_child_thread_and_publish(
     // them back off the struct removes the chance of a call site disagreeing with
     // the `Process` it just built.
     let child_pid = new_proc.pid;
-    let parent_pid = new_proc.parent_pid;
+    let parent_pid = new_proc.parent_pid.get();
 
     // `entry_point_trampoline` erets to `proc.context`, so this must land before
     // the thread exists.
@@ -2582,7 +2585,7 @@ fn spawn_child_thread_and_publish(
         entry_point_trampoline as extern "C" fn() -> !,
         core::ptr::null_mut(),
     )?;
-    new_proc.thread_id = Some(tid);
+    new_proc.thread_id.set(Some(tid));
 
     // Per-target state keyed on the *task slot*, which did not exist until the
     // line above - on amd64 the child's `CR3` root and its `SPAWN` row; on
@@ -3830,7 +3833,7 @@ pub fn reserve_pid_floor(floor: Pid) {
 pub fn resolve_thread_process(tid: usize) -> Option<Pid> {
     let map_pid = table::pid_for_thread(tid);
     let scan_pid = table::find_process(|p| {
-        if p.thread_id == Some(tid) { Some(p.pid) } else { None }
+        if p.thread_id.get() == Some(tid) { Some(p.pid) } else { None }
     });
     if let (Some(m), Some(s)) = (map_pid, scan_pid)
         && m != s
@@ -4166,7 +4169,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
     let mem = ProcessMemory::new(0x1000_0000, 0x80_0000_0000, 0x80_0010_0000, 0x2000_0000);
     
     alloc::boxed::Box::new(Process {
-        pid, pgid: pid, tgid: pid,
+        pid, pgid: PidCell::new(pid), tgid: pid,
         state: AtomicProcessState::new(ProcessState::Ready),
         #[cfg(feature = "procfs-diag")]
         auxv: None,
@@ -4178,22 +4181,22 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
             args: Vec::new(),
             context: UserContext::new(0, 0),
         }),
-        parent_pid: 0, brk: AtomicUsize::new(0x1000_0000), initial_brk: AtomicUsize::new(0x1000_0000),
+        parent_pid: PidCell::new(0), brk: AtomicUsize::new(0x1000_0000), initial_brk: AtomicUsize::new(0x1000_0000),
         entry_point: AtomicUsize::new(0), memory: mem, process_info_phys: AtomicUsize::new(0),
-        cwd: "/".to_string(),
-        root: "/".to_string(),
+        cwd: StrCell::new("/".to_string()),
+        root: StrCell::new("/".to_string()),
         stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
         stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
         exited: AtomicBool::new(false), exit_code: AtomicI32::new(0),
         dynamic_page_tables: Vec::new(), mmap_regions: AssistedSpinlock::new(Vec::new()),
         fds: Arc::new(SharedFdTable::new()),
         fault_mutex: Spinlock::new(alloc::collections::BTreeMap::new()),
-        thread_id: None, spawner_pid: None, ctty: AtomicU32::new(0),
+        thread_id: OptTidCell::new(None), spawner_pid: None, ctty: AtomicU32::new(0),
         terminal_state: Arc::new(Spinlock::new(akuma_tty::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         creds: Arc::new(SharedCreds::new(Creds::ROOT)),
-        channel: None, delegate_pid: None, grabbed_by: None, clear_child_tid: AtomicU64::new(0),
-        robust_list_head: 0, robust_list_len: 0,
+        channel: ChannelCell::new(None), delegate_pid: OptPidCell::new(None), grabbed_by: OptPidCell::new(None), clear_child_tid: AtomicU64::new(0),
+        robust_list_head: U64Cell::new(0), robust_list_len: UsizeCell::new(0),
         signal_actions: Arc::new(SharedSignalTable::new()),
         signal_mask: 0,
         sigaltstack_sp: AtomicU64::new(0), sigaltstack_flags: AtomicI32::new(2), sigaltstack_size: AtomicU64::new(0),

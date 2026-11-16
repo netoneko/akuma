@@ -269,19 +269,25 @@ impl<T, const N: usize> SlotTable<T, N> {
         })
     }
 
-    /// Run `f` with `&mut T` for the first `ACTIVE` slot satisfying `pred`, with
+    /// Run `f` with `&T` for the first `ACTIVE` slot satisfying `pred`, with
     /// IRQs masked for the whole call. `f` must not allocate or block — it runs
     /// under the mask.
-    pub fn with_active_mut<R>(
+    ///
+    /// **Shared, never `&mut T`.** This was `with_active_mut`, and it could not
+    /// be sound: [`Self::active_ref`] and [`Self::ref_if_current`] hand out
+    /// `&T` borrows that outlive their own mask and live on other cores, so a
+    /// `&mut T` to the same occupant aliased them whatever this call masked.
+    /// An IRQ mask is exclusion on one core; it is not uniqueness of a borrow.
+    /// A consumer that must change a field puts that field in an atomic or
+    /// inside its own lock and writes it through `&T`.
+    pub fn with_active<R>(
         &self,
         pred: impl Fn(&T) -> bool,
-        f: impl FnOnce(&mut T) -> R,
+        f: impl FnOnce(&T) -> R,
     ) -> Option<R> {
         with_irqs_disabled(|| {
-            let ptr = self.active_ptr_locked(pred)?;
-            // SAFETY: ACTIVE under the mask; the mask is exclusion enough for
-            // the closure's duration (crate contract).
-            Some(f(unsafe { &mut *ptr }))
+            let occupant = self.occupant(self.active_ptr_locked(pred)?)?;
+            Some(f(occupant))
         })
     }
 
@@ -538,16 +544,16 @@ mod tests {
         assert_eq!(t.find_active::<()>(|_, p| (p.id == 2).then_some(())), None);
     }
 
+    /// `with_active` hands out a shared borrow of the matching occupant, and
+    /// nothing for a predicate that matches no `ACTIVE` slot. A consumer that
+    /// must change a field does it through interior mutability.
     #[test]
-    fn with_active_mut_mutates_in_place() {
+    fn with_active_borrows_the_matching_occupant() {
         let t: SlotTable<Item, 4> = SlotTable::new();
         t.try_claim(Item::new(5)).unwrap();
-        let r = t.with_active_mut(|p| p.id == 5, |p| {
-            p.id = 500;
-            p.id
-        });
-        assert_eq!(r, Some(500));
-        assert_eq!(find_id(&t, 500), Some(500));
+        assert_eq!(t.with_active(|p| p.id == 5, |p| p.id * 100), Some(500));
+        assert_eq!(t.with_active(|p| p.id == 6, |p| p.id), None);
+        assert_eq!(find_id(&t, 5), Some(5));
     }
 
     #[test]

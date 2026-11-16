@@ -477,16 +477,16 @@ pub fn spawn_process_named(
     // Set the channel in the process struct (UNIFIED I/O)
     let attach_terminal = match attach {
         Some(Attach { channel: io, terminal, pid }) => {
-            process.channel = Some(io);
+            process.channel.set(Some(io));
             if let Some(pid) = pid {
                 process.pid = pid;
                 process.tgid = pid;
-                process.pgid = pid;
+                process.pgid.set(pid);
             }
             Some(terminal)
         }
         None => {
-            process.channel = Some(channel.clone());
+            process.channel.set(Some(channel.clone()));
             None
         }
     };
@@ -684,7 +684,7 @@ pub fn spawn_process_named(
         // fork calls `bind_child_task` on a `Box<Process>` that is not yet
         // registered in the table at all.
         let _ = crate::process::table::with_process(pid, |p| {
-            p.thread_id = Some(tid);
+            p.thread_id.set(Some(tid));
         });
         let bound = lookup_process_shared(pid)
             .map(|p| (runtime().bind_child_task)(tid, p, ChildKind::Process));
@@ -721,7 +721,7 @@ pub fn spawn_process_named(
     .map_err(|e| format!("Failed to spawn thread: {}", e))?;
 
     // Set the thread ID in the process table entry for the parent to see immediately
-    let _ = crate::process::table::with_process(pid, |p| p.thread_id = Some(thread_id));
+    let _ = crate::process::table::with_process(pid, |p| p.thread_id.set(Some(thread_id)));
 
     Ok((thread_id, channel, pid))
 }

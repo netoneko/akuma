@@ -95,8 +95,8 @@ pub(super) fn sys_setpgid(pid: u32, pgid: u32) -> u64 {
     let target_pgid = if pgid == 0 { target_pid } else { pgid };
 
     if let Some(old_pgid) = akuma_exec::process::with_process(target_pid, |p| {
-        let old = p.pgid;
-        p.pgid = target_pgid;
+        let old = p.pgid.get();
+        p.pgid.set(target_pgid);
         old
     }) {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -125,9 +125,9 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
 
     if let Some(proc) = akuma_exec::process::lookup_process_shared(target_pid) {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED && pid == 0 {
-            akuma_primitives::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid);
+            akuma_primitives::safe_print!(128, "[syscall] getpgid(0) for PID {}: returning PGID {}\n", target_pid, proc.pgid.get());
         }
-        u64::from(proc.pgid)
+        u64::from(proc.pgid.get())
     } else {
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[syscall] getpgid({}) not found: ESRCH\n", target_pid);
@@ -138,7 +138,7 @@ pub(super) fn sys_getpgid(pid: u32) -> u64 {
 
 pub(super) fn sys_setsid() -> u64 {
     if let Some(pid) = akuma_exec::process::with_current_process(|p| {
-        p.pgid = p.pid;
+        p.pgid.set(p.pid);
         // A new session has no controlling terminal (`super::pty`).
         p.ctty.store(0, core::sync::atomic::Ordering::Relaxed);
         p.pid
@@ -359,8 +359,8 @@ pub(super) fn sys_set_tid_address(tidptr: u64) -> u64 {
 pub(super) fn sys_set_robust_list(head: u64, len: usize) -> u64 {
     if len != 24 { return EINVAL; }
     if akuma_exec::process::with_current_process(|p| {
-        p.robust_list_head = head;
-        p.robust_list_len = len;
+        p.robust_list_head.set(head);
+        p.robust_list_len.set(len);
     }).is_some() {
         return 0;
     }
@@ -381,7 +381,7 @@ pub(super) fn sys_exit(code: i32) -> u64 {
                 akuma_exec::threading::current_thread_id(), proc.pid, proc.image.lock().name, code, secs, frac);
         }
         let pid = proc.pid;
-        let proc_tid = proc.thread_id;
+        let proc_tid = proc.thread_id.get();
         akuma_exec::process::with_current_process(|p| {
             p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
             p.exit_code.store(code, core::sync::atomic::Ordering::Relaxed);
@@ -521,7 +521,7 @@ pub(super) fn sys_exit_group(code: i32) -> u64 {
         }
         let pid = proc.pid;
         let tgid = proc.tgid;
-        let proc_tid = proc.thread_id;
+        let proc_tid = proc.thread_id.get();
         let l0_phys = proc.address_space.l0_phys();
         // Marked exited here as well as in `finish_process` (the same values, so
         // the second store changes nothing): from this point the siblings that
@@ -763,7 +763,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
                 // exactly the window the caller paid a syscall to close.
                 let parent_mask = akuma_exec::threading::thread_signal_mask();
                 if let Some(Some(child_tid)) =
-                    akuma_exec::process::with_process(new_pid, |p| p.thread_id)
+                    akuma_exec::process::with_process(new_pid, |p| p.thread_id.get())
                 {
                     akuma_exec::threading::seed_thread_signal_mask(child_tid, parent_mask);
                 }
@@ -1374,7 +1374,7 @@ pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
 
 pub(super) fn sys_getppid() -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        u64::from(proc.parent_pid)
+        u64::from(proc.parent_pid.get())
     } else {
         ESRCH
     }

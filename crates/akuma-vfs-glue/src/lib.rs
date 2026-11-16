@@ -376,7 +376,7 @@ fn resolve_mount(path: &str) -> Option<ResolvedMount> {
         let overrides = SPAWN_NS_OVERRIDE.lock();
         if let Some(ns) = overrides.get(&tid) {
             let cwd = akuma_exec::process::current_process_shared()
-                .map_or_else(|| String::from("/"), |p| p.cwd.clone());
+                .map_or_else(|| String::from("/"), |p| p.cwd.get());
             let absolute = resolve_path(&cwd, path);
             let ns_mount = ns.mount.lock();
             return ns_mount.resolve_arc_full(&absolute);
@@ -384,11 +384,11 @@ fn resolve_mount(path: &str) -> Option<ResolvedMount> {
     }
 
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        let absolute = resolve_path(&proc.cwd, path);
+        let absolute = resolve_path(&proc.cwd.get(), path);
         // `chroot(2)`: the path above is in the process's own view (its `..` were
         // folded against the chroot's `/`); place it under the real root. `None`
         // — the case for every process that never chrooted — allocates nothing.
-        let absolute = akuma_vfs::under_root(&proc.root, &absolute).unwrap_or(absolute);
+        let absolute = akuma_vfs::under_root(&proc.root.get(), &absolute).unwrap_or(absolute);
 
         // Try process namespace first (lock released before I/O).
         if let Some(resolved) = proc.namespace.mount.lock().resolve_arc_full(&absolute) {
@@ -1006,7 +1006,7 @@ pub fn fallocate(path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsE
 /// Resolve a path to its absolute form through the process's CWD.
 fn resolve_absolute(path: &str) -> String {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        resolve_path(&proc.cwd, path)
+        resolve_path(&proc.cwd.get(), path)
     } else {
         resolve_without_cwd(path)
     }

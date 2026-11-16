@@ -175,7 +175,7 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     let _lifecycle = LifecycleGuard::acquire();
     // Kill direct children first so parent-kill semantics cascade and avoid
     // leaving orphaned workers running after the parent exits.
-    let child_pids: Vec<Pid> = table::collect_pids(|p| p.parent_pid == pid);
+    let child_pids: Vec<Pid> = table::collect_pids(|p| p.parent_pid.get() == pid);
     for child_pid in child_pids {
         if child_pid != pid {
             let _ = kill_process(child_pid);
@@ -188,7 +188,7 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Get thread_id before cleanup (needed for channel removal and thread termination).
     // Some synthetic test processes don't have a started thread yet; still allow
     // kill/unregister for those entries.
-    let thread_id = proc.thread_id;
+    let thread_id = proc.thread_id.get();
 
     // Set the interrupt flag FIRST - this allows blocked syscalls (like accept())
     // to detect the interrupt and properly abort their sockets before we clean up.
@@ -218,7 +218,7 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
         p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
         p.exit_code.store(-9, core::sync::atomic::Ordering::Relaxed);
         p.state.store(ProcessState::Zombie(-9));
-        p.thread_id = None; // prevent entry_point_trampoline from matching this zombie
+        p.thread_id.set(None); // prevent entry_point_trampoline from matching this zombie
     });
 
     // Notify the CHILD channel so the parent's wait4 unblocks, and raise
@@ -259,7 +259,7 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     // Serialize against concurrent lifecycle ops — reentrant. See `process/lifecycle.rs`.
     let _lifecycle = LifecycleGuard::acquire();
     let proc = lookup_process_shared(pid).ok_or("Process not found")?;
-    let thread_id = proc.thread_id;
+    let thread_id = proc.thread_id.get();
 
     if let Some(tid) = thread_id {
         // Both halves; see the sibling call in `kill_process`.
@@ -276,7 +276,7 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
         p.exited.store(true, core::sync::atomic::Ordering::Relaxed);
         p.exit_code.store(exit_code, core::sync::atomic::Ordering::Relaxed);
         p.state.store(ProcessState::Zombie(exit_code));
-        p.thread_id = None;
+        p.thread_id.set(None);
     });
 
     // Do NOT unregister — leave zombie for wait4 to reap.
@@ -461,13 +461,13 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
     // check below needs both** — see `slot_still_owned_by`.
     let mut all_tids = [(0usize, 0 as Pid); table::MAX_PROCESSES];
     let mut tid_count = 0;
-    if let Some(tid) = proc.thread_id {
+    if let Some(tid) = proc.thread_id.get() {
         all_tids[tid_count] = (tid, pid);
         tid_count += 1;
     }
     table::for_each_process(|p| {
         if p.pid != pid && p.tgid == tgid
-            && let Some(tid) = p.thread_id
+            && let Some(tid) = p.thread_id.get()
             && tid_count < all_tids.len() {
                 all_tids[tid_count] = (tid, p.pid);
                 tid_count += 1;
@@ -559,7 +559,7 @@ fn kill_group(pgid: Pid, sig: u32, include_leader: bool) -> usize {
     let mut targets = [0 as Pid; table::MAX_PROCESSES];
     let mut count = 0;
     table::for_each_process(|p| {
-        if p.pgid == pgid && (include_leader || p.pid != pgid) && count < targets.len() {
+        if p.pgid.get() == pgid && (include_leader || p.pid != pgid) && count < targets.len() {
             targets[count] = p.pid;
             count += 1;
         }
@@ -734,7 +734,7 @@ mod ryzen_2026_10_16_zombie_tid_tests {
 
     fn register(pid: Pid, tid: usize) {
         let mut p = make_test_process(pid);
-        p.thread_id = Some(tid);
+        p.thread_id.set(Some(tid));
         register_process(pid, p);
         thread_pid_map_insert(tid, pid);
     }
@@ -797,7 +797,7 @@ mod ryzen_2026_10_16_zombie_tid_tests {
 
         register(ZOMBIE, TID);
         exit_to_zombie(ZOMBIE, TID);
-        with_process(ZOMBIE, |p| p.thread_id = None);
+        with_process(ZOMBIE, |p| p.thread_id.set(None));
         assert!(!reissuable(TID));
 
         unregister_process(ZOMBIE);

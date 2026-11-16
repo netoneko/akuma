@@ -102,7 +102,7 @@ pub(super) fn sys_reattach(pid: u32, force: u32) -> u64 {
                 // elsewhere — so their own wait loop exits the way a normal
                 // process exit would, not as if it had been yanked.
                 if let Some(proc) = akuma_exec::process::lookup_process_shared(previous_holder)
-                    && let Some(ref channel) = proc.channel {
+                    && let Some(channel) = proc.channel.get() {
                         channel.write(TERM_RESET_SEQUENCE);
                     }
                 // Best effort: a holder that already exited is the outcome wanted.

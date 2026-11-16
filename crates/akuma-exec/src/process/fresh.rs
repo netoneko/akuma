@@ -15,6 +15,7 @@
 //! The clone family (`Process::inherit_from`, `mod.rs`) is not a fresh process
 //! and keeps its own literal: nearly every field it sets comes from the parent.
 
+use super::cells::{ChannelCell, OptPidCell, OptTidCell, PidCell, StrCell, U64Cell, UsizeCell};
 use alloc::collections::BTreeMap;
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -86,7 +87,7 @@ impl Process {
         } = seed;
         Self {
             pid,
-            pgid: pid,
+            pgid: PidCell::new(pid),
             tgid: pid, // group leader = self
             state: AtomicProcessState::new(ProcessState::Ready),
             address_space: ProcAddressSpace::new(address_space),
@@ -97,14 +98,14 @@ impl Process {
                 context: UserContext::new(entry, sp),
                 text: akuma_primitives::TextPin::none(),
             }),
-            parent_pid,
+            parent_pid: PidCell::new(parent_pid),
             brk: AtomicUsize::new(brk),
             initial_brk: AtomicUsize::new(brk),
             entry_point: AtomicUsize::new(entry),
             memory,
             process_info_phys: AtomicUsize::new(process_info_phys),
-            cwd: String::from("/"),
-            root: String::from("/"),
+            cwd: StrCell::new(String::from("/")),
+            root: StrCell::new(String::from("/")),
             stdin: Arc::new(Spinlock::new(StdioBuffer::new())),
             stdout: Arc::new(Spinlock::new(StdioBuffer::new())),
             exited: AtomicBool::new(false),
@@ -114,7 +115,7 @@ impl Process {
             #[cfg(feature = "procfs-diag")]
             auxv: None,
             fds,
-            thread_id,
+            thread_id: OptTidCell::new(thread_id),
             // Set when spawned by another process.
             spawner_pid: None,
             ctty: AtomicU32::new(0),
@@ -122,12 +123,12 @@ impl Process {
             box_id: 0,
             creds: Arc::new(SharedCreds::new(creds)),
             namespace: akuma_isolation::global_namespace(),
-            channel,
-            delegate_pid: None,
-            grabbed_by: None,
+            channel: ChannelCell::new(channel),
+            delegate_pid: OptPidCell::new(None),
+            grabbed_by: OptPidCell::new(None),
             clear_child_tid: AtomicU64::new(0),
-            robust_list_head: 0,
-            robust_list_len: 0,
+            robust_list_head: U64Cell::new(0),
+            robust_list_len: UsizeCell::new(0),
             signal_actions: Arc::new(SharedSignalTable::new()),
             signal_mask: 0,
             fault_mutex: Spinlock::new(BTreeMap::new()),

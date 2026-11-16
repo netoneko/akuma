@@ -686,7 +686,10 @@ fn disown_space(pid: u32, root: u64) -> bool {
         return false;
     };
     akuma_exec::process::table::with_process(pid, |p| {
-        let old = core::mem::replace(&mut p.address_space, akuma_exec::process::ProcAddressSpace::new(view));
+        // Through `&Process`: the table no longer hands out `&mut` (it aliased
+        // the shared borrows other cores hold). `replace` swaps under the
+        // address-space lock.
+        let old = p.address_space.replace(view);
         if !old.is_shared() {
             core::mem::forget(old);
         }

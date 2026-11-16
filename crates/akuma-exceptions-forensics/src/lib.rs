@@ -45,7 +45,7 @@ pub fn interp_relr_forensics(far: usize, pid: u32) {
     let l0_ptr = akuma_exec::mmu::phys_to_virt(l0_addr).cast::<u64>().cast_const();
     let tid = akuma_exec::threading::current_thread_id();
     let (cur_pid, ttbr0_proc, ppid) = akuma_exec::process::current_process_shared()
-        .map_or((0, 0, 0), |p| (p.pid, p.address_space.ttbr0(), p.parent_pid));
+        .map_or((0, 0, 0), |p| (p.pid, p.address_space.ttbr0(), p.parent_pid.get()));
     const L0_MASK: u64 = 0x0000_FFFF_FFFF_F000;
     let base_differs = ttbr0_proc != 0 && (ttbr0 as u64 & L0_MASK) != (ttbr0_proc & L0_MASK);
     safe_print!(224,

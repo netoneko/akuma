@@ -496,7 +496,7 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
         }
         KillTarget::OwnGroup | KillTarget::Group(_) | KillTarget::All => {
             let me = akuma_exec::process::current_process_shared();
-            let (my_tgid, my_pgid) = me.map_or((0, 0), |p| (p.tgid, p.pgid));
+            let (my_tgid, my_pgid) = me.map_or((0, 0), |p| (p.tgid, p.pgid.get()));
             let group = match target {
                 KillTarget::Group(g) => Some(g),
                 KillTarget::OwnGroup => Some(my_pgid),
@@ -512,7 +512,7 @@ pub fn sys_kill(pid: u64, sig: u64) -> u64 {
                     return;
                 }
                 let wanted = match group {
-                    Some(g) => p.pgid == g,
+                    Some(g) => p.pgid.get() == g,
                     // `kill(-1)`: everything but init and the caller's group.
                     None => p.pid > 1 && p.tgid != my_tgid,
                 };

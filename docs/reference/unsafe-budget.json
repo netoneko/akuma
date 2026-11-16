@@ -134,7 +134,7 @@
     "crates/akuma-psci": 2,
     "crates/akuma-ring3-amd64": 4,
     "crates/akuma-sched-amd64": 4,
-    "crates/akuma-slot-table": 4,
+    "crates/akuma-slot-table": 3,
     "crates/akuma-stack": 4,
     "crates/akuma-svm-switch-amd64": 4,
     "crates/akuma-switch": 22,

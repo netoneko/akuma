@@ -697,7 +697,7 @@ fn affinity_slot(tid: u64) -> Option<usize> {
         return Some(akuma_exec::threading::current_thread_id());
     }
     let tid = u32::try_from(tid).ok()?;
-    if let Some(slot) = akuma_exec::process::lookup_process_shared(tid).and_then(|p| p.thread_id) {
+    if let Some(slot) = akuma_exec::process::lookup_process_shared(tid).and_then(|p| p.thread_id.get()) {
         return Some(slot);
     }
     let slot = tid as usize;
@@ -890,8 +890,8 @@ fn sys_arch_prctl(code: u64, addr: u64) -> u64 {
 fn owns_non_console_channel() -> bool {
     akuma_exec::process::current_process_shared().is_some_and(|p| {
         p.channel
-            .as_ref()
-            .is_some_and(|ch| !crate::console::is_console_channel(ch))
+            .get()
+            .is_some_and(|ch| !crate::console::is_console_channel(&ch))
     })
 }
 
@@ -2776,7 +2776,7 @@ pub fn sys_spawn(
     // keyboard from the TV by asking.
     if console {
         let attached = akuma_exec::process::current_process_shared()
-            .and_then(|p| p.channel.clone())
+            .and_then(|p| p.channel.get())
             .is_some_and(|ch| crate::console::is_console_channel(&ch));
         if !attached {
             return errno::EPERM;
