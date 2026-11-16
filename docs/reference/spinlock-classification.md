@@ -38,11 +38,13 @@ graph; none is claimed here.
 
 ## Recommendation
 
-1. **Do not mass-migrate the 28 always-masked locks yet.** `IrqSpinlock::lock()` masks and re-saves `DAIF` (and issues an `isb`
-   on aarch64) even when the caller already masked, so wrapping `with_irqs_disabled(|| X.lock())` in the new type pays the mask
-   twice. The correct migration removes the outer `with_irqs_disabled` at every site of that lock in the same change, which is a
-   per-lock edit (about 150 sites) and deserves a run of both boot suites per batch. **`POOL` was migrated without doing that**
-   (its sites still wrap), so the scheduler pays a second mask; worth measuring, and worth removing those wrappers.
+1. **Migrate the 28 always-masked locks one at a time, and never mask twice.** `IrqSpinlock::lock()` masks, so wrapping it in
+   `with_irqs_disabled(|| X.lock())` pays for two masks (and two `isb`s on aarch64). Two correct shapes, both used now:
+   - the wrapper only protects the lock: delete the wrapper (`POOL`: nine sites, done 2026-11-17);
+   - the wrapper protects more than the lock (the console's UART byte sequence): hold an `IrqGuard` yourself and take the lock
+     with `IrqSpinlock::lock_masked(&guard)` / `try_lock_masked`, which borrows the guard as proof that IRQs are masked, so
+     there is no second mask and the lock guard cannot outlive the masked section (`DMESG`, `CONSOLE_LOCK`).
+   Per-lock edit (about 150 sites for the 28), with both boot suites run per batch.
 2. **`KEYS`** is done (above).
 3. **Leave the 49** unless an interrupt handler is shown to reach one; add them to a list of "taken only from task context" so
    the next audit starts from a decision, not a re-scan.

@@ -50,10 +50,44 @@ impl<T> IrqSpinlock<T> {
         Some(IrqSpinlockGuard { guard, _irq: irq })
     }
 
+    /// Acquire when the caller **already holds an [`IrqGuard`]**, which is the proof that local IRQs are masked, so this does
+    /// not mask a second time. The returned guard borrows the proof: it cannot outlive the masked section it was taken in,
+    /// which is what makes skipping the mask sound. A caller with no `IrqGuard` takes [`IrqSpinlock::lock`].
+    pub fn lock_masked<'a>(&'a self, irq: &'a IrqGuard) -> MaskedGuard<'a, T> {
+        let _ = irq;
+        MaskedGuard { guard: self.inner.lock(), _irq: core::marker::PhantomData }
+    }
+
+    /// [`IrqSpinlock::lock_masked`], trying once.
+    pub fn try_lock_masked<'a>(&'a self, irq: &'a IrqGuard) -> Option<MaskedGuard<'a, T>> {
+        let _ = irq;
+        Some(MaskedGuard { guard: self.inner.try_lock()?, _irq: core::marker::PhantomData })
+    }
+
     /// Whether the lock is held right now. Diagnostic use only.
     #[must_use]
     pub fn is_locked(&self) -> bool {
         self.inner.is_locked()
+    }
+}
+
+/// The lock held inside a section that already masked IRQs (an [`IrqGuard`] the caller owns). It carries no mask of its own;
+/// it borrows the proof, so it cannot outlive the masked section.
+pub struct MaskedGuard<'a, T> {
+    guard: SpinlockGuard<'a, T>,
+    _irq: core::marker::PhantomData<&'a IrqGuard>,
+}
+
+impl<T> Deref for MaskedGuard<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        &self.guard
+    }
+}
+
+impl<T> DerefMut for MaskedGuard<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.guard
     }
 }
 
@@ -73,6 +107,18 @@ impl<T> DerefMut for IrqSpinlockGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lock_masked_takes_the_proof_and_excludes_like_lock() {
+        let l = IrqSpinlock::new(1u32);
+        let irq = IrqGuard::new();
+        {
+            let mut g = l.lock_masked(&irq);
+            *g += 1;
+            assert!(l.try_lock_masked(&irq).is_none(), "a held lock refuses a second taker");
+        }
+        assert_eq!(*l.try_lock_masked(&irq).expect("free again"), 2);
+    }
 
     #[test]
     fn locks_mutates_and_releases() {

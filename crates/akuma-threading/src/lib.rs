@@ -420,15 +420,14 @@ pub fn stack_high_water(slot: usize) -> Option<(usize, usize)> {
     if !STACK_USAGE_PROBE || slot >= MAX_THREADS {
         return None;
     }
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let stack = &pool.stacks[slot];
-        if !stack.is_allocated() {
-            return None;
-        }
-        let size = stack.size;
-        Some((stack_region(stack.base, size).high_water(config().canary_words * 8), size))
-    })
+    // `POOL` is an `IrqSpinlock`: `lock()` masks IRQs itself, so no outer `with_irqs_disabled` (that would mask twice).
+    let pool = POOL.lock();
+    let stack = &pool.stacks[slot];
+    if !stack.is_allocated() {
+        return None;
+    }
+    let size = stack.size;
+    Some((stack_region(stack.base, size).high_water(config().canary_words * 8), size))
 }
 
 /// Print a `[Stack]` high-water line: the deepest-used slot in each class and its
@@ -803,11 +802,9 @@ pub fn slot_stack_bounds(slot: usize) -> Option<(usize, usize)> {
     if slot >= MAX_THREADS {
         return None;
     }
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let stack = &pool.stacks[slot];
-        stack.is_allocated().then_some((stack.base, stack.size))
-    })
+    let pool = POOL.lock();
+    let stack = &pool.stacks[slot];
+    stack.is_allocated().then_some((stack.base, stack.size))
 }
 
 /// Is `slot` a thread slot that a core has already adopted as its idle thread?
@@ -1514,9 +1511,7 @@ pub fn adopt_core_idle(
     stack_size: usize,
 ) -> Option<usize> {
     let slot = claim_slot()?;
-    with_irqs_disabled(|| {
-        POOL.lock().stacks[slot] = StackInfo::new(stack_base.get(), stack_size);
-    });
+    POOL.lock().stacks[slot] = StackInfo::new(stack_base.get(), stack_size);
     if config().enable_stack_canaries {
         init_stack_canary(stack_base.get());
     }
@@ -2051,10 +2046,7 @@ pub fn get_thread_cpu_time(idx: usize) -> u64 {
         
         // If the thread is currently running, add the time since it started
         if get_thread_state(idx) == thread_state::RUNNING {
-            let start_time = with_irqs_disabled(|| {
-                let pool = POOL.lock();
-                pool.slots[idx].start_time_us
-            });
+            let start_time = POOL.lock().slots[idx].start_time_us;
             if start_time > 0 {
                 let now = (runtime().uptime_us)();
                 total += now.saturating_sub(start_time);
@@ -4611,16 +4603,14 @@ pub fn get_thread_stack_info(tid: usize) -> Option<(usize, usize)> {
     if tid >= MAX_THREADS {
         return None;
     }
-    // Disable IRQs to prevent deadlock if timer fires while we hold the lock
-    with_irqs_disabled(|| {
-        let pool = POOL.lock();
-        let stack = &pool.stacks[tid];
-        if stack.base == 0 {
-            None
-        } else {
-            Some((stack.base, stack.top))
-        }
-    })
+    // `POOL.lock()` masks IRQs, so a timer tick cannot land while the lock is held.
+    let pool = POOL.lock();
+    let stack = &pool.stacks[tid];
+    if stack.base == 0 {
+        None
+    } else {
+        Some((stack.base, stack.top))
+    }
 }
 
 /// Mark current thread as terminated (thread 0 cannot be terminated) - LOCK-FREE
@@ -4783,16 +4773,15 @@ where
             let pool = POOL.lock();
             pool.stacks[slot_idx].top as u64
         };
+        // Before the wider masked section, which no longer contains a second mask: the slot was just claimed and is not
+        // yet READY, so nothing reads its `start_time_us` (`get_thread_cpu_time` reads it only for a RUNNING thread).
+        POOL.lock().slots[slot_idx].start_time_us = 0;
         with_irqs_disabled(|| {
             // This slot was just claimed and is not yet READY.
             akuma_switch::set(
                 slot_idx,
                 akuma_switch::build_closure_context(stack_top as usize, trampoline as usize as u64, closure_ptr as u64),
             );
-            {
-                let mut pool = POOL.lock();
-                pool.slots[slot_idx].start_time_us = 0;
-            }
             THREAD_STATES[slot_idx].store(thread_state::READY, Ordering::SeqCst);
         });
     }
@@ -5113,7 +5102,7 @@ pub fn report_overrun_stack_canaries() -> usize {
     if !config().enable_stack_canaries {
         return 0;
     }
-    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| POOL.lock().stacks);
+    let stacks: [StackInfo; MAX_THREADS] = POOL.lock().stacks;
     let mut found = 0;
     for (i, stack) in stacks.iter().enumerate().skip(1) {
         if !stack.is_allocated() {
@@ -5145,7 +5134,7 @@ pub fn report_overrun_stack_canaries() -> usize {
 /// whose canary it can break and restore without disturbing a live thread. Skips
 /// slot 0 (the boot stack, which `check_stack_canary` treats as always-intact).
 pub fn first_idle_stack_base() -> Option<(usize, usize)> {
-    let stacks: [StackInfo; MAX_THREADS] = with_irqs_disabled(|| POOL.lock().stacks);
+    let stacks: [StackInfo; MAX_THREADS] = POOL.lock().stacks;
     (1..MAX_THREADS).find_map(|i| {
         let free = THREAD_STATES[i].load(Ordering::SeqCst) == thread_state::FREE;
         (free && stacks[i].is_allocated()).then_some((i, stacks[i].base))
@@ -5160,7 +5149,7 @@ pub fn first_idle_stack_base() -> Option<(usize, usize)> {
 /// Get list of all kernel threads with their info
 pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
     // Take a quick snapshot - read atomic states (lock-free) and pool data (brief lock)
-    let snapshot: ThreadPoolSnapshot = with_irqs_disabled(|| {
+    let snapshot: ThreadPoolSnapshot = {
         let pool = POOL.lock();
         
         let mut states = [ThreadState::Free; MAX_THREADS];
@@ -5191,7 +5180,7 @@ pub fn list_kernel_threads() -> Vec<KernelThreadInfo> {
             sps,
             stacks: pool.stacks,
         }
-    });
+    };
 
     // Process snapshot outside critical section (Vec allocation, canary checks, etc.)
     let mut threads = Vec::new();

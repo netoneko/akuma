@@ -67,11 +67,11 @@ static DMESG: akuma_irq_lock::IrqSpinlock<Ring<DMESG_CAP>> = akuma_irq_lock::Irq
 
 /// Tee `bytes` into the history ring. Never blocks; see [`DMESG`].
 #[inline]
-fn dmesg_capture(bytes: &[u8]) {
+fn dmesg_capture(irq: &akuma_primitives::irq::IrqGuard, bytes: &[u8]) {
     if DMESG_CAP == 0 {
         return;
     }
-    if let Some(mut ring) = DMESG.try_lock() {
+    if let Some(mut ring) = DMESG.try_lock_masked(irq) {
         ring.push_bytes(bytes);
     }
 }
@@ -178,37 +178,38 @@ pub fn set_multicore() {}
 /// shared PL011 register.
 #[inline]
 fn emit(bytes: &[u8]) {
-    crate::irq::with_irqs_disabled(|| {
-        // History first, and outside the cross-core console lock: the ring's
-        // own `try_lock` is what serialises it, and capturing before the UART
-        // write means a byte that a stalled or absent UART never accepts is
-        // still in `dmesg`.
-        dmesg_capture(bytes);
-        #[cfg(kernel_console_lock)]
-        if MULTICORE.load(Ordering::Acquire) {
-            let me = akuma_exec::bkl::current_core_id() as u8 + 1;
-            if CONSOLE_OWNER.load(Ordering::Relaxed) == me {
-                // Reentrant fast path: panic / sync-exception inside an
-                // `emit()` this core already owns. Write directly, do not
-                // re-acquire (Spinlock is not reentrant).
-                for &b in bytes {
-                    akuma_uart::write_byte(b);
-                }
-                return;
-            }
-            let _g = CONSOLE_LOCK.lock();
-            CONSOLE_OWNER.store(me, Ordering::Relaxed);
+    // One mask for the whole path, held as a guard so the locks below can take it as proof instead of masking again
+    // (`IrqSpinlock::lock_masked`).
+    let irq = akuma_primitives::irq::IrqGuard::new();
+    // History first, and outside the cross-core console lock: the ring's
+    // own `try_lock` is what serialises it, and capturing before the UART
+    // write means a byte that a stalled or absent UART never accepts is
+    // still in `dmesg`.
+    dmesg_capture(&irq, bytes);
+    #[cfg(kernel_console_lock)]
+    if MULTICORE.load(Ordering::Acquire) {
+        let me = akuma_exec::bkl::current_core_id() as u8 + 1;
+        if CONSOLE_OWNER.load(Ordering::Relaxed) == me {
+            // Reentrant fast path: panic / sync-exception inside an
+            // `emit()` this core already owns. Write directly, do not
+            // re-acquire (Spinlock is not reentrant).
             for &b in bytes {
                 akuma_uart::write_byte(b);
             }
-            CONSOLE_OWNER.store(0, Ordering::Relaxed);
-            drop(_g);
             return;
         }
+        let _g = CONSOLE_LOCK.lock_masked(&irq);
+        CONSOLE_OWNER.store(me, Ordering::Relaxed);
         for &b in bytes {
             akuma_uart::write_byte(b);
         }
-    });
+        CONSOLE_OWNER.store(0, Ordering::Relaxed);
+        drop(_g);
+        return;
+    }
+    for &b in bytes {
+        akuma_uart::write_byte(b);
+    }
 }
 
 /// Print a string to the console.
