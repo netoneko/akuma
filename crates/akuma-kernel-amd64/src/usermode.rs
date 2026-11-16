@@ -2448,9 +2448,9 @@ fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
     // glue's `execve::read_request`, shared with Taoxichuan (2026-11-01).
     let mut budget = exec_arg_budget();
     let req = match akuma_syscalls_glue::execve::read_request(
-        path_ptr,
-        argv_ptr,
-        envp_ptr,
+        akuma_syscalls_glue::UserAddr::new(path_ptr),
+        akuma_syscalls_glue::UserAddr::new(argv_ptr),
+        akuma_syscalls_glue::UserAddr::new(envp_ptr),
         loader::MAX_ARGV,
         loader::MAX_ENVP,
         &mut budget,
@@ -2797,9 +2797,9 @@ pub fn sys_spawn(
     // kernel's `spawn`.
     let mut budget = exec_arg_budget();
     let req = match akuma_syscalls_glue::execve::read_request(
-        path_ptr,
-        argv_ptr,
-        envp_ptr,
+        akuma_syscalls_glue::UserAddr::new(path_ptr),
+        akuma_syscalls_glue::UserAddr::new(argv_ptr),
+        akuma_syscalls_glue::UserAddr::new(envp_ptr),
         loader::MAX_ARGV,
         loader::MAX_ENVP,
         &mut budget,
@@ -2913,7 +2913,7 @@ pub fn sys_close_child_stdin(pid: u64) -> u64 {
 /// channel's (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "One waitpid").
 #[must_use]
 pub fn sys_waitpid(pid: u64, status_ptr: u64, _options: u64) -> u64 {
-    let r = akuma_syscalls_glue::proc::sys_waitpid(pid as u32, status_ptr);
+    let r = akuma_syscalls_glue::proc::sys_waitpid(pid as u32, akuma_syscalls_glue::UserAddr::new(status_ptr));
     after_reap();
     r
 }

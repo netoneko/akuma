@@ -493,7 +493,8 @@ pub fn pipe_stats() -> (usize, usize, usize, usize) {
     )
 }
 
-pub fn sys_pipe2(fds_ptr: u64, flags: u32) -> u64 {
+pub fn sys_pipe2(fds_ptr: UserAddr, flags: u32) -> u64 {
+    let fds_ptr = fds_ptr.get();
     if !validate_user_ptr(fds_ptr, 8) { return EFAULT; }
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return ENOSYS };
 

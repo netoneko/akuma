@@ -467,7 +467,8 @@ pub(super) fn sys_set_terminal_attributes(fd: u64, action: u64, mode_flags_arg: 
 }
 
 #[cfg(feature = "akuma-native")]
-pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: u64) -> u64 {
+pub(super) fn sys_get_terminal_attributes(_fd: u64, attr_ptr: UserAddr) -> u64 {
+    let attr_ptr = attr_ptr.get();
     if attr_ptr == 0 {
         return EINVAL;
     }
@@ -523,7 +524,8 @@ pub(super) fn sys_clear_screen() -> u64 {
 }
 
 #[cfg(feature = "akuma-native")]
-pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64) -> u64 {
+pub(super) fn sys_poll_input_event(buf_ptr: UserAddr, buf_len: usize, timeout_us: u64) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if buf_ptr == 0 || buf_len == 0 {
         return EINVAL;
     }
@@ -615,7 +617,8 @@ pub(super) fn sys_poll_input_event(buf_ptr: u64, buf_len: usize, timeout_us: u64
 }
 
 #[cfg(feature = "akuma-native")]
-pub(super) fn sys_get_cpu_stats(ptr: u64, max: usize) -> u64 {
+pub(super) fn sys_get_cpu_stats(ptr: UserAddr, max: usize) -> u64 {
+    let ptr = ptr.get();
     let stat_size = core::mem::size_of::<ThreadCpuStat>();
     if !validate_user_ptr(ptr, max * stat_size) { return EFAULT; }
     let count = max.min(akuma_exec::threading::types::MAX_THREADS);

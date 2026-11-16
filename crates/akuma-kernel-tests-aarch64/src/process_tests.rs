@@ -8002,9 +8002,9 @@ fn test_rt_sigtimedwait_timeout() {
     // 4. Call sigtimedwait
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
     let res = flat(sys_rt_sigtimedwait(
-        &raw mut mask as u64,
-        0,
-        &raw const ts as u64,
+        crate::syscall::UserAddr::new((&raw mut mask as u64)),
+        crate::syscall::UserAddr::new(0),
+        crate::syscall::UserAddr::new((&raw const ts as u64)),
         8
     ));
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
@@ -8117,7 +8117,7 @@ fn test_rt_sigtimedwait() {
     // 3. Call sigtimedwait (bypass validation since we use kernel stack)
     crate::syscall::BYPASS_VALIDATION.store(true, core::sync::atomic::Ordering::Release);
     let mut mask_val = wait_mask;
-    let res = flat(sys_rt_sigtimedwait(&raw mut mask_val as u64, 0, 0, 8));
+    let res = flat(sys_rt_sigtimedwait(crate::syscall::UserAddr::new((&raw mut mask_val as u64)), crate::syscall::UserAddr::new(0), crate::syscall::UserAddr::new(0), 8));
     crate::syscall::BYPASS_VALIDATION.store(false, core::sync::atomic::Ordering::Release);
 
     // Cleanup

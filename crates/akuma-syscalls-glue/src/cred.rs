@@ -92,7 +92,8 @@ pub(super) fn sys_setfsid(gid: bool) -> u64 {
 
 /// `getgroups(size, list)`. `size == 0` is the "how many?" probe and touches
 /// no memory; a buffer smaller than the list is EINVAL, per Linux.
-pub(super) fn sys_getgroups(size: i32, list_ptr: u64) -> u64 {
+pub(super) fn sys_getgroups(size: i32, list_ptr: UserAddr) -> u64 {
+    let list_ptr = list_ptr.get();
     if size < 0 {
         return EINVAL;
     }
@@ -121,7 +122,8 @@ pub(super) fn sys_getgroups(size: i32, list_ptr: u64) -> u64 {
 }
 
 /// `setgroups(size, list)`. Read into a stack array: no heap on this path.
-pub(super) fn sys_setgroups(size: u64, list_ptr: u64) -> u64 {
+pub(super) fn sys_setgroups(size: u64, list_ptr: UserAddr) -> u64 {
+    let list_ptr = list_ptr.get();
     let n = size as usize;
     if n > NGROUPS {
         return EINVAL;

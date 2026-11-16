@@ -19,6 +19,7 @@
 //! the syscall; amd64 reads a head, maps every segment as it loads, and returns
 //! into the new image through its syscall exit path.
 
+use akuma_exec::process::user_access::UserAddr;
 use akuma_primitives::errno::Errno;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -47,24 +48,27 @@ pub struct Request {
 /// `EFAULT` for an unreadable pointer, `ENOENT` for an empty path, `E2BIG` when
 /// the block is over `budget` or a vector over `max_argv`/`max_envp` entries.
 pub fn read_request(
-    path_ptr: u64,
-    argv_ptr: u64,
-    envp_ptr: u64,
+    path_ptr: UserAddr,
+    argv_ptr: UserAddr,
+    envp_ptr: UserAddr,
     max_argv: usize,
     max_envp: usize,
     budget: &mut Budget,
 ) -> Result<Request, Errno> {
-    let raw = read_cstr(path_ptr, PATH_MAX).map_err(|e| if e == Errno::E2BIG { Errno::ENAMETOOLONG } else { e })?;
+    let path_ptr = path_ptr.get();
+    let argv_ptr = argv_ptr.get();
+    let envp_ptr = envp_ptr.get();
+    let raw = read_cstr(UserAddr::new(path_ptr), PATH_MAX).map_err(|e| if e == Errno::E2BIG { Errno::ENAMETOOLONG } else { e })?;
     if raw.is_empty() {
         return Err(Errno::ENOENT);
     }
     let raw = String::from_utf8(raw).map_err(|_| Errno::ENOENT)?;
     let path = crate::fs::resolve_path_at(AT_FDCWD, &raw).map_err(|_| Errno::ENOENT)?;
-    let mut argv = read_vector(argv_ptr, max_argv, budget)?;
+    let mut argv = read_vector(UserAddr::new(argv_ptr), max_argv, budget)?;
     if argv.is_empty() {
         argv.push(raw.into_bytes());
     }
-    let envp = read_vector(envp_ptr, max_envp, budget)?;
+    let envp = read_vector(UserAddr::new(envp_ptr), max_envp, budget)?;
     Ok(Request { path, argv, envp })
 }
 
@@ -72,7 +76,8 @@ const AT_FDCWD: i32 = -100;
 
 /// A NULL-terminated array of string pointers: every string, or the whole call
 /// refused. Never a shorter list.
-fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>, Errno> {
+fn read_vector(ptr: UserAddr, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>, Errno> {
+    let ptr = ptr.get();
     let mut out = Vec::new();
     if ptr == 0 {
         return Ok(out);
@@ -89,7 +94,7 @@ fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>
         if i == max {
             return Err(Errno::E2BIG);
         }
-        let s = read_cstr(p, akuma_config::MAX_ARG_STRLEN)?;
+        let s = read_cstr(UserAddr::new(p), akuma_config::MAX_ARG_STRLEN)?;
         budget.charge(s.len()).map_err(|_| Errno::E2BIG)?;
         out.push(s);
     }
@@ -99,7 +104,8 @@ fn read_vector(ptr: u64, max: usize, budget: &mut Budget) -> Result<Vec<Vec<u8>>
 /// One C string of at most `max` bytes (without the NUL), page by page so a
 /// string that ends just before an unmapped page reads cleanly. `E2BIG` when
 /// there is no NUL within `max`.
-fn read_cstr(ptr: u64, max: usize) -> Result<Vec<u8>, Errno> {
+fn read_cstr(ptr: UserAddr, max: usize) -> Result<Vec<u8>, Errno> {
+    let ptr = ptr.get();
     let mut out = Vec::new();
     let mut at = ptr;
     let mut buf = [0u8; 256];

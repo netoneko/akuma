@@ -420,8 +420,8 @@ pub fn sys_read(fd_num: u64, buf_ptr: UserAddr, count: usize) -> u64 {
         return r;
     }
     match fd {
-        akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::read(fd_num as u32, n, true, buf_ptr, count),
-        akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::read(fd_num as u32, n, false, buf_ptr, count),
+        akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::read(fd_num as u32, n, true, UserAddr::new(buf_ptr), count),
+        akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::read(fd_num as u32, n, false, UserAddr::new(buf_ptr), count),
         _ => {}
     }
 
@@ -1228,8 +1228,8 @@ pub fn sys_write(fd_num: u64, buf_ptr: UserAddr, count: usize) -> u64 {
         return r;
     }
     match fd {
-        akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::write(fd_num as u32, n, true, buf_ptr, count),
-        akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::write(fd_num as u32, n, false, buf_ptr, count),
+        akuma_exec::process::FileDescriptor::PtyMaster(n) => return super::pty::write(fd_num as u32, n, true, UserAddr::new(buf_ptr), count),
+        akuma_exec::process::FileDescriptor::PtySlave(n) => return super::pty::write(fd_num as u32, n, false, UserAddr::new(buf_ptr), count),
         _ => {}
     }
 

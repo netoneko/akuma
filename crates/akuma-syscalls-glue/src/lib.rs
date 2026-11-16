@@ -740,7 +740,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
          nr::FSTATFS => fs::sys_fstatfs(args[0] as u32, UserAddr::new(args[1])),
          nr::STATFS => flat(fs::sys_statfs(UserAddr::new(args[0]), UserAddr::new(args[1]))),
         nr::DUP3 => fs::sys_dup3(args[0] as u32, args[1] as u32, args[2] as u32),
-        nr::PIPE2 => pipe::sys_pipe2(args[0], args[1] as u32),
+        nr::PIPE2 => pipe::sys_pipe2(UserAddr::new(args[0]), args[1] as u32),
         nr::BRK => mem::sys_brk(args[0] as usize),
         nr::OPENAT => flat(fs::sys_openat(args[0] as i32, UserAddr::new(args[1]), args[2] as u32, args[3] as u32)),
         nr::CLOSE => fs::sys_close(args[0] as u32),
@@ -790,9 +790,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::MMAP => mem::sys_mmap(args[0] as usize, args[1] as usize, args[2] as u32, args[3] as u32, args[4] as i32, args[5] as usize),
         nr::MUNMAP => mem::sys_munmap(args[0] as usize, args[1] as usize),
         nr::CLONE => proc::sys_clone(args[0], args[1], args[2], args[3], args[4]),
-        nr::CLONE3 => proc::sys_clone3(args[0], args[1] as usize),
+        nr::CLONE3 => proc::sys_clone3(UserAddr::new(args[0]), args[1] as usize),
         #[cfg(feature = "exec")]
-        nr::EXECVE => proc::sys_execve(args[0], args[1], args[2]),
+        nr::EXECVE => proc::sys_execve(UserAddr::new(args[0]), UserAddr::new(args[1]), UserAddr::new(args[2])),
         #[cfg(feature = "akuma-native")]
         nr::UPTIME => time::sys_uptime(),
         // The floor control: no arguments read, no user memory touched, no
@@ -816,14 +816,14 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::STATX => flat(fs::sys_statx(args[0] as i32, UserAddr::new(args[1]), args[2] as u32, args[3] as u32, UserAddr::new(args[4]))),
         nr::READLINKAT => flat(fs::sys_readlinkat(args[0] as i32, UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as usize)),
         #[cfg(all(feature = "exec", feature = "akuma-native"))]
-        nr::SPAWN => flat(proc::sys_spawn(args[0], args[1], args[2], args[3], args[4] as usize, args[5])),
+        nr::SPAWN => flat(proc::sys_spawn(UserAddr::new(args[0]), UserAddr::new(args[1]), UserAddr::new(args[2]), UserAddr::new(args[3]), args[4] as usize, args[5])),
         #[cfg(feature = "akuma-native")]
         nr::AKUMA_KILL => signal::sys_kill(args[0], args[1]),
         #[cfg(feature = "sc-reboot")]
         nr::REBOOT => reboot::sys_reboot(args[0] as u32, args[1] as u32, args[2] as u32),
         #[cfg(feature = "akuma-native")]
-        nr::WAITPID => proc::sys_waitpid(args[0] as u32, args[1]),
-        nr::GETRANDOM => proc::sys_getrandom(args[0], args[1] as usize),
+        nr::WAITPID => proc::sys_waitpid(args[0] as u32, UserAddr::new(args[1])),
+        nr::GETRANDOM => proc::sys_getrandom(UserAddr::new(args[0]), args[1] as usize),
         #[cfg(feature = "akuma-native")]
         nr::TIME => time::sys_time(),
         nr::CHDIR => flat(fs::sys_chdir(UserAddr::new(args[0]))),
@@ -832,7 +832,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "akuma-native")]
         nr::SET_TERMINAL_ATTRIBUTES => term::sys_set_terminal_attributes(args[0], args[1], args[2]),
         #[cfg(feature = "akuma-native")]
-        nr::GET_TERMINAL_ATTRIBUTES => term::sys_get_terminal_attributes(args[0], args[1]),
+        nr::GET_TERMINAL_ATTRIBUTES => term::sys_get_terminal_attributes(args[0], UserAddr::new(args[1])),
         #[cfg(feature = "akuma-native")]
         nr::SET_CURSOR_POSITION => term::sys_set_cursor_position(args[0], args[1]),
         #[cfg(feature = "akuma-native")]
@@ -842,17 +842,17 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "akuma-native")]
         nr::CLEAR_SCREEN => term::sys_clear_screen(),
         #[cfg(feature = "akuma-native")]
-        nr::POLL_INPUT_EVENT => term::sys_poll_input_event(args[0], args[1] as usize, args[2]),
+        nr::POLL_INPUT_EVENT => term::sys_poll_input_event(UserAddr::new(args[0]), args[1] as usize, args[2]),
         #[cfg(feature = "akuma-native")]
-        nr::GET_CPU_STATS => term::sys_get_cpu_stats(args[0], args[1] as usize),
+        nr::GET_CPU_STATS => term::sys_get_cpu_stats(UserAddr::new(args[0]), args[1] as usize),
         #[cfg(all(feature = "exec", feature = "akuma-native"))]
-        nr::SPAWN_EXT => flat(proc::sys_spawn_ext(args[0], args[1], args[2], args[3], args[4], args[5])),
+        nr::SPAWN_EXT => flat(proc::sys_spawn_ext(UserAddr::new(args[0]), UserAddr::new(args[1]), args[2], args[3], args[4], args[5])),
         #[cfg(feature = "akuma-native")]
         nr::SET_BOX_STACK => proc::sys_set_box_stack(args[0], args[1]),
         #[cfg(feature = "akuma-native")]
         nr::CLOSE_CHILD_STDIN => proc::sys_close_child_stdin(args[0] as u32),
         #[cfg(feature = "akuma-native")]
-        nr::CORE_INIT => proc::sys_core_init(args[0] as usize, args[1]),
+        nr::CORE_INIT => proc::sys_core_init(args[0] as usize, UserAddr::new(args[1])),
         #[cfg(feature = "sc-containers")]
         nr::REGISTER_BOX => container::sys_register_box(args[0], args[1], args[2] as usize, args[3], args[4] as usize, args[5] as u32),
         #[cfg(feature = "sc-containers")]
@@ -866,12 +866,12 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             proc::sys_exit_group(code);
             akuma_exec::process::return_to_kernel(code)
         }
-        nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, args[1], args[2], args[3] as usize),
-        nr::RT_SIGSUSPEND => signal::sys_rt_sigsuspend(args[0], args[1] as usize),
-        nr::RT_SIGPENDING => signal::sys_rt_sigpending(args[0], args[1] as usize),
-        nr::RT_SIGTIMEDWAIT => flat(signal::sys_rt_sigtimedwait(args[0], args[1], args[2], args[3] as usize)),
+        nr::RT_SIGPROCMASK => signal::sys_rt_sigprocmask(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as usize),
+        nr::RT_SIGSUSPEND => signal::sys_rt_sigsuspend(UserAddr::new(args[0]), args[1] as usize),
+        nr::RT_SIGPENDING => signal::sys_rt_sigpending(UserAddr::new(args[0]), args[1] as usize),
+        nr::RT_SIGTIMEDWAIT => flat(signal::sys_rt_sigtimedwait(UserAddr::new(args[0]), UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as usize)),
         nr::RT_SIGRETURN => 0,
-        nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, args[1] as usize, args[2] as usize, args[3] as usize),
+        nr::RT_SIGACTION => signal::sys_rt_sigaction(args[0] as u32, UserAddr::new(args[1] as usize as u64), UserAddr::new(args[2] as usize as u64), args[3] as usize),
         nr::GETCWD => fs::sys_getcwd(UserAddr::new(args[0]), args[1] as usize),
         nr::FCNTL => fs::sys_fcntl(args[0] as u32, args[1] as u32, args[2]),
         nr::NEWFSTATAT => flat(fs::sys_newfstatat(args[0] as i32, UserAddr::new(args[1]), UserAddr::new(args[2]), args[3] as u32)),
@@ -881,7 +881,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::ADJTIMEX => time::sys_adjtimex(UserAddr::new(args[0])),
         nr::CLOCK_ADJTIME => time::sys_clock_adjtime(args[0] as u32, UserAddr::new(args[1])),
         nr::FACCESSAT2 => flat(fs::sys_faccessat2(args[0] as i32, UserAddr::new(args[1]), args[2] as u32, args[3] as u32)),
-        nr::WAIT4 => proc::sys_wait4(args[0] as i32, args[1], args[2] as i32, args[3]),
+        nr::WAIT4 => proc::sys_wait4(args[0] as i32, UserAddr::new(args[1]), args[2] as i32, UserAddr::new(args[3])),
         nr::WAITID => proc::sys_waitid(args[0] as u32, args[1] as u32, args[2], args[3] as i32),
         #[cfg(feature = "akuma-native")]
         nr::SET_TPIDR_EL0 => proc::sys_set_tpidr_el0(args[0]),
@@ -892,7 +892,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::GETTID => akuma_exec::threading::current_thread_id() as u64,
         nr::GETRESUID => cred::sys_getres(args[0], args[1], args[2], false),
         nr::GETRESGID => cred::sys_getres(args[0], args[1], args[2], true),
-        nr::GETGROUPS => cred::sys_getgroups(args[0] as i32, args[1]),
+        nr::GETGROUPS => cred::sys_getgroups(args[0] as i32, UserAddr::new(args[1])),
         nr::KILL => signal::sys_kill(args[0], args[1]),
         nr::SETPGID => proc::sys_setpgid(args[0] as u32, args[1] as u32),
         nr::GETPGID => proc::sys_getpgid(args[0] as u32),
@@ -924,9 +924,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::FALLOCATE => fs::sys_fallocate(args[0] as u32, args[1] as i32, args[2] as i64, args[3] as i64),
         nr::MADVISE => mem::sys_madvise(args[0] as usize, args[1] as usize, args[2] as i32),
         nr::MPROTECT => mem::sys_mprotect(args[0] as usize, args[1] as usize, args[2] as u32),
-        nr::FUTEX => sync::sys_futex(args[0] as usize, args[1] as i32, args[2] as u32, args[3], args[4] as usize, args[5] as u32),
+        nr::FUTEX => sync::sys_futex(args[0] as usize, args[1] as i32, args[2] as u32, UserAddr::new(args[3]), args[4] as usize, args[5] as u32),
         nr::SET_ROBUST_LIST => proc::sys_set_robust_list(args[0], args[1] as usize),
-        nr::SIGALTSTACK => signal::sys_sigaltstack(args[0], args[1]),
+        nr::SIGALTSTACK => signal::sys_sigaltstack(UserAddr::new(args[0]), UserAddr::new(args[1])),
         nr::GETRLIMIT => proc::sys_prlimit64(0, args[0] as u32, 0, args[1]),
         nr::PRLIMIT64 => proc::sys_prlimit64(args[0] as u32, args[1] as u32, args[2], args[3]),
         #[cfg(feature = "sc-eventfd")]
@@ -1013,7 +1013,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             // glibc asks with up to 128 bytes and grows on `EINVAL`; nothing needs
             // more than a page, and the size is a kernel allocation.
             let cpusetsize = (args[1] as usize).min(4096);
-            if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr(mask_ptr as u64, cpusetsize) {
+            if cpusetsize >= CPU_SET_WORD_BYTES && validate_user_ptr((mask_ptr as u64), cpusetsize) {
                 let mut kernel_mask = alloc::vec![0u8; cpusetsize];
                 // CPUs the process may run on: the kernel's `probed_core_count`
                 // hook. The AArch64 shared-kernel SMP build answers the
@@ -1057,7 +1057,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CLOSE_RANGE => {
             fs::sys_close_range(args[0] as u32, args[1] as u32, args[2] as u32)
         }
-        nr::CAPGET => proc::sys_capget(args[0], args[1]),
+        nr::CAPGET => proc::sys_capget(UserAddr::new(args[0]), UserAddr::new(args[1])),
         // `capset` stays an accepted no-op — see the `CAPSET` doc comment. The
         // id setters are real since 2026-10-14 (`cred.rs`).
         nr::CAPSET => 0,
@@ -1069,8 +1069,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::SETREGID => cred::sys_setresgid(args[0], args[1], u64::from(u32::MAX)),
         nr::SETFSUID => cred::sys_setfsid(false),
         nr::SETFSGID => cred::sys_setfsid(true),
-        nr::SETGROUPS => cred::sys_setgroups(args[0], args[1]),
-        nr::SYSINFO => proc::sys_sysinfo(args[0] as usize),
+        nr::SETGROUPS => cred::sys_setgroups(args[0], UserAddr::new(args[1])),
+        nr::SYSINFO => proc::sys_sysinfo(UserAddr::new(args[0] as usize as u64)),
         nr::CLOCK_GETRES => time::sys_clock_getres(args[0] as u32, UserAddr::new(args[1])),
         #[cfg(feature = "sc-epoll")]
         nr::EPOLL_CREATE1 => poll::sys_epoll_create1(args[0] as u32),
@@ -1088,7 +1088,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-timerfd")]
         nr::TIMERFD_SETTIME => flat(timerfd::sys_timerfd_settime(args[0] as u32, args[1] as i32, args[2] as usize, args[3] as usize)),
         #[cfg(feature = "sc-timerfd")]
-        nr::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(args[0], args[1]),
+        nr::TIMERFD_GETTIME => timerfd::sys_timerfd_gettime(args[0], UserAddr::new(args[1])),
         nr::IO_URING_SETUP | nr::IO_URING_ENTER | nr::IO_URING_REGISTER => {
             // `io_uring_enter` is a *loop* call in any runtime that gets as far
             // as trying it, so this one especially must not print per call.

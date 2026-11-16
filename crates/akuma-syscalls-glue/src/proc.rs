@@ -664,12 +664,13 @@ pub fn clone_thread(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid
 }
 
 pub(super) fn sys_clone(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64) -> u64 {
-    sys_clone_pidfd(flags, stack, parent_tid, tls, child_tid, 0)
+    sys_clone_pidfd(flags, stack, parent_tid, tls, child_tid, UserAddr::new(0))
 }
 
 /// Internal clone implementation that optionally writes a pidfd to `pidfd_out_ptr`.
 /// `pidfd_out_ptr = 0` means no pidfd requested (used by sys_clone).
-pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64, pidfd_out_ptr: u64) -> u64 {
+pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64, child_tid: u64, pidfd_out_ptr: UserAddr) -> u64 {
+    let pidfd_out_ptr = pidfd_out_ptr.get();
     use akuma_syscalls_linux::proc::clone_flags::{CLONE_THREAD, CLONE_VFORK, CLONE_VM};
     #[cfg(feature = "sc-pidfd")]
     use akuma_syscalls_linux::proc::clone_flags::CLONE_PIDFD;
@@ -823,7 +824,8 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
     ENOSYS
 }
 
-pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
+pub(super) fn sys_clone3(cl_args_ptr: UserAddr, size: usize) -> u64 {
+    let cl_args_ptr = cl_args_ptr.get();
     // `struct clone_args` is `akuma_syscalls_linux::CloneArgs` since
     // 2026-08-27, reached here through `use super::*`. The short-copy contract
     // that makes its field order unchangeable has a host test there.
@@ -851,16 +853,19 @@ pub(super) fn sys_clone3(cl_args_ptr: u64, size: usize) -> u64 {
 
     // Pass the pidfd pointer through so CLONE_PIDFD can write the fd number back
     // to the caller's clone_args.pidfd field.
-    sys_clone_pidfd(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid, cl_args.pidfd)
+    sys_clone_pidfd(flags, stack, cl_args.parent_tid, cl_args.tls, cl_args.child_tid, UserAddr::new(cl_args.pidfd))
 }
 
 #[cfg(feature = "exec")]
-pub(super) fn sys_execve(path_ptr: u64, argv_ptr: u64, envp_ptr: u64) -> u64 {
+pub(super) fn sys_execve(path_ptr: UserAddr, argv_ptr: UserAddr, envp_ptr: UserAddr) -> u64 {
+    let path_ptr = path_ptr.get();
+    let argv_ptr = argv_ptr.get();
+    let envp_ptr = envp_ptr.get();
     // Linux bounds the bytes (`ARG_MAX`) and each string (`MAX_ARG_STRLEN`),
     // never the count: the counts here are only a sanity bound, and the real
     // byte limit is the stack builder's refusal (`E2BIG`) once the strings
     // and their pointer arrays do not fit the eager stack.
-    let req = match super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget()) {
+    let req = match super::execve::read_request(UserAddr::new(path_ptr), UserAddr::new(argv_ptr), UserAddr::new(envp_ptr), EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget()) {
         Ok(r) => r,
         Err(e) => return e.ret(),
     };
@@ -1035,7 +1040,8 @@ impl super::execve::ExecArch for NativeExec {
 /// (see [`akuma_syscalls_linux::Rusage`]), everything else 0. A bad pointer is
 /// ignored — the caller already got a zeroed attempt at entry and Linux does not
 /// fail the reap over it either.
-fn report_child_rusage(rusage_ptr: u64, cpu_time_us: u64) {
+fn report_child_rusage(rusage_ptr: UserAddr, cpu_time_us: u64) {
+    let rusage_ptr = rusage_ptr.get();
     if rusage_ptr != 0 {
         let _ = write_user_val(rusage_ptr, &akuma_syscalls_linux::Rusage::with_cpu_time_us(cpu_time_us));
     }
@@ -1052,7 +1058,9 @@ fn report_child_rusage(rusage_ptr: u64, cpu_time_us: u64) {
 ///
 /// The CPU time is the child channel's, recorded when the exit was published:
 /// the thread slot it ran on may be recycled by now.
-fn reap_exited(pid: u32, ch: &akuma_exec::process::ProcessChannel, status_ptr: u64, rusage_ptr: u64) -> u64 {
+fn reap_exited(pid: u32, ch: &akuma_exec::process::ProcessChannel, status_ptr: UserAddr, rusage_ptr: UserAddr) -> u64 {
+    let status_ptr = status_ptr.get();
+    let rusage_ptr = rusage_ptr.get();
     let code = ch.exit_code();
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         let st = encode_wait_status(code);
@@ -1061,14 +1069,16 @@ fn reap_exited(pid: u32, ch: &akuma_exec::process::ProcessChannel, status_ptr: u
     if status_ptr != 0 && write_user_val(status_ptr, &encode_wait_status(code)).is_err() {
         return EFAULT;
     }
-    report_child_rusage(rusage_ptr, ch.cpu_time_us());
+    report_child_rusage(UserAddr::new(rusage_ptr), ch.cpu_time_us());
     akuma_exec::process::clear_lazy_regions(pid);
     let _ = akuma_exec::process::unregister_process(pid);
     akuma_exec::process::reap_child_channel(pid);
     u64::from(pid)
 }
 
-pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64) -> u64 {
+pub(super) fn sys_wait4(pid: i32, status_ptr: UserAddr, options: i32, rusage_ptr: UserAddr) -> u64 {
+    let status_ptr = status_ptr.get();
+    let rusage_ptr = rusage_ptr.get();
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] wait4(pid={}, options=0x{:x})\n", pid, options);
     }
@@ -1101,7 +1111,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
         if let Some(ch) = akuma_exec::process::get_child_channel(p) {
             loop {
                 if ch.has_exited() {
-                    return reap_exited(p, &ch, status_ptr, rusage_ptr);
+                    return reap_exited(p, &ch, UserAddr::new(status_ptr), UserAddr::new(rusage_ptr));
                 }
 
                 if wnohang {
@@ -1111,7 +1121,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
                 ch.add_poller(waiter_tid);
                 // Double-check after registering to avoid missed wakeup race.
                 if ch.has_exited() {
-                    return reap_exited(p, &ch, status_ptr, rusage_ptr);
+                    return reap_exited(p, &ch, UserAddr::new(status_ptr), UserAddr::new(rusage_ptr));
                 }
                 // Tested *before* blocking so that on wake the loop re-runs
                 // has_exited() first: a reapable child outranks EINTR. SIGCHLD
@@ -1133,7 +1143,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
 
         loop {
             if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
-                return reap_exited(child_pid, &ch, status_ptr, rusage_ptr);
+                return reap_exited(child_pid, &ch, UserAddr::new(status_ptr), UserAddr::new(rusage_ptr));
             }
 
             if wnohang {
@@ -1143,7 +1153,7 @@ pub(super) fn sys_wait4(pid: i32, status_ptr: u64, options: i32, rusage_ptr: u64
             akuma_exec::process::add_poller_to_all_children(waiter_tgid, waiter_tid);
             // Double-check after registering to avoid missed-wakeup race.
             if let Some((child_pid, ch)) = akuma_exec::process::find_exited_child(waiter_tgid) {
-                return reap_exited(child_pid, &ch, status_ptr, rusage_ptr);
+                return reap_exited(child_pid, &ch, UserAddr::new(status_ptr), UserAddr::new(rusage_ptr));
             }
             // Before blocking, so a child that became reapable while we slept is
             // returned ahead of EINTR (see the pid>0 arm).
@@ -1332,14 +1342,15 @@ pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: 
     0
 }
 
-pub(super) fn sys_sysinfo(info_ptr: usize) -> u64 {
+pub(super) fn sys_sysinfo(info_ptr: UserAddr) -> u64 {
+    let info_ptr = info_ptr.get() as usize;
     // This used to be a `[u8; 112]` filled by five `core::ptr::write(ptr.add(N))`
     // calls under a comment listing the AArch64 offsets. The comment was
     // correct and nothing checked that it stayed correct; the offsets are
     // `akuma_syscalls_linux::Sysinfo`'s now, asserted there. Every field the
     // old code left at zero still is — `Default` zeroes the struct exactly as
     // the array did.
-    if !validate_user_ptr(info_ptr as u64, core::mem::size_of::<Sysinfo>()) { return EFAULT; }
+    if !validate_user_ptr((info_ptr as u64), core::mem::size_of::<Sysinfo>()) { return EFAULT; }
     let info = Sysinfo {
         uptime: (akuma_primitives::clock::uptime_us() / 1_000_000).cast_signed(),
         totalram: akuma_exec::pmm::total_count() as u64 * 4096,
@@ -1368,7 +1379,8 @@ pub(super) fn sys_getpid() -> u64 {
 /// secondary core and already treats `ENOSYS` as the expected result under
 /// shared-kernel SMP, so this stub stays for ABI compatibility.
 #[cfg(feature = "akuma-native")]
-pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: u64) -> u64 {
+pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: UserAddr) -> u64 {
+    let init_program_ptr = init_program_ptr.get();
     let _ = (core_idx, init_program_ptr);
     ENOSYS
 }
@@ -1400,7 +1412,9 @@ pub(super) fn sys_getppid() -> u64 {
 ///
 /// Root gets "all capabilities" and anything else gets none, matching what
 /// procfs reports — there is no finer capability model to answer from.
-pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
+pub(super) fn sys_capget(hdr_ptr: UserAddr, data_ptr: UserAddr) -> u64 {
+    let hdr_ptr = hdr_ptr.get();
+    let data_ptr = data_ptr.get();
     /// `_LINUX_CAPABILITY_VERSION_1/2/3`. v3 is what every current libc uses.
     const CAP_V1: u32 = 0x1998_0330;
     const CAP_V2: u32 = 0x2007_1026;
@@ -1478,7 +1492,8 @@ pub(super) fn sys_capget(hdr_ptr: u64, data_ptr: u64) -> u64 {
 /// `flags` is not consulted, here or before this change: `GRND_NONBLOCK` and
 /// `GRND_RANDOM` distinguish two pools this kernel does not have, and both
 /// sources below always answer.
-pub(super) fn sys_getrandom(ptr: u64, len: usize) -> u64 {
+pub(super) fn sys_getrandom(ptr: UserAddr, len: usize) -> u64 {
+    let ptr = ptr.get();
     if !validate_user_ptr(ptr, len) { return EFAULT; }
     let _drv_bkl = super::fs::DriverBklGuard::new();
     let mut remaining = len;
@@ -1635,7 +1650,8 @@ fn spawn_creds(o: &SpawnOptions) -> Result<Option<akuma_isolation::creds::Creds>
 }
 
 #[cfg(feature = "exec")]
-pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
+pub(super) fn parse_argv_array(ptr: UserAddr) -> Vec<String> {
+    let ptr = ptr.get();
     if ptr == 0 { return Vec::new(); }
     let mut args = Vec::new();
     let mut i = 0;
@@ -1661,7 +1677,11 @@ pub(super) fn parse_argv_array(ptr: u64) -> Vec<String> {
 const SPAWN_FLAG_PTY: u64 = 1;
 
 #[cfg(feature = "exec")]
-pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: u64, stdin_len: usize, flags: u64) -> SysResult {
+pub(super) fn sys_spawn(path_ptr: UserAddr, argv_ptr: UserAddr, envp_ptr: UserAddr, stdin_ptr: UserAddr, stdin_len: usize, flags: u64) -> SysResult {
+    let path_ptr = path_ptr.get();
+    let argv_ptr = argv_ptr.get();
+    let envp_ptr = envp_ptr.get();
+    let stdin_ptr = stdin_ptr.get();
     // arg6 carries spawn flags. Bit 0 (SPAWN_FLAG_PTY) marks the child's stdin
     // as a terminal so the kernel line discipline runs (sshd sets it for an
     // interactive login shell — the client's `pty-req`).
@@ -1670,7 +1690,7 @@ pub(super) fn sys_spawn(path_ptr: u64, argv_ptr: u64, envp_ptr: u64, stdin_ptr: 
     // reader as `execve` and as the amd64 kernel's `spawn`. An over-long or
     // unreadable string fails the call (`E2BIG`/`EFAULT`) instead of ending
     // the list where it stood.
-    let req = super::execve::read_request(path_ptr, argv_ptr, envp_ptr, EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
+    let req = super::execve::read_request(UserAddr::new(path_ptr), UserAddr::new(argv_ptr), UserAddr::new(envp_ptr), EXEC_MAX_STRINGS, EXEC_MAX_STRINGS, &mut native_arg_budget())?;
     let stdin_data = if stdin_ptr != 0 {
         if stdin_len > SPAWN_STDIN_MAX { return Err(Errno::E2BIG); }
         // Bounded above, then validated and copied in one step. The explicit `validate_user_ptr` that used to precede
@@ -1747,7 +1767,9 @@ const SPAWN_OPTIONS_V1_SIZE: usize = 72;
 /// original 72-byte layout", which is what every binary built before the field
 /// was added passes (the argument was ignored and they leave it at whatever the
 /// register held — the wrapper zeroes it).
-pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64, _a4: u64, _a5: u64) -> SysResult {
+pub fn sys_spawn_ext(path_ptr: UserAddr, options_ptr: UserAddr, options_len: u64, _a3: u64, _a4: u64, _a5: u64) -> SysResult {
+    let path_ptr = path_ptr.get();
+    let options_ptr = options_ptr.get();
     let path = copy_from_user_str(path_ptr, 512)?;
 
     if options_ptr == 0 { return Err(Errno::EINVAL); }
@@ -1801,7 +1823,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     // `len > 1` special-case leaked argv[0] (the path) through as a real argument
     // for no-arg commands — e.g. a boxed `/bin/rump_server` with no args saw
     // "/bin/rump_server" as a positional URL and tried rump_init_server() on it.
-    let args_vec = parse_argv_array(o.args_ptr);
+    let args_vec = parse_argv_array(UserAddr::new(o.args_ptr));
     let args_refs: Vec<&str> = args_vec.iter().skip(1).map(alloc::string::String::as_str).collect();
     let args_opt = if args_refs.is_empty() { None } else { Some(args_refs.as_slice()) };
 
@@ -1819,7 +1841,7 @@ pub fn sys_spawn_ext(path_ptr: u64, options_ptr: u64, options_len: u64, _a3: u64
     // to `DEFAULT_ENV`. A caller that wants to *narrow* the environment therefore
     // has to pass at least one variable; `box run` composes the full list
     // (image `Env`, then `-e` overrides) rather than passing only the overrides.
-    let env_vec = parse_argv_array(o.env_ptr);
+    let env_vec = parse_argv_array(UserAddr::new(o.env_ptr));
     let env_opt = if env_vec.is_empty() { None } else { Some(env_vec.as_slice()) };
 
     let creds = spawn_creds(&o)?;
@@ -1916,7 +1938,8 @@ pub fn sys_close_child_stdin(pid: u32) -> u64 {
 /// descriptors are closed, so a reap never runs while the child is still inside
 /// its exit path (`docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md`, "One waitpid").
 #[cfg(feature = "akuma-native")]
-pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
+pub fn sys_waitpid(pid: u32, status_ptr: UserAddr) -> u64 {
+    let status_ptr = status_ptr.get();
     if status_ptr != 0 && !validate_user_ptr(status_ptr, 4) { return EFAULT; }
 
     // **Only the parent's thread group may reap**, the rule `wait4` and
@@ -1931,13 +1954,13 @@ pub fn sys_waitpid(pid: u32, status_ptr: u64) -> u64 {
             return ECHILD;
         }
         return akuma_exec::process::find_exited_child(waiter_tgid)
-            .map_or(0, |(child, ch)| reap_exited(child, &ch, status_ptr, 0));
+            .map_or(0, |(child, ch)| reap_exited(child, &ch, UserAddr::new(status_ptr), UserAddr::new(0)));
     }
     if !akuma_exec::process::is_child_of_group(pid, waiter_tgid) {
         return ECHILD;
     }
     match akuma_exec::process::get_child_channel(pid) {
-        Some(ch) if ch.has_exited() => reap_exited(pid, &ch, status_ptr, 0),
+        Some(ch) if ch.has_exited() => reap_exited(pid, &ch, UserAddr::new(status_ptr), UserAddr::new(0)),
         _ => 0,
     }
 }

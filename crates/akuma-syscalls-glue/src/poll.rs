@@ -918,7 +918,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: usize, maxevents: i32, timeout: i3
     if maxevents <= 0 { return EINVAL; }
     let maxevents = maxevents as usize;
     let out_size = maxevents * EPOLL_EVENT_SIZE;
-    if !validate_user_ptr(events_ptr as u64, out_size) { return EFAULT; }
+    if !validate_user_ptr((events_ptr as u64), out_size) { return EFAULT; }
 
     let epoll_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(epfd)) {
         Some(akuma_exec::process::FileDescriptor::EpollFd(id)) => id,

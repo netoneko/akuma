@@ -26,7 +26,8 @@ pub fn timerfd_add_poller(id: u32, tid: usize) {
 // `use super::*`. The `bits()`/`from_bits()` pair below is what keeps this
 // path's arithmetic unsigned, exactly as it was — see that type's doc comment.
 
-fn timespec_to_us_safe(ptr: usize) -> Result<u64, Errno> {
+fn timespec_to_us_safe(ptr: UserAddr) -> Result<u64, Errno> {
+    let ptr = ptr.get() as usize;
     if ptr == 0 { return Ok(0); }
     let mut ts = Timespec::default();
     if read_user_into(&mut ts, ptr as u64).is_err() {
@@ -35,7 +36,8 @@ fn timespec_to_us_safe(ptr: usize) -> Result<u64, Errno> {
     Ok(ts.to_us())
 }
 
-fn us_to_timespec_safe(us: u64, ptr: usize) -> Result<(), Errno> {
+fn us_to_timespec_safe(us: u64, ptr: UserAddr) -> Result<(), Errno> {
+    let ptr = ptr.get() as usize;
     let ts = Timespec::from_bits(us / 1_000_000, (us % 1_000_000) * 1_000);
     if write_user_val(ptr as u64, &ts).is_err() {
         return Err(Errno::EFAULT);
@@ -82,8 +84,8 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
             // struct itimerspec { it_interval at 0, it_value at 16 }
-            if us_to_timespec_safe(state.interval_us, old_value).is_err() { return Err(Errno::EFAULT); }      // it_interval
-            if us_to_timespec_safe(remaining, old_value + 16).is_err() { return Err(Errno::EFAULT); }         // it_value (remaining time)
+            if us_to_timespec_safe(state.interval_us, UserAddr::new(old_value as u64)).is_err() { return Err(Errno::EFAULT); }      // it_interval
+            if us_to_timespec_safe(remaining, UserAddr::new((old_value + 16) as u64)).is_err() { return Err(Errno::EFAULT); }         // it_value (remaining time)
         } else {
             let zero = [0u8; 32];
             if copy_to_user(old_value as u64, &zero).is_err() {
@@ -94,8 +96,8 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
 
     // struct itimerspec { struct timespec it_interval; struct timespec it_value; }
     // it_interval is at offset 0, it_value (initial) is at offset 16
-    let interval_us = timespec_to_us_safe(new_value)?;       // it_interval
-    let initial_us = timespec_to_us_safe(new_value + 16)?;   // it_value (initial expiration)
+    let interval_us = timespec_to_us_safe(UserAddr::new(new_value as u64))?;       // it_interval
+    let initial_us = timespec_to_us_safe(UserAddr::new((new_value + 16) as u64))?;   // it_value (initial expiration)
 
     const TFD_TIMER_ABSTIME: i32 = 1;
     let now = akuma_primitives::clock::uptime_us();
@@ -125,7 +127,8 @@ pub(super) fn sys_timerfd_settime(fd_num: u32, flags: i32, new_value: usize, old
     Ok(0)
 }
 
-pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
+pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: UserAddr) -> u64 {
+    let out_ptr = out_ptr.get();
     let timer_id = match akuma_exec::process::current_process_shared().and_then(|p| p.get_fd(fd_arg0 as u32)) {
         Some(akuma_exec::process::FileDescriptor::TimerFd(id)) => id,
         _ => return EBADF,
@@ -140,8 +143,8 @@ pub(super) fn sys_timerfd_gettime(fd_arg0: u64, out_ptr: u64) -> u64 {
             let now = akuma_primitives::clock::uptime_us();
             let elapsed = now.saturating_sub(state.armed_at_us);
             let remaining = state.initial_us.saturating_sub(elapsed);
-            if us_to_timespec_safe(state.interval_us, out).is_err() { return EFAULT; }
-            if us_to_timespec_safe(remaining, out + 16).is_err() { return EFAULT; }
+            if us_to_timespec_safe(state.interval_us, UserAddr::new(out as u64)).is_err() { return EFAULT; }
+            if us_to_timespec_safe(remaining, UserAddr::new((out + 16) as u64)).is_err() { return EFAULT; }
         } else {
             let zero = [0u8; 32];
             if copy_to_user(out as u64, &zero).is_err() {

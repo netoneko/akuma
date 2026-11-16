@@ -43,6 +43,13 @@ BOUNDARY_FILES = {
     "crates/akuma-kernel-amd64/src/uaccess.rs",      # amd64's range checks and byte copies, the same layer
 }
 
+# Boundary helpers inside otherwise-converted files: glue's own `validate_user_ptr` and `copy_from_user_str` sit beside the
+# `akuma_user_access` copy family and take the raw address like it does; everything above them passes a `UserAddr`.
+BOUNDARY_FNS = {
+    ("crates/akuma-syscalls-glue/src/lib.rs", "validate_user_ptr"),
+    ("crates/akuma-syscalls-glue/src/lib.rs", "copy_from_user_str"),
+}
+
 _walk = base.walk
 
 
@@ -52,7 +59,7 @@ def walk():
     for comp, rows in res.items():
         if comp in NOT_USER_COMPONENTS:
             continue
-        rows = [r for r in rows if r[0] not in BOUNDARY_FILES]
+        rows = [r for r in rows if r[0] not in BOUNDARY_FILES and (r[0], r[2]) not in BOUNDARY_FNS]
         if rows:
             out[comp] = rows
     return out

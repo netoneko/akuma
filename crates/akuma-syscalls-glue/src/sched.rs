@@ -14,7 +14,9 @@ use super::*;
 /// `tcache` has been ignored by Linux since 2.6.24 — ignored here too,
 /// recorded rather than implemented. Returns 0, or `EFAULT` when a given
 /// pointer is not writable.
-pub fn sys_getcpu(cpu_ptr: u64, node_ptr: u64, current_cpu: u32) -> u64 {
+pub fn sys_getcpu(cpu_ptr: UserAddr, node_ptr: UserAddr, current_cpu: u32) -> u64 {
+    let cpu_ptr = cpu_ptr.get();
+    let node_ptr = node_ptr.get();
     let (cpu, node) = akuma_syscalls_linux::sched::cpu_node(current_cpu);
     if cpu_ptr != 0 {
         if !validate_user_ptr(cpu_ptr, 4) {

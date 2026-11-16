@@ -302,17 +302,19 @@ fn register_current(p: &mut PtyPair<WakeHandle>) -> bool {
 }
 
 /// `read(2)` on either side.
-pub fn read(fd_num: u32, n: u32, master: bool, buf_ptr: u64, count: usize) -> u64 {
+pub fn read(fd_num: u32, n: u32, master: bool, buf_ptr: UserAddr, count: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if count == 0 {
         return 0;
     }
     if !validate_user_ptr(buf_ptr, count) {
         return EFAULT;
     }
-    if master { read_master(fd_num, n, buf_ptr, count) } else { read_slave(fd_num, n, buf_ptr, count) }
+    if master { read_master(fd_num, n, UserAddr::new(buf_ptr), count) } else { read_slave(fd_num, n, UserAddr::new(buf_ptr), count) }
 }
 
-fn read_master(fd_num: u32, n: u32, buf_ptr: u64, count: usize) -> u64 {
+fn read_master(fd_num: u32, n: u32, buf_ptr: UserAddr, count: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     let nonblock = super::net::fd_is_nonblock(fd_num);
     let mut chunk = [0u8; CHUNK];
     let mut total = 0usize;
@@ -354,7 +356,8 @@ fn read_master(fd_num: u32, n: u32, buf_ptr: u64, count: usize) -> u64 {
     total as u64
 }
 
-fn read_slave(fd_num: u32, n: u32, buf_ptr: u64, count: usize) -> u64 {
+fn read_slave(fd_num: u32, n: u32, buf_ptr: UserAddr, count: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     let nonblock = super::net::fd_is_nonblock(fd_num);
     let mut chunk = [0u8; CHUNK];
     let want = count.min(CHUNK);
@@ -397,7 +400,8 @@ fn read_slave(fd_num: u32, n: u32, buf_ptr: u64, count: usize) -> u64 {
 }
 
 /// `write(2)` on either side.
-pub fn write(fd_num: u32, n: u32, master: bool, buf_ptr: u64, count: usize) -> u64 {
+pub fn write(fd_num: u32, n: u32, master: bool, buf_ptr: UserAddr, count: usize) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if count == 0 {
         return 0;
     }

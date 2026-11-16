@@ -7,7 +7,9 @@ use super::*;
 // through `use super::*`; only the two handler sentinels are named here.
 use akuma_syscalls_linux::signal::{SIG_DFL, SIG_IGN};
 
-pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigsetsize: usize) -> u64 {
+pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: UserAddr, oldact_ptr: UserAddr, sigsetsize: usize) -> u64 {
+    let act_ptr = act_ptr.get() as usize;
+    let oldact_ptr = oldact_ptr.get() as usize;
     if sig == 0 || sig as usize > akuma_exec::process::MAX_SIGNALS { return EINVAL; }
     if sig == 9 || sig == 19 { return EINVAL; }
     let sigset_ok = sigsetsize == 8;
@@ -19,7 +21,7 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
 
     let idx = (sig - 1) as usize;
 
-    if oldact_ptr != 0 && validate_user_ptr(oldact_ptr as u64, 32) {
+    if oldact_ptr != 0 && validate_user_ptr((oldact_ptr as u64), 32) {
         let actions = proc.signal_actions.actions.lock();
         let old = &actions[idx];
         let handler_val = match old.handler {
@@ -38,7 +40,7 @@ pub(super) fn sys_rt_sigaction(sig: u32, act_ptr: usize, oldact_ptr: usize, sigs
         }
     }
 
-    if act_ptr != 0 && validate_user_ptr(act_ptr as u64, 32) {
+    if act_ptr != 0 && validate_user_ptr((act_ptr as u64), 32) {
         let mut sa = KernelSigaction::default();
         if read_user_into(&mut sa, act_ptr as u64).is_err() {
             return EFAULT;
@@ -86,7 +88,9 @@ pub fn signal_is_fatal_default(sig: u32) -> bool {
 /// set: pointer to new signal mask
 /// oldset: pointer to store old signal mask
 /// sigsetsize: size of signal set (must be 8)
-pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigsetsize: usize) -> u64 {
+pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: UserAddr, oldset_ptr: UserAddr, sigsetsize: usize) -> u64 {
+    let set_ptr = set_ptr.get();
+    let oldset_ptr = oldset_ptr.get();
     if sigsetsize != 8 {
         return EINVAL;
     }
@@ -124,7 +128,8 @@ pub(super) fn sys_rt_sigprocmask(how: u32, set_ptr: u64, oldset_ptr: u64, sigset
 /// the process's, AND blocked; Akuma pends every signal on a thread). A
 /// `sigsetsize` above 8 is `EINVAL`; a smaller one gets that many bytes, as on
 /// Linux.
-pub(super) fn sys_rt_sigpending(set_ptr: u64, sigsetsize: usize) -> u64 {
+pub(super) fn sys_rt_sigpending(set_ptr: UserAddr, sigsetsize: usize) -> u64 {
+    let set_ptr = set_ptr.get();
     if sigsetsize > 8 {
         return EINVAL;
     }
@@ -148,7 +153,8 @@ pub(super) fn sys_rt_sigpending(set_ptr: u64, sigsetsize: usize) -> u64 {
 /// restores it — see exceptions.rs / threading::set_restore_sigmask). Block until
 /// a signal not blocked by the suspend mask is pending, then return EINTR so the
 /// syscall-return path delivers it. SIGKILL/SIGSTOP are never blocked.
-pub(super) fn sys_rt_sigsuspend(mask_ptr: u64, sigsetsize: usize) -> u64 {
+pub(super) fn sys_rt_sigsuspend(mask_ptr: UserAddr, sigsetsize: usize) -> u64 {
+    let mask_ptr = mask_ptr.get();
     if sigsetsize != 8 {
         return EINVAL;
     }
@@ -233,7 +239,9 @@ fn suspend_until_signal(new_mask: u64) -> u64 {
 /// sigaltstack - set/get alternate signal stack
 /// ss: pointer to new stack_t structure
 /// old_ss: pointer to store old stack_t structure
-pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
+pub(super) fn sys_sigaltstack(ss_ptr: UserAddr, old_ss_ptr: UserAddr) -> u64 {
+    let ss_ptr = ss_ptr.get();
+    let old_ss_ptr = old_ss_ptr.get();
     // stack_t structure:
     // void *ss_sp;     // Base address of stack (8 bytes)
     // int ss_flags;    // Flags (4 bytes)
@@ -280,7 +288,10 @@ pub(super) fn sys_sigaltstack(ss_ptr: u64, old_ss_ptr: u64) -> u64 {
 /// info: pointer to siginfo_t structure (ignored for now)
 /// timeout: pointer to timespec structure
 /// sigsetsize: size of signal set (must be 8)
-pub fn sys_rt_sigtimedwait(set_ptr: u64, info_ptr: u64, timeout_ptr: u64, sigsetsize: usize) -> SysResult {
+pub fn sys_rt_sigtimedwait(set_ptr: UserAddr, info_ptr: UserAddr, timeout_ptr: UserAddr, sigsetsize: usize) -> SysResult {
+    let set_ptr = set_ptr.get();
+    let info_ptr = info_ptr.get();
+    let timeout_ptr = timeout_ptr.get();
     if sigsetsize != 8 {
         return Err(Errno::EINVAL);
     }
