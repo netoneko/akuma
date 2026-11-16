@@ -133,6 +133,10 @@ OPENAI_BASE_PATH=api/coding/paas/v4/chat/completions; export OPENAI_BASE_PATH
 exec /usr/local/bin/goose "$@"
 CFG
     chmod 755 $P/usr/local/bin/goose-glm
+    # goose against OpenAI (api.openai.com); token in /root/.akuma/openai/token.
+    install -m 755 "$(dirname "$0")/goose-openai" $P/usr/local/bin/goose-openai
+    mkdir -p $P/root/.akuma/openai && chmod 700 $P/root/.akuma/openai
+    [ -f /root/.akuma/openai/token ] && install -m 600 /root/.akuma/openai/token $P/root/.akuma/openai/token || true
     # Claude Code (native linux-x64-musl build, ~262 MB, fetched on the box from
     # downloads.claude.ai and sha256-checked against manifest.json; see README)
     # against z.ai's Anthropic-compatible endpoint. Verified 2026-10-16: --version,

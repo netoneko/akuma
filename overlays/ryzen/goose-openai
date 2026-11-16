@@ -1,0 +1,14 @@
+#!/bin/sh
+# goose against OpenAI. goose ignores OPENAI_API_KEY from the environment, so the
+# key goes to its file secret store (0600) per run, from ~/.akuma/openai/token.
+. /etc/akuma-dev.env
+umask 077
+mkdir -p /root/.config/goose
+printf 'OPENAI_API_KEY: %s\n' "$(cat /root/.akuma/openai/token)" > "/root/.config/goose/secrets.yaml"
+GOOSE_DISABLE_KEYRING=1; export GOOSE_DISABLE_KEYRING
+GOOSE_PROVIDER=openai; export GOOSE_PROVIDER
+GOOSE_MODEL=${GOOSE_MODEL:-gpt-5.4}; export GOOSE_MODEL
+GOOSE_THINKING_EFFORT=${GOOSE_THINKING_EFFORT:-medium}; export GOOSE_THINKING_EFFORT
+OPENAI_HOST=https://api.openai.com; export OPENAI_HOST
+OPENAI_BASE_PATH=v1/chat/completions; export OPENAI_BASE_PATH
+exec /usr/local/bin/goose "$@"
