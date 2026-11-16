@@ -9,7 +9,7 @@ Fixed on branch `ouch` (each verified as stated in its commit message):
 
 | Finding | Commit | How it was checked |
 |---|---|---|
-| C1, C2 sshd key material | `41559adb` | builds; hook tests. **Not** exercised against a live client with the new binary |
+| C1, C2 sshd key material | `41559adb` | AArch64 QEMU: the rebuilt sshd on a second port, three OpenSSH public-key logins; host key loaded from the existing file. The no-entropy refusal path was not exercised |
 | C3 kernel entropy pool, M2 TCP seed and first ephemeral port | `31badd58` | RFC 8439 vector and pool host tests; AArch64 QEMU boot, `/dev/urandom` differs per read |
 | H2, M9 host-root gate (`caller_is_host_root`) | `f9c13a54` | AArch64 QEMU: root keeps clock and mount; uid 1000 refused `date -s`, `mount`, `/dev/vda`, `reboot -f` |
 | M7 validation bypass sealed before init | `ed65401d` | AArch64 QEMU boot suite unchanged |
