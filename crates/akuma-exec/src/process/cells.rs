@@ -71,11 +71,20 @@ impl OptPidCell {
     }
 }
 
-/// An optional scheduler slot index (`thread_id`).
+/// An optional scheduler slot index (`thread_id`), stored as the thread's incarnation.
+///
+/// The cell keeps a packed [`akuma_threading::ThreadRef`] (slot and generation in one word, so a reader never sees a new
+/// slot with an old generation). [`get`](Self::get) is the slot as it always was; [`get_live`](Self::get_live) is the
+/// slot only if it still hosts the thread that was recorded. A stale tid acting on a recycled slot is the largest bug
+/// class in the tree by incident count (`TYPE_SYSTEM_SAFETY_REPORT.md` §5: `KTG_STALE_TID_EXIT_STAMP_J4_HANG`,
+/// `STALE_THREAD_SLOT_KILL`, `AKUMA_STALE_TID_ZOMBIE_SLOT`); anything that *acts on* the thread should use `get_live`.
+/// A check-then-act on the generation is still a race: the window is one load, not the lifetime of the process.
 #[derive(Debug)]
 pub struct OptTidCell(AtomicU64);
 
 impl OptTidCell {
+    /// A cell for a tid that may not be live yet (or at all, in a synthetic test process): the recorded generation is
+    /// `0`, which is what a slot that never recycles carries. Prefer [`new_live`](Self::new_live) when `v` is live now.
     #[must_use]
     pub const fn new(v: Option<usize>) -> Self {
         Self(AtomicU64::new(match v {
@@ -83,15 +92,35 @@ impl OptTidCell {
             None => NONE,
         }))
     }
+    /// A cell for a tid that is live right now: records its current incarnation.
+    #[must_use]
+    pub fn new_live(v: Option<usize>) -> Self {
+        let cell = Self::new(None);
+        cell.set(v);
+        cell
+    }
     #[inline]
     #[must_use]
     pub fn get(&self) -> Option<usize> {
         let raw = self.0.load(Ordering::Acquire);
-        (raw != NONE).then_some(raw as usize)
+        (raw != NONE).then(|| akuma_threading::ThreadRef::from_raw(raw).tid())
     }
+    /// The slot, only if it still hosts the incarnation recorded when the cell was set. `None` for a thread that
+    /// exited and whose slot was recycled, which [`get`](Self::get) would still name.
+    #[inline]
+    #[must_use]
+    pub fn get_live(&self) -> Option<usize> {
+        let raw = self.0.load(Ordering::Acquire);
+        if raw == NONE {
+            return None;
+        }
+        let r = akuma_threading::ThreadRef::from_raw(raw);
+        r.is_current().then(|| r.tid())
+    }
+    /// Record `v` as live now (its current generation).
     #[inline]
     pub fn set(&self, v: Option<usize>) {
-        self.0.store(v.map_or(NONE, |t| t as u64), Ordering::Release);
+        self.0.store(v.map_or(NONE, |t| akuma_threading::ThreadRef::of_live_tid(t).raw()), Ordering::Release);
     }
 }
 

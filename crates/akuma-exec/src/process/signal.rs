@@ -188,7 +188,9 @@ pub fn kill_process(pid: Pid) -> Result<(), &'static str> {
     // Get thread_id before cleanup (needed for channel removal and thread termination).
     // Some synthetic test processes don't have a started thread yet; still allow
     // kill/unregister for those entries.
-    let thread_id = proc.thread_id.get();
+    // `get_live`: a recorded tid whose slot was recycled must not be interrupted, polled or terminated below. It would
+    // be somebody else's thread.
+    let thread_id = proc.thread_id.get_live();
 
     // Set the interrupt flag FIRST - this allows blocked syscalls (like accept())
     // to detect the interrupt and properly abort their sockets before we clean up.
@@ -259,7 +261,7 @@ pub fn kill_process_with_signal(pid: Pid, sig: u32) -> Result<(), &'static str> 
     // Serialize against concurrent lifecycle ops — reentrant. See `process/lifecycle.rs`.
     let _lifecycle = LifecycleGuard::acquire();
     let proc = lookup_process_shared(pid).ok_or("Process not found")?;
-    let thread_id = proc.thread_id.get();
+    let thread_id = proc.thread_id.get_live();
 
     if let Some(tid) = thread_id {
         // Both halves; see the sibling call in `kill_process`.

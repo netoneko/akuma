@@ -115,7 +115,7 @@ impl Process {
             #[cfg(feature = "procfs-diag")]
             auxv: None,
             fds,
-            thread_id: OptTidCell::new(thread_id),
+            thread_id: OptTidCell::new_live(thread_id),
             // Set when spawned by another process.
             spawner_pid: None,
             ctty: AtomicU32::new(0),

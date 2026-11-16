@@ -1514,7 +1514,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
     let mut siblings: Vec<(Pid, Option<usize>)> = Vec::new();
     table::for_each_process(|p| {
         if p.pid != my_pid && p.tgid == tgid {
-            siblings.push((p.pid, p.thread_id.get()));
+            siblings.push((p.pid, p.thread_id.get_live()));
         }
     });
     // Who is tearing down which group, ungated. A group kill is rare and always

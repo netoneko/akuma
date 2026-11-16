@@ -528,7 +528,7 @@ pub const TTBR0_L0_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 /// in a futex/pipe/msgqueue wait queue, or in a waker preempted mid-flight —
 /// is indistinguishable from a live one, and acting on it acts on whoever
 /// owns the slot now (see `ThreadWaker::wake` for the corruption that
-/// enabled). A `(generation, tid)` pair ([`WakeHandle`]) names one
+/// enabled). A `(generation, tid)` pair ([`ThreadRef`]) names one
 /// *incarnation*: if the generation no longer matches, the wake is refused
 /// before any side effect.
 ///
@@ -548,13 +548,17 @@ pub fn thread_generation(tid: usize) -> u64 {
     }
 }
 
-/// Bits of a [`WakeHandle`] that hold the tid. `MAX_THREADS` is 256 (64 on
+/// Bits of a [`ThreadRef`] that hold the tid. `MAX_THREADS` is 256 (64 on
 /// host), so 16 bits leaves the upper 48 for the generation — at a pathological
 /// million spawns/second that wraps after ~9 years of uptime.
 const WAKE_HANDLE_TID_BITS: u32 = 16;
 const _: () = assert!(MAX_THREADS <= 1 << WAKE_HANDLE_TID_BITS);
 
-/// A generation-tagged wake target: names one *incarnation* of a thread slot,
+/// The old name, from when this was only a wake target. It is a thread reference now: anything that holds a thread
+/// beyond the instant it learned its tid should hold this (`TYPE_SYSTEM_SAFETY_REPORT.md` §5).
+pub type WakeHandle = ThreadRef;
+
+/// A generation-tagged reference to a thread: names one *incarnation* of a thread slot,
 /// not the slot itself. Mint one with [`current_wake_handle`] when a waiter
 /// enqueues itself (the tid is self-evidently live), or
 /// [`wake_handle_for_thread`] when the caller otherwise knows the tid is
@@ -565,11 +569,35 @@ const _: () = assert!(MAX_THREADS <= 1 << WAKE_HANDLE_TID_BITS);
 /// and then held across a preemption (or simply left behind by a dead waiter)
 /// wakes whoever owns the slot by then.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct WakeHandle(u64);
+pub struct ThreadRef(u64);
 
-impl WakeHandle {
+impl ThreadRef {
     fn new(tid: usize, generation: u64) -> Self {
         Self((generation << WAKE_HANDLE_TID_BITS) | tid as u64)
+    }
+
+    /// The packed form, for an atomic cell that stores a reference (`Process::thread_id`).
+    #[must_use]
+    pub const fn raw(self) -> u64 {
+        self.0
+    }
+
+    /// Rebuild from [`ThreadRef::raw`].
+    #[must_use]
+    pub const fn from_raw(raw: u64) -> Self {
+        Self(raw)
+    }
+
+    /// The reference to the calling thread's incarnation.
+    #[must_use]
+    pub fn current() -> Self {
+        current_wake_handle()
+    }
+
+    /// A reference to `tid`'s current incarnation. Only for a caller that knows `tid` is live right now.
+    #[must_use]
+    pub fn of_live_tid(tid: usize) -> Self {
+        wake_handle_for_thread(tid)
     }
 
     /// The slot index this handle points at. Only meaningful for bookkeeping
@@ -590,7 +618,7 @@ impl WakeHandle {
 }
 
 /// Handle for the calling thread — what a waiter stores in a wait queue.
-pub fn current_wake_handle() -> WakeHandle {
+pub fn current_wake_handle() -> ThreadRef {
     wake_handle_for_thread(get_current_thread_register())
 }
 
@@ -598,8 +626,8 @@ pub fn current_wake_handle() -> WakeHandle {
 /// knows `tid` is live right now (e.g. it holds the registration that created
 /// it); calling this at wake time on a tid stored long ago just launders a
 /// stale tid into a fresh-looking handle.
-pub fn wake_handle_for_thread(tid: usize) -> WakeHandle {
-    WakeHandle::new(tid, thread_generation(tid))
+pub fn wake_handle_for_thread(tid: usize) -> ThreadRef {
+    ThreadRef::new(tid, thread_generation(tid))
 }
 
 /// The netpoll loop's own handle while it parks between laps (`u64::MAX`: none). A packet
@@ -618,7 +646,7 @@ pub fn register_netpoll_parker() {
 pub fn wake_netpoll_parker() {
     let raw = NETPOLL_PARKER.load(Ordering::Acquire);
     if raw != u64::MAX {
-        wake_by_handle(WakeHandle(raw));
+        wake_by_handle(ThreadRef(raw));
     }
 }
 
@@ -626,7 +654,7 @@ pub fn wake_netpoll_parker() {
 /// slot still hosts the incarnation the handle names. Refusal has no side
 /// effect — not even the sticky `WOKEN_STATES` flag, which on a stale tid
 /// would spend a phantom wake on the slot's next occupant.
-pub fn wake_by_handle(handle: WakeHandle) {
+pub fn wake_by_handle(handle: ThreadRef) {
     ThreadWaker { handle }.wake();
 }
 
@@ -1395,7 +1423,7 @@ fn scrub_thread_slot(i: usize) {
     EXPECTED_L0[i].store(0, Ordering::Release);
     SWITCH_INS[i].store(0, Ordering::Relaxed);
 
-    // New incarnation: every WakeHandle minted for the previous occupant goes
+    // New incarnation: every ThreadRef minted for the previous occupant goes
     // stale here, before the new occupant is observable. Exactly one bumper per
     // rebirth — scrub runs under the claim path's winning FREE→INITIALIZING CAS.
     SLOT_GEN[i].fetch_add(1, Ordering::AcqRel);
@@ -2678,7 +2706,7 @@ pub fn claim_slot() -> Option<usize> {
             PICK_HITS[slot].store(0, Ordering::Relaxed);
             PICK_SKIP_ONCPU[slot].store(0, Ordering::Relaxed);
             PICK_SKIP_CANRUN[slot].store(0, Ordering::Relaxed);
-            // The generation is what makes a `WakeHandle` for the *previous*
+            // The generation is what makes a `ThreadRef` for the *previous*
             // occupant inert. Bumped here — under the winning CAS, before
             // anything can hold a handle to the new occupant — which is the
             // same "exactly one bumper per rebirth" rule `scrub_thread_slot`
@@ -4049,11 +4077,11 @@ pub fn update_thread_context(thread_id: usize, user_context: &UserContext) {
 
 use core::task::Waker;
 
-/// Waker implementation for thread-based waking. Carries a [`WakeHandle`], so
+/// Waker implementation for thread-based waking. Carries a [`ThreadRef`], so
 /// it wakes one *incarnation* of the slot — a waker created for a thread that
 /// has since exited (and whose slot was recycled) does nothing at all.
 pub struct ThreadWaker {
-    handle: WakeHandle,
+    handle: ThreadRef,
 }
 
 impl ThreadWaker {
@@ -4126,10 +4154,10 @@ impl ThreadWaker {
     }
 }
 
-/// Creates a RawWaker around a packed [`WakeHandle`] — the generation rides in
+/// Creates a RawWaker around a packed [`ThreadRef`] — the generation rides in
 /// the data pointer, so a `Waker` cloned into an executor or wait registry
 /// stays incarnation-bound with no allocation.
-fn waker_from_handle(handle: WakeHandle) -> Waker {
+fn waker_from_handle(handle: ThreadRef) -> Waker {
     akuma_switch::handle_waker::<ThreadWake>(handle.0)
 }
 
@@ -4138,7 +4166,7 @@ struct ThreadWake;
 
 impl akuma_switch::HandleWake for ThreadWake {
     fn wake(handle: u64) {
-        wake_by_handle(WakeHandle(handle));
+        wake_by_handle(ThreadRef(handle));
     }
 }
 
@@ -4154,7 +4182,7 @@ pub fn current_thread_waker() -> Waker {
 /// where the caller knows the tid is live right now — a waiter registering
 /// itself, or a wake site that has just validated liveness. Calling this at
 /// wake time on a tid stored long ago launders a stale tid into a
-/// fresh-looking handle; store a [`WakeHandle`] at enqueue time instead and
+/// fresh-looking handle; store a [`ThreadRef`] at enqueue time instead and
 /// wake with [`wake_by_handle`].
 pub fn get_waker_for_thread(thread_id: usize) -> Waker {
     waker_from_handle(wake_handle_for_thread(thread_id))
