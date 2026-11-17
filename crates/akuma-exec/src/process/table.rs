@@ -519,6 +519,27 @@ pub fn count_process_states() -> (usize, usize, usize) {
 pub static THREAD_PID_MAP: Spinlock<BTreeMap<usize, Pid>> =
     Spinlock::new(BTreeMap::new());
 
+/// The incarnation (`ThreadRef`, packed) of the thread that was registered in [`THREAD_PID_MAP`] for each slot, or
+/// `u64::MAX` for none. Written by [`thread_pid_map_insert`] (whose caller knows the thread is live) and cleared by
+/// [`thread_pid_map_remove`].
+///
+/// A map row says "slot N belongs to pid P" but not *which* thread of slot N: on amd64 a recycled slot keeps its old row until
+/// a sweep, so the row alone cannot prove the slot is still the thread that was registered. This is that proof, and it is what
+/// lets an action aimed at a number the user supplied (`tkill`) go through `ThreadRef::with_live`: a row left behind by a
+/// recycled slot carries a stale generation and is refused.
+static REGISTERED_REF: [AtomicU64; MAX_THREADS_FOR_REFS] = {
+    const NONE: AtomicU64 = AtomicU64::new(u64::MAX);
+    [NONE; MAX_THREADS_FOR_REFS]
+};
+const MAX_THREADS_FOR_REFS: usize = crate::threading::types::MAX_THREADS;
+
+/// The registered incarnation of `tid`'s thread, if the map row's registration recorded one. See [`REGISTERED_REF`].
+#[must_use]
+pub fn registered_thread_ref(tid: usize) -> Option<crate::threading::ThreadRef> {
+    let raw = REGISTERED_REF.get(tid)?.load(Ordering::Acquire);
+    (raw != u64::MAX).then(|| crate::threading::ThreadRef::from_raw(raw))
+}
+
 // ── Per-thread identity cache (the `current` this kernel never had) ──────
 //
 // `THREAD_PID_MAP` is authoritative but resolving through it costs a
@@ -799,6 +820,9 @@ pub fn thread_pid_map_insert(tid: usize, pid: Pid) {
     with_irqs_disabled(|| {
         THREAD_PID_MAP.lock().insert(tid, pid);
         identity_store_locked(tid, pid);
+        if let Some(cell) = REGISTERED_REF.get(tid) {
+            cell.store(crate::threading::ThreadRef::of_live_tid(tid).raw(), Ordering::Release);
+        }
     });
 }
 
@@ -809,6 +833,9 @@ pub fn thread_pid_map_remove(tid: usize) -> Option<Pid> {
     with_irqs_disabled(|| {
         let prev = THREAD_PID_MAP.lock().remove(&tid);
         identity_clear_locked(tid);
+        if let Some(cell) = REGISTERED_REF.get(tid) {
+            cell.store(u64::MAX, Ordering::Release);
+        }
         prev
     })
 }

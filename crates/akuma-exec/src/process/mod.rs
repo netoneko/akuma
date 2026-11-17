@@ -1670,7 +1670,7 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                 //
                 // This is the same rule `unregister_process` already applies (table.rs,
                 // "consult THREAD_PID_MAP"); the grace path simply never got it.
-                for (sib_pid, t) in &siblings {
+                for ((sib_pid, t), sib_ref) in siblings.iter().zip(sibling_refs.iter()) {
                     if let Some(tid) = t {
                         if crate::threading::is_thread_terminated(*tid) {
                             continue;
@@ -1691,7 +1691,14 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
                         mmu::as_trace(format_args!(
                             "[KTG-HARD] my_pid={} sib_pid={} tid={} core={}\n",
                             my_pid, sib_pid, tid, crate::bkl::current_core_id()));
-                        crate::threading::mark_thread_terminated(*tid);
+                        // `with_live` with the sibling's *recorded* incarnation: the ownership test above and this
+                        // terminate are not atomic, and this is a 2-second-old snapshot. If the slot was reborn in
+                        // between, the reference is refused and nothing is terminated. The terminate itself
+                        // (atomics, a trace line, the futex purge) is short and takes no lock a slot claimant holds.
+                        match sib_ref {
+                            Some(r) => { let _ = r.with_live(crate::threading::mark_thread_terminated); }
+                            None => crate::threading::mark_thread_terminated(*tid),
+                        }
                     }
                 }
                 break;
@@ -1706,10 +1713,13 @@ pub fn kill_thread_group(my_pid: Pid, _l0_phys: usize, exit_code: i32) {
         // Ownership-guarded like the smp-shared path: a sibling that died before
         // this group kill keeps its recorded `thread_id`, and the slot may have
         // been recycled to an unrelated process by now.
-        for (sib_pid, sib_tid) in &siblings {
+        for ((sib_pid, sib_tid), sib_ref) in siblings.iter().zip(sibling_refs.iter()) {
             if let Some(tid) = sib_tid {
                 if grace_kill_should_terminate(*sib_pid, *tid) {
-                    crate::threading::mark_thread_terminated(*tid);
+                    match sib_ref {
+                        Some(r) => { let _ = r.with_live(crate::threading::mark_thread_terminated); }
+                        None => crate::threading::mark_thread_terminated(*tid),
+                    }
                 }
             }
         }

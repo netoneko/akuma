@@ -421,16 +421,26 @@ pub fn sys_tkill(tid: u32, sig: u32) -> u64 {
             target, target_mask, action);
     }
 
+    // The decision above and the effect below are not atomic, and `slot` is a number the caller supplied. The incarnation
+    // recorded when the slot was registered (`registered_thread_ref`) lets the effect run through `ThreadRef::with_live`: a
+    // slot recycled since is refused (the call reports success, as it would for a thread that had just exited). A slot with
+    // no recorded incarnation (registered through a path that did not mint one) keeps the old bare-slot behaviour.
+    let act = |f: &dyn Fn(usize)| match akuma_exec::process::registered_thread_ref(slot) {
+        Some(r) => {
+            let _ = r.with_live(|s| f(s));
+        }
+        None => f(slot),
+    };
     match action {
         TkillAction::Drop => {}
-        TkillAction::Pend => akuma_exec::threading::pend_signal_for_thread(slot, sig),
-        TkillAction::PendInterrupt => {
+        TkillAction::Pend => act(&|s| akuma_exec::threading::pend_signal_for_thread(s, sig)),
+        TkillAction::PendInterrupt => act(&|s| {
             // The interrupt bit first, then the pend (which wakes the slot): a
             // park that finds no `UserFn` handler re-parks unless the bit is
             // already up when it re-checks.
-            akuma_exec::process::interrupt_thread(slot);
-            akuma_exec::threading::pend_signal_for_thread(slot, sig);
-        }
+            akuma_exec::process::interrupt_thread(s);
+            akuma_exec::threading::pend_signal_for_thread(s, sig);
+        }),
     }
     0
 }

@@ -119,8 +119,19 @@ and generation are read atomically.
   next to its tid); and the SIGCHLD raise on a parent (`raise_sigchld_for_parent`: `set_last_sigchld` and the pend in one
   section, so the siginfo side-channel and the signal land on the same incarnation; `sigchld_target_thread` returns the
   `ThreadRef`). `OptTidCell::live_ref()` is the cell accessor for "hold this reference across a later effect".
-- **Deliberately still bare-tid:** `tkill`/`tgkill` (the tid is a user-supplied number; the most that can be checked is the
-  `THREAD_PID_MAP` ownership of the moment, and minting a `ThreadRef` after that check does not close its window), the itimer
+- **`tkill`/`tgkill` too** (T3): the tid is a number the caller supplied, so no stored reference exists for it. `thread_pid_map_insert`
+  now records the registering thread's `ThreadRef` per slot (`REGISTERED_REF`, cleared by `thread_pid_map_remove`), and `sys_tkill`
+  runs its interrupt and pend through `registered_thread_ref(slot)`'s `with_live`. A row left behind by a recycled slot (amd64
+  keeps one until a sweep) carries a stale generation and is refused: the call reports success, as for a thread that just
+  exited. A slot with no recorded incarnation keeps the bare-slot behaviour.
+- **The grace-expiry hard terminate and the single-core terminate** (T4) run `mark_thread_terminated` through `with_live` with the
+  sibling's recorded `ThreadRef`: its body is atomics, an optional trace line and the futex purge (a short spinlock), none of
+  which a slot claimant holds, so it fits the contract. The 2-second-old snapshot can no longer terminate a recycled slot.
+- **`Pid` newtype: decided against.** `Pid` is a `u32` alias (28 files, 304 occurrences, ~95 raw `pid: u32` parameters, plus the
+  casts at the syscall boundary); tids are `usize`, so a pid and a tid cannot be swapped without an explicit cast, and the
+  stale-tid class is `ThreadRef`'s. A newtype would be a 500-plus-edit sweep guarding against pid-versus-other-`u32` mixups that
+  no incident motivates. Revisit if one appears.
+- **Deliberately still bare-tid:** the itimer
   expiry (a per-slot table walk that owns its slot), the fault-handler pends in `akuma-exceptions` (the target is the *current*
   thread), the lifecycle functions a claimant owns (`seed_entry`, `publish_slot`, `abandon_slot`, `mark_thread_ready`), and the
   read-only diagnostics. Of the ~60 `tid: usize` functions in `akuma-threading`, the effects on *another* thread were the
