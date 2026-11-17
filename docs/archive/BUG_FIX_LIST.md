@@ -13,15 +13,15 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1668
-- **Docs contributing at least one fix:** 485
+- **Total distinct fixes counted:** 1669
+- **Docs contributing at least one fix:** 486
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
 | Syscall / ABI Compatibility Audits | 257 | 15.4% | 39 |
 | Memory & Virtual Memory | 205 | 12.3% | 73 |
-| Scheduler & Process Management | 155 | 9.3% | 51 |
+| Scheduler & Process Management | 156 | 9.3% | 52 |
 | SMP & Locking | 142 | 8.5% | 61 |
 | Networking | 104 | 6.2% | 38 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
@@ -34,7 +34,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Misc / Cross-cutting | 95 | 5.7% | 27 |
 | Console & Terminal | 63 | 3.8% | 22 |
 | Containers | 69 | 4.1% | 13 |
-| **Total** | **1668** | **100.0%** | **485** |
+| **Total** | **1669** | **100.0%** | **486** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -710,7 +710,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `akuma-mmu` range checks wrapped `va_start + len + PAGE_SIZE - 1`; `page_span` treats a wrapping range as not mapped
 - `prefault_user_range` and `madvise(WILLNEED)` rounded unchecked; `checked_add` plus `page_ceil`
 
-## Scheduler & Process Management (155 fixes, 51 docs)
+## Scheduler & Process Management (156 fixes, 52 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -971,6 +971,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md
 - `tkill` and the hard terminates could hit a recycled thread slot; they act through the recorded `ThreadRef` with `with_live`
+
+### docs/archive/GETPPID_RETURNED_THREAD_PID.md
+
+- `getppid` returned the forking thread's pid, not its thread-group id, so codex's post-`PR_SET_PDEATHSIG` parent check failed on every command forked from a tokio worker and the child SIGTERM'd itself (`exited 143 in 0ms`); `sys_getppid` now resolves the parent thread to its tgid.
 
 ## SMP & Locking (142 fixes, 61 docs)
 
@@ -2804,3 +2808,5 @@ Also scanned 2026-11-08 (closing `post-release-improvements`, 136 commits, the S
 Also scanned 2026-11-16 (closing `ouch`, 29 commits ahead of main, 27 of them not merges: the pre-AMI security audit and its fixes, the userspace review of sshd, box and tar, herd and wifi, the unsafe-site reduction and the shared file offset; 4 archive docs added and 4 per-binary review reports). Counted above: SECURITY_AUDIT_2026_11_16 (Misc / Cross-cutting, 25 bullets), FORKED_DESCRIPTORS_DID_NOT_SHARE_AN_OFFSET (Syscall / ABI), and the four `ISSUES_2026_11_16` reports, sshd under SSH, box and tar under Containers, herd and wifi under Userspace Apps. The sshd review's C1 and C2 are not in that report (it lists them as the audit's) and are counted once, under SECURITY_AUDIT_2026_11_16. No counted fix: UNSAFE_SITE_REDUCTION (a refactor, 367 to 329 `unsafe` sites and the `Pod` rule; the `with_active_mut` aliasing it leaves alone is counted under SECURITY_AUDIT_2026_11_16, and the unaligned canary reads in `talc_dealloc`/`talc_realloc` and the unaligned trailing canary write in `talc_alloc` are dead behind `ENABLE_CANARIES = false`, so no live defect) and TYPE_SYSTEM_SAFETY_REPORT (ranked proposals; its Defects A and B, the AArch64 path read of kernel memory and the unbounded user length reaching `vec!`, are counted under SECURITY_AUDIT_2026_11_16, and its other findings, such as `mremap::plan` not bounding `new_size`, are open). Not counted because they are opt-in and off by default: `dac=1` on the boot line, which turns on mode-bit enforcement before init, and `net.allow=`, which installs the ingress filter; the audit leaves H1 and H5 partly open, and the privileged-port and metadata-address checks from the same commit are counted. Open by their own text: box's B13 (`read_in_container` follows symlinks when it reads the image's `/etc/passwd`), wifi's W6 (a hand-written `passphrase =` value is trimmed; documented, not changed), the audit's H1 remainder, M1, M3 to M6 and M8, the `akuma_switch` functions whose obligations are doc-only, and sshd's missing re-keying and one-channel limit. Fix-shaped commit with no archive doc to cite, not counted: `d1a91089` (`open("file/x", O_CREAT)` with a regular file as the parent returned a descriptor and failed at the first write, so it is `ENOTDIR` at the open, and a failed create fails the open instead of dropping `write_file`'s result; box's review report records the divergence as not fixed and was written before the fix, and a trailing slash on a regular file still resolves to the file). Docs-only and merge commits carry no fix.
 
 Also scanned 2026-11-17 (merging `ec2-setup-review` into `ouch`, the T-series type-safety work): counted above: TYPE_SAFETY_DEFECTS_2026_11_17 (six defects found by the sweep, split across Memory, SMP and Scheduler; the same fixes were previously recorded only in `docs/reference/safety-types.md`). No counted fix: AWS_ENA_DRIVER (a decision and plan; `crates/akuma-net-ena` is not connected to the kernel, so the commit `ena: track ring phase across wraps` is new code in an unused crate, named here as uncounted), TYPE_SYSTEM_SAFETY_REPORT, NEWTYPE_AUDIT and UNSAFE_OWNERSHIP_TYPES_DESIGN (proposals and a design, with in-place corrections), and the `IrqSpinlock` migration of ~30 locks (hardening of locks the audit found no live hang in, except `KEYS`, counted above).
+
+Also 2026-11-17 (`more-improvements`): CLOCK_GETTIME_EINTR_ON_SIGNAL (non-blocking syscalls consumed the signal interrupt flag and answered `EINTR`; Syscall / ABI Compatibility). Counts above not yet bumped.

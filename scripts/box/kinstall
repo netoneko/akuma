@@ -1,8 +1,22 @@
 #!/bin/sh
-# kinstall — install the kernel kbuild just produced onto /boot/akuma-amd64.
-# A thin wrapper so the procedure stays in git: the script it runs is the
-# repository's, and it verifies the multiboot2 header and re-reads what it wrote.
-# Does NOT reboot. `/bin/busybox reboot -f` yourself once it exits 0.
+# kinstall — install a kernel as the one GRUB boots. Two homes:
+#
+#  * inside Akuma (uname -s = Akuma): install the kernel kbuild just produced
+#    onto /boot/akuma-amd64 — the repository's scripts/install_kernel_amd64.sh.
+#    Does NOT reboot; `/bin/busybox reboot -f` yourself once it exits 0.
+#
+#  * on the host Linux (ryzen's Pop): `kinstall [--build] [elf]`. --build first
+#    builds the kernel LOCALLY as your user (default features, so KVM,
+#    plus no-tests — scripts/build_kernel_amd64_host.sh), then writes it onto
+#    p3's /boot/akuma-amd64 (scripts/docker/install_kernel_amd64_host.sh).
+#    Does NOT arm: run overlays/ryzen/arm.sh after.
 set -e
+if [ "$(uname -s)" = Linux ]; then
+    SRC=${AKUMA_SRC:-$(cd "$(dirname "$0")/../.." && pwd)}
+    BUILD=0; [ "${1:-}" = --build ] && { BUILD=1; shift; }
+    ELF=${1:-$SRC/target/docker-kernel/akuma-amd64}
+    [ "$BUILD" = 1 ] && sh "$SRC/scripts/build_kernel_amd64_host.sh" "$ELF"
+    exec sh "$SRC/scripts/docker/install_kernel_amd64_host.sh" "$ELF"
+fi
 . /etc/akuma-dev.env
 exec sh "$AKUMA_SRC/scripts/install_kernel_amd64.sh" "$@"

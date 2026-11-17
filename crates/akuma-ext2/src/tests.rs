@@ -62,6 +62,43 @@ fn mount_empty() -> Ext2Filesystem<MemBlockDevice> {
     Ext2Filesystem::new(load_fixture("test.ext2"), || 0).unwrap()
 }
 
+#[test]
+fn unsupported_ext_features_are_rejected_without_writes() {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingDevice {
+        inner: MemBlockDevice,
+        writes: Arc<AtomicUsize>,
+    }
+    impl BlockDevice for RecordingDevice {
+        fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+            self.inner.read_bytes(offset, buf)
+        }
+        fn write_bytes(&self, offset: u64, buf: &[u8]) -> Result<(), ()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_bytes(offset, buf)
+        }
+    }
+
+    let fixture = include_bytes!("../tests/fixtures/test.ext2");
+    // has_journal (compat), recovery-needed and extents (incompat),
+    // metadata checksums (ro-compat), and unknown bits in each word.
+    for (offset, bit) in [(92, 0x4u32), (96, 0x4), (96, 0x40),
+                          (100, 0x400), (92, 0x8000_0000),
+                          (96, 0x8000_0000), (100, 0x8000_0000)] {
+        let mut bytes = fixture.to_vec();
+        let pos = 1024 + offset;
+        let previous = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        bytes[pos..pos + 4].copy_from_slice(&(previous | bit).to_le_bytes());
+        let writes = Arc::new(AtomicUsize::new(0));
+        let device = RecordingDevice { inner: MemBlockDevice::from_bytes(&bytes), writes: writes.clone() };
+        assert!(matches!(Ext2Filesystem::new(device, || 0), Err(FsError::NotSupported)),
+            "feature at {offset} bit {bit:#x}");
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
+    }
+}
+
 fn mount_populated() -> Ext2Filesystem<MemBlockDevice> {
     Ext2Filesystem::new(load_fixture("populated.ext2"), || 0).unwrap()
 }
@@ -804,7 +841,7 @@ fn reuse_space_after_removal() {
 extern crate std;
 static PIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn pin_test_serial() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn pin_test_serial() -> std::sync::MutexGuard<'static, ()> {
     PIN_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
@@ -2306,6 +2343,7 @@ fn sample_inode() -> Inode {
         size_upper: 0xC1C2_C3C4,
         fragment_addr: 0xD1D2_D3D4,
         os_specific_2: [0x5A; 12],
+        number: 0,
     }
 }
 
@@ -3728,4 +3766,194 @@ fn a_busy_inode_on_one_filesystem_does_not_block_the_same_number_on_another() {
     b.write_at("/prog", 0, b"X").unwrap();
     assert_eq!(b.read_file("/prog").unwrap(), b"X");
     drop(text);
+}
+
+#[cfg(feature = "ext3")]
+#[test]
+fn clean_ext3_image_reads_and_rejects_all_mutations() {
+    use crate::MountMode;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use alloc::sync::Arc;
+
+    struct ReadOnlyDevice { inner: MemBlockDevice, writes: Arc<AtomicUsize> }
+    impl BlockDevice for ReadOnlyDevice {
+        fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+            self.inner.read_bytes(offset, buf)
+        }
+        fn write_bytes(&self, _: u64, _: &[u8]) -> Result<(), ()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Err(())
+        }
+    }
+
+    let dir = std::env::temp_dir().join(std::format!("akuma-ext3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    let input = dir.join("input");
+    std::fs::write(&input, b"read from ext3\n").unwrap();
+    let file = std::fs::File::create(&image).unwrap();
+    file.set_len(16 * 1024 * 1024).unwrap();
+    let mkfs = Command::new("mke2fs").args(["-q", "-F", "-t", "ext3", "-b", "1024"]).arg(&image).status().expect("ext3 tests require mke2fs");
+    assert!(mkfs.success());
+    let command = std::format!("write {} /hello", input.display());
+    let debugfs = Command::new("debugfs").args(["-w", "-R", &command]).arg(&image).output().expect("ext3 tests require debugfs");
+    assert!(debugfs.status.success());
+    let bytes = std::fs::read(&image).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let dev = ReadOnlyDevice { inner: MemBlockDevice::from_bytes(&bytes), writes: writes.clone() };
+    let fs = Arc::new(Ext2Filesystem::new_with_options(dev, || 0, None, MountMode::ReadOnly).unwrap());
+    let mut mounts = akuma_vfs::MountTable::new();
+    assert!(matches!(mounts.mount_with("/", None, 0, fs.clone()), Err(FsError::ReadOnly)));
+    mounts.mount_with("/", None, akuma_vfs::MS_RDONLY, fs.clone()).unwrap();
+    assert!(matches!(mounts.remount("/", 0), Err(FsError::ReadOnly)));
+    assert_eq!(mounts.resolve_arc_with_flags("/").unwrap().2, akuma_vfs::MS_RDONLY);
+    assert_eq!(fs.read_file("/hello").unwrap(), b"read from ext3\n");
+    let ino = fs.resolve_inode("/hello").unwrap();
+    assert_eq!(fs.write_file("/hello", b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.write_at("/hello", 0, b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.append("/hello", b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.create_dir("/dir"), Err(FsError::ReadOnly));
+    assert_eq!(fs.remove_file("/hello"), Err(FsError::ReadOnly));
+    assert_eq!(fs.remove_dir("/dir"), Err(FsError::ReadOnly));
+    assert_eq!(fs.create_symlink("/link", "/hello"), Err(FsError::ReadOnly));
+    assert_eq!(fs.create_socket_node("/socket"), Err(FsError::ReadOnly));
+    assert_eq!(fs.rename("/hello", "/new"), Err(FsError::ReadOnly));
+    assert_eq!(fs.link("/hello", "/new"), Err(FsError::ReadOnly));
+    assert_eq!(fs.chmod("/hello", 0o600), Err(FsError::ReadOnly));
+    assert_eq!(fs.chown("/hello", Some(1), Some(1)), Err(FsError::ReadOnly));
+    assert_eq!(fs.set_times("/hello", Some(1), Some(1)), Err(FsError::ReadOnly));
+    assert_eq!(fs.fallocate("/hello", 0, 0, 1), Err(FsError::ReadOnly));
+    assert_eq!(fs.truncate("/hello", 0), Err(FsError::ReadOnly));
+    assert_eq!(fs.write_at_by_inode(ino, 0, b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.truncate_by_inode(ino, 0), Err(FsError::ReadOnly));
+    assert_eq!(fs.fallocate_by_inode(ino, 0, 0, 1), Err(FsError::ReadOnly));
+    fs.stats().unwrap();
+    fs.sync().unwrap();
+    assert_eq!(writes.load(Ordering::Relaxed), 0);
+
+    // Neither recovery-needed nor an unclean filesystem may be read as if
+    // the pre-recovery home blocks were current.
+    for (offset, value) in [(96, 0x4u32), (232, 42)] {
+        let mut bad = bytes.clone();
+        let pos = 1024 + offset;
+        let old = u32::from_le_bytes(bad[pos..pos + 4].try_into().unwrap());
+        bad[pos..pos + 4].copy_from_slice(&(old | value).to_le_bytes());
+        assert!(matches!(Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bad), || 0, None, MountMode::ReadOnly), Err(FsError::NotSupported)));
+    }
+    assert!(matches!(Ext2Filesystem::new(MemBlockDevice::from_bytes(&bytes), || 0), Err(FsError::NotSupported)));
+}
+
+#[cfg(feature = "ext4")]
+#[test]
+fn default_ext4_metadata_checksum_image_reads_on_host() {
+    use crate::MountMode;
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(std::format!("akuma-ext4-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    let input = dir.join("input");
+    // Alternating non-zero and zero blocks force a tree with external extent
+    // nodes, as well as holes. debugfs skips the all-zero blocks.
+    let mut content = vec![0u8; 256 * 1024];
+    for (i, block) in content.chunks_mut(1024).enumerate() {
+        if i % 2 == 0 { block.fill(0x71); }
+    }
+    std::fs::write(&input, &content).unwrap();
+    let file = std::fs::File::create(&image).unwrap();
+    file.set_len(32 * 1024 * 1024).unwrap();
+    let status = Command::new("mke2fs").args(["-q", "-F", "-t", "ext4", "-b", "1024"]).arg(&image).status().expect("ext4 tests require mke2fs");
+    assert!(status.success());
+    let command = std::format!("write {} /data", input.display());
+    let output = Command::new("debugfs").args(["-w", "-R", &command]).arg(&image).output().expect("ext4 tests require debugfs");
+    assert!(output.status.success());
+    let bytes = std::fs::read(&image).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let fs = Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bytes), || 0, None, MountMode::ReadOnly).unwrap();
+    {
+        let state = fs.state.read();
+        let root = fs.read_inode(&state, 2).expect("root inode checksum");
+        fs.read_inode_data(&state, &root).expect("root directory checksum");
+    }
+    assert_eq!(fs.read_file("/data").unwrap(), content);
+    assert_eq!(fs.write_file("/data", b"x"), Err(FsError::ReadOnly));
+    assert!(matches!(Ext2Filesystem::new(MemBlockDevice::from_bytes(&bytes), || 0), Err(FsError::NotSupported)));
+
+    let u16_at = |at: usize| u16::from_le_bytes(bytes[at..at + 2].try_into().unwrap()) as usize;
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let bs = 1024usize << u32_at(1024 + 24);
+    let group_table = (u32_at(1024 + 20) + 1) * bs;
+    let inode_size = u16_at(1024 + 88);
+    let inode_table = u32_at(group_table + 8) * bs;
+    let journal_inode = inode_table + 7 * inode_size;
+    let journal_block = u32_at(journal_inode + 60) * bs;
+    let root_inode = inode_table + inode_size;
+    let root_block = u32_at(root_inode + 40 + 20) * bs;
+    let data_number = fs.resolve_inode("/data").unwrap() as usize;
+    let data_inode = inode_table + (data_number - 1) * inode_size;
+    assert!(u16_at(data_inode + 46) > 0, "fixture must exercise external extent blocks");
+    let extent_block = u32_at(data_inode + 40 + 16) * bs;
+
+    // Each corruption is detected at the layer which consumes that metadata.
+    for (at, mount_fails) in [
+        (1024 + 136, true), // superblock
+        (group_table + 12, true), // descriptor, read while validating journal
+        (root_inode + 100, false), // inode generation
+        (root_block + 8, false), // directory entry
+        (extent_block + 16, false), // external extent node
+    ] {
+        let mut bad = bytes.clone();
+        bad[at] ^= 1;
+        let result = Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bad), || 0, None, MountMode::ReadOnly);
+        if mount_fails {
+            assert!(matches!(result, Err(FsError::Corrupt)), "offset {at}");
+        } else {
+            assert_eq!(result.unwrap().read_file("/data"), Err(FsError::Corrupt), "offset {at}");
+        }
+    }
+    let mut dirty_journal = bytes.clone();
+    dirty_journal[journal_block + 31] = 1; // big-endian s_start
+    assert!(matches!(Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&dirty_journal), || 0, None, MountMode::ReadOnly), Err(FsError::NotSupported)));
+    let mut bad_journal = bytes;
+    bad_journal[journal_block] ^= 1;
+    assert!(matches!(Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bad_journal), || 0, None, MountMode::ReadOnly), Err(FsError::Corrupt)));
+}
+
+#[cfg(feature = "ext4")]
+#[test]
+fn ext4_checksummed_indexed_directory_is_scanned_and_verified() {
+    use crate::MountMode;
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(std::format!("akuma-htree-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    std::fs::File::create(&image).unwrap().set_len(32 * 1024 * 1024).unwrap();
+    assert!(Command::new("mke2fs").args(["-q", "-F", "-t", "ext4", "-b", "1024"]).arg(&image).status().unwrap().success());
+    let commands = dir.join("commands");
+    let mut script = std::string::String::new();
+    for n in 0..400 { script.push_str(&std::format!("write /dev/null /file{n:04}\n")); }
+    std::fs::write(&commands, script).unwrap();
+    let result = Command::new("debugfs").arg("-w").arg("-f").arg(&commands).arg(&image).output().unwrap();
+    assert!(result.status.success());
+    let result = Command::new("e2fsck").arg("-fyD").arg(&image).output().expect("indexed directory test requires e2fsck");
+    assert!(matches!(result.status.code(), Some(0 | 1)));
+    let bytes = std::fs::read(&image).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let fs = Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bytes), || 0, None, MountMode::ReadOnly).unwrap();
+    {
+        let state = fs.state.read();
+        assert_ne!(fs.read_inode(&state, 2).unwrap().flags & 0x1000, 0, "fixture must have an index");
+    }
+    assert!(fs.exists("/file0399"));
+    assert_eq!(fs.read_dir("/").unwrap().iter().filter(|entry| entry.name.starts_with("file")).count(), 400);
+    let u32_at = |at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    let inode_size = u16::from_le_bytes(bytes[1024 + 88..1024 + 90].try_into().unwrap()) as usize;
+    let group_table = (u32_at(1024 + 20) + 1) * 1024;
+    let root_inode = u32_at(group_table + 8) * 1024 + inode_size;
+    let root_block = u32_at(root_inode + 60) * 1024;
+    let mut bad = bytes;
+    bad[root_block + 40] ^= 1;
+    let fs = Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bad), || 0, None, MountMode::ReadOnly).unwrap();
+    assert!(matches!(fs.read_dir("/"), Err(FsError::Corrupt)));
 }

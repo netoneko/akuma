@@ -66,10 +66,10 @@ mutation is written through to the device before the call returns.
 
 ## On-disk layout the driver assumes
 
-Standard ext2, revision ≥ 1, no `incompat` features negotiated (the driver does
-not check `feature_incompat`, so a disk with `filetype` absent or `sparse_super`
-tricks will misbehave — the kernel's own images are made with a fixed `mke2fs`
-recipe, `scripts/create_disk.sh`).
+The default mount supports the legacy ext2 feature set used by the kernel's
+images (`scripts/create_disk.sh`). Mount checks all three on-disk feature words
+and rejects unsupported combinations. The optional, read-only ext3/ext4
+subset is described below.
 
 ```
 byte 0      1024        block 1        per block group ...
@@ -743,3 +743,33 @@ mounted `-o sync` and default.
 - [`docs/reference/subsystems/locking.md`](../../docs/reference/subsystems/locking.md) — the BKL / `no-bkl-*` model
 - `crates/akuma-primitives/src/inode_pin.rs` — the pin mechanism module doc
 - `crates/akuma-virtio/src/block.rs` — the device layer, sector RMW, the transitive-guard note
+
+### Experimental ext3 and ext4 read-only access
+
+The additive Cargo features `ext3` and `ext4` (the latter implies `ext3`) enable
+an explicit `Ext2Filesystem::new_with_options(..., MountMode::ReadOnly)` path.
+The default constructors still request read/write ext2. The runtime `mount(2)`
+path accepts `ext3` and `ext4` names and forwards `MS_RDONLY`; the top-level
+kernel features have the same names. Read-only is enforced by the driver and
+cannot be removed by remounting.
+
+This is deliberately limited: ext3 requires an internal journal and no orphan
+recovery pending; the standard constructor requires a clean journal. Ext4 additionally accepts extent trees,
+including sparse and unwritten extents, with 32-bit physical block numbers.
+The 64-bit descriptor layout and `flex_bg` are supported when all referenced
+block addresses fit in 32 bits. CRC32C metadata checksums are checked for the
+superblock, group descriptors, inodes, directory leaves and HTree index nodes,
+and external extent nodes. Alternate checksum seeds and legacy group checksums
+are not supported. A test image can be created with:
+
+```sh
+mke2fs -t ext4 IMAGE
+```
+
+Unknown feature bits and all journaled write mounts are rejected. A read-only
+mount can replay a classic 32-bit unchecksummed ext3 journal into a bounded
+in-memory overlay without writing to the source device; other dirty journal
+formats and pending orphan recovery are rejected. Host tests with
+these features require `mke2fs` and `debugfs` and generate disposable images.
+`scripts/probes/ext_ro_qemu.sh` builds a guest and tests ext3 and ext4 through
+QEMU with separate disposable block images.

@@ -125,6 +125,9 @@ impl<const MAX: usize> MountSet<MAX> {
         flags: u64,
         fs: Arc<dyn Filesystem>,
     ) -> Result<(), FsError> {
+        if fs.is_read_only() && flags & MS_RDONLY == 0 {
+            return Err(FsError::ReadOnly);
+        }
         if self.mounts.len() >= MAX {
             return Err(FsError::NoSpace);
         }
@@ -154,6 +157,9 @@ impl<const MAX: usize> MountSet<MAX> {
             .iter_mut()
             .find(|m| m.path == path)
             .ok_or(FsError::NotFound)?;
+        if entry.fs.is_read_only() && flags & MS_RDONLY == 0 {
+            return Err(FsError::ReadOnly);
+        }
         entry.flags = flags & MS_RDONLY;
         Ok(())
     }

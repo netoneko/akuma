@@ -196,6 +196,7 @@ pub fn init(cmdline: &str) {
             return;
         }
         SVM_WANTED.store(true, Ordering::Release);
+        akuma_kernel_amd64::drivers::services::vfs::set_kvm_present(true, api::enabled());
         if let Some(mib) = cmdline.split_ascii_whitespace().find_map(|t| t.strip_prefix("kvmmem=")).and_then(|v| v.parse::<u64>().ok()) {
             ctl::reserve_init(mib);
         }

@@ -53,6 +53,7 @@ smoltcp = { version = "0.12.0", default-features = false, features = ["proto-ipv
 log = { version = "0.4", default-features = false }
 
 [features]
+ext3-qemu-write-test = ["akuma-vfs-glue/ext3-qemu-write-test"]
 # `default` exists so a bare `cargo build -p akuma-syscalls-glue` (and the
 # pre-commit hook's per-crate clippy) compiles a configuration that a real kernel
 # actually produces. With no features at all, half the socket layer is

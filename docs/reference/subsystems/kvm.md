@@ -216,7 +216,7 @@ opens **`/dev/kvm0`**, writes the spec (`create`), copies the console to stdout 
 Why a character device: it takes effects (a `/proc` file would be read-only plumbing) and a
 Firecracker-shaped `/dev/kvm` can sit beside it later; why not a syscall: nothing else in this kernel
 adds one for a single driver. It is opened by the kernel's own `openat` arm like `/dev/power`, so
-`ls /dev` does not list it; `open` is `ENOENT` unless the kernel was booted with `kvmctl`.
+`ls /dev` lists `kvm0` (and `kvm`) on the host once `kvmctl` armed the hypervisor, like `wifi0` (`0600`, never in a box); `open` is `ENOENT` unless the kernel was booted with `kvmctl`.
 
 - **The VM's lifetime is its owner's.** The creating process is the lease-holder; the run loop checks
   every 200 ms that it is still alive and stops the guest when it is not. That is what lets herd

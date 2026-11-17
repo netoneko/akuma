@@ -177,9 +177,9 @@ impl BlockDevice for VirtioBlk {
         akuma_virtio::block::write_bytes(offset, data).map_err(|_| ())
     }
 
-    // No `flush`: the default no-op is the honest answer. The cache in front
-    // of the media here is the *host's* (QEMU/Firecracker), which this kernel
-    // cannot reach past; a VMM-backed disk loses nothing to a guest reset.
+    fn flush(&self) -> Result<(), ()> {
+        akuma_virtio::block::flush_at(0).map_err(|_| ())
+    }
 }
 
 /// A partition on the USB disk, as something `akuma-ext2` can read.
@@ -288,7 +288,8 @@ impl BlockDevice for RootDevice {
 
     fn flush(&self) -> Result<(), ()> {
         match self {
-            Self::Virtio(_) | Self::Ram(_) => Ok(()),
+            Self::Virtio(d) => d.flush(),
+            Self::Ram(_) => Ok(()),
             Self::Usb(d) => d.flush(),
             Self::Nvme(d) => d.flush(),
         }

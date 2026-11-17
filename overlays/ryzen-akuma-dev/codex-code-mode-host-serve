@@ -1,0 +1,6 @@
+#!/bin/sh
+# codex's code-mode host as a long-lived gRPC service on loopback (herd service
+# codex-code-mode-host). A wrapper because herd's `args = --listen ...` loses its first
+# flag at spawn; same shape as goose-glm-serve.
+HOME=/root; export HOME
+exec /usr/local/bin/codex-code-mode-host --listen grpc://127.0.0.1:47200

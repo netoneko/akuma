@@ -110,6 +110,17 @@ const WIFI_NODES: &[DevNode] = &[
     DevNode { name: "wifi0", is_block: false, perm: 0o600, major: 10, minor: 242, ino: 19 },
 ];
 
+/// The hypervisor's control device, when `kvmctl` armed it. Root-only (`0600`): a
+/// write hands the kernel a VM spec. Misc major 10; the minor is from the dynamic range.
+const KVM_CTL_NODES: &[DevNode] = &[
+    DevNode { name: "kvm0", is_block: false, perm: 0o600, major: 10, minor: 243, ino: 20 },
+];
+
+/// The KVM-ioctl node (`kvmapi`/`kvmctl`). Linux's own `/dev/kvm` is misc minor 232.
+const KVM_API_NODES: &[DevNode] = &[
+    DevNode { name: "kvm", is_block: false, perm: 0o600, major: 10, minor: 232, ino: 21 },
+];
+
 /// `vda`..`vdd`, gated per-slot on [`DevProbe::block_slots`]. Spelled out
 /// rather than computed so the whole table is static data the lookup can
 /// borrow from. `254` is virtio-blk's major; the minor spacing of 16 mirrors
@@ -138,6 +149,10 @@ pub struct DevProbe {
     pub framebuffer: bool,
     /// A wifi backend is registered (`/dev/wifi0`).
     pub wifi: bool,
+    /// `kvmctl` armed the hypervisor (`/dev/kvm0`).
+    pub kvm_ctl: bool,
+    /// The KVM-ioctl node is enabled (`/dev/kvm`).
+    pub kvm_api: bool,
     /// Bit `i` set means block slot `i` is populated, i.e. `vd{a+i}` exists.
     pub block_slots: u8,
     /// The caller runs inside a box (`box_id != 0`).
@@ -180,6 +195,8 @@ fn all_nodes(probe: DevProbe) -> impl Iterator<Item = &'static DevNode> {
         .chain(AUDIO_NODES.iter().filter(move |_| probe.audio))
         .chain(FB_NODES.iter().filter(move |_| probe.framebuffer))
         .chain(WIFI_NODES.iter().filter(move |_| probe.wifi))
+        .chain(KVM_CTL_NODES.iter().filter(move |_| probe.kvm_ctl))
+        .chain(KVM_API_NODES.iter().filter(move |_| probe.kvm_api))
         .chain(
             BLOCK_NODES
                 .iter()
@@ -219,7 +236,7 @@ mod tests {
 
     /// A host probe: sound device present, two disks, not in a box.
     fn host() -> DevProbe {
-        DevProbe { audio: true, framebuffer: false, wifi: false, block_slots: 0b0011, in_box: false }
+        DevProbe { audio: true, framebuffer: false, wifi: false, kvm_ctl: false, kvm_api: false, block_slots: 0b0011, in_box: false }
     }
 
     /// Collecting is the test's own convenience — the crate itself never does.
@@ -283,7 +300,7 @@ mod tests {
 
     #[test]
     fn inodes_are_unique() {
-        let p = DevProbe { audio: true, framebuffer: false, wifi: false, block_slots: 0b1111, in_box: false };
+        let p = DevProbe { audio: true, framebuffer: false, wifi: false, kvm_ctl: false, kvm_api: false, block_slots: 0b1111, in_box: false };
         let mut inos: Vec<u64> = list(p).map(|n| n.ino).collect();
         let total = inos.len();
         inos.sort_unstable();
@@ -294,7 +311,7 @@ mod tests {
     /// Every table entry must be reachable by name, or it can never be `stat`ed.
     #[test]
     fn every_listed_node_is_also_lookupable() {
-        let p = DevProbe { audio: true, framebuffer: false, wifi: false, block_slots: 0b1111, in_box: false };
+        let p = DevProbe { audio: true, framebuffer: false, wifi: false, kvm_ctl: false, kvm_api: false, block_slots: 0b1111, in_box: false };
         for node in list(p) {
             assert_eq!(lookup(p, node.name).as_ref(), Some(node), "{}", node.name);
         }
@@ -302,13 +319,13 @@ mod tests {
 
     #[test]
     fn a_box_gets_no_listing_at_all() {
-        let p = DevProbe { audio: true, framebuffer: true, wifi: false, block_slots: 0b1111, in_box: true };
+        let p = DevProbe { audio: true, framebuffer: true, wifi: false, kvm_ctl: false, kvm_api: false, block_slots: 0b1111, in_box: true };
         assert_eq!(list(p).count(), 0);
     }
 
     #[test]
     fn a_box_never_sees_host_hardware() {
-        let p = DevProbe { audio: true, framebuffer: true, wifi: false, block_slots: 0b1111, in_box: true };
+        let p = DevProbe { audio: true, framebuffer: true, wifi: false, kvm_ctl: false, kvm_api: false, block_slots: 0b1111, in_box: true };
         for name in ["vda", "vdb", "vdc", "vdd", "dsp", "audio", "random", "urandom"] {
             assert!(lookup(p, name).is_none(), "{name} must not leak into a box");
         }
@@ -338,6 +355,17 @@ mod tests {
         assert!(names(with).contains(&"wifi0"));
         assert!(lookup(DevProbe::default(), "wifi0").is_none());
         assert!(lookup(DevProbe { in_box: true, ..with }, "wifi0").is_none());
+    }
+
+    #[test]
+    fn kvm_nodes_follow_their_probes_and_are_root_only() {
+        let with = DevProbe { kvm_ctl: true, kvm_api: true, ..Default::default() };
+        assert_eq!(lookup(with, "kvm0").map(|n| (n.perm, n.major, n.minor)), Some((0o600, 10, 243)));
+        assert_eq!(lookup(with, "kvm").map(|n| (n.perm, n.minor)), Some((0o600, 232)));
+        assert!(names(with).contains(&"kvm0") && names(with).contains(&"kvm"));
+        assert!(lookup(DevProbe::default(), "kvm0").is_none());
+        assert!(lookup(DevProbe::default(), "kvm").is_none());
+        assert!(lookup(DevProbe { in_box: true, ..with }, "kvm0").is_none());
     }
 
     #[test]

@@ -1525,6 +1525,7 @@ dependencies = [
  "akuma-isolation",
  "akuma-locks-rw",
  "akuma-net",
+ "akuma-params",
  "akuma-pmm",
  "akuma-primitives",
  "akuma-procfs",

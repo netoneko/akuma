@@ -780,7 +780,7 @@ pub fn keyboard_has_byte() -> bool {
 pub mod services {
     /// The VFS's view of driver-owned device nodes.
     pub mod vfs {
-        pub use akuma_vfs_glue::set_wifi_present;
+        pub use akuma_vfs_glue::{set_kvm_present, set_wifi_present};
     }
     /// The EGA text line, the output of last resort before any console exists.
     pub mod boot {

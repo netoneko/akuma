@@ -17,15 +17,24 @@ extern crate alloc;
 
 mod ext2;
 
+#[cfg(feature = "ext3")]
+pub use ext2::journal;
+
 pub use ext2::{
     DEFERRED_DRAIN_CALLS, DEFERRED_DRAIN_FREED, DEFERRED_DRAIN_SKIPPED, DEFERRED_FREE_LEAKED,
     DEFERRED_FREE_PENDING, Ext2Filesystem, cache_occupancy, cache_stats, deferred_free_pending,
-    AuditReport, init_inode_freed_hook, set_cache_cap_bytes,
+    AuditReport, MountMode, init_inode_freed_hook, set_cache_cap_bytes,
 };
+#[cfg(feature = "ext3")]
+pub use ext2::RecoveryDevice;
 
 /// Trait abstracting raw block device I/O.
 #[allow(clippy::result_unit_err)]
 pub trait BlockDevice: Send + Sync {
+    /// Whether this device has permanently failed and cached filesystem data
+    /// must no longer be served. Ordinary block devices remain healthy.
+    fn is_failed(&self) -> bool { false }
+
     /// Read `buf.len()` bytes starting at byte offset `offset`.
     fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()>;
 
@@ -35,7 +44,7 @@ pub trait BlockDevice: Send + Sync {
     /// Durability barrier: when this returns, every byte this device has
     /// acknowledged writing is on stable media. The default is a no-op for
     /// devices with no volatile write cache between the kernel and the media
-    /// (RAM disks, VMM-backed virtio where the host owns the cache); the USB
+    /// (such as RAM disks); the USB
     /// mass-storage path implements it with SCSI `SYNCHRONIZE CACHE (10)`.
     ///
     /// Called by [`crate::Ext2Filesystem::sync`] after the write-back cache
