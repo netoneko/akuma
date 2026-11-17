@@ -388,6 +388,16 @@ namespace.
 - **TTY processing:** `archive/PIPE_TTY_FIX.md`.
 - **`stat`/`unlinkat`/`dup3`** + kernel pipes fix: `archive/STAT_AND_UNLINKAT_FIX.md`.
 
+## Future work
+
+- **`/proc/<pid>/stat` and `status` report the forking thread's pid as `ppid`.** `ProcStat.ppid` is `p.parent_pid.get()`
+  (`crates/akuma-vfs-glue/src/proc.rs`), which is the *thread* that forked (wait4 and orphan reaping key on it).
+  `getppid(2)` returns the parent's tgid since 2026-11-17; these two should too, or `ps`/`pstree` and anything comparing
+  `/proc/self/stat` to `getppid()` disagree for a child forked from a non-main thread. Fix: resolve through
+  `lookup_process_shared(parent_pid).tgid` as `sys_getppid` does (a helper both call), and add a forktest that forks from
+  a worker thread and checks `getppid()`, `/proc/self/stat` field 4 and the parent's `getpid()` agree.
+  [`archive/GETPPID_RETURNED_THREAD_PID.md`](../../archive/GETPPID_RETURNED_THREAD_PID.md).
+
 ## Background
 
 - `archive/PROCFS.md`, `archive/NAMESPACES.md`, `archive/CWD.md`.
