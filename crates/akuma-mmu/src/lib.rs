@@ -204,7 +204,7 @@ use akuma_mmap::PhysFrame;
 // `akuma-user-space` was split out, the x86_64 one since B3 widened it
 // (`docs/archive/AKUMA_SELF_HOSTING_AMD64.md`).
 use akuma_user_space::{FrameLedger, MappingPins};
-use akuma_primitives::irq::{with_irqs_disabled, IrqGuard};
+use akuma_primitives::irq::IrqGuard;
 
 /// `(first page, page count)` covering `len` bytes from `va_start`, or `None` if `va_start + len` wraps. A range that wraps is
 /// not mapped: the old `(va_start + len + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)` produced a small end page for one near the top
@@ -1052,7 +1052,6 @@ pub fn flush_tlb_page(_va: usize, _target: TlbTarget) -> TlbFlush { TlbFlush::do
 
 use alloc::vec::Vec;
 use alloc::collections::BTreeMap;
-use spinning_top::Spinlock;
 
 
 use asid::AsidAllocator;
@@ -1475,7 +1474,7 @@ struct PendingAsFree {
     asid: u16,
 }
 
-static PENDING_TTBR_FREES: Spinlock<Vec<PendingAsFree>> = Spinlock::new(Vec::new());
+static PENDING_TTBR_FREES: akuma_irq_lock::IrqSpinlock<Vec<PendingAsFree>> = akuma_irq_lock::IrqSpinlock::new(Vec::new());
 /// Lock-free mirror of `PENDING_TTBR_FREES.len()` so hot paths can skip the
 /// drain without taking the lock.
 static PENDING_TTBR_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -1483,7 +1482,7 @@ static PENDING_TTBR_FREE_COUNT: AtomicUsize = AtomicUsize::new(0);
 /// (entries, user frames, page-table frames) parked awaiting a TTBR-clear
 /// drain. Diagnostics + boot-suite PMM-conservation accounting.
 pub fn pending_ttbr_free_stats() -> (usize, usize, usize) {
-    with_irqs_disabled(|| {
+    {
         let pending = PENDING_TTBR_FREES.lock();
         let mut uf = 0;
         let mut pf = 0;
@@ -1492,20 +1491,20 @@ pub fn pending_ttbr_free_stats() -> (usize, usize, usize) {
             pf += e.pt_frames.len() + 1; // + the L0 itself
         }
         (pending.len(), uf, pf)
-    })
+    }
 }
 
 /// The L0 addresses of up to `out.len()` parked address spaces, for a diagnostic that asks
 /// the gates which core or thread still names each one. Returns how many it wrote.
 pub fn pending_ttbr_free_l0s(out: &mut [u64]) -> usize {
-    with_irqs_disabled(|| {
+    {
         let pending = PENDING_TTBR_FREES.lock();
         let n = pending.len().min(out.len());
         for (slot, e) in out.iter_mut().zip(pending.iter()) {
             *slot = e.l0_frame.addr as u64;
         }
         n
-    })
+    }
 }
 
 /// Free the frames of a dead address space, or park them if some core's
@@ -1524,11 +1523,11 @@ fn free_or_defer_as_frames(
         as_trace(format_args!(
             "[AS-FREE-DEFER] l0=0x{:x} asid=0x{:x} path={} held_by_core={}\n",
             l0_addr, asid, path, core));
-        with_irqs_disabled(|| {
+        {
             let mut pending = PENDING_TTBR_FREES.lock();
             pending.push(PendingAsFree { l0_frame, user_frames, pt_frames, asid });
             PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
-        });
+        };
         return;
     }
     // Second gate, saved contexts (the F8 fix, `COW_PILE_AUDIT.md` §10): a thread
@@ -1544,11 +1543,11 @@ fn free_or_defer_as_frames(
         as_trace(format_args!(
             "[AS-FREE-DEFER] l0=0x{:x} asid=0x{:x} path={} held_by_ctx tid={} state={}\n",
             l0_addr, asid, path, tid, state));
-        with_irqs_disabled(|| {
+        {
             let mut pending = PENDING_TTBR_FREES.lock();
             pending.push(PendingAsFree { l0_frame, user_frames, pt_frames, asid });
             PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
-        });
+        };
         return;
     }
     as_trace(format_args!("[AS-FREE] l0=0x{:x} asid=0x{:x} path={} core={}\n",
@@ -1621,7 +1620,7 @@ pub fn drain_pending_ttbr_frees() -> usize {
 /// stay: releasing on the core check alone re-opens the F8 window this list exists
 /// to close.
 fn take_one_ready_ttbr_free() -> Option<PendingAsFree> {
-    with_irqs_disabled(|| {
+    (|| {
         let mut pending = PENDING_TTBR_FREES.lock();
         let mut i = 0;
         while i < pending.len() {
@@ -1637,7 +1636,7 @@ fn take_one_ready_ttbr_free() -> Option<PendingAsFree> {
         }
         PENDING_TTBR_FREE_COUNT.store(pending.len(), Ordering::Release);
         None
-    })
+    })()
 }
 
 /// Tracks shared L0 page table reference counts and deferred frame lists.
@@ -1668,8 +1667,8 @@ impl Drop for SharedL0Entry {
     }
 }
 
-static SHARED_L0_TABLE: Spinlock<BTreeMap<usize, SharedL0Entry>> =
-    Spinlock::new(BTreeMap::new());
+static SHARED_L0_TABLE: akuma_irq_lock::IrqSpinlock<BTreeMap<usize, SharedL0Entry>> =
+    akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 /// Diagnostics: (entries, deferred user frames, deferred page-table frames)
 /// currently parked in `SHARED_L0_TABLE`. A non-zero deferred count with no
@@ -1677,7 +1676,7 @@ static SHARED_L0_TABLE: Spinlock<BTreeMap<usize, SharedL0Entry>> =
 /// are stranded until the view drops. Boot-suite PMM-conservation tests use
 /// this to tell "frames parked here" apart from a genuine PMM leak.
 pub fn shared_l0_stats() -> (usize, usize, usize) {
-    with_irqs_disabled(|| {
+    {
         let table = SHARED_L0_TABLE.lock();
         let mut deferred_user = 0usize;
         let mut deferred_pt = 0usize;
@@ -1690,7 +1689,7 @@ pub fn shared_l0_stats() -> (usize, usize, usize) {
             }
         }
         (table.len(), deferred_user, deferred_pt)
-    })
+    }
 }
 
 /// Copy `dst.len()` bytes **out of** the physical frame at `pa`.
@@ -1834,7 +1833,7 @@ impl UserAddressSpace {
                 return None;
             }
         };
-        with_irqs_disabled(|| {
+        {
             let mut table = SHARED_L0_TABLE.lock();
             table.entry(parent_l0_phys)
                 .and_modify(|e| e.ref_count += 1)
@@ -1845,7 +1844,7 @@ impl UserAddressSpace {
                     deferred_l0: None,
                     deferred_asid: None,
                 });
-        });
+        };
         instr::as_new_shared();
         Some(Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
@@ -1873,7 +1872,7 @@ impl UserAddressSpace {
     /// `owner_asid` is the ASID in the owner's `ttbr0` (bits 63:48).
     #[must_use]
     pub fn new_thread_view(parent_l0_phys: usize, owner_asid: u16) -> Self {
-        with_irqs_disabled(|| {
+        {
             let mut table = SHARED_L0_TABLE.lock();
             table.entry(parent_l0_phys)
                 .and_modify(|e| e.ref_count += 1)
@@ -1884,7 +1883,7 @@ impl UserAddressSpace {
                     deferred_l0: None,
                     deferred_asid: None,
                 });
-        });
+        };
         instr::as_new_shared();
         Self {
             l0_frame: PhysFrame { addr: parent_l0_phys },
@@ -2735,10 +2734,10 @@ impl Drop for UserAddressSpace {
         let l0_addr = self.l0_frame.addr;
         if !self.ledger.is_shared() {
             // Owner dropping — check if shared views still exist
-            let has_shared = with_irqs_disabled(|| {
+            let has_shared = {
                 let table = SHARED_L0_TABLE.lock();
                 table.get(&l0_addr).is_some_and(|e| e.ref_count > 0)
-            });
+            };
             if has_shared {
                 // #region agent log
                 log::debug!("[FORK-DBG] AS owner L0=0x{:x} DEFERRING free (siblings alive)", l0_addr);
@@ -2750,7 +2749,7 @@ impl Drop for UserAddressSpace {
                 let l0 = self.l0_frame;
                 let n_uf = user_frames.len();
                 let owner_asid = self.asid;
-                let stored = with_irqs_disabled(|| {
+                let stored = {
                     let mut table = SHARED_L0_TABLE.lock();
                     if let Some(entry) = table.get_mut(&l0_addr) {
                         entry.deferred_user_frames = Some(user_frames);
@@ -2762,7 +2761,7 @@ impl Drop for UserAddressSpace {
                     } else {
                         false
                     }
-                });
+                };
                 // Parked: the last view frees it. Not parked (the views all went
                 // between the check and the store): it is ours to free below.
                 free_own_asid = !stored;
@@ -2777,12 +2776,12 @@ impl Drop for UserAddressSpace {
                 // tables freed and poisoned under it. See `free_or_defer_as_frames`.
                 let user_frames = self.ledger.take_user_frames();
                 let pt_frames = self.ledger.take_page_table_frames();
-                with_irqs_disabled(|| { SHARED_L0_TABLE.lock().remove(&l0_addr); });
+                { SHARED_L0_TABLE.lock().remove(&l0_addr); };
                 free_or_defer_as_frames(l0_addr, self.asid, self.l0_frame, user_frames, pt_frames, "owner");
             }
         } else {
             // Shared view dropping — decrement refcount
-            let deferred = with_irqs_disabled(|| {
+            let deferred = (|| {
                 let mut table = SHARED_L0_TABLE.lock();
                 if let Some(entry) = table.get_mut(&l0_addr) {
                     entry.ref_count = entry.ref_count.saturating_sub(1);
@@ -2800,7 +2799,7 @@ impl Drop for UserAddressSpace {
                     }
                 }
                 (None, None, None)
-            });
+            })();
             // Free deferred frames outside the lock
             if let (Some(ref uf), Some(ref pf), Some(ref l0)) = deferred {
                 // #region agent log

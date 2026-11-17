@@ -84,7 +84,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 ///
 /// A `Spinlock`, not a `PreemptGuard`-wrapped one — see the module docs' BKL
 /// section for what that constrains.
-static UNIX_TABLE: Spinlock<Option<UnixTable>> = Spinlock::new(None);
+static UNIX_TABLE: akuma_irq_lock::IrqSpinlock<Option<UnixTable>> = akuma_irq_lock::IrqSpinlock::new(None);
 
 /// Threads parked in `accept(2)`, keyed by listener socket id.
 ///
@@ -103,11 +103,11 @@ static ACCEPT_WAITERS: Spinlock<BTreeMap<u32, BTreeMap<usize, WakeHandle>>> =
 /// table holds `BTreeMap`s, which need the allocator — and this module can be
 /// reached before anything guarantees the heap is up on every path.
 fn with_table<R>(f: impl FnOnce(&mut UnixTable) -> R) -> R {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         let mut guard = UNIX_TABLE.lock();
         let table = guard.get_or_insert_with(UnixTable::new);
         f(table)
-    })
+    }
 }
 
 // ============================================================================
@@ -407,7 +407,7 @@ pub fn scm_release(tokens: Vec<u32>) {
 /// which a `connect` lands with no waiter recorded, and the thread then sleeps
 /// through its own wake-up.
 fn accept_wait_slot(listener: u32, tid: usize) -> bool {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    (|| {
         let mut guard = UNIX_TABLE.lock();
         let table = guard.get_or_insert_with(UnixTable::new);
         match table.get(listener) {
@@ -422,7 +422,7 @@ fn accept_wait_slot(listener: u32, tid: usize) -> bool {
             .or_default()
             .insert(tid, wake_handle_for_thread(tid));
         false
-    })
+    })()
 }
 
 /// Wake everything parked in `accept` on this listener.

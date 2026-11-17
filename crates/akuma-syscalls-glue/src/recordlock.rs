@@ -23,7 +23,7 @@ use super::*;
 use akuma_reclock::{Kind, Table};
 use alloc::sync::Arc;
 
-static TABLE: Spinlock<Table> = Spinlock::new(Table::new());
+static TABLE: akuma_irq_lock::IrqSpinlock<Table> = akuma_irq_lock::IrqSpinlock::new(Table::new());
 
 const F_GETLK: u32 = 5;
 const F_SETLK: u32 = 6;
@@ -50,7 +50,7 @@ akuma_pod::pod!(Flock { l_type: i16, l_whence: i16, _pad0: i32, l_start: i64, l_
 
 /// Drop `holder`'s locks on `path` — called from `flock_release`.
 pub(super) fn release_file(path: &str, holder: usize) {
-    akuma_primitives::irq::with_irqs_disabled(|| TABLE.lock().release_file(path, holder as u64));
+    TABLE.lock().release_file(path, holder as u64);
 }
 
 /// Handle one of the three commands. `fd` is already known to be open.
@@ -89,7 +89,7 @@ pub(super) fn sys_fcntl_lock(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return EINVAL;
             }
             let owner = Arc::as_ptr(&proc.fds) as u64;
-            akuma_primitives::irq::with_irqs_disabled(|| TABLE.lock().unlock(&path, owner, s, e));
+            TABLE.lock().unlock(&path, owner, s, e);
             return 0;
         }
         _ => return EINVAL,
@@ -98,7 +98,7 @@ pub(super) fn sys_fcntl_lock(fd: u32, cmd: u32, arg: u64) -> u64 {
     let pid = proc.tgid;
 
     if cmd == F_GETLK {
-        let blocker = akuma_primitives::irq::with_irqs_disabled(|| TABLE.lock().conflict(&path, owner, kind, s, e));
+        let blocker = TABLE.lock().conflict(&path, owner, kind, s, e);
         let out = match blocker {
             None => Flock { l_type: F_UNLCK, ..fl },
             Some(b) => Flock {
@@ -114,7 +114,7 @@ pub(super) fn sys_fcntl_lock(fd: u32, cmd: u32, arg: u64) -> u64 {
     }
 
     loop {
-        let r = akuma_primitives::irq::with_irqs_disabled(|| TABLE.lock().try_lock(&path, owner, pid, kind, s, e));
+        let r = TABLE.lock().try_lock(&path, owner, pid, kind, s, e);
         if r.is_ok() {
             return 0;
         }

@@ -10,6 +10,7 @@ akuma-config = { path = "../akuma-config" }
 # `irq::with_irqs_disabled` around every touch of the ring, and `clock::uptime_us`
 # for the exit stamp the retention window is measured from.
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 spinning_top = "0.3"
 
 [lints]

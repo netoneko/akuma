@@ -394,6 +394,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-config",
  "akuma-exec",
+ "akuma-irq-lock",
  "akuma-kacho",
  "akuma-pmm",
  "akuma-primitives",
@@ -463,6 +464,7 @@ dependencies = [
 name = "akuma-isolation"
 version = "0.1.0"
 dependencies = [
+ "akuma-irq-lock",
  "akuma-primitives",
  "akuma-vfs",
  "spinning_top",
@@ -1162,6 +1164,7 @@ version = "0.1.0"
 dependencies = [
  "akuma-config",
  "akuma-exec",
+ "akuma-irq-lock",
  "akuma-primitives",
  "spinning_top",
 ]
@@ -1178,6 +1181,7 @@ name = "akuma-syscalls-log"
 version = "0.1.0"
 dependencies = [
  "akuma-config",
+ "akuma-irq-lock",
  "akuma-primitives",
  "spinning_top",
 ]
@@ -1378,6 +1382,7 @@ dependencies = [
  "akuma-exec",
  "akuma-fpcache",
  "akuma-fpcache-rw",
+ "akuma-irq-lock",
  "akuma-middleware",
  "akuma-mmap",
  "akuma-mmu",

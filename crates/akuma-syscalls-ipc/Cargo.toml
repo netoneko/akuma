@@ -9,6 +9,7 @@ description = "The System V message-queue syscall family (msgget/msgctl/msgsnd/m
 akuma-config = { path = "../akuma-config" }
 # `errno::negated::*` for the return codes, and `irq`/`clock` reached through it.
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 # `user_access` for the msgp copies, and `threading` for the poller wake handles.
 akuma-exec = { path = "../akuma-exec" }
 spinning_top = "0.3"

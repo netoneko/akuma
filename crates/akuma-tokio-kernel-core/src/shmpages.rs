@@ -34,7 +34,7 @@ use akuma_fpcache_rw::{Generations, Key, Publish, Refs, Table, write_span, zero_
 use akuma_primitives::irq::with_irqs_disabled;
 use spinning_top::Spinlock;
 
-static TABLE: Spinlock<Table> = Spinlock::new(Table::new());
+static TABLE: akuma_irq_lock::IrqSpinlock<Table> = akuma_irq_lock::IrqSpinlock::new(Table::new());
 
 /// `TABLE`'s length, mirrored so [`active`] is a load, not a lock: it is asked
 /// once per `write(2)` on the whole system.
@@ -74,12 +74,12 @@ impl Refs for PmmRefs {
 }
 
 fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
-    with_irqs_disabled(|| {
+    {
         let mut t = TABLE.lock();
         let r = f(&mut t);
         LEN.store(t.len(), Ordering::SeqCst);
         r
-    })
+    }
 }
 
 /// The key for page `index` of `inode` on the root filesystem.
@@ -90,7 +90,7 @@ pub fn key(inode: u32, index: u64) -> Key {
 /// The frame for `key` with a reference taken for the caller's mapping, which
 /// the caller must either install or release (`free_page`).
 pub fn lookup_and_ref(key: Key) -> Option<usize> {
-    let pa = with_irqs_disabled(|| TABLE.lock().lookup_and_ref(key, &PmmRefs))?;
+    let pa = TABLE.lock().lookup_and_ref(key, &PmmRefs)?;
     HITS.fetch_add(1, Ordering::Relaxed);
     Some(pa)
 }

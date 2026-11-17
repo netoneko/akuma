@@ -1627,8 +1627,8 @@ struct Quarantine {
     len: usize,
 }
 
-static QUARANTINE: Spinlock<Quarantine> =
-    Spinlock::new(Quarantine { pa: [0; QUARANTINE_SLOTS], head: 0, len: 0 });
+static QUARANTINE: akuma_irq_lock::IrqSpinlock<Quarantine> =
+    akuma_irq_lock::IrqSpinlock::new(Quarantine { pa: [0; QUARANTINE_SLOTS], head: 0, len: 0 });
 
 static UAF_DETECTED: AtomicUsize = AtomicUsize::new(0);
 
@@ -1727,7 +1727,7 @@ fn quarantine_push(pa: usize) -> Option<usize> {
     }
     poison_page(pa);
     QUAR_PRESENT[quar_slot(pa)].store(pa, Ordering::Release);
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         let mut q = QUARANTINE.lock();
         if q.len < QUARANTINE_SLOTS {
             let idx = (q.head + q.len) % QUARANTINE_SLOTS;
@@ -1741,7 +1741,7 @@ fn quarantine_push(pa: usize) -> Option<usize> {
             q.head = (head + 1) % QUARANTINE_SLOTS;
             Some(evicted)
         }
-    })
+    }
 }
 
 /// Empty the quarantine, verifying every frame on the way out. Returns the
@@ -1749,7 +1749,7 @@ fn quarantine_push(pa: usize) -> Option<usize> {
 pub fn quarantine_drain_all() -> usize {
     let mut released = 0usize;
     loop {
-        let pa = akuma_primitives::irq::with_irqs_disabled(|| {
+        let pa = (|| {
             let mut q = QUARANTINE.lock();
             if q.len == 0 {
                 return None;
@@ -1758,7 +1758,7 @@ pub fn quarantine_drain_all() -> usize {
             q.head = (q.head + 1) % QUARANTINE_SLOTS;
             q.len -= 1;
             Some(pa)
-        });
+        })();
         match pa {
             Some(pa) => { release_from_quarantine(pa); released += 1; }
             None => break,
@@ -1775,7 +1775,7 @@ pub fn discount_uaf_detections(n: usize) {
 
 #[must_use]
 pub fn quarantine_stats() -> (usize, usize) {
-    let len = akuma_primitives::irq::with_irqs_disabled(|| QUARANTINE.lock().len);
+    let len = QUARANTINE.lock().len;
     (len, UAF_DETECTED.load(Ordering::Relaxed))
 }
 

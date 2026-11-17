@@ -44,6 +44,7 @@ trace-err = []
 [dependencies]
 akuma-middleware = { path = "../akuma-middleware", optional = true }
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 akuma-user-layout = { path = "../akuma-user-layout" }
 akuma-fpcache-rw = { path = "../akuma-fpcache-rw", optional = true }
 akuma-fpcache = { path = "../akuma-fpcache", optional = true }

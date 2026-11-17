@@ -71,6 +71,15 @@ impl<T> IrqSpinlock<T> {
     }
 }
 
+impl<T> IrqSpinlockGuard<'_, T> {
+    /// The mask this guard holds, as proof for taking a *second* [`IrqSpinlock`] without masking again:
+    /// `other.lock_masked(guard.irq_proof())`. The borrow ties the inner guard to this one, so it cannot outlive it.
+    #[must_use]
+    pub fn irq_proof(&self) -> &IrqGuard {
+        &self._irq
+    }
+}
+
 /// The lock held inside a section that already masked IRQs (an [`IrqGuard`] the caller owns). It carries no mask of its own;
 /// it borrows the proof, so it cannot outlive the masked section.
 pub struct MaskedGuard<'a, T> {
@@ -118,6 +127,16 @@ mod tests {
             assert!(l.try_lock_masked(&irq).is_none(), "a held lock refuses a second taker");
         }
         assert_eq!(*l.try_lock_masked(&irq).expect("free again"), 2);
+    }
+
+    #[test]
+    fn a_second_lock_nests_under_the_first_guards_mask() {
+        let outer = IrqSpinlock::new(1u32);
+        let inner = IrqSpinlock::new(10u32);
+        let g = outer.lock();
+        let mut h = inner.lock_masked(g.irq_proof());
+        *h += *g;
+        assert_eq!(*h, 11);
     }
 
     #[test]

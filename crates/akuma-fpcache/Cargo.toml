@@ -15,6 +15,7 @@ akuma-exec = { path = "../akuma-exec" }
 akuma-pmm = { path = "../akuma-pmm" }
 # `irq::with_irqs_disabled`, `preempt::current_tid`, and `safe_print!`.
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 # The observe/decide/hysteresis band on the elastic cap.
 akuma-kacho = { path = "../akuma-kacho" }
 spinning_top = "0.3"

@@ -45,7 +45,7 @@ struct FlockEntry {
     holders: Vec<(usize, u32)>,
 }
 
-static FLOCK_TABLE: Spinlock<BTreeMap<String, FlockEntry>> = Spinlock::new(BTreeMap::new());
+static FLOCK_TABLE: akuma_irq_lock::IrqSpinlock<BTreeMap<String, FlockEntry>> = akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 /// Release whatever lock `(holder, fd)` holds on `path`, if any. A no-op if
 /// it holds none — safe to call unconditionally from every fd-teardown path
@@ -63,7 +63,7 @@ pub fn flock_release(path: &str, holder: usize, fd: u32) {
     // for a file drops the process's `fcntl` locks on it, and exit (`close_all`
     // calls this per fd) drops the rest. See `recordlock`.
     super::recordlock::release_file(path, holder);
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         let mut table = FLOCK_TABLE.lock();
         if let Some(entry) = table.get_mut(path) {
             entry.holders.retain(|&(h, f)| !(h == holder && f == fd));
@@ -71,7 +71,7 @@ pub fn flock_release(path: &str, holder: usize, fd: u32) {
                 table.remove(path);
             }
         }
-    });
+    };
 }
 
 pub(super) fn sys_flock(fd: u32, operation: u32) -> u64 {
@@ -98,7 +98,7 @@ pub(super) fn sys_flock(fd: u32, operation: u32) -> u64 {
         op @ (LOCK_SH | LOCK_EX) => {
             let want = if op == LOCK_SH { LockKind::Shared } else { LockKind::Exclusive };
             loop {
-                let acquired = akuma_primitives::irq::with_irqs_disabled(|| {
+                let acquired = {
                     let mut table = FLOCK_TABLE.lock();
                     match table.get_mut(&path) {
                         None => {
@@ -120,7 +120,7 @@ pub(super) fn sys_flock(fd: u32, operation: u32) -> u64 {
                             }
                         }
                     }
-                });
+                };
                 if acquired {
                     return 0;
                 }

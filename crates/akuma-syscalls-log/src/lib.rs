@@ -41,10 +41,8 @@ use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::vec::Vec;
 use core::fmt::Write as _;
-use spinning_top::Spinlock;
 
 use akuma_primitives::clock::uptime_us;
-use akuma_primitives::irq::with_irqs_disabled;
 
 /// Ring depth per pid, from `akuma_config`. Read as a `const`, not handed over:
 /// see that crate's header for why the four `…Config` structs this file used to
@@ -76,11 +74,11 @@ struct ProcessSyscallLog {
     box_id: u64,
 }
 
-static SYSCALL_LOG: Spinlock<BTreeMap<u32, ProcessSyscallLog>> =
-    Spinlock::new(BTreeMap::new());
+static SYSCALL_LOG: akuma_irq_lock::IrqSpinlock<BTreeMap<u32, ProcessSyscallLog>> =
+    akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 pub fn record(pid: u32, box_id: u64, nr: u64, timestamp_us: u64, duration_us: u64, result: u64) {
-    with_irqs_disabled(|| {
+    {
         let mut log = SYSCALL_LOG.lock();
         let entry = log.entry(pid).or_insert_with(|| ProcessSyscallLog {
             entries: VecDeque::new(),
@@ -105,7 +103,7 @@ pub fn record(pid: u32, box_id: u64, nr: u64, timestamp_us: u64, duration_us: u6
             entry.entries.pop_front();
         }
         entry.entries.push_back(SyscallEntry { timestamp_us, nr, duration_us, result });
-    });
+    };
 }
 
 /// Drop every log whose retention window has closed. Run from every place that
@@ -124,13 +122,13 @@ fn prune_expired(log: &mut BTreeMap<u32, ProcessSyscallLog>, now: u64) {
 
 pub fn mark_exited(pid: u32) {
     let now = uptime_us();
-    with_irqs_disabled(|| {
+    {
         let mut log = SYSCALL_LOG.lock();
         if let Some(entry) = log.get_mut(&pid) {
             entry.exited_at_us = Some(now);
         }
         prune_expired(&mut log, now);
-    });
+    };
 }
 
 /// Render `pid`'s retained log, or `None` if there is none, it has expired, or
@@ -144,7 +142,7 @@ pub fn mark_exited(pid: u32) {
 pub fn get_formatted(pid: u32, viewer_box_id: u64) -> Option<Vec<u8>> {
     let now = uptime_us();
     
-    with_irqs_disabled(|| {
+    (|| {
         let mut log = SYSCALL_LOG.lock();
 
         // Lazily remove expired entries
@@ -177,7 +175,7 @@ pub fn get_formatted(pid: u32, viewer_box_id: u64) -> Option<Vec<u8>> {
             );
         }
         Some(out.into_bytes())
-    })
+    })()
 }
 
 /// Whether [`get_formatted`] would return `Some`, without rendering.
@@ -188,7 +186,7 @@ pub fn get_formatted(pid: u32, viewer_box_id: u64) -> Option<Vec<u8>> {
 #[must_use]
 pub fn has_log(pid: u32, viewer_box_id: u64) -> bool {
     let now = uptime_us();
-    with_irqs_disabled(|| {
+    {
         let log = SYSCALL_LOG.lock();
         log.get(&pid).is_some_and(|entry| {
             (viewer_box_id == 0 || entry.box_id == viewer_box_id)
@@ -196,7 +194,7 @@ pub fn has_log(pid: u32, viewer_box_id: u64) -> bool {
                     .exited_at_us
                     .is_none_or(|exited_at| now.saturating_sub(exited_at) < retain_us())
         })
-    })
+    }
 }
 
 /// Every pid with a live retained log that `viewer_box_id` may see.
@@ -204,14 +202,14 @@ pub fn has_log(pid: u32, viewer_box_id: u64) -> bool {
 pub fn list_pids_with_logs(viewer_box_id: u64) -> Vec<u32> {
     let now = uptime_us();
     
-    with_irqs_disabled(|| {
+    {
         let mut log = SYSCALL_LOG.lock();
         prune_expired(&mut log, now);
         log.iter()
             .filter(|(_, v)| viewer_box_id == 0 || v.box_id == viewer_box_id)
             .map(|(pid, _)| *pid)
             .collect()
-    })
+    }
 }
 
 #[cfg(test)]

@@ -41,7 +41,7 @@ pub const PROCESS_TABLE_FULL: &str = "Process table full";
 
 /// Slots promised to a [`ProcessSlot`] and not yet claimed. Under a lock, not an
 /// atomic, so that reading the table's count and raising this is one step.
-static RESERVED: Spinlock<usize> = Spinlock::new(0);
+static RESERVED: akuma_irq_lock::IrqSpinlock<usize> = akuma_irq_lock::IrqSpinlock::new(0);
 
 /// A claim on one process-table slot, taken **before** the child is built.
 ///
@@ -67,7 +67,7 @@ pub struct ProcessSlot(());
 /// Reserve one slot, or `None` if the table is full. A refusal also requests a
 /// drain, since the table may be full of reclaimable rows.
 pub fn reserve_process_slot() -> Option<ProcessSlot> {
-    let granted = with_irqs_disabled(|| {
+    let granted = {
         let mut reserved = RESERVED.lock();
         let occupied = PROCESS_TABLE.active_count() + PROCESS_TABLE.retired_count();
         if occupied + *reserved < MAX_PROCESSES {
@@ -76,7 +76,7 @@ pub fn reserve_process_slot() -> Option<ProcessSlot> {
         } else {
             false
         }
-    });
+    };
     if granted {
         Some(ProcessSlot(()))
     } else {
@@ -87,10 +87,10 @@ pub fn reserve_process_slot() -> Option<ProcessSlot> {
 
 impl Drop for ProcessSlot {
     fn drop(&mut self) {
-        with_irqs_disabled(|| {
+        {
             let mut reserved = RESERVED.lock();
             *reserved = reserved.saturating_sub(1);
-        });
+        };
     }
 }
 

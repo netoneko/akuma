@@ -21,4 +21,5 @@ akuma-vfs = { path = "../akuma-vfs" }
 # `Pid` and `with_irqs_disabled`, both for the box registry (moved here from
 # `akuma-exec` 2026-08-30). Both are safe items, so this crate keeps `forbid`.
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 spinning_top = "0.3"
