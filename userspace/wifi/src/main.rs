@@ -5,6 +5,7 @@
 //! wifi scan                       networks in range (* = known)
 //! wifi list                       known networks in /etc/wifi (never the key)
 //! wifi add <name> [ssid]          passphrase on stdin -> /etc/wifi/<name> (psk, 0600)
+//! wifi add -i                     asks for the network name and password
 //! wifi add-open <name> [ssid]     an open network
 //! wifi connect [name]             join <name>, or the best known network in range
 //! wifi disconnect
@@ -49,7 +50,7 @@ fn fail(s: &str) -> ! {
 }
 
 fn usage() -> ! {
-    out("usage: wifi status | scan | list | add <name> [ssid] | add-open <name> [ssid] |\n");
+    out("usage: wifi status | scan | list | add [-i | <name> [ssid]] | add-open <name> [ssid] |\n");
     out("            connect [name] | disconnect | forget <name> | auto\n");
     exit(2)
 }
@@ -302,6 +303,52 @@ fn cmd_list() {
     }
 }
 
+/// One line from stdin into `buf`, without the `\n` (or `\r\n`). Stops at EOF
+/// or a full buffer. The returned slice borrows `buf`, which the caller wipes.
+fn read_line(buf: &mut [u8]) -> &[u8] {
+    let mut len = 0;
+    while len < buf.len() {
+        let n = read(0, &mut buf[len..]);
+        if n <= 0 {
+            break;
+        }
+        len += n as usize;
+        if buf[..len].contains(&b'\n') {
+            break;
+        }
+    }
+    let line = buf[..len].split(|&c| c == b'\n').next().unwrap_or(&[]);
+    line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+/// Read a passphrase line. On a terminal, echo is off while it is typed, so the
+/// passphrase is not left on the screen (or in a console log); `prompt` is
+/// shown only then.
+fn read_secret(buf: &mut [u8], prompt: &str) -> usize {
+    let saved = echo_off();
+    if saved.is_some() {
+        out(prompt);
+    }
+    let len = read_line(buf).len();
+    echo_restore(saved);
+    if saved.is_some() {
+        out("\n");
+    }
+    len
+}
+
+/// Write `/etc/wifi/<name>` (keeping what a re-add must keep) and say so.
+fn store(name: &str, ssid: Ssid, psk: Option<[u8; 32]>) {
+    // Re-adding a network keeps what was set on it (see `wifi::replacing`).
+    let path = format!("{CONFIG_DIR}/{name}");
+    let old = read_file(&path).and_then(|t| parse_config(name, &t).ok());
+    let verb = if old.is_some() { "updated" } else { "added" };
+    let kind = if psk.is_some() { "psk" } else { "open" };
+    let fresh = Network { name: String::from(name), ssid, psk, priority: 0, autoconnect: true, bssid: None };
+    save(&replacing(fresh, old.as_ref()));
+    out(&format!("{verb} {name} ({path}, {kind})\n"));
+}
+
 fn cmd_add(open_net: bool) {
     let name = arg(2).unwrap_or_else(|| usage());
     if !valid_name(name) {
@@ -312,30 +359,10 @@ fn cmd_add(open_net: bool) {
     let psk = if open_net {
         None
     } else {
-        // One line on stdin. On a terminal, echo is off while it is typed, so
-        // the passphrase is not left on the screen (or in a console log).
-        let saved = echo_off();
-        if saved.is_some() {
-            out("passphrase: ");
-        }
+        // One line on stdin (see `read_secret`).
         let mut buf = [0u8; 128];
-        let mut len = 0;
-        while len < buf.len() {
-            let n = read(0, &mut buf[len..]);
-            if n <= 0 {
-                break;
-            }
-            len += n as usize;
-            if buf[..len].contains(&b'\n') {
-                break;
-            }
-        }
-        echo_restore(saved);
-        if saved.is_some() {
-            out("\n");
-        }
-        let line = buf[..len].split(|&c| c == b'\n').next().unwrap_or(&[]);
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let len = read_secret(&mut buf, "passphrase: ");
+        let line = &buf[..len];
         if !valid_passphrase(line) {
             buf.fill(0);
             fail("a WPA2 passphrase is 8-63 printable ASCII characters (one line on stdin)");
@@ -344,13 +371,41 @@ fn cmd_add(open_net: bool) {
         buf.fill(0);
         Some(k)
     };
-    // Re-adding a network keeps what was set on it (see `wifi::replacing`).
-    let path = format!("{CONFIG_DIR}/{name}");
-    let old = read_file(&path).and_then(|t| parse_config(name, &t).ok());
-    let verb = if old.is_some() { "updated" } else { "added" };
-    let fresh = Network { name: String::from(name), ssid, psk, priority: 0, autoconnect: true, bssid: None };
-    save(&replacing(fresh, old.as_ref()));
-    out(&format!("{verb} {name} ({path}, {})\n", if open_net { "open" } else { "psk" }));
+    store(name, ssid, psk);
+}
+
+/// `wifi add -i`: ask for the network name and the password, then write the
+/// same file `wifi add` / `wifi add-open` would. The name is the SSID, and also
+/// the file's name when it is a valid one (otherwise it is asked for). An empty
+/// password means an open network.
+fn cmd_add_interactive() {
+    out("network name (SSID): ");
+    let mut nbuf = [0u8; 128];
+    let ssid_bytes = read_line(&mut nbuf);
+    let ssid = Ssid::new(ssid_bytes).filter(|s| !s.is_empty()).unwrap_or_else(|| fail("an SSID is 1-32 bytes"));
+
+    let mut name = String::from_utf8(ssid_bytes.to_vec()).unwrap_or_default();
+    if !valid_name(&name) {
+        out("not usable as a file name; save as: ");
+        let mut fbuf = [0u8; 128];
+        name = String::from_utf8(read_line(&mut fbuf).to_vec()).unwrap_or_default();
+        if !valid_name(&name) {
+            fail("network names are 1-64 of [A-Za-z0-9._-], not starting with a dot");
+        }
+    }
+
+    let mut buf = [0u8; 128];
+    let len = read_secret(&mut buf, "password (empty for an open network): ");
+    let psk = if len == 0 {
+        None
+    } else if valid_passphrase(&buf[..len]) {
+        Some(derive_psk(&buf[..len], ssid.as_bytes()))
+    } else {
+        buf.fill(0);
+        fail("a WPA2 passphrase is 8-63 printable ASCII characters");
+    };
+    buf.fill(0);
+    store(&name, ssid, psk);
 }
 
 fn cmd_connect() {
@@ -460,6 +515,7 @@ pub extern "C" fn main() {
         "status" => print_status(&read_status().unwrap_or_else(|e| fail(&e))),
         "scan" => cmd_scan(),
         "list" => cmd_list(),
+        "add" if arg(2) == Some("-i") => cmd_add_interactive(),
         "add" => cmd_add(false),
         "add-open" => cmd_add(true),
         "connect" => cmd_connect(),

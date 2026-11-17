@@ -181,7 +181,7 @@ bssid = aa:bb:cc:dd:ee:ff        # optional: pin one access point
 
 `passphrase = …` is accepted when the file is written by hand. It is turned
 into `psk` (PBKDF2-HMAC-SHA1, 4096 rounds, the SSID as salt) when read, and
-`wifi` never writes it back. `wifi add` stores only the PSK, so the human
+`wifi` never writes it back. `wifi add` (and `wifi add -i`) stores only the PSK, so the human
 passphrase, which people reuse, never reaches the disk. The PSK is still the
 network's full credential, hence `0600`. Today every Akuma process is uid 0
 (`geteuid` answers 0), so the modes state the intent rather than enforce it.
@@ -290,8 +290,12 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
 - **No `poll(2)` readiness on `/dev/wifi0`.** The tool polls by reading (100 ms
   steps). Readiness-on-state-change is the natural next step once a real radio
   makes state change asynchronously.
-- **`wifi add` does not suppress echo** when the passphrase is typed at a
-  terminal. Redirect it from a file instead.
+- **`wifi add -i`** (2026-11-17) is the interactive form: it asks for the
+  network name (the SSID, also the file name when valid, else it asks for one)
+  and the password (echo off, empty means an open network) and writes the same
+  `0600` file as `wifi add`. It does not ask twice, so a mistyped password is
+  only found when `wifi connect` fails. `wifi add` itself has suppressed echo
+  on a terminal since 2026-11-16 (`userspace/wifi/docs/ISSUES_2026_11_16.md` W2).
 - **No IP layer yet.** Joining does not bring up an interface in
   `akuma-net-nic`; that is the `ExternalDevice::Rtw89` work in W5.
 

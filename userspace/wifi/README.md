@@ -13,6 +13,7 @@ supplicant: the kernel does the WPA2 handshake. How the pieces fit:
 | `wifi scan` | scan, then list what is in range, strongest first; `*` marks known networks |
 | `wifi list` | known networks: name, priority, autoconnect, `open`/`psk`, SSID. **Never the key** |
 | `wifi add <name> [ssid] < passfile` | one line on stdin (8–63 printable ASCII) → PSK → `/etc/wifi/<name>`, `0600`. The SSID defaults to the name |
+| `wifi add -i` | interactive: asks for the network name (the SSID, also the file name when valid, else asked) and the password (echo off; empty = open network), then writes the same file |
 | `wifi add-open <name> [ssid]` | an open network |
 | `wifi connect [name]` | join `<name>`, or with no name scan and join the best known network in range; waits for `connected` or `failed` (exit 1 on failure) |
 | `wifi disconnect` | drop the link |
@@ -52,8 +53,9 @@ menu entry 7; against `wifisim=lossy`, entry 15 (`overlays/ryzen/README.md`).
 
 ## Limits
 
-- `wifi add` turns terminal echo off while it reads the passphrase, and only
-  when stdin is a terminal. Piped input is read as is.
+- `wifi add` and `wifi add -i` turn terminal echo off while they read the
+  passphrase, and only when stdin is a terminal. Piped input is read as is.
+  `wifi add -i` asks for the password once, with no confirmation.
 - A hand-edited `passphrase = ...` line is trimmed, so leading and trailing
   spaces in a passphrase are lost. Use `psk = <64 hex>` for one that has them.
   (`wifi add` always writes the derived `psk`.)
