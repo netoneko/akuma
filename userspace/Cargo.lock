@@ -52,6 +52,9 @@ dependencies = [
 [[package]]
 name = "akuma-boot"
 version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
 
 [[package]]
 name = "akuma-cpu"

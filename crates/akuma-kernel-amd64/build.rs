@@ -13,6 +13,7 @@ fn main() {
     build_user_program(&dir, "threadprobe");
     build_user_program(&dir, "killprobe");
     build_user_program(&dir, "sigregs");
+    build_user_program(&dir, "isoprobe");
 }
 
 /// Export the amd64 linker script's path to the bin.

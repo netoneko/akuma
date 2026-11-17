@@ -14,6 +14,7 @@ userspace/amd64/hello/hello.rs             the ELF loader's probe
 userspace/amd64/fdprobe/fdprobe.rs         the descriptor table's probe
 userspace/amd64/threadprobe/threadprobe.rs clone(CLONE_VM)+futex, raw — a boot check
 userspace/amd64/killprobe/killprobe.rs     a threaded process for the boot suite to SIGKILL
+userspace/amd64/isoprobe/isoprobe.rs       can one process read another's memory? fork+exec real processes; `scripts/run_isolation_probe.sh` runs it as init and reads the verdict
 userspace/amd64/sigregs/sigregs.rs         do rcx/r11 and the SSE/AVX file survive a tick-time and a fault-time signal? — a boot check
 userspace/amd64/ruststd/ruststd.rs         **the odd one out** — see below
 userspace/amd64/run_all/run_all.c         C, not built by build.rs: runs a list of probes as `init` with framed banners (musl-static, built by hand — see its header)

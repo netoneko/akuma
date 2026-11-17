@@ -225,6 +225,15 @@ cannot be swapped with a length or an fd) and the call sites, not the arithmetic
   unreachable from the other, and after a fork every frame visible in two spaces is read-only, CoW-marked/counted ≥ 2, while an
   unrelated third process is untouched. These read page tables and frames; they do not execute a user read from a second
   process.
+- **Behavioural probe (amd64, T10):** `userspace/amd64/isoprobe` runs real processes, no page-table reading:
+  a fork child sees the parent's secret through the COW share and writes its own copy; the parent's bytes are unchanged; a
+  `fork`+`execve`'d peer (a fresh address space) loads the parent's address and is killed by `SIGSEGV`; a harness-sanity step
+  aims the same flow at an address mapped in the peer and requires it is *not* reported killed (so the check cannot pass by always
+  saying "killed"); a load of a kernel-half address is killed by `SIGSEGV`. `scripts/run_isolation_probe.sh` builds the kernel and
+  disk, boots it under KVM (TCG if there is no `/dev/kvm`) with `INIT=/bin/isoprobe`, and exits 0/1/2 for pass/fail/no verdict.
+  Mutation-checked: the fork walk keeping the child's mapping writable fails it ("COW leak: the child's write is visible in the
+  parent"); aliasing PML4 slot 0 into every new space breaks the kernel outright (a page-table-walk panic, no verdict, exit 2).
+  **aarch64 has no counterpart** (there is no `aarch64` musl or no_std userspace target installed here to build one).
 - **Mutation-checked (2026-11-17), each reverted afterwards.** aarch64 under QEMU: skipping the parent's read-only demotion in
   `cow_share_and_demote_range` fails it ("a frame mapped in two processes is writable in one of them"); making two unrelated spaces
   map the test's page 3 to one frame fails it ("two unrelated processes share a physical frame", plus its knock-on checks).

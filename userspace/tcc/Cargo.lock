@@ -5,6 +5,25 @@ version = 4
 [[package]]
 name = "akuma-boot"
 version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+]
+
+[[package]]
+name = "akuma-cpu"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-not-even-once"
+version = "0.1.0"
+
+[[package]]
+name = "akuma-primitives"
+version = "0.1.0"
+dependencies = [
+ "akuma-cpu",
+ "akuma-not-even-once",
+]
 
 [[package]]
 name = "cc"

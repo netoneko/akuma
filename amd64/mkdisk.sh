@@ -65,6 +65,7 @@ DEBUGFS=$(find_tool debugfs) || {
 # the path carries a hash and has to be searched for rather than spelled.
 HELLO=$(find target/x86_64-unknown-none/release/build -name hello.elf 2>/dev/null | head -1)
 FDPROBE=$(find target/x86_64-unknown-none/release/build -name fdprobe.elf 2>/dev/null | head -1)
+ISOPROBE=$(find target/x86_64-unknown-none/release/build -name isoprobe.elf 2>/dev/null | head -1)
 [ -n "$HELLO" ] || {
     echo "hello.elf not found — run 'cargo build -p akuma --target x86_64-unknown-none --release' first" >&2
     exit 1
@@ -215,6 +216,8 @@ done
 "$DEBUGFS" -w -R "mkdir /bin" "$IMG" >/dev/null 2>&1
 "$DEBUGFS" -w -R "write $HELLO bin/hello" "$IMG" >/dev/null 2>&1
 [ -n "$FDPROBE" ] && "$DEBUGFS" -w -R "write $FDPROBE bin/fdprobe" "$IMG" >/dev/null 2>&1
+# The behavioural isolation probe (`userspace/amd64/isoprobe`): run as init, it execs itself by this path.
+[ -n "$ISOPROBE" ] && "$DEBUGFS" -w -R "write $ISOPROBE bin/isoprobe" "$IMG" >/dev/null 2>&1
 # The C ext2 probes (`userspace/ext2probe/c/build.sh`). Static musl, no
 # `libakuma` — which is why they exist: the Rust `ext2probe` beside them does not
 # build for x86_64, so its measurements could not be run on this kernel at all.
