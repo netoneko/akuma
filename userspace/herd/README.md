@@ -312,3 +312,16 @@ herd depends only on `libakuma` (see `Cargo.toml`).
 - Future: multiple services per core (point `core = N` at a per-core `/bin/herd`),
   cross-core supervision/restart, capability-per-service, pinning across nodes/VMs (cluster
   vision), affinity sets. See the *Limitations & future* section of the core-aware doc.
+- Future: fix three things found wiring `codex-code-mode-host` up as a service (2026-11-17,
+  `/etc/herd/available/codex-code-mode-host.conf`):
+  - **`args = --listen grpc://127.0.0.1:47200` loses its first flag at spawn.** The config
+    parse (`split_whitespace`, `main.rs`) yields both tokens; the child still got only
+    `grpc://...` (`error: unexpected argument 'grpc://...'`). Not yet traced past herd — suspect
+    the spawn path treating `args[0]` specially. Workaround: a wrapper script run via
+    `command = /bin/sh` (the `goose-glm` shape).
+  - **`herd enable` copies the config into `enabled/` instead of linking it**, so editing
+    `available/` does nothing until `herd disable` + `herd enable`; the service keeps
+    restarting on the stale copy. Link it (as the shipped `goose-glm`/`hostname` entries are),
+    or have `herd start` re-read `available/`.
+  - **`herd status` keeps `restart-pending ... last_exit=2` after a successful start** until the
+    next reload; it should show `running` as soon as `start` reports a pid.
