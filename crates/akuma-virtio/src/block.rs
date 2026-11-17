@@ -85,6 +85,7 @@ pub struct VirtioBlockDevice {
     index: usize,
     capacity_sectors: u64,
     read_only: bool,
+    can_flush: bool,
 }
 
 impl VirtioBlockDevice {
@@ -97,11 +98,11 @@ impl VirtioBlockDevice {
             .enumerate()
             .find_map(|(i, r)| r.claim().map(|r| (i, r)))
             .ok_or(BlockError::NotFound)?;
-        let features = transport.begin(blk::F_RO).map_err(|_| BlockError::NotFound)?;
+        let features = transport.begin(blk::F_RO | blk::F_FLUSH).map_err(|_| BlockError::NotFound)?;
         let queue = Queue::setup(&mut transport, 0, ring).map_err(|_| BlockError::NotFound)?;
         transport.driver_ok();
         let capacity_sectors = transport.config_u64(blk::CAPACITY);
-        Ok(Self { transport, queue, index, capacity_sectors, read_only: features & blk::F_RO != 0 })
+        Ok(Self { transport, queue, index, capacity_sectors, read_only: features & blk::F_RO != 0, can_flush: features & blk::F_FLUSH != 0 })
     }
 
     /// One request, waited for: `kind` at `sector`, over `len` bytes at `data`.
@@ -117,12 +118,15 @@ impl VirtioBlockDevice {
         // Anything but S_OK reads as failure if the device never writes it.
         req.set(STATUS_AT, 0xff);
         #[allow(clippy::cast_possible_truncation)]
+        let header = Buf { addr: phys_of(req.addr() as *const u8), len: blk::HEADER_LEN as u32, device_writes: false };
+        let status = Buf { addr: phys_of(req.addr_of(STATUS_AT) as *const u8), len: 1, device_writes: true };
         let bufs = [
-            Buf { addr: phys_of(req.addr() as *const u8), len: blk::HEADER_LEN as u32, device_writes: false },
-            Buf { addr: phys_of(data), len, device_writes: kind == blk::T_IN },
-            Buf { addr: phys_of(req.addr_of(STATUS_AT) as *const u8), len: 1, device_writes: true },
+            header,
+            Buf { addr: if len == 0 { 0 } else { phys_of(data) }, len, device_writes: kind == blk::T_IN },
+            status,
         ];
-        let head = self.queue.submit(&self.transport, &bufs).map_err(|_| ())?;
+        let flush_bufs = [header, status];
+        let head = self.queue.submit(&self.transport, if kind == blk::T_FLUSH { &flush_bufs } else { &bufs }).map_err(|_| ())?;
         // Spin until *this* request is back. With one request in flight nothing
         // else can complete; an element the queue refuses (a device naming a
         // head it was never given) frees nothing and is skipped.
@@ -146,6 +150,12 @@ impl VirtioBlockDevice {
     #[must_use]
     pub fn capacity_bytes(&self) -> u64 {
         self.capacity_sectors * SECTOR_SIZE as u64
+    }
+
+    /// Flush all completed writes to the device's stable backing storage.
+    pub fn flush(&mut self) -> Result<(), BlockError> {
+        if !self.can_flush { return Err(BlockError::WriteError); }
+        self.request(blk::T_FLUSH, 0, core::ptr::null(), 0).map_err(|_| BlockError::WriteError)
     }
 
     /// Read sectors from the device
@@ -430,6 +440,11 @@ pub fn read_bytes_at(idx: usize, offset: u64, buf: &mut [u8]) -> Result<(), Bloc
 /// Write bytes at an arbitrary offset to device `idx`.
 pub fn write_bytes_at(idx: usize, offset: u64, buf: &[u8]) -> Result<(), BlockError> {
     with_device_at(idx, |dev| dev.write_bytes(offset, buf)).ok_or(BlockError::NotInitialized)?
+}
+
+/// Flush all prior writes on device `idx`.
+pub fn flush_at(idx: usize) -> Result<(), BlockError> {
+    with_device_at(idx, VirtioBlockDevice::flush).ok_or(BlockError::NotInitialized)?
 }
 
 /// Execute a closure with access to the boot device (`vda`).

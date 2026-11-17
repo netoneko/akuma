@@ -1,8 +1,7 @@
 //! virtio-blk on the wire (virtio 1.x §5.2).
 //!
-//! A request is three buffers: a 16-byte header the device reads, the data
-//! (device-written for a read, device-read for a write), and one status byte
-//! the device writes last.
+//! A read or write has a header, data and status; a flush has only the header
+//! and status. The device writes the status byte last.
 
 /// Bytes per sector: the unit of the header's `sector` and of [`CAPACITY`],
 /// whatever the device's block size.
@@ -11,9 +10,12 @@ pub const SECTOR_SIZE: usize = 512;
 pub const CAPACITY: usize = 0;
 /// Feature: the device is read-only.
 pub const F_RO: u64 = 1 << 5;
+/// Device supports the write-cache flush command (Virtio 1.2 §5.2).
+pub const F_FLUSH: u64 = 1 << 9;
 
 pub const T_IN: u32 = 0;
 pub const T_OUT: u32 = 1;
+pub const T_FLUSH: u32 = 4;
 
 pub const HEADER_LEN: usize = 16;
 

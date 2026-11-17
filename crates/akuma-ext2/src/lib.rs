@@ -35,7 +35,7 @@ pub trait BlockDevice: Send + Sync {
     /// Durability barrier: when this returns, every byte this device has
     /// acknowledged writing is on stable media. The default is a no-op for
     /// devices with no volatile write cache between the kernel and the media
-    /// (RAM disks, VMM-backed virtio where the host owns the cache); the USB
+    /// (such as RAM disks); the USB
     /// mass-storage path implements it with SCSI `SYNCHRONIZE CACHE (10)`.
     ///
     /// Called by [`crate::Ext2Filesystem::sync`] after the write-back cache

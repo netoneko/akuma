@@ -20,6 +20,10 @@ impl BlockDevice for KernelBlockDevice {
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
         akuma_virtio::block::write_bytes_at(self.idx, offset, data).map_err(|_| ())
     }
+
+    fn flush(&self) -> Result<(), ()> {
+        akuma_virtio::block::flush_at(self.idx).map_err(|_| ())
+    }
 }
 
 /// Mount ext2 from the boot device (`vda`), cache sized from the global cap.
