@@ -49,9 +49,9 @@ fi
 rustup target add x86_64-unknown-none
 
 K=target/x86_64-unknown-none/release/akuma
-cargo build -p akuma --target x86_64-unknown-none --release || exit 1
+cargo build -p akuma --target x86_64-unknown-none --release --features vfat,ext4 || exit 1
 cp $K $OUT/akuma-amd64.tests
-cargo build -p akuma --target x86_64-unknown-none --release --features no-tests || exit 1
+cargo build -p akuma --target x86_64-unknown-none --release --features no-tests,vfat,ext4 || exit 1
 cp $K $OUT/akuma-amd64
 ls -la $OUT
 
