@@ -16,7 +16,7 @@ for kind in ext3 ext4; do
     image="$work/$kind.img"
     truncate -s 32M "$image"
     if [ "$kind" = ext4 ]; then
-        mke2fs -q -F -t ext4 -b 1024 -O '^metadata_csum,^uninit_bg' "$image"
+        mke2fs -q -F -t ext4 -b 1024 "$image"
     else
         mke2fs -q -F -t ext3 -b 1024 "$image"
     fi

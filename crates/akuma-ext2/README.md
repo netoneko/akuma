@@ -757,12 +757,13 @@ This is deliberately limited: ext3 requires a clean filesystem with an internal
 journal and no orphan recovery pending. Ext4 additionally accepts extent trees,
 including sparse and unwritten extents, with 32-bit physical block numbers.
 The 64-bit descriptor layout and `flex_bg` are supported when all referenced
-block addresses fit in 32 bits. Metadata checksums and lazy group checksums
-are not supported, so ordinary default ext4 images are still rejected. A test
-image with those features disabled can be created with:
+block addresses fit in 32 bits. CRC32C metadata checksums are checked for the
+superblock, group descriptors, inodes, directory leaves and HTree index nodes,
+and external extent nodes. Alternate checksum seeds and legacy group checksums
+are not supported. A test image can be created with:
 
 ```sh
-mke2fs -t ext4 -O '^metadata_csum,^uninit_bg' IMAGE
+mke2fs -t ext4 IMAGE
 ```
 
 Unknown feature bits, dirty journals, journal recovery and all journaled write

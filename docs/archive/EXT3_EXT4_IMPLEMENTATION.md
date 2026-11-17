@@ -1,0 +1,75 @@
+# ext3/ext4 implementation notes
+
+These notes describe the independently written extension of `akuma-ext2` on
+`more-improvements`. They record implemented behavior and current limits, not
+a claim of complete ext3/ext4 support. The on-disk layouts are based on the
+published [ext4 format documentation](https://docs.kernel.org/filesystems/ext4/)
+and [virtio 1.2 specification](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html).
+Linux filesystem and e2fsprogs implementation code was not reused; e2fsprogs
+is used as an image generator and independent test oracle.
+
+## Mount and I/O contracts
+
+The `ext3` and `ext4` Cargo features are additive and off by default; `ext4`
+implies `ext3`. The original constructor requests read-write access and still
+only accepts the legacy ext2 feature mask. `MountMode::ReadOnly` is explicit,
+enforced at the filesystem entry points and retained in the VFS mount table;
+remounting a read-only instance writable fails. Runtime mount names `ext2`,
+`ext3` and `ext4` share the same on-disk capability checks.
+
+Clean internal-journal ext3/ext4 filesystems can be read without replay. The
+filesystem state must be clean, no recovery or orphan processing may be pending,
+and the journal must be internal. Unknown feature bits and unsupported
+combinations are rejected before writes. In particular, there is no journal
+replay or journaled write implementation; requesting writable access to a
+journaled image fails. Unclean read-only images fail rather than exposing stale
+home blocks.
+
+Virtio-blk negotiates the flush feature and submits a two-descriptor FLUSH
+request after preceding writes complete. Filesystem sync propagates failure;
+when the device does not offer flush the driver returns an error rather than
+claiming a durability guarantee. This is a prerequisite for journaling, not a
+transaction implementation. USB and NVMe retain their own barriers.
+
+## Ext4 read path
+
+Inode block mapping selects the legacy map or an extent tree based on the inode
+flag. The extent walker checks headers, entry bounds, depth, ordering, lengths,
+physical ranges and high address bits; holes and unwritten extents read as
+zero. External extent nodes are read through the block cache. A 64-byte group
+descriptor and `flex_bg` are accepted, but block numbers beyond `u32` are not.
+
+For `metadata_csum`, a small independently implemented reflected CRC32C routine
+validates the superblock at mount, group descriptors and inodes on access,
+directory leaf and HTree index blocks on traversal, and external extent nodes
+on traversal. The inode number is transient in-memory state and is not encoded
+in the on-disk inode. The implementation supports the UUID-derived seed and
+checksum type 1; alternate seeds and unsupported checksum or incompatible
+features remain gated. The read-only HTree path scans directory blocks linearly
+rather than implementing hash lookup. Directory and extent checks are performed
+on blocks actually visited, not as a whole-volume scrub. Data blocks themselves
+are not checksummed by ext4 metadata checksums.
+
+The deferred-free slot array lives on the heap. An inline 16 KiB array was
+copied through the runtime mount path, creating a 43 KiB stack frame and
+corrupting the amd64 guest's 32 KiB kernel stack. The QEMU guest caught this;
+the mount regression probe checks for the stack canary as well as its verdict.
+
+## Verification and remaining work
+
+Host tests generate images with `mke2fs`, populate them with `debugfs`, and
+exercise clean ext3 and default ext4 images, sparse and multi-level extent
+maps, HTree directories and metadata corruption. `scripts/probes/ext_ro_qemu.sh`
+builds the guest, boots it with disposable ext2 root and ext3/ext4 data images,
+checks `fsync`, read, write rejection and remount rejection, and runs `e2fsck
+-fn` on each data image after shutdown. The script uses QEMU software emulation
+and does not touch an existing VM image.
+
+Still required: journal parsing and recovery (including revokes, checksums,
+wraparound, orphan handling and interrupted recovery), transaction-aware cache
+and eviction, ordered barriers and write-error handling, ext3 write support,
+ext4 extent/metadata allocation and checksum updates, failure injection at
+every durable boundary, and interoperability and power-cut testing. New
+features must be accepted only when all relevant read or write paths support
+them; a Cargo flag is not a promise to accept every filesystem carrying that
+name.

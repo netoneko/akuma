@@ -48,6 +48,8 @@ use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_component
 use crate::BlockDevice;
 
 mod audit;
+#[cfg(feature = "ext4")]
+mod checksum;
 pub use audit::AuditReport;
 
 /// Device-write callback for cache flushes (eviction and `flush_dirty`).
@@ -742,6 +744,8 @@ pub(crate) struct Inode {
     pub(crate) size_upper: u32,
     pub(crate) fragment_addr: u32,
     pub(crate) os_specific_2: [u8; 12],
+    /// In-memory identity for checksums; never serialized.
+    pub(crate) number: u32,
 }
 
 impl Default for Inode {
@@ -768,6 +772,7 @@ impl Default for Inode {
             size_upper: 0,
             fragment_addr: 0,
             os_specific_2: [0; 12],
+            number: 0,
         }
     }
 }
@@ -806,7 +811,7 @@ const _: () = assert!(offset_of!(BlockGroupDescriptor, free_blocks_count) == 12)
 const _: () = assert!(offset_of!(BlockGroupDescriptor, free_inodes_count) == 14);
 const _: () = assert!(offset_of!(BlockGroupDescriptor, used_dirs_count) == 16);
 
-const _: () = assert!(size_of::<Inode>() == 128);
+const _: () = assert!(offset_of!(Inode, number) == 128);
 const _: () = assert!(offset_of!(Inode, type_perms) == 0);
 const _: () = assert!(offset_of!(Inode, uid) == 2);
 const _: () = assert!(offset_of!(Inode, size_lower) == 4);
@@ -995,7 +1000,7 @@ pub(crate) const INODE_POINTER_WORDS: usize = 15;
 pub(crate) const INODE_POINTERS_OFFSET: usize = offset_of!(Inode, direct_blocks);
 
 impl Inode {
-    pub(crate) const SIZE: usize = size_of::<Self>();
+    pub(crate) const SIZE: usize = 128;
 
     /// Where Linux keeps the high 16 bits of the owner and group: `osd2`'s
     /// `l_i_uid_high` and `l_i_gid_high`, inode bytes 120 and 122. Without them
@@ -1123,6 +1128,7 @@ impl Inode {
             size_upper: le_u32(buf, 108)?,
             fragment_addr: le_u32(buf, 112)?,
             os_specific_2: buf.get(116..Self::SIZE)?.try_into().ok()?,
+            number: 0,
         })
     }
 
@@ -1192,6 +1198,9 @@ pub(crate) struct Ext2State {
     inode_size: u16,
     block_group_count: u32,
     descriptor_size: usize,
+    /// CRC32C seed for ext4 metadata, if enabled on disk.
+    #[cfg(feature = "ext4")]
+    checksum_seed: Option<u32>,
     blocks_per_group: u32,
     first_data_block: u32,
 
@@ -1445,7 +1454,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3") && mode == MountMode::ReadOnly { 0x4 } else { 0 };
         let ext4_read = cfg!(feature = "ext4") && mode == MountMode::ReadOnly;
         let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else { 0 };
-        let ro_compat_supported = RO_COMPAT_SUPPORTED | if ext4_read { 0x8 | 0x20 | 0x40 } else { 0 };
+        let ro_compat_supported = RO_COMPAT_SUPPORTED | if ext4_read { 0x8 | 0x20 | 0x40 | 0x400 } else { 0 };
         if superblock.feature_compat & !compat_supported != 0
             || superblock.feature_incompat & !incompat_supported != 0
             || superblock.feature_ro_compat & !ro_compat_supported != 0
@@ -1462,6 +1471,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 return Err(FsError::NotSupported);
             }
         }
+        #[cfg(feature = "ext4")]
+        let checksum_seed = if superblock.feature_ro_compat & 0x400 != 0 {
+            if sb_buf[373] != 1 { return Err(FsError::NotSupported); }
+            if checksum::superblock(&sb_buf) != Some(true) { return Err(FsError::Corrupt); }
+            Some(checksum::seed(&superblock.uuid))
+        } else { None };
 
         // ── On-disk arithmetic validation (AKUMA_EXT2_CLEANUP.md §2.3) ──────
         //
@@ -1508,7 +1523,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         };
         // A whole `Inode` is read out of each `inode_size`-byte table entry —
         // anything smaller is the heap over-read §2.3 documents.
-        if (inode_size as usize) < size_of::<Inode>() {
+        if (inode_size as usize) < Inode::SIZE {
             return Err(FsError::Corrupt);
         }
         let first_data_block = superblock.first_data_block;
@@ -1521,6 +1536,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             inode_size,
             block_group_count,
             descriptor_size,
+            #[cfg(feature = "ext4")]
+            checksum_seed,
             blocks_per_group,
             first_data_block,
             bgd_cache: vec![None; block_group_count as usize],
@@ -1824,6 +1841,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let offset = Self::bgd_offset(state, group);
         let mut buf = [0u8; size_of::<BlockGroupDescriptor>()];
         self.read_range(state, offset, &mut buf)?;
+        #[cfg(feature = "ext4")]
+        if let Some(seed) = state.checksum_seed {
+            let mut full = vec![0u8; state.descriptor_size];
+            self.read_range(state, offset, &mut full)?;
+            if checksum::group(seed, group, &full) != Some(true) { return Err(FsError::Corrupt); }
+        }
         if state.descriptor_size == 64 {
             let mut high = [0u8; 12];
             self.read_range(state, offset + 32, &mut high)?;
@@ -2013,7 +2036,14 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let mut buf = vec![0u8; state.inode_size as usize];
         self.read_range(state, inode_offset, &mut buf)?;
 
-        Inode::parse(&buf).ok_or(FsError::Corrupt)
+        #[cfg(feature = "ext4")]
+        if let Some(seed) = state.checksum_seed {
+            if checksum::inode(seed, inode_num, &buf) != Some(true) { return Err(FsError::Corrupt); }
+        }
+
+        let mut inode = Inode::parse(&buf).ok_or(FsError::Corrupt)?;
+        inode.number = inode_num;
+        Ok(inode)
     }
 
     fn write_inode(&self, state: &Ext2State, inode_num: u32, inode: &Inode) -> Result<(), FsError> {
@@ -2030,7 +2060,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let inode_offset = inode_table as u64 * state.block_size as u64
             + index_in_group as u64 * state.inode_size as u64;
 
-        let mut buf = [0u8; size_of::<Inode>()];
+        let mut buf = [0u8; Inode::SIZE];
         inode.serialize(&mut buf);
         self.write_range(state, inode_offset, &buf)
     }
@@ -2583,6 +2613,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             let Some(child) = selected else { return Ok(None); };
             expected_depth = Some(depth - 1);
             node = self.read_block(state, child)?;
+            #[cfg(feature = "ext4")]
+            if let Some(seed) = state.checksum_seed {
+                let max = le_u16(&node, 4).ok_or(FsError::Corrupt)? as usize;
+                let tail = 12usize.checked_add(max.checked_mul(12).ok_or(FsError::Corrupt)?).ok_or(FsError::Corrupt)?;
+                let expected = le_u32(&node, tail).ok_or(FsError::Corrupt)?;
+                let crc = checksum::inode_seed(seed, inode.number, inode.generation);
+                if checksum::crc32c(crc, node.get(..tail).ok_or(FsError::Corrupt)?) != expected {
+                    return Err(FsError::Corrupt);
+                }
+            }
         }
     }
 
@@ -2713,6 +2753,39 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Inode Data Operations
     // ========================================================================
 
+    fn validate_directory_block(&self, state: &Ext2State, inode: &Inode, block: &[u8]) -> Result<(), FsError> {
+        #[cfg(feature = "ext4")]
+        if let Some(seed) = state.checksum_seed {
+            let tail = block.len().checked_sub(12).ok_or(FsError::Corrupt)?;
+            let crc = checksum::inode_seed(seed, inode.number, inode.generation);
+            if le_u32(block, tail) == Some(0) && le_u16(block, tail + 4) == Some(12)
+                && block.get(tail + 6..tail + 8) == Some(&[0, 0xde]) {
+                let expected = le_u32(block, tail + 8).ok_or(FsError::Corrupt)?;
+                if checksum::crc32c(crc, &block[..tail]) != expected { return Err(FsError::Corrupt); }
+            } else if inode.flags & 0x1000 != 0 {
+                // HTree index blocks hide in fake directory entries. The root
+                // has dot entries; internal nodes start with a fake entry.
+                let index = if block.get(8..10) == Some(&[b'.', 0]) && le_u16(block, 4) == Some(12) {
+                    32usize
+                } else if le_u32(block, 0) == Some(0) && le_u16(block, 4) == Some(block.len() as u16) {
+                    8usize
+                } else { return Err(FsError::Corrupt); };
+                let limit = le_u16(block, index).ok_or(FsError::Corrupt)? as usize;
+                let count = le_u16(block, index + 2).ok_or(FsError::Corrupt)? as usize;
+                if count == 0 || count > limit { return Err(FsError::Corrupt); }
+                let end = index.checked_add(count.checked_mul(8).ok_or(FsError::Corrupt)?).ok_or(FsError::Corrupt)?;
+                let tail = index.checked_add(limit.checked_mul(8).ok_or(FsError::Corrupt)?).ok_or(FsError::Corrupt)?;
+                if tail.checked_add(8) != Some(block.len()) { return Err(FsError::Corrupt); }
+                let expected = le_u32(block, tail + 4).ok_or(FsError::Corrupt)?;
+                let crc = checksum::crc32c(crc, block.get(..end).ok_or(FsError::Corrupt)?);
+                let crc = checksum::crc32c(crc, &block[tail..tail + 4]);
+                if checksum::crc32c(crc, &[0; 4]) != expected { return Err(FsError::Corrupt); }
+            } else { return Err(FsError::Corrupt); }
+        }
+        let _ = (state, inode, block);
+        Ok(())
+    }
+
     /// `pub(crate)` for `mod tests`, which reads a directory's raw entries back.
     pub(crate) fn read_inode_data(&self, state: &Ext2State, inode: &Inode) -> Result<Vec<u8>, FsError> {
         let size = inode.file_size() as usize;
@@ -2730,6 +2803,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             if let Some(phys_block) = self.get_block_num(state, inode, logical_block)? {
                 let remaining = size - data.len();
                 let to_copy = core::cmp::min(remaining, state.block_size);
+                if inode.type_perms & 0xf000 == S_IFDIR {
+                    self.with_block(state, phys_block, |b| self.validate_directory_block(state, inode, b))??;
+                }
                 self.with_block(state, phys_block, |b| data.extend_from_slice(&b[..to_copy]))?;
             } else {
                 let remaining = size - data.len();
@@ -3348,6 +3424,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
                 // `parse_directory` breaking on it.
                 return Ok(None);
             };
+            self.with_block(state, phys, |b| self.validate_directory_block(state, dir_inode, b))??;
             let found = self.with_block(state, phys, |b| {
                 let mut offset = 0usize;
                 while offset + DIR_ENTRY_HEADER_SIZE <= b.len() {
@@ -3941,16 +4018,16 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
                 // unknown, so reading 0 as "not a directory" made getdents64 report
                 // `.git/refs/heads` as a regular file and git saw no refs at all.
                 let ft = if typed { file_type } else { 0 };
-                let node = if ft == FT_DIR { None } else { self.read_inode(&state, inode_num).ok() };
+                let node = if ft == FT_DIR { None } else { Some(self.read_inode(&state, inode_num)?) };
                 let kind = node.as_ref().map(|i| i.type_perms & 0xF000);
                 let (is_dir, is_symlink) = match ft {
                     0 => (kind == Some(S_IFDIR), kind == Some(S_IFLNK)),
                     ft => (ft == FT_DIR, ft == FT_SYMLINK),
                 };
                 let size = if is_dir { 0 } else { node.map_or(0, |i| i.file_size()) };
-                DirEntry { name, is_dir, is_symlink, size }
+                Ok(DirEntry { name, is_dir, is_symlink, size })
             })
-            .collect();
+            .collect::<Result<Vec<_>, FsError>>()?;
 
         Ok(entries)
     }
