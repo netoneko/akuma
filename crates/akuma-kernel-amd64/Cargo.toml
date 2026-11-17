@@ -11,8 +11,8 @@ links = "akuma_kernel_amd64"
 workspace = true
 
 [features]
-ext3 = ["akuma-ext2/ext3"]
-ext4 = ["ext3", "akuma-ext2/ext4"]
+ext3 = ["akuma-ext2/ext3", "akuma-vfs-glue/ext3"]
+ext4 = ["ext3", "akuma-ext2/ext4", "akuma-vfs-glue/ext4"]
 default = ["linux-extra-syscalls"]
 # The seven families together: what a Linux program expects beyond the core set.
 # In `default`. Six families stay individually settable; SysV message queues are

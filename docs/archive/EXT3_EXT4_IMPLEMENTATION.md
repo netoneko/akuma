@@ -18,12 +18,24 @@ remounting a read-only instance writable fails. Runtime mount names `ext2`,
 `ext3` and `ext4` share the same on-disk capability checks.
 
 Clean internal-journal ext3/ext4 filesystems can be read without replay. The
-filesystem state must be clean, no recovery or orphan processing may be pending,
-and the journal must be internal. Unknown feature bits and unsupported
+filesystem state must be clean, no orphan processing may be pending, and the
+journal must be internal. Unknown feature bits and unsupported
 combinations are rejected before writes. In particular, there is no journal
-replay or journaled write implementation; requesting writable access to a
-journaled image fails. Unclean read-only images fail rather than exposing stale
-home blocks.
+on-device replay or journaled write implementation; requesting writable access
+to a journaled image fails. A narrow unclean ext3 profile can instead be
+recovered in memory on a read-only mount, as described below.
+
+The `journal::plan_replay` parser reads a bounded, classic
+32-bit unchecksummed journal into a read-only plan, handling completed
+transactions, revocations, escaped blocks and ring/sequence wrap. It is not
+applied to a read-only in-memory device overlay through `recover_read_only`;
+the normal read-only guest mount path tries that recovery after an unsupported
+clean mount. The backing device is never written. This path only supports
+classic ext3 with no pending orphan recovery; it rejects ext4 layout features,
+checksummed/64-bit journals and journals larger than 64 MiB. It rejects home
+blocks overlapping the journal and checks the resulting superblock before
+publishing the mount. A host test constructs a committed transaction on a real
+ext3 image and compares the recovered contents with `e2fsck` journal replay.
 
 Virtio-blk negotiates the flush feature and submits a two-descriptor FLUSH
 request after preceding writes complete. Filesystem sync propagates failure;
@@ -65,8 +77,8 @@ checks `fsync`, read, write rejection and remount rejection, and runs `e2fsck
 -fn` on each data image after shutdown. The script uses QEMU software emulation
 and does not touch an existing VM image.
 
-Still required: journal parsing and recovery (including revokes, checksums,
-wraparound, orphan handling and interrupted recovery), transaction-aware cache
+Still required: on-device journal recovery (including checksums and orphan
+handling), transaction-aware cache
 and eviction, ordered barriers and write-error handling, ext3 write support,
 ext4 extent/metadata allocation and checksum updates, failure injection at
 every durable boundary, and interoperability and power-cut testing. New

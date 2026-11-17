@@ -17,7 +17,9 @@ pub extern "C" fn main() {
     let result = syscall(FSYNC, root_fd as u64, 0, 0, 0, 0, 0) as i64;
     close(root_fd);
     if result != 0 { println("ext-ro-probe: ROOT FSYNC FAILED"); exit(7); }
-    let kind = if libakuma::arg(1).as_deref() == Some("ext3") { b"ext3\0" } else { b"ext4\0" };
+    let arg = libakuma::arg(1);
+    let recover = arg.as_deref() == Some("ext3recover");
+    let kind = if matches!(arg.as_deref(), Some("ext3" | "ext3recover")) { b"ext3\0" } else { b"ext4\0" };
     let result = syscall(libakuma::syscall::MOUNT,
         b"/dev/vdb\0".as_ptr() as u64, b"/mnt\0".as_ptr() as u64,
         kind.as_ptr() as u64, MS_RDONLY, 0, 0) as i64;
@@ -27,7 +29,8 @@ pub extern "C" fn main() {
     let mut buf = [0u8; 64];
     let n = read(fd, &mut buf);
     close(fd);
-    if n < 0 || &buf[..n as usize] != b"QEMU_EXT4_READ_OK\n" {
+    let expected = if recover { b"QEMU_EXT3_REPLAY!\n" } else { b"QEMU_EXT4_READ_OK\n" };
+    if n < 0 || &buf[..n as usize] != expected {
         println("ext-ro-probe: CONTENT FAILED"); exit(3);
     }
     let fd = open("/mnt/payload", libakuma::open_flags::O_WRONLY);

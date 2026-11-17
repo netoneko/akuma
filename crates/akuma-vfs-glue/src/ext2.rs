@@ -41,16 +41,25 @@ pub fn mount_device(
     cache_cap: Option<usize>,
     mode: MountMode,
 ) -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
-    let fs = Arc::new(Ext2Filesystem::new_with_options(
+    let result = Ext2Filesystem::new_with_options(
         KernelBlockDevice { idx },
         || crate::utc_time_us().unwrap_or(0),
         cache_cap,
         mode,
-    )?);
+    );
     // No `register_for_reap` here since the registry moved to `lib.rs`:
     // `mount_with` enrols every filesystem that asks for it, so this path and
     // the amd64 kernel's — which builds its own `Ext2Filesystem` over a
     // different device type and never calls this function — cannot diverge on
     // whether orphaned-lock recovery is wired.
-    Ok(fs)
+    match result {
+        Ok(fs) => Ok(Arc::new(fs)),
+        #[cfg(feature = "ext3")]
+        Err(akuma_vfs::FsError::NotSupported) if mode == MountMode::ReadOnly => {
+            Ok(Arc::new(Ext2Filesystem::recover_read_only(
+                KernelBlockDevice { idx }, || crate::utc_time_us().unwrap_or(0), cache_cap,
+            )?))
+        }
+        Err(error) => Err(error),
+    }
 }

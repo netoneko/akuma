@@ -33,6 +33,8 @@
 )]
 
 use alloc::collections::BTreeMap;
+#[cfg(feature = "ext3")]
+use alloc::collections::BTreeSet;
 use alloc::boxed::Box;
 use core::cell::Cell;
 use alloc::string::{String, ToString};
@@ -49,7 +51,7 @@ use crate::BlockDevice;
 
 mod audit;
 #[cfg(feature = "ext3")]
-mod journal;
+pub mod journal;
 #[cfg(feature = "ext4")]
 mod checksum;
 pub use audit::AuditReport;
@@ -1342,7 +1344,7 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     /// concurrently; a holder killed mid-hold is recovered by
     /// [`Self::abandon_tid`] rather than by this crate inferring liveness.
     /// `pub(crate)` for `mod tests`; not reachable outside the crate.
-    pub(crate) state: RecoverableCell<Ext2State>,
+    pub(crate) state: Box<RecoverableCell<Ext2State>>,
     block_cache: Spinlock<BlockCache>,
     /// Inodes unlinked while a mapping still pinned them — see [`DeferredFrees`].
     deferred: DeferredFrees,
@@ -1364,6 +1366,38 @@ pub struct Ext2Filesystem<B: BlockDevice> {
 pub enum MountMode {
     ReadOnly,
     ReadWrite,
+}
+
+/// A read-only device view with journal replay applied in memory.
+#[cfg(feature = "ext3")]
+pub struct RecoveryDevice<B> {
+    dev: B,
+    block_size: usize,
+    blocks: BTreeMap<u32, Vec<u8>>,
+}
+
+#[cfg(feature = "ext3")]
+impl<B: BlockDevice> BlockDevice for RecoveryDevice<B> {
+    fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+        self.dev.read_bytes(offset, buf)?;
+        let end = offset.checked_add(buf.len() as u64).ok_or(())?;
+        let bs = self.block_size as u64;
+        if buf.is_empty() { return Ok(()); }
+        let first = u32::try_from(offset / bs).map_err(|_| ())?;
+        let last = u32::try_from((end - 1) / bs).map_err(|_| ())?;
+        for (&block, data) in self.blocks.range(first..=last) {
+            let start = u64::from(block) * bs;
+            let stop = start + bs;
+            let lo = offset.max(start);
+            let hi = end.min(stop);
+            if lo < hi {
+                buf[(lo - offset) as usize..(hi - offset) as usize]
+                    .copy_from_slice(&data[(lo - start) as usize..(hi - start) as usize]);
+            }
+        }
+        Ok(())
+    }
+    fn write_bytes(&self, _: u64, _: &[u8]) -> Result<(), ()> { Err(()) }
 }
 
 /// Deterministic work counters for one filesystem instance — see
@@ -1426,6 +1460,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         cache_cap_bytes: Option<usize>,
         mode: MountMode,
     ) -> Result<Self, FsError> {
+        Self::new_internal(dev, utc_time_us, cache_cap_bytes, mode, false)
+    }
+
+    fn new_internal(
+        dev: B,
+        utc_time_us: fn() -> u64,
+        cache_cap_bytes: Option<usize>,
+        mode: MountMode,
+        inspect_dirty_journal: bool,
+    ) -> Result<Self, FsError> {
         let mut sb_buf = [0u8; 1024];
         dev.read_bytes(SUPERBLOCK_OFFSET, &mut sb_buf).map_err(|_| FsError::IoError)?;
 
@@ -1455,7 +1499,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let journal = superblock.feature_compat & 0x4 != 0;
         let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3") && mode == MountMode::ReadOnly { 0x4 } else { 0 };
         let ext4_read = cfg!(feature = "ext4") && mode == MountMode::ReadOnly;
-        let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else { 0 };
+        let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else { 0 }
+            | if inspect_dirty_journal { 0x4 } else { 0 };
         let ro_compat_supported = RO_COMPAT_SUPPORTED | if ext4_read { 0x8 | 0x20 | 0x40 | 0x400 } else { 0 };
         if superblock.feature_compat & !compat_supported != 0
             || superblock.feature_incompat & !incompat_supported != 0
@@ -1554,7 +1599,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             dev,
             mode,
             time_fn: utc_time_us,
-            state: RecoverableCell::new(state),
+            state: Box::new(RecoverableCell::new(state)),
             block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
             deferred: DeferredFrees::new(),
             id: NEXT_FS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
@@ -1562,7 +1607,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             counters: WorkCounters::default(),
         };
         #[cfg(feature = "ext3")]
-        if journal { fs.validate_clean_journal(le_u32(&sb_buf, 224).ok_or(FsError::Corrupt)?)?; }
+        if journal && !inspect_dirty_journal { fs.validate_clean_journal(le_u32(&sb_buf, 224).ok_or(FsError::Corrupt)?)?; }
         Ok(fs)
     }
 
@@ -1574,6 +1619,82 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let block = self.get_block_num(&state, &inode, 0)?.ok_or(FsError::Corrupt)?;
         let data = self.read_block(&state, block)?;
         journal::validate_clean(&data, state.block_size, inode.file_size() / state.block_size as u64, &state.superblock.uuid)
+    }
+
+    /// Recover a classic ext3 journal into a read-only in-memory overlay.
+    /// The original device is never written. Only the bounded journal format
+    /// accepted by [`journal::plan_replay`] is supported; orphan recovery,
+    /// checksummed journals and ext4 features remain unsupported here.
+    #[cfg(feature = "ext3")]
+    pub fn recover_read_only(
+        dev: B,
+        utc_time_us: fn() -> u64,
+        cache_cap_bytes: Option<usize>,
+    ) -> Result<Ext2Filesystem<RecoveryDevice<B>>, FsError> {
+        let mut sb = [0u8; 1024];
+        dev.read_bytes(SUPERBLOCK_OFFSET, &mut sb).map_err(|_| FsError::IoError)?;
+        let compat = le_u32(&sb, 92).ok_or(FsError::Corrupt)?;
+        let incompat = le_u32(&sb, 96).ok_or(FsError::Corrupt)?;
+        let ro = le_u32(&sb, 100).ok_or(FsError::Corrupt)?;
+        // Limit recovery to classic ext3, with no orphan processing or
+        // checksum-dependent ext4 metadata, until those paths are supported.
+        if compat & 4 == 0 || incompat & 4 == 0 || incompat & !(4 | INCOMPAT_FILETYPE) != 0
+            || ro & !(1 | 2) != 0 || le_u32(&sb, 232) != Some(0) {
+            return Err(FsError::NotSupported);
+        }
+        let journal_inode = le_u32(&sb, 224).ok_or(FsError::Corrupt)?;
+        let fs = Self::new_internal(dev, utc_time_us, cache_cap_bytes, MountMode::ReadOnly, true)?;
+        let (mut blocks, journal_super, block_size) = {
+            let state = fs.read_state();
+            let inode = fs.read_inode(&state, journal_inode)?;
+            if inode.type_perms & 0xf000 != S_IFREG { return Err(FsError::Corrupt); }
+            let first = fs.get_block_num(&state, &inode, 0)?.ok_or(FsError::Corrupt)?;
+            let superblock = fs.read_block(&state, first)?;
+            if superblock.get(28..32) == Some(&[0, 0, 0, 0]) {
+                return Err(FsError::NotSupported);
+            }
+            let max = u32::from_be_bytes(superblock.get(16..20).ok_or(FsError::Corrupt)?.try_into().map_err(|_| FsError::Corrupt)?);
+            if u64::from(max) * state.block_size as u64 > 64 * 1024 * 1024
+                || u64::from(max) > inode.file_size() / state.block_size as u64 {
+                return Err(FsError::NotSupported);
+            }
+            let mut mapping = Vec::with_capacity(max as usize);
+            let mut journal_phys = BTreeSet::new();
+            for logical in 0..max {
+                let physical = fs.get_block_num(&state, &inode, logical)?.ok_or(FsError::Corrupt)?;
+                if physical >= state.superblock.total_blocks || !journal_phys.insert(physical) { return Err(FsError::Corrupt); }
+                mapping.push(physical);
+            }
+            let plan = journal::plan_replay(&superblock, state.block_size, inode.file_size() / state.block_size as u64,
+                state.superblock.total_blocks, &state.superblock.uuid, |index| {
+                    fs.read_block(&state, *mapping.get(index as usize).ok_or(FsError::Corrupt)?)
+                })?;
+            if plan.iter().any(|entry| journal_phys.contains(&entry.home)) { return Err(FsError::Corrupt); }
+            (plan.into_iter().map(|entry| (entry.home, entry.data)).collect::<BTreeMap<_, _>>(), first, state.block_size)
+        };
+        let dev = fs.dev;
+        let sb_block = (SUPERBLOCK_OFFSET / block_size as u64) as u32;
+        let sb_offset = (SUPERBLOCK_OFFSET % block_size as u64) as usize;
+        let mut super_block = match blocks.remove(&sb_block) {
+            Some(data) => data,
+            None => {
+                let mut data = vec![0; block_size];
+                dev.read_bytes(u64::from(sb_block) * block_size as u64, &mut data).map_err(|_| FsError::IoError)?;
+                data
+            }
+        };
+        let recovered_sb = super_block.get_mut(sb_offset..sb_offset + 1024).ok_or(FsError::Corrupt)?;
+        if le_u32(recovered_sb, 232) != Some(0) || le_u16(recovered_sb, 58) != Some(1) {
+            return Err(FsError::NotSupported);
+        }
+        let recovered_flags = le_u32(recovered_sb, 96).ok_or(FsError::Corrupt)?;
+        put_u32(recovered_sb, 96, recovered_flags & !4);
+        blocks.insert(sb_block, super_block);
+        let mut journal_header = vec![0; block_size];
+        dev.read_bytes(u64::from(journal_super) * block_size as u64, &mut journal_header).map_err(|_| FsError::IoError)?;
+        journal_header[28..32].fill(0);
+        blocks.insert(journal_super, journal_header);
+        Ext2Filesystem::new_with_options(RecoveryDevice { dev, block_size, blocks }, utc_time_us, cache_cap_bytes, MountMode::ReadOnly)
     }
 
     fn current_time(&self) -> u32 {

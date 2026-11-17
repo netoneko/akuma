@@ -12,15 +12,20 @@ sh amd64/mkdisk.sh "$work/root.img" 128
 debugfs -w -R 'mkdir /mnt' "$work/root.img" >/dev/null 2>&1
 debugfs -w -R "write userspace/target/x86_64-unknown-none/release/ext-ro-probe /bin/ext-ro-probe" "$work/root.img" >/dev/null 2>&1
 printf 'QEMU_EXT4_READ_OK\n' > "$work/payload"
-for kind in ext3 ext4; do
+for kind in ext3 ext4 ext3recover; do
     image="$work/$kind.img"
     truncate -s 32M "$image"
-    if [ "$kind" = ext4 ]; then
+    if [ "$kind" = ext3recover ]; then
+        python3 scripts/probes/create_dirty_ext3.py "$image"
+    elif [ "$kind" = ext4 ]; then
         mke2fs -q -F -t ext4 -b 1024 "$image"
     else
         mke2fs -q -F -t ext3 -b 1024 "$image"
     fi
-    debugfs -w -R "write $work/payload /payload" "$image" >/dev/null 2>&1
+    if [ "$kind" != ext3recover ]; then
+        debugfs -w -R "write $work/payload /payload" "$image" >/dev/null 2>&1
+    fi
+    before=$(sha256sum "$image" | cut -d' ' -f1)
     # The guest parks after init exits, so timeout is expected. Inspect the
     # serial log and require both the probe verdict and a clean boot suite.
     status=0
@@ -40,6 +45,15 @@ for kind in ext3 ext4; do
         cat "$work/$kind.log"
         exit 1
     fi
-    e2fsck -fn "$image"
+    after=$(sha256sum "$image" | cut -d' ' -f1)
+    test "$before" = "$after" || { echo "$kind image changed during read-only mount" >&2; exit 1; }
+    if [ "$kind" = ext3recover ]; then
+        cp "$image" "$work/oracle.img"
+        e2fsck -fy -E journal_only "$work/oracle.img" || [ "$?" -eq 1 ]
+        test "$(debugfs -R 'cat /payload' "$work/oracle.img" 2>/dev/null)" = 'QEMU_EXT3_REPLAY!'
+        e2fsck -fn "$work/oracle.img"
+    else
+        e2fsck -fn "$image"
+    fi
     echo "$kind QEMU read-only probe passed"
 done
