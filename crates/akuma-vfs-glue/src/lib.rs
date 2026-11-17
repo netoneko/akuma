@@ -1410,6 +1410,16 @@ pub fn set_wifi_present(present: bool) {
     WIFI_PRESENT.store(present, core::sync::atomic::Ordering::Relaxed);
 }
 
+static KVM_CTL_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+static KVM_API_PRESENT: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Announce the hypervisor's nodes: `ctl` is `/dev/kvm0`, `api` is `/dev/kvm`. They then
+/// appear in `stat`/`ls /dev` for the host; opening is the kernel's own `openat` arm.
+pub fn set_kvm_present(ctl: bool, api: bool) {
+    KVM_CTL_PRESENT.store(ctl, core::sync::atomic::Ordering::Relaxed);
+    KVM_API_PRESENT.store(api, core::sync::atomic::Ordering::Relaxed);
+}
+
 /// Live kernel state plus caller identity, assembled for `akuma_vfs::dev`.
 fn dev_probe() -> DevProbe {
     let mut block_slots = 0u8;
@@ -1422,6 +1432,8 @@ fn dev_probe() -> DevProbe {
         audio: crate::audio_is_available(),
         framebuffer: FRAMEBUFFER_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
         wifi: WIFI_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
+        kvm_ctl: KVM_CTL_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
+        kvm_api: KVM_API_PRESENT.load(core::sync::atomic::Ordering::Relaxed),
         block_slots,
         // Boxes get no synthetic /dev — see `DevProbe::in_box` for why, and
         // for the two carve-outs (`null`/`zero` stat, and `/dev/net/tap0`,
