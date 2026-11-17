@@ -1408,6 +1408,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(FsError::NoFilesystem);
         }
 
+        // Do not interpret newer ext-family layouts as legacy ext2. In
+        // particular, HAS_JOURNAL is a compatible bit, but writing a
+        // journaled filesystem without maintaining its journal is unsafe.
+        // These masks describe the legacy layouts already used by our ext2
+        // images, not a general ext3/ext4 compatibility claim.
+        const COMPAT_SUPPORTED: u32 = 0x0008 | 0x0010 | 0x0020; // xattr, resize inode, dir index
+        const INCOMPAT_SUPPORTED: u32 = 0x0002; // directory entry file type
+        const RO_COMPAT_SUPPORTED: u32 = 0x0001 | 0x0002; // sparse super, large file
+        if superblock.feature_compat & !COMPAT_SUPPORTED != 0
+            || superblock.feature_incompat & !INCOMPAT_SUPPORTED != 0
+            || superblock.feature_ro_compat & !RO_COMPAT_SUPPORTED != 0
+        {
+            return Err(FsError::NotSupported);
+        }
+
         // ── On-disk arithmetic validation (AKUMA_EXT2_CLEANUP.md §2.3) ──────
         //
         // Everything below feeds a division, a shift, or a heap allocation
@@ -1447,8 +1462,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(FsError::Corrupt);
         }
         let first_data_block = superblock.first_data_block;
-        let block_group_count =
-            (total_blocks - first_data_block + blocks_per_group - 1) / blocks_per_group;
+        let block_group_count = (total_blocks - first_data_block).div_ceil(blocks_per_group);
 
         let state = Ext2State {
             superblock,

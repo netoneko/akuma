@@ -62,6 +62,43 @@ fn mount_empty() -> Ext2Filesystem<MemBlockDevice> {
     Ext2Filesystem::new(load_fixture("test.ext2"), || 0).unwrap()
 }
 
+#[test]
+fn unsupported_ext_features_are_rejected_without_writes() {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    struct RecordingDevice {
+        inner: MemBlockDevice,
+        writes: Arc<AtomicUsize>,
+    }
+    impl BlockDevice for RecordingDevice {
+        fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+            self.inner.read_bytes(offset, buf)
+        }
+        fn write_bytes(&self, offset: u64, buf: &[u8]) -> Result<(), ()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_bytes(offset, buf)
+        }
+    }
+
+    let fixture = include_bytes!("../tests/fixtures/test.ext2");
+    // has_journal (compat), recovery-needed and extents (incompat),
+    // metadata checksums (ro-compat), and unknown bits in each word.
+    for (offset, bit) in [(92, 0x4u32), (96, 0x4), (96, 0x40),
+                          (100, 0x400), (92, 0x8000_0000),
+                          (96, 0x8000_0000), (100, 0x8000_0000)] {
+        let mut bytes = fixture.to_vec();
+        let pos = 1024 + offset;
+        let previous = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        bytes[pos..pos + 4].copy_from_slice(&(previous | bit).to_le_bytes());
+        let writes = Arc::new(AtomicUsize::new(0));
+        let device = RecordingDevice { inner: MemBlockDevice::from_bytes(&bytes), writes: writes.clone() };
+        assert!(matches!(Ext2Filesystem::new(device, || 0), Err(FsError::NotSupported)),
+            "feature at {offset} bit {bit:#x}");
+        assert_eq!(writes.load(Ordering::Relaxed), 0);
+    }
+}
+
 fn mount_populated() -> Ext2Filesystem<MemBlockDevice> {
     Ext2Filesystem::new(load_fixture("populated.ext2"), || 0).unwrap()
 }
