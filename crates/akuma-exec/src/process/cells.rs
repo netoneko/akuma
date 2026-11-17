@@ -125,6 +125,13 @@ impl OptTidCell {
         let raw = self.0.load(Ordering::Acquire);
         (raw != NONE).then(|| akuma_threading::ThreadRef::from_raw(raw))
     }
+    /// [`thread_ref`](Self::thread_ref), but only if the incarnation is still current (what [`get_live`](Self::get_live) checks),
+    /// for a caller that wants to *hold* the reference across a later effect and run it through `ThreadRef::with_live`.
+    #[inline]
+    #[must_use]
+    pub fn live_ref(&self) -> Option<akuma_threading::ThreadRef> {
+        self.thread_ref().filter(|r| r.is_current())
+    }
     /// Run `f(slot)` only while the recorded incarnation is still the slot's, with the slot guaranteed not to be reborn
     /// until `f` returns (`ThreadRef::with_live`: short, non-blocking effects only). `None` if the cell is empty or its
     /// thread is gone.

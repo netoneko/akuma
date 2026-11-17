@@ -463,17 +463,19 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
     //
     // Each entry is `(tid, the pid that recorded it)`, because the **staleness
     // check below needs both** — see `slot_still_owned_by`.
-    let mut all_tids = [(0usize, 0 as Pid); table::MAX_PROCESSES];
+    // The third field is the recorded `ThreadRef`: the two effects below (interrupt, pend) happen after the ownership check,
+    // so they go through `with_live` and cannot land on a slot recycled in between.
+    let mut all_tids = [(0usize, 0 as Pid, threading::ThreadRef::from_raw(0)); table::MAX_PROCESSES];
     let mut tid_count = 0;
-    if let Some(tid) = proc.thread_id.get_live() {
-        all_tids[tid_count] = (tid, pid);
+    if let Some(r) = proc.thread_id.live_ref() {
+        all_tids[tid_count] = (r.tid(), pid, r);
         tid_count += 1;
     }
     table::for_each_process(|p| {
         if p.pid != pid && p.tgid == tgid
-            && let Some(tid) = p.thread_id.get_live()
+            && let Some(r) = p.thread_id.live_ref()
             && tid_count < all_tids.len() {
-                all_tids[tid_count] = (tid, p.pid);
+                all_tids[tid_count] = (r.tid(), p.pid, r);
                 tid_count += 1;
             }
     });
@@ -503,9 +505,9 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
     // `slot_still_owned_by` prints when it fires, so the next one says so.
     let mut kept = 0;
     for i in 0..tid_count {
-        let (tid, owner) = all_tids[i];
+        let (tid, owner, r) = all_tids[i];
         if slot_still_owned_by(tid, owner) {
-            all_tids[kept] = (tid, owner);
+            all_tids[kept] = (tid, owner, r);
             kept += 1;
         }
     }
@@ -524,16 +526,16 @@ pub fn pend_signal_to_group(pid: Pid, sig: u32) -> bool {
         idx >= MAX_SIGNALS || signal_can_act(proc.signal_actions.actions.lock()[idx].handler, sig)
     };
     if interrupts {
-        for &(tid, _) in all_tids {
-            crate::process::interrupt_thread(tid);
+        for &(_, _, r) in all_tids {
+            let _ = r.with_live(crate::process::interrupt_thread);
         }
     }
 
     // NOW pend signals and wake. pend_signal_for_thread calls wake() internally.
     // The interrupted flag is already set, so when the thread wakes and checks
     // is_current_interrupted(), it sees true.
-    for &(tid, _) in all_tids {
-        threading::pend_signal_for_thread(tid, sig);
+    for &(_, _, r) in all_tids {
+        let _ = r.with_live(|tid| threading::pend_signal_for_thread(tid, sig));
     }
 
     // `true` regardless of `kept`: the process **exists** — that is what this

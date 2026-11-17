@@ -113,6 +113,18 @@ and generation are read atomically.
   core for the duration. Used for `interrupt_thread` in `kill_process`/`kill_process_with_signal` and for the deferred
   `request_thread_kill` in `kill_thread_group` (which carries each sibling's recorded `ThreadRef` through its 2-second grace
   wait). `OptTidCell::{thread_ref, with_live}` are the cell-level forms.
+- **The cross-thread effects that target a recorded thread now go through `with_live`** (T3): `interrupt_thread` and the
+  deferred `request_thread_kill` (`kill_process*`, `kill_thread_group`); the group signal delivery's interrupt and
+  `pend_signal_for_thread` (`kill_process_with_signal`'s multi-thread path, which carries each thread's recorded `ThreadRef`
+  next to its tid); and the SIGCHLD raise on a parent (`raise_sigchld_for_parent`: `set_last_sigchld` and the pend in one
+  section, so the siginfo side-channel and the signal land on the same incarnation; `sigchld_target_thread` returns the
+  `ThreadRef`). `OptTidCell::live_ref()` is the cell accessor for "hold this reference across a later effect".
+- **Deliberately still bare-tid:** `tkill`/`tgkill` (the tid is a user-supplied number; the most that can be checked is the
+  `THREAD_PID_MAP` ownership of the moment, and minting a `ThreadRef` after that check does not close its window), the itimer
+  expiry (a per-slot table walk that owns its slot), the fault-handler pends in `akuma-exceptions` (the target is the *current*
+  thread), the lifecycle functions a claimant owns (`seed_entry`, `publish_slot`, `abandon_slot`, `mark_thread_ready`), and the
+  read-only diagnostics. Of the ~60 `tid: usize` functions in `akuma-threading`, the effects on *another* thread were the
+  ones whose stale target was a bug class; the rest are reads of per-slot state or operate on the caller's own thread.
 - Also fixed: the x86 claim path bumped the generation a second time after `scrub_thread_slot` had; one bump per rebirth now.
 - **Tests:** `with_live_holds_off_a_rebirth_until_the_section_ends` runs a section on a second thread while the slot is
   released and re-claimed, and asserts the section's per-slot write survives and the rebirth returns only after the section

@@ -87,22 +87,24 @@ pub fn parent_pid_of(child_pid: Pid) -> Option<Pid> {
 ///      *some* thread and leave the bit pending; we pin it to the leader so a
 ///      blocked SIGCHLD stays pending on a real thread of the group until the
 ///      mask is cleared).
-fn sigchld_target_thread(tgid: Pid) -> Option<usize> {
+fn sigchld_target_thread(tgid: Pid) -> Option<crate::threading::ThreadRef> {
     const SIGCHLD_BIT: u64 = 1u64 << (17 - 1);
-    let mut best_with_altstack: Option<usize> = None;
-    let mut best_unblocked: Option<usize> = None;
-    let mut leader_tid: Option<usize> = None;
+    let mut best_with_altstack: Option<crate::threading::ThreadRef> = None;
+    let mut best_unblocked: Option<crate::threading::ThreadRef> = None;
+    let mut leader_tid: Option<crate::threading::ThreadRef> = None;
 
     crate::process::table::for_each_process(|p| {
         if p.tgid != tgid { return; }
-        let Some(tid) = p.thread_id.get_live() else { return; };
-        if p.pid == tgid { leader_tid = Some(tid); }
+        // The recorded incarnation, not just its slot: the caller acts on it later (`with_live`).
+        let Some(r) = p.thread_id.live_ref() else { return; };
+        let tid = r.tid();
+        if p.pid == tgid { leader_tid = Some(r); }
         let blocks_sigchld = crate::threading::thread_signal_mask_of(tid) & SIGCHLD_BIT != 0;
         if !blocks_sigchld {
-            if best_unblocked.is_none() { best_unblocked = Some(tid); }
+            if best_unblocked.is_none() { best_unblocked = Some(r); }
             let (sp, _size, flags) = crate::threading::get_sigaltstack(tid);
             if sp != 0 && flags != 2 /* SS_DISABLE */ && best_with_altstack.is_none() {
-                best_with_altstack = Some(tid);
+                best_with_altstack = Some(r);
             }
         }
     });
@@ -134,9 +136,12 @@ pub fn raise_sigchld_for_parent(child_pid: Pid, exit_code: i32) {
     let Some(tgid) = find_process(|p| if p.pid == ppid { Some(p.tgid) } else { None }) else { return };
     // Kernel-thread parents (e.g. the in-kernel sshd bridge) have no live child
     // entry and no userspace to signal — silently skip.
-    if let Some(tid) = sigchld_target_thread(tgid) {
-        crate::threading::set_last_sigchld(tid, child_pid, exit_code);
-        crate::threading::pend_signal_for_thread(tid, SIGCHLD);
+    if let Some(target) = sigchld_target_thread(tgid) {
+        // One section for both effects: the siginfo side-channel and the pend must land on the same incarnation.
+        let _ = target.with_live(|tid| {
+            crate::threading::set_last_sigchld(tid, child_pid, exit_code);
+            crate::threading::pend_signal_for_thread(tid, SIGCHLD);
+        });
     }
 }
 
