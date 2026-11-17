@@ -1,0 +1,18 @@
+[package]
+name = "akuma-vfat"
+version = "0.1.0"
+edition = "2024"
+description = "FAT12/16/32 (VFAT long names) filesystem for no_std kernels, written from the Microsoft FAT specification"
+
+[lints]
+workspace = true
+
+[features]
+# Same meaning as `akuma-ext2`'s: under the shared-kernel SMP build the
+# filesystem lock is held with preemption off and IRQs masked.
+bkl-smp = ["akuma-primitives/bkl-smp"]
+
+[dependencies]
+akuma-vfs = { path = "../akuma-vfs" }
+akuma-primitives = { path = "../akuma-primitives" }
+spinning_top = "0.3"

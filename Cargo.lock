@@ -1496,6 +1496,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-vfat"
+version = "0.1.0"
+dependencies = [
+ "akuma-primitives",
+ "akuma-vfs",
+ "spinning_top",
+]
+
+[[package]]
 name = "akuma-vfs"
 version = "0.1.0"
 dependencies = [

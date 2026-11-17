@@ -478,6 +478,7 @@ anything reached only from `akuma_exec::init`). When the archive says *fixed*, a
 | Rump stack (sysproxy, fiber) | [`reference/subsystems/rump-stack.md`](reference/subsystems/rump-stack.md) | **C** |
 | SSH (built-in + userspace) | [`reference/subsystems/ssh.md`](reference/subsystems/ssh.md) | A |
 | VFS (ext2, procfs, pipes) | [`reference/subsystems/vfs.md`](reference/subsystems/vfs.md) | A |
+| VFAT (FAT12/16/32, for the ESP; not yet mounted by a kernel) | [`reference/subsystems/vfat.md`](reference/subsystems/vfat.md) | C |
 | fd table (dup / close / cloexec / fork state machine) | [`reference/subsystems/fdtable.md`](reference/subsystems/fdtable.md) | B |
 | Syscalls / Linux ABI | [`reference/subsystems/syscalls.md`](reference/subsystems/syscalls.md) | A |
 | Containers / boxes / herd | [`reference/subsystems/containers.md`](reference/subsystems/containers.md) | B |

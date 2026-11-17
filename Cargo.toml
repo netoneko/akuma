@@ -29,6 +29,7 @@ default-members = [
     "crates/akuma-elf",
     "crates/akuma-elf-exec",
     "crates/akuma-ext2",
+    "crates/akuma-vfat",
     "crates/akuma-isolation",
     "crates/akuma-kacho",
     "crates/akuma-entry",
