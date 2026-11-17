@@ -49,6 +49,8 @@ use akuma_primitives::Registered;
 use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_components, split_path};
 use crate::BlockDevice;
 
+#[cfg(all(test, feature = "ext3"))]
+mod journal_integration;
 mod audit;
 #[cfg(feature = "ext3")]
 pub mod journal;
@@ -1460,7 +1462,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         cache_cap_bytes: Option<usize>,
         mode: MountMode,
     ) -> Result<Self, FsError> {
-        Self::new_internal(dev, utc_time_us, cache_cap_bytes, mode, false)
+        Self::new_internal(dev, utc_time_us, cache_cap_bytes, mode, false, false)
     }
 
     fn new_internal(
@@ -1469,6 +1471,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         cache_cap_bytes: Option<usize>,
         mode: MountMode,
         inspect_dirty_journal: bool,
+        test_journal_writes: bool,
     ) -> Result<Self, FsError> {
         let mut sb_buf = [0u8; 1024];
         dev.read_bytes(SUPERBLOCK_OFFSET, &mut sb_buf).map_err(|_| FsError::IoError)?;
@@ -1497,7 +1500,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         const INCOMPAT_SUPPORTED: u32 = 0x0002; // directory entry file type
         const RO_COMPAT_SUPPORTED: u32 = 0x0001 | 0x0002; // sparse super, large file
         let journal = superblock.feature_compat & 0x4 != 0;
-        let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3") && mode == MountMode::ReadOnly { 0x4 } else { 0 };
+        let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3")
+            && (mode == MountMode::ReadOnly || (cfg!(test) && test_journal_writes)) { 0x4 } else { 0 };
         let ext4_read = cfg!(feature = "ext4") && mode == MountMode::ReadOnly;
         let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else { 0 }
             | if inspect_dirty_journal { 0x4 } else { 0 };
@@ -1643,7 +1647,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             return Err(FsError::NotSupported);
         }
         let journal_inode = le_u32(&sb, 224).ok_or(FsError::Corrupt)?;
-        let fs = Self::new_internal(dev, utc_time_us, cache_cap_bytes, MountMode::ReadOnly, true)?;
+        let fs = Self::new_internal(dev, utc_time_us, cache_cap_bytes, MountMode::ReadOnly, true, false)?;
         let (mut blocks, journal_super, block_size) = {
             let state = fs.read_state();
             let inode = fs.read_inode(&state, journal_inode)?;

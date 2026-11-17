@@ -3,6 +3,12 @@
 
 use akuma_vfs::FsError;
 
+#[path = "journal_staging.rs"]
+pub mod staging;
+
+#[path = "journal_writer.rs"]
+pub mod writer;
+
 const MAGIC: u32 = 0xc03b_3998;
 
 fn be32(data: &[u8], offset: usize) -> Result<u32, FsError> {

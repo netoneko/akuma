@@ -37,6 +37,23 @@ blocks overlapping the journal and checks the resulting superblock before
 publishing the mount. A host test constructs a committed transaction on a real
 ext3 image and compares the recovered contents with `e2fsck` journal replay.
 
+The independent classic JBD transaction writer and block-level staging buffer
+are available as building blocks, but are not connected to a writable mount.
+The writer sets and flushes the recovery marker, writes and flushes staged log
+blocks, publishes and flushes the journal start, commits, then checkpoints and
+clears the journal and recovery marker with barriers. Superblock after-images
+retain the recovery bit until the final marker update. It requires an exclusive
+device with a truthful flush and atomic persistence for the sectors carrying
+recovery metadata; this contract has not yet been established for every device.
+
+A host-only adapter stages the existing ext2 mutation paths against an ext3
+image and commits successful operations. Create, rename, unlink and truncate
+are interrupted at each I/O and barrier; each image is journal-replayed by
+`e2fsck`, then checked without repairs and compared against the pre- and
+post-operation content. This does not yet address rollback of in-memory state,
+thread death, concurrent operations, oversized transactions, or writable VFS
+mounts.
+
 Virtio-blk negotiates the flush feature and submits a two-descriptor FLUSH
 request after preceding writes complete. Filesystem sync propagates failure;
 when the device does not offer flush the driver returns an error rather than
