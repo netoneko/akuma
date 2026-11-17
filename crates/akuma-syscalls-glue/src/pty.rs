@@ -51,12 +51,12 @@ impl Slot {
 
 /// The pairs. ~400 bytes a slot of `.bss`; a pair's buffers live on the heap
 /// only while it is open.
-static PTYS: Spinlock<[Slot; MAX_PTYS]> = Spinlock::new([Slot::EMPTY; MAX_PTYS]);
+static PTYS: akuma_irq_lock::IrqSpinlock<[Slot; MAX_PTYS]> = akuma_irq_lock::IrqSpinlock::new([Slot::EMPTY; MAX_PTYS]);
 
 /// Run `f` on the table with IRQs masked. Nothing inside `f` may block,
 /// allocate, signal or wake — those are returned and performed afterwards.
 fn with_table<R>(f: impl FnOnce(&mut [Slot; MAX_PTYS]) -> R) -> R {
-    akuma_primitives::irq::with_irqs_disabled(|| f(&mut PTYS.lock()))
+    f(&mut PTYS.lock())
 }
 
 /// Run `f` on pair `n`, if it exists, and fire the wakes it leaves behind.

@@ -54,7 +54,7 @@ use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 /// See docs/archive/BKL_PHASE7E_PROCESS_TABLE_RECLAIM.md.
 pub const PIPE_CAPACITY: usize = akuma_pipes::DEFAULT_CAPACITY;
 
-static PIPES: Spinlock<PipeTable<WakeHandle>> = Spinlock::new(PipeTable::new());
+static PIPES: akuma_irq_lock::IrqSpinlock<PipeTable<WakeHandle>> = akuma_irq_lock::IrqSpinlock::new(PipeTable::new());
 
 /// Run `f` against the table with IRQs masked and the lock held.
 ///
@@ -62,7 +62,7 @@ static PIPES: Spinlock<PipeTable<WakeHandle>> = Spinlock::new(PipeTable::new());
 /// inside `f`, which is why every wake it produces is *returned* rather than
 /// fired (see the module header).
 fn with_table<R>(f: impl FnOnce(&mut PipeTable<WakeHandle>) -> R) -> R {
-    akuma_primitives::irq::with_irqs_disabled(|| f(&mut PIPES.lock()))
+    f(&mut PIPES.lock())
 }
 
 /// The wake effect, if a kernel registered its own — see [`set_wake_sink`].

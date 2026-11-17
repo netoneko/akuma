@@ -36,6 +36,35 @@ design ("never blocks"). The rest (`MOUNT_TABLE`, the rump proxies, the kvm and 
 `fbcon`) are taken from syscall or driver-poll context. A real classification of these needs each interrupt handler's call
 graph; none is claimed here.
 
+## Which locks can an interrupt actually reach (`scripts/spinlock_irq_reach.py`)
+
+A name-based call graph from the interrupt entry points (`dispatch_irq`, `timer_irq_handler`, `nic_irq_handler`,
+`on_timer_interrupt`, the aarch64 `el0_irq`/`el1_irq`, the amd64 `timer_trap`/`timer_interrupt_entry`/`on_tick`). Following *every*
+name makes 84 of 97 locks "reachable" (`new`, `read`, `init` exist dozens of times and merge unrelated code), which says nothing.
+Following only names defined in **exactly one place** leaves 9, all with a printable path. The cost is that a path through a
+duplicated name or a function pointer (`(runtime().hook)(..)`) is invisible, so "not reachable" means "no unique-name path",
+and the 9 are the *minimum* set.
+
+- **Taken in an interrupt-handler body:** `IRQ_HANDLERS` (`dispatch_irq`), `POOL` (`timer_irq_handler` → `cleanup_terminated`),
+  `ALARM_QUEUE` (`on_timer_interrupt`). The first two were already `IrqSpinlock`; **`ALARM_QUEUE` is one now** (its two task-context
+  sites hand-paired `IrqGuard::new()` with `.lock()`; that pair is gone).
+- **Reached only through `deliver_on_irq_return`** (the signal delivery on the way back to EL0): `CHILD_CHANNELS`,
+  `BOX_MEMBER_KILLER`, `THREAD_PID_MAP`, `PENDING_TTBR_FREES`, `COW_REFCOUNTS`, `SYSCALL_LOG`. That function calls
+  `unmask_irqs_sync()` before it does any of this, so it runs as ordinary task context with interrupts open; these are not
+  hardware-interrupt locks. (`BOX_MEMBER_KILLER`'s two unmasked sites are therefore fine.)
+- Everything else (88 locks) has no unique-name path from an interrupt entry.
+
+The hazard that masking prevents is **one side taking the lock masked and the other unmasked** (a tick landing while an unmasked
+holder runs lets a masked spinner starve it on one core); that is the *mixed* class above, already read. A lock that is never
+masked anywhere cannot make a spinner out of a thread that has IRQs on: the spinner is preempted and the holder runs.
+
+## Migrated so far
+`IRQ_HANDLERS`, `POOL`, `DMESG`, `CONSOLE_LOCK`, `KEYS`, `ALARM_QUEUE`, and (wrapper removed at every site) `ASID_ALLOCATOR`, `RESERVE`
+(amd64 SVM), `EC_WIN`, `PTYS`, `IN_FLIGHT`, `PIPES`, `COW_REFCOUNTS`, `PIDFD_TABLE`. **Left:** `PROCESS_CHANNELS` (shares a generic
+`registry_*` helper typed over `Spinlock` with `TERMINAL_STATES`) and 19 always-masked locks whose wrappers hold more than the lock
+(5 to 67 lines): each needs its closure read to see whether the work after the guard drops needs the mask. They are consistent
+today (every site masks) and none is interrupt-reachable by the analysis above, so migrating them is hygiene, not a fix.
+
 ## Recommendation
 
 1. **Migrate the 28 always-masked locks one at a time, and never mask twice.** `IrqSpinlock::lock()` masks, so wrapping it in

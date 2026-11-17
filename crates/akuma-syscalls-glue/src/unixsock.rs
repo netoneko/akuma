@@ -291,11 +291,11 @@ pub fn unix_channel_detach(pipe_id: u32) {
 ///
 /// Not collected: a socket sent over itself and never read keeps itself
 /// alive, which Linux's unix GC exists to break. No caller here does that.
-static IN_FLIGHT: Spinlock<BTreeMap<u32, FileDescriptor>> = Spinlock::new(BTreeMap::new());
+static IN_FLIGHT: akuma_irq_lock::IrqSpinlock<BTreeMap<u32, FileDescriptor>> = akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 static NEXT_TOKEN: AtomicU32 = AtomicU32::new(1);
 
 fn with_in_flight<R>(f: impl FnOnce(&mut BTreeMap<u32, FileDescriptor>) -> R) -> R {
-    akuma_primitives::irq::with_irqs_disabled(|| f(&mut IN_FLIGHT.lock()))
+    f(&mut IN_FLIGHT.lock())
 }
 
 /// Tokens on their way into a record; released on drop.

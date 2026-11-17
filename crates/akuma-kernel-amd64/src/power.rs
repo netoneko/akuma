@@ -49,7 +49,7 @@ static MODE: AtomicU8 = AtomicU8::new(MODE_NONE);
 /// The EC mirror as a device window, set once by [`map_window`] before `MODE_EC`
 /// is published. Read under the lock with interrupts off: the lock is held only
 /// to copy the two-word window out.
-static EC_WIN: Spinlock<Option<akuma_primitives::mmio::MmioWindow>> = Spinlock::new(None);
+static EC_WIN: akuma_irq_lock::IrqSpinlock<Option<akuma_primitives::mmio::MmioWindow>> = akuma_irq_lock::IrqSpinlock::new(None);
 
 /// The running energy total, integrated between `/proc/power` reads. The
 /// renderer is the sampler: nothing reads the EC or ticks a timer when nobody
@@ -132,7 +132,7 @@ fn map_window(pa: u64) -> bool {
     let Some(w) = paging::map_device_window(pa, BLOCK_LEN as u64) else {
         return false;
     };
-    akuma_primitives::irq::with_irqs_disabled(|| *EC_WIN.lock() = Some(w));
+    *EC_WIN.lock() = Some(w);
     true
 }
 
@@ -140,7 +140,7 @@ fn map_window(pa: u64) -> bool {
 /// memory: a wider access is allowed to tear, a byte is not.
 fn read_window() -> [u8; BLOCK_LEN] {
     let mut b = [0u8; BLOCK_LEN];
-    let Some(w) = akuma_primitives::irq::with_irqs_disabled(|| *EC_WIN.lock()) else {
+    let Some(w) = *EC_WIN.lock() else {
         return b;
     };
     for (i, slot) in b.iter_mut().enumerate() {

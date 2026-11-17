@@ -98,6 +98,7 @@ akuma-user-access = { path = "../akuma-user-access" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 akuma-fpcache-rw = { path = "../akuma-fpcache-rw" }
 spinning_top = "0.3"
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 lock_api = "0.4"
 log = { version = "0.4", default-features = false }
 akuma-tty = { path = "../akuma-tty" }

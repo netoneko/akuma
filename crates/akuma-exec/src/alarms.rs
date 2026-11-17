@@ -22,7 +22,6 @@ use core::future::Future;
 use core::pin::Pin;
 use core::task::{Context, Poll, Waker};
 
-use spinning_top::Spinlock;
 
 // ============================================================================
 // Duration
@@ -94,17 +93,16 @@ impl ScheduledWake {
 /// `release` shared the same counter, so a concurrent pair could restore DAIF while a
 /// critical section was still open elsewhere. The BKL hid that by serializing all of
 /// EL1; giving the queue its own `Spinlock` removes the dependency on it.
-static ALARM_QUEUE: Spinlock<[ScheduledWake; QUEUE_SIZE]> = Spinlock::new({
+static ALARM_QUEUE: akuma_irq_lock::IrqSpinlock<[ScheduledWake; QUEUE_SIZE]> = akuma_irq_lock::IrqSpinlock::new({
     const EMPTY: ScheduledWake = ScheduledWake::empty();
     [EMPTY; QUEUE_SIZE]
 });
 
 /// Schedule a waker to fire at a given deadline (in microseconds)
 pub fn schedule_wake(at_us: u64, waker: &Waker) {
-    // Callers run in ordinary EL1 code with IRQs enabled, so mask them for the hold —
-    // otherwise the timer IRQ firing on this same core while we hold the lock would
-    // have `on_timer_interrupt` spin forever on a `Spinlock` this core already owns.
-    let _irq_guard = crate::runtime::IrqGuard::new();
+    // `ALARM_QUEUE` is an `IrqSpinlock`: `lock()` masks IRQs for the hold. Callers run in ordinary EL1 code with IRQs
+    // enabled, and without the mask the timer IRQ firing on this core while we hold the lock would have
+    // `on_timer_interrupt` spin forever on a lock this core already owns. (This used to be a hand-paired `IrqGuard`.)
     let mut queue = ALARM_QUEUE.lock();
 
     // Find a slot - prefer empty slots or replace matching waker
@@ -143,7 +141,6 @@ pub fn schedule_wake(at_us: u64, waker: &Waker) {
 /// The earliest pending alarm's deadline (uptime µs), for an idle core deciding how long it
 /// may halt with its tick stopped. `None`: no alarm is pending.
 pub fn next_deadline() -> Option<u64> {
-    let _irq_guard = crate::runtime::IrqGuard::new();
     let queue = ALARM_QUEUE.lock();
     queue.iter().filter(|e| e.waker.is_some()).map(|e| e.at).min()
 }

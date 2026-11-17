@@ -11,7 +11,6 @@
 //! that adopted it) guarantees.
 
 use akuma_vm_spec::arena::Arena;
-use spinning_top::Spinlock;
 
 /// Where the frames go back to.
 #[derive(Debug)]
@@ -76,7 +75,7 @@ impl Drop for GuestRam {
 /// The `kvmmem=` reserve: one contiguous block taken from the page allocator at boot, while
 /// memory is unfragmented, and never returned; guests' RAM is carved out of it.
 pub mod reserve {
-    use super::{Arena, GuestRam, Spinlock, Src};
+    use super::{Arena, GuestRam, Src};
 
     struct State {
         /// Host-physical, `align`-aligned.
@@ -85,10 +84,10 @@ pub mod reserve {
         arena: Arena,
     }
 
-    static RESERVE: Spinlock<Option<State>> = Spinlock::new(None);
+    static RESERVE: akuma_irq_lock::IrqSpinlock<Option<State>> = akuma_irq_lock::IrqSpinlock::new(None);
 
     fn locked<T>(f: impl FnOnce(&mut Option<State>) -> T) -> T {
-        akuma_primitives::irq::with_irqs_disabled(|| f(&mut RESERVE.lock()))
+        f(&mut RESERVE.lock())
     }
 
     /// What [`init`] did.

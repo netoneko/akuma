@@ -246,6 +246,7 @@ akuma-virtio = { path = "../akuma-virtio" }
 # virtio HAL uses. Reached transitively already; named here because this crate
 # now calls it directly.
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 # The boot command line, kept once; `init=`/`initargs=` through `akuma_params::init`, the reader the AArch64 kernel uses too.
 akuma-params = { path = "../akuma-params" }
 # The fd table's parts (`Names`/`FlagSet`) that `KERNEL_TABLE`'s static is

@@ -13,6 +13,7 @@ workspace = true
 akuma-cpu = { path = "../akuma-cpu" }
 akuma-phys = { path = "../akuma-phys" }
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 # Guest RAM: contiguous blocks (`GuestRam::alloc`, the `kvmmem=` reserve) and zeroing a reused slice.
 akuma-pmm = { path = "../akuma-pmm" }
 akuma-mmu-raw = { path = "../akuma-mmu-raw" }

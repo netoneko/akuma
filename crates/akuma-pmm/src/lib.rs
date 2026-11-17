@@ -1356,17 +1356,15 @@ pub fn is_page_free(pa: usize) -> bool {
 // this lock's hold either, or that ordering deadlocks.
 // ============================================================================
 
-static COW_REFCOUNTS: Spinlock<cow_table::CowTable> = Spinlock::new(cow_table::CowTable::new());
+static COW_REFCOUNTS: akuma_irq_lock::IrqSpinlock<cow_table::CowTable> = akuma_irq_lock::IrqSpinlock::new(cow_table::CowTable::new());
 
 /// Increment the CoW reference count for a physical address. First call for a
 /// new address inserts it with count=2 (parent + child). Subsequent calls
 /// increment by 1 (additional fork children).
 pub fn cow_ref_inc(pa: usize) {
-    let (created, before, after) = akuma_primitives::irq::with_irqs_disabled(|| {
-        // First share stores 2 (parent + child), later ones add 1; `created` distinguishes a new entry
-        // from an existing count of 1, which the resurrection detector below needs.
-        COW_REFCOUNTS.lock().inc(pa)
-    });
+    // First share stores 2 (parent + child), later ones add 1; `created` distinguishes a new entry
+    // from an existing count of 1, which the resurrection detector below needs.
+    let (created, before, after) = COW_REFCOUNTS.lock().inc(pa);
     // Resurrection detector: an inc that CREATED the entry on a
     // frame currently parked in quarantine means the caller took a reference to
     // a frame whose last reference was already dropped — the freed+poisoned
@@ -1413,7 +1411,7 @@ pub fn cow_resurrection_count() -> usize {
 pub fn cow_ref_dec(pa: usize) -> bool {
     // Not tracked -> single owner -> safe to free, recorded as `0->0` so an untracked decrement is still
     // visible in the history: a run of these on a frame that *should* be shared is itself the desync.
-    let (before, after, last) = akuma_primitives::irq::with_irqs_disabled(|| COW_REFCOUNTS.lock().dec(pa));
+    let (before, after, last) = COW_REFCOUNTS.lock().dec(pa);
     cow_ledger_record(pa, true, before, after);
     last
 }
@@ -1422,15 +1420,13 @@ pub fn cow_ref_dec(pa: usize) -> bool {
 /// the address is not in the CoW table (not shared).
 #[must_use]
 pub fn cow_ref_get(pa: usize) -> u16 {
-    akuma_primitives::irq::with_irqs_disabled(|| {
-        COW_REFCOUNTS.lock().get(pa)
-    })
+    COW_REFCOUNTS.lock().get(pa)
 }
 
 /// Number of entries in the CoW refcount table (for diagnostics).
 #[must_use]
 pub fn cow_ref_count() -> usize {
-    akuma_primitives::irq::with_irqs_disabled(|| COW_REFCOUNTS.lock().len())
+    COW_REFCOUNTS.lock().len()
 }
 
 // Step 7 (`docs/archive/PMM_EXTRACT.md` §7): host tests for `COW_REFCOUNTS` —

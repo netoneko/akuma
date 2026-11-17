@@ -5,21 +5,17 @@ struct KernelPidFd {
     target_pid: u32,
 }
 
-static PIDFD_TABLE: Spinlock<BTreeMap<u32, KernelPidFd>> = Spinlock::new(BTreeMap::new());
+static PIDFD_TABLE: akuma_irq_lock::IrqSpinlock<BTreeMap<u32, KernelPidFd>> = akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 static NEXT_PIDFD_ID: AtomicU32 = AtomicU32::new(1);
 
 pub fn pidfd_create(target_pid: u32) -> u32 {
     let id = NEXT_PIDFD_ID.fetch_add(1, Ordering::SeqCst);
-    akuma_primitives::irq::with_irqs_disabled(|| {
-        PIDFD_TABLE.lock().insert(id, KernelPidFd { target_pid });
-    });
+    PIDFD_TABLE.lock().insert(id, KernelPidFd { target_pid });
     id
 }
 
 pub(super) fn pidfd_get_pid(id: u32) -> Option<u32> {
-    akuma_primitives::irq::with_irqs_disabled(|| {
-        PIDFD_TABLE.lock().get(&id).map(|pf| pf.target_pid)
-    })
+    PIDFD_TABLE.lock().get(&id).map(|pf| pf.target_pid)
 }
 
 /// Returns true when the tracked process has exited (pidfd becomes EPOLLIN-readable).
@@ -33,9 +29,7 @@ pub fn pidfd_can_read(id: u32) -> bool {
 }
 
 pub fn pidfd_close(id: u32) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
-        PIDFD_TABLE.lock().remove(&id);
-    });
+    PIDFD_TABLE.lock().remove(&id);
 }
 
 pub(super) fn sys_pidfd_open(pid: u32, flags: u32) -> u64 {

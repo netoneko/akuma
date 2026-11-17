@@ -1057,7 +1057,7 @@ use spinning_top::Spinlock;
 
 use asid::AsidAllocator;
 
-static ASID_ALLOCATOR: Spinlock<AsidAllocator> = Spinlock::new(AsidAllocator::new());
+static ASID_ALLOCATOR: akuma_irq_lock::IrqSpinlock<AsidAllocator> = akuma_irq_lock::IrqSpinlock::new(AsidAllocator::new());
 
 /// Rate-limited report that the ASID space is full. Non-zero means either genuine
 /// concurrency above MAX_ASID or — far more likely — leaked ASIDs from address spaces
@@ -1795,7 +1795,7 @@ impl UserAddressSpace {
         // so the scheduler doesn't flag the new owner's legitimate installs.
         unnote_freed_l0(l0_frame.addr as u64 & L0_BASE_MASK);
         track_frame(l0_frame, FrameSource::UserPageTable);
-        let asid = match with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc()) {
+        let asid = match ASID_ALLOCATOR.lock().alloc() {
             Some(a) => a,
             // Exhaustion used to propagate silently through `?`: address-space creation
             // just started failing, so fork/exec returned an error with nothing in the
@@ -1822,7 +1822,7 @@ impl UserAddressSpace {
     /// Create a shared view of an existing address space (for CLONE_THREAD).
     /// Uses the same L0 page table; Drop will NOT free the pages.
     pub fn new_shared(parent_l0_phys: usize) -> Option<Self> {
-        let asid = match with_irqs_disabled(|| ASID_ALLOCATOR.lock().alloc()) {
+        let asid = match ASID_ALLOCATOR.lock().alloc() {
             Some(a) => a,
             // Exhaustion used to propagate silently through `?`: address-space creation
             // just started failing, so fork/exec returned an error with nothing in the
@@ -2841,7 +2841,7 @@ impl Drop for UserAddressSpace {
         // the last view returns the owner's if the owner parked it.
         for asid in [free_own_asid.then_some(self.asid), parked_asid].into_iter().flatten() {
             let _ = flush_tlb_asid(asid, TlbTarget::AllCores);
-            with_irqs_disabled(|| ASID_ALLOCATOR.lock().free(asid));
+            ASID_ALLOCATOR.lock().free(asid);
         }
         instr::as_drop_exit(_ledger);
     }

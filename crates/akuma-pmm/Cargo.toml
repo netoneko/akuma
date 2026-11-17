@@ -9,6 +9,7 @@ workspace = true
 
 [dependencies]
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 # Safe wrappers for `dc cvac` / `dsb ish` and the `CTR_EL0` cache-line size, used
 # by the `frame` module's zero-and-clean. Removes the `asm!` from this crate
 # entirely; what `unsafe` is left is raw-frame access, not instructions.

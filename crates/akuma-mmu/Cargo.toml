@@ -52,6 +52,7 @@ akuma-pagetable = { path = "../akuma-pagetable" }
 akuma-cpu = { path = "../akuma-cpu" }
 # irq masking, the console, phys_to_virt/virt_to_phys.
 akuma-primitives = { path = "../akuma-primitives" }
+akuma-irq-lock = { path = "../akuma-irq-lock" }
 # PhysFrame, PAGE_SIZE/PAGE_SHIFT, and the `flags`/`user_flags` PTE vocabulary.
 akuma-mmap = { path = "../akuma-mmap" }
 # The frame ledger half of `UserAddressSpace` — which physical frames it holds

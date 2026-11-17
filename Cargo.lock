@@ -315,6 +315,7 @@ dependencies = [
  "akuma-exec-core",
  "akuma-fdtable",
  "akuma-fpcache-rw",
+ "akuma-irq-lock",
  "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",
@@ -512,6 +513,7 @@ dependencies = [
  "akuma-fpu-amd64",
  "akuma-gdt",
  "akuma-idt-amd64",
+ "akuma-irq-lock",
  "akuma-isolation",
  "akuma-kacho",
  "akuma-kernel-core",
@@ -761,6 +763,7 @@ dependencies = [
  "akuma-bkl",
  "akuma-cpu",
  "akuma-fdt",
+ "akuma-irq-lock",
  "akuma-mmap",
  "akuma-mmu-raw",
  "akuma-pagetable",
@@ -915,6 +918,7 @@ name = "akuma-pmm"
 version = "0.1.0"
 dependencies = [
  "akuma-frame-raw",
+ "akuma-irq-lock",
  "akuma-primitives",
  "spinning_top",
 ]
@@ -1055,6 +1059,7 @@ name = "akuma-svm-switch-amd64"
 version = "0.1.0"
 dependencies = [
  "akuma-cpu",
+ "akuma-irq-lock",
  "akuma-mmu-raw",
  "akuma-phys",
  "akuma-pmm",
@@ -1104,6 +1109,7 @@ dependencies = [
  "akuma-cow",
  "akuma-cpu",
  "akuma-exec",
+ "akuma-irq-lock",
  "akuma-isolation",
  "akuma-mmap",
  "akuma-mmu",
