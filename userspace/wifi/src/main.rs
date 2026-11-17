@@ -31,7 +31,7 @@ use akuma_wifi::status::{Link, Status};
 use akuma_wifi::{IfName, Ssid};
 use libakuma::{arg, argc, chmod, close, exit, mkdir_p, open, open_flags, print, read, read_dir, rename, sleep_ms, syscall, unlink, write};
 use wifi::{
-    AutoStep, CONFIG_DIR, Network, auto_backoff, auto_step, choose, derive_psk, parse_config, printable_ssid, replacing,
+    AutoStep, CONFIG_DIR, Network, auto_backoff, auto_step, choose, derive_psk, name_for_ssid, parse_config, printable_ssid, replacing,
     scan_mark, valid_name, valid_passphrase,
 };
 
@@ -375,24 +375,17 @@ fn cmd_add(open_net: bool) {
 }
 
 /// `wifi add -i`: ask for the network name and the password, then write the
-/// same file `wifi add` / `wifi add-open` would. The name is the SSID, and also
-/// the file's name when it is a valid one (otherwise it is asked for). An empty
-/// password means an open network.
+/// same file `wifi add` / `wifi add-open` would. The name is the SSID — any
+/// bytes, UTF-8 included — and the file is named from it by `name_for_ssid`
+/// (the SSID itself when that is a safe file name, else a slug plus a hash), and
+/// the name is printed so `wifi connect <name>` / `wifi forget <name>` can be
+/// typed. An empty password means an open network.
 fn cmd_add_interactive() {
     out("network name (SSID): ");
     let mut nbuf = [0u8; 128];
     let ssid_bytes = read_line(&mut nbuf);
     let ssid = Ssid::new(ssid_bytes).filter(|s| !s.is_empty()).unwrap_or_else(|| fail("an SSID is 1-32 bytes"));
-
-    let mut name = String::from_utf8(ssid_bytes.to_vec()).unwrap_or_default();
-    if !valid_name(&name) {
-        out("not usable as a file name; save as: ");
-        let mut fbuf = [0u8; 128];
-        name = String::from_utf8(read_line(&mut fbuf).to_vec()).unwrap_or_default();
-        if !valid_name(&name) {
-            fail("network names are 1-64 of [A-Za-z0-9._-], not starting with a dot");
-        }
-    }
+    let name = name_for_ssid(ssid.as_bytes());
 
     let mut buf = [0u8; 128];
     let len = read_secret(&mut buf, "password (empty for an open network): ");

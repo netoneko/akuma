@@ -13,7 +13,7 @@ supplicant: the kernel does the WPA2 handshake. How the pieces fit:
 | `wifi scan` | scan, then list what is in range, strongest first; `*` marks known networks |
 | `wifi list` | known networks: name, priority, autoconnect, `open`/`psk`, SSID. **Never the key** |
 | `wifi add <name> [ssid] < passfile` | one line on stdin (8–63 printable ASCII) → PSK → `/etc/wifi/<name>`, `0600`. The SSID defaults to the name |
-| `wifi add -i` | interactive: asks for the network name (the SSID, also the file name when valid, else asked) and the password (echo off; empty = open network), then writes the same file |
+| `wifi add -i` | interactive: asks for the network name (the SSID, any bytes: spaces, symbols, UTF-8) and the password (echo off; empty = open network), then writes the same file. The file name is derived from the SSID and printed (see below) |
 | `wifi add-open <name> [ssid]` | an open network |
 | `wifi connect [name]` | join `<name>`, or with no name scan and join the best known network in range; waits for `connected` or `failed` (exit 1 on failure) |
 | `wifi disconnect` | drop the link |
@@ -50,6 +50,19 @@ run for 20 seeds × 2000 looks against the kernel's lossy simulated radio
 (`akuma_wifi::sim::SimRadio::new_lossy`) with the device calls replaced by the
 simulator. End to end, against the kernel's `wifisim` radio: ryzen overlay
 menu entry 7; against `wifisim=lossy`, entry 15 (`overlays/ryzen/README.md`).
+
+## File names for odd SSIDs
+
+An SSID is up to 32 arbitrary bytes, so `wifi add -i` does not use it as a path.
+`name_for_ssid` keeps it when it is already a safe name (`home`, `Cafe-5G`);
+otherwise the name is the ASCII letters/digits/`_` of the SSID (runs of anything
+else become `-`) plus an FNV-1a hash of the exact SSID bytes: `My Home WiFi!` →
+`My-Home-WiFi-<8 hex>`, `家のWiFi` → `WiFi-<8 hex>`, an SSID with no ASCII at all →
+`net-<8 hex>`. It is a pure function of the SSID, so adding the same network again
+updates its file instead of creating a second one. The file's *contents* never
+had the problem: `ssid = ` carries UTF-8 as is and `ssid_hex = ` carries anything
+else. `wifi list`, `scan` and `status` print UTF-8 SSIDs as written and escape only
+control characters, backslashes and non-UTF-8 bytes as `\xNN`.
 
 ## Limits
 

@@ -5,7 +5,7 @@ use akuma_wifi::sim::{SIM_WPA2_PSK, SimRadio};
 use akuma_wifi::status::{Bss, Error, Link};
 use akuma_wifi::{IfName, Security, Ssid, hex};
 
-use crate::{AutoStep, ConfigError, auto_backoff, auto_step, choose, derive_psk, parse_config, printable_ssid, replacing, scan_mark, valid_name};
+use crate::{AutoStep, ConfigError, auto_backoff, auto_step, choose, derive_psk, parse_config, name_for_ssid, printable_ssid, replacing, scan_mark, valid_name};
 
 fn h(s: &str) -> [u8; 32] {
     let mut k = [0u8; 32];
@@ -264,4 +264,35 @@ fn scan_marks_only_joinable_networks_with_a_star() {
     assert_eq!(scan_mark(&known, &bss(b"home", 3, -50, Security::Open)), '!');
     assert_eq!(scan_mark(&known, &bss(b"cafe", 4, -50, Security::Wpa2Psk)), '!');
     assert_eq!(scan_mark(&known, &bss(b"other", 5, -50, Security::Open)), ' ');
+}
+
+#[test]
+fn file_names_from_ssids() {
+    // Already a safe name: kept as is, so `wifi add -i` for "home" still writes /etc/wifi/home.
+    assert_eq!(name_for_ssid(b"home"), "home");
+    assert_eq!(name_for_ssid(b"Cafe-5G"), "Cafe-5G");
+    // Spaces, symbols, UTF-8, bytes that are not text: always a valid name, never empty.
+    for ssid in [&b"My Home WiFi!"[..], "Café ☕".as_bytes(), "家のWiFi".as_bytes(), "家".as_bytes(), b"\xff\xfe", b"../../etc", b".hidden", &[b'a'; 32]] {
+        let n = name_for_ssid(ssid);
+        assert!(valid_name(&n), "{n:?} for {ssid:?}");
+        assert_eq!(n, name_for_ssid(ssid), "stable");
+    }
+    assert!(name_for_ssid(b"My Home WiFi!").starts_with("My-Home-WiFi-"));
+    assert!(name_for_ssid("家".as_bytes()).starts_with("net-"));
+    // Names that slug alike stay apart.
+    assert_ne!(name_for_ssid("Café".as_bytes()), name_for_ssid(b"Caf"));
+    assert_ne!(name_for_ssid("家".as_bytes()), name_for_ssid("宿".as_bytes()));
+}
+
+#[test]
+fn utf8_ssids_print_as_written() {
+    assert_eq!(printable_ssid(&Ssid::new("Café ☕".as_bytes()).unwrap()), "Café ☕");
+    assert_eq!(printable_ssid(&Ssid::new(b"a\xffb").unwrap()), "a\\xffb");
+    assert_eq!(printable_ssid(&Ssid::new("a\u{85}b".as_bytes()).unwrap()), "a\\xc2\\x85b");
+}
+
+#[test]
+fn utf8_ssid_survives_the_config_file() {
+    let n = crate::Network { name: name_for_ssid("家のWiFi".as_bytes()), ssid: Ssid::new("家のWiFi".as_bytes()).unwrap(), psk: None, priority: 0, autoconnect: true, bssid: None };
+    assert_eq!(parse_config(&n.name, &n.to_config()), Ok(n));
 }

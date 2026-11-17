@@ -300,15 +300,69 @@ pub fn valid_name(name: &str) -> bool {
         && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
-/// An SSID for a terminal: printable ASCII as is, anything else `\xNN`.
+/// The `/etc/wifi` file name for a network called `ssid` when the user gave no
+/// other: the SSID itself when that is already a [`valid_name`], otherwise its
+/// ASCII letters, digits and `_` (runs of anything else become one `-`, at most
+/// 40 bytes) plus `-` and 8 hex digits of an FNV-1a hash of the exact SSID bytes.
+///
+/// An SSID is up to 32 arbitrary bytes — UTF-8 names, spaces, symbols, emoji —
+/// and none of that belongs in a path. The hash keeps two SSIDs that slug alike
+/// (`Café` / `Cafe`, or two names in a script with no ASCII at all) in separate
+/// files, and makes the name a pure function of the SSID, so adding the same
+/// network again updates its file (and keeps its priority) instead of making a
+/// second one.
+#[must_use]
+pub fn name_for_ssid(ssid: &[u8]) -> String {
+    if let Ok(t) = core::str::from_utf8(ssid) {
+        if valid_name(t) {
+            return String::from(t);
+        }
+    }
+    let mut slug = String::new();
+    let mut gap = false;
+    for &b in ssid {
+        if b.is_ascii_alphanumeric() || b == b'_' {
+            if gap && !slug.is_empty() {
+                slug.push('-');
+            }
+            gap = false;
+            if slug.len() < 40 {
+                slug.push(b as char);
+            }
+        } else {
+            gap = true;
+        }
+    }
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in ssid {
+        hash = (hash ^ u32::from(b)).wrapping_mul(0x0100_0193);
+    }
+    if slug.is_empty() {
+        alloc::format!("net-{hash:08x}")
+    } else {
+        alloc::format!("{slug}-{hash:08x}")
+    }
+}
+
+/// An SSID for a terminal: printable text as is (UTF-8 included, so `Café` and
+/// `家のWiFi` read as written), control characters, backslashes and bytes that
+/// are not UTF-8 as `\xNN`.
 #[must_use]
 pub fn printable_ssid(s: &Ssid) -> String {
     let mut out = String::new();
-    for &b in s.as_bytes() {
-        if (0x20..=0x7e).contains(&b) && b != b'\\' {
-            out.push(b as char);
-        } else {
-            out.push_str(&alloc::format!("\\x{b:02x}"));
+    for chunk in s.as_bytes().utf8_chunks() {
+        for c in chunk.valid().chars() {
+            if c.is_control() || c == '\\' {
+                let mut b = [0u8; 4];
+                for &x in c.encode_utf8(&mut b).as_bytes() {
+                    out.push_str(&alloc::format!("\\x{x:02x}"));
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        for &x in chunk.invalid() {
+            out.push_str(&alloc::format!("\\x{x:02x}"));
         }
     }
     out

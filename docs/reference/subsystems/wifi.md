@@ -291,7 +291,8 @@ priority, stronger signal), and the non-UTF-8 SSID displayed as `sim\xe2\x98\x83
   steps). Readiness-on-state-change is the natural next step once a real radio
   makes state change asynchronously.
 - **`wifi add -i`** (2026-11-17) is the interactive form: it asks for the
-  network name (the SSID, also the file name when valid, else it asks for one)
+  network name (the SSID: any bytes, UTF-8 included; the file name is derived
+  from it by `name_for_ssid` and printed, see `userspace/wifi/README.md`)
   and the password (echo off, empty means an open network) and writes the same
   `0600` file as `wifi add`. It does not ask twice, so a mistyped password is
   only found when `wifi connect` fails. `wifi add` itself has suppressed echo
