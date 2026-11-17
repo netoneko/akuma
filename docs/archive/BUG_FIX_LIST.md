@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1662
-- **Docs contributing at least one fix:** 482
+- **Total distinct fixes counted:** 1668
+- **Docs contributing at least one fix:** 485
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 257 | 15.5% | 39 |
-| Memory & Virtual Memory | 201 | 12.1% | 72 |
-| Scheduler & Process Management | 154 | 9.3% | 50 |
-| SMP & Locking | 141 | 8.5% | 60 |
-| Networking | 104 | 6.3% | 38 |
+| Syscall / ABI Compatibility Audits | 257 | 15.4% | 39 |
+| Memory & Virtual Memory | 205 | 12.3% | 73 |
+| Scheduler & Process Management | 155 | 9.3% | 51 |
+| SMP & Locking | 142 | 8.5% | 61 |
+| Networking | 104 | 6.2% | 38 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.6% | 6 |
-| Toolchain & Self-Hosting | 94 | 5.7% | 14 |
+| Toolchain & Self-Hosting | 94 | 5.6% | 14 |
 | SSH | 56 | 3.4% | 23 |
-| VFS & Filesystem | 149 | 9.0% | 48 |
-| Boot & Drivers | 144 | 8.7% | 25 |
+| VFS & Filesystem | 149 | 8.9% | 48 |
+| Boot & Drivers | 144 | 8.6% | 25 |
 | Signals & Exceptions | 50 | 3.0% | 20 |
 | Misc / Cross-cutting | 95 | 5.7% | 27 |
 | Console & Terminal | 63 | 3.8% | 22 |
-| Containers | 69 | 4.2% | 13 |
-| **Total** | **1662** | **100.0%** | **482** |
+| Containers | 69 | 4.1% | 13 |
+| **Total** | **1668** | **100.0%** | **485** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -355,7 +355,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - AArch64 ran a script with `$0` as the symlink-resolved path instead of the cwd-resolved one
 - AArch64's close-on-exec sweep skipped releasing `flock`s and `/dev/dsp`
 
-## Memory & Virtual Memory (201 fixes, 72 docs)
+## Memory & Virtual Memory (205 fixes, 73 docs)
 
 ### docs/archive/BUN_MEMORY_STUDY.md
 - GIC/UART MMIO collision with the heap
@@ -704,7 +704,13 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - The amd64 heap request was a flat 512 MiB below its threshold with no floor tied to RAM, so a 512 MiB machine failed boot (`heap ends ... but the region holding it ends ...`); `akuma-mem-policy` sizes it, for all four kernels
 
-## Scheduler & Process Management (154 fixes, 50 docs)
+### docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md
+- `brk` near the top of the address space wrapped to page 0 in `set_brk` and unmapped the process's own image and heap; `page_ceil` refuses it
+- ELF `PT_LOAD` segments were unvalidated, `vaddr + memsz` could wrap; `validate_load_segments` checks once before any rounding
+- `akuma-mmu` range checks wrapped `va_start + len + PAGE_SIZE - 1`; `page_span` treats a wrapping range as not mapped
+- `prefault_user_range` and `madvise(WILLNEED)` rounded unchecked; `checked_add` plus `page_ceil`
+
+## Scheduler & Process Management (155 fixes, 51 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -963,7 +969,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - A recycled slot on the hooked path skipped the collector's cleanup and inherited a dead process's tid -> pid row, so a futex waiter keyed on a finished process's tgid
 - A socket wait that halts relied on a tick to displace it, which the hooked path does not have, so httpd's `accept` held the only core at SMP=1
 
-## SMP & Locking (141 fixes, 60 docs)
+### docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md
+- `tkill` and the hard terminates could hit a recycled thread slot; they act through the recorded `ThreadRef` with `with_live`
+
+## SMP & Locking (142 fixes, 61 docs)
 
 ### docs/archive/AKUMA_EXEC_AUDIT.md
 (The `akuma-exec` -> `#![forbid(unsafe_code)]` campaign is a refactor and is not counted — see `AKUMA_EXEC_FORBID_UNSAFE.md`; these are the soundness defects it surfaced and fixed. §5b's triplicated `FrameSource` enum + converters is a duplication cleanup with no bug and is not counted; §6.E group 3 turned out to be non-problems and is not counted.)
@@ -1235,6 +1244,9 @@ aren't recorded anywhere else.)
 
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - A kernel thread that yields kept the BKL across the switch on the hooked path, so two yielding waiters on one core wedged the other; `x86_yield_now` hands the lock off
+
+### docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md
+- xHCI `KEYS` deadlocked one core (unmasked reader preempted onto the pump spinning on the masked producer's lock); now an `IrqSpinlock`
 
 ## Networking (104 fixes, 38 docs)
 
@@ -2790,3 +2802,5 @@ Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). 
 Also scanned 2026-11-08 (closing `post-release-improvements`, 136 commits, the Shanghai middleware work, the unsafe-reduction rounds and the ETXTBSY and signal fixes). Counted above: COW_FRESHFRAME_STAGING, ETXTBSY_TEXT_BUSY, HVF_BOOT_TEST_STAGE2_FAULT, LINK_KERNEL_BIN_LAYOUT and SIGNAL_FATAL_DEFAULT_LINUX. The tokio kernels' fixes from the same branch (TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK, TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE, TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE, INFINITY_ON_TAOXICHUAN's stack growth, TAOXICHUAN_B21_AARCH64's build break) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: NEWTYPE_AUDIT, VEC_SENSITIVE_LAYERS_AUDIT, UNSAFE_KERNEL_AUDIT, UNSAFE_CONTEXT_TABLE_DESIGN, UNSAFE_OWNERSHIP_TYPES_DESIGN, UNSAFE_FORBID_THREE_CRATES_PLAN and GLM_BRIEF_UNSAFE_CPU_STEP (audits, designs and a brief); UNSAFE_KERNEL_CPU_STEP (a refactor; the seven missing `unsafe` blocks in a model's aarch64-only change were fixed in the merge, before they built anywhere); BUILDING_KERNEL_WITH_LOCAL_AI_PAIN_AND_SUFFERING (an experiment log; its harness fixes are rig changes); RTW89_WIFI_DORMANCY_AUDIT (root cause of the ryzen link drops; the Pop fix is host configuration and the Akuma fixes are planned, not landed, so the `u64` underflow in the `[rtw] link:` gap line stays open); AKUMA_KVM_DEV_CYCLE's new Ports section (a port-allocation note). Fix-shaped commits with no archive doc, uncounted: `0fdf7a7f` (two `akuma-primitives` test fixtures shared a table and raced), `72ff4d3e` (`check_addr_params` truncated at the first `cfg(test)`), `c662d795` (follow-up inside COW_FRESHFRAME_STAGING), `616f704d` (clippy), the `install.sh` and ssh-client `-y` commits (tooling), and the `shanghai` gate commits (rig).
 
 Also scanned 2026-11-16 (closing `ouch`, 29 commits ahead of main, 27 of them not merges: the pre-AMI security audit and its fixes, the userspace review of sshd, box and tar, herd and wifi, the unsafe-site reduction and the shared file offset; 4 archive docs added and 4 per-binary review reports). Counted above: SECURITY_AUDIT_2026_11_16 (Misc / Cross-cutting, 25 bullets), FORKED_DESCRIPTORS_DID_NOT_SHARE_AN_OFFSET (Syscall / ABI), and the four `ISSUES_2026_11_16` reports, sshd under SSH, box and tar under Containers, herd and wifi under Userspace Apps. The sshd review's C1 and C2 are not in that report (it lists them as the audit's) and are counted once, under SECURITY_AUDIT_2026_11_16. No counted fix: UNSAFE_SITE_REDUCTION (a refactor, 367 to 329 `unsafe` sites and the `Pod` rule; the `with_active_mut` aliasing it leaves alone is counted under SECURITY_AUDIT_2026_11_16, and the unaligned canary reads in `talc_dealloc`/`talc_realloc` and the unaligned trailing canary write in `talc_alloc` are dead behind `ENABLE_CANARIES = false`, so no live defect) and TYPE_SYSTEM_SAFETY_REPORT (ranked proposals; its Defects A and B, the AArch64 path read of kernel memory and the unbounded user length reaching `vec!`, are counted under SECURITY_AUDIT_2026_11_16, and its other findings, such as `mremap::plan` not bounding `new_size`, are open). Not counted because they are opt-in and off by default: `dac=1` on the boot line, which turns on mode-bit enforcement before init, and `net.allow=`, which installs the ingress filter; the audit leaves H1 and H5 partly open, and the privileged-port and metadata-address checks from the same commit are counted. Open by their own text: box's B13 (`read_in_container` follows symlinks when it reads the image's `/etc/passwd`), wifi's W6 (a hand-written `passphrase =` value is trimmed; documented, not changed), the audit's H1 remainder, M1, M3 to M6 and M8, the `akuma_switch` functions whose obligations are doc-only, and sshd's missing re-keying and one-channel limit. Fix-shaped commit with no archive doc to cite, not counted: `d1a91089` (`open("file/x", O_CREAT)` with a regular file as the parent returned a descriptor and failed at the first write, so it is `ENOTDIR` at the open, and a failed create fails the open instead of dropping `write_file`'s result; box's review report records the divergence as not fixed and was written before the fix, and a trailing slash on a regular file still resolves to the file). Docs-only and merge commits carry no fix.
+
+Also scanned 2026-11-17 (merging `ec2-setup-review` into `ouch`, the T-series type-safety work): counted above: TYPE_SAFETY_DEFECTS_2026_11_17 (six defects found by the sweep, split across Memory, SMP and Scheduler; the same fixes were previously recorded only in `docs/reference/safety-types.md`). No counted fix: AWS_ENA_DRIVER (a decision and plan; `crates/akuma-net-ena` is not connected to the kernel, so the commit `ena: track ring phase across wraps` is new code in an unused crate, named here as uncounted), TYPE_SYSTEM_SAFETY_REPORT, NEWTYPE_AUDIT and UNSAFE_OWNERSHIP_TYPES_DESIGN (proposals and a design, with in-place corrections), and the `IrqSpinlock` migration of ~30 locks (hardening of locks the audit found no live hang in, except `KEYS`, counted above).
