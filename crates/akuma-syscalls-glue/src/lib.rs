@@ -616,7 +616,19 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         syscall_num,
         nr::RT_SIGPROCMASK | nr::RT_SIGACTION | nr::RT_SIGPENDING | nr::RT_SIGRETURN | nr::SIGALTSTACK
             | nr::KILL | nr::TKILL | nr::TGKILL | nr::AKUMA_KILL | nr::PIDFD_SEND_SIGNAL
+            | nr::CLOCK_GETTIME | nr::CLOCK_GETRES | nr::GETPID | nr::GETPPID | nr::GETTID
+            | nr::GETUID | nr::GETEUID | nr::GETGID | nr::GETEGID | nr::UNAME | nr::SYSINFO
+            | nr::GETRANDOM | nr::GETRLIMIT | nr::PRLIMIT64 | nr::GETRUSAGE | nr::TIMES
+            | nr::SCHED_YIELD | nr::SCHED_GETAFFINITY | nr::SET_TID_ADDRESS
     );
+    // The second list is the calls that **cannot block** and that Linux never
+    // answers `EINTR`. `is_current_interrupted` *consumes* the flag, so a
+    // non-blocking call landing between a signal being posted and its delivery
+    // took the `EINTR` meant for a blocking wait and handed it to a program
+    // that cannot handle it: Rust's `Instant::now()` unwraps `clock_gettime`,
+    // so codex's TUI panicked ("Interrupted system call", std `time.rs`) on
+    // the first terminal resize under herdr
+    // (`docs/archive/CLOCK_GETTIME_EINTR_ON_SIGNAL.md`).
     if !never_interrupted && akuma_exec::process::is_current_interrupted() {
         // **`EINTR`, and nothing else.**
         //
