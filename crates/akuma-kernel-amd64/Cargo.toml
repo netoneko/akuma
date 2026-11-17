@@ -49,6 +49,12 @@ ring0-preempt = []
 # `default` and `headless` add it, its `server` image does not.
 console = []
 
+# `mount -t vfat` (`src/vfat.rs`): FAT12/16/32 with long names, for the EFI System Partition
+# (`/dev/nvme0n1pN`, through the NVMe driver's auxiliary window) and virtio-blk test images.
+# Off by default; ryzen's build enables it. Pulls in `akuma-vfat`, so a build without it
+# carries none of the FAT code and `mount -t vfat` answers `ENODEV` from glue.
+vfat = ["dep:akuma-vfat"]
+
 # The compile-time syscall debug mode the AArch64 kernel has (root
 # `Cargo.toml`'s `syscall-debug-info`): glue's per-arm `[syscall]` lines and the
 # `[FORK-DBG]`/`[TRAMP]` fork/exec/thread-spawn lifecycle traces
@@ -287,6 +293,7 @@ akuma-ext2 = { path = "../akuma-ext2", features = ["bkl-smp"] }
 # The `Filesystem` trait `Ext2Filesystem` implements, plus `FsError`/`Metadata`
 # and the `MS_*` flag words a mount record carries.
 akuma-vfs = { path = "../akuma-vfs" }
+akuma-vfat = { path = "../akuma-vfat", features = ["bkl-smp"], optional = true }
 # **C1 step 4a**: the kernel-side VFS *instance* — the global mount table, the
 # path walk (CWD, `..`, symlinks), the synthetic `/dev` and `/etc/mtab` nodes.
 # `src/fs.rs` carried its own `Spinlock<Option<MountTable>>` and a `with_fs`

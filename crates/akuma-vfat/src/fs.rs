@@ -87,7 +87,7 @@ enum Fat {
     End,
 }
 
-struct State<D> {
+struct State<D: BlockDevice> {
     dev: D,
     g: Geometry,
     now: fn() -> u64,
@@ -98,8 +98,17 @@ struct State<D> {
     fsinfo_invalid: bool,
 }
 
+/// Dropping the last handle (an unmount) is the volume's last chance to leave
+/// FSInfo truthful and the device flushed; `umount(2)` does not call `sync`.
+impl<D: BlockDevice> Drop for State<D> {
+    fn drop(&mut self) {
+        let _ = self.refresh_fsinfo();
+        let _ = self.dev.flush();
+    }
+}
+
 /// A mounted FAT volume.
-pub struct Vfat<D> {
+pub struct Vfat<D: BlockDevice> {
     state: Spinlock<State<D>>,
 }
 

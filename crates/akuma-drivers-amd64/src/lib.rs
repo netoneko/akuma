@@ -96,6 +96,10 @@ pub fn register() {
         close_guest_partition: nvme::close_guest_partition,
         guest_read: nvme::guest_read,
         guest_write: nvme::guest_write,
+        open_aux_partition: nvme::open_aux_partition,
+        close_aux_partition: nvme::close_aux_partition,
+        aux_read: nvme::aux_read,
+        aux_write: nvme::aux_write,
     });
     #[cfg(feature = "i8042")]
     akuma_kernel_amd64::drivers::register_keyboard(akuma_kernel_amd64::drivers::Keyboard {

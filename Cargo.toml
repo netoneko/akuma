@@ -435,6 +435,9 @@ hda = ["akuma-drivers-amd64/hda"]
 i8042 = ["akuma-drivers-amd64/i8042"]
 kvm = ["akuma-drivers-amd64/kvm"]
 nvme = ["akuma-drivers-amd64/nvme"]
+# `mount -t vfat` (EFI System Partition editing): amd64 only, off by default, on for ryzen.
+# Pair it with `nvme` (in `headless`/`all-drivers`) for `/dev/nvme0n1pN` sources.
+vfat = ["akuma-kernel-amd64/vfat"]
 touchpad = ["akuma-drivers-amd64/touchpad"]
 wifi = ["akuma-drivers-amd64/wifi"]
 xhci = ["akuma-drivers-amd64/xhci"]

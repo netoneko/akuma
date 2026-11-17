@@ -633,7 +633,14 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // numbers and are dispatched through the `AKUMA_PRIVATE_BASE` match
         // above (315-318, 324, 325), not here. See
         // `docs/archive/AKUMA_AMD64_BOXES_AUDIT.md`.
-        Syscall::Mount => to_glue(call, [a1, a2, a3, a4, a5, 0]),
+        Syscall::Mount => {
+            // FAT spellings are this kernel's (feature `vfat`); everything else is glue's.
+            #[cfg(feature = "vfat")]
+            let ours = crate::vfat::try_mount(a1, a2, a3, a4);
+            #[cfg(not(feature = "vfat"))]
+            let ours: Option<u64> = None;
+            ours.unwrap_or_else(|| to_glue(call, [a1, a2, a3, a4, a5, 0]))
+        }
         Syscall::Umount2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `readlinkat` / `symlinkat` — **served by glue** (4b step 2, batch 1).
         // Glue's readlinkat is strictly more than the arm it replaces: it

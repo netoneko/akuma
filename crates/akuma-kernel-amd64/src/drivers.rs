@@ -645,6 +645,12 @@ pub struct Nvme {
     pub close_guest_partition: fn(),
     pub guest_read: fn(offset: u64, buf: &mut [u8]) -> Result<(), &'static str>,
     pub guest_write: fn(offset: u64, data: &[u8]) -> Result<(), &'static str>,
+    /// A third window, for the EFI System Partition the host mounts as `vfat`: opened by GPT
+    /// number (refused when it is the root's or overlaps it), size in bytes.
+    pub open_aux_partition: fn(number: u32) -> Result<u64, &'static str>,
+    pub close_aux_partition: fn(),
+    pub aux_read: fn(offset: u64, buf: &mut [u8]) -> Result<(), &'static str>,
+    pub aux_write: fn(offset: u64, data: &[u8]) -> Result<(), &'static str>,
 }
 
 static NVME: Registered<Nvme> = Registered::new("no NVMe driver registered");
@@ -700,6 +706,30 @@ pub fn nvme_close_guest_partition() {
     if let Some(d) = NVME.get() {
         (d.close_guest_partition)();
     }
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_open_aux_partition(number: u32) -> Result<u64, &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.open_aux_partition)(number))
+}
+
+pub fn nvme_close_aux_partition() {
+    if let Some(d) = NVME.get() {
+        (d.close_aux_partition)();
+    }
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_aux_read(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.aux_read)(offset, buf))
+}
+
+/// # Errors
+/// The driver's, or [`NO_DRIVER`].
+pub fn nvme_aux_write(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    NVME.get().map_or(Err(NO_DRIVER), |d| (d.aux_write)(offset, data))
 }
 
 /// # Errors

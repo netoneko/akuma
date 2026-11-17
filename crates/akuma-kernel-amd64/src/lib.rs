@@ -141,6 +141,9 @@ mod sock;
 /// `clone(CLONE_VM|CLONE_THREAD)`: threads sharing one address space.
 mod thread;
 mod uaccess;
+/// `mount -t vfat` (feature `vfat`).
+#[cfg(all(target_arch = "x86_64", feature = "vfat"))]
+mod vfat;
 #[cfg(target_arch = "x86_64")]
 mod splash;
 /// The boot suite's view of this crate (`crates/akuma-kernel-tests-amd64`): one

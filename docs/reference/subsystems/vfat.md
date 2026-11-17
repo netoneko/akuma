@@ -4,9 +4,10 @@
 `BlockDevice`. Exists so Akuma can edit the EFI System Partition (GRUB's
 `grub.cfg`) from userspace instead of rebooting into something else.
 
-> **Stability: C (new, not yet wired into a kernel).** The crate is host-tested
-> and `fsck.vfat -n` accepts everything it writes, but **no kernel mounts it
-> yet** — see "Not done" below. Verify behaviour before relying on it.
+> **Stability: C (new).** Host-tested, `fsck.vfat -n` accepts everything it
+> writes, and the amd64 kernel mounts it under QEMU (virtio-blk and NVMe, see
+> "Kernel wiring"). **Not yet run on the ryzen's real ESP.** Verify behaviour
+> before relying on it.
 
 ## Provenance
 
@@ -55,12 +56,48 @@ implementation's source was read; keep it that way.
 - **Failed writes give back what they allocated** (`write_file_data` shrinks to
   the old size), so `NoSpace` does not leak clusters.
 
+## Kernel wiring (amd64 only, feature `vfat`)
+
+```bash
+# ryzen: the default image plus the feature
+cargo build -p akuma --target x86_64-unknown-none --release --features vfat
+# anywhere else it is just added to the lean image
+cargo build -p akuma --target x86_64-unknown-none --release --no-default-features --features headless,vfat
+```
+
+Then, as root (box 0):
+
+```
+mkdir -p /boot/efi && mount -t vfat /dev/nvme0n1p1 /boot/efi
+vi /boot/efi/EFI/.../grub.cfg
+umount /boot/efi        # or just `reboot`: both leave FSInfo truthful and flush NVMe
+```
+
+- **Not in `akuma-syscalls-glue`.** `mount(2)` is shared with the AArch64
+  kernel, which does not get this. The amd64 dispatcher offers every `mount` to
+  `crates/akuma-kernel-amd64/src/vfat.rs::try_mount` first; it answers only for
+  `vfat`/`msdos`/`fat*` (and not for `MS_REMOUNT`, which glue's flag flip
+  handles) and returns `None` for the rest. Without the feature the arm compiles
+  to glue alone and `-t vfat` is `ENODEV`.
+- **Sources.** `/dev/vdX` is a whole virtio-blk disk (a VMM test image).
+  `/dev/nvme0n1pN` is GPT partition `N` through a **third window** in the NVMe
+  driver (`nvme::open_aux_partition`, beside the root's and the hypervisor
+  guest's): validated by the same GPT code, refused (`EBUSY`) when it is the
+  root's partition or overlaps the root's or the guest's, one at a time. The
+  controller is brought up on demand, so a box whose root is not NVMe can still
+  mount an ESP. The window closes when the filesystem is dropped (unmount),
+  flushing the controller's cache. A new class slot, not a driver `cfg`, in the
+  machine half.
+- **Unmount does the sync.** `umount2` does not call `Filesystem::sync`, so
+  `Vfat`'s `Drop` (the last `Arc` going) refreshes FSInfo and flushes.
+- **Clock.** `clock::now_us`, which is 0 before the first SNTP sync: a write
+  before then is stamped 1980, the FAT epoch.
+
 ## Not done
 
-- **Kernel wiring.** Nothing registers `Vfat` with `mount(2)`'s `fstype`
-  switch or provides the ESP's `BlockDevice` adapter (the GPT partition window
-  on NVMe/virtio). That, plus a clock (`now: fn() -> u64`), is the next step for
-  "edit grub.cfg from Akuma".
+- **Never run on ryzen's ESP.** Only QEMU. A real ESP may hold things this was
+  not tried against (FAT32 with a 4 KiB-sector NVMe namespace: the crate
+  supports 512..4096-byte sectors, the QEMU rig only exercises 512).
 - `*_by_inode` methods (no stable inode), `link`, `symlink`, `chown`,
   `fallocate` — `NotSupported`, like the trait default. `chmod` maps only the
   write bits onto the READ_ONLY attribute.
@@ -76,6 +113,19 @@ implementation's source was read; keep it that way.
 ```bash
 cargo test -p akuma-vfat --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)
 ```
+
+Kernel boot gates (QEMU, need dosfstools and e2fsprogs; both exit 0 only on a
+guest `VFATPROBE PASS` **and** a clean host `fsck.vfat -n`):
+
+```bash
+FAT=16 SIZE_MIB=64 sh amd64/run-vfat.sh   # virtio-blk, -M microvm (FAT=12 SIZE_MIB=8, FAT=32 SIZE_MIB=128 also pass)
+sh amd64/run-vfat-nvme.sh                 # NVMe ESP, -M q35, root on USB; also checks a decoy partition is byte-identical
+```
+
+`userspace/vfatprobe` is the guest half (mount, `mkdir`, create, rewrite
+longer/shorter, append, long names, rename, unlink, `rmdir`, unmount, remount,
+re-verify). It needs no busybox; on an image with one, `mount -t vfat` is the
+same syscall.
 
 `src/tests.rs` — layout vectors and a RAM-disk suite run on FAT12/16/32.
 `tests/interop.rs` — formats with our `format` and runs `fsck.vfat -n` over a

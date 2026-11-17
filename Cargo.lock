@@ -562,6 +562,7 @@ dependencies = [
  "akuma-user-space",
  "akuma-user-tree",
  "akuma-usermode-amd64",
+ "akuma-vfat",
  "akuma-vfs",
  "akuma-vfs-glue",
  "akuma-virtio",

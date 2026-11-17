@@ -472,3 +472,20 @@ fn fat12_odd_and_even_entries_do_not_disturb_neighbours() {
         assert_eq!(fs.read_file(&std::format!("/f{i}")).unwrap(), vec![i as u8; cb * 3 + 1]);
     }
 }
+
+#[test]
+fn dropping_the_mount_leaves_fsinfo_truthful() {
+    let (ram, fs) = make(FatKind::Fat32, 64);
+    let g = fs.geometry();
+    fs.write_file("/a", &vec![1u8; 100_000]).unwrap();
+    let free = fs.stats().unwrap().free_blocks as u32;
+    let info = u64::from(g.fsinfo_sector) * u64::from(g.bytes_per_sector);
+    let word = |off: u64| {
+        let mut b = [0u8; 4];
+        ram.read_bytes(info + off, &mut b).unwrap();
+        u32::from_le_bytes(b)
+    };
+    assert_eq!(word(488), u32::MAX, "unknown while dirty");
+    drop(fs); // an unmount
+    assert_eq!(word(488), free, "free count written back on drop");
+}

@@ -140,6 +140,9 @@ struct Nvme {
     /// A partition lent to the hypervisor's guest ([`open_guest_partition`]): its own window,
     /// checked by the same code as the host's, and never the host's own.
     guest: Option<Window>,
+    /// A partition the host mounts besides its root ([`open_aux_partition`]): the EFI System
+    /// Partition. Its own window, never the root's and never the guest's.
+    aux: Option<Window>,
     /// A command timed out or the controller reported fatal status; the
     /// controller has been disabled and nothing more is issued.
     dead: bool,
@@ -367,6 +370,7 @@ pub fn init() -> Result<(), &'static str> {
         window: None,
         host_part: 0,
         guest: None,
+        aux: None,
         dead: false,
     };
 
@@ -475,8 +479,72 @@ pub fn open_guest_partition(number: u32) -> Result<u64, &'static str> {
     if w.first_lba < host.first_lba + host.lbas && host.first_lba < w.first_lba + w.lbas {
         return Err("that partition overlaps the host's");
     }
+    if n.aux.is_some_and(|a| overlaps(w, a)) {
+        return Err("that partition is mounted by the host");
+    }
     n.guest = Some(w);
     Ok(w.bytes())
+}
+
+fn overlaps(a: Window, b: Window) -> bool {
+    a.first_lba < b.first_lba + b.lbas && b.first_lba < a.first_lba + a.lbas
+}
+
+/// Open partition `number` as the host's **auxiliary** window (the EFI System Partition, for a
+/// `vfat` mount). A third window beside the root's and the guest's, validated by the same GPT
+/// code, and refused when it is the root partition or overlaps the root's or the guest's: a
+/// FAT driver must never be pointed at the disk's ext2 root. One at a time. Brings the
+/// controller up if nothing has (a box whose root is not on NVMe). Returns its size in bytes.
+pub fn open_aux_partition(number: u32) -> Result<u64, &'static str> {
+    init()?;
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    if n.aux.is_some() {
+        return Err("an auxiliary partition is already open");
+    }
+    if number == n.host_part {
+        return Err("that partition is the host's root");
+    }
+    let w = partition_window(n, number)?;
+    if n.window.is_some_and(|h| overlaps(w, h)) {
+        return Err("that partition overlaps the host's root");
+    }
+    if n.guest.is_some_and(|h| overlaps(w, h)) {
+        return Err("that partition overlaps the guest's");
+    }
+    n.aux = Some(w);
+    Ok(w.bytes())
+}
+
+/// Give the auxiliary partition back (flushing the controller's cache first).
+pub fn close_aux_partition() {
+    let mut g = NVME.lock();
+    let Some(n) = g.as_mut() else { return };
+    if n.aux.take().is_some() && !n.dead {
+        let _ = n.submit(false, cmd::flush(0, NSID), "flush auxiliary partition");
+    }
+}
+
+/// [`read_bytes`] within the **auxiliary** partition.
+pub fn aux_read(offset: u64, buf: &mut [u8]) -> Result<(), &'static str> {
+    if buf.is_empty() {
+        return Ok(());
+    }
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    let w = n.aux.ok_or("no auxiliary partition open")?;
+    read_in(n, w, offset, buf)
+}
+
+/// [`write_bytes`] within the **auxiliary** partition.
+pub fn aux_write(offset: u64, data: &[u8]) -> Result<(), &'static str> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    let mut g = NVME.lock();
+    let n = g.as_mut().ok_or("NVMe not initialised")?;
+    let w = n.aux.ok_or("no auxiliary partition open")?;
+    write_in(n, w, offset, data)
 }
 
 /// Give the guest's partition back (flushing the controller's cache first).
