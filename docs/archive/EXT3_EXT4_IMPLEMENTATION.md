@@ -27,7 +27,7 @@ recovered in memory on a read-only mount, as described below.
 
 The `journal::plan_replay` parser reads a bounded, classic
 32-bit unchecksummed journal into a read-only plan, handling completed
-transactions, revocations, escaped blocks and ring/sequence wrap. It is not
+transactions, revocations, escaped blocks and ring/sequence wrap. It is
 applied to a read-only in-memory device overlay through `recover_read_only`;
 the normal read-only guest mount path tries that recovery after an unsupported
 clean mount. The backing device is never written. This path only supports
@@ -45,6 +45,15 @@ clears the journal and recovery marker with barriers. Superblock after-images
 retain the recovery bit until the final marker update. It requires an exclusive
 device with a truthful flush and atomic persistence for the sectors carrying
 recovery metadata; this contract has not yet been established for every device.
+
+`JournaledDevice` stages writes and commits them with this writer. It requires
+an explicit `JournalStorage` implementation that promises both stable barriers
+and atomic sector writes; a generic virtio device does not claim the latter.
+The device poisons itself after staging or commit failures. It cannot stop a
+filesystem from serving already cached data after an abort, detect a killed
+caller, or provide per-operation serialization: the future VFS integration
+must handle those conditions. A host-only test brackets existing filesystem
+operations manually and checks the committed image with `e2fsck`.
 
 A host-only adapter stages the existing ext2 mutation paths against an ext3
 image and commits successful operations. Create, rename, unlink and truncate

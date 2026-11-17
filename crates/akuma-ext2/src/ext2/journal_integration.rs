@@ -176,3 +176,80 @@ fn staged_ext3_mutations_survive_journal_commit_and_fsck() {
     assert_eq!(output.stdout, b"journaled");
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+/// The production transaction device is exercised here under explicit,
+/// test-only operation bracketing. VFS does not yet provide this bracketing.
+#[test]
+fn transaction_device_commits_filesystem_operations_to_ext3() {
+    use super::journal::device::{JournaledDevice, JournalStorage};
+    use alloc::collections::BTreeSet;
+    #[derive(Clone)]
+    struct Disk(Arc<Spinlock<Vec<u8>>>);
+    impl BlockDevice for Disk {
+        fn read_bytes(&self, offset: u64, out: &mut [u8]) -> Result<(), ()> {
+            let bytes = self.0.lock(); let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(out.len()).ok_or(())?;
+            out.copy_from_slice(bytes.get(start..end).ok_or(())?); Ok(())
+        }
+        fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+            let mut bytes = self.0.lock(); let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(data.len()).ok_or(())?;
+            bytes.get_mut(start..end).ok_or(())?.copy_from_slice(data); Ok(())
+        }
+        fn flush(&self) -> Result<(), ()> { Ok(()) }
+    }
+    impl JournalStorage for Disk { fn atomic_write_bytes(&self) -> usize { 512 } }
+
+    let dir = std::env::temp_dir().join(std::format!("akuma-ext3-device-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    std::fs::File::create(&image).unwrap().set_len(32 * 1024 * 1024).unwrap();
+    assert!(Command::new("mke2fs").args(["-q", "-F", "-t", "ext3", "-b", "1024"]).arg(&image).status().unwrap().success());
+    let disk = Disk(Arc::new(Spinlock::new(std::fs::read(&image).unwrap())));
+    let (journal, protected, uuid) = {
+        let fs = Ext2Filesystem::new_with_options(disk.clone(), || 0, None, MountMode::ReadOnly).unwrap();
+        let state = fs.read_state();
+        let inode = fs.read_inode(&state, 8).unwrap();
+        let mut map = Vec::new();
+        for logical in 0..inode.file_size() / BS as u64 {
+            map.push(fs.get_block_num(&state, &inode, logical as u32).unwrap().unwrap());
+        }
+        fn protect_indirect<B: BlockDevice>(fs: &Ext2Filesystem<B>, state: &Ext2State, block: u32, depth: u8, out: &mut BTreeSet<u32>) {
+            if block == 0 { return; }
+            assert!(out.insert(block));
+            if depth > 1 {
+                let data = fs.read_block(state, block).unwrap();
+                for entry in data.chunks_exact(4) {
+                    let child = u32::from_le_bytes(entry.try_into().unwrap());
+                    if child != 0 { protect_indirect(fs, state, child, depth - 1, out); }
+                }
+            }
+        }
+        let mut protected = BTreeSet::new();
+        protect_indirect(&fs, &state, inode.indirect_block, 1, &mut protected);
+        protect_indirect(&fs, &state, inode.double_indirect_block, 2, &mut protected);
+        protect_indirect(&fs, &state, inode.triple_indirect_block, 3, &mut protected);
+        (map, protected, state.superblock.uuid)
+    };
+    let dev = JournaledDevice::new(disk.clone(), BS, 32768, journal, protected, uuid).unwrap();
+    let fs = Ext2Filesystem::new_internal(dev, || 0, None, MountMode::ReadWrite, false, true).unwrap();
+    fs.dev.begin().unwrap(); fs.create_dir("/test").unwrap(); fs.sync().unwrap();
+    let before = disk.0.lock().clone();
+    fs.dev.begin().unwrap(); fs.write_file("/test/a", b"transaction device\n").unwrap();
+    assert_eq!(*disk.0.lock(), before, "staging must not write the backing image");
+    assert_eq!(fs.read_file("/test/a").unwrap(), b"transaction device\n");
+    fs.sync().unwrap();
+    fs.dev.begin().unwrap(); fs.rename("/test/a", "/test/b").unwrap(); fs.sync().unwrap();
+    assert_eq!(fs.read_file("/test/b").unwrap(), b"transaction device\n");
+    std::fs::write(&image, &*disk.0.lock()).unwrap();
+    let result = Command::new("e2fsck").args(["-fn"]).arg(&image).output().unwrap();
+    assert!(result.status.success(), "{}", std::string::String::from_utf8_lossy(&result.stdout));
+    let result = Command::new("debugfs").args(["-R", "cat /test/b"]).arg(&image).output().unwrap();
+    assert_eq!(result.stdout, b"transaction device\n");
+    let before = disk.0.lock().clone();
+    fs.dev.begin().unwrap(); fs.write_file("/test/b", b"discarded").unwrap(); fs.dev.abort();
+    assert!(fs.dev.is_poisoned());
+    assert_eq!(*disk.0.lock(), before, "aborted staged writes must not reach home blocks");
+    let mut byte = [0]; assert!(fs.dev.read_bytes(0, &mut byte).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}

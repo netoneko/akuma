@@ -37,9 +37,14 @@ impl WriteSet {
         let first = u32::try_from(offset / bs).map_err(|_| FsError::NotSupported)?;
         let last = u32::try_from((end - 1) / bs).map_err(|_| FsError::NotSupported)?;
         if last >= self.filesystem_blocks { return Err(FsError::NotSupported); }
-        let missing_count = (first..=last).filter(|n| !self.blocks.contains_key(n)).count();
-        if self.blocks.len().checked_add(missing_count).ok_or(FsError::NoSpace)? > self.max_blocks {
-            return Err(FsError::NoSpace);
+        let mut missing_count = 0usize;
+        for block in first..=last {
+            if !self.blocks.contains_key(&block) {
+                missing_count += 1;
+                if self.blocks.len().checked_add(missing_count).ok_or(FsError::NoSpace)? > self.max_blocks {
+                    return Err(FsError::NoSpace);
+                }
+            }
         }
         let mut missing = Vec::with_capacity(missing_count);
         for block in first..=last {

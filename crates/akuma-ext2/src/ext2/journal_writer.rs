@@ -154,10 +154,29 @@ mod tests {
 
     #[derive(Clone)]
     struct Image { journal: Vec<Vec<u8>>, home: BTreeMap<u32, Vec<u8>>, recovery: bool }
+    #[derive(Clone)]
+    enum Write { Journal(u32, Vec<u8>), Home(u32, Vec<u8>), Recovery(bool) }
+    impl Write {
+        fn apply(&self, image: &mut Image) {
+            match self {
+                Self::Journal(block, data) => image.journal[*block as usize].copy_from_slice(data),
+                Self::Home(block, data) => {
+                    if *block == 1 { image.recovery = data[96] & 4 != 0; }
+                    image.home.insert(*block, data.clone());
+                }
+                Self::Recovery(required) => {
+                    image.recovery = *required;
+                    if *required { image.home.get_mut(&1).unwrap()[96] |= 4; }
+                    else { image.home.get_mut(&1).unwrap()[96] &= !4; }
+                }
+            }
+        }
+    }
     struct Sim {
         live: Image,
         durable: Image,
         snapshots: Vec<Image>,
+        pending: Vec<Write>,
         steps: usize,
         fail_at: Option<usize>,
     }
@@ -175,7 +194,7 @@ mod tests {
             home.insert(1, superblock);
             home.insert(22, vec![0x11; BS]); home.insert(23, vec![0x22; BS]);
             let image = Image { journal, home, recovery: false };
-            Self { live: image.clone(), durable: image.clone(), snapshots: vec![image], steps: 0, fail_at: None }
+            Self { live: image.clone(), durable: image.clone(), snapshots: vec![image], pending: Vec::new(), steps: 0, fail_at: None }
         }
         fn before(&mut self) -> Result<(), FsError> {
             self.steps += 1;
@@ -183,30 +202,39 @@ mod tests {
             Ok(())
         }
         fn snapshot(&mut self) {
-            // Two legal power-loss outcomes: all writes since the last barrier
-            // made it, or none did. Prefixes are captured after every write.
-            self.snapshots.push(self.live.clone());
-            self.snapshots.push(self.durable.clone());
+            // A device may persist any subset of writes since its last
+            // barrier. Enumerate them independently, including out-of-order
+            // checkpoint writes, for each crash point.
+            assert!(self.pending.len() <= 10);
+            for mask in 0..(1usize << self.pending.len()) {
+                let mut image = self.durable.clone();
+                for (i, write) in self.pending.iter().enumerate() {
+                    if mask & (1 << i) != 0 { write.apply(&mut image); }
+                }
+                self.snapshots.push(image);
+            }
         }
     }
     impl JournalIo for Sim {
         fn read_journal(&mut self, block: u32) -> Result<Vec<u8>, FsError> { self.before()?; Ok(self.live.journal[block as usize].clone()) }
         fn write_journal(&mut self, block: u32, data: &[u8]) -> Result<(), FsError> {
-            self.before()?; self.live.journal[block as usize].copy_from_slice(data); self.snapshot(); Ok(())
+            self.before()?; self.live.journal[block as usize].copy_from_slice(data);
+            self.pending.push(Write::Journal(block, data.to_vec())); self.snapshot(); Ok(())
         }
         fn write_home(&mut self, block: u32, data: &[u8]) -> Result<(), FsError> {
             self.before()?;
             if block == 1 { self.live.recovery = data[96] & 4 != 0; }
-            self.live.home.insert(block, data.to_vec()); self.snapshot(); Ok(())
+            self.live.home.insert(block, data.to_vec());
+            self.pending.push(Write::Home(block, data.to_vec())); self.snapshot(); Ok(())
         }
         fn set_recovery(&mut self, required: bool) -> Result<(), FsError> {
             self.before()?; self.live.recovery = required;
             if required { self.live.home.get_mut(&1).unwrap()[96] |= 4; }
             else { self.live.home.get_mut(&1).unwrap()[96] &= !4; }
-            self.snapshot(); Ok(())
+            self.pending.push(Write::Recovery(required)); self.snapshot(); Ok(())
         }
         fn flush(&mut self) -> Result<(), FsError> {
-            self.before()?; self.durable = self.live.clone(); self.snapshot(); Ok(())
+            self.before()?; self.durable = self.live.clone(); self.pending.clear(); self.snapshot(); Ok(())
         }
         fn home_is_allowed(&self, block: u32) -> bool { block == 1 || block >= 16 }
     }
