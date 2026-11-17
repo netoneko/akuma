@@ -562,31 +562,29 @@ impl Default for ProcessChannel {
 }
 
 /// Global registry mapping thread IDs to their process channels
-static PROCESS_CHANNELS: Spinlock<BTreeMap<usize, Arc<ProcessChannel>>> =
-    Spinlock::new(BTreeMap::new());
+static PROCESS_CHANNELS: akuma_irq_lock::IrqSpinlock<BTreeMap<usize, Arc<ProcessChannel>>> =
+    akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 /// Global registry mapping thread IDs to their shared terminal states
-static TERMINAL_STATES: Spinlock<BTreeMap<usize, Arc<Spinlock<terminal::TerminalState>>>> =
-    Spinlock::new(BTreeMap::new());
+static TERMINAL_STATES: akuma_irq_lock::IrqSpinlock<BTreeMap<usize, Arc<Spinlock<terminal::TerminalState>>>> =
+    akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 /// Per-thread registry accessors. Both statics above are the same shape
 /// (`tid -> Arc<_>`) and their six accessors were the same three bodies twice
 /// over; these are the single copy. Like the FIFO helpers, each takes exactly
-/// one registry, and each runs under `with_irqs_disabled` — a timer tick inside
-/// the hold would let a spinner that *does* have IRQs off wedge the holder off
-/// the CPU permanently (the freeze reproduced in `wake_pollers`).
-fn registry_insert<T>(reg: &Spinlock<BTreeMap<usize, T>>, thread_id: usize, value: T) {
-    with_irqs_disabled(|| {
-        reg.lock().insert(thread_id, value);
-    });
+/// one registry. Both statics are `IrqSpinlock`s, so each hold is IRQ-masked by `lock()` itself: a timer tick inside
+/// the hold would let a spinner that *does* have IRQs off wedge the holder off the CPU permanently (the freeze
+/// reproduced in `wake_pollers`).
+fn registry_insert<T>(reg: &akuma_irq_lock::IrqSpinlock<BTreeMap<usize, T>>, thread_id: usize, value: T) {
+    reg.lock().insert(thread_id, value);
 }
 
-fn registry_get<T: Clone>(reg: &Spinlock<BTreeMap<usize, T>>, thread_id: usize) -> Option<T> {
-    with_irqs_disabled(|| reg.lock().get(&thread_id).cloned())
+fn registry_get<T: Clone>(reg: &akuma_irq_lock::IrqSpinlock<BTreeMap<usize, T>>, thread_id: usize) -> Option<T> {
+    reg.lock().get(&thread_id).cloned()
 }
 
-fn registry_remove<T>(reg: &Spinlock<BTreeMap<usize, T>>, thread_id: usize) -> Option<T> {
-    with_irqs_disabled(|| reg.lock().remove(&thread_id))
+fn registry_remove<T>(reg: &akuma_irq_lock::IrqSpinlock<BTreeMap<usize, T>>, thread_id: usize) -> Option<T> {
+    reg.lock().remove(&thread_id)
 }
 
 /// Register a process channel for a thread
