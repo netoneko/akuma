@@ -38,7 +38,7 @@ publishing the mount. A host test constructs a committed transaction on a real
 ext3 image and compares the recovered contents with `e2fsck` journal replay.
 
 The independent classic JBD transaction writer and block-level staging buffer
-are available as building blocks, but are not connected to a writable mount.
+are available as building blocks; ordinary kernel writable mounts remain gated.
 The writer sets and flushes the recovery marker, writes and flushes staged log
 blocks, publishes and flushes the journal start, commits, then checkpoints and
 clears the journal and recovery marker with barriers. Superblock after-images
@@ -49,11 +49,22 @@ recovery metadata; this contract has not yet been established for every device.
 `JournaledDevice` stages writes and commits them with this writer. It requires
 an explicit `JournalStorage` implementation that promises both stable barriers
 and atomic sector writes; a generic virtio device does not claim the latter.
-The device poisons itself after staging or commit failures. It cannot stop a
-filesystem from serving already cached data after an abort, detect a killed
-caller, or provide per-operation serialization: the future VFS integration
-must handle those conditions. A host-only test brackets existing filesystem
-operations manually and checks the committed image with `e2fsck`.
+The device poisons itself after staging or commit failures, and the ext2
+filesystem checks that state before serving cached reads. The separate
+`JournaledFilesystem` wrapper serializes operations, commits successful
+mutations, and poisons before abandoning a dead transaction holder. Host-only
+tests exercise it against ext3, including concurrent writes and an abandoned
+holder. The wrapper cancels an empty transaction when an error occurs before
+the filesystem write lock was taken; errors after that point poison the mount
+because in-memory rollback is not implemented. That remains restrictive for
+general writable use. The underlying device and cache locks also need a
+complete killed-thread audit before enabling ordinary guest writes.
+
+`ext3-qemu-write-test` enables a separate `ext3test` mount type solely for
+disposable QEMU tests. Its adapter assumes atomic 512-byte writes for a guest
+stop, a property generic virtio does not promise for a host power failure.
+`scripts/probes/ext_rw_qemu.sh` boots such a guest, runs file mutations and
+checks the resulting image with `e2fsck -fn`; the feature is off by default.
 
 A host-only adapter stages the existing ext2 mutation paths against an ext3
 image and commits successful operations. Create, rename, unlink and truncate

@@ -62,3 +62,8 @@ akuma-vfs = { path = "../../crates/akuma-vfs", optional = true }
 name = "ext-ro-probe"
 path = "src/bin/ext-ro-probe.rs"
 required-features = ["akuma"]
+
+[[bin]]
+name = "ext-rw-probe"
+path = "src/bin/ext-rw-probe.rs"
+required-features = ["akuma"]

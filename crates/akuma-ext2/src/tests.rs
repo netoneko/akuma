@@ -841,7 +841,7 @@ fn reuse_space_after_removal() {
 extern crate std;
 static PIN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn pin_test_serial() -> std::sync::MutexGuard<'static, ()> {
+pub(crate) fn pin_test_serial() -> std::sync::MutexGuard<'static, ()> {
     PIN_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 

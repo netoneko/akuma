@@ -26,6 +26,22 @@ impl BlockDevice for KernelBlockDevice {
     }
 }
 
+/// Disposable QEMU-only test adapter. QEMU guest-stop testing assumes
+/// completed 512-byte writes are atomic; virtio itself does not promise this
+/// for a host power failure. Never enabled in ordinary kernel profiles.
+#[cfg(feature = "ext3-qemu-write-test")]
+impl akuma_ext2::journal::device::JournalStorage for KernelBlockDevice {
+    fn atomic_write_bytes(&self) -> usize { 512 }
+}
+
+#[cfg(feature = "ext3-qemu-write-test")]
+pub fn mount_qemu_write_test(idx: usize, cache_cap: Option<usize>) -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
+    let fs = akuma_ext2::journal::filesystem::JournaledFilesystem::mount(
+        KernelBlockDevice { idx }, || crate::utc_time_us().unwrap_or(0), cache_cap,
+    )?;
+    Ok(Arc::new(fs))
+}
+
 /// Mount ext2 from the boot device (`vda`), cache sized from the global cap.
 pub fn mount() -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
     mount_device(0, None, MountMode::ReadWrite)

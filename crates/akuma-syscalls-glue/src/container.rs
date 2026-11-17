@@ -229,6 +229,15 @@ pub(super) fn sys_mount(
     let fs: alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem> = match fstype.as_str() {
         "proc" => alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
+        #[cfg(feature = "ext3-qemu-write-test")]
+        "ext3test" => {
+            let Some(idx) = akuma_virtio::block::device_index_by_name(&source) else { return Err(Errno::ENODEV); };
+            if flags & akuma_vfs::MS_RDONLY != 0 { return Err(Errno::EINVAL); }
+            match akuma_vfs_glue::ext2::mount_qemu_write_test(idx, Some(16 * 1024 * 1024)) {
+                Ok(fs) => fs,
+                Err(_) => return Err(Errno::ENODEV),
+            }
+        }
         "ext2" | "ext3" | "ext4" => {
             // The source must name a registered block device (vdb, /dev/vdb, …).
             // The boot disk (vda) is deliberately mountable here too — it is

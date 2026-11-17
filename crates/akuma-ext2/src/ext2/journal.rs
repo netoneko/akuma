@@ -3,6 +3,9 @@
 
 use akuma_vfs::FsError;
 
+#[path = "journal_filesystem.rs"]
+pub mod filesystem;
+
 #[path = "journal_device.rs"]
 pub mod device;
 

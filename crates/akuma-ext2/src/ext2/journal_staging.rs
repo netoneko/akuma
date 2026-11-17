@@ -71,6 +71,8 @@ impl WriteSet {
     /// Read a staged block, if present; absent blocks must be read from home.
     pub fn get(&self, block: u32) -> Option<&[u8]> { self.blocks.get(&block).map(Vec::as_slice) }
 
+    pub fn is_empty(&self) -> bool { self.blocks.is_empty() }
+
     /// Return the staged after-images, consuming the write set.
     pub fn into_blocks(self) -> Vec<ReplayBlock> {
         self.blocks.into_iter().map(|(home, data)| ReplayBlock { home, data }).collect()

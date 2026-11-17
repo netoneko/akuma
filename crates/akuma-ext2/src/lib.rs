@@ -31,6 +31,10 @@ pub use ext2::RecoveryDevice;
 /// Trait abstracting raw block device I/O.
 #[allow(clippy::result_unit_err)]
 pub trait BlockDevice: Send + Sync {
+    /// Whether this device has permanently failed and cached filesystem data
+    /// must no longer be served. Ordinary block devices remain healthy.
+    fn is_failed(&self) -> bool { false }
+
     /// Read `buf.len()` bytes starting at byte offset `offset`.
     fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()>;
 

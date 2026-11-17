@@ -2,8 +2,10 @@
 //! writable filesystem mount: callers must bracket every mutation and stop
 //! using their filesystem instance if a transaction is aborted or fails.
 
-use alloc::{collections::BTreeSet, vec, vec::Vec};
-use spinning_top::Spinlock;
+use alloc::{boxed::Box, collections::BTreeSet, vec, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::ops::Range;
+use akuma_locks_rw_cell::RecoverableCell;
 use akuma_vfs::FsError;
 use crate::BlockDevice;
 use super::{staging::WriteSet, writer::{self, JournalIo}};
@@ -18,7 +20,6 @@ pub trait JournalStorage: BlockDevice {
 
 struct State {
     active: Option<WriteSet>,
-    poisoned: bool,
 }
 
 /// A device that stages writes until an explicit journal commit.
@@ -34,16 +35,18 @@ pub struct JournaledDevice<B: JournalStorage> {
     filesystem_blocks: u32,
     journal: Vec<u32>,
     protected: BTreeSet<u32>,
+    journal_inode: Range<u64>,
     uuid: [u8; 16],
     max_blocks: usize,
-    state: Spinlock<State>,
+    state: Box<RecoverableCell<State>>,
+    poisoned: AtomicBool,
 }
 
 impl<B: JournalStorage> JournaledDevice<B> {
     /// Create an idle transaction device over a previously validated clean
     /// internal journal. `protected` must include journal mapping metadata as
     /// well as every journal data block; all mappings are filesystem-relative.
-    pub fn new(dev: B, block_size: usize, filesystem_blocks: u32, journal: Vec<u32>, mut protected: BTreeSet<u32>, uuid: [u8; 16]) -> Result<Self, FsError> {
+    pub fn new(dev: B, block_size: usize, filesystem_blocks: u32, journal: Vec<u32>, mut protected: BTreeSet<u32>, journal_inode: Range<u64>, uuid: [u8; 16]) -> Result<Self, FsError> {
         let atomic = dev.atomic_write_bytes();
         if !(1024..=65536).contains(&block_size) || !block_size.is_power_of_two()
             || atomic < 512 || !atomic.is_power_of_two() || atomic > block_size
@@ -52,11 +55,19 @@ impl<B: JournalStorage> JournaledDevice<B> {
         }
         let mut unique = BTreeSet::new();
         for &block in &journal {
-            if block >= filesystem_blocks || !unique.insert(block) { return Err(FsError::Corrupt); }
+            if block >= filesystem_blocks || protected.contains(&block) || !unique.insert(block) { return Err(FsError::Corrupt); }
             protected.insert(block);
         }
         if protected.iter().any(|&block| block >= filesystem_blocks) { return Err(FsError::Corrupt); }
         if protected.contains(&((1024 / block_size) as u32)) { return Err(FsError::Corrupt); }
+        if journal_inode.start >= journal_inode.end || journal_inode.end > u64::from(filesystem_blocks) * block_size as u64 {
+            return Err(FsError::Corrupt);
+        }
+        let first_inode_block = (journal_inode.start / block_size as u64) as u32;
+        let last_inode_block = ((journal_inode.end - 1) / block_size as u64) as u32;
+        if (first_inode_block..=last_inode_block).any(|block| protected.contains(&block) || block == (1024 / block_size) as u32) {
+            return Err(FsError::Corrupt);
+        }
         let mut js = vec![0; block_size];
         dev.read_bytes(u64::from(journal[0]) * block_size as u64, &mut js).map_err(|_| FsError::IoError)?;
         super::validate_clean(&js, block_size, journal.len() as u64, &uuid)?;
@@ -71,48 +82,72 @@ impl<B: JournalStorage> JournaledDevice<B> {
         let descriptor_capacity = (block_size - 12 - 16) / 8;
         let max_blocks = capacity.min(descriptor_capacity);
         if max_blocks == 0 { return Err(FsError::NotSupported); }
-        Ok(Self { dev, block_size, filesystem_blocks, journal, protected, uuid, max_blocks,
-            state: Spinlock::new(State { active: None, poisoned: false }) })
+        // Fail the mount before accepting mutations if the promised barrier
+        // is not actually available on this device.
+        dev.flush().map_err(|_| FsError::IoError)?;
+        Ok(Self { dev, block_size, filesystem_blocks, journal, protected, journal_inode, uuid, max_blocks,
+            state: Box::new(RecoverableCell::new(State { active: None })), poisoned: AtomicBool::new(false) })
     }
 
     pub fn begin(&self) -> Result<(), FsError> {
-        let mut state = self.state.lock();
-        if state.poisoned { return Err(FsError::IoError); }
+        if self.is_poisoned() { return Err(FsError::IoError); }
+        let (mut state, _hold) = self.state.write_holding(super::super::state_hold_guard);
+        if self.is_poisoned() { return Err(FsError::IoError); }
         if state.active.is_some() { return Err(FsError::Internal); }
         state.active = Some(WriteSet::new(self.block_size, self.filesystem_blocks, self.max_blocks)?);
         Ok(())
     }
 
+    /// Cancel an empty transaction. Only safe when the filesystem has also
+    /// proved that its own state and cache were not changed.
+    pub fn cancel_empty(&self) -> bool {
+        if self.is_poisoned() { return false; }
+        let (mut state, _hold) = self.state.write_holding(super::super::state_hold_guard);
+        if self.is_poisoned() { return false; }
+        if state.active.as_ref().is_some_and(WriteSet::is_empty) {
+            state.active = None;
+            true
+        } else { false }
+    }
+
     /// Abort and permanently poison the device. Its filesystem's in-memory
     /// state may already have changed and must not be reused.
     pub fn abort(&self) {
-        let mut state = self.state.lock();
-        state.active = None;
-        state.poisoned = true;
+        self.poisoned.store(true, Ordering::Release);
     }
 
-    pub fn is_poisoned(&self) -> bool { self.state.lock().poisoned }
+    pub fn is_poisoned(&self) -> bool { self.poisoned.load(Ordering::Acquire) }
+
+    /// Poison first, then abandon a dead caller's state lock. The owner must
+    /// establish that `tid` died in this transaction before calling this.
+    pub fn abandon_transaction(&self, tid: usize) -> bool {
+        self.poisoned.store(true, Ordering::Release);
+        self.state.abandon_tid(tid)
+    }
 
     /// Flush a staged transaction through the journal and checkpoint it. A
     /// failure poisons the device; the result may already be durable and must
     /// be recovered before the backing filesystem is used again.
     pub fn commit(&self) -> Result<(), FsError> {
-        let mut state = self.state.lock();
-        if state.poisoned { return Err(FsError::IoError); }
+        if self.is_poisoned() { return Err(FsError::IoError); }
+        let (mut state, _hold) = self.state.write_holding(super::super::state_hold_guard);
+        if self.is_poisoned() { return Err(FsError::IoError); }
         let staged = state.active.take().ok_or(FsError::Internal)?.into_blocks();
         if staged.is_empty() { return Ok(()); }
         let mut raw = RawJournal { dev: &self.dev, block_size: self.block_size, journal: &self.journal, protected: &self.protected, uuid: &self.uuid };
         let result = writer::commit(&mut raw, self.block_size, self.journal.len() as u64,
             self.filesystem_blocks, (1024 / self.block_size) as u32, &self.uuid, &staged);
-        if result.is_err() { state.poisoned = true; }
+        if result.is_err() { self.poisoned.store(true, Ordering::Release); }
         result
     }
 }
 
 impl<B: JournalStorage> BlockDevice for JournaledDevice<B> {
+    fn is_failed(&self) -> bool { self.is_poisoned() }
     fn read_bytes(&self, offset: u64, out: &mut [u8]) -> Result<(), ()> {
-        let state = self.state.lock();
-        if state.poisoned { return Err(()); }
+        if self.is_poisoned() { return Err(()); }
+        let (state, _hold) = self.state.read_holding(super::super::state_hold_guard);
+        if self.is_poisoned() { return Err(()); }
         self.dev.read_bytes(offset, out)?;
         let end = offset.checked_add(out.len() as u64).ok_or(())?;
         if out.is_empty() { return Ok(()); }
@@ -132,21 +167,39 @@ impl<B: JournalStorage> BlockDevice for JournaledDevice<B> {
         Ok(())
     }
     fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
-        let mut state = self.state.lock();
-        if state.poisoned { return Err(()); }
-        if state.active.is_none() { state.poisoned = true; return Err(()); }
+        if self.is_poisoned() { return Err(()); }
+        let (mut state, _hold) = self.state.write_holding(super::super::state_hold_guard);
+        if self.is_poisoned() { return Err(()); }
+        if state.active.is_none() { self.poisoned.store(true, Ordering::Release); return Err(()); }
+        let end = match offset.checked_add(data.len() as u64) {
+            Some(end) => end,
+            None => { self.poisoned.store(true, Ordering::Release); return Err(()); }
+        };
+        let lo = offset.max(self.journal_inode.start);
+        let hi = end.min(self.journal_inode.end);
+        if lo < hi {
+            let mut original = vec![0; (hi - lo) as usize];
+            if self.dev.read_bytes(lo, &mut original).is_err()
+                || original != data[(lo - offset) as usize..(hi - offset) as usize] {
+                self.poisoned.store(true, Ordering::Release);
+                return Err(());
+            }
+        }
         let result = state.active.as_mut().expect("checked above").stage(offset, data, |block| {
             let mut bytes = vec![0; self.block_size];
             self.dev.read_bytes(u64::from(block) * self.block_size as u64, &mut bytes).map_err(|_| FsError::IoError)?;
             Ok(bytes)
         });
-        if result.is_err() { state.active = None; state.poisoned = true; }
+        if result.is_err() { state.active = None; self.poisoned.store(true, Ordering::Release); }
         result.map_err(|_| ())
     }
     fn flush(&self) -> Result<(), ()> {
-        if self.state.lock().active.is_some() { self.commit().map_err(|_| ()) }
-        else if self.is_poisoned() { Err(()) }
-        else { self.dev.flush() }
+        if self.is_poisoned() { return Err(()); }
+        let active = {
+            let (state, _hold) = self.state.read_holding(super::super::state_hold_guard);
+            state.active.is_some()
+        };
+        if active { self.commit().map_err(|_| ()) } else { self.dev.flush() }
     }
 }
 
@@ -189,6 +242,7 @@ impl<B: JournalStorage> JournalIo for RawJournal<'_, B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spinning_top::Spinlock;
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicBool, Ordering};
     #[derive(Clone)]
@@ -220,7 +274,7 @@ mod tests {
         js[24..28].copy_from_slice(&1u32.to_be_bytes());
         js[48..64].copy_from_slice(&uuid);
         let disk = Disk { bytes: Arc::new(Spinlock::new(bytes)), fail_flush: Arc::new(AtomicBool::new(false)) };
-        let device = JournaledDevice::new(disk.clone(), 1024, 16, (2..10).collect(), BTreeSet::new(), uuid).unwrap();
+        let device = JournaledDevice::new(disk.clone(), 1024, 16, (2..10).collect(), BTreeSet::new(), 15 * 1024..15 * 1024 + 128, uuid).unwrap();
         (device, disk)
     }
     #[test]
@@ -234,6 +288,14 @@ mod tests {
         assert!(dev.read_bytes(0, &mut [0]).is_err());
         assert_eq!(&disk.bytes.lock()[12 * 1024..12 * 1024 + 7], &[0; 7]);
         assert_ne!(disk.bytes.lock()[1024 + 96] & 4, 0);
+    }
+    #[test]
+    fn mount_rejects_a_device_that_cannot_flush() {
+        let (dev, disk) = device();
+        drop(dev);
+        disk.fail_flush.store(true, Ordering::Relaxed);
+        let result = JournaledDevice::new(disk, 1024, 16, (2..10).collect(), BTreeSet::new(), 15 * 1024..15 * 1024 + 128, [0x42; 16]);
+        assert!(matches!(result, Err(FsError::IoError)));
     }
     #[test]
     fn writes_without_a_transaction_poison_the_device() {
@@ -251,5 +313,24 @@ mod tests {
         assert_eq!(dev.commit(), Err(FsError::NotSupported));
         assert!(dev.is_poisoned());
         assert_eq!(*disk.bytes.lock(), before);
+    }
+    #[test]
+    fn journal_inode_bytes_cannot_be_changed_by_a_staged_block_write() {
+        let (dev, disk) = device();
+        let before = disk.bytes.lock().clone();
+        dev.begin().unwrap();
+        assert!(dev.write_bytes(15 * 1024, &[1; 1024]).is_err());
+        assert!(dev.is_poisoned());
+        assert_eq!(*disk.bytes.lock(), before);
+    }
+    #[test]
+    fn dead_transaction_holder_is_poisoned_before_its_lock_is_released() {
+        let (dev, _) = device();
+        let hold = dev.state.write_as(7);
+        core::mem::forget(hold);
+        assert!(dev.abandon_transaction(7));
+        assert!(dev.is_poisoned());
+        assert!(dev.state.try_write_as(0).is_some());
+        assert_eq!(dev.begin(), Err(FsError::IoError));
     }
 }

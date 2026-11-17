@@ -1341,6 +1341,8 @@ impl core::ops::DerefMut for Ext2WriteGuard<'_> {
 pub struct Ext2Filesystem<B: BlockDevice> {
     dev: B,
     mode: MountMode,
+    journal_writes: bool,
+    write_epoch: AtomicU64,
     time_fn: fn() -> u64,
     /// Internal state behind the recoverable reader/writer lock. Reads proceed
     /// concurrently; a holder killed mid-hold is recovered by
@@ -1380,6 +1382,7 @@ pub struct RecoveryDevice<B> {
 
 #[cfg(feature = "ext3")]
 impl<B: BlockDevice> BlockDevice for RecoveryDevice<B> {
+    fn is_failed(&self) -> bool { self.dev.is_failed() }
     fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
         self.dev.read_bytes(offset, buf)?;
         let end = offset.checked_add(buf.len() as u64).ok_or(())?;
@@ -1471,7 +1474,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         cache_cap_bytes: Option<usize>,
         mode: MountMode,
         inspect_dirty_journal: bool,
-        test_journal_writes: bool,
+        allow_validated_journal_writes: bool,
     ) -> Result<Self, FsError> {
         let mut sb_buf = [0u8; 1024];
         dev.read_bytes(SUPERBLOCK_OFFSET, &mut sb_buf).map_err(|_| FsError::IoError)?;
@@ -1501,7 +1504,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         const RO_COMPAT_SUPPORTED: u32 = 0x0001 | 0x0002; // sparse super, large file
         let journal = superblock.feature_compat & 0x4 != 0;
         let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3")
-            && (mode == MountMode::ReadOnly || (cfg!(test) && test_journal_writes)) { 0x4 } else { 0 };
+            && (mode == MountMode::ReadOnly || allow_validated_journal_writes) { 0x4 } else { 0 };
         let ext4_read = cfg!(feature = "ext4") && mode == MountMode::ReadOnly;
         let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else { 0 }
             | if inspect_dirty_journal { 0x4 } else { 0 };
@@ -1602,6 +1605,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let fs = Self {
             dev,
             mode,
+            journal_writes: allow_validated_journal_writes,
+            write_epoch: AtomicU64::new(0),
             time_fn: utc_time_us,
             state: Box::new(RecoverableCell::new(state)),
             block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
@@ -1709,6 +1714,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         if self.mode == MountMode::ReadOnly { Err(FsError::ReadOnly) } else { Ok(()) }
     }
 
+    fn ensure_device_healthy(&self) -> Result<(), FsError> {
+        if self.dev.is_failed() { Err(FsError::IoError) } else { Ok(()) }
+    }
+
     /// Try to acquire a read lock with a retry limit (used by unit tests only).
     /// Returns None if it cannot be acquired within `max_retries` attempts.
     #[cfg(test)]
@@ -1762,6 +1771,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     fn write_state(&self) -> Ext2WriteGuard<'_> {
         let (inner, hold) = self.state.write_holding(state_hold_guard);
         let mut guard = Ext2WriteGuard { inner, hold };
+        if self.journal_writes { self.write_epoch.fetch_add(1, Ordering::Relaxed); }
         let epoch = akuma_primitives::inode_pin::unpin_epoch();
         if self.mode == MountMode::ReadWrite && self.deferred.drained_at.load(Ordering::Acquire) != epoch {
             // Recorded before the drain: a pin that goes during it moves the
@@ -2183,6 +2193,21 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         let mut inode = Inode::parse(&buf).ok_or(FsError::Corrupt)?;
         inode.number = inode_num;
+        if self.journal_writes {
+            // The existing ext2 mutators do not maintain indexed directory
+            // trees, xattr ownership, compression, or immutable/append flags.
+            // Refuse such inodes until those semantics are implemented.
+            let unsupported_flags = 0x4 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x80000 | 0x1000_0000;
+            if inode.flags & unsupported_flags != 0 || inode.file_acl != 0 { return Err(FsError::NotSupported); }
+            if buf.len() >= 132 {
+                let extra = le_u16(&buf, 128).ok_or(FsError::Corrupt)? as usize;
+                let at = 128usize.checked_add(extra).ok_or(FsError::Corrupt)?;
+                if at > buf.len() || extra % 4 != 0 { return Err(FsError::Corrupt); }
+                if at <= buf.len().saturating_sub(4) && le_u32(&buf, at) == Some(0xea02_0000) {
+                    return Err(FsError::NotSupported);
+                }
+            }
+        }
         Ok(inode)
     }
 
@@ -2557,6 +2582,11 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         inode: &mut Inode,
     ) -> Result<(), FsError> {
         if akuma_primitives::inode_pin::is_pinned(inode_num) {
+            if self.journal_writes {
+                // Until on-disk orphan tracking exists, an unlinked pinned
+                // inode could leak across a crash even after a clean commit.
+                return Err(FsError::NotSupported);
+            }
             // A live mapping still names this inode, so it cannot be freed now —
             // queue it. `push`'s result is load-bearing and was previously
             // discarded, which is what leaked ~148 MB per self-host build.
@@ -3655,6 +3685,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     pub fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {
+        self.ensure_device_healthy()?;
         self.lookup_path(path)
     }
 
@@ -3683,6 +3714,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     pub fn read_at_by_inode(&self, inode_num: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.ensure_device_healthy()?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -3874,6 +3906,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// is the case it exists for (a shared mapping's write-back after the
     /// name is gone). A free inode is `NotFound`, not a resurrection.
     pub fn write_at_by_inode(&self, inode_num: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         if data.is_empty() {
             return Ok(0);
@@ -3891,6 +3924,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// creates its shared-memory file, unlinks it, and only then sizes it.
     /// Never creates; a free inode is `NotFound`.
     pub fn truncate_by_inode(&self, inode_num: u32, length: u64) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         let mut state = self.write_state();
         if self.read_inode(&state, inode_num)?.type_perms == 0 {
@@ -3901,6 +3935,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     /// `fallocate(2)` by inode — see [`Self::truncate_by_inode`].
     pub fn fallocate_by_inode(&self, inode_num: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         if mode != 0 {
             return Err(FsError::NotSupported);
@@ -4137,6 +4172,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
+        self.ensure_device_healthy()?;
         let state = self.read_state();
         let inode_num = self.lookup_path_internal(&state, path)?;
         let inode = self.read_inode(&state, inode_num)?;
@@ -4173,6 +4209,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        self.ensure_device_healthy()?;
         let state = self.read_state();
         let inode_num = self.lookup_path_internal(&state, path)?;
         let inode = self.read_inode(&state, inode_num)?;
@@ -4185,6 +4222,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         // Try to find existing file
         match self.lookup_path(path) {
@@ -4238,6 +4276,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn read_at(&self, path: &str, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.ensure_device_healthy()?;
         if buf.is_empty() {
             return Ok(0);
         }
@@ -4283,6 +4322,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         self.write_locked(path, Some(offset), data).map(|(_, n)| n)
     }
@@ -4291,12 +4331,14 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// write lock that the write itself runs under, so two appenders cannot
     /// both pick the same offset. See [`Filesystem::append`].
     fn append(&self, path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         self.write_locked(path, None, data)
     }
 
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         // Check if already exists
         if self.lookup_path(path).is_ok() {
@@ -4368,6 +4410,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn remove_file(&self, path: &str) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
         let (parent_inode, name) = self.lookup_parent(path)?;
@@ -4402,6 +4445,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn remove_dir(&self, path: &str) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
 
@@ -4436,6 +4480,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn create_symlink(&self, link_path: &str, target: &str) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         if self.lookup_path(link_path).is_ok() {
             return Err(FsError::AlreadyExists);
@@ -4448,6 +4493,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         // `AlreadyExists` is the honest answer and the caller depends on it:
         // AF_UNIX `bind` maps it to `EADDRINUSE`, which is what tells a daemon
@@ -4464,12 +4510,14 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {
+        self.ensure_device_healthy()?;
         let state = self.read_state();
         let inode_num = self.lookup_path_internal(&state, path)?;
         self.read_symlink_inode(&state, inode_num)
     }
 
     fn is_symlink(&self, path: &str) -> bool {
+        if self.dev.is_failed() { return false; }
         let state = self.read_state();
         if let Ok(inode_num) = self.lookup_path_internal(&state, path) {
             if let Ok(inode) = self.read_inode(&state, inode_num) {
@@ -4489,6 +4537,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// the reverse `EISDIR`, over a non-empty directory `ENOTEMPTY`, into its
     /// own subtree `EINVAL`; an empty destination directory is replaced.
     fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         let src_inode_num = self.lookup_path(old_path)?;
         let (src_parent, src_name) = self.lookup_parent(old_path)?;
@@ -4580,6 +4629,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// further bookkeeping; `remove_file` already decrements and frees only at
     /// zero.
     fn link(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         let mut state = self.write_state();
         let src = self.lookup_path_internal(&state, old_path)?;
@@ -4603,21 +4653,25 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn exists(&self, path: &str) -> bool {
+        if self.dev.is_failed() { return false; }
         self.lookup_path(path).is_ok()
     }
 
     fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
+        self.ensure_device_healthy()?;
         let state = self.read_state();
         let inode_num = self.lookup_path_internal(&state, path)?;
         self.metadata_of(&state, inode_num)
     }
 
     fn metadata_by_inode(&self, inode_num: u32) -> Result<Metadata, FsError> {
+        self.ensure_device_healthy()?;
         let state = self.read_state();
         self.metadata_of(&state, inode_num)
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
         let state = self.write_state();
@@ -4633,6 +4687,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// (`creation_time` here is ext2's `i_ctime`), not mtime: a change of owner
     /// is not a change of content.
     fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
         let state = self.write_state();
@@ -4664,6 +4719,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         atime_secs: Option<u64>,
         mtime_secs: Option<u64>,
     ) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         if atime_secs.is_none() && mtime_secs.is_none() {
             return Ok(());
@@ -4682,6 +4738,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn fallocate(&self, path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         if mode != 0 {
             return Err(FsError::NotSupported);
@@ -4696,6 +4753,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         self.require_writable()?;
         // Extension and shrink are both real now (2026-09-22). The old shape
         // answered `Ok(())` for *extend* — a silent no-op, the exact
@@ -4711,6 +4769,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn stats(&self) -> Result<FsStats, FsError> {
+        self.ensure_device_healthy()?;
         // A deferred free whose last pin has gone is free space: finish it
         // first, so `df` after the last `munmap`/`close` shows it.
         if akuma_primitives::inode_pin::unpinned_since(self.deferred.drained_at.load(Ordering::Acquire)) {
@@ -4728,6 +4787,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn sync(&self) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         if self.mode == MountMode::ReadOnly { return Ok(()); }
         // Flush any superblock / block-group-descriptor free-count updates that
         // `stage_*` deferred. Every mutating method already flushes its own, so
@@ -4745,22 +4805,27 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn resolve_inode(&self, path: &str) -> Result<u32, FsError> {
+        self.ensure_device_healthy()?;
         self.lookup_path(path)
     }
 
     fn read_at_by_inode(&self, inode_num: u32, offset: usize, buf: &mut [u8]) -> Result<usize, FsError> {
+        self.ensure_device_healthy()?;
         Ext2Filesystem::read_at_by_inode(self, inode_num, offset, buf)
     }
 
     fn write_at_by_inode(&self, inode_num: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.ensure_device_healthy()?;
         Ext2Filesystem::write_at_by_inode(self, inode_num, offset, data)
     }
 
     fn truncate_by_inode(&self, inode_num: u32, length: u64) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         Ext2Filesystem::truncate_by_inode(self, inode_num, length)
     }
 
     fn fallocate_by_inode(&self, inode_num: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.ensure_device_healthy()?;
         Ext2Filesystem::fallocate_by_inode(self, inode_num, mode, offset, len)
     }
 }

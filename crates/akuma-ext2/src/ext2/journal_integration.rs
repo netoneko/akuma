@@ -139,6 +139,7 @@ fn commit_staged(fs: &Ext2Filesystem<StagedDevice>, shared: &Arc<Spinlock<Inner>
 
 #[test]
 fn staged_ext3_mutations_survive_journal_commit_and_fsck() {
+    let _serial = crate::tests::pin_test_serial();
     let dir = std::env::temp_dir().join(std::format!("akuma-ext3-write-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let image = dir.join("disk.img");
@@ -181,6 +182,7 @@ fn staged_ext3_mutations_survive_journal_commit_and_fsck() {
 /// test-only operation bracketing. VFS does not yet provide this bracketing.
 #[test]
 fn transaction_device_commits_filesystem_operations_to_ext3() {
+    let _serial = crate::tests::pin_test_serial();
     use super::journal::device::{JournaledDevice, JournalStorage};
     use alloc::collections::BTreeSet;
     #[derive(Clone)]
@@ -206,7 +208,7 @@ fn transaction_device_commits_filesystem_operations_to_ext3() {
     std::fs::File::create(&image).unwrap().set_len(32 * 1024 * 1024).unwrap();
     assert!(Command::new("mke2fs").args(["-q", "-F", "-t", "ext3", "-b", "1024"]).arg(&image).status().unwrap().success());
     let disk = Disk(Arc::new(Spinlock::new(std::fs::read(&image).unwrap())));
-    let (journal, protected, uuid) = {
+    let (journal, protected, journal_inode, uuid) = {
         let fs = Ext2Filesystem::new_with_options(disk.clone(), || 0, None, MountMode::ReadOnly).unwrap();
         let state = fs.read_state();
         let inode = fs.read_inode(&state, 8).unwrap();
@@ -229,9 +231,14 @@ fn transaction_device_commits_filesystem_operations_to_ext3() {
         protect_indirect(&fs, &state, inode.indirect_block, 1, &mut protected);
         protect_indirect(&fs, &state, inode.double_indirect_block, 2, &mut protected);
         protect_indirect(&fs, &state, inode.triple_indirect_block, 3, &mut protected);
-        (map, protected, state.superblock.uuid)
+        let index = 7u32;
+        let group = index / state.inodes_per_group;
+        let in_group = index % state.inodes_per_group;
+        let bgd = fs.read_bgd(&state, group).unwrap();
+        let start = u64::from(bgd.inode_table) * BS as u64 + u64::from(in_group) * u64::from(state.inode_size);
+        (map, protected, start..start + u64::from(state.inode_size), state.superblock.uuid)
     };
-    let dev = JournaledDevice::new(disk.clone(), BS, 32768, journal, protected, uuid).unwrap();
+    let dev = JournaledDevice::new(disk.clone(), BS, 32768, journal.clone(), protected.clone(), journal_inode.clone(), uuid).unwrap();
     let fs = Ext2Filesystem::new_internal(dev, || 0, None, MountMode::ReadWrite, false, true).unwrap();
     fs.dev.begin().unwrap(); fs.create_dir("/test").unwrap(); fs.sync().unwrap();
     let before = disk.0.lock().clone();
@@ -246,10 +253,52 @@ fn transaction_device_commits_filesystem_operations_to_ext3() {
     assert!(result.status.success(), "{}", std::string::String::from_utf8_lossy(&result.stdout));
     let result = Command::new("debugfs").args(["-R", "cat /test/b"]).arg(&image).output().unwrap();
     assert_eq!(result.stdout, b"transaction device\n");
+    drop(fs);
+    let fs = super::journal::filesystem::JournaledFilesystem::mount(disk.clone(), || 0, None).unwrap();
+    fs.create_dir("/automatic").unwrap();
+    fs.write_file("/automatic/a", b"automatic transaction\n").unwrap();
+    fs.rename("/automatic/a", "/automatic/b").unwrap();
+    assert_eq!(fs.read_file("/automatic/b").unwrap(), b"automatic transaction\n");
+    std::thread::scope(|scope| {
+        for index in 0..4 {
+            let fs = &fs;
+            scope.spawn(move || {
+                let path = std::format!("/automatic/thread{index}");
+                fs.write_file(&path, b"parallel\n").unwrap();
+                assert_eq!(fs.read_file(&path).unwrap(), b"parallel\n");
+            });
+        }
+    });
+    std::fs::write(&image, &*disk.0.lock()).unwrap();
+    assert!(Command::new("e2fsck").args(["-fn"]).arg(&image).output().unwrap().status.success());
+    let xattr = Command::new("debugfs").args(["-w", "-R", "ea_set /automatic/b user.example value"]).arg(&image).output().unwrap();
+    assert!(xattr.status.success());
+    let xattr_disk = Disk(Arc::new(Spinlock::new(std::fs::read(&image).unwrap())));
+    let xattr_fs = super::journal::filesystem::JournaledFilesystem::mount(xattr_disk, || 0, None).unwrap();
+    assert_eq!(xattr_fs.read_file("/automatic/b"), Err(FsError::NotSupported));
+    let mut dirty = disk.0.lock().clone();
+    dirty[1024 + 96] |= 4;
+    let dirty_disk = Disk(Arc::new(Spinlock::new(dirty.clone())));
+    assert!(matches!(super::journal::filesystem::JournaledFilesystem::mount(dirty_disk.clone(), || 0, None), Err(FsError::NotSupported)));
+    assert_eq!(*dirty_disk.0.lock(), dirty, "dirty writable mounts must not modify the disk");
+    let pinned_fs = super::journal::filesystem::JournaledFilesystem::mount(disk.clone(), || 0, None).unwrap();
+    let inode = pinned_fs.resolve_inode("/automatic/b").unwrap();
+    let pin = akuma_primitives::InodePin::new(inode);
+    let before_pin = disk.0.lock().clone();
+    assert_eq!(pinned_fs.remove_file("/automatic/b"), Err(FsError::NotSupported));
+    assert_eq!(*disk.0.lock(), before_pin, "pinned unlink must not reach the disk without orphan tracking");
+    drop(pin);
+    let second = super::journal::filesystem::JournaledFilesystem::mount(disk.clone(), || 0, None).unwrap();
+    second.simulate_dead_gate_holder(7);
+    assert!(second.abandon_tid(7));
+    assert_eq!(second.read_file("/automatic/b"), Err(FsError::IoError));
     let before = disk.0.lock().clone();
-    fs.dev.begin().unwrap(); fs.write_file("/test/b", b"discarded").unwrap(); fs.dev.abort();
-    assert!(fs.dev.is_poisoned());
-    assert_eq!(*disk.0.lock(), before, "aborted staged writes must not reach home blocks");
-    let mut byte = [0]; assert!(fs.dev.read_bytes(0, &mut byte).is_err());
+    assert_eq!(fs.remove_file("/missing"), Err(FsError::NotFound));
+    assert_eq!(*disk.0.lock(), before, "failed mutation must not reach home blocks");
+    assert_eq!(fs.read_file("/automatic/b").unwrap(), b"automatic transaction\n", "a failure before the write lock must not poison the filesystem");
+    assert_eq!(fs.remove_file("/automatic"), Err(FsError::NotAFile));
+    assert_eq!(fs.read_file("/automatic/b"), Err(FsError::IoError), "cached reads must not survive an uncertain abort");
+    assert!(!fs.exists("/automatic/b"));
+    assert_eq!(fs.sync(), Err(FsError::IoError));
     std::fs::remove_dir_all(dir).unwrap();
 }

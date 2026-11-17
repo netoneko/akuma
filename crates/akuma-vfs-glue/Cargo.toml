@@ -63,6 +63,7 @@ akuma-syscalls-ipc = { path = "../akuma-syscalls-ipc", optional = true }
 [features]
 ext3 = ["akuma-ext2/ext3"]
 ext4 = ["ext3", "akuma-ext2/ext4"]
+ext3-qemu-write-test = ["ext3"]
 # Forwarded from the bin, which owns the real definitions. They gate exactly what
 # they gated when this code was `src/vfs/`.
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
