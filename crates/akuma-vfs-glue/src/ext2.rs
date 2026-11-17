@@ -2,7 +2,7 @@
 
 use alloc::sync::Arc;
 use akuma_vfs::Filesystem;
-pub use akuma_ext2::{BlockDevice, Ext2Filesystem};
+pub use akuma_ext2::{BlockDevice, Ext2Filesystem, MountMode};
 
 /// Kernel block device adapter implementing `akuma_ext2::BlockDevice`.
 ///
@@ -24,7 +24,7 @@ impl BlockDevice for KernelBlockDevice {
 
 /// Mount ext2 from the boot device (`vda`), cache sized from the global cap.
 pub fn mount() -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
-    mount_device(0, None)
+    mount_device(0, None, MountMode::ReadWrite)
 }
 
 /// Mount ext2 from device `idx` with an optional per-instance cache cap.
@@ -35,11 +35,13 @@ pub fn mount() -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
 pub fn mount_device(
     idx: usize,
     cache_cap: Option<usize>,
+    mode: MountMode,
 ) -> Result<Arc<dyn Filesystem>, akuma_vfs::FsError> {
-    let fs = Arc::new(Ext2Filesystem::new_with_cache_cap(
+    let fs = Arc::new(Ext2Filesystem::new_with_options(
         KernelBlockDevice { idx },
         || crate::utc_time_us().unwrap_or(0),
         cache_cap,
+        mode,
     )?);
     // No `register_for_reap` here since the registry moved to `lib.rs`:
     // `mount_with` enrols every filesystem that asks for it, so this path and

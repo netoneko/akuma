@@ -1318,6 +1318,7 @@ impl core::ops::DerefMut for Ext2WriteGuard<'_> {
 /// Ext2 filesystem implementation
 pub struct Ext2Filesystem<B: BlockDevice> {
     dev: B,
+    mode: MountMode,
     time_fn: fn() -> u64,
     /// Internal state behind the recoverable reader/writer lock. Reads proceed
     /// concurrently; a holder killed mid-hold is recovered by
@@ -1338,6 +1339,13 @@ pub struct Ext2Filesystem<B: BlockDevice> {
     /// parallel. These belong to one mount and answer for one test's work only.
     #[cfg(test)]
     counters: WorkCounters,
+}
+
+/// Access requested at construction. A read-only mount never writes to its device.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MountMode {
+    ReadOnly,
+    ReadWrite,
 }
 
 /// Deterministic work counters for one filesystem instance — see
@@ -1390,6 +1398,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         utc_time_us: fn() -> u64,
         cache_cap_bytes: Option<usize>,
     ) -> Result<Self, FsError> {
+        Self::new_with_options(dev, utc_time_us, cache_cap_bytes, MountMode::ReadWrite)
+    }
+
+    /// Mount with an explicit access mode and optional block-cache cap.
+    pub fn new_with_options(
+        dev: B,
+        utc_time_us: fn() -> u64,
+        cache_cap_bytes: Option<usize>,
+        mode: MountMode,
+    ) -> Result<Self, FsError> {
         let mut sb_buf = [0u8; 1024];
         dev.read_bytes(SUPERBLOCK_OFFSET, &mut sb_buf).map_err(|_| FsError::IoError)?;
 
@@ -1416,11 +1434,24 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         const COMPAT_SUPPORTED: u32 = 0x0008 | 0x0010 | 0x0020; // xattr, resize inode, dir index
         const INCOMPAT_SUPPORTED: u32 = 0x0002; // directory entry file type
         const RO_COMPAT_SUPPORTED: u32 = 0x0001 | 0x0002; // sparse super, large file
-        if superblock.feature_compat & !COMPAT_SUPPORTED != 0
-            || superblock.feature_incompat & !INCOMPAT_SUPPORTED != 0
+        let journal = superblock.feature_compat & 0x4 != 0;
+        let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3") && mode == MountMode::ReadOnly { 0x4 } else { 0 };
+        let incompat_supported = INCOMPAT_SUPPORTED | if cfg!(feature = "ext4") && mode == MountMode::ReadOnly { 0x40 } else { 0 };
+        if superblock.feature_compat & !compat_supported != 0
+            || superblock.feature_incompat & !incompat_supported != 0
             || superblock.feature_ro_compat & !RO_COMPAT_SUPPORTED != 0
         {
             return Err(FsError::NotSupported);
+        }
+        if journal {
+            // Journal replay and orphan recovery would write to the device.
+            // Only accept clean, internal-journal volumes with neither pending.
+            let journal_inode = le_u32(&sb_buf, 224).ok_or(FsError::Corrupt)?;
+            let journal_device = le_u32(&sb_buf, 228).ok_or(FsError::Corrupt)?;
+            let last_orphan = le_u32(&sb_buf, 232).ok_or(FsError::Corrupt)?;
+            if superblock.fs_state != 1 || journal_inode == 0 || journal_device != 0 || last_orphan != 0 {
+                return Err(FsError::NotSupported);
+            }
         }
 
         // ── On-disk arithmetic validation (AKUMA_EXT2_CLEANUP.md §2.3) ──────
@@ -1482,6 +1513,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
         Ok(Self {
             dev,
+            mode,
             time_fn: utc_time_us,
             state: RecoverableCell::new(state),
             block_cache: Spinlock::new(make_block_cache(block_size, cache_cap_bytes)),
@@ -1494,6 +1526,10 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     fn current_time(&self) -> u32 {
         ((self.time_fn)() / 1_000_000) as u32
+    }
+
+    fn require_writable(&self) -> Result<(), FsError> {
+        if self.mode == MountMode::ReadOnly { Err(FsError::ReadOnly) } else { Ok(()) }
     }
 
     /// Try to acquire a read lock with a retry limit (used by unit tests only).
@@ -1550,7 +1586,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let (inner, hold) = self.state.write_holding(state_hold_guard);
         let mut guard = Ext2WriteGuard { inner, hold };
         let epoch = akuma_primitives::inode_pin::unpin_epoch();
-        if self.deferred.drained_at.load(Ordering::Acquire) != epoch {
+        if self.mode == MountMode::ReadWrite && self.deferred.drained_at.load(Ordering::Acquire) != epoch {
             // Recorded before the drain: a pin that goes during it moves the
             // epoch again, and the next hold drains again.
             self.deferred.drained_at.store(epoch, Ordering::Release);
@@ -2412,6 +2448,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         inode: &Inode,
         logical_block: u32,
     ) -> Result<Option<u32>, FsError> {
+        if inode.flags & 0x80000 != 0 {
+            if !cfg!(feature = "ext4") || state.superblock.feature_incompat & 0x40 == 0 {
+                return Err(FsError::NotSupported);
+            }
+            return self.extent_block_num(state, inode, logical_block);
+        }
         let ptrs_per_block = (state.block_size / 4) as u32;
 
         if logical_block < 12 {
@@ -2464,6 +2506,58 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         Err(FsError::NotSupported)
+    }
+
+    /// Walk the extent tree, checking each visited node before using its map.
+    /// High physical block numbers are rejected while this driver uses u32 block IDs.
+    fn extent_block_num(&self, state: &Ext2State, inode: &Inode, logical: u32) -> Result<Option<u32>, FsError> {
+        let mut raw_inode = [0u8; 128];
+        inode.serialize(&mut raw_inode);
+        let mut node = raw_inode[40..100].to_vec();
+        let mut expected_depth = None;
+        loop {
+            let magic = le_u16(&node, 0).ok_or(FsError::Corrupt)?;
+            let count = le_u16(&node, 2).ok_or(FsError::Corrupt)? as usize;
+            let max = le_u16(&node, 4).ok_or(FsError::Corrupt)? as usize;
+            let depth = le_u16(&node, 6).ok_or(FsError::Corrupt)?;
+            if magic != 0xf30a || depth > 5 || max == 0 || max > (node.len() - 12) / 12
+                || count > max || expected_depth.is_some_and(|d| d != depth) {
+                return Err(FsError::Corrupt);
+            }
+            let mut previous_end: u64 = 0;
+            let mut selected = None;
+            for i in 0..count {
+                let at = 12 + i * 12;
+                let start = le_u32(&node, at).ok_or(FsError::Corrupt)?;
+                if i != 0 && u64::from(start) < previous_end { return Err(FsError::Corrupt); }
+                if depth == 0 {
+                    let raw_len = le_u16(&node, at + 4).ok_or(FsError::Corrupt)?;
+                    let len = if raw_len > 0x8000 { raw_len - 0x8000 } else { raw_len };
+                    if len == 0 { return Err(FsError::Corrupt); }
+                    previous_end = u64::from(start) + u64::from(len);
+                    if previous_end > u64::from(u32::MAX) + 1 { return Err(FsError::Corrupt); }
+                    let high = le_u16(&node, at + 6).ok_or(FsError::Corrupt)?;
+                    let base = le_u32(&node, at + 8).ok_or(FsError::Corrupt)?;
+                    if high != 0 { return Err(FsError::NotSupported); }
+                    if base == 0 || u64::from(base) + u64::from(len) > u64::from(state.superblock.total_blocks) {
+                        return Err(FsError::Corrupt);
+                    }
+                    if logical >= start && u64::from(logical) < previous_end && raw_len <= 0x8000 {
+                        selected = Some(base + (logical - start));
+                    }
+                } else {
+                    previous_end = u64::from(start) + 1;
+                    let child = le_u32(&node, at + 4).ok_or(FsError::Corrupt)?;
+                    if le_u16(&node, at + 8).ok_or(FsError::Corrupt)? != 0 { return Err(FsError::NotSupported); }
+                    if child == 0 || child >= state.superblock.total_blocks { return Err(FsError::Corrupt); }
+                    if start <= logical { selected = Some(child); }
+                }
+            }
+            if depth == 0 { return Ok(selected); }
+            let Some(child) = selected else { return Ok(None); };
+            expected_depth = Some(depth - 1);
+            node = self.read_block(state, child)?;
+        }
     }
 
     fn read_block_ptr(block: &[u8], index: usize) -> u32 {
@@ -3537,6 +3631,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// is the case it exists for (a shared mapping's write-back after the
     /// name is gone). A free inode is `NotFound`, not a resurrection.
     pub fn write_at_by_inode(&self, inode_num: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.require_writable()?;
         if data.is_empty() {
             return Ok(0);
         }
@@ -3553,6 +3648,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// creates its shared-memory file, unlinks it, and only then sizes it.
     /// Never creates; a free inode is `NotFound`.
     pub fn truncate_by_inode(&self, inode_num: u32, length: u64) -> Result<(), FsError> {
+        self.require_writable()?;
         let mut state = self.write_state();
         if self.read_inode(&state, inode_num)?.type_perms == 0 {
             return Err(FsError::NotFound);
@@ -3562,6 +3658,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 
     /// `fallocate(2)` by inode — see [`Self::truncate_by_inode`].
     pub fn fallocate_by_inode(&self, inode_num: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.require_writable()?;
         if mode != 0 {
             return Err(FsError::NotSupported);
         }
@@ -3769,6 +3866,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
 // ============================================================================
 
 impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
+    fn is_read_only(&self) -> bool {
+        self.mode == MountMode::ReadOnly
+    }
     fn identity(&self) -> u32 {
         self.id
     }
@@ -3842,6 +3942,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        self.require_writable()?;
         // Try to find existing file
         match self.lookup_path(path) {
             Ok(inode_num) => {
@@ -3939,6 +4040,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        self.require_writable()?;
         self.write_locked(path, Some(offset), data).map(|(_, n)| n)
     }
 
@@ -3946,11 +4048,13 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// write lock that the write itself runs under, so two appenders cannot
     /// both pick the same offset. See [`Filesystem::append`].
     fn append(&self, path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+        self.require_writable()?;
         self.write_locked(path, None, data)
     }
 
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
+        self.require_writable()?;
         // Check if already exists
         if self.lookup_path(path).is_ok() {
             return Err(FsError::AlreadyExists);
@@ -4021,6 +4125,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn remove_file(&self, path: &str) -> Result<(), FsError> {
+        self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
         let (parent_inode, name) = self.lookup_parent(path)?;
 
@@ -4054,6 +4159,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn remove_dir(&self, path: &str) -> Result<(), FsError> {
+        self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
 
         if inode_num == ROOT_INODE {
@@ -4087,6 +4193,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn create_symlink(&self, link_path: &str, target: &str) -> Result<(), FsError> {
+        self.require_writable()?;
         if self.lookup_path(link_path).is_ok() {
             return Err(FsError::AlreadyExists);
         }
@@ -4098,6 +4205,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+        self.require_writable()?;
         // `AlreadyExists` is the honest answer and the caller depends on it:
         // AF_UNIX `bind` maps it to `EADDRINUSE`, which is what tells a daemon
         // it must `unlink` a stale node before it can restart. Silently reusing
@@ -4138,6 +4246,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// the reverse `EISDIR`, over a non-empty directory `ENOTEMPTY`, into its
     /// own subtree `EINVAL`; an empty destination directory is replaced.
     fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        self.require_writable()?;
         let src_inode_num = self.lookup_path(old_path)?;
         let (src_parent, src_name) = self.lookup_parent(old_path)?;
         let (dst_parent, dst_name) = self.lookup_parent(new_path)?;
@@ -4228,6 +4337,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// further bookkeeping; `remove_file` already decrements and frees only at
     /// zero.
     fn link(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        self.require_writable()?;
         let mut state = self.write_state();
         let src = self.lookup_path_internal(&state, old_path)?;
         let mut inode = self.read_inode(&state, src)?;
@@ -4265,6 +4375,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
         let state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
@@ -4279,6 +4390,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     /// (`creation_time` here is ext2's `i_ctime`), not mtime: a change of owner
     /// is not a change of content.
     fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        self.require_writable()?;
         let inode_num = self.lookup_path(path)?;
         let state = self.write_state();
         let mut inode = self.read_inode(&state, inode_num)?;
@@ -4309,6 +4421,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         atime_secs: Option<u64>,
         mtime_secs: Option<u64>,
     ) -> Result<(), FsError> {
+        self.require_writable()?;
         if atime_secs.is_none() && mtime_secs.is_none() {
             return Ok(());
         }
@@ -4326,6 +4439,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn fallocate(&self, path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        self.require_writable()?;
         if mode != 0 {
             return Err(FsError::NotSupported);
         }
@@ -4339,6 +4453,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
+        self.require_writable()?;
         // Extension and shrink are both real now (2026-09-22). The old shape
         // answered `Ok(())` for *extend* — a silent no-op, the exact
         // "accepted and did nothing" failure this tree's own docs call the
@@ -4370,6 +4485,7 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
     }
 
     fn sync(&self) -> Result<(), FsError> {
+        if self.mode == MountMode::ReadOnly { return Ok(()); }
         // Flush any superblock / block-group-descriptor free-count updates that
         // `stage_*` deferred. Every mutating method already flushes its own, so
         // this normally has nothing to do; it is the backstop for unmount and
@@ -4407,3 +4523,62 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
 }
 
 // ============================================================================
+
+#[cfg(all(test, feature = "ext4"))]
+mod extent_tests {
+    use super::*;
+
+    struct Image(Vec<u8>);
+    impl BlockDevice for Image {
+        fn read_bytes(&self, offset: u64, dst: &mut [u8]) -> Result<(), ()> {
+            let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(dst.len()).ok_or(())?;
+            dst.copy_from_slice(self.0.get(start..end).ok_or(())?);
+            Ok(())
+        }
+        fn write_bytes(&self, _: u64, _: &[u8]) -> Result<(), ()> { Err(()) }
+    }
+
+    fn header(buf: &mut [u8], entries: u16, max: u16, depth: u16) {
+        put_u16(buf, 0, 0xf30a);
+        put_u16(buf, 2, entries);
+        put_u16(buf, 4, max);
+        put_u16(buf, 6, depth);
+    }
+
+    #[test]
+    fn extent_tree_handles_holes_unwritten_and_corrupt_nodes() {
+        let mut image = include_bytes!("../tests/fixtures/test.ext2").to_vec();
+        let word = le_u32(&image, 1024 + 96).unwrap() | 0x40;
+        put_u32(&mut image, 1024 + 96, word);
+        let bs = 1024usize << le_u32(&image, 1024 + 24).unwrap();
+        // External leaf with one initialized and one unwritten extent.
+        let leaf = &mut image[50 * bs..51 * bs];
+        leaf.fill(0);
+        header(leaf, 2, ((bs - 12) / 12) as u16, 0);
+        put_u32(leaf, 12, 5);
+        put_u16(leaf, 16, 3);
+        put_u32(leaf, 20, 100);
+        put_u32(leaf, 24, 10);
+        put_u16(leaf, 28, 0x8002);
+        put_u32(leaf, 32, 110);
+        let fs = Ext2Filesystem::new_with_options(Image(image), || 0, None, MountMode::ReadOnly).unwrap();
+        let state = fs.read_state();
+        let mut raw = [0u8; 128];
+        put_u32(&mut raw, 32, 0x80000);
+        header(&mut raw[40..100], 1, 4, 1);
+        put_u32(&mut raw, 52, 5);
+        put_u32(&mut raw, 56, 50);
+        let inode = Inode::parse(&raw).unwrap();
+        assert_eq!(fs.get_block_num(&state, &inode, 4), Ok(None));
+        assert_eq!(fs.get_block_num(&state, &inode, 5), Ok(Some(100)));
+        assert_eq!(fs.get_block_num(&state, &inode, 7), Ok(Some(102)));
+        assert_eq!(fs.get_block_num(&state, &inode, 8), Ok(None));
+        assert_eq!(fs.get_block_num(&state, &inode, 10), Ok(None));
+        put_u16(&mut raw, 46, 6); // tree depth exceeds the supported format
+        assert_eq!(fs.get_block_num(&state, &Inode::parse(&raw).unwrap(), 5), Err(FsError::Corrupt));
+        put_u16(&mut raw, 46, 1);
+        put_u16(&mut raw, 44, 5); // root capacity exceeds its 60-byte space
+        assert_eq!(fs.get_block_num(&state, &Inode::parse(&raw).unwrap(), 5), Err(FsError::Corrupt));
+    }
+}

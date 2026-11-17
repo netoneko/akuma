@@ -66,10 +66,10 @@ mutation is written through to the device before the call returns.
 
 ## On-disk layout the driver assumes
 
-Standard ext2, revision ≥ 1, no `incompat` features negotiated (the driver does
-not check `feature_incompat`, so a disk with `filetype` absent or `sparse_super`
-tricks will misbehave — the kernel's own images are made with a fixed `mke2fs`
-recipe, `scripts/create_disk.sh`).
+The default mount supports the legacy ext2 feature set used by the kernel's
+images (`scripts/create_disk.sh`). Mount checks all three on-disk feature words
+and rejects unsupported combinations. The optional, read-only ext3/ext4
+subset is described below.
 
 ```
 byte 0      1024        block 1        per block group ...
@@ -743,3 +743,27 @@ mounted `-o sync` and default.
 - [`docs/reference/subsystems/locking.md`](../../docs/reference/subsystems/locking.md) — the BKL / `no-bkl-*` model
 - `crates/akuma-primitives/src/inode_pin.rs` — the pin mechanism module doc
 - `crates/akuma-virtio/src/block.rs` — the device layer, sector RMW, the transitive-guard note
+
+### Experimental ext3 and ext4 read-only access
+
+The additive Cargo features `ext3` and `ext4` (the latter implies `ext3`) enable
+an explicit `Ext2Filesystem::new_with_options(..., MountMode::ReadOnly)` path.
+The default constructors still request read/write ext2. The runtime `mount(2)`
+path accepts `ext3` and `ext4` names and forwards `MS_RDONLY`; the top-level
+kernel features have the same names. Read-only is enforced by the driver and
+cannot be removed by remounting.
+
+This is deliberately limited: ext3 requires a clean filesystem with an internal
+journal and no orphan recovery pending. Ext4 additionally accepts extent trees,
+including sparse and unwritten extents, with 32-bit physical block numbers.
+Only the checked legacy feature set plus extents is accepted: in particular,
+`64bit`, `metadata_csum`, `flex_bg`, and the usual newer ext4 defaults are not
+supported. A constrained test image can be created with:
+
+```sh
+mke2fs -t ext4 -O '^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^uninit_bg' IMAGE
+```
+
+Unknown feature bits, dirty journals, journal recovery and all journaled write
+mounts are rejected. There is no journal implementation yet. Host tests with
+these features require `mke2fs` and `debugfs` and generate disposable images.

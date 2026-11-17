@@ -3766,3 +3766,108 @@ fn a_busy_inode_on_one_filesystem_does_not_block_the_same_number_on_another() {
     assert_eq!(b.read_file("/prog").unwrap(), b"X");
     drop(text);
 }
+
+#[cfg(feature = "ext3")]
+#[test]
+fn clean_ext3_image_reads_and_rejects_all_mutations() {
+    use crate::MountMode;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use alloc::sync::Arc;
+
+    struct ReadOnlyDevice { inner: MemBlockDevice, writes: Arc<AtomicUsize> }
+    impl BlockDevice for ReadOnlyDevice {
+        fn read_bytes(&self, offset: u64, buf: &mut [u8]) -> Result<(), ()> {
+            self.inner.read_bytes(offset, buf)
+        }
+        fn write_bytes(&self, _: u64, _: &[u8]) -> Result<(), ()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Err(())
+        }
+    }
+
+    let dir = std::env::temp_dir().join(std::format!("akuma-ext3-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    let input = dir.join("input");
+    std::fs::write(&input, b"read from ext3\n").unwrap();
+    let file = std::fs::File::create(&image).unwrap();
+    file.set_len(16 * 1024 * 1024).unwrap();
+    let mkfs = Command::new("mke2fs").args(["-q", "-F", "-t", "ext3", "-b", "1024"]).arg(&image).status().expect("ext3 tests require mke2fs");
+    assert!(mkfs.success());
+    let command = std::format!("write {} /hello", input.display());
+    let debugfs = Command::new("debugfs").args(["-w", "-R", &command]).arg(&image).output().expect("ext3 tests require debugfs");
+    assert!(debugfs.status.success());
+    let bytes = std::fs::read(&image).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let writes = Arc::new(AtomicUsize::new(0));
+    let dev = ReadOnlyDevice { inner: MemBlockDevice::from_bytes(&bytes), writes: writes.clone() };
+    let fs = Arc::new(Ext2Filesystem::new_with_options(dev, || 0, None, MountMode::ReadOnly).unwrap());
+    let mut mounts = akuma_vfs::MountTable::new();
+    assert!(matches!(mounts.mount_with("/", None, 0, fs.clone()), Err(FsError::ReadOnly)));
+    mounts.mount_with("/", None, akuma_vfs::MS_RDONLY, fs.clone()).unwrap();
+    assert!(matches!(mounts.remount("/", 0), Err(FsError::ReadOnly)));
+    assert_eq!(mounts.resolve_arc_with_flags("/").unwrap().2, akuma_vfs::MS_RDONLY);
+    assert_eq!(fs.read_file("/hello").unwrap(), b"read from ext3\n");
+    let ino = fs.resolve_inode("/hello").unwrap();
+    assert_eq!(fs.write_file("/hello", b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.write_at("/hello", 0, b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.append("/hello", b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.create_dir("/dir"), Err(FsError::ReadOnly));
+    assert_eq!(fs.remove_file("/hello"), Err(FsError::ReadOnly));
+    assert_eq!(fs.remove_dir("/dir"), Err(FsError::ReadOnly));
+    assert_eq!(fs.create_symlink("/link", "/hello"), Err(FsError::ReadOnly));
+    assert_eq!(fs.create_socket_node("/socket"), Err(FsError::ReadOnly));
+    assert_eq!(fs.rename("/hello", "/new"), Err(FsError::ReadOnly));
+    assert_eq!(fs.link("/hello", "/new"), Err(FsError::ReadOnly));
+    assert_eq!(fs.chmod("/hello", 0o600), Err(FsError::ReadOnly));
+    assert_eq!(fs.chown("/hello", Some(1), Some(1)), Err(FsError::ReadOnly));
+    assert_eq!(fs.set_times("/hello", Some(1), Some(1)), Err(FsError::ReadOnly));
+    assert_eq!(fs.fallocate("/hello", 0, 0, 1), Err(FsError::ReadOnly));
+    assert_eq!(fs.truncate("/hello", 0), Err(FsError::ReadOnly));
+    assert_eq!(fs.write_at_by_inode(ino, 0, b"x"), Err(FsError::ReadOnly));
+    assert_eq!(fs.truncate_by_inode(ino, 0), Err(FsError::ReadOnly));
+    assert_eq!(fs.fallocate_by_inode(ino, 0, 0, 1), Err(FsError::ReadOnly));
+    fs.stats().unwrap();
+    fs.sync().unwrap();
+    assert_eq!(writes.load(Ordering::Relaxed), 0);
+
+    // Neither recovery-needed nor an unclean filesystem may be read as if
+    // the pre-recovery home blocks were current.
+    for (offset, value) in [(96, 0x4u32), (232, 42)] {
+        let mut bad = bytes.clone();
+        let pos = 1024 + offset;
+        let old = u32::from_le_bytes(bad[pos..pos + 4].try_into().unwrap());
+        bad[pos..pos + 4].copy_from_slice(&(old | value).to_le_bytes());
+        assert!(matches!(Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bad), || 0, None, MountMode::ReadOnly), Err(FsError::NotSupported)));
+    }
+    assert!(matches!(Ext2Filesystem::new(MemBlockDevice::from_bytes(&bytes), || 0), Err(FsError::NotSupported)));
+}
+
+#[cfg(feature = "ext4")]
+#[test]
+fn constrained_ext4_extent_image_reads_on_host() {
+    use crate::MountMode;
+    use std::process::Command;
+    let dir = std::env::temp_dir().join(std::format!("akuma-ext4-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img");
+    let input = dir.join("input");
+    let mut content = vec![0u8; 180_000];
+    content[..3000].fill(0x71);
+    content[90000..].fill(0xa2);
+    std::fs::write(&input, &content).unwrap();
+    let file = std::fs::File::create(&image).unwrap();
+    file.set_len(32 * 1024 * 1024).unwrap();
+    let status = Command::new("mke2fs").args(["-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^uninit_bg"]).arg(&image).status().expect("ext4 tests require mke2fs");
+    assert!(status.success());
+    let command = std::format!("write {} /data", input.display());
+    let output = Command::new("debugfs").args(["-w", "-R", &command]).arg(&image).output().expect("ext4 tests require debugfs");
+    assert!(output.status.success());
+    let bytes = std::fs::read(&image).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    let fs = Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bytes), || 0, None, MountMode::ReadOnly).unwrap();
+    assert_eq!(fs.read_file("/data").unwrap(), content);
+    assert_eq!(fs.write_file("/data", b"x"), Err(FsError::ReadOnly));
+    assert!(matches!(Ext2Filesystem::new(MemBlockDevice::from_bytes(&bytes), || 0), Err(FsError::NotSupported)));
+}

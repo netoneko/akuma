@@ -144,6 +144,8 @@ pub struct MountInfo {
 /// Trait for filesystem implementations (object-safe).
 pub trait Filesystem: Send + Sync {
     fn name(&self) -> &str;
+    /// Whether this filesystem instance can only be mounted read-only.
+    fn is_read_only(&self) -> bool { false }
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError>;
     fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError>;
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError>;

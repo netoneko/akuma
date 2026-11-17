@@ -8,6 +8,9 @@ description = "Ext2 filesystem implementation for no_std kernels"
 workspace = true
 
 [features]
+# Read-only access to clean, internal-journal ext3 filesystems.
+ext3 = []
+ext4 = ["ext3"]
 # Deferred-free drain instrumentation (`DEFERRED_DRAIN_*`). OFF by default:
 # `DEFERRED_DRAIN_SKIPPED` increments once per skipped entry per drain pass, and
 # a drain sweeps up to `DEFERRED_FREE_SLOTS` entries and runs tens of thousands
