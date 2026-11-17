@@ -48,6 +48,8 @@ use akuma_vfs::{DirEntry, Filesystem, FsError, FsStats, Metadata, path_component
 use crate::BlockDevice;
 
 mod audit;
+#[cfg(feature = "ext3")]
+mod journal;
 #[cfg(feature = "ext4")]
 mod checksum;
 pub use audit::AuditReport;
@@ -1548,7 +1550,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             inode_hint: vec![0; block_group_count as usize],
         };
 
-        Ok(Self {
+        let fs = Self {
             dev,
             mode,
             time_fn: utc_time_us,
@@ -1558,7 +1560,20 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             id: NEXT_FS_ID.fetch_add(1, core::sync::atomic::Ordering::Relaxed),
             #[cfg(test)]
             counters: WorkCounters::default(),
-        })
+        };
+        #[cfg(feature = "ext3")]
+        if journal { fs.validate_clean_journal(le_u32(&sb_buf, 224).ok_or(FsError::Corrupt)?)?; }
+        Ok(fs)
+    }
+
+    #[cfg(feature = "ext3")]
+    fn validate_clean_journal(&self, inode_num: u32) -> Result<(), FsError> {
+        let state = self.read_state();
+        let inode = self.read_inode(&state, inode_num)?;
+        if inode.type_perms & 0xf000 != S_IFREG { return Err(FsError::Corrupt); }
+        let block = self.get_block_num(&state, &inode, 0)?.ok_or(FsError::Corrupt)?;
+        let data = self.read_block(&state, block)?;
+        journal::validate_clean(&data, state.block_size, inode.file_size() / state.block_size as u64, &state.superblock.uuid)
     }
 
     fn current_time(&self) -> u32 {

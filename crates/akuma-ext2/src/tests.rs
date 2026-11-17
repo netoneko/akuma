@@ -3886,6 +3886,8 @@ fn default_ext4_metadata_checksum_image_reads_on_host() {
     let group_table = (u32_at(1024 + 20) + 1) * bs;
     let inode_size = u16_at(1024 + 88);
     let inode_table = u32_at(group_table + 8) * bs;
+    let journal_inode = inode_table + 7 * inode_size;
+    let journal_block = u32_at(journal_inode + 60) * bs;
     let root_inode = inode_table + inode_size;
     let root_block = u32_at(root_inode + 40 + 20) * bs;
     let data_number = fs.resolve_inode("/data").unwrap() as usize;
@@ -3896,7 +3898,7 @@ fn default_ext4_metadata_checksum_image_reads_on_host() {
     // Each corruption is detected at the layer which consumes that metadata.
     for (at, mount_fails) in [
         (1024 + 136, true), // superblock
-        (group_table + 12, false), // descriptor
+        (group_table + 12, true), // descriptor, read while validating journal
         (root_inode + 100, false), // inode generation
         (root_block + 8, false), // directory entry
         (extent_block + 16, false), // external extent node
@@ -3910,6 +3912,12 @@ fn default_ext4_metadata_checksum_image_reads_on_host() {
             assert_eq!(result.unwrap().read_file("/data"), Err(FsError::Corrupt), "offset {at}");
         }
     }
+    let mut dirty_journal = bytes.clone();
+    dirty_journal[journal_block + 31] = 1; // big-endian s_start
+    assert!(matches!(Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&dirty_journal), || 0, None, MountMode::ReadOnly), Err(FsError::NotSupported)));
+    let mut bad_journal = bytes;
+    bad_journal[journal_block] ^= 1;
+    assert!(matches!(Ext2Filesystem::new_with_options(MemBlockDevice::from_bytes(&bad_journal), || 0, None, MountMode::ReadOnly), Err(FsError::Corrupt)));
 }
 
 #[cfg(feature = "ext4")]
