@@ -13,8 +13,8 @@ use akuma_tty as terminal;
 /// Registry mapping child PIDs to (ProcessChannel, parent_pid)
 /// Used by parent processes to read child stdout via ChildStdout FD
 /// and by wait4(-1) to find children of a specific parent.
-static CHILD_CHANNELS: Spinlock<BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>> =
-    Spinlock::new(BTreeMap::new());
+static CHILD_CHANNELS: akuma_irq_lock::IrqSpinlock<BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>> =
+    akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 /// Register a child process channel (called when spawning via syscall)
 ///
@@ -27,16 +27,16 @@ static CHILD_CHANNELS: Spinlock<BTreeMap<Pid, (Arc<ProcessChannel>, Pid)>> =
 pub fn register_child_channel(child_pid: Pid, channel: Arc<ProcessChannel>, parent_pid: Pid) {
     // Resolved before the registry lock is taken: `find_process` takes the process-table lock.
     let parent = find_process(|p| if p.pid == parent_pid { Some(p.tgid) } else { None }).unwrap_or(parent_pid);
-    with_irqs_disabled(|| {
+    {
         CHILD_CHANNELS.lock().insert(child_pid, (channel, parent));
-    })
+    }
 }
 
 /// Get a child process channel by PID
 pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
-    with_irqs_disabled(|| {
+    {
         CHILD_CHANNELS.lock().get(&child_pid).map(|(ch, _)| ch.clone())
-    })
+    }
 }
 
 /// True when `child_pid` is registered as a child of the thread group `waiter_tgid`.
@@ -49,9 +49,9 @@ pub fn get_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
 /// calls `waitid(P_PIDFD, <pidfd of itself>)` and *requires* ECHILD; blocking
 /// on a non-child instead deadlocks the caller against its own exit.
 pub fn is_child_of_group(child_pid: Pid, waiter_tgid: Pid) -> bool {
-    let ppid = with_irqs_disabled(|| {
+    let ppid = {
         CHILD_CHANNELS.lock().get(&child_pid).map(|(_, ppid)| *ppid)
-    });
+    };
     let Some(ppid) = ppid else { return false };
     if ppid == waiter_tgid {
         return true;
@@ -67,7 +67,7 @@ pub fn is_child_of_group(child_pid: Pid, waiter_tgid: Pid) -> bool {
 /// threads) — resolve its thread group before using it as a signal target
 /// (see [`sigchld_target_thread`]).
 pub fn parent_pid_of(child_pid: Pid) -> Option<Pid> {
-    with_irqs_disabled(|| CHILD_CHANNELS.lock().get(&child_pid).map(|(_, ppid)| *ppid))
+    CHILD_CHANNELS.lock().get(&child_pid).map(|(_, ppid)| *ppid)
 }
 
 /// Pick which thread of group `tgid` receives a process-directed signal.
@@ -184,9 +184,9 @@ pub fn publish_child_exit(child_pid: Pid, exit_code: i32) {
 /// Remove a child process channel (called when the parent CLOSES its
 /// `ChildStdout` read fd, or on `execve`/teardown of the reading process).
 pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
-    with_irqs_disabled(|| {
+    {
         CHILD_CHANNELS.lock().remove(&child_pid).map(|(ch, _)| ch)
-    })
+    }
 }
 
 /// Reap a child's channel on the `wait*` (waitpid/wait4/waitid) path.
@@ -226,7 +226,7 @@ pub fn remove_child_channel(child_pid: Pid) -> Option<Arc<ProcessChannel>> {
 /// ~900 k times a second and grew a `Vec` until every physical page was gone
 /// (`docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` §6 item 6).
 pub fn reap_child_channel(child_pid: Pid) -> bool {
-    with_irqs_disabled(|| {
+    {
         let mut map = CHILD_CHANNELS.lock();
         match map.get_mut(&child_pid) {
             Some((ch, ppid)) if ch.has_stdout_data() => {
@@ -236,7 +236,7 @@ pub fn reap_child_channel(child_pid: Pid) -> bool {
             Some(_) => map.remove(&child_pid).is_some(),
             None => false,
         }
-    })
+    }
 }
 
 /// The parent recorded for a child that has been reaped but whose channel is
@@ -246,7 +246,7 @@ pub const REAPED_PARENT: Pid = Pid::MAX;
 
 /// Find any exited child of the given parent. Returns (child_pid, channel).
 pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> {
-    with_irqs_disabled(|| {
+    (|| {
         let channels = CHILD_CHANNELS.lock();
         for (&child_pid, (ch, ppid)) in channels.iter() {
             if *ppid == parent_pid && ch.has_exited() {
@@ -254,41 +254,41 @@ pub fn find_exited_child(parent_pid: Pid) -> Option<(Pid, Arc<ProcessChannel>)> 
             }
         }
         None
-    })
+    })()
 }
 
 /// Register `poller_tid` as a poller on every child channel of `parent_pid`.
 /// When any child exits, `set_exited()` wakes the poller.
 pub fn add_poller_to_all_children(parent_pid: Pid, poller_tid: usize) {
-    with_irqs_disabled(|| {
+    {
         let channels = CHILD_CHANNELS.lock();
         for (ch, ppid) in channels.values() {
             if *ppid == parent_pid {
                 ch.add_poller(poller_tid);
             }
         }
-    })
+    }
 }
 
 /// Check if the given parent has any children registered.
 pub fn has_children(parent_pid: Pid) -> bool {
-    with_irqs_disabled(|| {
+    {
         CHILD_CHANNELS.lock().values().any(|(_, ppid)| *ppid == parent_pid)
-    })
+    }
 }
 
 /// The registry's children of `parent_pid` — the set `wait4(-1)` from that
 /// parent draws on. Allocates one `Vec`; for tests and diagnostics, not for a
 /// hot path.
 pub fn children_of(parent_pid: Pid) -> Vec<Pid> {
-    with_irqs_disabled(|| {
+    {
         CHILD_CHANNELS
             .lock()
             .iter()
             .filter(|(_, (_, ppid))| *ppid == parent_pid)
             .map(|(&pid, _)| pid)
             .collect()
-    })
+    }
 }
 
 /// Hand every child of `dying` to `new_parent` — Linux's reparent-to-init at
@@ -309,7 +309,7 @@ pub fn children_of(parent_pid: Pid) -> Vec<Pid> {
 /// moved. A child that has already exited moves too, and the new parent's
 /// next `wait4(-1)` finds it through [`find_exited_child`].
 pub fn reparent_children_to(dying: Pid, new_parent: Pid) -> usize {
-    let moved = with_irqs_disabled(|| {
+    let moved = {
         let mut map = CHILD_CHANNELS.lock();
         let mut n = 0usize;
         for (_, ppid) in map.values_mut() {
@@ -319,7 +319,7 @@ pub fn reparent_children_to(dying: Pid, new_parent: Pid) -> usize {
             }
         }
         n
-    });
+    };
     // Two passes rather than a mutation inside `for_each_process`, which hands
     // out `&Process`. The `Vec` is empty for a process with no children — nearly
     // all of them — and `Vec::new` does not allocate until something is pushed,

@@ -28,7 +28,6 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, BTreeMap as PollerMap, VecDeque};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, Ordering};
-use spinning_top::Spinlock;
 
 use akuma_exec::process::user_access::{
     Prefault, copy_from_user, copy_to_user, copy_to_user_with, validate_user_range,
@@ -36,7 +35,6 @@ use akuma_exec::process::user_access::{
 use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 use akuma_primitives::clock::uptime_us;
 use akuma_primitives::errno::negated::{E2BIG, EAGAIN, EEXIST, EFAULT, EINVAL, ENOENT, ENOMSG};
-use akuma_primitives::irq::with_irqs_disabled;
 
 /// Whether to print the per-call `[msg*]` traces — a `const` from
 /// `akuma_config`, so the traces fold out entirely when it is false.
@@ -87,7 +85,7 @@ struct MsgQueue {
 // could open a queue belonging to another container by guessing the key.
 // msqids are still allocated from a global atomic so they are unique across all
 // boxes; the box_id in the tuple provides the isolation boundary.
-static MSGQUEUE_TABLE: Spinlock<BTreeMap<(u64, u32), MsgQueue>> = Spinlock::new(BTreeMap::new());
+static MSGQUEUE_TABLE: akuma_irq_lock::IrqSpinlock<BTreeMap<(u64, u32), MsgQueue>> = akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 // Global counter — msqids only need to be unique within a box (the table key is
 // (box_id, msqid)), but a single atomic is simpler and the 32-bit space is large
 // enough that cross-box "waste" is not a concern in practice.
@@ -100,7 +98,7 @@ fn current_box_id() -> u64 {
 #[must_use]
 pub fn sys_msgget(key: i32, flags: i32) -> u64 {
     let box_id = current_box_id();
-    with_irqs_disabled(|| {
+    (|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if key == IPC_PRIVATE {
             let msqid = NEXT_MSQID.fetch_add(1, Ordering::SeqCst);
@@ -134,7 +132,7 @@ pub fn sys_msgget(key: i32, flags: i32) -> u64 {
                 ENOENT
             }
         }
-    })
+    })()
 }
 
 #[must_use]
@@ -142,7 +140,7 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
     let box_id = current_box_id();
     match cmd {
         IPC_RMID => {
-            let pollers_to_wake = with_irqs_disabled(|| {
+            let pollers_to_wake = {
                 let mut table = MSGQUEUE_TABLE.lock();
                 let mut handles = alloc::vec::Vec::new();
                 if let Some(q) = table.get_mut(&(box_id, msqid)) {
@@ -152,7 +150,7 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
                 }
                 table.remove(&(box_id, msqid));
                 handles
-            });
+            };
             for handle in pollers_to_wake {
                 wake_by_handle(handle);
             }
@@ -162,14 +160,14 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
             0
         }
         IPC_STAT => {
-            let (key, mode, cbytes, qnum) = with_irqs_disabled(|| {
+            let (key, mode, cbytes, qnum) = {
                 let table = MSGQUEUE_TABLE.lock();
                 if let Some(q) = table.get(&(box_id, msqid)) {
                     (q.key, q.mode, q.cbytes, q.messages.len())
                 } else {
                     (0i32, 0u32, 0usize, 0usize)
                 }
-            });
+            };
             // msqid_ds layout (112 bytes total)
             let mut ds = [0u8; 112];
             // ipc_perm.key (i32 at offset 0)
@@ -194,7 +192,7 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
                 return EFAULT;
             }
             let mode = u32::from(u16::from_ne_bytes([ds[20], ds[21]]));
-            with_irqs_disabled(|| {
+            {
                 let mut table = MSGQUEUE_TABLE.lock();
                 if let Some(q) = table.get_mut(&(box_id, msqid)) {
                     q.mode = mode;
@@ -202,7 +200,7 @@ pub fn sys_msgctl(msqid: u32, cmd: i32, buf: u64) -> u64 {
                 } else {
                     EINVAL
                 }
-            })
+            }
         }
         _ => EINVAL,
     }
@@ -231,7 +229,7 @@ pub fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
     }
     let tid = akuma_exec::threading::current_thread_id();
     loop {
-        let result = with_irqs_disabled(|| {
+        let result = (|| {
             let mut table = MSGQUEUE_TABLE.lock();
             let q = match table.get_mut(&(box_id, msqid)) {
                 Some(q) => q,
@@ -251,7 +249,7 @@ pub fn sys_msgsnd(msqid: u32, msgp: u64, msgsz: usize, flags: i32) -> u64 {
             let recv_handles: alloc::vec::Vec<WakeHandle> = q.recv_pollers.values().copied().collect();
             q.recv_pollers.clear();
             (Some(0u64), recv_handles)
-        });
+        })();
         if let (Some(r), handles) = result {
             for handle in handles {
                 wake_by_handle(handle);
@@ -271,7 +269,7 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
         return EFAULT;
     }
     loop {
-        let result = with_irqs_disabled(|| {
+        let result = (|| {
             let mut table = MSGQUEUE_TABLE.lock();
             let q = match table.get_mut(&(box_id, msqid)) {
                 Some(q) => q,
@@ -344,7 +342,7 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
             let send_handles: alloc::vec::Vec<WakeHandle> = q.send_pollers.values().copied().collect();
             q.send_pollers.clear();
             (Some(actual_len as u64), send_handles)
-        });
+        })();
         if let (Some(r), handles) = result {
             for handle in handles {
                 wake_by_handle(handle);
@@ -358,22 +356,22 @@ pub fn sys_msgrcv(msqid: u32, msgp: u64, msgsz: usize, msgtyp: i64, flags: i32) 
 
 /// Register a thread as interested in receiving from this queue (for epoll/poll).
 pub fn msgqueue_add_recv_poller(box_id: u64, msqid: u32, tid: usize) {
-    with_irqs_disabled(|| {
+    {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
             q.recv_pollers.insert(tid, wake_handle_for_thread(tid));
         }
-    });
+    };
 }
 
 /// Register a thread as interested in sending to this queue (for epoll/poll).
 pub fn msgqueue_add_send_poller(box_id: u64, msqid: u32, tid: usize) {
-    with_irqs_disabled(|| {
+    {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
             q.send_pollers.insert(tid, wake_handle_for_thread(tid));
         }
-    });
+    };
 }
 
 pub struct MsgQueueSnapshot {
@@ -387,7 +385,7 @@ pub struct MsgQueueSnapshot {
 
 #[must_use]
 pub fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
-    with_irqs_disabled(|| {
+    {
         MSGQUEUE_TABLE.lock().iter()
             .map(|((box_id, msqid), q)| MsgQueueSnapshot {
                 box_id: *box_id,
@@ -398,7 +396,7 @@ pub fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
                 qnum: q.messages.len(),
             })
             .collect()
-    })
+    }
 }
 
 // ============================================================================
@@ -408,31 +406,31 @@ pub fn list_msg_queues() -> Vec<MsgQueueSnapshot> {
 /// Test helper: return the number of recv pollers registered on a queue.
 #[must_use]
 pub fn msgqueue_recv_pollers_count(box_id: u64, msqid: u32) -> usize {
-    with_irqs_disabled(|| {
+    {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.recv_pollers.len())
-    })
+    }
 }
 
 /// Test helper: return the number of send pollers registered on a queue.
 #[must_use]
 pub fn msgqueue_send_pollers_count(box_id: u64, msqid: u32) -> usize {
-    with_irqs_disabled(|| {
+    {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.send_pollers.len())
-    })
+    }
 }
 
 /// Test helper: check if a specific tid is registered as a recv poller.
 #[must_use]
 pub fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
-    with_irqs_disabled(|| {
+    {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).is_some_and(|q| q.recv_pollers.contains_key(&tid))
-    })
+    }
 }
 
 /// Test helper: directly push a message into a queue (bypasses userspace pointer validation).
 #[must_use]
 pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) -> bool {
-    with_irqs_disabled(|| {
+    (|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
             let msg_len = data.len();
@@ -449,13 +447,13 @@ pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) ->
         } else {
             false
         }
-    })
+    })()
 }
 
 /// Test helper: pop a message from a queue (bypasses userspace pointer validation).
 #[must_use]
 pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::Vec<u8>)> {
-    with_irqs_disabled(|| {
+    (|| {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
             if let Some(msg) = q.messages.pop_front() {
@@ -474,15 +472,15 @@ pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::
         } else {
             None
         }
-    })
+    })()
 }
 
 /// Test helper: return the number of messages in the queue.
 #[must_use]
 pub fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
-    with_irqs_disabled(|| {
+    {
         MSGQUEUE_TABLE.lock().get(&(box_id, msqid)).map_or(0, |q| q.messages.len())
-    })
+    }
 }
 
 /// Remove every queue belonging to a box, without waking anyone parked on one.
@@ -490,8 +488,8 @@ pub fn msgqueue_message_count(box_id: u64, msqid: u32) -> usize {
 /// Called from `akuma-syscalls-glue`'s `sys_kill_box` after the box's threads
 /// are killed, which is what makes not waking them correct.
 pub fn cleanup_box_queues(box_id: u64) {
-    with_irqs_disabled(|| {
+    {
         let mut table = MSGQUEUE_TABLE.lock();
         table.retain(|(bid, _), _| *bid != box_id);
-    });
+    };
 }

@@ -20,7 +20,7 @@ struct KernelEventFd {
     ref_count: u32,
 }
 
-static EVENTFDS: Spinlock<BTreeMap<u32, KernelEventFd>> = Spinlock::new(BTreeMap::new());
+static EVENTFDS: akuma_irq_lock::IrqSpinlock<BTreeMap<u32, KernelEventFd>> = akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 static NEXT_EVENTFD_ID: AtomicU32 = AtomicU32::new(1);
 
 pub fn eventfd_create(initval: u32, flags: u32) -> u32 {
@@ -29,18 +29,18 @@ pub fn eventfd_create(initval: u32, flags: u32) -> u32 {
         Ok(ef) => ef,
         Err(_) => return 0,
     };
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         EVENTFDS.lock().insert(id, KernelEventFd {
             ef,
             pollers: BTreeMap::new(),
             ref_count: 1,
         });
-    });
+    };
     id
 }
 
 pub fn eventfd_read(id: u32) -> Result<u64, i32> {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    (|| {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
             let val = efd.ef.read()?;
@@ -55,11 +55,11 @@ pub fn eventfd_read(id: u32) -> Result<u64, i32> {
         } else {
             Err(akuma_net::socket::libc_errno::EBADF)
         }
-    })
+    })()
 }
 
 pub fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    (|| {
         let mut table = EVENTFDS.lock();
         if let Some(efd) = table.get_mut(&id) {
             efd.ef.write(val)?;
@@ -76,25 +76,25 @@ pub fn eventfd_write(id: u32, val: u64) -> Result<(), i32> {
         } else {
             Err(akuma_net::socket::libc_errno::EBADF)
         }
-    })
+    })()
 }
 
 pub(super) fn eventfd_can_read(id: u32) -> bool {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         EVENTFDS.lock().get(&id).is_some_and(|efd| efd.ef.can_read())
-    })
+    }
 }
 
 pub(super) fn eventfd_is_nonblock(id: u32) -> bool {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         EVENTFDS.lock().get(&id).is_some_and(|efd| efd.ef.is_nonblock())
-    })
+    }
 }
 
 /// Increment the reference count for a shared eventfd (called on fork).
 /// Mirrors `pipe_clone_ref` in the pipe subsystem.
 pub fn eventfd_clone_ref(id: u32) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count += 1;
@@ -102,13 +102,13 @@ pub fn eventfd_clone_ref(id: u32) {
                 akuma_primitives::safe_print!(96, "[eventfd] clone_ref id={} ref_count={}\n", id, efd.ref_count);
             }
         }
-    });
+    };
 }
 
 /// Decrement the reference count. Destroys the eventfd only when ref_count reaches 0.
 /// Previously this blindly removed the entry, breaking parent processes after fork+exec.
 pub fn eventfd_close(id: u32) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         let mut efds = EVENTFDS.lock();
         if let Some(efd) = efds.get_mut(&id) {
             efd.ref_count = efd.ref_count.saturating_sub(1);
@@ -119,15 +119,15 @@ pub fn eventfd_close(id: u32) {
                 efds.remove(&id);
             }
         }
-    });
+    };
 }
 
 pub fn eventfd_add_poller(id: u32, tid: usize) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    (|| {
         if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
             efd.pollers.insert(tid, wake_handle_for_thread(tid));
         }
-    });
+    })();
 }
 
 pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {

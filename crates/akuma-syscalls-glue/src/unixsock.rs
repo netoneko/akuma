@@ -94,8 +94,8 @@ static UNIX_TABLE: akuma_irq_lock::IrqSpinlock<Option<UnixTable>> = akuma_irq_lo
 /// registration so an entry that outlives its thread wakes nobody rather than
 /// the slot's next occupant — the same tid-recycling hazard `pipe.rs` documents
 /// on its own poller map.
-static ACCEPT_WAITERS: Spinlock<BTreeMap<u32, BTreeMap<usize, WakeHandle>>> =
-    Spinlock::new(BTreeMap::new());
+static ACCEPT_WAITERS: akuma_irq_lock::IrqSpinlock<BTreeMap<u32, BTreeMap<usize, WakeHandle>>> =
+    akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 /// Run `f` with the table, creating it on first use.
 ///
@@ -248,9 +248,9 @@ pub fn unix_sock_close(sock: u32) {
     // Anything parked in accept() on this listener must be woken to discover
     // the listener is gone, or it sleeps forever on a queue nobody will fill.
     wake_accept_waiters(sock);
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         ACCEPT_WAITERS.lock().remove(&sock);
-    });
+    };
 }
 
 /// Take one reference. Registered as `ExecRuntime::unix_sock_clone_ref`.
@@ -427,11 +427,11 @@ fn accept_wait_slot(listener: u32, tid: usize) -> bool {
 
 /// Wake everything parked in `accept` on this listener.
 fn wake_accept_waiters(listener: u32) {
-    let handles: Vec<WakeHandle> = akuma_primitives::irq::with_irqs_disabled(|| {
+    let handles: Vec<WakeHandle> = {
         let mut map = ACCEPT_WAITERS.lock();
         map.get_mut(&listener)
             .map_or_default(|w| core::mem::take(w).into_values().collect())
-    });
+    };
     for h in handles {
         wake_by_handle(h);
     }
@@ -919,13 +919,13 @@ pub fn listener_ready(fd: u32, tid: Option<usize>) -> Option<bool> {
         Some(s.accept_ready())
     })?;
     if !ready && let Some(tid) = tid {
-        akuma_primitives::irq::with_irqs_disabled(|| {
+        {
             ACCEPT_WAITERS
                 .lock()
                 .entry(sock)
                 .or_default()
                 .insert(tid, wake_handle_for_thread(tid));
-        });
+        };
     }
     Some(ready)
 }

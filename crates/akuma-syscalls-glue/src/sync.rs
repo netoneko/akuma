@@ -63,8 +63,8 @@ impl WaiterId for QueuedWaiter {
 /// safe under the hold) and refuses to demand-page. Changing it to `Prefault::Yes`
 /// would allocate frames, take `as_lock` and possibly read a file with IRQs masked
 /// and this spinlock held.
-static FUTEX_WAITERS: Spinlock<WaiterTable<QueuedWaiter>> =
-    Spinlock::new(WaiterTable::new());
+static FUTEX_WAITERS: akuma_irq_lock::IrqSpinlock<WaiterTable<QueuedWaiter>> =
+    akuma_irq_lock::IrqSpinlock::new(WaiterTable::new());
 
 const BITSET_MATCH_ANY: u32 = akuma_syscalls_sync::MATCH_ANY;
 
@@ -295,7 +295,7 @@ pub fn futex_do_wake(tgid: u32, uaddr: usize, max_wake: u32, wake_mask: u32) -> 
     let key = (tgid, uaddr);
 
     let to_wake: Vec<QueuedWaiter> =
-        akuma_primitives::irq::with_irqs_disabled(|| FUTEX_WAITERS.lock().wake(key, max_wake, wake_mask));
+        FUTEX_WAITERS.lock().wake(key, max_wake, wake_mask);
 
     // Outside the hold — the generation in each handle is what makes that safe: if this
     // path is preempted here and a popped waiter's slot is recycled meanwhile, the wake
@@ -336,9 +336,9 @@ pub fn futex_wake(tgid: u32, uaddr: usize, max_wake: i32) {
 #[cfg(kernel_tests)]
 pub fn futex_wait_at_tgid_for_test(tgid: u32, uaddr: usize) {
     let key = (tgid, uaddr);
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         FUTEX_WAITERS.lock().enqueue(key, QueuedWaiter(akuma_exec::threading::current_wake_handle()), BITSET_MATCH_ANY);
-    });
+    };
     akuma_exec::threading::park_indefinitely();
     // futex_do_wake removed us from the queue before calling wake()
 }
@@ -362,7 +362,7 @@ fn futex_check_and_enqueue(
     val: u32,
     first: bool,
 ) -> Result<(), Errno> {
-    let r = akuma_primitives::irq::with_irqs_disabled(|| {
+    let r = (|| {
         let mut waiters = FUTEX_WAITERS.lock();
         let mut current_val: u32 = 0;
         if read_user_into_with(&mut current_val, uaddr as u64, Prefault::No).is_err() {
@@ -374,7 +374,7 @@ fn futex_check_and_enqueue(
         // `tid` is the enqueuing thread itself, so its handle is live by definition.
         waiters.enqueue(key, QueuedWaiter(akuma_exec::threading::wake_handle_for_thread(tid)), bitset);
         Ok(())
-    });
+    })();
     if r.is_ok() {
         fe(tid, if first { FE_ENQ } else { FE_REENQ }, uaddr);
     }
@@ -396,18 +396,18 @@ fn futex_requeue_table(
     max_wake: u32,
     max_requeue: u32,
 ) -> (Vec<QueuedWaiter>, usize) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    (|| {
         let (to_wake, requeued) = FUTEX_WAITERS.lock().requeue(key1, key2, max_wake, max_requeue);
         for h in &requeued {
             fe(h.tid(), FE_RQ, key2.1);
         }
         (to_wake, requeued.len())
-    })
+    })()
 }
 
 /// Remove `tid` from `key`'s waiter queue, dropping the queue if it empties.
 fn futex_dequeue(key: (u32, usize), tid: usize) {
-    akuma_primitives::irq::with_irqs_disabled(|| FUTEX_WAITERS.lock().dequeue(key, tid));
+    FUTEX_WAITERS.lock().dequeue(key, tid);
     fe(tid, FE_DEQ, key.1);
 }
 
@@ -423,11 +423,11 @@ fn futex_dequeue(key: (u32, usize), tid: usize) {
 /// `typenum` stall in `archive/SELFHOST_DEVBOX_SMOLTCP.md`). Requeue never
 /// crosses `tgid`, so the search is bounded to this thread group's queues.
 fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    (|| {
         if let Some(k) = FUTEX_WAITERS.lock().remove_anywhere(tgid, tid) {
             fe(tid, FE_RMANY, k.1);
         }
-    });
+    })();
 }
 
 /// Dump the whole futex waiter table: every `(tgid, uaddr)` key and the tids queued on it.
@@ -445,7 +445,7 @@ fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
 /// Printed next to `[THR-DUMP]`/`[PIPE-DUMP]` under `DEADLOCK_THREAD_DUMP_ENABLED`.
 pub fn futex_dump() {
     let now = akuma_primitives::clock::uptime_us();
-    let stuck: Vec<(u32, usize)> = akuma_primitives::irq::with_irqs_disabled(|| {
+    let stuck: Vec<(u32, usize)> = (|| {
         let waiters = FUTEX_WAITERS.lock();
         if waiters.keys() == 0 {
             akuma_primitives::tprint!(48, "[FUTEX-DUMP] table empty\n");
@@ -473,7 +473,7 @@ pub fn futex_dump() {
             }
         }
         stuck
-    });
+    })();
     let orphans = futex_orphan_check();
     // Only when something is actually wedged, and only a few times per boot: each
     // report is tens of lines of serial output, which is itself enough to perturb a
@@ -531,7 +531,7 @@ fn futex_orphan_check() -> Vec<(u32, usize)> {
     }
     use akuma_exec::threading::{MAX_THREADS, thread_state};
     let queued: Vec<usize> =
-        akuma_primitives::irq::with_irqs_disabled(|| FUTEX_WAITERS.lock().queued_tids());
+        FUTEX_WAITERS.lock().queued_tids();
     for tid in 0..MAX_THREADS {
         if akuma_exec::threading::get_thread_state(tid) != thread_state::WAITING {
             continue;
@@ -582,11 +582,11 @@ fn futex_orphan_check() -> Vec<(u32, usize)> {
 /// small (only addresses with live waiters) and this runs once per slot recycle, not per
 /// futex op.
 pub fn futex_purge_tid(tid: usize) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         for k in FUTEX_WAITERS.lock().purge(tid) {
             fe(tid, FE_PURGE, k.1);
         }
-    });
+    };
 }
 
 /// Test hooks for the boot self-test in `crates/akuma-kernel-tests-aarch64/src/process_tests.rs`.
@@ -602,13 +602,13 @@ pub mod test_hooks {
     use alloc::vec::Vec;
 
     pub fn enqueue(key: (u32, usize), tid: usize) {
-        akuma_primitives::irq::with_irqs_disabled(|| {
+        {
             FUTEX_WAITERS.lock().enqueue(
                 key,
                 QueuedWaiter(akuma_exec::threading::wake_handle_for_thread(tid)),
                 super::BITSET_MATCH_ANY,
             );
-        });
+        };
     }
 
 /// `None` when no queue exists for `key` (distinct from an empty one, which the
@@ -617,7 +617,7 @@ pub mod test_hooks {
 /// The returned tids have their bitset stripped: the deterministic test checks
 /// FIFO ordering, not bitset bookkeeping.
     pub fn queue(key: (u32, usize)) -> Option<Vec<usize>> {
-        akuma_primitives::irq::with_irqs_disabled(|| FUTEX_WAITERS.lock().queue(key))
+        FUTEX_WAITERS.lock().queue(key)
     }
 
     pub fn requeue(key1: (u32, usize), key2: (u32, usize), max_wake: u32, max_requeue: u32) -> (Vec<usize>, usize) {
@@ -633,14 +633,14 @@ pub mod test_hooks {
         // Whatever is on it, gone — the deterministic test's teardown. The table
         // has no "remove key" of its own on purpose: every real path removes a
         // named waiter and drops the queue only when it empties.
-        akuma_primitives::irq::with_irqs_disabled(|| {
+        {
             let mut t = FUTEX_WAITERS.lock();
             if let Some(tids) = t.queue(key) {
                 for tid in tids {
                     t.dequeue(key, tid);
                 }
             }
-        });
+        };
     }
 }
 
@@ -739,9 +739,9 @@ pub(super) fn sys_futex(uaddr: usize, op: i32, val: u32, timeout_ptr: UserAddr, 
                 // — if we are still on the ORIGINAL key — drop ourselves so the
                 // re-validate/re-enqueue below cannot double-enqueue. A waiter sitting
                 // on the requeue target is left parked.
-                let located = akuma_primitives::irq::with_irqs_disabled(|| {
+                let located = {
                     FUTEX_WAITERS.lock().locate_and_take(tgid, tid, key)
-                });
+                };
                 // `locate_and_take` performs the self-removal; the event ring
                 // still has to record it, because `S` in a `hist=` string is how
                 // a wedged thread's last transition is read back.

@@ -72,10 +72,8 @@ pub use akuma_primitives::safe_print;
 
 use akuma_primitives::FileKey;
 use akuma_exec::PhysFrame;
-use akuma_primitives::irq::with_irqs_disabled;
 use alloc::collections::BTreeMap;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use spinning_top::Spinlock;
 
 
 /// The kill switch, published by [`init`]. False until then, which is also what
@@ -143,7 +141,7 @@ struct Entry {
 /// them: this table is reachable from the BKL-free fault window, and a nested IRQ
 /// that hard-spins for the BKL while a peer core holds this lock is the AB-BA
 /// shape `docs/reference/subsystems/locking.md` warns about.
-static PAGES: Spinlock<BTreeMap<(u32, u32, usize), Entry>> = Spinlock::new(BTreeMap::new());
+static PAGES: akuma_irq_lock::IrqSpinlock<BTreeMap<(u32, u32, usize), Entry>> = akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 
 /// Rotating eviction cursor, so successive evictions sweep the keyspace
 /// (clock-like) instead of always dropping the numerically lowest inode.
@@ -329,7 +327,7 @@ pub fn lookup_and_ref(
     if !enabled() {
         return None;
     }
-    let hit = with_irqs_disabled(|| {
+    let hit = {
         let pages = PAGES.lock();
         let hit = pages.get(&(inode, mount_id, file_off)).copied();
         if let Some(ref h) = hit {
@@ -347,7 +345,7 @@ pub fn lookup_and_ref(
             akuma_pmm::cow_ref_inc(h.pa);
         }
         hit
-    })?;
+    }?;
     HITS.fetch_add(1, Ordering::Relaxed);
     Some((PhysFrame::new(hit.pa), want_exec && !hit.icache_done))
 }
@@ -358,13 +356,13 @@ pub fn mark_icache_clean(key: FileKey, file_off: usize, frame: PhysFrame) {
     if !enabled() {
         return;
     }
-    with_irqs_disabled(|| {
+    (|| {
         if let Some(e) = PAGES.lock().get_mut(&(inode, mount_id, file_off))
             && e.pa == frame.addr
         {
             e.icache_done = true;
         }
-    });
+    })();
 }
 
 /// Publish a freshly filled frame. Takes the cache's own reference.
@@ -390,7 +388,7 @@ pub fn insert(key: FileKey, file_off: usize, frame: PhysFrame, icache_done: bool
     }
     MISSES.fetch_add(1, Ordering::Relaxed);
 
-    let evicted = with_irqs_disabled(|| {
+    let evicted = (|| {
         let mut pages = PAGES.lock();
         // Lost the race to a peer filling the same page: keep the existing entry
         // so both mappers converge on one frame, and let the caller's frame stay
@@ -456,7 +454,7 @@ pub fn insert(key: FileKey, file_off: usize, frame: PhysFrame, icache_done: bool
         pages.remove(&vk);
         EVICT_CURSOR.store(vk.2.wrapping_add(4096), Ordering::Relaxed);
         Some((ve.pa, took_mapped))
-    });
+    })();
 
     if let Some((pa, took_mapped)) = evicted {
         EVICTIONS.fetch_add(1, Ordering::Relaxed);
@@ -489,14 +487,14 @@ pub fn invalidate_inode(inode: u32) {
     if !enabled() || inode == 0 {
         return;
     }
-    let dropped: alloc::vec::Vec<usize> = with_irqs_disabled(|| {
+    let dropped: alloc::vec::Vec<usize> = {
         let mut pages = PAGES.lock();
         let keys: alloc::vec::Vec<(u32, u32, usize)> = pages
             .range((inode, 0u32, 0usize)..=(inode, u32::MAX, usize::MAX))
             .map(|(k, _)| *k)
             .collect();
         keys.iter().filter_map(|k| pages.remove(k).map(|e| e.pa)).collect()
-    });
+    };
     if dropped.is_empty() {
         return;
     }
@@ -509,7 +507,7 @@ pub fn invalidate_inode(inode: u32) {
 /// Number of cached pages (diagnostics / `[FPCACHE]` PSTATS line).
 #[must_use]
 pub fn len() -> usize {
-    with_irqs_disabled(|| PAGES.lock().len())
+    PAGES.lock().len()
 }
 
 /// Release up to `want` *unmapped* cached pages back to the PMM under memory
@@ -524,7 +522,7 @@ pub fn shrink(want: usize) -> usize {
     if !enabled() || want == 0 {
         return 0;
     }
-    let dropped: alloc::vec::Vec<usize> = with_irqs_disabled(|| {
+    let dropped: alloc::vec::Vec<usize> = {
         let mut pages = PAGES.lock();
         let victims: alloc::vec::Vec<(u32, u32, usize)> = pages
             .iter()
@@ -534,7 +532,7 @@ pub fn shrink(want: usize) -> usize {
             .take(want)
             .collect();
         victims.iter().filter_map(|k| pages.remove(k).map(|e| e.pa)).collect()
-    });
+    };
     let n = dropped.len();
     EVICTIONS.fetch_add(n, Ordering::Relaxed);
     for pa in dropped {

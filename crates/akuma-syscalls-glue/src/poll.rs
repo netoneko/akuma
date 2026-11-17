@@ -33,7 +33,7 @@ use alloc::collections::BTreeMap;
 /// [`akuma_syscalls_poll::InterestList`]. What stays here is the lock around it
 /// and the IRQ discipline that lock needs; see `epoll_reset_edge`.
 #[cfg(feature = "sc-epoll")]
-static EPOLL_TABLE: Spinlock<BTreeMap<u32, InterestList>> = Spinlock::new(BTreeMap::new());
+static EPOLL_TABLE: akuma_irq_lock::IrqSpinlock<BTreeMap<u32, InterestList>> = akuma_irq_lock::IrqSpinlock::new(BTreeMap::new());
 #[cfg(feature = "sc-epoll")]
 static NEXT_EPOLL_ID: AtomicU32 = AtomicU32::new(1);
 /// Counts `epoll_pwait(timeout=0)` returns with `nready=0` for rate-limited logging.
@@ -222,9 +222,9 @@ fn log_epoll_pwait_return(
 
 #[cfg(feature = "sc-epoll")]
 pub fn epoll_destroy(epoll_id: u32) {
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         EPOLL_TABLE.lock().remove(&epoll_id);
-    });
+    };
 }
 
 /// No-ops when epoll is gated out: there is no interest table to reset, and the
@@ -270,12 +270,12 @@ fn epoll_reset_edge(fd: u32, bits: u32) {
     // allocation and N spinlock round-trips on every `read()` of a pipe, i.e.
     // on sshd's session bridge, every byte a TUI writes, and every busybox
     // pipeline. See `docs/archive/TOKIO_PIPE_EPOLL_HANG.md`.
-    akuma_primitives::irq::with_irqs_disabled(|| {
+    {
         let mut table = EPOLL_TABLE.lock();
         for inst in table.values_mut() {
             inst.reset_edge(fd, bits);
         }
-    });
+    };
 }
 
 /// Called when a socket read drained the receive buffer (an `EAGAIN`, or any
@@ -322,9 +322,9 @@ pub fn epoll_on_fd_write_blocked(fd: u32) {
 pub fn sys_epoll_create1(flags: u32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         let epoll_id = NEXT_EPOLL_ID.fetch_add(1, Ordering::SeqCst);
-        akuma_primitives::irq::with_irqs_disabled(|| {
+        {
             EPOLL_TABLE.lock().insert(epoll_id, InterestList::new());
-        });
+        };
         let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::EpollFd(epoll_id));
         if flags & ep::EPOLL_CLOEXEC != 0 {
             proc.set_cloexec(fd);
@@ -363,7 +363,7 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: UserAddr) -> u64 {
     // barred outright (locking.md). The membership probe keeps EBADF ahead of EFAULT,
     // which is the precedence the un-hoisted code had.
     let event = if ctl.needs_event() {
-        if !akuma_primitives::irq::with_irqs_disabled(|| EPOLL_TABLE.lock().contains_key(&epoll_id)) {
+        if !EPOLL_TABLE.lock().contains_key(&epoll_id) {
             return EBADF;
         }
         #[cfg(target_arch = "x86_64")]
@@ -392,13 +392,13 @@ pub fn sys_epoll_ctl(epfd: u32, op: i32, fd: u32, event_ptr: UserAddr) -> u64 {
     // to sit inside an IRQ-masked spinlock hold.
     let mut outcome = None;
 
-    let result = akuma_primitives::irq::with_irqs_disabled(|| {
+    let result = (|| {
         let mut table = EPOLL_TABLE.lock();
         let Some(instance) = table.get_mut(&epoll_id) else { return EBADF };
         let o = instance.apply(ctl, fd, ev_events, ev_data);
         outcome = Some(o);
         o.errno()
-    });
+    })();
 
     // Gated, like every other trace in this file. Ungated, this fires on EVERY
     // successful `epoll_ctl` ADD/MOD — and an epoll-driven server re-arms its
@@ -475,7 +475,7 @@ fn epoll_instance_pending(epoll_id: u32, waker: Option<&Waker>, depth: u8) -> bo
     let mut heap: Option<alloc::vec::Vec<(u32, Entry)>> = None;
     let mut count = 0usize;
 
-    let found = akuma_primitives::irq::with_irqs_disabled(|| {
+    let found = (|| {
         let table = EPOLL_TABLE.lock();
         let Some(inst) = table.get(&epoll_id) else { return false };
         if inst.len() > STACK_SNAPSHOT_SIZE {
@@ -487,7 +487,7 @@ fn epoll_instance_pending(epoll_id: u32, waker: Option<&Waker>, depth: u8) -> bo
             }
         }
         true
-    });
+    })();
     if !found {
         return false;
     }
@@ -841,9 +841,9 @@ mod stdin_starved {
         // Only the epoll that actually holds fd 0: the second capture spent its
         // whole budget on an HTTP worker's private loop. If this never fires,
         // no thread is scanning stdin's epoll at all.
-        let holds_fd0 = akuma_primitives::irq::with_irqs_disabled(|| {
+        let holds_fd0 = {
             super::EPOLL_TABLE.lock().get(&epoll_id).is_some_and(|inst| inst.get(0).is_some())
-        });
+        };
         if !holds_fd0 || DUMPED.fetch_add(1, Relaxed) >= DUMPS {
             return;
         }
@@ -864,7 +864,7 @@ mod stdin_starved {
     }
 
     fn dump_instance(proc: &akuma_exec::process::Process, efd: u32, id: u32) {
-        let entries = akuma_primitives::irq::with_irqs_disabled(|| {
+        let entries = (|| {
             let table = super::EPOLL_TABLE.lock();
             let mut out = [None; 24];
             if let Some(inst) = table.get(&id) {
@@ -873,7 +873,7 @@ mod stdin_starved {
                 }
             }
             out
-        });
+        })();
         akuma_primitives::safe_print!(64, "[stdin-starved]  epfd={}:\n", efd);
         for (fd, e) in entries.iter().flatten() {
             let kind = proc.get_fd(*fd);
@@ -990,7 +990,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: UserAddr, maxevents: i32, timeout:
         const STACK_SNAPSHOT_SIZE: usize = 128;
         let mut stack_snapshot = [0u32; STACK_SNAPSHOT_SIZE];
 
-        let snapshot = akuma_primitives::irq::with_irqs_disabled(|| {
+        let snapshot = (|| {
             let table = EPOLL_TABLE.lock();
             let instance = table.get(&epoll_id)?;
 
@@ -1003,7 +1003,7 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: UserAddr, maxevents: i32, timeout:
             } else {
                 Some((count, Some(instance.fds().collect::<alloc::vec::Vec<u32>>())))
             }
-        });
+        })();
         let (snapshot_count, heap_snapshot) = match snapshot {
             Some(s) => s,
             None => return EBADF,
@@ -1019,10 +1019,10 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: UserAddr, maxevents: i32, timeout:
             if ready_count >= maxevents { break; }
 
             // Re-acquire lock to get entry details (MUST NOT hold during readiness check)
-            let entry_info = akuma_primitives::irq::with_irqs_disabled(|| {
+            let entry_info = {
                 let table = EPOLL_TABLE.lock();
                 table.get(&epoll_id).and_then(|inst| inst.get(fd))
-            });
+            };
 
             let Some(entry) = entry_info else {
                 continue; // FD removed from epoll interest during loop
@@ -1041,11 +1041,11 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: UserAddr, maxevents: i32, timeout:
             // HUP/ERR to force both handlers to run, and dereferenced a connection
             // object it had already torn down along with the fd. Prune instead.
             if akuma_exec::process::current_process_shared().is_none_or(|p| p.get_fd(fd).is_none()) {
-                akuma_primitives::irq::with_irqs_disabled(|| {
+                (|| {
                     if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
                         inst.prune(fd);
                     }
-                });
+                })();
                 continue;
             }
 
@@ -1063,12 +1063,12 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: UserAddr, maxevents: i32, timeout:
             // then writing `revents` back undid that re-arm, and every later
             // arrival was SUPPRESSED — a tokio client's stream stalled after ~0.3 s
             // on the 4-core box (`InterestList::scan_entry` has the whole story).
-            let step = akuma_primitives::irq::with_irqs_disabled(|| {
+            let step = {
                 EPOLL_TABLE
                     .lock()
                     .get_mut(&epoll_id)
                     .and_then(|inst| inst.scan_entry(fd, revents))
-            });
+            };
             let Some(step) = step else {
                 continue; // instance or entry vanished while we probed
             };
