@@ -65,6 +65,12 @@ disposable QEMU tests. Its adapter assumes atomic 512-byte writes for a guest
 stop, a property generic virtio does not promise for a host power failure.
 `scripts/probes/ext_rw_qemu.sh` boots such a guest, runs file mutations and
 checks the resulting image with `e2fsck -fn`; the feature is off by default.
+`scripts/probes/ext3_qemu_crash_matrix.sh` builds an additional test-only
+instrumented kernel, stops the guest after each completed journal write or
+barrier, and runs journal replay plus a no-repair `e2fsck` check on each copy.
+It also verifies the new contents survive every stop after the commit barrier.
+The QEMU test covers guest termination with the host still running; it does not
+establish host power-loss atomicity.
 
 A host-only adapter stages the existing ext2 mutation paths against an ext3
 image and commits successful operations. Create, rename, unlink and truncate

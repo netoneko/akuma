@@ -16,6 +16,9 @@ use super::{staging::WriteSet, writer::{self, JournalIo}};
 /// For example, a generic virtio device does not advertise this guarantee.
 pub trait JournalStorage: BlockDevice {
     fn atomic_write_bytes(&self) -> usize;
+    /// Test-only hook after a completed journal write or durability barrier.
+    #[cfg(feature = "ext3-qemu-crash-test")]
+    fn after_journal_io(&self, _commit_durable: bool) {}
 }
 
 struct State {
@@ -134,7 +137,10 @@ impl<B: JournalStorage> JournaledDevice<B> {
         if self.is_poisoned() { return Err(FsError::IoError); }
         let staged = state.active.take().ok_or(FsError::Internal)?.into_blocks();
         if staged.is_empty() { return Ok(()); }
-        let mut raw = RawJournal { dev: &self.dev, block_size: self.block_size, journal: &self.journal, protected: &self.protected, uuid: &self.uuid };
+        let mut raw = RawJournal { dev: &self.dev, block_size: self.block_size, journal: &self.journal, protected: &self.protected, uuid: &self.uuid,
+            #[cfg(feature = "ext3-qemu-crash-test")]
+            commit_pending: false,
+        };
         let result = writer::commit(&mut raw, self.block_size, self.journal.len() as u64,
             self.filesystem_blocks, (1024 / self.block_size) as u32, &self.uuid, &staged);
         if result.is_err() { self.poisoned.store(true, Ordering::Release); }
@@ -209,6 +215,8 @@ struct RawJournal<'a, B> {
     journal: &'a [u32],
     protected: &'a BTreeSet<u32>,
     uuid: &'a [u8; 16],
+    #[cfg(feature = "ext3-qemu-crash-test")]
+    commit_pending: bool,
 }
 impl<B: JournalStorage> JournalIo for RawJournal<'_, B> {
     fn read_journal(&mut self, block: u32) -> Result<Vec<u8>, FsError> {
@@ -219,10 +227,19 @@ impl<B: JournalStorage> JournalIo for RawJournal<'_, B> {
     }
     fn write_journal(&mut self, block: u32, data: &[u8]) -> Result<(), FsError> {
         let physical = *self.journal.get(block as usize).ok_or(FsError::Corrupt)?;
-        self.dev.write_bytes(u64::from(physical) * self.block_size as u64, data).map_err(|_| FsError::IoError)
+        self.dev.write_bytes(u64::from(physical) * self.block_size as u64, data).map_err(|_| FsError::IoError)?;
+        #[cfg(feature = "ext3-qemu-crash-test")]
+        {
+            self.commit_pending = data.get(..8) == Some(&[0xc0, 0x3b, 0x39, 0x98, 0, 0, 0, 2]);
+            self.dev.after_journal_io(false);
+        }
+        Ok(())
     }
     fn write_home(&mut self, block: u32, data: &[u8]) -> Result<(), FsError> {
-        self.dev.write_bytes(u64::from(block) * self.block_size as u64, data).map_err(|_| FsError::IoError)
+        self.dev.write_bytes(u64::from(block) * self.block_size as u64, data).map_err(|_| FsError::IoError)?;
+        #[cfg(feature = "ext3-qemu-crash-test")]
+        self.dev.after_journal_io(false);
+        Ok(())
     }
     fn set_recovery(&mut self, required: bool) -> Result<(), FsError> {
         let block = 1024 / self.block_size;
@@ -233,9 +250,21 @@ impl<B: JournalStorage> JournalIo for RawJournal<'_, B> {
         if sb.get(56..58) != Some(&[0x53, 0xef]) || sb.get(104..120) != Some(self.uuid.as_slice()) { return Err(FsError::Corrupt); }
         let flags = u32::from_le_bytes(sb[96..100].try_into().map_err(|_| FsError::Corrupt)?);
         sb[96..100].copy_from_slice(&(if required { flags | 4 } else { flags & !4 }).to_le_bytes());
-        self.dev.write_bytes((block * self.block_size) as u64, &data).map_err(|_| FsError::IoError)
+        self.dev.write_bytes((block * self.block_size) as u64, &data).map_err(|_| FsError::IoError)?;
+        #[cfg(feature = "ext3-qemu-crash-test")]
+        self.dev.after_journal_io(false);
+        Ok(())
     }
-    fn flush(&mut self) -> Result<(), FsError> { self.dev.flush().map_err(|_| FsError::IoError) }
+    fn flush(&mut self) -> Result<(), FsError> {
+        self.dev.flush().map_err(|_| FsError::IoError)?;
+        #[cfg(feature = "ext3-qemu-crash-test")]
+        {
+            let committed = self.commit_pending;
+            self.commit_pending = false;
+            self.dev.after_journal_io(committed);
+        }
+        Ok(())
+    }
     fn home_is_allowed(&self, block: u32) -> bool { !self.protected.contains(&block) }
 }
 

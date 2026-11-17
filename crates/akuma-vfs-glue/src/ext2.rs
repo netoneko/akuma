@@ -32,6 +32,20 @@ impl BlockDevice for KernelBlockDevice {
 #[cfg(feature = "ext3-qemu-write-test")]
 impl akuma_ext2::journal::device::JournalStorage for KernelBlockDevice {
     fn atomic_write_bytes(&self) -> usize { 512 }
+    #[cfg(feature = "ext3-qemu-crash-test")]
+    fn after_journal_io(&self, commit_durable: bool) {
+        use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        static STEP: AtomicUsize = AtomicUsize::new(0);
+        static COMMITTED: AtomicBool = AtomicBool::new(false);
+        let Some(target) = akuma_params::Params::new(akuma_params::line(), "").value("ext3crash")
+            .and_then(|s| s.parse::<usize>().ok()) else { return; };
+        let step = STEP.fetch_add(1, Ordering::Relaxed) + 1;
+        if commit_durable { COMMITTED.store(true, Ordering::Relaxed); }
+        if step == target {
+            akuma_primitives::safe_print!(96, "EXT3_CRASH_STOP {} {}\n", step, COMMITTED.load(Ordering::Relaxed) as u8);
+            loop { core::hint::spin_loop(); }
+        }
+    }
 }
 
 #[cfg(feature = "ext3-qemu-write-test")]

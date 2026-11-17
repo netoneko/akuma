@@ -236,6 +236,7 @@ ext3 = ["akuma-ext2/ext3", "akuma-vfs-glue/ext3", "akuma-kernel-amd64/ext3"]
 ext4 = ["ext3", "akuma-ext2/ext4", "akuma-vfs-glue/ext4", "akuma-kernel-amd64/ext4"]
 # Disposable QEMU integration images only: assumes atomic 512-byte writes.
 ext3-qemu-write-test = ["ext3", "akuma-vfs-glue/ext3-qemu-write-test", "akuma-syscalls-glue/ext3-qemu-write-test", "akuma-kernel-amd64/ext3-qemu-write-test"]
+ext3-qemu-crash-test = ["ext3-qemu-write-test", "akuma-ext2/ext3-qemu-crash-test", "akuma-vfs-glue/ext3-qemu-crash-test", "akuma-kernel-amd64/ext3-qemu-crash-test"]
 # Compile the `[syscall]`/`[FORK-DBG]`/AIO-stub debug traces in. OFF by default.
 #
 # It is a FEATURE and not just `src/config.rs` const because three AIO stubs are

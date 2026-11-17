@@ -67,3 +67,8 @@ required-features = ["akuma"]
 name = "ext-rw-probe"
 path = "src/bin/ext-rw-probe.rs"
 required-features = ["akuma"]
+
+[[bin]]
+name = "ext-crash-probe"
+path = "src/bin/ext-crash-probe.rs"
+required-features = ["akuma"]
