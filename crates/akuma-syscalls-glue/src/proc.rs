@@ -1387,7 +1387,13 @@ pub(super) fn sys_core_init(core_idx: usize, init_program_ptr: UserAddr) -> u64 
 
 pub(super) fn sys_getppid() -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
-        u64::from(proc.parent_pid.get())
+        // `parent_pid` is the *forking thread's* pid (wait4 and orphan reaping key on it), but Linux's
+        // `getppid` is the parent's thread-group id. A child forked from a worker thread saw the
+        // thread's pid, so codex's post-`PR_SET_PDEATHSIG` check (`getppid() != parent's getpid()`)
+        // raised SIGTERM on every command it spawned from a tokio worker.
+        let ppid = proc.parent_pid.get();
+        let tgid = akuma_exec::process::lookup_process_shared(ppid).map_or(ppid, |p| p.tgid);
+        u64::from(tgid)
     } else {
         ESRCH
     }

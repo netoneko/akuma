@@ -13,15 +13,15 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1668
-- **Docs contributing at least one fix:** 485
+- **Total distinct fixes counted:** 1669
+- **Docs contributing at least one fix:** 486
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
 | Syscall / ABI Compatibility Audits | 257 | 15.4% | 39 |
 | Memory & Virtual Memory | 205 | 12.3% | 73 |
-| Scheduler & Process Management | 155 | 9.3% | 51 |
+| Scheduler & Process Management | 156 | 9.3% | 52 |
 | SMP & Locking | 142 | 8.5% | 61 |
 | Networking | 104 | 6.2% | 38 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
@@ -34,7 +34,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Misc / Cross-cutting | 95 | 5.7% | 27 |
 | Console & Terminal | 63 | 3.8% | 22 |
 | Containers | 69 | 4.1% | 13 |
-| **Total** | **1668** | **100.0%** | **485** |
+| **Total** | **1669** | **100.0%** | **486** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -710,7 +710,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `akuma-mmu` range checks wrapped `va_start + len + PAGE_SIZE - 1`; `page_span` treats a wrapping range as not mapped
 - `prefault_user_range` and `madvise(WILLNEED)` rounded unchecked; `checked_add` plus `page_ceil`
 
-## Scheduler & Process Management (155 fixes, 51 docs)
+## Scheduler & Process Management (156 fixes, 52 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -971,6 +971,10 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md
 - `tkill` and the hard terminates could hit a recycled thread slot; they act through the recorded `ThreadRef` with `with_live`
+
+### docs/archive/GETPPID_RETURNED_THREAD_PID.md
+
+- `getppid` returned the forking thread's pid, not its thread-group id, so codex's post-`PR_SET_PDEATHSIG` parent check failed on every command forked from a tokio worker and the child SIGTERM'd itself (`exited 143 in 0ms`); `sys_getppid` now resolves the parent thread to its tgid.
 
 ## SMP & Locking (142 fixes, 61 docs)
 
