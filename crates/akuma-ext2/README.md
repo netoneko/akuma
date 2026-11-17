@@ -756,14 +756,17 @@ cannot be removed by remounting.
 This is deliberately limited: ext3 requires a clean filesystem with an internal
 journal and no orphan recovery pending. Ext4 additionally accepts extent trees,
 including sparse and unwritten extents, with 32-bit physical block numbers.
-Only the checked legacy feature set plus extents is accepted: in particular,
-`64bit`, `metadata_csum`, `flex_bg`, and the usual newer ext4 defaults are not
-supported. A constrained test image can be created with:
+The 64-bit descriptor layout and `flex_bg` are supported when all referenced
+block addresses fit in 32 bits. Metadata checksums and lazy group checksums
+are not supported, so ordinary default ext4 images are still rejected. A test
+image with those features disabled can be created with:
 
 ```sh
-mke2fs -t ext4 -O '^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^uninit_bg' IMAGE
+mke2fs -t ext4 -O '^metadata_csum,^uninit_bg' IMAGE
 ```
 
 Unknown feature bits, dirty journals, journal recovery and all journaled write
 mounts are rejected. There is no journal implementation yet. Host tests with
 these features require `mke2fs` and `debugfs` and generate disposable images.
+`scripts/probes/ext_ro_qemu.sh` builds a guest and tests ext3 and ext4 through
+QEMU with separate disposable block images.

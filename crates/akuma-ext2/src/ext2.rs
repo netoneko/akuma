@@ -33,6 +33,7 @@
 )]
 
 use alloc::collections::BTreeMap;
+use alloc::boxed::Box;
 use core::cell::Cell;
 use alloc::string::{String, ToString};
 use alloc::vec;
@@ -412,7 +413,9 @@ const DEFERRED_FREE_SLOTS: usize = 4096;
 /// an unrelated inode on another. (The global version of this list failed
 /// exactly that way against the test suite's parallel mounts.)
 struct DeferredFrees {
-    slots: [AtomicU32; DEFERRED_FREE_SLOTS],
+    // Construct directly on the heap: moving a 16 KiB inline array through
+    // mount's return values overflowed the 32 KiB guest kernel stack.
+    slots: Box<[AtomicU32]>,
     /// `inode_pin::unpin_epoch()` when this list was last drained. A queued
     /// inode becomes freeable the moment its last pin goes - an `munmap`, a
     /// `close`, a process exit - and none of those is a filesystem call, so
@@ -423,8 +426,11 @@ struct DeferredFrees {
 }
 
 impl DeferredFrees {
-    const fn new() -> Self {
-        Self { slots: [const { AtomicU32::new(0) }; DEFERRED_FREE_SLOTS], drained_at: AtomicU64::new(0) }
+    fn new() -> Self {
+        Self {
+            slots: (0..DEFERRED_FREE_SLOTS).map(|_| AtomicU32::new(0)).collect::<Vec<_>>().into_boxed_slice(),
+            drained_at: AtomicU64::new(0),
+        }
     }
 
     /// Record `inode` for a later free. `false` means there was no room.
@@ -1185,6 +1191,7 @@ pub(crate) struct Ext2State {
     inodes_per_group: u32,
     inode_size: u16,
     block_group_count: u32,
+    descriptor_size: usize,
     blocks_per_group: u32,
     first_data_block: u32,
 
@@ -1436,10 +1443,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         const RO_COMPAT_SUPPORTED: u32 = 0x0001 | 0x0002; // sparse super, large file
         let journal = superblock.feature_compat & 0x4 != 0;
         let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3") && mode == MountMode::ReadOnly { 0x4 } else { 0 };
-        let incompat_supported = INCOMPAT_SUPPORTED | if cfg!(feature = "ext4") && mode == MountMode::ReadOnly { 0x40 } else { 0 };
+        let ext4_read = cfg!(feature = "ext4") && mode == MountMode::ReadOnly;
+        let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else { 0 };
+        let ro_compat_supported = RO_COMPAT_SUPPORTED | if ext4_read { 0x8 | 0x20 | 0x40 } else { 0 };
         if superblock.feature_compat & !compat_supported != 0
             || superblock.feature_incompat & !incompat_supported != 0
-            || superblock.feature_ro_compat & !RO_COMPAT_SUPPORTED != 0
+            || superblock.feature_ro_compat & !ro_compat_supported != 0
         {
             return Err(FsError::NotSupported);
         }
@@ -1481,6 +1490,16 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         }
 
         let block_size = 1024usize << block_size_log;
+        let descriptor_size = if superblock.feature_incompat & 0x80 != 0 {
+            // The current block device and allocator use 32-bit block IDs.
+            // Accept the 64-bit layout only while its addresses fit that API.
+            if le_u32(&sb_buf, 336).ok_or(FsError::Corrupt)? != 0 { return Err(FsError::NotSupported); }
+            let size = le_u16(&sb_buf, 254).ok_or(FsError::Corrupt)? as usize;
+            if size != 64 { return Err(FsError::NotSupported); }
+            size
+        } else {
+            size_of::<BlockGroupDescriptor>()
+        };
         let inode_size = if version_major >= 1 {
             sb_inode_size
         } else {
@@ -1501,6 +1520,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             inodes_per_group,
             inode_size,
             block_group_count,
+            descriptor_size,
             blocks_per_group,
             first_data_block,
             bgd_cache: vec![None; block_group_count as usize],
@@ -1761,7 +1781,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     fn bgd_offset(state: &Ext2State, group: u32) -> u64 {
         let bgd_table_block = state.first_data_block + 1;
         bgd_table_block as u64 * state.block_size as u64
-            + group as u64 * size_of::<BlockGroupDescriptor>() as u64
+            + group as u64 * state.descriptor_size as u64
     }
 
     /// Read a sub-block byte range through the block cache (the cached copy
@@ -1800,9 +1820,15 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     fn read_bgd(&self, state: &Ext2State, group: u32) -> Result<BlockGroupDescriptor, FsError> {
+        if group >= state.block_group_count { return Err(FsError::Corrupt); }
         let offset = Self::bgd_offset(state, group);
         let mut buf = [0u8; size_of::<BlockGroupDescriptor>()];
         self.read_range(state, offset, &mut buf)?;
+        if state.descriptor_size == 64 {
+            let mut high = [0u8; 12];
+            self.read_range(state, offset + 32, &mut high)?;
+            if high.iter().any(|&b| b != 0) { return Err(FsError::NotSupported); }
+        }
         BlockGroupDescriptor::parse(&buf).ok_or(FsError::Corrupt)
     }
 
@@ -4580,5 +4606,22 @@ mod extent_tests {
         put_u16(&mut raw, 46, 1);
         put_u16(&mut raw, 44, 5); // root capacity exceeds its 60-byte space
         assert_eq!(fs.get_block_num(&state, &Inode::parse(&raw).unwrap(), 5), Err(FsError::Corrupt));
+    }
+
+    #[test]
+    fn wide_group_descriptors_use_the_recorded_stride_and_reject_high_addresses() {
+        let mut image = include_bytes!("../tests/fixtures/test.ext2").to_vec();
+        let word = le_u32(&image, 1024 + 96).unwrap() | 0x80;
+        put_u32(&mut image, 1024 + 96, word);
+        put_u16(&mut image, 1024 + 254, 64);
+        put_u32(&mut image, 1024 + 32, 1024);
+        // 1 KiB blocks put the descriptor table at block 2.
+        let second = 2048 + 64;
+        put_u32(&mut image, second + 8, 123);
+        let fs = Ext2Filesystem::new_with_options(Image(image.clone()), || 0, None, MountMode::ReadOnly).unwrap();
+        assert_eq!(fs.read_bgd(&fs.read_state(), 1).unwrap().inode_table, 123);
+        put_u32(&mut image, second + 40, 1);
+        let fs = Ext2Filesystem::new_with_options(Image(image), || 0, None, MountMode::ReadOnly).unwrap();
+        assert_eq!(fs.read_bgd(&fs.read_state(), 1), Err(FsError::NotSupported));
     }
 }

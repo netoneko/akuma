@@ -3846,7 +3846,7 @@ fn clean_ext3_image_reads_and_rejects_all_mutations() {
 
 #[cfg(feature = "ext4")]
 #[test]
-fn constrained_ext4_extent_image_reads_on_host() {
+fn ext4_64bit_extent_image_reads_on_host() {
     use crate::MountMode;
     use std::process::Command;
     let dir = std::env::temp_dir().join(std::format!("akuma-ext4-{}", std::process::id()));
@@ -3859,7 +3859,7 @@ fn constrained_ext4_extent_image_reads_on_host() {
     std::fs::write(&input, &content).unwrap();
     let file = std::fs::File::create(&image).unwrap();
     file.set_len(32 * 1024 * 1024).unwrap();
-    let status = Command::new("mke2fs").args(["-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^uninit_bg"]).arg(&image).status().expect("ext4 tests require mke2fs");
+    let status = Command::new("mke2fs").args(["-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^metadata_csum,^uninit_bg"]).arg(&image).status().expect("ext4 tests require mke2fs");
     assert!(status.success());
     let command = std::format!("write {} /data", input.display());
     let output = Command::new("debugfs").args(["-w", "-R", &command]).arg(&image).output().expect("ext4 tests require debugfs");

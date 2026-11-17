@@ -57,3 +57,8 @@ std-probe = []
 libakuma = { path = "../libakuma", optional = true }
 akuma-ext2 = { path = "../../crates/akuma-ext2", optional = true }
 akuma-vfs = { path = "../../crates/akuma-vfs", optional = true }
+
+[[bin]]
+name = "ext-ro-probe"
+path = "src/bin/ext-ro-probe.rs"
+required-features = ["akuma"]
