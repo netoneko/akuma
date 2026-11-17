@@ -1506,7 +1506,8 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         let compat_supported = COMPAT_SUPPORTED | if cfg!(feature = "ext3")
             && (mode == MountMode::ReadOnly || allow_validated_journal_writes) { 0x4 } else { 0 };
         let ext4_read = cfg!(feature = "ext4") && mode == MountMode::ReadOnly;
-        let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else { 0 }
+        let ext4_write = cfg!(feature = "ext4") && allow_validated_journal_writes && mode == MountMode::ReadWrite;
+        let incompat_supported = INCOMPAT_SUPPORTED | if ext4_read { 0x40 | 0x80 | 0x200 } else if ext4_write { 0x40 } else { 0 }
             | if inspect_dirty_journal { 0x4 } else { 0 };
         let ro_compat_supported = RO_COMPAT_SUPPORTED | if ext4_read { 0x8 | 0x20 | 0x40 | 0x400 } else { 0 };
         if superblock.feature_compat & !compat_supported != 0
@@ -2197,8 +2198,9 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
             // The existing ext2 mutators do not maintain indexed directory
             // trees, xattr ownership, compression, or immutable/append flags.
             // Refuse such inodes until those semantics are implemented.
-            let unsupported_flags = 0x4 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x80000 | 0x1000_0000;
+            let unsupported_flags = 0x4 | 0x10 | 0x20 | 0x800 | 0x1000 | 0x1000_0000;
             if inode.flags & unsupported_flags != 0 || inode.file_acl != 0 { return Err(FsError::NotSupported); }
+            if inode.flags & 0x80000 != 0 && state.superblock.feature_incompat & 0x40 == 0 { return Err(FsError::Corrupt); }
             if buf.len() >= 132 {
                 let extra = le_u16(&buf, 128).ok_or(FsError::Corrupt)? as usize;
                 let at = 128usize.checked_add(extra).ok_or(FsError::Corrupt)?;
@@ -2824,6 +2826,12 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         logical_block: u32,
         zero_leaf: bool,
     ) -> Result<u32, FsError> {
+        if inode.flags & 0x80000 != 0 {
+            // Existing initialized extent blocks may be overwritten. Growing
+            // an extent tree, converting unwritten extents and allocating
+            // holes are intentionally not implemented yet.
+            return self.get_block_num(state, inode, logical_block)?.ok_or(FsError::NotSupported);
+        }
         let ptrs_per_block = (state.block_size / 4) as u32;
 
         if logical_block < 12 {
@@ -3032,6 +3040,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     /// unlink and `O_TRUNC`. `sectors_used` follows each free, so the inode
     /// stays self-consistent for `e2fsck` at every point an error can leave it.
     fn free_blocks_from(&self, state: &mut Ext2State, inode: &mut Inode, first: u32) -> Result<(), FsError> {
+        if inode.flags & 0x80000 != 0 { return Err(FsError::NotSupported); }
         let sect = (state.block_size / 512) as u32;
         let ppb = (state.block_size / 4) as u32;
 
@@ -3160,6 +3169,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     }
 
     fn truncate_inode(&self, state: &mut Ext2State, inode: &mut Inode) -> Result<(), FsError> {
+        if inode.flags & 0x80000 != 0 { return Err(FsError::NotSupported); }
         // Free all direct blocks
         // Indexed, not iterated, and clippy's `needless_range_loop` cannot be
         // honoured here: `Inode` is packed, so `&mut inode.direct_blocks[..]`

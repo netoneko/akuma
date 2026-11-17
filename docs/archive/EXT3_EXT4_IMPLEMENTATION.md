@@ -65,6 +65,11 @@ disposable QEMU tests. Its adapter assumes atomic 512-byte writes for a guest
 stop, a property generic virtio does not promise for a host power failure.
 `scripts/probes/ext_rw_qemu.sh` boots such a guest, runs file mutations and
 checks the resulting image with `e2fsck -fn`; the feature is off by default.
+The test also covers a constrained ext4 image with extents but without 64-bit
+descriptors, metadata checksums, flex groups or other newer features. Existing
+initialized extent blocks can be overwritten and new files use legacy block
+maps. Growing or truncating an extent tree is rejected; journal extents must
+fit in the journal inode. This is not general writable ext4 support.
 `scripts/probes/ext3_qemu_crash_matrix.sh` builds an additional test-only
 instrumented kernel, stops the guest after each completed journal write or
 barrier, and runs journal replay plus a no-repair `e2fsck` check on each copy.

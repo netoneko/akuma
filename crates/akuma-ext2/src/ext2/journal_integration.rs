@@ -302,3 +302,58 @@ fn transaction_device_commits_filesystem_operations_to_ext3() {
     assert_eq!(fs.sync(), Err(FsError::IoError));
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[cfg(feature = "ext4")]
+#[test]
+fn constrained_ext4_journals_existing_extent_overwrites_and_new_legacy_files() {
+    use super::journal::{device::JournalStorage, filesystem::JournaledFilesystem};
+    let _serial = crate::tests::pin_test_serial();
+    #[derive(Clone)]
+    struct Disk(Arc<Spinlock<Vec<u8>>>);
+    impl BlockDevice for Disk {
+        fn read_bytes(&self, offset: u64, out: &mut [u8]) -> Result<(), ()> {
+            let data = self.0.lock(); let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(out.len()).ok_or(())?;
+            out.copy_from_slice(data.get(start..end).ok_or(())?); Ok(())
+        }
+        fn write_bytes(&self, offset: u64, data: &[u8]) -> Result<(), ()> {
+            let mut bytes = self.0.lock(); let start = usize::try_from(offset).map_err(|_| ())?;
+            let end = start.checked_add(data.len()).ok_or(())?;
+            bytes.get_mut(start..end).ok_or(())?.copy_from_slice(data); Ok(())
+        }
+        fn flush(&self) -> Result<(), ()> { Ok(()) }
+    }
+    impl JournalStorage for Disk { fn atomic_write_bytes(&self) -> usize { 512 } }
+    let dir = std::env::temp_dir().join(std::format!("akuma-ext4-write-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let image = dir.join("disk.img"); let input = dir.join("input");
+    std::fs::File::create(&image).unwrap().set_len(32 * 1024 * 1024).unwrap();
+    std::fs::write(&input, b"original contents\n").unwrap();
+    assert!(Command::new("mke2fs").args(["-q", "-F", "-t", "ext4", "-b", "1024", "-O", "^64bit,^metadata_csum,^flex_bg,^huge_file,^dir_nlink,^extra_isize,^uninit_bg"]).arg(&image).status().unwrap().success());
+    let command = std::format!("write {} /existing", input.display());
+    assert!(Command::new("debugfs").args(["-w", "-R", &command]).arg(&image).output().unwrap().status.success());
+    let disk = Disk(Arc::new(Spinlock::new(std::fs::read(&image).unwrap())));
+    let fs = JournaledFilesystem::mount(disk.clone(), || 0, None).unwrap();
+    assert_eq!(fs.name(), "ext4");
+    assert_eq!(fs.write_at("/existing", 0, b"new"), Ok(3));
+    fs.create_dir("/dir").unwrap();
+    fs.write_file("/dir/a", b"new legacy file\n").unwrap();
+    fs.rename("/dir/a", "/dir/b").unwrap();
+    assert_eq!(fs.read_file("/dir/b").unwrap(), b"new legacy file\n");
+    assert_eq!(fs.read_file("/existing").unwrap(), b"newginal contents\n");
+    std::fs::write(&image, &*disk.0.lock()).unwrap();
+    let check = Command::new("e2fsck").arg("-fn").arg(&image).output().unwrap();
+    assert!(check.status.success(), "{}", std::string::String::from_utf8_lossy(&check.stdout));
+    let read = Command::new("debugfs").args(["-R", "cat /dir/b"]).arg(&image).output().unwrap();
+    assert_eq!(read.stdout, b"new legacy file\n");
+    let reject_fs = JournaledFilesystem::mount(disk.clone(), || 0, None).unwrap();
+    let before_hole = disk.0.lock().clone();
+    assert_eq!(reject_fs.write_at("/existing", 1024, b"x"), Err(FsError::NotSupported));
+    assert_eq!(*disk.0.lock(), before_hole, "unsupported extent growth must not modify the image");
+    // Truncating an extent-mapped file is rejected before any disk change.
+    let before = disk.0.lock().clone();
+    assert_eq!(fs.truncate("/existing", 0), Err(FsError::NotSupported));
+    assert_eq!(*disk.0.lock(), before);
+    assert_eq!(fs.read_file("/dir/b"), Err(FsError::IoError));
+    std::fs::remove_dir_all(dir).unwrap();
+}

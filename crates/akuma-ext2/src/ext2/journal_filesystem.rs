@@ -17,6 +17,7 @@ const NO_OWNER: usize = usize::MAX;
 /// wrapper is not connected to the kernel's writable mount path.
 pub struct JournaledFilesystem<B: JournalStorage> {
     inner: Ext2Filesystem<JournaledDevice<B>>,
+    is_ext4: bool,
     gate: Box<RecoverableCell<()>>,
     owner: AtomicUsize,
 }
@@ -34,15 +35,15 @@ impl<B: JournalStorage> JournaledFilesystem<B> {
         let fs = Ext2Filesystem::new_with_options(dev, utc_time_us, cache_cap_bytes, MountMode::ReadOnly)?;
         let (mapping, protected, inode_range, block_size, total, uuid) = {
             let state = fs.read_state();
+            let allowed_incompat = 2 | if cfg!(feature = "ext4") { 0x40 } else { 0 };
             if state.superblock.feature_compat & 4 == 0
-                || state.superblock.feature_incompat & !2 != 0
+                || state.superblock.feature_incompat & !allowed_incompat != 0
                 || state.superblock.feature_ro_compat & !(1 | 2) != 0
                 || journal_inode == 0 || journal_inode > state.superblock.total_inodes {
                 return Err(FsError::NotSupported);
             }
             let inode = fs.read_inode(&state, journal_inode)?;
-            if inode.flags & 0x80000 != 0 || inode.file_size() % state.block_size as u64 != 0
-                || inode.file_size() > 64 * 1024 * 1024 {
+            if inode.file_size() % state.block_size as u64 != 0 || inode.file_size() > 64 * 1024 * 1024 {
                 return Err(FsError::NotSupported);
             }
             let mut protected = BTreeSet::new();
@@ -60,9 +61,17 @@ impl<B: JournalStorage> JournaledFilesystem<B> {
                 }
                 Ok(())
             }
-            protect(&fs, &state, inode.indirect_block, 1, &mut protected)?;
-            protect(&fs, &state, inode.double_indirect_block, 2, &mut protected)?;
-            protect(&fs, &state, inode.triple_indirect_block, 3, &mut protected)?;
+            if inode.flags & 0x80000 != 0 {
+                // The initial ext4 profile accepts a journal whose extents all
+                // fit in the inode. External extent nodes need protection too.
+                let mut raw = [0u8; 128];
+                inode.serialize(&mut raw);
+                if u16::from_le_bytes([raw[46], raw[47]]) != 0 { return Err(FsError::NotSupported); }
+            } else {
+                protect(&fs, &state, inode.indirect_block, 1, &mut protected)?;
+                protect(&fs, &state, inode.double_indirect_block, 2, &mut protected)?;
+                protect(&fs, &state, inode.triple_indirect_block, 3, &mut protected)?;
+            }
             let mut mapping = Vec::new();
             for logical in 0..inode.file_size() / state.block_size as u64 {
                 mapping.push(fs.get_block_num(&state, &inode, logical as u32)?.ok_or(FsError::Corrupt)?);
@@ -83,7 +92,8 @@ impl<B: JournalStorage> JournaledFilesystem<B> {
 
     pub fn new(inner: Ext2Filesystem<JournaledDevice<B>>) -> Result<Self, FsError> {
         if inner.mode != MountMode::ReadWrite || !inner.journal_writes || inner.dev.is_poisoned() { return Err(FsError::NotSupported); }
-        Ok(Self { inner, gate: Box::new(RecoverableCell::new(())), owner: AtomicUsize::new(NO_OWNER) })
+        let is_ext4 = inner.read_state().superblock.feature_incompat & 0x40 != 0;
+        Ok(Self { inner, is_ext4, gate: Box::new(RecoverableCell::new(())), owner: AtomicUsize::new(NO_OWNER) })
     }
 
     fn locked<T>(&self, f: impl FnOnce(&Ext2Filesystem<JournaledDevice<B>>) -> Result<T, FsError>) -> Result<T, FsError> {
@@ -117,7 +127,7 @@ impl<B: JournalStorage> JournaledFilesystem<B> {
 }
 
 impl<B: JournalStorage> Filesystem for JournaledFilesystem<B> {
-    fn name(&self) -> &str { "ext3" }
+    fn name(&self) -> &str { if self.is_ext4 { "ext4" } else { "ext3" } }
     fn identity(&self) -> u32 { self.inner.identity() }
     fn needs_tid_reap(&self) -> bool { true }
     fn abandon_tid(&self, tid: usize) -> bool {
