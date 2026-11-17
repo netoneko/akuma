@@ -30,6 +30,12 @@ name = "devroot-ensure"
 path = "src/bin/devroot_ensure.rs"
 required-features = ["host-probe"]
 
+# Put host files into an ext2 image copy without mounting it (no loop device on Akuma).
+[[bin]]
+name = "ext2put"
+path = "src/bin/ext2put.rs"
+required-features = ["host-probe"]
+
 # Runs the shared workload against the real OS filesystem (std::fs) — a
 # real-kernel reference point, e.g. in a Docker container.
 [[bin]]

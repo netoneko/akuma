@@ -325,3 +325,8 @@ herd depends only on `libakuma` (see `Cargo.toml`).
     or have `herd start` re-read `available/`.
   - **`herd status` keeps `restart-pending ... last_exit=2` after a successful start** until the
     next reload; it should show `running` as soon as `start` reports a pid.
+- Future: **a command to reload the config on demand** (`herd reload`). Today herd re-reads `enabled/` only on its
+  ~20 s tick, so `herd enable` followed at once by `herd start` runs the *previous* config (the VM kept its old
+  `vm_disk` and booted the wrong image, 2026-11-17), and a script has to `sleep 25` between the two. `reload` should
+  re-read `enabled/` synchronously and return once the new config is live, so `enable`/`disable`/`start` can follow it
+  with no wait; `herd start` could call it itself.
