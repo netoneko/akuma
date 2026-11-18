@@ -44,13 +44,17 @@ pub fn ensure_test_pmm() {
     ONCE.call_once(|| {
         // 64 MiB: headroom for the whole `cargo test` binary's cumulative
         // allocations across every test that reaches this path, not just one.
-        const ARENA_WORDS: usize = 64 * 1024 * 1024 / 8;
-        let arena: alloc::vec::Vec<u64> = alloc::vec![0u64; ARENA_WORDS];
+        const ARENA_BYTES: usize = 64 * 1024 * 1024;
+        // Page-aligned: the allocator carves 4 KiB frames at `base + n * 4096`, and `akuma_pagetable::Table::at`
+        // asserts a frame is page-aligned. A `Vec<u64>` is only 8-aligned, so the frames were aligned or not by luck
+        // of where the host heap put the arena (the two zombie-tid tests failed on it). One spare page lets the base
+        // round up.
+        let arena: alloc::vec::Vec<u64> = alloc::vec![0u64; (ARENA_BYTES + 4096) / 8];
         // Leaked: this arena outlives every test in the binary; nothing ever
         // frees it back to the host allocator.
         let arena: &'static mut [u64] = alloc::boxed::Box::leak(arena.into_boxed_slice());
-        let base = arena.as_ptr() as usize;
-        let size = core::mem::size_of_val(arena);
+        let base = (arena.as_ptr() as usize).next_multiple_of(4096);
+        let size = ARENA_BYTES;
 
         akuma_pmm::register_config(akuma_pmm::PmmConfig {
             cow_ref_ledger: true,

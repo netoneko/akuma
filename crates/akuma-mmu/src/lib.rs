@@ -3096,9 +3096,22 @@ fn x86_user_range_ok(va_start: usize, len: usize, need_write: bool) -> bool {
 }
 
 /// The active PML4, from `CR3`.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", target_os = "none"))]
 fn x86_read_cr3() -> u64 {
     akuma_cpu::ctlreg::cr3() & X86_ADDR_MASK
+}
+
+/// Host build (the unit tests, on an x86_64 machine): there is no `CR3`, and the stub answers 0, which
+/// `UserAddressSpace::new` then dereferences as the kernel root to copy the shared PML4 slots from (a fault at
+/// `0 + 256 * 8` in every test that makes a process). A page-aligned, zeroed table of our own stands in: the host
+/// physmap is the identity, so its address is its "physical" address, and every shared slot reads as unmapped.
+#[cfg(all(target_arch = "x86_64", not(target_os = "none")))]
+fn x86_read_cr3() -> u64 {
+    use core::sync::atomic::AtomicU64;
+    #[repr(align(4096))]
+    struct HostKernelRoot([AtomicU64; 512]);
+    static HOST_KERNEL_ROOT: HostKernelRoot = HostKernelRoot([const { AtomicU64::new(0) }; 512]);
+    HOST_KERNEL_ROOT.0.as_ptr() as u64 & X86_ADDR_MASK
 }
 
 /// Install `root` as the active PML4 — `akuma_pagetable::amd64::load_cr3`, which
