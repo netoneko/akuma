@@ -1,14 +1,127 @@
 {
   "common": [
+    "console",
+    "ext3",
+    "ext3-qemu-crash-test",
+    "ext3-qemu-write-test",
+    "ext4",
     "linux-extra-syscalls",
     "no-tests",
+    "pmm-forensics",
+    "ring0-preempt",
     "sc-aio",
     "sc-containers",
     "sc-epoll",
     "sc-eventfd",
     "sc-pidfd",
+    "sc-private-ns",
     "sc-timerfd",
-    "syscall-debug-info"
+    "syscall-debug-info",
+    "vfat"
   ],
-  "drift": {}
+  "drift": {
+    "ext3": {
+      "only_aarch64": [
+        "akuma-ext2/ext3",
+        "akuma-vfs-glue/ext3"
+      ],
+      "only_amd64": []
+    },
+    "ext3-qemu-crash-test": {
+      "only_aarch64": [
+        "akuma-ext2/ext3-qemu-crash-test",
+        "akuma-vfs-glue/ext3-qemu-crash-test"
+      ],
+      "only_amd64": []
+    },
+    "ext3-qemu-write-test": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/ext3-qemu-write-test",
+        "akuma-vfs-glue/ext3-qemu-write-test"
+      ],
+      "only_amd64": []
+    },
+    "ext4": {
+      "only_aarch64": [
+        "akuma-ext2/ext4",
+        "akuma-vfs-glue/ext4"
+      ],
+      "only_amd64": []
+    },
+    "linux-extra-syscalls": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/sc-sysv-ipc",
+        "akuma-vfs-glue/sc-sysv-ipc"
+      ],
+      "only_amd64": []
+    },
+    "no-tests": {
+      "only_aarch64": [
+        "akuma-exec/no-tests",
+        "akuma-kernel-core/no-tests",
+        "akuma-syscalls-glue/no-tests"
+      ],
+      "only_amd64": []
+    },
+    "pmm-forensics": {
+      "only_aarch64": [
+        "akuma-pmm/pmm-forensics"
+      ],
+      "only_amd64": []
+    },
+    "sc-aio": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/sc-aio"
+      ],
+      "only_amd64": []
+    },
+    "sc-containers": {
+      "only_aarch64": [
+        "akuma-isolation/containers",
+        "akuma-syscalls-glue/sc-containers",
+        "akuma-vfs-glue/sc-containers"
+      ],
+      "only_amd64": []
+    },
+    "sc-epoll": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/sc-epoll"
+      ],
+      "only_amd64": []
+    },
+    "sc-eventfd": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/sc-eventfd"
+      ],
+      "only_amd64": []
+    },
+    "sc-pidfd": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/sc-pidfd"
+      ],
+      "only_amd64": []
+    },
+    "sc-private-ns": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/sc-private-ns",
+        "akuma-vfs-glue/sc-private-ns"
+      ],
+      "only_amd64": []
+    },
+    "sc-timerfd": {
+      "only_aarch64": [
+        "akuma-syscalls-glue/sc-timerfd"
+      ],
+      "only_amd64": []
+    },
+    "syscall-debug-info": {
+      "only_aarch64": [
+        "akuma-config/syscall-debug-info",
+        "akuma-exec/debug-info",
+        "akuma-syscalls-time/debug-info",
+        "akuma-syscalls/debug-info"
+      ],
+      "only_amd64": []
+    }
+  }
 }
