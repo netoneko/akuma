@@ -18,6 +18,17 @@ Items 4 and 6 now use the shared-stack loopback and capability-aware DAC
 policies described in `docs/reference/subsystems/containers.md`. The accepted
 uid/gid map writes in item 8 remain a compatibility stub.
 
+Verification on 2026-11-19: the full 16-target kernel build matrix and
+`check_addr_params.py` passed. On amd64 and AArch64 QEMU guests,
+`scripts/bwrap_suite.py` passed all 14 cases, including Codex 0.169.0's
+inner stage, the shared-loopback denial, host loopback, and dropped-capability
+file access. `scripts/box0_dac_inheritance.c` additionally checked ordinary
+uid-0 owner access and denial of another owner's file before and after fork
+and exec; host root could read that file. `scripts/box0_socket_inheritance.c`
+checked the inherited and newly-created socket policies on both architectures.
+The private namespace shares the network stack and has no independent
+loopback; native smoltcp currently supports IPv4 only.
+
 ## 1. What is gated today
 
 Two shapes. **Host root only** (`akuma_exec::process::host_root()`: box 0 *and* uid 0, the `HostRoot` token); and
