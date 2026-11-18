@@ -11,6 +11,7 @@
  *   jvmprobe name RIP  -> NAME PASS rip in <range> | NAME SURPRISE | NAME MISSING (G9's owner)
  *   jvmprobe rwx       -> RWX RED mmap-RWX-refused=EINVAL/EACCES (+ RWX PASS rw_to_rx=42)
  *                          | RWX RED rw_to_rx <why>   (the ability HotSpot minimally needs)
+ *   jvmprobe wxrange strict|relaxed -> WXRANGE PASS mode=... cases=3
  *   jvmprobe java CMD  -> JVM PASS firstline | JVM RED <diagnosis> (+ evidence path)
  *
  * Exit code: 0 iff the arm PASSED. RED and CRASH exit 1: a clean, named failure is the
@@ -159,6 +160,9 @@ static int arm_cycles(void) {
 }
 
 /* ---------------- rwx ---------------- */
+/* amd64: mov eax, 42; ret */
+static const unsigned char return_42[] = {0xb8, 42, 0x00, 0x00, 0x00, 0xc3};
+
 /* jitprobe's arms, kept (precedent, kernel 0.0.8 verdicts in its README): single-call
  * W|X is the policy baseline (refused), RW->mprotect(R|X)->call is the ability
  * HotSpot's code cache minimally needs. rw_to_rx failing = RED (the JVM-blocking
@@ -179,9 +183,7 @@ static int child_rwx(void) {
         printf("RWX RED rw_to_rx mmap errno=%d (%s)\n", errno, estr(errno));
         return 1;
     }
-    /* mov eax,42; ret */
-    unsigned char code[] = {0xb8, 42, 0x00, 0x00, 0x00, 0xc3};
-    memcpy(p, code, sizeof code);
+    memcpy(p, return_42, sizeof return_42);
     if (mprotect(p, sz, PROT_READ | PROT_EXEC) != 0) {
         printf("RWX RED rw_to_rx mprotect errno=%d (%s)\n", errno, estr(errno));
         return 1;
@@ -207,6 +209,74 @@ static int arm_rwx(void) {
         return 1;
     }
     return WEXITSTATUS(st);
+}
+
+/* A three-page code cache can become executable while clean. Then dirty one
+ * page, take it through read-only and back, and retry the whole-range change. */
+static int check_wx_range(size_t dirty, int relaxed) {
+    const size_t page = 4096, len = 3 * page;
+    const int rw = PROT_READ | PROT_WRITE, rx = PROT_READ | PROT_EXEC;
+    unsigned char *p = mmap(NULL, len, rw, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (p == MAP_FAILED) {
+        printf("WXRANGE RED dirty=%zu mmap errno=%d\n", dirty, errno);
+        return 1;
+    }
+
+    int failed = 1;
+    if (mprotect(p, len, rx) != 0 || mprotect(p, len, rw) != 0) {
+        printf("WXRANGE RED dirty=%zu clean RX/RW round trip errno=%d\n", dirty, errno);
+        goto done;
+    }
+    unsigned char *code = p + dirty * page;
+    memcpy(code, return_42, sizeof return_42);
+    if (mprotect(code, page, PROT_READ) != 0 || mprotect(code, page, rw) != 0) {
+        printf("WXRANGE RED dirty=%zu R/RW round trip errno=%d\n", dirty, errno);
+        goto done;
+    }
+    int rc = mprotect(p, len, rx);
+    int err = rc == 0 ? 0 : errno;
+    if (relaxed ? rc != 0 : (rc != -1 || err != EACCES)) {
+        printf("WXRANGE RED dirty=%zu RX range rc=%d errno=%d expected_errno=%d\n",
+               dirty, rc, err, relaxed ? 0 : EACCES);
+        goto done;
+    }
+    if (memcmp(code, return_42, sizeof return_42) != 0) {
+        printf("WXRANGE RED dirty=%zu code bytes changed across mprotect\n", dirty);
+        goto done;
+    }
+
+    if (relaxed) {
+        int (*fn)(void) = (int (*)(void))code;
+        if (fn() != 42) {
+            printf("WXRANGE RED dirty=%zu RX code returned the wrong value\n", dirty);
+            goto done;
+        }
+    } else {
+        /* Every page must retain write access after a rejected range. A
+         * partial application would make a prefix read-only. */
+        volatile unsigned char *bytes = p;
+        for (size_t i = 0; i < 3; i++) {
+            size_t off = i * page + sizeof return_42;
+            printf("WXRANGE CHECK dirty=%zu write-after-denial page=%zu\n", dirty, i);
+            bytes[off] = 0x5a;
+            if (bytes[off] != 0x5a) {
+                printf("WXRANGE RED dirty=%zu write did not stick page=%zu\n", dirty, i);
+                goto done;
+            }
+        }
+    }
+    failed = 0;
+done:
+    munmap(p, len);
+    return failed;
+}
+
+static int arm_wxrange(int relaxed) {
+    for (size_t dirty = 0; dirty < 3; dirty++) {
+        if (check_wx_range(dirty, relaxed)) return 1;
+    }
+    printf("WXRANGE PASS mode=%s cases=3\n", relaxed ? "relaxed" : "strict");
+    return 0;
 }
 
 /* ---------------- java ---------------- */
@@ -792,6 +862,7 @@ static void usage(void) {
             "usage: jvmprobe getcpu|auxv|cycles|rwx|maps|mmaparms|sysinfo|java CMD [ARG]...\n"
             "       jvmprobe name CMD EXPECTED_RIP_HEX [ARG]...\n"
             "       jvmprobe lazyrel\n"
+            "       jvmprobe wxrange strict|relaxed\n"
             "  one arm per invocation; NAME VERDICT detail on stdout; exit 0 iff PASS\n");
 }
 
@@ -805,6 +876,10 @@ int main(int argc, char **argv) {
     if (!strcmp(arm, "auxv")) return arm_auxv();
     if (!strcmp(arm, "cycles")) return arm_cycles();
     if (!strcmp(arm, "rwx")) return arm_rwx();
+    if (!strcmp(arm, "wxrange") && argc == 3) {
+        if (!strcmp(argv[2], "strict")) return arm_wxrange(0);
+        if (!strcmp(argv[2], "relaxed")) return arm_wxrange(1);
+    }
     if (!strcmp(arm, "maps")) return arm_maps();
     if (!strcmp(arm, "mmaparms")) return arm_mmaparms();
     if (!strcmp(arm, "sysinfo")) return arm_sysinfo();

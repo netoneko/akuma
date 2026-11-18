@@ -42,6 +42,9 @@
  * Static, musl, pure C — a crash is unambiguously the kernel's.
  * Build: <arch>-linux-musl-gcc -static -O2 -Wall -Wextra -o mmaplazy mmaplazy.c
  * Usage: mmaplazy [dir]        (default /tmp)
+ *        mmaplazy --trace dir OP...
+ * Each OP is N:start:count (PROT_NONE), R:start:count (PROT_READ),
+ * U:start:count (munmap), or C:page:1 (check one readable page).
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -269,7 +272,79 @@ static void check_shared_views(const char *path) {
     munmap(b, DATA_PAGES * PAGE);
 }
 
+/* Map starting one page into the fixture, through the last partial page.
+ * The page states guard the replay against invalid reads after a deletion. */
+static int run_trace(const char *path, int count, char **ops) {
+    enum { READABLE, PROTECTED, UNMAPPED };
+    unsigned char state[DATA_PAGES] = {0};
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) { perror("trace open"); return 2; }
+    const size_t len = DATA_PAGES * PAGE;
+    unsigned char *base = mmap(NULL, len, PROT_READ, MAP_PRIVATE, fd, PAGE);
+    close(fd);
+    if (base == MAP_FAILED) { perror("trace mmap"); return 2; }
+
+    int rc = 0;
+    for (int i = 0; i < count; i++) {
+        char action;
+        unsigned start, pages;
+        int consumed = 0;
+        if (sscanf(ops[i], "%c:%2u:%2u%n", &action, &start, &pages, &consumed) != 3 ||
+            ops[i][consumed] || !pages || start >= DATA_PAGES || pages > DATA_PAGES - start ||
+            !strchr("NRUC", action) || (action == 'C' && pages != 1)) {
+            fprintf(stderr, "trace invalid operation %s\n", ops[i]);
+            rc = 2;
+            break;
+        }
+        unsigned end = start + pages;
+        for (unsigned j = start; j < end; j++) {
+            if (state[j] == UNMAPPED || (action == 'C' && state[j] != READABLE)) {
+                fprintf(stderr, "trace invalid page state for %s\n", ops[i]);
+                rc = 2;
+                break;
+            }
+        }
+        if (rc) break;
+
+        unsigned char *addr = base + start * PAGE;
+        if (action == 'C') {
+            unsigned long file_off = (start + 1) * PAGE;
+            for (unsigned long j = 0; j < PAGE; j++) {
+                unsigned long off = file_off + j;
+                unsigned char want = off < FILE_BYTES ? byte_at(off) : 0;
+                if (addr[j] != want) {
+                    printf("TRACE MISMATCH %s file_offset=%lu expected=%02x actual=%02x\n",
+                           ops[i], off, (unsigned)want, (unsigned)addr[j]);
+                    rc = 1;
+                    break;
+                }
+            }
+            if (rc) break;
+        } else {
+            size_t size = pages * PAGE;
+            int prot = action == 'N' ? PROT_NONE : PROT_READ;
+            int result = action == 'U' ? munmap(addr, size) : mprotect(addr, size, prot);
+            if (result < 0) { perror(ops[i]); rc = 2; break; }
+            memset(state + start, action == 'U' ? UNMAPPED :
+                   action == 'N' ? PROTECTED : READABLE, pages);
+        }
+    }
+    munmap(base, len);
+    if (!rc) puts("TRACE PASS");
+    return rc;
+}
+
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "--trace") == 0) {
+        if (argc < 4) { fprintf(stderr, "usage: mmaplazy --trace dir OP...\n"); return 2; }
+        char path[320];
+        int n = snprintf(path, sizeof path, "%s/mmaplazy.trace.%ld", argv[2], (long)getpid());
+        if (n < 0 || (size_t)n >= sizeof path) return 2;
+        if (write_file(path) < 0) { perror(path); unlink(path); return 2; }
+        int rc = run_trace(path, argc - 3, argv + 3);
+        unlink(path);
+        return rc;
+    }
     snprintf(dir, sizeof dir, "%s", argc > 1 ? argv[1] : "/tmp");
     printf("mmaplazy: file %lu bytes (%lu pages + %lu), dir %s\n",
            FILE_BYTES, DATA_PAGES, TAIL_BYTES, dir);
