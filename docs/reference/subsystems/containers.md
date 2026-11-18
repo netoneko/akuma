@@ -66,7 +66,7 @@ the box's recorded `creator_pid`.
 | Internet `bind` to ports 1–1023 on smoltcp | Host root | `EACCES` |
 | Process-targeted resource limits, priority and scheduling | Caller can see the target's box | `ESRCH` |
 
-Abstract AF_UNIX names are local to the caller's box. Pathname AF_UNIX sockets
+Abstract AF_UNIX names are local to the box in which the socket was created. Pathname AF_UNIX sockets
 use the mount ID and inode resolved through the caller's filesystem view. Both
 must match the listener's identity, including when the pathname is exposed by
 a bind mount. An already-open Unix socket can be inherited across a namespace
@@ -76,7 +76,10 @@ the target has its own root.
 
 On the shared smoltcp stack, a private mount namespace cannot initiate IPv4
 traffic to `127.0.0.0/8` or `0.0.0.0`. Box 0 can use loopback normally.
-Connected sockets inherited from the parent remain usable. A private namespace
+Sockets inherited from the parent retain their original loopback policy, including
+when connected or used for an addressed UDP send after the transition. Passing such
+a socket intentionally gives the recipient access to that socket's original context;
+launchers must close descriptors they do not intend to share. A private namespace
 therefore has no independently usable loopback network on this stack. Native
 smoltcp sockets currently support IPv4 only. Other network destinations retain
 their existing policy, including the metadata-address restriction.

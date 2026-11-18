@@ -454,7 +454,12 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
         return ESRCH;
     };
     let creds = current_creds();
-    let sock = with_table(|t| t.alloc(ty, creds));
+    let namespace_id = super::caller_box_and_pid().0;
+    let sock = with_table(|t| {
+        let sock = t.alloc(ty, creds);
+        t.get_mut(sock).unwrap().namespace_id = namespace_id;
+        sock
+    });
     // A datagram socket gets its receive queue right away, not at `bind`.
     // Anyone who learns its name can send to it, and it must also be able to
     // receive a *reply* while still unbound — which is what a `syslog(3)`-style
@@ -489,9 +494,12 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
 pub fn socketpair_alloc(sock_type: i32, px: u32, py: u32) -> Option<(u32, u32)> {
     let ty = SockType::from_raw(sock_type & 0xFF)?;
     let creds = current_creds();
+    let namespace_id = super::caller_box_and_pid().0;
     Some(with_table(|t| {
         let a = t.alloc(ty, creds);
         let b = t.alloc(ty, creds);
+        t.get_mut(a).unwrap().namespace_id = namespace_id;
+        t.get_mut(b).unwrap().namespace_id = namespace_id;
         // Endpoint a reads px and writes py; the peer is mirrored.
         t.pair(a, b, px, py);
         (a, b)
@@ -515,11 +523,11 @@ fn socket_path(name: &[u8]) -> Result<String, Errno> {
     super::fs::resolve_path_at(akuma_syscalls_linux::flags::at::AT_FDCWD, path)
 }
 
-fn socket_destination(name: &UnixName) -> Result<(UnixAddress, akuma_primitives::InodePin), Errno> {
+fn socket_destination(sock: u32, name: &UnixName) -> Result<(UnixAddress, akuma_primitives::InodePin), Errno> {
     let address = match name {
         UnixName::Unnamed => UnixAddress::Unnamed,
         UnixName::Abstract(name) => UnixAddress::Abstract {
-            box_id: super::caller_box_and_pid().0,
+            box_id: with_table(|t| t.get(sock).map(|s| s.namespace_id)).ok_or(Errno::EBADF)?,
             name: name.clone(),
         },
         UnixName::Path(name) => {
@@ -544,7 +552,7 @@ pub fn sys_bind(fd: u32, addr_ptr: UserAddr, addrlen: usize) -> SysResult {
     };
     let name = read_sockaddr(addr_ptr, addrlen)?;
     let Some(path_bytes) = name.path_bytes() else {
-        let (address, pin) = socket_destination(&name)?;
+        let (address, pin) = socket_destination(sock, &name)?;
         with_table(|t| t.bind(sock, name, address, pin)).map_err(Errno::new)?;
         return Ok(0);
     };
@@ -613,7 +621,7 @@ pub fn sys_connect(fd: u32, addr_ptr: UserAddr, addrlen: usize) -> SysResult {
 
     loop {
         let outcome = {
-            let (address, _pin) = socket_destination(&name)?;
+            let (address, _pin) = socket_destination(sock, &name)?;
             with_table(|t| t.connect(sock, &address, creds))
         };
         match outcome {
@@ -1076,7 +1084,7 @@ pub fn unix_sendto_anc(
     // sends must fail the second one, not the first.
     let queue = match dest {
         Some(name) => {
-            let (address, _pin) = match socket_destination(name) {
+            let (address, _pin) = match socket_destination(sock, name) {
                 Ok(destination) => destination,
                 Err(e) => return e.ret(),
             };

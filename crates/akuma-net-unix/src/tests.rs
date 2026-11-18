@@ -654,6 +654,22 @@ mod names {
     use super::*;
 
     #[test]
+    fn accepted_socket_keeps_listeners_namespace() {
+        let mut t = UnixTable::new();
+        let listener = t.alloc(SockType::Stream, creds(1));
+        let client = t.alloc(SockType::Stream, creds(2));
+        t.get_mut(listener).unwrap().namespace_id = 42;
+        let name = UnixName::Abstract(b"service".to_vec());
+        let address = UnixAddress::Abstract { box_id: 42, name: b"service".to_vec() };
+        t.bind(listener, name, address.clone(), InodePin::none()).unwrap();
+        t.listen(listener, 1).unwrap();
+        let ConnectOutcome::Queued { server_sock, .. } = t.connect(client, &address, creds(2)).unwrap() else {
+            panic!("expected queued stream connection");
+        };
+        assert_eq!(t.get(server_sock).unwrap().namespace_id, 42);
+    }
+
+    #[test]
     fn abstract_names_are_scoped_to_the_callers_box() {
         let mut t = UnixTable::new();
         let name = UnixName::Abstract(b"log".to_vec());

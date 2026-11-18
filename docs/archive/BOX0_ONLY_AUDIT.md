@@ -9,7 +9,7 @@ reading or only suspect it.
 Follow-up: items 1–3, 5, 7 and 11 were addressed. Kernel log reads, clears and
 unread size require host root on amd64. The hostname, domain name and shared
 smoltcp privileged ports require host root on both architectures. AF_UNIX
-abstract names are scoped to the caller's box. Pathname sockets are resolved
+abstract names are scoped to the box in which the socket was created. Pathname sockets are resolved
 through the caller's VFS view and keyed by mount ID and pinned inode.
 Process-targeted limit, priority and scheduling calls apply box visibility.
 `/proc/mounts` skips the global table when the namespace has its own root.

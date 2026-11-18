@@ -95,8 +95,9 @@ the inner stage); the test uses the command line codex's runtime generates inste
 ## What this does not enforce (said out loud)
 
 * **Network.** `--unshare-net` is accepted, and `NETLINK_ROUTE` acknowledges its `lo` setup. A private mount namespace
-  shares the smoltcp stack but cannot initiate IPv4 loopback traffic. It has no independent loopback service. Connected
-  sockets passed in by the parent remain usable. Codex's restricted mode also installs a network seccomp filter.
+  shares the smoltcp stack but sockets created there cannot initiate IPv4 loopback traffic. It has no independent
+  loopback service. Inherited sockets retain their creating box's loopback policy, including unconnected sockets.
+  Codex's restricted mode also installs a network seccomp filter.
 * **Seccomp** is separate work (`docs/archive/SECCOMP.md`); this feature does not depend on it, codex's stage does.
 * **User namespaces / uid maps.** `uid_map`/`gid_map`/`setgroups` accept writes and change nothing. A uid-0 process that
   drops capabilities loses DAC overrides and retains ordinary uid-0 owner permissions, including access to its own 0600

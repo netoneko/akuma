@@ -638,6 +638,8 @@ pub struct Pending {
 #[derive(Debug, Clone)]
 pub struct UnixSock {
     pub ty: SockType,
+    /// Namespace identity captured at socket creation, retained on inheritance.
+    pub namespace_id: u64,
     pub state: SockState,
     /// This socket's own bound name, reported by `getsockname`.
     pub name: UnixName,
@@ -673,6 +675,7 @@ impl UnixSock {
     pub fn new(ty: SockType, creds: Ucred) -> Self {
         Self {
             ty,
+            namespace_id: 0,
             state: SockState::Unbound,
             name: UnixName::Unnamed,
             binding: None,
@@ -960,10 +963,12 @@ impl UnixTable {
         // immediately (Linux behaviour — a client may write before the server
         // accepts, and those bytes must be buffered, not lost).
         let listener_creds = self.socks[&target].creds;
+        let listener_namespace = self.socks[&target].namespace_id;
         let listener_name = self.socks[&target].name.clone();
         let server_sock = self.alloc(ty, listener_creds);
         {
             let srv = self.socks.get_mut(&server_sock).ok_or(libc_errno::EBADF)?;
+            srv.namespace_id = listener_namespace;
             srv.state = SockState::Connected;
             srv.peer = Some(id);
             srv.name = listener_name.clone();
