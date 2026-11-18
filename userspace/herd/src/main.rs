@@ -571,6 +571,7 @@ pub extern "C" fn main() {
         "config" => done(cmd_config(named("config"))),
         "enable" => done(cmd_enable(named("enable"))),
         "disable" => done(cmd_disable(named("disable"))),
+        "reload" => done(send_control("reload", "")),
         "start" => done(cmd_start(named("start"))),
         "stop" => done(cmd_stop(named("stop"))),
         "log" => done(cmd_log(named("log"))),
@@ -1723,11 +1724,10 @@ fn kill_service_to(state: &mut HerdState, name: &str, target: ServiceState) -> R
 /// `herd start <svc>`: start a service that is not running, clearing a `Halted`
 /// or `Exited` state and the restart count.
 fn control_start(state: &mut HerdState, name: &str) -> Reply {
-    // Enabled since the last 20 s reload: pick it up now rather than make the
-    // caller wait for one.
-    if !state.services.contains_key(name) {
-        reload_config(state);
-    }
+    // Re-read `enabled/` now, not at the next 20 s tick: a service enabled or
+    // edited since then would otherwise start on its previous config (the VM
+    // that booted the wrong disk, 2026-11-17). An unchanged file costs a read.
+    reload_config(state);
     let Some(svc) = state.services.get_mut(name) else {
         return Reply::err(format!("{name}: not enabled; run `herd enable {name}` first"));
     };
@@ -1767,6 +1767,8 @@ enum Request<'a> {
     Stop(&'a str),
     /// Every service the daemon supervises, with its state.
     Status,
+    /// Re-read `enabled/` now, synchronously, and start what is new.
+    Reload,
 }
 
 /// `[token=<hex>] start <svc>`, `[token=<hex>] stop <svc>` or `status`,
@@ -1781,6 +1783,9 @@ fn parse_request(line: &str) -> Option<(Option<&str>, Request<'_>)> {
     let verb = words.next()?;
     if verb == "status" {
         return if words.next().is_none() { Some((token, Request::Status)) } else { None };
+    }
+    if verb == "reload" {
+        return if words.next().is_none() { Some((token, Request::Reload)) } else { None };
     }
     let name = words.next()?;
     if words.next().is_some() || !valid_service_name(name) {
@@ -1966,8 +1971,15 @@ fn handle_request(state: &mut HerdState, line: &str) -> Reply {
             control_start(state, name)
         }
         Some(Request::Status) => return Reply::ok(status_report(state)),
+        Some(Request::Reload) => {
+            print("[herd] Reload requested\n");
+            reload_config(state);
+            start_stopped_services(state, uptime() / 1000);
+            state.last_config_reload_ms = uptime() / 1000;
+            Reply::ok(format!("reloaded: {} service(s) configured", state.services.len()))
+        }
         // The line is not echoed back or logged: it may carry the token.
-        None => Reply::err(String::from("bad request; expected `start <svc>`, `stop <svc>` or `status`")),
+        None => Reply::err(String::from("bad request; expected `start <svc>`, `stop <svc>`, `reload` or `status`")),
     };
     print("[herd] ");
     print(&reply.msg);
@@ -2557,12 +2569,24 @@ fn cmd_enable(name: &str) -> bool {
         }
     };
     
-    // Write to enabled
-    if write_file(&dst_path, &content) {
+    // Link, do not copy: a copy froze the config at enable time, so editing
+    // `available/` did nothing until a disable + enable and the service kept
+    // restarting on the stale text (2026-11-17). A dangling link from a removed
+    // `available/` file is replaced; if the filesystem refuses symlinks, fall
+    // back to the copy.
+    let _ = libakuma::unlink(&dst_path);
+    let linked = libakuma::symlink(&src_path, &dst_path) == 0;
+    if linked || write_file(&dst_path, &content) {
         print("Enabled service '");
         print(name);
-        print("'\n");
-        print("Service will start on next config reload (within 20s) or reboot.\n");
+        print(if linked { "' (linked)\n" } else { "' (copied)\n" });
+        // Make the running daemon see it now instead of at its next tick.
+        // Without a daemon (boot-time `herd enable`) it is picked up on start.
+        if TcpStream::connect(HERD_CONTROL_ADDR).is_ok() {
+            let _ = send_control("reload", "");
+        } else {
+            print("Service will start when the herd daemon starts.\n");
+        }
         true
     } else {
         print("Error: Failed to enable service '");
@@ -2578,8 +2602,8 @@ fn cmd_enable(name: &str) -> bool {
 fn cmd_disable(name: &str) -> bool {
     let path = format!("{}/{}.conf", HERD_ENABLED_DIR, name);
     
-    // Check if enabled
-    if read_file_bytes(&path).is_none() {
+    // Check if enabled (`readlink` also sees a link whose target is gone).
+    if read_file_bytes(&path).is_none() && libakuma::readlink(&path).is_none() {
         print("Service '");
         print(name);
         print("' is not enabled.\n");
@@ -2591,6 +2615,9 @@ fn cmd_disable(name: &str) -> bool {
         print("Disabled service '");
         print(name);
         print("'\n");
+        if TcpStream::connect(HERD_CONTROL_ADDR).is_ok() {
+            let _ = send_control("reload", "");
+        }
         true
     } else {
         print("Error: Failed to delete ");
@@ -2627,12 +2654,13 @@ fn send_control(verb: &str, name: &str) -> bool {
     };
     // `start`/`stop` carry the daemon's token. No token file means a daemon
     // that predates it or could not write one; it accepts the bare request.
-    let token = if name.is_empty() {
+    let token = if verb == "status" {
         None
     } else {
         read_file_string(CONTROL_TOKEN_PATH).map(|t| String::from(t.trim()))
     };
     let request = match (name.is_empty(), token) {
+        (true, Some(t)) if !t.is_empty() => format!("token={t} {verb}\n"),
         (true, _) => format!("{verb}\n"),
         (false, Some(t)) if !t.is_empty() => format!("token={t} {verb} {name}\n"),
         (false, _) => format!("{verb} {name}\n"),
@@ -2896,11 +2924,26 @@ vm_ram_mib = 768\nvm_vcpus = 2\nvm_forward = 2223:4444\nvm_cmdline = init=/usr/b
     }
 
     #[test]
+    fn a_flag_first_args_line_keeps_every_word() {
+        let c = parse_service_config("command = /bin/h\nargs = --listen grpc://127.0.0.1:47200\n").unwrap();
+        assert_eq!(c.args, ["--listen", "grpc://127.0.0.1:47200"]);
+    }
+
+    #[test]
+    fn reload_needs_the_token_like_start() {
+        assert!(!authorized(Some("ab12"), None, &Request::Reload));
+        assert!(authorized(Some("ab12"), Some("ab12"), &Request::Reload));
+    }
+
+    #[test]
     fn requests_parse() {
         assert_eq!(parse_request("stop kot"), Some((None, Request::Stop("kot"))));
         assert_eq!(parse_request("  start   sshd \r"), Some((None, Request::Start("sshd"))));
         assert_eq!(parse_request("token=ab12 stop kot"), Some((Some("ab12"), Request::Stop("kot"))));
         assert_eq!(parse_request("token=ab12 status"), Some((Some("ab12"), Request::Status)));
+        assert_eq!(parse_request("reload"), Some((None, Request::Reload)));
+        assert_eq!(parse_request("token=ab12 reload"), Some((Some("ab12"), Request::Reload)));
+        assert_eq!(parse_request("reload kot"), None);
         assert_eq!(parse_request("stop"), None);
         assert_eq!(parse_request("token=ab12"), None);
         assert_eq!(parse_request("stop kot now"), None);
