@@ -98,6 +98,7 @@ pub fn call(func: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 }
 
 /// Issue the call over `hvc #0`, regardless of the selected conduit.
+#[cfg(target_arch = "aarch64")]
 #[must_use]
 pub fn hvc_call(func: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let ret: i64;
@@ -119,6 +120,7 @@ pub fn hvc_call(func: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 }
 
 /// Issue the call over `smc #0`, regardless of the selected conduit.
+#[cfg(target_arch = "aarch64")]
 #[must_use]
 pub fn smc_call(func: u64, a1: u64, a2: u64, a3: u64) -> i64 {
     let ret: i64;
@@ -136,6 +138,21 @@ pub fn smc_call(func: u64, a1: u64, a2: u64, a3: u64) -> i64 {
         );
     }
     ret
+}
+
+/// PSCI is an AArch64 interface: elsewhere (a host `cargo test`, the amd64 kernels) there is no
+/// conduit, and every call reports `NOT_SUPPORTED` (-1) instead of failing to assemble.
+#[cfg(not(target_arch = "aarch64"))]
+#[must_use]
+pub const fn hvc_call(_func: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    -1
+}
+
+/// See [`hvc_call`]: `NOT_SUPPORTED` off AArch64.
+#[cfg(not(target_arch = "aarch64"))]
+#[must_use]
+pub const fn smc_call(_func: u64, _a1: u64, _a2: u64, _a3: u64) -> i64 {
+    -1
 }
 
 #[cfg(test)]

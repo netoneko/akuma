@@ -22,9 +22,9 @@ impl Pages {
 
     /// The pages covering `len` bytes, rounded up; `None` past [`Pages::MAX`]. This is the boundary check.
     #[must_use]
-    pub const fn from_len_ceil(len: usize) -> Option<Pages> {
+    pub const fn from_len_ceil(len: usize) -> Option<Self> {
         let pages = len.div_ceil(PAGE_SIZE) as u64;
-        if pages > Self::MAX { None } else { Some(Pages(pages)) }
+        if pages > Self::MAX { None } else { Some(Self(pages)) }
     }
 
     /// The count.
@@ -67,21 +67,21 @@ pub struct PageRange {
 impl PageRange {
     /// `pages` pages from `start`; `None` if `start` is not page-aligned or the range would pass `2^48`.
     #[must_use]
-    pub const fn new(start: VirtAddr, pages: Pages) -> Option<PageRange> {
+    pub const fn new(start: VirtAddr, pages: Pages) -> Option<Self> {
         if !start.is_page_aligned() {
             return None;
         }
         match start.get().checked_add(pages.bytes()) {
-            Some(end) if end as u64 <= (1u64 << 48) => Some(PageRange { start, pages }),
+            Some(end) if end as u64 <= (1u64 << 48) => Some(Self { start, pages }),
             _ => None,
         }
     }
 
     /// The range a syscall's `(addr, len)` names: `addr` aligned, `len` rounded up to whole pages.
     #[must_use]
-    pub const fn from_user(start: usize, len: usize) -> Option<PageRange> {
+    pub const fn from_user(start: usize, len: usize) -> Option<Self> {
         match Pages::from_len_ceil(len) {
-            Some(p) => PageRange::new(VirtAddr::new(start), p),
+            Some(p) => Self::new(VirtAddr::new(start), p),
             None => None,
         }
     }

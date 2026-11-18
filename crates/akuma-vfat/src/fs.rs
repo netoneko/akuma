@@ -731,27 +731,24 @@ impl<D: BlockDevice> State<D> {
             return Err(FsError::AlreadyExists);
         }
         let taken = |s: &[u8; 11]| existing.iter().any(|e| e.short() == s);
-        let (short, nt, lfn) = match encode_short_exact(name) {
-            Some((s, nt)) => {
-                if taken(&s) {
-                    return Err(FsError::AlreadyExists);
+        let (short, nt, lfn) = if let Some((s, nt)) = encode_short_exact(name) {
+            if taken(&s) {
+                return Err(FsError::AlreadyExists);
+            }
+            (s, nt, Vec::new())
+        } else {
+            let mut n = 1;
+            let s = loop {
+                let cand = make_alias(name, n);
+                if !taken(&cand) {
+                    break cand;
                 }
-                (s, nt, Vec::new())
-            }
-            None => {
-                let mut n = 1;
-                let s = loop {
-                    let cand = make_alias(name, n);
-                    if !taken(&cand) {
-                        break cand;
-                    }
-                    n += 1;
-                    if n > 999_999 {
-                        return Err(FsError::NoSpace);
-                    }
-                };
-                (s, 0, build_lfn(name, &s))
-            }
+                n += 1;
+                if n > 999_999 {
+                    return Err(FsError::NoSpace);
+                }
+            };
+            (s, 0, build_lfn(name, &s))
         };
         let need = lfn.len() + 1;
 
@@ -773,28 +770,25 @@ impl<D: BlockDevice> State<D> {
                 run = 0;
             }
         }
-        let start = match found {
-            Some(s) => s,
-            None => {
-                // Grow the directory. The fixed FAT12/16 root cannot.
-                if dref == 0 {
-                    return Err(FsError::NoSpace);
-                }
-                let cb = self.g.cluster_bytes as usize;
-                let more = (need - run) * DIR_ENTRY_SIZE;
-                let add = more.div_ceil(cb);
-                if img.bytes.len() + add * cb > MAX_DIR_BYTES {
-                    return Err(FsError::NoSpace);
-                }
-                let mut prev = *img.clusters.last().ok_or(FsError::Corrupt)?;
-                for _ in 0..add {
-                    let c = self.alloc_cluster(prev)?;
-                    img.clusters.push(c);
-                    img.bytes.resize(img.bytes.len() + cb, 0);
-                    prev = c;
-                }
-                total - run
+        let start = if let Some(s) = found { s } else {
+            // Grow the directory. The fixed FAT12/16 root cannot.
+            if dref == 0 {
+                return Err(FsError::NoSpace);
             }
+            let cb = self.g.cluster_bytes as usize;
+            let more = (need - run) * DIR_ENTRY_SIZE;
+            let add = more.div_ceil(cb);
+            if img.bytes.len() + add * cb > MAX_DIR_BYTES {
+                return Err(FsError::NoSpace);
+            }
+            let mut prev = *img.clusters.last().ok_or(FsError::Corrupt)?;
+            for _ in 0..add {
+                let c = self.alloc_cluster(prev)?;
+                img.clusters.push(c);
+                img.bytes.resize(img.bytes.len() + cb, 0);
+                prev = c;
+            }
+            total - run
         };
 
         let (date, time, tenths) = unix_to_dos((self.now)());
@@ -1006,12 +1000,11 @@ impl<D: BlockDevice> State<D> {
         let mut first = e.first;
         if len < u64::from(e.size()) {
             self.shrink(&mut first, len)?;
-        } else if len > u64::from(e.size()) {
-            if let Err(err) = self.fill_zero(&mut first, u64::from(e.size()), len) {
+        } else if len > u64::from(e.size())
+            && let Err(err) = self.fill_zero(&mut first, u64::from(e.size()), len) {
                 let _ = self.shrink(&mut first, u64::from(e.size()));
                 return Err(err);
             }
-        }
         self.commit_file(pdref, &e, first, len as u32)
     }
 

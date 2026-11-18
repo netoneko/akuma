@@ -2931,6 +2931,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Inode Data Operations
     // ========================================================================
 
+    #[allow(clippy::unnecessary_wraps)] // only fallible with the `ext4` feature
     fn validate_directory_block(&self, state: &Ext2State, inode: &Inode, block: &[u8]) -> Result<(), FsError> {
         #[cfg(feature = "ext4")]
         if let Some(seed) = state.checksum_seed {

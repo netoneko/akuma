@@ -192,7 +192,7 @@ struct DevNodeFile((&'static str, u32, u32));
 
 #[cfg(feature = "sc-private-ns")]
 impl Filesystem for DevNodeFile {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "devnode"
     }
     fn read_dir(&self, _path: &str) -> Result<Vec<DirEntry>, FsError> {

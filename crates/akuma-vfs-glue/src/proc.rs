@@ -924,8 +924,8 @@ impl ProcFilesystem {
                     meta(RO, crate::render_mountinfo(caller_box_id(), Some(v.pid)).len() as u64, None)
                 }
                 PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::OomScore => meta(RW, 2, None),
-                PidFile::UidMap | PidFile::GidMap => meta(RW, ProcFilesystem::const_file_bytes("uid_map").len() as u64, None),
-                PidFile::Setgroups => meta(RW, ProcFilesystem::const_file_bytes("setgroups").len() as u64, None),
+                PidFile::UidMap | PidFile::GidMap => meta(RW, Self::const_file_bytes("uid_map").len() as u64, None),
+                PidFile::Setgroups => meta(RW, Self::const_file_bytes("setgroups").len() as u64, None),
                 PidFile::Maps | PidFile::Statm | PidFile::Auxv => {
                     let data = pid_address_space_file(v.pid, f.name()).ok_or(FsError::NotFound)?;
                     meta(RO, data.len() as u64, None)

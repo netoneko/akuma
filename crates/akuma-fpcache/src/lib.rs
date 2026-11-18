@@ -356,13 +356,11 @@ pub fn mark_icache_clean(key: FileKey, file_off: usize, frame: PhysFrame) {
     if !enabled() {
         return;
     }
-    (|| {
-        if let Some(e) = PAGES.lock().get_mut(&(inode, mount_id, file_off))
-            && e.pa == frame.addr
-        {
-            e.icache_done = true;
-        }
-    })();
+    if let Some(e) = PAGES.lock().get_mut(&(inode, mount_id, file_off))
+        && e.pa == frame.addr
+    {
+        e.icache_done = true;
+    }
 }
 
 /// Publish a freshly filled frame. Takes the cache's own reference.

@@ -430,7 +430,7 @@ pub fn msgqueue_is_recv_poller(box_id: u64, msqid: u32, tid: usize) -> bool {
 /// Test helper: directly push a message into a queue (bypasses userspace pointer validation).
 #[must_use]
 pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) -> bool {
-    (|| {
+    {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
             let msg_len = data.len();
@@ -447,13 +447,13 @@ pub fn msgqueue_push_direct(box_id: u64, msqid: u32, mtype: i64, data: &[u8]) ->
         } else {
             false
         }
-    })()
+    }
 }
 
 /// Test helper: pop a message from a queue (bypasses userspace pointer validation).
 #[must_use]
 pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::Vec<u8>)> {
-    (|| {
+    {
         let mut table = MSGQUEUE_TABLE.lock();
         if let Some(q) = table.get_mut(&(box_id, msqid)) {
             if let Some(msg) = q.messages.pop_front() {
@@ -472,7 +472,7 @@ pub fn msgqueue_pop_direct(box_id: u64, msqid: u32) -> Option<(i64, alloc::vec::
         } else {
             None
         }
-    })()
+    }
 }
 
 /// Test helper: return the number of messages in the queue.

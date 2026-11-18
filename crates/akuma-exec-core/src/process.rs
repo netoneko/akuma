@@ -440,8 +440,9 @@ impl KernelFile {
     }
 }
 
-/// The acknowledgements a `NETLINK_ROUTE` stub socket owes its caller: the 16-byte `nlmsghdr` of each acknowledged
-/// request, in order. A fixed ring of atomics (this crate holds no locks); one producer (`sendto`) and one consumer
+/// The acknowledgements a `NETLINK_ROUTE` stub socket owes its caller.
+///
+/// The 16-byte `nlmsghdr` of each acknowledged request, in order. A fixed ring of atomics (this crate holds no locks); one producer (`sendto`) and one consumer
 /// (`recvfrom`) per socket, which is how the descriptor is used.
 pub struct NetlinkAcks {
     slots: [[core::sync::atomic::AtomicU64; 2]; Self::CAP],
@@ -455,6 +456,7 @@ impl NetlinkAcks {
     #[must_use]
     pub const fn new() -> Self {
         use core::sync::atomic::{AtomicU32, AtomicU64};
+        #[allow(clippy::declare_interior_mutable_const)] // a const is the only way to repeat a non-Copy array element
         const SLOT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
         Self { slots: [SLOT; Self::CAP], head: AtomicU32::new(0), tail: AtomicU32::new(0) }
     }

@@ -1122,7 +1122,7 @@ pub fn sys_pread64(fd_num: u32, buf_ptr: UserAddr, count: usize, offset: i64) ->
         // read at it.
         akuma_exec::process::FileDescriptor::BlockDev { idx, .. } => {
             let _vfs_bkl = VfsBklGuard::new();
-            blockdev_read_at(idx, offset as u64, UserAddr::new(buf_ptr), count).map_or_else(|e| e.ret(), |n| n as u64)
+            blockdev_read_at(idx, offset as u64, UserAddr::new(buf_ptr), count).map_or_else(akuma_primitives::errno::Errno::ret, |n| n as u64)
         }
         _ => ESPIPE
     }
@@ -1211,7 +1211,7 @@ pub(super) fn sys_pwrite64(fd_num: u32, buf_ptr: UserAddr, count: usize, offset:
             if copy_from_user(&mut buf, buf_ptr).is_err() {
                 return EFAULT;
             }
-            blockdev_write_at(idx, offset as u64, &buf).map_or_else(|e| e.ret(), |n| n as u64)
+            blockdev_write_at(idx, offset as u64, &buf).map_or_else(akuma_primitives::errno::Errno::ret, |n| n as u64)
         }
         _ => ESPIPE
     }
@@ -2225,7 +2225,7 @@ pub fn openat_path(dirfd: i32, raw_path: &str, flags: u32, mode: u32) -> SysResu
         && let Some(key) = f.file_key()
         && akuma_vfs_glue::metadata(&f.path).is_err()
     {
-        let file = akuma_exec::process::KernelFile::new(f.path.clone(), flags).with_inode(key);
+        let file = akuma_exec::process::KernelFile::new(f.path, flags).with_inode(key);
         let nfd = proc.alloc_fd(akuma_exec::process::FileDescriptor::File(file));
         if flags & akuma_exec::process::open_flags::O_CLOEXEC != 0 {
             proc.set_cloexec(nfd);
@@ -3139,7 +3139,7 @@ pub(super) fn sys_fchown(fd: u32, uid: u64, gid: u64) -> u64 {
     let proc = match akuma_exec::process::current_process_shared() { Some(p) => p, None => return EBADF };
     match proc.get_fd(fd) {
         Some(akuma_exec::process::FileDescriptor::File(f)) => {
-            chown_path(&f.path, chown_id(uid), chown_id(gid)).unwrap_or_else(|e| e.ret())
+            chown_path(&f.path, chown_id(uid), chown_id(gid)).unwrap_or_else(akuma_primitives::errno::Errno::ret)
         }
         Some(_) => 0,
         None => EBADF,

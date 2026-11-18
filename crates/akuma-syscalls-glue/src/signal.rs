@@ -427,7 +427,7 @@ pub fn sys_tkill(tid: u32, sig: u32) -> u64 {
     // no recorded incarnation (registered through a path that did not mint one) keeps the old bare-slot behaviour.
     let act = |f: &dyn Fn(usize)| match akuma_exec::process::registered_thread_ref(slot) {
         Some(r) => {
-            let _ = r.with_live(|s| f(s));
+            let _ = r.with_live(f);
         }
         None => f(slot),
     };

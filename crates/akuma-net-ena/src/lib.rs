@@ -33,6 +33,7 @@ pub mod regs {
 
 /// Encode the depth and entry size of an admin or event queue.
 /// Queue depth must be a nonzero power of two.
+#[must_use]
 pub const fn queue_caps(depth: u16, entry_size: u16) -> Option<u32> {
     if depth == 0 || !depth.is_power_of_two() || entry_size == 0 {
         None
@@ -42,6 +43,7 @@ pub const fn queue_caps(depth: u16, entry_size: u16) -> Option<u32> {
 }
 
 /// Decode the advertised DMA address width from the capabilities register.
+#[must_use]
 pub const fn dma_address_width(caps: u32) -> u8 {
     ((caps >> 8) & 0xff) as u8
 }
@@ -58,6 +60,7 @@ pub struct RingCursor {
 }
 
 impl RingCursor {
+    #[must_use]
     pub const fn new(depth: u16) -> Option<Self> {
         if depth == 0 || !depth.is_power_of_two() {
             None
@@ -66,8 +69,10 @@ impl RingCursor {
         }
     }
 
+    #[must_use]
     pub const fn index(&self) -> u16 { self.index }
 
+    #[must_use]
     pub const fn phase(&self) -> bool { self.phase }
 
     pub fn advance(&mut self) {

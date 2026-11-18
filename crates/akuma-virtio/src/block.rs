@@ -155,7 +155,7 @@ impl VirtioBlockDevice {
     /// Flush all completed writes to the device's stable backing storage.
     pub fn flush(&mut self) -> Result<(), BlockError> {
         if !self.can_flush { return Err(BlockError::WriteError); }
-        self.request(blk::T_FLUSH, 0, core::ptr::null(), 0).map_err(|_| BlockError::WriteError)
+        self.request(blk::T_FLUSH, 0, core::ptr::null(), 0).map_err(|()| BlockError::WriteError)
     }
 
     /// Read sectors from the device
