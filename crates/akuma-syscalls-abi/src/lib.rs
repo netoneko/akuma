@@ -368,6 +368,9 @@ syscall_table! {
     Mount   => MOUNT   = 165, nr::MOUNT;
     /// `umount2(target, flags)`. Same gate and same doc as [`Syscall::Mount`].
     Umount2 => UMOUNT2 = 166, nr::UMOUNT2;
+    /// `pivot_root(new_root, put_old)`. On Akuma it re-roots the caller's *private mount namespace* and mounts the
+    /// old root nowhere (`docs/archive/BWRAP_ON_BOXES.md`); anyone who did not make such a namespace gets `EPERM`.
+    PivotRoot => PIVOT_ROOT = 155, nr::PIVOT_ROOT;
 
     // ── readiness ──────────────────────────────────────────────────────────
     /// asm-generic has no `poll`(7) or `select`(23) — `ppoll` and `pselect6`

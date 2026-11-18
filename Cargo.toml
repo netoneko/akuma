@@ -416,13 +416,14 @@ sound = ["akuma-virtio/sound", "akuma-kernel-glue/sound", "akuma-kernel-tests-aa
 # kernels. `sc-reboot` is NOT a member: only the AArch64 kernel has it, and the
 # group means the same thing on both kernels.
 linux-extra-syscalls = [
-    "sc-aio", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
+    "sc-aio", "sc-containers", "sc-private-ns", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
     "dep:akuma-syscalls-ipc", "akuma-vfs-glue/sc-sysv-ipc", "akuma-syscalls-glue/sc-sysv-ipc",
     "akuma-kernel-amd64/linux-extra-syscalls",
 ]
 # Tier 1 — pure dead weight, no akuma-exec callbacks.
 sc-aio          = ["akuma-syscalls-glue/sc-aio", "akuma-kernel-amd64/sc-aio"]
 sc-containers   = ["akuma-vfs-glue/sc-containers", "akuma-syscalls-glue/sc-containers", "akuma-isolation/containers", "akuma-kernel-tests-aarch64/sc-containers", "akuma-kernel-amd64/sc-containers"]
+sc-private-ns   = ["sc-containers", "akuma-vfs-glue/sc-private-ns", "akuma-syscalls-glue/sc-private-ns", "akuma-kernel-amd64/sc-private-ns"]
 sc-timerfd      = ["akuma-syscalls-glue/sc-timerfd", "akuma-kernel-amd64/sc-timerfd"]
 # Tier 2 — each needs a no-op ExecRuntime callback stub when off.
 sc-eventfd      = ["akuma-syscalls-glue/sc-eventfd", "akuma-kernel-glue/sc-eventfd", "akuma-kernel-amd64/sc-eventfd"]

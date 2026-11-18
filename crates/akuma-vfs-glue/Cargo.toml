@@ -70,6 +70,9 @@ ext3-qemu-crash-test = ["ext3-qemu-write-test", "dep:akuma-params", "akuma-ext2/
 # they gated when this code was `src/vfs/`.
 sc-sysv-ipc = ["dep:akuma-syscalls-ipc"]
 sc-containers = ["akuma-isolation/containers"]
+# Private mount namespaces (`clone(CLONE_NEWNS)`, `pivot_root`): the mount-set operations a process may perform on its own
+# namespace. `docs/archive/BWRAP_ON_BOXES.md`.
+sc-private-ns = ["sc-containers"]
 sc-reboot = []
 # So build.rs can emit `kernel_bkl_smp` — see its header for why that matters.
 bkl-smp = []

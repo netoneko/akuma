@@ -188,6 +188,20 @@ pub(super) fn sys_mount(
     let target_ptr = target_ptr.get();
     let fstype_ptr = fstype_ptr.get();
     let Some(root) = mount_permit() else {
+        // The one boxed process that may mount: the builder of a private namespace, into that namespace only.
+        #[cfg(feature = "sc-private-ns")]
+        if let Some(tok) = akuma_exec::process::ns_creator() {
+            return super::private_ns::mount(tok, source_ptr, target_ptr, fstype_ptr, flags);
+        }
+        // A mount refused inside a private namespace is worth a line: it is a locked namespace (after `pivot_root`)
+        // and the caller is a program that expected to be able to mount.
+        #[cfg(feature = "sc-private-ns")]
+        if akuma_exec::box_registry::is_private_ns(caller_box_and_pid().0) {
+            let target = copy_from_user_str(target_ptr, 256).unwrap_or_default();
+            let fstype = if fstype_ptr != 0 { copy_from_user_str(fstype_ptr, 64).unwrap_or_default() } else { String::new() };
+            let source = if source_ptr != 0 { copy_from_user_str(source_ptr, 256).unwrap_or_default() } else { String::new() };
+            akuma_primitives::safe_print!(320, "[mount] denied in locked namespace: source={} target={} fstype={} flags=0x{:x}\n", source, target, fstype, flags);
+        }
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[mount] denied: boxed processes may not mount\n");
         }
@@ -296,6 +310,13 @@ pub(super) fn sys_mount(
 pub(super) fn sys_umount2(target_ptr: UserAddr, _flags: i32) -> SysResult {
     let target_ptr = target_ptr.get();
     let Some(root) = mount_permit() else {
+        #[cfg(feature = "sc-private-ns")]
+        {
+            let target = copy_from_user_str(target_ptr, 4096)?;
+            if let Some(result) = super::private_ns::umount(&target) {
+                return result;
+            }
+        }
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
             akuma_primitives::safe_print!(128, "[umount2] denied: boxed processes may not unmount\n");
         }
@@ -385,6 +406,12 @@ fn build_bind(data_ptr: UserAddr, read_only: bool) -> Result<alloc::sync::Arc<dy
     } else {
         akuma_isolation::subdir_fs::SubdirFs::new(root_fs, &source)
     }))
+}
+
+/// `pivot_root(new_root, put_old)` — see `private_ns`. Refused for everyone but the builder of a private namespace.
+#[cfg(feature = "sc-private-ns")]
+pub(super) fn sys_pivot_root(new_ptr: UserAddr, old_ptr: UserAddr) -> SysResult {
+    super::private_ns::pivot_root(new_ptr.get(), old_ptr.get())
 }
 
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: UserAddr, target_len: usize, fstype_ptr: UserAddr, fstype_len: usize, data_ptr: UserAddr) -> SysResult {

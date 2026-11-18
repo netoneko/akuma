@@ -953,6 +953,17 @@ pub fn host_root() -> Option<akuma_primitives::HostRoot> {
         .then(akuma_primitives::HostRoot::vouch_checked)
 }
 
+/// The caller as the **builder of its own private mount namespace**: it is in a box a `clone(CLONE_NEWNS)` made and
+/// that box has not been locked by its final `pivot_root`. The token lets the mount effects act on that box's namespace only
+/// (`akuma_primitives::NsCreator`); a process anywhere else gets `None`, so box 0's checks are unchanged.
+/// The only place an `NsCreator` is minted.
+#[must_use]
+pub fn ns_creator() -> Option<akuma_primitives::NsCreator> {
+    let p = current_process_shared()?;
+    (p.box_id != 0 && crate::box_registry::private_ns_building(p.box_id))
+        .then(|| akuma_primitives::NsCreator::vouch_checked(p.box_id))
+}
+
 pub fn current_process_shared() -> Option<&'static Process> {
     // Identity cache fast path (own-process half): the map value's `Process`
     // in two validated loads — same resolution, same fallbacks.

@@ -128,3 +128,27 @@ mod tests {
         assert_eq!(access::cascade_kill_order(&registry_snapshot(), 0), [0]);
     }
 }
+
+// Private namespaces need a second box; a host-only kernel has none.
+pub fn register_private_ns(_box_id: u64, _now_us: u64) {}
+#[must_use]
+pub fn private_ns_building(_box_id: u64) -> bool {
+    false
+}
+#[must_use]
+pub fn is_private_ns(_box_id: u64) -> bool {
+    false
+}
+pub fn lock_private_ns(_box_id: u64) -> bool {
+    false
+}
+pub fn set_private_ns_old_root(_box_id: u64, _at: Option<String>) {}
+#[must_use]
+pub fn private_ns_old_root(_box_id: u64) -> Option<String> {
+    None
+}
+pub fn unregister_private_ns(_box_id: u64) {}
+#[must_use]
+pub fn private_ns_born_before(_cutoff_us: u64) -> alloc::vec::Vec<u64> {
+    alloc::vec::Vec::new()
+}

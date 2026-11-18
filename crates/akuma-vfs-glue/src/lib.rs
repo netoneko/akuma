@@ -115,6 +115,277 @@ pub fn mount_in_namespace(_root: akuma_primitives::HostRoot, box_id: u64, path: 
     ns.mount.lock().mount(path, fs)
 }
 
+/// The caller's namespace (its box's) for a private-namespace operation.
+#[cfg(feature = "sc-private-ns")]
+fn private_ns_of(tok: akuma_primitives::NsCreator) -> Result<Arc<Namespace>, FsError> {
+    BOX_NAMESPACES.lock().get(&tok.box_id()).cloned().ok_or(FsError::NotFound)
+}
+
+/// Mount `fs` at `path` in the caller's own private namespace (never the global table): the `mount(2)` of a
+/// process that is building the namespace a `clone(CLONE_NEWNS)` gave it. `path` is absolute.
+///
+/// # Errors
+/// `NoSpace` past the mount limit; `NotFound` if the namespace is gone.
+#[cfg(feature = "sc-private-ns")]
+pub fn private_ns_mount(
+    tok: akuma_primitives::NsCreator,
+    path: &str,
+    source: Option<&str>,
+    flags: u64,
+    fs: Arc<dyn Filesystem>,
+) -> Result<(), FsError> {
+    let ns = private_ns_of(tok)?;
+    let mut set = ns.mount.lock();
+    // Mounts stack on Linux (bubblewrap binds a directory onto itself to make it a mount point, then binds the real
+    // thing over that). A mount set holds one filesystem per path, so mounting over a mount point replaces it: the
+    // top of the stack is all anything can reach either way.
+    let _ = set.unmount(path);
+    set.mount_with(path, source, flags, fs)
+}
+
+/// `umount2` in a private namespace. `NotFound` when `path` is not a mount point there.
+#[cfg(feature = "sc-private-ns")]
+pub fn private_ns_unmount(tok: akuma_primitives::NsCreator, path: &str) -> Result<(), FsError> {
+    private_ns_of(tok)?.mount.lock().unmount(path)
+}
+
+/// `mount(MS_REMOUNT)` in a private namespace: store `flags` (only `MS_RDONLY` is kept) on the mount at `path`.
+#[cfg(feature = "sc-private-ns")]
+pub fn private_ns_remount(tok: akuma_primitives::NsCreator, path: &str, flags: u64) -> Result<(), FsError> {
+    private_ns_of(tok)?.mount.lock().remount(path, flags)
+}
+
+/// What a bind mount's source is.
+#[cfg(feature = "sc-private-ns")]
+pub enum BindSource {
+    /// A directory: `(filesystem, path inside it)`.
+    Dir(Arc<dyn Filesystem>, String),
+    /// One of the host's device nodes, seen through the old-root stand-in's `/dev`, as the one-node filesystem to
+    /// mount at the bind's target. Devices are served by path (`/dev/null` opens as the null device wherever it is
+    /// named), so the mount only has to exist: bubblewrap looks it up in `mountinfo` afterwards.
+    DeviceNode(Arc<dyn Filesystem>),
+}
+
+/// The caller's view of `path` as something a bind mount can serve, resolved through the caller's namespace and
+/// then the global table, as any open would be.
+///
+/// # Errors
+/// `NotFound` when nothing resolves; `NotADirectory` for any other file (a file bind is not supported).
+#[cfg(feature = "sc-private-ns")]
+pub fn resolve_for_bind(path: &str) -> Result<BindSource, FsError> {
+    let r = resolve_mount(path).ok_or(FsError::NotFound)?;
+    // A path that is exactly a mount point comes back relative as "".
+    let rel = if r.rel.is_empty() { String::from("/") } else { r.rel };
+    if r.fs.name() == StandInDev::NAME && rel != "/" {
+        let node = StandInDev::node(&rel).ok_or(FsError::NotFound)?;
+        return Ok(BindSource::DeviceNode(Arc::new(DevNodeFile(node))));
+    }
+    if !r.fs.metadata(&rel)?.is_dir {
+        return Err(FsError::NotADirectory);
+    }
+    Ok(BindSource::Dir(r.fs, rel))
+}
+
+/// One device node as a filesystem whose root *is* the node (a file bind's mount).
+#[cfg(feature = "sc-private-ns")]
+struct DevNodeFile((&'static str, u32, u32));
+
+#[cfg(feature = "sc-private-ns")]
+impl Filesystem for DevNodeFile {
+    fn name(&self) -> &str {
+        "devnode"
+    }
+    fn read_dir(&self, _path: &str) -> Result<Vec<DirEntry>, FsError> {
+        Err(FsError::NotADirectory)
+    }
+    fn read_file(&self, _path: &str) -> Result<Vec<u8>, FsError> {
+        Ok(Vec::new())
+    }
+    fn write_file(&self, _path: &str, _data: &[u8]) -> Result<(), FsError> {
+        Ok(())
+    }
+    fn create_dir(&self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::NotADirectory)
+    }
+    fn remove_file(&self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+    fn remove_dir(&self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::NotADirectory)
+    }
+    fn exists(&self, _path: &str) -> bool {
+        true
+    }
+    fn metadata(&self, _path: &str) -> Result<Metadata, FsError> {
+        Ok(StandInDev::meta(false, 2 + u64::from(self.0.1 * 16 + self.0.2)))
+    }
+    fn stats(&self) -> Result<akuma_vfs::FsStats, FsError> {
+        Ok(akuma_vfs::FsStats { block_size: 4096, total_blocks: 0, free_blocks: 0 })
+    }
+}
+
+/// The host's device nodes a sandbox's `--dev` binds (`null zero full random urandom tty`), as a read-only
+/// filesystem mounted at `put_old/dev` while the pre-pivot view is attached. Without it `oldroot/dev/null` does not
+/// exist (Akuma serves `/dev` by absolute path, not from the root filesystem) and `--dev` cannot find its sources.
+#[cfg(feature = "sc-private-ns")]
+struct StandInDev;
+
+#[cfg(feature = "sc-private-ns")]
+impl StandInDev {
+    const NAME: &'static str = "devfs-standin";
+    /// `(name, major, minor)`.
+    const NODES: [(&'static str, u32, u32); 6] =
+        [("null", 1, 3), ("zero", 1, 5), ("full", 1, 7), ("random", 1, 8), ("urandom", 1, 9), ("tty", 5, 0)];
+
+    fn node(path: &str) -> Option<(&'static str, u32, u32)> {
+        let name = path.trim_matches('/');
+        Self::NODES.iter().copied().find(|n| n.0 == name)
+    }
+
+    fn meta(is_dir: bool, ino: u64) -> Metadata {
+        Metadata {
+            is_dir,
+            size: 0,
+            inode: ino,
+            mode: if is_dir { 0o40755 } else { 0o20666 },
+            created: None,
+            modified: None,
+            accessed: None,
+            links: None,
+            uid: 0,
+            gid: 0,
+        }
+    }
+}
+
+#[cfg(feature = "sc-private-ns")]
+impl Filesystem for StandInDev {
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+    fn is_read_only(&self) -> bool {
+        true
+    }
+    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
+        if !path.trim_matches('/').is_empty() {
+            return Err(FsError::NotADirectory);
+        }
+        Ok(Self::NODES
+            .iter()
+            .map(|n| DirEntry { name: String::from(n.0), is_dir: false, is_symlink: false, size: 0 })
+            .collect())
+    }
+    fn read_file(&self, path: &str) -> Result<Vec<u8>, FsError> {
+        Self::node(path).map(|_| Vec::new()).ok_or(FsError::NotFound)
+    }
+    fn write_file(&self, _path: &str, _data: &[u8]) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+    fn create_dir(&self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+    fn remove_file(&self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+    fn remove_dir(&self, _path: &str) -> Result<(), FsError> {
+        Err(FsError::ReadOnly)
+    }
+    fn exists(&self, path: &str) -> bool {
+        path.trim_matches('/').is_empty() || Self::node(path).is_some()
+    }
+    fn metadata(&self, path: &str) -> Result<Metadata, FsError> {
+        if path.trim_matches('/').is_empty() {
+            return Ok(Self::meta(true, 1));
+        }
+        Self::node(path).map(|n| Self::meta(false, 2 + u64::from(n.1 * 16 + n.2))).ok_or(FsError::NotFound)
+    }
+    fn stats(&self) -> Result<akuma_vfs::FsStats, FsError> {
+        Ok(akuma_vfs::FsStats { block_size: 4096, total_blocks: 0, free_blocks: 0 })
+    }
+}
+
+/// `pivot_root(new_root, put_old)` for a private namespace: the namespace becomes `new_root` as `/`, keeping only the
+/// mounts that were under it.
+///
+/// * `put_old` **under** `new_root`: the pre-pivot view of the world (the caller's namespace and the global table) is
+///   attached at `put_old`, as Linux leaves the old root mounted there. bubblewrap needs it: it pivots into a
+///   scratch tmpfs first and then binds every source from `oldroot/…`. The namespace stays buildable and
+///   [`private_ns_detach`] (`umount2(put_old)`) removes the view.
+/// * `put_old == new_root` (`pivot_root(".", ".")`, bubblewrap's second, "Russian doll" pivot): there is no old root
+///   to keep. It is dropped, mounted nowhere, and the namespace is **locked**: nothing can be mounted, pivoted or
+///   unshared again.
+///
+/// Both paths are absolute and already resolved against the caller's cwd, and `put_old` is at or under `new_root`.
+///
+/// # Errors
+/// `NotFound`/`NotADirectory` for a `new_root` that is not a directory in the caller's view;
+/// `PermissionDenied` if the namespace is already locked.
+#[cfg(feature = "sc-private-ns")]
+pub fn private_ns_pivot(tok: akuma_primitives::NsCreator, new_root: &str, put_old: &str) -> Result<(), FsError> {
+    let ns = private_ns_of(tok)?;
+    if !akuma_exec::box_registry::private_ns_building(tok.box_id()) {
+        return Err(FsError::PermissionDenied);
+    }
+    let r = resolve_mount(new_root).ok_or(FsError::NotFound)?;
+    let rel = if r.rel.is_empty() { String::from("/") } else { r.rel };
+    if !r.fs.metadata(&rel)?.is_dir {
+        return Err(FsError::NotADirectory);
+    }
+    let root_fs: Arc<dyn Filesystem> = if rel == "/" {
+        r.fs
+    } else {
+        Arc::new(akuma_isolation::subdir_fs::SubdirFs::new(r.fs, &rel))
+    };
+    let new_trim = new_root.trim_end_matches('/');
+    // `put_old` as the new root will name it: `/tmp/newroot/oldroot` under `/tmp/newroot` is `/oldroot`.
+    let attach = put_old.strip_prefix(new_trim).filter(|rel| rel.len() > 1).map(String::from);
+
+    // The pre-pivot view, taken before the namespace is replaced: its own mounts first (they win), then the global
+    // table's for every path the namespace did not cover.
+    let old_view = attach.as_ref().map(|_| {
+        let mut v = ns.mount.lock().entries();
+        if let Some(t) = MOUNT_TABLE.lock().as_ref() {
+            for e in t.entries() {
+                if !v.iter().any(|(p, ..)| *p == e.0) {
+                    v.push(e);
+                }
+            }
+        }
+        v
+    });
+
+    let mut set = ns.mount.lock();
+    let mut after = set.rebased(new_root, root_fs, r.flags);
+    if let (Some(rel), Some(view)) = (&attach, old_view) {
+        for (path, source, flags, fs) in view {
+            let at = if path == "/" { rel.clone() } else { alloc::format!("{rel}{path}") };
+            let _ = after.mount_with(&at, source.as_deref(), flags, fs);
+        }
+        let _ = after.mount_with(&alloc::format!("{rel}/dev"), Some("dev"), MS_RDONLY, Arc::new(StandInDev));
+    }
+    *set = after;
+    drop(set);
+    match attach {
+        Some(rel) => akuma_exec::box_registry::set_private_ns_old_root(tok.box_id(), Some(rel)),
+        None => {
+            let _ = akuma_exec::box_registry::lock_private_ns(tok.box_id());
+        }
+    }
+    Ok(())
+}
+
+/// `umount2(put_old, MNT_DETACH)` after the first pivot: the attached pre-pivot view and everything under it go.
+/// `Ok` when there is nothing attached (a lazy unmount is idempotent).
+#[cfg(feature = "sc-private-ns")]
+pub fn private_ns_detach(tok: akuma_primitives::NsCreator) -> Result<(), FsError> {
+    let ns = private_ns_of(tok)?;
+    if let Some(rel) = akuma_exec::box_registry::private_ns_old_root(tok.box_id()) {
+        ns.mount.lock().unmount_tree(&rel);
+        akuma_exec::box_registry::set_private_ns_old_root(tok.box_id(), None);
+    }
+    Ok(())
+}
+
 /// Turn a box's pristine `SubdirFs` root into `fs` (an overlay of image layers).
 ///
 /// Only `MOUNT_IN_NS` with fstype `overlay` reaches this. A box is born with a
@@ -835,6 +1106,12 @@ pub fn append(path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
 
 /// Create a directory
 pub fn create_dir(path: &str) -> Result<(), FsError> {
+    // Linux looks the name up before it asks whether the mount is writable, so `mkdir` of a directory that is
+    // already there is `EEXIST` even on a read-only mount (a sandbox's `--dev /dev` over a `--ro-bind / /` relies on
+    // it) and `EROFS` only for one that is not.
+    if exists(path) {
+        return Err(FsError::AlreadyExists);
+    }
     with_fs_write(path, |fs, rel| fs.create_dir(rel))
 }
 
@@ -1596,6 +1873,61 @@ pub fn stats_for_path(path: &str) -> Result<FsView, FsError> {
 /// Allocation-free end to end: rows render into `buf` via [`FmtBuf`] while the
 /// mount lock is held, and the caller copies the bytes out afterwards.
 pub fn render_mounts(viewer_box_id: u64, target_pid: Option<u32>, buf: &mut [u8]) -> usize {
+    render_mounts_inner(viewer_box_id, target_pid, buf)
+}
+
+/// `/proc/<pid>/mountinfo` for `target_pid`.
+///
+/// One line per mount in the process's view — its own namespace, plus
+/// the global table **unless the namespace has a `/` of its own** (then nothing falls through to the host, as
+/// resolution does not). `id parent 0:id / <mount point> <opts> - <fstype> <source> <opts>`; the parent is the
+/// deepest other mount that contains it.
+///
+/// Allocates (a `Vec` of rows, bounded by the mounts there are): this is a procfs read, whose `Vec<u8>` result is
+/// an allocation anyway.
+#[must_use]
+pub fn render_mountinfo(viewer_box_id: u64, target_pid: Option<u32>) -> Vec<u8> {
+    use core::fmt::Write as _;
+    let mut rows: Vec<(String, Option<String>, u64, Arc<dyn Filesystem>)> = Vec::new();
+    let mut ns_has_root = false;
+    if let Some(pid) = target_pid
+        && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
+        && proc.box_id != 0
+    {
+        rows = proc.namespace.mount.lock().entries();
+        ns_has_root = rows.iter().any(|(p, ..)| p == "/");
+    }
+    if !ns_has_root
+        && let Some(t) = MOUNT_TABLE.lock().as_ref()
+    {
+        for e in t.entries() {
+            if !rows.iter().any(|(p, ..)| *p == e.0) {
+                rows.push(e);
+            }
+        }
+    }
+    // Shallow first, so a parent's id exists before its children name it.
+    rows.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
+    let mut out = String::new();
+    for (i, (path, source, flags, fs)) in rows.iter().enumerate() {
+        let id = 100 + i;
+        let parent = rows[..i]
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, (p, ..))| {
+                path.strip_prefix(p.trim_end_matches('/')).is_some_and(|r| r.starts_with('/'))
+            })
+            .map_or(id, |(j, _)| 100 + j);
+        let opts = if flags & MS_RDONLY != 0 { "ro" } else { "rw" };
+        // A box never sees where a mount came from (as in `render_mounts`).
+        let src = if viewer_box_id == 0 { source.as_deref().unwrap_or("none") } else { "none" };
+        let _ = writeln!(out, "{id} {parent} 0:{id} / {path} {opts},relatime - {} {src} {opts}", fs.name());
+    }
+    out.into_bytes()
+}
+
+fn render_mounts_inner(viewer_box_id: u64, target_pid: Option<u32>, buf: &mut [u8]) -> usize {
     use akuma_primitives::console::FmtBuf;
     use core::fmt::Write as _;
 

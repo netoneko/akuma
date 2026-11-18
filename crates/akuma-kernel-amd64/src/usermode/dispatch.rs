@@ -642,6 +642,9 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
             ours.unwrap_or_else(|| to_glue(call, [a1, a2, a3, a4, a5, 0]))
         }
         Syscall::Umount2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // `pivot_root(new_root, put_old)` — glue's arm (`sc-private-ns`); `EPERM` for everyone but the builder of a
+        // private mount namespace.
+        Syscall::PivotRoot => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `readlinkat` / `symlinkat` — **served by glue** (4b step 2, batch 1).
         // Glue's readlinkat is strictly more than the arm it replaces: it
         // distinguishes `EINVAL` (path exists, not a symlink) from `ENOENT`
@@ -992,6 +995,14 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
                 // and a tick-time signal used to return through `sysretq`
                 // with `RCX = RIP` (`docs/archive/AMD64_FORK_VS_THREADS_SEGV.md`).
                 return Some(sys_spawn_clone(child_stack));
+            }
+            // `CLONE_NEWNS`: the child is born into a private mount namespace (glue's `private_ns`, shared with the
+            // AArch64 kernel). The other `CLONE_NEW*` bits are accepted and change nothing.
+            #[cfg(feature = "sc-private-ns")]
+            match akuma_syscalls_glue::private_ns::clone_namespace(a1) {
+                Ok(Some(into)) => return Some(sys_fork_into(Some(into))),
+                Ok(None) => {}
+                Err(errno) => return Some(errno),
             }
             sys_fork()
         }

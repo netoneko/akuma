@@ -886,6 +886,9 @@ impl ProcFilesystem {
                     let size = crate::render_mounts(caller_box_id(), Some(v.pid), &mut probe);
                     meta(RO, size as u64, None)
                 }
+                PidFile::Mountinfo => {
+                    meta(RO, crate::render_mountinfo(caller_box_id(), Some(v.pid)).len() as u64, None)
+                }
                 PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::OomScore => meta(RW, 2, None),
                 PidFile::Maps | PidFile::Statm | PidFile::Auxv => {
                     let data = pid_address_space_file(v.pid, f.name()).ok_or(FsError::NotFound)?;
@@ -1213,6 +1216,25 @@ impl Filesystem for ProcFilesystem {
             let n = buf.len().min(len - offset);
             buf[..n].copy_from_slice(&scratch[offset..offset + n]);
             return Ok(n);
+        }
+
+        // <pid>/mountinfo — the same view with ids and options.
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && parts[1] == "mountinfo"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    let target = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
+                    if caller_box_id() != 0 && target.box_id != caller_box_id() {
+                        return Err(FsError::NotFound);
+                    }
+                    let data = crate::render_mountinfo(caller_box_id(), Some(pid));
+                    if offset >= data.len() {
+                        return Ok(0);
+                    }
+                    let n = buf.len().min(data.len() - offset);
+                    buf[..n].copy_from_slice(&data[offset..offset + n]);
+                    return Ok(n);
+                }
         }
 
         // Handle <pid>/mounts — the target's namespace mounts, box-filtered.
@@ -1573,6 +1595,19 @@ impl Filesystem for ProcFilesystem {
                 && let Ok(pid) = parts[0].parse::<Pid>() {
                     return akuma_syscalls_log::get_formatted(pid, current_box_id)
                         .ok_or(FsError::NotFound);
+                }
+        }
+
+        // <pid>/mountinfo (see `read_at`).
+        {
+            let parts: Vec<&str> = path.splitn(2, '/').collect();
+            if parts.len() == 2 && parts[1] == "mountinfo"
+                && let Ok(pid) = parts[0].parse::<Pid>() {
+                    let target = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
+                    if current_box_id != 0 && target.box_id != current_box_id {
+                        return Err(FsError::NotFound);
+                    }
+                    return Ok(crate::render_mountinfo(current_box_id, Some(pid)));
                 }
         }
 

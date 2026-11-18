@@ -52,7 +52,7 @@ pub mod file_key;
 pub mod pages;
 pub use pages::{PageRange, Pages, page_ceil};
 pub mod privilege;
-pub use privilege::HostRoot;
+pub use privilege::{HostRoot, NsCreator};
 pub use file_key::{FileKey, Ino, MountId};
 pub mod inode_pin;
 pub mod text_busy;

@@ -118,6 +118,8 @@ pub mod pidfd;
 pub mod eventfd;
 #[cfg(feature = "sc-eventfd")]
 pub mod signalfd;
+#[cfg(feature = "sc-private-ns")]
+pub mod private_ns;
 pub mod log;
 #[cfg(feature = "sc-sysv-ipc")]
 pub mod msgqueue;
@@ -1143,6 +1145,8 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         }
         #[cfg(feature = "sc-containers")]
         nr::MOUNT => flat(container::sys_mount(UserAddr::new(args[0]), UserAddr::new(args[1]), UserAddr::new(args[2]), args[3], UserAddr::new(args[4]))),
+        #[cfg(feature = "sc-private-ns")]
+        nr::PIVOT_ROOT => flat(container::sys_pivot_root(UserAddr::new(args[0]), UserAddr::new(args[1]))),
         #[cfg(feature = "sc-containers")]
         nr::UMOUNT2 => flat(container::sys_umount2(UserAddr::new(args[0]), args[1] as i32)),
         #[cfg(feature = "sc-containers")]

@@ -2622,6 +2622,11 @@ impl akuma_syscalls_glue::execve::ExecArch for Amd64Exec {
 ///
 /// Returns the child pid in the parent; the child never returns from here.
 fn sys_fork() -> u64 {
+    sys_fork_into(None)
+}
+
+/// [`sys_fork`], with the child born into `into` (`clone(CLONE_NEWNS)`'s private namespace) when given.
+fn sys_fork_into(into: Option<(u64, alloc::sync::Arc<akuma_isolation::Namespace>)>) -> u64 {
     use crate::fd::errno;
 
     // **The fold.** Everything this function used to do by hand —
@@ -2664,7 +2669,7 @@ fn sys_fork() -> u64 {
     // the same question asked of the authoritative table.
     crate::drivers::hypervisor_note_fork();
     let child_pid = alloc_pid();
-    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, UserAddr::new(0))) {
+    match akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process_into(child_pid, UserAddr::new(0), into.clone())) {
         Ok(pid) => u64::from(pid),
         Err(e) => {
             // Named, not swallowed. Every failure inside `fork_process` is a

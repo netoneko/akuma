@@ -720,6 +720,20 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             None => return ESRCH,
         };
 
+        // `CLONE_NEWNS`: the child is born into a private mount namespace (`private_ns`). A vfork child shares its
+        // parent's address space and view until it execs, so the two cannot be combined.
+        #[cfg(feature = "sc-private-ns")]
+        let into = match super::private_ns::clone_namespace(flags) {
+            Ok(into) => into,
+            Err(errno) => return errno,
+        };
+        #[cfg(feature = "sc-private-ns")]
+        if into.is_some() && flags & CLONE_VFORK != 0 {
+            return EINVAL;
+        }
+        #[cfg(not(feature = "sc-private-ns"))]
+        let into: Option<(u64, alloc::sync::Arc<akuma_isolation::Namespace>)> = None;
+
         let child_pid = akuma_exec::process::allocate_pid();
 
         if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
@@ -747,7 +761,7 @@ pub(super) fn sys_clone_pidfd(flags: u64, stack: u64, parent_tid: u64, tls: u64,
             if use_vfork_fastpath {
                 akuma_exec::process::vfork_process(child_pid, UserAddr::new(stack))
             } else {
-                akuma_exec::process::fork_process(child_pid, UserAddr::new(stack))
+                akuma_exec::process::fork_process_into(child_pid, UserAddr::new(stack), into.clone())
             }
         });
         match fork_result {

@@ -71,6 +71,9 @@ no-tests = []
 smoltcp = ["dep:smoltcp", "akuma-net/smoltcp"]
 sc-aio = []
 sc-containers = ["akuma-isolation/containers"]
+# `clone(CLONE_NEWNS)` makes a private mount namespace its creator can mount into until `pivot_root` locks it;
+# `mount`, `umount2` and `pivot_root` act on it. `docs/archive/BWRAP_ON_BOXES.md`.
+sc-private-ns = ["sc-containers", "akuma-vfs-glue/sc-private-ns"]
 sc-epoll = []
 sc-pidfd = []
 sc-timerfd = []

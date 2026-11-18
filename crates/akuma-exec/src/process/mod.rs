@@ -3255,6 +3255,17 @@ pub fn fork_share_parent_memory(
 /// region list. A pathological
 /// huge `brk` can still monopolize CPU for a long time (see `MAX_FORK_BRK_COPY_PAGES`).
 pub fn fork_process(child_pid: u32, stack_ptr: UserAddr) -> Result<u32, &'static str> {
+    fork_process_into(child_pid, stack_ptr, None)
+}
+
+/// [`fork_process`], with the child placed in `into` — `(box id, namespace)` — instead of inheriting the parent's.
+/// The one caller is `clone(CLONE_NEWNS)`: the child starts life in the private namespace the clone made
+/// (`docs/archive/BWRAP_ON_BOXES.md`).
+pub fn fork_process_into(
+    child_pid: u32,
+    stack_ptr: UserAddr,
+    into: Option<(u64, Arc<akuma_isolation::Namespace>)>,
+) -> Result<u32, &'static str> {
     let stack_ptr = stack_ptr.get();
     // Serialize lifecycle against preemption under shared-kernel SMP. See
     // `process/lifecycle.rs`. The guard drops on every return path (including `?`
@@ -3303,6 +3314,10 @@ pub fn fork_process(child_pid: u32, stack_ptr: UserAddr) -> Result<u32, &'static
         creds: Arc::new(SharedCreds::new(parent.creds.get())),
         clear_child_tid: 0,
     })?;
+    if let Some((box_id, namespace)) = into {
+        new_proc.box_id = box_id;
+        new_proc.namespace = namespace;
+    }
 
     // 4. Build the child's address space from the parent's — through the
     // registered hook, because this step and only this step is architecture

@@ -39,3 +39,31 @@ impl HostRoot {
         Self { _private: () }
     }
 }
+
+/// The caller is inside a **private mount namespace it can still build**.
+///
+/// That is the box a `clone(CLONE_NEWNS)` made, before its final `pivot_root` locked it
+/// (`docs/archive/BWRAP_ON_BOXES.md`). It lets the mount effects act on *that
+/// box's* namespace and nothing else; it is not [`HostRoot`], and no effect that takes a `HostRoot` accepts it.
+///
+/// Mint site, by name: `akuma_exec::process::ns_creator()`, after it has tested that the caller's box is a private
+/// namespace that has not been pivoted. That is the only `NsCreator::vouch_checked` in the tree.
+#[derive(Clone, Copy, Debug)]
+pub struct NsCreator {
+    box_id: u64,
+}
+
+impl NsCreator {
+    /// Mint after testing that `box_id` is a buildable private namespace the caller belongs to. **Only**
+    /// `akuma_exec::process::ns_creator()` may call this.
+    #[must_use]
+    pub const fn vouch_checked(box_id: u64) -> Self {
+        Self { box_id }
+    }
+
+    /// The only namespace this token may act on.
+    #[must_use]
+    pub const fn box_id(self) -> u64 {
+        self.box_id
+    }
+}

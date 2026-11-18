@@ -306,6 +306,9 @@ pub enum PidFile {
     Status,
     Stat,
     Mounts,
+    /// `mountinfo`: the same mounts with ids, parents and options (`proc(5)`). bubblewrap parses it after a bind
+    /// mount to learn the flags it must carry over.
+    Mountinfo,
     /// A symlink to the running image.
     Exe,
     OomScoreAdj,
@@ -322,11 +325,12 @@ pub enum PidFile {
 
 impl PidFile {
     /// Listing order inside a pid directory (after `fd` and `task`).
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::Cmdline,
         Self::Status,
         Self::Stat,
         Self::Mounts,
+        Self::Mountinfo,
         Self::Exe,
         Self::OomScoreAdj,
         Self::OomAdj,
@@ -344,6 +348,7 @@ impl PidFile {
             Self::Status => "status",
             Self::Stat => "stat",
             Self::Mounts => "mounts",
+            Self::Mountinfo => "mountinfo",
             Self::Exe => "exe",
             Self::OomScoreAdj => "oom_score_adj",
             Self::OomAdj => "oom_adj",

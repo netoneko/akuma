@@ -19,8 +19,9 @@
 //! The tests below stay here: they cover box-root semantics, which is this
 //! crate's concern rather than the mount set's.
 
-/// A container's mount namespace: up to 16 mounts, independent of the global table.
-pub type MountNamespace = akuma_vfs::MountSet<16>;
+/// A container's mount namespace: up to 48 mounts, independent of the global table. (16 until a sandbox's old-root view
+/// and its new mounts had to coexist; `docs/archive/BWRAP_ON_BOXES.md`.)
+pub type MountNamespace = akuma_vfs::MountSet<48>;
 
 #[cfg(test)]
 mod tests {
@@ -113,5 +114,57 @@ mod tests {
 
         assert_eq!(tag_at(&ns, "/proc/tag"), "proc");
         assert_eq!(tag_at(&ns, "/etc/tag"), "overlay");
+    }
+
+    /// `pivot_root`'s result: the new root at `/`, the mounts under it re-based, and **nothing** of the old
+    /// namespace left to resolve.
+    #[test]
+    fn rebased_keeps_mounts_under_the_prefix_and_drops_the_rest() {
+        let mut ns = MountNamespace::new();
+        ns.mount("/tmp", tagged("tmpfs")).unwrap();
+        ns.mount("/tmp/newroot/usr", tagged("usr")).unwrap();
+        ns.mount("/tmp/newroot/proc", tagged("proc")).unwrap();
+        ns.mount("/srv", tagged("old-srv")).unwrap();
+
+        let after = ns.rebased("/tmp/newroot", tagged("newroot"), 0);
+
+        assert_eq!(tag_at(&after, "/tag"), "newroot");
+        assert_eq!(tag_at(&after, "/usr/tag"), "usr");
+        assert_eq!(tag_at(&after, "/proc/tag"), "proc");
+        // /srv and /tmp were the old root's: they resolve to the new root's own paths, not to the old mounts.
+        assert_eq!(tag_at(&after, "/srv/tag"), "newroot");
+        assert_eq!(tag_at(&after, "/tmp/tag"), "newroot");
+        assert_eq!(after.list_mounts().len(), 3);
+        // The source set is untouched.
+        assert_eq!(tag_at(&ns, "/srv/tag"), "old-srv");
+    }
+
+    #[test]
+    fn rebased_at_the_root_is_the_same_set_with_a_new_root() {
+        let mut ns = MountNamespace::new();
+        ns.mount("/proc", tagged("proc")).unwrap();
+        let after = ns.rebased("/", tagged("root"), 0);
+        assert_eq!(tag_at(&after, "/proc/tag"), "proc");
+        assert_eq!(tag_at(&after, "/etc/tag"), "root");
+    }
+
+    /// A mount that merely starts with the prefix's text (`/tmp/newroot2`) is not under it.
+    #[test]
+    fn rebased_matches_whole_path_components() {
+        let mut ns = MountNamespace::new();
+        ns.mount("/tmp/newroot2", tagged("sibling")).unwrap();
+        let after = ns.rebased("/tmp/newroot", tagged("newroot"), 0);
+        assert_eq!(after.list_mounts().len(), 1);
+    }
+
+    #[test]
+    fn unmount_tree_takes_the_subtree_and_nothing_beside_it() {
+        let mut ns = MountNamespace::new();
+        ns.mount("/oldroot", tagged("a")).unwrap();
+        ns.mount("/oldroot/proc", tagged("b")).unwrap();
+        ns.mount("/oldroot2", tagged("c")).unwrap();
+        ns.mount("/usr", tagged("d")).unwrap();
+        assert_eq!(ns.unmount_tree("/oldroot"), 2);
+        assert_eq!(ns.list_mounts().len(), 2);
     }
 }

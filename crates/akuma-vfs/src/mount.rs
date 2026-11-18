@@ -176,6 +176,23 @@ impl<const MAX: usize> MountSet<MAX> {
         Ok(())
     }
 
+    /// Every mount as `(path, source, flags, filesystem)`, for copying one view into another namespace. Allocates.
+    #[must_use]
+    pub fn entries(&self) -> Vec<(String, Option<String>, u64, Arc<dyn Filesystem>)> {
+        self.mounts.iter().map(|m| (m.path.clone(), m.source.clone(), m.flags, m.fs.clone())).collect()
+    }
+
+    /// Remove the mount at `prefix` and every mount beneath it (`umount2(MNT_DETACH)` of a subtree). Returns how many
+    /// went.
+    pub fn unmount_tree(&mut self, prefix: &str) -> usize {
+        let prefix = prefix.trim_end_matches('/');
+        let before = self.mounts.len();
+        self.mounts.retain(|m| {
+            !(m.path == prefix || m.path.strip_prefix(prefix).is_some_and(|r| r.starts_with('/')))
+        });
+        before - self.mounts.len()
+    }
+
     /// Replace the root mount, but **only** while it is still the pristine one
     /// this set was born with.
     ///
@@ -226,6 +243,26 @@ impl<const MAX: usize> MountSet<MAX> {
         // replaced, and must not be served for the overlay replacing it.
         current.id = NEXT_MOUNT_ID.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The set a `pivot_root(prefix, ..)` leaves: `root_fs` (with `root_flags`) at `/`, plus every mount of this
+    /// set that lies strictly **under** `prefix`, with the prefix stripped from its path. Mounts elsewhere,
+    /// and a mount at `prefix` itself (its filesystem is `root_fs`, the caller resolved it), are dropped, so
+    /// nothing of the old root survives in the result. This set is not modified.
+    ///
+    /// Capacity cannot be exceeded: the result holds at most the entries this set held.
+    #[must_use]
+    pub fn rebased(&self, prefix: &str, root_fs: Arc<dyn Filesystem>, root_flags: u64) -> Self {
+        let prefix = prefix.trim_end_matches('/');
+        let mut out = Self::new();
+        let _ = out.mount_with("/", None, root_flags, root_fs);
+        for m in &self.mounts {
+            let Some(rest) = m.path.strip_prefix(prefix) else { continue };
+            if rest.len() > 1 && rest.starts_with('/') {
+                let _ = out.mount_with(rest, m.source.as_deref(), m.flags, m.fs.clone());
+            }
+        }
+        out
     }
 
     /// Resolve an **absolute** path to `(filesystem, relative_path)`.

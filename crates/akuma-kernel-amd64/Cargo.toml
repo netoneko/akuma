@@ -31,7 +31,7 @@ default = ["linux-extra-syscalls"]
 # feature that did not forward to `akuma-vfs-glue`, on a stale belief that
 # `/proc` was not mounted here, so amd64 had the queues but no listing.
 linux-extra-syscalls = [
-    "sc-aio", "sc-containers", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
+    "sc-aio", "sc-containers", "sc-private-ns", "sc-timerfd", "sc-eventfd", "sc-pidfd", "sc-epoll",
     "akuma-syscalls-glue/sc-sysv-ipc", "akuma-vfs-glue/sc-sysv-ipc",
 ]
 # Preempt ring 0. Syscalls run with `IF` set once the BKL is taken, and the timer
@@ -162,6 +162,7 @@ sc-aio = ["akuma-syscalls-glue/sc-aio"]
 # the single-box world this target already is.
 # `docs/archive/AKUMA_AMD64_SC_CONTAINERS_MOUNT.md`.
 sc-containers = ["akuma-syscalls-glue/sc-containers", "akuma-vfs-glue/sc-containers", "akuma-isolation/containers"]
+sc-private-ns = ["sc-containers", "akuma-syscalls-glue/sc-private-ns", "akuma-vfs-glue/sc-private-ns"]
 # Compile the boot self-test suite **out**.
 #
 # The same opt-in the AArch64 kernel has (root `Cargo.toml`), and it means the

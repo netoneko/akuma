@@ -286,6 +286,8 @@ pub const ACCEPT4: u64 = 242;
 pub const TIMES: u64 = 153;
 pub const MOUNT: u64 = 40;
 pub const UMOUNT2: u64 = 39;
+/// `pivot_root(new_root, put_old)`. x86_64 spells it 155.
+pub const PIVOT_ROOT: u64 = 41;
 pub const MOUNT_IN_NS: u64 = 325;
 pub const RENAMEAT2: u64 = 276;
 pub const STATX: u64 = 291;
