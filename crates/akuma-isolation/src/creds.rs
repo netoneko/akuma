@@ -46,8 +46,7 @@ pub struct Creds {
     ngroups: u8,
     umask: u16,
     /// `capset` emptied the effective and permitted sets (`bwrap --cap-drop ALL`). One-way, like an id drop.
-    /// `capget` then reports no capabilities. It does **not** take away uid 0's file permission overrides: there is
-    /// no capability model finer than "uid 0 or not" (`docs/archive/BWRAP_ON_BOXES.md`).
+    /// `capget` then reports no capabilities and DAC no longer grants capability overrides.
     caps_dropped: bool,
 }
 
@@ -316,6 +315,6 @@ mod tests {
         assert!(c.has_capabilities());
         c.drop_capabilities();
         assert!(!c.has_capabilities());
-        assert!(c.is_root(), "uid 0 keeps its file permissions; only the reported capabilities go");
+        assert!(c.is_root(), "the uid remains 0 after capabilities are dropped");
     }
 }

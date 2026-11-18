@@ -6,7 +6,7 @@
 //!
 //! **Every check is a no-op while `dac::enforcing()` is off**, and the first
 //! thing each does is test that flag, so the off state costs one relaxed load and
-//! reads no metadata. With it on, uid 0 still skips the metadata read for
+//! reads no metadata. With it on, a caller with capabilities still skips the metadata read for
 //! everything except exec — root passes every other check — so the only
 //! processes that pay are the ones that dropped.
 //!
@@ -42,7 +42,7 @@ fn subject(want: u32) -> Option<Creds> {
         return None;
     }
     let c = akuma_exec::process::current_creds();
-    (!c.is_root() || want & MAY_EXEC != 0).then_some(c)
+    (!c.has_capabilities() || want & MAY_EXEC != 0).then_some(c)
 }
 
 /// May the caller access `path` for `want` (`MAY_*` bits)? `EACCES` if not.
