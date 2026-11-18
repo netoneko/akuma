@@ -92,6 +92,9 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/SYSCALL_CONSTANT_AUDIT_2026_10_30.md
 - `akuma-ring3-amd64::nr` (Taoxichuan's dispatch table) had `GETPID = 38` and `SENDFILE = 39`, both off by one, so `setitimer` (38) answered the caller's pid while it still had a `GETPID` arm; the third x86_64 table is gone
 
+### docs/archive/TOKIO_KERNEL_GATES_RERUN.md
+- found here, counted in `BUG_FIX_LIST.md`: `read_user_cstr`'s prefault was aarch64-only, so `open` of a `.rodata` path got `EFAULT` and tokioprobe's DNS failed
+
 ### docs/archive/DENVER_BRANCH_FIXES.md
 - the legacy-syscall fold rewrote the caller's six argument registers in its saved frame and the stub popped them back into ring 3, so `stat` (folded to `fstatat`) returned musl's saved `buf` in `r8` zeroed and its copy-out stored to NULL, killing `java -version`; the arguments as they arrived go back after the call (`fold-regpreserve`)
 - `sysinfo(2)` was served nowhere, so musl's `sysconf(_SC_PHYS_PAGES)` failed and HotSpot sized a too-small heap and exited with `Too small maximum heap`; one arm translating glue's answer (`sysinfo`)

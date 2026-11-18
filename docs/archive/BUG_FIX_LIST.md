@@ -13,13 +13,13 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1677
-- **Docs contributing at least one fix:** 491
+- **Total distinct fixes counted:** 1678
+- **Docs contributing at least one fix:** 492
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 259 | 15.4% | 41 |
+| Syscall / ABI Compatibility Audits | 260 | 15.4% | 42 |
 | Memory & Virtual Memory | 205 | 12.2% | 73 |
 | Scheduler & Process Management | 156 | 9.3% | 52 |
 | SMP & Locking | 142 | 8.5% | 61 |
@@ -34,7 +34,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Misc / Cross-cutting | 98 | 5.8% | 28 |
 | Console & Terminal | 63 | 3.8% | 22 |
 | Containers | 71 | 4.2% | 14 |
-| **Total** | **1677** | **100.0%** | **491** |
+| **Total** | **1678** | **100.0%** | **492** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -55,7 +55,10 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (259 fixes, 41 docs)
+## Syscall / ABI Compatibility Audits (260 fixes, 42 docs)
+
+### docs/archive/TOKIO_KERNEL_GATES_RERUN.md
+- `read_user_cstr` prefaulted a page-aligned string start on aarch64 only (`9cc41207`); on the tokio kernels, whose ring-0 fault handler fills only zero pages, `open` of a lazily mapped `.rodata` path returned `EFAULT` and tokioprobe's DNS lookup failed with `Invalid flags`; the prefault runs on every architecture again (found through Taoxichuan)
 
 ### docs/archive/SECCOMP.md
 - Codex could not install its seccomp filter. Native amd64 and AArch64 now install and enforce filters across exec, including on the signal return path.

@@ -920,8 +920,13 @@ pub struct UserCStr {
 /// a path argument name a kernel address (`symlinkat(<kernel va>, ..)` then `readlink` read it back). The same hole
 /// was open in the rump proxy's `copyinstr`, which walked bytes with no per-page check at all.
 ///
-/// amd64 keeps the old shape: its kernel half is above `USER_VA_LIMIT`, SMAP faults a ring-0 read of a supervisor
-/// page into the fixup, and its lazy pages are filled by the fault the byte read takes, which the walk does not model.
+/// The kernel half of amd64 is above `USER_VA_LIMIT` and SMAP faults a ring-0 read of a supervisor page into the fixup,
+/// so the per-page *privilege* walk is aarch64's alone; but the per-page **prefault** is every architecture's. The main
+/// amd64 kernel fills a lazy page from the fault the byte read takes, which is why this was once left to the fault; the
+/// tokio kernels' ring-0 fault handler fills only zero pages (a file fill reads the filesystem, which a ring-0 fault may
+/// already hold), so a path in a lazily mapped `.rodata` was `EFAULT` there (`TAOXICHUAN_SHARED_MAPPINGS_AND_LAZY_IMAGE.md`;
+/// tokioprobe's `open("/etc/resolv.conf")`, so its DNS, failed on Taoxichuan and Denver after 9cc41207 narrowed this to
+/// aarch64: `docs/archive/TOKIO_KERNEL_GATES_RERUN.md`).
 ///
 /// The null page is refused even under `BYPASS_VALIDATION`: the bypass lets the boot self-tests pass *kernel*
 /// buffers, and no kernel buffer lives in page 0. On amd64 page 0 reads as zeros in ring 0, so a waived check turned
@@ -942,7 +947,6 @@ pub fn read_user_cstr(ptr: u64, max_len: usize) -> Result<UserCStr, Errno> {
         }
         // One walk per page the string enters (the first byte, then each page boundary).
         if !bypass
-            && cfg!(target_arch = "aarch64")
             && (len == 0 || addr.trailing_zeros() >= 12)
             && !validate_user_range(addr, 1, Prefault::Yes)
         {
