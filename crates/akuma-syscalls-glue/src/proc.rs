@@ -481,6 +481,33 @@ pub fn sys_exit_group_pub(code: i32) -> ! {
     akuma_exec::process::return_to_kernel(code);
 }
 
+/// Terminate the calling thread for a synchronous seccomp kill.
+pub fn sys_exit_thread_pub(code: i32) -> ! {
+    use akuma_exec::{process, threading};
+
+    if let Some(proc) = process::current_process_shared()
+        && proc.tgid == proc.pid
+    {
+        // The leader owns the address space. Remain in the kernel while
+        // workers use it, then run normal group teardown once they have left.
+        let tid = threading::current_thread_id();
+        const SIGKILL_PENDING: u64 = 1 << 8;
+        let mut survivors = process::live_group_threads(proc.tgid);
+        let code = if survivors == 0 { code } else { 0 };
+        while survivors != 0
+            && threading::pending_signals_raw(tid) & SIGKILL_PENDING == 0
+            && !proc.signal_actions.group_exiting()
+        {
+            threading::sleep_us(10_000);
+            survivors = process::live_group_threads(proc.tgid);
+        }
+        let code = if threading::pending_signals_raw(tid) & SIGKILL_PENDING != 0 { -9 } else { code };
+        sys_exit_group_pub(code)
+    }
+    sys_exit(code);
+    akuma_exec::process::return_to_kernel(code);
+}
+
 pub(super) fn sys_exit_group(code: i32) -> u64 {
     if let Some(proc) = akuma_exec::process::current_process_shared() {
         // One teardown per group. A sibling already claimed it: that sibling's
@@ -1979,10 +2006,6 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
     const PR_GET_PDEATHSIG: i32 = 2;
     const PR_SET_DUMPABLE: i32 = 4;
     const PR_GET_DUMPABLE: i32 = 3;
-    const PR_SET_SECCOMP: i32 = 22;
-    const PR_GET_SECCOMP: i32 = 21;
-    const PR_SET_NO_NEW_PRIVS: i32 = 38;
-    const PR_GET_NO_NEW_PRIVS: i32 = 39;
     const PR_SET_VMA: i32 = 0x53564d41; // "SVMA"
     const PR_CAPBSET_READ: i32 = 23;
     /// The highest capability number this kernel admits to, matching the
@@ -1992,6 +2015,9 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
     const PR_CAP_AMBIENT: i32 = 47;
     const PR_SET_PTRACER: i32 = 42;
 
+    if let Some(result) = crate::seccomp::prctl(option, arg2, arg3, arg4, arg5) {
+        return result;
+    }
     match option {
         PR_SET_NAME => {
             // Set process name (up to 16 chars including null)
@@ -2026,7 +2052,7 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
                 }
             0
         }
-        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_NO_NEW_PRIVS | PR_SET_VMA => {
+        PR_SET_PDEATHSIG | PR_SET_DUMPABLE | PR_SET_VMA => {
             // Accept but ignore these settings
             0
         }
@@ -2041,14 +2067,6 @@ pub(super) fn sys_prctl(option: i32, arg2: u64, arg3: u64, arg4: u64, arg5: u64)
         PR_GET_DUMPABLE => {
             // Return 1 (dumpable)
             1
-        }
-        PR_GET_NO_NEW_PRIVS => {
-            // Return 0 (not set)
-            0
-        }
-        PR_SET_SECCOMP | PR_GET_SECCOMP => {
-            // Return -EINVAL for seccomp (not supported)
-            EINVAL
         }
         PR_CAPBSET_READ => {
             // We hold every capability, so the answer is 1 — but only for a

@@ -108,6 +108,7 @@ use akuma_syscalls_linux::proc::{CPU_SET_BITS_PER_WORD, CPU_SET_WORD_BYTES};
 
 #[cfg(feature = "sc-aio")]
 mod aio;
+mod seccomp;
 #[cfg(feature = "sc-reboot")]
 mod reboot;
 #[cfg(feature = "sc-containers")]
@@ -959,6 +960,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             time::sys_setitimer(args[0] as u32, UserAddr::new(args[1]), UserAddr::new(args[2]))
         }
         nr::MEMBARRIER => mem::membarrier_cmd(args[0] as u32),
+        nr::SECCOMP => seccomp::syscall(args[0] as u32, args[1] as u32, args[2]),
         nr::PRCTL => proc::sys_prctl(args[0] as i32, args[1], args[2], args[3], args[4]),
         nr::TIMES => time::sys_times(UserAddr::new(args[0])),
         nr::GETRUSAGE => time::sys_getrusage(args[0] as i32, UserAddr::new(args[1])),

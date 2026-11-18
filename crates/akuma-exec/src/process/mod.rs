@@ -18,6 +18,8 @@
 /// site (syscalls-glue, exceptions, the boot suite) resolves unchanged. The
 /// demand-paging half stayed: [`lazy_prefault`].
 pub use akuma_user_access as user_access;
+mod seccomp;
+pub use seccomp::Seccomp;
 pub mod lazy_prefault;
 pub mod address_space;
 pub mod maps_rows;
@@ -843,6 +845,8 @@ pub struct Process {
     /// box transitions leave them alone. See `akuma_isolation::creds` and
     /// `docs/archive/UNIX_PERMISSIONS.md` §4.
     pub creds: Arc<SharedCreds>,
+    /// The Linux calling thread’s policy, retained when the image changes.
+    pub seccomp: Seccomp,
     pub namespace: Arc<akuma_isolation::Namespace>,
     pub channel: ChannelCell,
     pub delegate_pid: OptPidCell,
@@ -1016,6 +1020,7 @@ impl Process {
             fds: o.fds,
             signal_actions: o.signal_actions,
             creds: o.creds,
+            seccomp: parent.seccomp.inherit(),
             clear_child_tid: AtomicU64::new(o.clear_child_tid),
 
             // ── inherited verbatim from the parent ──
@@ -4243,6 +4248,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         terminal_state: Arc::new(Spinlock::new(akuma_tty::TerminalState::default())),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         creds: Arc::new(SharedCreds::new(Creds::ROOT)),
+        seccomp: Seccomp::default(),
         channel: ChannelCell::new(None), delegate_pid: OptPidCell::new(None), grabbed_by: OptPidCell::new(None), clear_child_tid: AtomicU64::new(0),
         robust_list_head: U64Cell::new(0), robust_list_len: UsizeCell::new(0),
         signal_actions: Arc::new(SharedSignalTable::new()),

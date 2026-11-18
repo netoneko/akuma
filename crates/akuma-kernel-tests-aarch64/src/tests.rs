@@ -3574,6 +3574,7 @@ fn make_test_process(
         )),
         box_id: 0, namespace: akuma_isolation::global_namespace(),
         creds: alloc::sync::Arc::new(akuma_exec::process::SharedCreds::new(akuma_exec::process::Creds::ROOT)),
+        seccomp: akuma_exec::process::Seccomp::default(),
         channel: akuma_exec::process::ChannelCell::new(None), delegate_pid: akuma_exec::process::OptPidCell::new(None), grabbed_by: akuma_exec::process::OptPidCell::new(None), clear_child_tid: core::sync::atomic::AtomicU64::new(0),
         robust_list_head: akuma_exec::process::U64Cell::new(0), robust_list_len: akuma_exec::process::UsizeCell::new(0),
         signal_actions: alloc::sync::Arc::new(akuma_exec::process::SharedSignalTable::new()),

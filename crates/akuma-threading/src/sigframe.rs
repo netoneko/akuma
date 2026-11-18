@@ -71,12 +71,12 @@ pub struct SigfaultFields {
 }
 akuma_pod::pod!(SigfaultFields { si_addr: u64 });
 
-/// `siginfo_t::_sifields`: 112 bytes the two arms below overlap in.
+/// `siginfo_t::_sifields`: 112 bytes shared by its payloads.
 ///
 /// A C union, held here as plain words rather than a Rust `union`. The frame is
 /// copied to user space as bytes, so every byte must be initialised; a Rust
 /// `union` built from its 8-byte `fault` arm leaves the other 104 uninitialised,
-/// and the type could not say otherwise. Words plus the two setters keep the same
+/// and the type could not say otherwise. Words plus the setters keep the same
 /// layout and make the frame [`akuma_pod::Pod`]. A setter overwrites only its arm's
 /// bytes, exactly as assigning a union field did.
 #[repr(C)]
@@ -100,6 +100,14 @@ impl SiFields {
     /// Fill the `_sigchld` arm.
     pub fn set_chld(&mut self, chld: SigchldFields) {
         self.put(akuma_pod::bytes_of(&chld));
+    }
+
+    /// Fill the `_sigsys` arm.
+    pub fn set_sigsys(&mut self, addr: u64, nr: i32, arch: u32) {
+        self.words[0] = addr;
+        let bytes = akuma_pod::bytes_of_mut(&mut self.words[1]);
+        bytes[..4].copy_from_slice(&nr.to_ne_bytes());
+        bytes[4..].copy_from_slice(&arch.to_ne_bytes());
     }
 
     /// Fill the `_sigfault` arm.

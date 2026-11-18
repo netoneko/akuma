@@ -534,11 +534,51 @@ extern "C" fn syscall_handler(
     // A sibling thread of a process that has called `exit_group` leaves here,
     // before the syscall runs: its address space is about to be freed and
     // anything it does with it from now on is a race with the reaper.
+    use akuma_syscalls::seccomp::{AUDIT_ARCH_AMD64, Decision, SIGSYS, SyscallData};
+
+    let mut trap_delivered = false;
     let r = if crate::thread::should_leave_now() {
         mark_leave();
         crate::fd::errno::EINTR
     } else {
-        syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
+        let decision = current_process().map_or(Decision::Dispatch, |p| {
+            let data = SyscallData {
+                nr: nr as i32,
+                arch: AUDIT_ARCH_AMD64,
+                instruction_pointer: crate::sched::read_current_uctx(|u| u.user_rip)
+                    .expect("syscall entry has a user context"),
+                args: [a1, a2, a3, a4, a5, a6],
+            };
+            akuma_syscalls::seccomp::decide(&data, p.seccomp.evaluate(&data))
+        });
+        match decision {
+            Decision::Dispatch | Decision::LogAndDispatch => {
+                if matches!(decision, Decision::LogAndDispatch) {
+                    akuma_primitives::safe_print!(96, "[seccomp] pid={} nr={} LOG\n", current_pid(), nr);
+                }
+                syscall_dispatch(nr, a1, a2, a3, a4, a5, a6)
+            }
+            Decision::Return(result) => result,
+            Decision::KillThread => {
+                let _ = crate::sched::with_current_uctx(|u| u.leave = SECCOMP_THREAD_EXIT);
+                0u64.wrapping_sub(u64::from(SIGSYS))
+            }
+            Decision::KillProcess => {
+                exit_current_from_signal(SIGSYS);
+                0u64.wrapping_sub(u64::from(SIGSYS))
+            }
+            Decision::Trap(info) => {
+                #[cfg(feature = "ring0-preempt")]
+                akuma_cpu::interrupts::off();
+                trap_delivered = crate::signal::deliver_seccomp_trap(info, nr);
+                if trap_delivered {
+                    0
+                } else {
+                    exit_current_from_signal(SIGSYS);
+                    0u64.wrapping_sub(u64::from(SIGSYS))
+                }
+            }
+        }
     };
     // `saturating_sub` rather than a plain one: a syscall that blocks can
     // resume on another core, and while KVM and this machine both present an
@@ -584,13 +624,17 @@ extern "C" fn syscall_handler(
     //
     // Costs one relaxed load of this thread's pending word when nothing is
     // pending, which is every syscall but a handful per boot.
-    let r = crate::signal::deliver_pending(r);
+    let r = if trap_delivered { r } else { crate::signal::deliver_pending(r) };
     let leaving = crate::sched::read_current_uctx(|u| u.leave != 0).unwrap_or(false);
     if !leaving {
         crate::smp::bkl_leave();
     }
     r
 }
+
+// The stub only tests for nonzero. The leader's epilogue uses this value
+// to keep its address space alive until any surviving threads finish.
+const SECCOMP_THREAD_EXIT: u64 = 2;
 
 /// Set the running task's `UserCtx::leave`: the syscall return path reads it and
 /// `sysret`s nowhere, leaving ring 3 for good. A no-op with no `UserCtx` on this
@@ -1674,7 +1718,35 @@ fn run_process(first: &UserContext) -> ! {
     // SAFETY: both are addresses the loader (or `Image::new`) mapped
     // user-accessible in the address space the scheduler installed for this
     // task, and every program this kernel runs ends in exit_group.
-    let status = enter_user(first.pc, first.sp, forked_child);
+    let mut status = enter_user(first.pc, first.sp, forked_child);
+    if crate::sched::read_current_uctx(|u| u.leave) == Some(SECCOMP_THREAD_EXIT)
+        && let Some(proc) = current_process()
+    {
+        // This kernel keeps the address space in the group leader's Process.
+        // Leave its task in kernel mode until surviving workers release it.
+        let tid = crate::sched::current_task();
+        const SIGKILL_PENDING: u64 = 1 << 8;
+        let mut survivors = crate::thread::live_count(proc.tgid);
+        if survivors != 0 {
+            // A thread-only death does not set the status of a surviving group.
+            status = 0;
+        }
+        while survivors != 0
+            && crate::thread::group_exit_status().is_none()
+            && akuma_exec::threading::pending_signals_raw(tid) & SIGKILL_PENDING == 0
+        {
+            akuma_exec::threading::sleep_us(10_000);
+            survivors = crate::thread::live_count(proc.tgid);
+        }
+        status = match crate::thread::group_exit_status() {
+            Some(akuma_exec::process::GroupExit::Code(code)) => u64::from(code),
+            Some(akuma_exec::process::GroupExit::Signal(sig)) => 0u64.wrapping_sub(u64::from(sig)),
+            None if akuma_exec::threading::pending_signals_raw(tid) & SIGKILL_PENDING != 0 => {
+                (-9i64).cast_unsigned()
+            }
+            None => status,
+        };
+    }
     // **This task slot is the process's tid, and it stays the zombie's until the
     // reap** (`hold_exited_thread_slot`; `unregister_process` releases it).
     // Reissued at `sched::finish` below, as it used to be, the tid named the
@@ -2124,7 +2196,7 @@ pub fn register_exec_process(
         );
 
     // Group leader = self; no CLONE_THREAD groups in the table yet.
-    let proc = Box::new(Process::fresh(FreshProcess {
+    let mut proc = Box::new(Process::fresh(FreshProcess {
         pid,
         parent_pid: ppid,
         // 5b slice 4: the **owning** address space, moved in from the loader.
@@ -2258,6 +2330,9 @@ pub fn register_exec_process(
         // re-arm come with it.
         channel: channel.clone().or_else(|| console_attached.then(crate::console::channel).flatten()),
     }));
+    if let Some(parent) = akuma_exec::process::lookup_process_shared(ppid) {
+        proc.seccomp = parent.seccomp.inherit();
+    }
     register_reserved(pid, proc, slot);
     thread_pid_map_insert(task_slot, pid);
     // Tell the console pump who to address its keystrokes to, so `^C` goes

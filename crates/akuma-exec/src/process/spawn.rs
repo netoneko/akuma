@@ -438,6 +438,10 @@ pub fn spawn_process_named(
             }
         }
     };
+
+    if let Some(parent) = super::current_process_shared() {
+        process.seccomp = parent.seccomp.inherit();
+    }
     crate::mmu::as_trace(format_args!("[AS-NEW] pid={} l0=0x{:x} asid=0x{:x} via=spawn\n",
         process.pid, process.address_space.l0_phys(), process.address_space.asid()));
     // The image just loaded: its executable is busy until the process exits.

@@ -155,7 +155,7 @@ fn codex_amd64_filter_captured_on_linux() {
         })
         .collect();
     let program = Program::new(code).unwrap();
-    assert_eq!(program.len(), 114);
+    assert_eq!(program.instruction_count(), 114);
     assert_eq!(program.evaluate(&data(0, [0; 6])), ALLOW); // read
     assert_eq!(program.evaluate(&data(59, [0; 6])), ALLOW); // execve
     assert_eq!(program.evaluate(&data(41, [2, 1, 0, 0, 0, 0])), ERRNO | 1); // AF_INET

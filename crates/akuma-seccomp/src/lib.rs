@@ -25,6 +25,7 @@ pub const ALLOW: u32 = 0x7fff_0000;
 const ACTION_MASK: u32 = 0xffff_0000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(C)]
 pub struct Data {
     pub nr: i32,
     pub arch: u32,
@@ -44,6 +45,14 @@ impl Data {
         }
     }
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<Data>() == Data::SIZE);
+    assert!(core::mem::offset_of!(Data, nr) == 0);
+    assert!(core::mem::offset_of!(Data, arch) == 4);
+    assert!(core::mem::offset_of!(Data, instruction_pointer) == 8);
+    assert!(core::mem::offset_of!(Data, args) == 16);
+};
 
 fn half(word: u64, offset: u32) -> u32 {
     let upper = (offset & 4 != 0) == cfg!(target_endian = "little");
@@ -177,13 +186,8 @@ impl Program {
     }
 
     #[must_use]
-    pub fn len(&self) -> usize {
+    pub fn instruction_count(&self) -> usize {
         self.instructions.len()
-    }
-
-    #[must_use]
-    pub const fn is_empty(&self) -> bool {
-        false
     }
 
     #[must_use]

@@ -52,6 +52,7 @@ akuma-fpcache = { path = "../akuma-fpcache" }
 akuma-gic = { path = "../akuma-gic" }
 # The Linux/aarch64 syscall number table, for the SIGSEGV-vs-stub diagnostics
 # (`nr::READ`, `nr::EPOLL_CTL`, ...). Zero-dependency ABI crate.
+akuma-syscalls = { path = "../akuma-syscalls" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 # The kernel heap, for the crash-time memory-stats dump
 # (`log_memory_stats_on_crash`). Leaf crate.

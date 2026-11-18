@@ -9,6 +9,7 @@ here are original. Fonts and the `akuma-fbcon` dependencies have their own file:
 
 | Where | Derived from | Licence | Notice |
 |---|---|---|---|
+| `crates/akuma-seccomp/src/bpf.rs` | NetBSD `sys/net/bpf.h` | BSD-3-Clause | Below |
 | `crates/akuma-rtw89` | Linux `drivers/net/wireless/realtek/rtw89/` (v6.17) | GPL-2.0 OR BSD-3-Clause, used as BSD-3-Clause | In `crates/akuma-rtw89/src/lib.rs` |
 | `userspace/rumpkernel/rumpuser/src/fiber.rs` | NetBSD `lib/librumpuser/rumpfiber.c`, itself partly from Xen MiniOS `sched.c` | BSD-2-Clause, and MIT (Xen MiniOS) | Below |
 | `userspace/rumpkernel/rumpuser/virtif_user_instr.c` | NetBSD `sys/rump/net/lib/libvirtif/virtif_user.c` (instrumentation added) | BSD-2-Clause | Below |

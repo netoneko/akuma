@@ -689,6 +689,7 @@ syscall_table! {
     Sysinfo    => SYSINFO    = 99,  nr::SYSINFO;
     Syslog     => SYSLOG     = 103, nr::SYSLOG;
     Reboot     => REBOOT     = 169, nr::REBOOT;
+    Seccomp    => SECCOMP    = 317, nr::SECCOMP;
     Getrandom  => GETRANDOM  = 318, nr::GETRANDOM;
 }
 
@@ -1126,6 +1127,7 @@ mod tests {
             (Syscall::Pwrite64, 18u64, 68u64),
             (Syscall::Umask, 95, 166),
             (Syscall::Prctl, 157, 167),
+            (Syscall::Seccomp, 317, 277),
             (Syscall::SchedGetaffinity, 204, 123),
             (Syscall::SchedSetaffinity, 203, 122),
             (Syscall::Fchownat, 260, 54),

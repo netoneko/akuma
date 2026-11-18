@@ -77,6 +77,7 @@ to an actively-churning one doesn't inherit its risk).
 | `pipe.rs` | pipe/fifo | always | [`syscalls/pipe.md`](syscalls/pipe.md) | A |
 | `poll.rs` | poll/ppoll/epoll | `sc-epoll` (Tier 2) | [`syscalls/poll.md`](syscalls/poll.md) | B |
 | `proc.rs` | fork/clone/execve/wait/exit | always | [`syscalls/proc.md`](syscalls/proc.md) | A |
+| `seccomp.rs` | seccomp and no_new_privs prctl operations | always | [`syscalls/seccomp.md`](syscalls/seccomp.md) | B |
 | `signal.rs` | rt_sigaction/kill/tkill/sigreturn | always | [`syscalls/signal.md`](syscalls/signal.md) | **C** |
 | `sync.rs` | futex | always | [`syscalls/sync.md`](syscalls/sync.md) | **C** |
 | `term.rs` | ioctl (TIOCGWINSZ/TIOCSWINSZ) + rich terminal 307–313 | always | [`syscalls/term.md`](syscalls/term.md) | B |

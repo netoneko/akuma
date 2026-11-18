@@ -95,6 +95,7 @@ akuma-el0-entry = { path = "../akuma-el0-entry" }
 # `process::user_access`. `process::lazy_prefault` registers its demand-paging
 # half back into it at `init`.
 akuma-user-access = { path = "../akuma-user-access" }
+akuma-seccomp = { path = "../akuma-seccomp" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }
 akuma-fpcache-rw = { path = "../akuma-fpcache-rw" }
 spinning_top = "0.3"

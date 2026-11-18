@@ -1028,6 +1028,7 @@ pub fn kernel_main(dtb_ptr: usize) -> ! {
         inc_qemu_dc_zva_ec15: syscall::syscall_counters::inc_qemu_dc_zva_ec15,
         inc_qemu_stp_xzr_ec15: syscall::syscall_counters::inc_qemu_stp_xzr_ec15,
         sys_exit_group: syscall::proc::sys_exit_group_pub,
+        sys_exit_thread: syscall::proc::sys_exit_thread_pub,
         notify_child_channel_exited: syscall::proc::notify_child_channel_exited_pub,
         vfork_complete: syscall::proc::vfork_complete,
         signal_is_fatal_default: syscall::signal::signal_is_fatal_default,
