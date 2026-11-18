@@ -978,6 +978,7 @@ impl ProcFilesystem {
             FileDescriptor::EpollFd(_) => String::from("anon_inode:[eventpoll]"),
             FileDescriptor::TimerFd(_) => String::from("anon_inode:[timerfd]"),
             FileDescriptor::EventFd(_) => String::from("anon_inode:[eventfd]"),
+            FileDescriptor::SignalFd { .. } => String::from("anon_inode:[signalfd]"),
             FileDescriptor::DevNull => String::from("/dev/null"),
             FileDescriptor::DevUrandom => String::from("/dev/urandom"),
             FileDescriptor::DevZero => String::from("/dev/zero"),

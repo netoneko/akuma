@@ -23,6 +23,14 @@ const ALL: u32 = EPOLL_EVENT_MASK;
 /// Nothing requested at all — what a registration of `EPOLLET` alone amounts to.
 const NONE: u32 = 0;
 
+/// A signalfd is readable while a masked signal is pending and is **never**
+/// writable, unlike the eventfd beside it.
+#[test]
+fn a_signalfd_is_read_only() {
+    assert_eq!(readiness(FdState::SignalFd { can_read: false }, ALL), 0);
+    assert_eq!(readiness(FdState::SignalFd { can_read: true }, ALL), EPOLLIN);
+}
+
 // ---------------------------------------------------------------------------
 // readiness: the state -> bits map
 // ---------------------------------------------------------------------------

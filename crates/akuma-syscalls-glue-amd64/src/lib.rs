@@ -138,6 +138,7 @@ pub fn dispatch_call(call: Syscall, a: [u64; 6]) -> Option<u64> {
         | Syscall::Ppoll
         | Syscall::Pselect6
         | Syscall::Eventfd2
+        | Syscall::Signalfd4
         | Syscall::EpollCreate1
         | Syscall::EpollCtl
         | Syscall::EpollPwait

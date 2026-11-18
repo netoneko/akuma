@@ -211,6 +211,9 @@ pub const SIGALTSTACK: u64 = 132;
 pub const GETRLIMIT: u64 = 163;
 pub const PRLIMIT64: u64 = 261;
 pub const EVENTFD2: u64 = 19;
+/// `signalfd4(fd, mask, sizemask, flags)`. x86_64 spells it 289 (and a flagless
+/// `signalfd` 282, which is not a row: no asm-generic number).
+pub const SIGNALFD4: u64 = 74;
 pub const PREAD64: u64 = 67;
 pub const PWRITE64: u64 = 68;
 pub const PREADV: u64 = 69;

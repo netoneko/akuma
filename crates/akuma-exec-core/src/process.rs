@@ -220,6 +220,10 @@ pub enum FileDescriptor {
     /// framing, no name.
     UnixSocket { rx: u32, tx: u32, sock: u32 },
     EventFd(u32),
+    /// `signalfd4(2)`: reads return the pending signals in `mask` as
+    /// `signalfd_siginfo` records. Plain data: a `dup` copies it, and there is
+    /// no table entry to refcount (the signals themselves are per-thread state).
+    SignalFd { mask: u64 },
     DevNull,
     DevUrandom,
     /// `/dev/zero`: reads fill the buffer with zero bytes (returning the full

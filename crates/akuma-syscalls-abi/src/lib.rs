@@ -393,6 +393,11 @@ syscall_table! {
     /// failed to construct at all on amd64 for want of this row and
     /// [`Self::EpollCreate1`] together.
     Eventfd2     => EVENTFD2     = 290, nr::EVENTFD2;
+    /// `signalfd4(fd, mask, sizemask, flags)`: a descriptor that reads pending
+    /// signals. bubblewrap's parent watches its child through one (its
+    /// `SIGCHLD` loop), and falls back to the flagless `signalfd`(282), which
+    /// has no asm-generic twin and so is not a row, when this answers `ENOSYS`.
+    Signalfd4    => SIGNALFD4    = 289, nr::SIGNALFD4;
     /// `epoll_create1(flags)`. musl's `epoll_create(size)` narrows to this
     /// with `flags = 0` (size is advisory and discarded) rather than issuing
     /// a distinct number, so `epoll_create`(213) is the one legacy spelling

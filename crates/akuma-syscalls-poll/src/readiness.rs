@@ -57,6 +57,10 @@ pub enum FdState {
     /// as this kernel is concerned.
     EventFd { can_read: bool },
 
+    /// A signalfd: readable while a signal in its mask is pending. Never
+    /// writable (`write` on one is `EINVAL`).
+    SignalFd { can_read: bool },
+
     /// A child process's stdout, read through its `ProcessChannel`.
     ///
     /// `channel_gone` is the channel having disappeared entirely, which is not
@@ -198,6 +202,12 @@ pub const fn readiness(state: FdState, requested: u32) -> u32 {
             }
             if wants_out {
                 ready |= EPOLLOUT;
+            }
+        }
+
+        FdState::SignalFd { can_read } => {
+            if wants_in && can_read {
+                ready |= EPOLLIN;
             }
         }
 

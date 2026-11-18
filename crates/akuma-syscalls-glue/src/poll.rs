@@ -599,6 +599,12 @@ fn epoll_check_fd_readiness_at(fd_num: u32, requested: u32, waker: Option<&Waker
             }
             FdState::EventFd { can_read: super::eventfd::eventfd_can_read(efd_id) }
         }
+        #[cfg(feature = "sc-eventfd")]
+        akuma_exec::process::FileDescriptor::SignalFd { mask } => {
+            // No poller to register: a signal's pend wakes its target thread,
+            // which re-evaluates readiness when it runs.
+            FdState::SignalFd { can_read: super::signalfd::signalfd_can_read(mask) }
+        }
         akuma_exec::process::FileDescriptor::ChildStdout(child_pid) => {
             if requested & ep::EPOLLIN == 0 {
                 FdState::ChildStdout { channel_gone: false, has_data: false }

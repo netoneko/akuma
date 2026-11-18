@@ -725,6 +725,8 @@ fn poll(call: Syscall, a: [u64; 6]) -> Option<u64> {
         // cross-thread wakeup a `mio` epoll reactor uses to interrupt a
         // blocking `epoll_pwait`.
         Syscall::Eventfd2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
+        // `signalfd4(fd, mask, sizemask, flags)` — glue's arm (`sc-eventfd`).
+        Syscall::Signalfd4 => to_glue(call, [a1, a2, a3, a4, 0, 0]),
         // `timerfd_create(clockid, flags)` / `timerfd_settime(fd, flags,
         // new_value, old_value)` / `timerfd_gettime(fd, out)` — glue's arms
         // (`sc-timerfd`). `struct itimerspec` needs no boundary translation
