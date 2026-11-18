@@ -105,6 +105,18 @@ the inner stage); the test uses the command line codex's runtime generates inste
   writable tmpfs rather than mode 000. `MS_REC` is ignored: a bind is of one mount's view.
 * `st_dev` changed for every file from a constant `1` to `makedev(0, mount id)`. `statx` follows; synthetic nodes keep 1.
 
+## Bugs fixed on the way
+
+Most of the table above is missing features. Two were defects in code that already claimed to work:
+
+* **`mkdir` of an existing directory on a read-only mount answered `EROFS`, not `EEXIST`.** `create_dir` checked the
+  mount's read-only flag before whether the name existed; Linux looks the name up first. `bwrap --dev /dev` over a
+  `--ro-bind / /` creates mount points that already exist and relies on `EEXIST`. `akuma_vfs_glue::create_dir` tests
+  `exists` first.
+* **Writes to `/proc/self/...` were `ENOENT`.** `ProcFilesystem::write_file`/`write_at` matched the path before
+  canonicalising `self/`, so `echo > /proc/self/setgroups` (and `oom_score_adj`) found no pid; `read_at` already
+  canonicalised. Both write paths do now.
+
 ## Dead ends and surprises
 
 * First plan was a `bwrap` shim over `box`; dropped when the user pointed out boxes already give the isolation and that

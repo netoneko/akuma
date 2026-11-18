@@ -753,6 +753,14 @@ Then:
   only: pushing to `main` (`git push origin main`, `HEAD:main`, a merge into it) still needs the user's explicit
   permission, every time.** If you are on `main`, branch first and push the branch. A push also publishes any commit of
   the user's that is ahead of origin; that is expected.
+- **Before merging to `main`, run `scripts/premerge_build.sh`** and get every step to PASS. It builds every kernel and feature set
+  with `--release`: the main kernel on aarch64 and amd64 (headless, the ryzen set, server, the devbox and rump-devbox
+  sets) and the platform kernels `taoxichuan`, `shanghai` (with its middleware sets) and `denver` (default and JVM sets)
+  on both architectures. `cargo build` at the root never reaches the platform kernels (they are not `default-members`),
+  and they share `akuma-syscalls-glue`, `akuma-exec` and `akuma-tokio-kernel-core` with the main kernel, so an API change
+  there breaks them silently (`docs/archive/DENVER_BUILD_BREAKAGE.md`). `--only <word>` runs a subset, `--fast` one
+  build per kernel/arch, `--list` the names. A new kernel or build target goes in its `STEPS` list. It is a build gate,
+  not a test run: host tests, clippy and the `scripts/check_*.py` budgets are separate.
 - **Never rewrite history**: no `reset`, `rebase`, `commit --amend` or force-push, in this repo or any submodule. A
   mistake is fixed by a new commit.
 - **Docs-only commits use `git commit --no-verify`.** A commit whose every path is Markdown or under `docs/` or
