@@ -18,7 +18,7 @@ codex runs each shell command as `tools.exec_command(...)` inside a **code-mode 
 | layer | symptom | state |
 |---|---|---|
 | host spawned over stdio | host dies after first use; `gRPC code-mode session closed`, then `KeepAliveTimedOut` after ~36 s | worked around (step 2) |
-| sandbox (`bwrap`) | `Can't read /proc/sys/kernel/overflowuid`; no `/proc/self/ns` | worked around (step 3); not fixed |
+| sandbox (`bwrap`) | `Can't read /proc/sys/kernel/overflowuid`; no `/proc/self/ns` | **fixed 2026-11-18** (private mount namespaces; step 3) |
 | the command's child | `exited 143 in 0ms`, even `true`: the child gets SIGTERM before it runs (`[signal] pid=N killed by signal 15` in `dmesg`) | **fixed** in the kernel, `getppid` (step 5; [`GETPPID_RETURNED_THREAD_PID.md`](../archive/GETPPID_RETURNED_THREAD_PID.md)) |
 
 Ruled out (each probed on this box): HTTP/2 and V8 in the host (a standalone TCP host answers gRPC in 0.4 ms), plain
@@ -35,15 +35,22 @@ herd enable codex-code-mode-host && herd start codex-code-mode-host
 
 - The service runs a **wrapper script** because herd's `args = --listen grpc://…` loses its first flag at spawn
   (`userspace/herd/README.md` Roadmap). Do not "simplify" it back to `command = …host`.
-- **`herd enable` copies** the conf into `enabled/`. After editing `available/`, `herd disable` then `herd enable`, or herd keeps
+- **`herd enable` links** `enabled/<n>.conf` to `available/<n>.conf` (since 2026-11-18; it copied before), so an edit to `available/` is picked up by `herd reload` (or the next `herd start`, which reloads first). On an older herd: `herd disable` then `herd enable`, or herd keeps
   restarting the old copy. `herd status` keeps showing `restart-pending … last_exit=2` after a good start; trust `ps`.
 - Point codex at it: `export CODE_MODE_HOST=http://127.0.0.1:47200` (`/etc/profile.d/20-codex-code-mode-host.sh`; there is no
   config-file key for the URL) and, in `~/.codex/config.toml`, `[features] code_mode_host = true`. Existing shells need the export by hand.
 
-## 3. Turn codex's sandbox off (only while bwrap cannot run)
+## 3. The sandbox: real `bwrap` on private mount namespaces
 
-`~/.codex/config.toml`: `sandbox_mode = "danger-full-access"` (top level, before any `[table]`). That makes codex run
-commands unsandboxed on this box; revert it when `bwrap` works. `codex sandbox linux -- /bin/ls` is the one-line probe.
+Since 2026-11-18 `bwrap` runs (kernel feature `sc-private-ns`, in `default`/`headless`):
+[`../archive/BWRAP_ON_BOXES.md`](../archive/BWRAP_ON_BOXES.md). It needs Alpine's `bubblewrap` (+ `libcap2`, `musl`) on the
+box, and `/dev /proc /sys /run /tmp` as real directories on the root filesystem (a `--ro-bind / /` cannot create them).
+**Do not** use `codex sandbox linux -- CMD` as the probe: in 0.169.0 it fails with `execvp linux` on real Linux too. Use
+the command codex's runtime generates, `scripts/bwrap_suite.py`'s `inner.sh`, or a fake-model run (step 4).
+`sandbox_mode = "danger-full-access"` in `~/.codex/config.toml` is no longer needed for the sandbox to *start*; whether
+the box's uid-0 root should be trusted inside it is [`../archive/BOX0_ONLY_AUDIT.md`](../archive/BOX0_ONLY_AUDIT.md).
+What is not enforced (network namespace, uid maps) is in the design doc; codex's own seccomp filter is what refuses
+network in its restricted mode.
 
 ## 4. Reproduce without a model or network: `scripts/codex/fakemodel.py`
 
@@ -119,7 +126,7 @@ That trace is how the cause was found: `pid=150 nr=200 a1=<its own tid> a2=0xf`,
 | `unsupported custom tool call: exec` | the model name is not in `models_cache.json`; codex gives unknown models no code-mode tool |
 | `code_mode_host is ignored` warning | the URL is not a config key; use `CODE_MODE_HOST` |
 | `dmesg` shows `[signal] pid=N killed by signal 15` but no sender | the default log names the victim only; that is what step 5 adds |
-| the guest boots the **old** disk/kernel after you edited the conf | herd runs its cached config until its ~20 s reload tick; `herd enable` then an immediate `herd start` uses the old one. Wait 30 s, then check the `.vm` runfile (a `herd reload` is on the roadmap) |
+| the guest boots the **old** disk/kernel after you edited the conf | herd runs its cached config until its ~20 s reload tick; `herd enable` then an immediate `herd start` uses the old one. Wait 30 s, then check the `.vm` runfile (fixed 2026-11-18: `herd reload`, and `herd start` reloads first) |
 | `ssh: publickey authentication failed` to the guest | the image's `authorized_keys` lacks your client key (stale image) |
 | `/bin/sh: codex: not found` in the guest | `ext2put` files are 0644; `chmod 755` |
 | `herd stop` of the host service during a trace | codex then falls back to spawning its own stdio host and fails differently |

@@ -254,6 +254,23 @@ needs it now.
 
 Regression: `test_box_isolation_syscall_guards` cases 8b–8d.
 
+### The one exception: a private mount namespace (`sc-private-ns`)
+
+`clone(CLONE_NEWNS)` from the **host** (box 0, uid 0 or `CLONE_NEWUSER`) makes a fresh box and runs the child in it. A
+boxed process creating one is `EPERM` (no nested namespaces). That child — the *builder* — may `mount`, `umount2` and
+`pivot_root` **in its own namespace only**, through the `NsCreator` token (`akuma_exec::process::ns_creator()` is the one
+mint site, and only while the namespace is not locked). Every other boxed caller keeps `EPERM`, and nothing that takes a
+`HostRoot` accepts the token.
+
+`pivot_root(new, put_old)`: with `put_old` under `new`, the namespace is re-rooted at `new` and the pre-pivot view is
+attached at `put_old` until `umount2(put_old)` (bubblewrap binds its sources from there); with `put_old == new` the old
+root is mounted nowhere and the namespace is **locked** for good. Mounts over a mount point replace it; `MS_BIND` takes a
+directory (or a `/dev` node) resolved through the caller's view, `MS_REMOUNT|MS_RDONLY` and propagation flags are honoured
+or ignored as `docs/archive/BWRAP_ON_BOXES.md` lists. What a private namespace does **not** isolate (network, uid maps, pid
+numbers) and what a uid-0 sandbox can still reach: that file and `docs/archive/BOX0_ONLY_AUDIT.md`.
+
+Regression: `scripts/bwrap_suite.py` (needs a guest with Alpine's `bubblewrap`).
+
 ## OCI images and the overlay root
 
 `box run <image>` starts a container whose root is the image's layers, read-only
@@ -442,6 +459,8 @@ Regression: `scripts/box_amd64_suite.py`. History and open items:
 
 ## Background
 
+- `archive/BWRAP_ON_BOXES.md` — real bubblewrap on private namespaces; `archive/BOX0_ONLY_AUDIT.md` — what a box's root
+  can still reach.
 - `archive/AKUMA_AMD64_BOXES_AUDIT.md` — boxes on amd64: eight faults and the suite.
 - `archive/BOX_CONTAINERS.md`, `archive/CONTAINERS_STAGE_1_PLAN.md`,
   `archive/CONTAINERS_STAGE_2_PLAN.md`, `archive/RUMP_PLUS_HERD.md`.
