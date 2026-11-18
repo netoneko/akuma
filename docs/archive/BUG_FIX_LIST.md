@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1670
-- **Docs contributing at least one fix:** 487
+- **Total distinct fixes counted:** 1677
+- **Docs contributing at least one fix:** 491
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 258 | 15.4% | 40 |
-| Memory & Virtual Memory | 205 | 12.3% | 73 |
+| Syscall / ABI Compatibility Audits | 259 | 15.4% | 41 |
+| Memory & Virtual Memory | 205 | 12.2% | 73 |
 | Scheduler & Process Management | 156 | 9.3% | 52 |
 | SMP & Locking | 142 | 8.5% | 61 |
 | Networking | 104 | 6.2% | 38 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.6% | 6 |
 | Toolchain & Self-Hosting | 94 | 5.6% | 14 |
-| SSH | 56 | 3.4% | 23 |
-| VFS & Filesystem | 149 | 8.9% | 48 |
+| SSH | 56 | 3.3% | 23 |
+| VFS & Filesystem | 150 | 8.9% | 49 |
 | Boot & Drivers | 144 | 8.6% | 25 |
 | Signals & Exceptions | 50 | 3.0% | 20 |
-| Misc / Cross-cutting | 95 | 5.7% | 27 |
+| Misc / Cross-cutting | 98 | 5.8% | 28 |
 | Console & Terminal | 63 | 3.8% | 22 |
-| Containers | 69 | 4.1% | 13 |
-| **Total** | **1670** | **100.0%** | **487** |
+| Containers | 71 | 4.2% | 14 |
+| **Total** | **1677** | **100.0%** | **491** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -55,7 +55,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (258 fixes, 40 docs)
+## Syscall / ABI Compatibility Audits (259 fixes, 41 docs)
 
 ### docs/archive/SECCOMP.md
 - Codex could not install its seccomp filter. Native amd64 and AArch64 now install and enforce filters across exec, including on the signal return path.
@@ -357,6 +357,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - AArch64 `comm` was the full path instead of the basename
 - AArch64 ran a script with `$0` as the symlink-resolved path instead of the cwd-resolved one
 - AArch64's close-on-exec sweep skipped releasing `flock`s and `/dev/dsp`
+
+### docs/archive/CLOCK_GETTIME_EINTR_ON_SIGNAL.md
+- The syscall prologue answered `EINTR` to every syscall while the thread's interrupt flag was set and the first syscall consumed it, so a `clock_gettime` (which Linux never fails with `EINTR`) landed in the window between a signal's post and its handler frame and panicked codex's TUI on a resize; `never_interrupted` now lists the calls that cannot block (`clock_gettime`, the id getters, `uname`, `sysinfo`, `getrandom`, `getrlimit`, ...) so they no longer consume the flag
 
 ## Memory & Virtual Memory (205 fixes, 73 docs)
 
@@ -1822,7 +1825,7 @@ aren't recorded anywhere else.)
 - `--port 22x` silently served on the default, unknown flags and config keys were dropped without a word, and `--help` started a server; these print a warning with the default that applies (deliberately not fatal, so a remote-only box stays reachable) and `--help` prints usage and exits (S11)
 - `SERVICE_REQUEST` accepted any service name; it must be `ssh-userauth` (S12)
 
-## VFS & Filesystem (149 fixes, 48 docs)
+## VFS & Filesystem (150 fixes, 49 docs)
 
 ### docs/archive/AKUMA_EXT2_CLEANUP.md
 - §2.3: `read_inode` heap over-read (UB) — a rev-1 superblock's `inode_size` was taken off disk with no minimum check, so an image with `inode_size < 128` blitted a whole `Inode` out of a smaller allocation
@@ -2070,6 +2073,9 @@ aren't recorded anywhere else.)
 - Writes through an `O_RDONLY` fd and reads through an `O_WRONLY` fd succeeded (`write`/`pwrite`/`read`/`pread` on AArch64, `pwrite`/`read`/`pread` on amd64); they are `EBADF`
 - `pread`/`pwrite` on a pipe or socketpair answered `EBADF` instead of `ESPIPE`
 - amd64 `lseek` on `/dev/null`, `/dev/zero` and `/dev/urandom` returned the offset asked for; Linux returns 0
+
+### docs/archive/DEVFS_KVM_NODES_NOT_LISTED.md
+- `/dev/kvm0` and `/dev/kvm` were opened by the kernel's own `openat` arm but never in the devfs table, so `ls /dev` and `stat` showed neither and the hypervisor looked unwired; `DevProbe` gained `kvm_ctl`/`kvm_api` and the table the two root-only nodes (boxes still see neither)
 
 ## Boot & Drivers (144 fixes, 25 docs)
 
@@ -2362,7 +2368,7 @@ aren't recorded anywhere else.)
 - Every group `SIGKILL` cost 2 s on AArch64: each thread's `kill_thread_group` grace-waited for siblings in their own grace waits; `claim_group_exit` makes the first caller do the teardown
 - amd64 `kill` could return `EINTR` without sending (glue's dispatch prologue), orphaning a child; signal senders are exempt from the gate
 
-## Misc / Cross-cutting (95 fixes, 27 docs)
+## Misc / Cross-cutting (98 fixes, 28 docs)
 
 ### docs/archive/AKUMA_KVM.md
 (The SVM phases — trivial guest, permission maps + AP hook, the 12-probe consistency ladder, the long-mode metal PASS, the two-level translation phase — are capability, not fixes; the ladder is an instrument, not a defect. These are the two defects the phases surfaced.)
@@ -2536,6 +2542,11 @@ aren't recorded anywhere else.)
 - amd64 clamped a read of `/dev/zero` or `/dev/urandom` to one 64 KiB chunk, so `dd bs=1M count=8` wrote 512 KiB; they are served whole, in chunks, like a regular file (built, not yet booted)
 - `--features no-tests` did not compile on amd64: a doubled `cfg` sat on one test function and none on `proc_consistency_check` (built for the default, `headless` and `no-tests` sets)
 
+### docs/archive/DENVER_BUILD_BREAKAGE.md
+- `akuma-syscalls-glue`'s `box_access` import was used only by `akuma-native`'s box syscalls, so every platform kernel (which builds glue without that feature) failed on the workspace's denied `unused_imports`, and that one error hid the rest; the import carries the same `cfg` as its use
+- `Process::auxv` (`procfs-diag`) was assigned through the shared `&Process` that `with_process` hands out, so the tokio kernels' init and exec retention did not compile; it is a `Spinlock<Option<..>>` with its clone, init and two readers updated
+- glue's no-smoltcp `sendto`/`recvfrom` unwrapped the `UserAddr` and passed the `u64` to `unix_send_user`/`unix_recv_user`, which take the typed address, so the rump devbox build did not compile; found by the first run of `scripts/premerge_build.sh`
+
 ## Console & Terminal (63 fixes, 22 docs)
 
 ### docs/archive/VEC_AUDIT.md
@@ -2647,7 +2658,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - amd64 `setpgid` outside a pty session was a no-op, so `^C` on the serial console reached an empty foreground group; the shared spawn gives each child a group and amd64 uses glue's `setpgid`/`getpgid`
 
-## Containers (69 fixes, 13 docs)
+## Containers (71 fixes, 14 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -2746,6 +2757,10 @@ aren't recorded anywhere else.)
 - `box cp` followed symlinks, lost modes, held whole files in memory and exited 0 on failure; it uses `lstat`, recreates symlinks, keeps modes, streams through `fsx::copy_file`, counts failures and exits 1 on any (B11)
 - the deprecated `waitpid` folded a signal death into status 0, so `box run img cmd && next` carried on after a crash; `box run`, `open`, `use` and `grab` use `waitpid_status` with the shell convention (128 plus the signal) (B12)
 
+### docs/archive/BWRAP_ON_BOXES.md
+- `mkdir` of an existing directory on a read-only mount answered `EROFS` because `create_dir` tested the mount's read-only flag before whether the name existed, which broke `bwrap --dev /dev` over `--ro-bind / /` (Linux answers `EEXIST`); the name is looked up first
+- `ProcFilesystem::write_file`/`write_at` matched the path before canonicalising `self/`, so a write to `/proc/self/setgroups` (or `oom_score_adj`) was `ENOENT` while the read of the same path worked; both write paths canonicalise as `read_at` did
+
 ## Files scanned with zero counted fixes (reference docs, open issues, reverted attempts, or pure duplicates of a fix counted elsewhere)
 
 Also scanned 2026-11-13 (closing `akuma-multiarch-attempt-0`: one kernel package for both architectures, the shared mm/fd/exec/signal paths, the hooked scheduler, safe guest entry and the amd64 `unsafe` cleanup; 165 archive docs added or edited). AKUMA_MULTIARCH_ATTEMPT_0 is the branch's running log; its inline fixes are counted under ten categories and every fix with its own archive doc is counted there instead. No counted fix: AKUMA_ONE_MUNMAP and AKUMA_ONE_VA_PLACER (convergence steps whose divergences are placement policy, pinned); AMD64_RING0_PREEMPTION and HOOKED_EL1_PREEMPTION's preemption itself (capabilities; the latter's TTBR0 publication is counted); FPCACHE_UNDERSIZED_AT_LOW_RAM (open by its own header); SGI_SCHEDULER_RESIDUE (dead-code removal, behaviours measured and accepted); AMD64_KERNEL_UNSAFE_AUDIT (`unsafe` reduction; the `deliver_pending` `&mut UserCtx` alias it removed was not UB in practice, and the `sysretq` canonical-`rip` refusal is hardening); the archived proposals B12_AARCH64_SLOT_TABLE, B15_TOKIO_KERNEL_KIT, B21_TOKIO_KERNEL_AARCH64, INSTALL_SCRIPT, INSTALL_SCRIPT_QWEN_EXPERIMENT, LIBAKUMA_LINUX_COMPAT and LINUX_COMPAT_PUSH. Not counted, open by the log's own text: an amd64 `ssh host cmd` session prints nothing on stderr, and `altstackexec`'s two AArch64 rungs. The three test-harness bugs behind the amd64 RAM-floor measurement (`a4f3051e`) and W5a's thread-probe flake are test fixes, uncounted.
@@ -2812,4 +2827,4 @@ Also scanned 2026-11-16 (closing `ouch`, 29 commits ahead of main, 27 of them no
 
 Also scanned 2026-11-17 (merging `ec2-setup-review` into `ouch`, the T-series type-safety work): counted above: TYPE_SAFETY_DEFECTS_2026_11_17 (six defects found by the sweep, split across Memory, SMP and Scheduler; the same fixes were previously recorded only in `docs/reference/safety-types.md`). No counted fix: AWS_ENA_DRIVER (a decision and plan; `crates/akuma-net-ena` is not connected to the kernel, so the commit `ena: track ring phase across wraps` is new code in an unused crate, named here as uncounted), TYPE_SYSTEM_SAFETY_REPORT, NEWTYPE_AUDIT and UNSAFE_OWNERSHIP_TYPES_DESIGN (proposals and a design, with in-place corrections), and the `IrqSpinlock` migration of ~30 locks (hardening of locks the audit found no live hang in, except `KEYS`, counted above).
 
-Also 2026-11-17 (`more-improvements`): CLOCK_GETTIME_EINTR_ON_SIGNAL (non-blocking syscalls consumed the signal interrupt flag and answered `EINTR`; Syscall / ABI Compatibility). Counts above not yet bumped.
+Also scanned 2026-11-18 (`more-improvements`: real bubblewrap and codex's sandbox on private mount namespaces, the three platform kernels building again, herd, the seccomp and mmap-pilot merges). Counted above: CLOCK_GETTIME_EINTR_ON_SIGNAL (Syscall / ABI), DEVFS_KVM_NODES_NOT_LISTED (VFS), BWRAP_ON_BOXES (Containers: two defects among the features it records), DENVER_BUILD_BREAKAGE (Misc: the three shared-crate fixes; the three in the tokio-kernel crates are in `TAOXICHUAN_BUG_FIX_LIST.md`), and GETPPID_RETURNED_THREAD_PID and SECCOMP, listed already. No counted fix: BOX0_ONLY_AUDIT (an audit: it lists candidates and changes nothing), MMAPLAZY_PROPERTY_TEST_PILOT (the method found no defect; a deliberately broken kernel was the control), EXT3_EXT4_IMPLEMENTATION (a feature record). Fix-shaped commits with no archive doc to cite, so uncounted: `62a4d766` herd (`enable` copied instead of linking, so an edited config did nothing until a disable and enable; `start` ran the previous config; no `reload`; recorded in `userspace/herd/README.md`'s roadmap) and `e6fbd10c` (that roadmap). The signalfd, private-namespace, procfs (`ns`, `mountinfo`, `fdinfo`, `uid_map`), netlink, `capset` and per-mount `st_dev` commits add missing features and are not bugs.

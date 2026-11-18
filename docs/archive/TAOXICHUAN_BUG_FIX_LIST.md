@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 132
-- **Docs contributing at least one fix:** 43
+- **Total distinct fixes counted:** 135
+- **Docs contributing at least one fix:** 44
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 40 | 30.3% | 7 |
-| Exec & ELF Loading | 12 | 9.1% | 5 |
-| Processes, Fork, Threads & Scheduling | 35 | 26.5% | 10 |
-| Memory & Copy-on-Write | 18 | 13.6% | 7 |
-| Signals | 6 | 4.5% | 3 |
+| Syscalls, Files & Pipes | 40 | 29.6% | 7 |
+| Exec & ELF Loading | 12 | 8.9% | 5 |
+| Processes, Fork, Threads & Scheduling | 35 | 25.9% | 10 |
+| Memory & Copy-on-Write | 18 | 13.3% | 7 |
+| Signals | 6 | 4.4% | 3 |
 | Networking & Readiness | 4 | 3.0% | 2 |
-| SMP, Time & Boot | 12 | 9.1% | 6 |
-| Build & Integration | 5 | 3.8% | 3 |
-| **Total** | **132** | **100.0%** | **43** |
+| SMP, Time & Boot | 12 | 8.9% | 6 |
+| Build & Integration | 8 | 5.9% | 4 |
+| **Total** | **135** | **100.0%** | **44** |
 
 **Largest single write-ups:**
 
@@ -262,7 +262,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK.md
 - `bkl::enter` could be reached with interrupts on, so a timer tick during a ticket wait took a second ticket behind the suspended outer one and every core queued behind them (about 1 amd64 boot in 8, 0 of 100 after); it masks interrupts for the whole wait (`BklCpu::irq_save`/`irq_restore`)
 
-## Build & Integration (5 fixes, 3 docs)
+## Build & Integration (8 fixes, 4 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `akuma-boot-amd64` assembled its AT&T `boot.s` unconditionally, which broke the Mac's pre-commit hook (`att_syntax` is x86-only); the `global_asm!` is gated on `target_arch = "x86_64"` (stage 1)
@@ -274,6 +274,11 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ### docs/archive/DENVER_BRANCH_FIXES.md
 - the committed `sigprobe` binary stored its `rax = 99` edit at ucontext byte 152 (the `rcx` slot) while the source says 144, so the gate reported a `rt_sigreturn` bug the kernel did not have (a register dump of all 17 saved `gregs` showed it restoring exactly what was written); rebuilt from source, PASS on the same kernel
+
+### docs/archive/DENVER_BUILD_BREAKAGE.md
+- `akuma-tokio-kernel-core`'s file-page cache calls (`akuma_fpcache::insert`, `Key::new`, `Table::for_each_in`) kept raw `(mount, inode)` pairs after the cache moved to the typed `FileKey`, and `shmpages::wrote`/`zeroed` were half-migrated (a `FileKey` parameter over a body using the old calls); `denver`, and with it the platform-kernel family, did not build on either architecture
+- `akuma-tokio-kernel-core`'s `clone_thread`, `fork_process` and `execve::read_request` calls passed `u64` where the typed `UserAddr` is taken, and `read_request`'s `Errno` was not converted to the `u64` the syscall answers
+- the two tokio kernels' arch halves broke the same way: aarch64's `read_at_by_inode` hook called `read_at_by_mount_inode` with a raw pair, and `sys_getcpu` took raw pointers on both aarch64 and amd64
 
 ---
 
@@ -304,6 +309,7 @@ These are fixes to code every kernel runs, so the Akuma list counts them:
 - `SIGNAL_FATAL_DEFAULT_LINUX.md`: glue's `signal_is_fatal_default` dropped `SIGUSR1`/`SIGUSR2` and the real-time signals, `sys_tkill` ran the default action on its caller, and the dispatch prologue answered `rt_sigprocmask` with `EINTR`; found bringing signals to aarch64 Taoxichuan (B21 A5.7).
 - `DENVER_BRANCH_FIXES.md`: `akuma-exec`'s `/proc/<pid>/maps` leaf walk called an amd64-only method and broke the AArch64 build.
 - `ETXTBSY_TEXT_BUSY.md`: a file being executed could be rewritten (the tokio kernels' signed-exec proof died with SIGSEGV); the fix is in ext2 and glue's `openat`, so every kernel has it.
+- `DENVER_BUILD_BREAKAGE.md`: glue's `box_access` import was unused without `akuma-native` (a denied lint on every platform kernel), `Process::auxv` was assigned through a shared reference, and glue's no-smoltcp `sendto`/`recvfrom` passed an unwrapped address (the rump devbox build).
 
 
 ## Files scanned with zero counted fixes
