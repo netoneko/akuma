@@ -737,16 +737,17 @@ fn sys_memfd_create(flags: u64) -> u64 {
 
 /// The task slot `tid` names for the affinity calls: 0 is the caller; otherwise a process id
 /// (what `taskset -p` and `ps` show), then, failing that, a thread id (what `gettid` returns).
-fn affinity_slot(tid: u64) -> Option<usize> {
-    if tid == 0 {
-        return Some(akuma_exec::threading::current_thread_id());
+fn affinity_target(id: u32) -> Option<akuma_exec::threading::ThreadRef> {
+    use akuma_exec::process::{caller_can_see_process, lookup_process_shared, pid_for_thread};
+
+    if id == 0 {
+        return Some(akuma_exec::threading::ThreadRef::current());
     }
-    let tid = u32::try_from(tid).ok()?;
-    if let Some(slot) = akuma_exec::process::lookup_process_shared(tid).and_then(|p| p.thread_id.get()) {
-        return Some(slot);
-    }
-    let slot = tid as usize;
-    (slot < akuma_exec::threading::MAX_THREADS && akuma_exec::process::find_pid_by_thread(slot).is_some()).then_some(slot)
+    let proc = lookup_process_shared(id)
+        .or_else(|| pid_for_thread(id as usize).and_then(lookup_process_shared))?;
+    let target = proc.thread_id.live_ref()?;
+    (caller_can_see_process(proc) && pid_for_thread(target.tid()) == Some(proc.pid))
+        .then_some(target)
 }
 
 /// `sched_setaffinity(tid, len, mask)`: the request is decoded and clipped by
@@ -766,10 +767,19 @@ fn sys_sched_setaffinity(tid: u64, len: u64, mask_ptr: UserAddr) -> u64 {
         return errno::EFAULT;
     }
     // A caller's bytes past what we read are not inspected: a real cpu_set that large is all zero.
-    let Some(slot) = affinity_slot(tid) else { return errno::ESRCH };
+    let Some(target) = affinity_target(tid as u32) else { return errno::ESRCH };
     let Ok(requested) = affinity::decode(&buf[..n]) else { return errno::EINVAL };
     let Ok(mask) = affinity::effective(requested, crate::smp::online_cpus()) else { return errno::EINVAL };
-    if crate::sched::set_affinity(slot, mask) { 0 } else { errno::EAGAIN }
+    let changed = if target.tid() == akuma_exec::threading::current_thread_id() {
+        // A running caller cannot be recycled while it migrates.
+        crate::sched::set_affinity(target.tid(), mask)
+    } else {
+        let Some(changed) = target.with_live(|slot| crate::sched::set_affinity(slot, mask)) else {
+            return errno::ESRCH;
+        };
+        changed
+    };
+    if changed { 0 } else { errno::EAGAIN }
 }
 
 /// `sched_getaffinity(tid, len, mask)`: the stored mask, or every online core; returns the bytes
@@ -781,8 +791,9 @@ fn sys_sched_getaffinity(tid: u64, len: u64, mask_ptr: UserAddr) -> u64 {
     if len < 8 {
         return errno::EINVAL;
     }
-    let Some(slot) = affinity_slot(tid) else { return errno::ESRCH };
-    let mask = akuma_affinity::report(crate::sched::affinity_of(slot), crate::smp::online_cpus());
+    let Some(target) = affinity_target(tid as u32) else { return errno::ESRCH };
+    let Some(stored) = target.with_live(crate::sched::affinity_of) else { return errno::ESRCH };
+    let mask = akuma_affinity::report(stored, crate::smp::online_cpus());
     if !crate::uaccess::write_bytes(mask_ptr, &mask.to_le_bytes()) {
         return errno::EFAULT;
     }
@@ -800,8 +811,7 @@ fn sys_sched_getaffinity(tid: u64, len: u64, mask_ptr: UserAddr) -> u64 {
 ///
 /// The action numbers are [`akuma_dmesg::Action`] rather than local `const`s:
 /// an action mapped to the wrong arm makes `dmesg` clear the log instead of
-/// reading it and reports no error, and the decode is the half that a host test
-/// can pin. The AArch64 kernel decodes through the same table.
+/// reading it and reports no error. The shared action decoder is host-tested.
 fn sys_syslog(action: u64, bufp: u64, len: u64) -> u64 {
     use crate::fd::errno;
     use akuma_dmesg::Action;
@@ -813,7 +823,13 @@ fn sys_syslog(action: u64, bufp: u64, len: u64) -> u64 {
     if action.is_noop() {
         return 0;
     }
-    if action.sizes() {
+    if action == Action::SizeBuffer {
+        return crate::serial::KLOG_CAP as u64;
+    }
+    if !akuma_exec::process::caller_is_host_root() {
+        return errno::EPERM;
+    }
+    if action == Action::SizeUnread {
         return crate::serial::klog_len() as u64;
     }
     if !action.reads() {

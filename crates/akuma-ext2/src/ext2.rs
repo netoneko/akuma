@@ -3504,23 +3504,13 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
     // Socket node operations
     // ========================================================================
 
-    /// Create a zero-length `S_IFSOCK` node — the filesystem presence of an
-    /// AF_UNIX `bind(2)` on a pathname.
-    ///
-    /// Deliberately NOT a variant of file creation with a different mode: the
-    /// node must never be openable as a file. It holds no data and allocates no
-    /// data blocks, and the only things that read it are `stat` (for
-    /// `S_ISSOCK`), `unlink`, and directory listings. `connect` resolves against
-    /// the kernel's AF_UNIX name table, not against this inode — the node exists
-    /// so that userspace conventions work (a client checking `S_ISSOCK`, a
-    /// daemon `unlink`ing a stale path, `ls -l` showing an `s`), not as the
-    /// socket itself.
+    /// Allocate and link the inode for an AF_UNIX pathname bind.
     fn create_socket_node_internal(
         &self,
         state: &mut Ext2State,
         parent_inode: u32,
         name: &str,
-    ) -> Result<(), FsError> {
+    ) -> Result<u32, FsError> {
         let inode_num = self.allocate_inode(state, false)?;
         let now = self.current_time();
         let inode = Inode {
@@ -3536,7 +3526,7 @@ impl<B: BlockDevice> Ext2Filesystem<B> {
         };
         self.write_inode(state, inode_num, &inode)?;
         self.add_dir_entry(state, parent_inode, name, inode_num, FT_SOCK)?;
-        Ok(())
+        Ok(inode_num)
     }
 
     fn read_symlink_inode(&self, state: &Ext2State, inode_num: u32) -> Result<String, FsError> {
@@ -4502,21 +4492,29 @@ impl<B: BlockDevice> Filesystem for Ext2Filesystem<B> {
         Ok(())
     }
 
-    fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+    fn create_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
         self.ensure_device_healthy()?;
         self.require_writable()?;
-        // `AlreadyExists` is the honest answer and the caller depends on it:
-        // AF_UNIX `bind` maps it to `EADDRINUSE`, which is what tells a daemon
-        // it must `unlink` a stale node before it can restart. Silently reusing
-        // the node would let two daemons believe they own the same path.
-        if self.lookup_path(path).is_ok() {
-            return Err(FsError::AlreadyExists);
-        }
-        let (parent_inode, name) = self.lookup_parent(path)?;
         let mut state = self.write_state();
-        self.create_socket_node_internal(&mut state, parent_inode, &name)?;
+        match self.lookup_path_internal(&state, path) {
+            Ok(_) => return Err(FsError::AlreadyExists),
+            Err(FsError::NotFound) => {}
+            Err(e) => return Err(e),
+        }
+        let (parent_inode, name) = self.lookup_parent_internal(&state, path)?;
+        let inode = self.create_socket_node_internal(&mut state, parent_inode, &name)?;
         self.flush_meta(&mut state)?;
-        Ok(())
+        Ok(akuma_primitives::InodePin::new(inode))
+    }
+
+    fn lookup_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
+        self.ensure_device_healthy()?;
+        let state = self.read_state();
+        let inode = self.lookup_path_internal(&state, path)?;
+        if self.read_inode(&state, inode)?.type_perms & 0xF000 != S_IFSOCK {
+            return Err(FsError::NotAFile);
+        }
+        Ok(akuma_primitives::InodePin::new(inode))
     }
 
     fn read_symlink(&self, path: &str) -> Result<String, FsError> {

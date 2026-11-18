@@ -11,11 +11,11 @@
 //!
 //! Run: `cargo test -p akuma-net-unix --target $(rustc -vV | grep '^host:' | cut -d' ' -f2)`
 
-use akuma_primitives::errno as libc_errno;
+use akuma_primitives::{InodePin, errno as libc_errno};
 use crate::{
     AF_UNIX, Channel, ConnectOutcome, DEFAULT_BACKLOG, MAX_BACKLOG, Pending, Record, Shutdown,
     SOCKADDR_UN_LEN, SUN_PATH_LEN, SUN_PATH_OFFSET, SockAddrUn, SockState, SockType, Ucred,
-    UnixName, UnixTable, plan_read, plan_write,
+    UnixAddress, UnixName, UnixTable, plan_read, plan_write,
 };
 use alloc::vec;
 use alloc::vec::Vec;
@@ -45,6 +45,21 @@ fn raw_abstract(name: &[u8]) -> Vec<u8> {
 
 fn creds(pid: u32) -> Ucred {
     Ucred { pid, uid: 1000 + pid, gid: 100 }
+}
+
+fn test_address(name: &UnixName) -> UnixAddress {
+    match name {
+        UnixName::Abstract(name) => UnixAddress::Abstract { box_id: 0, name: name.clone() },
+        UnixName::Path(_) => UnixAddress::Path { mount_id: 1, inode: 2 },
+        UnixName::Unnamed => UnixAddress::Unnamed,
+    }
+}
+
+impl UnixTable {
+    fn bind_test(&mut self, id: u32, name: UnixName) -> Result<(), i32> {
+        let address = test_address(&name);
+        self.bind(id, name, address, InodePin::none())
+    }
 }
 
 // ============================================================================
@@ -639,12 +654,60 @@ mod names {
     use super::*;
 
     #[test]
+    fn abstract_names_are_scoped_to_the_callers_box() {
+        let mut t = UnixTable::new();
+        let name = UnixName::Abstract(b"log".to_vec());
+        let host = t.alloc(SockType::Dgram, creds(1));
+        let sandbox = t.alloc(SockType::Dgram, creds(2));
+        let client = t.alloc(SockType::Dgram, creds(3));
+        let host_address = test_address(&name);
+        let sandbox_address = UnixAddress::Abstract { box_id: 42, name: b"log".to_vec() };
+
+        t.bind_test(host, name.clone()).unwrap();
+        t.get_mut(host).unwrap().rx = 10;
+        assert_eq!(t.connect(client, &sandbox_address, creds(3)), Err(libc_errno::ECONNREFUSED));
+        assert_eq!(t.resolve_dgram_dest(&sandbox_address), Err(libc_errno::ECONNREFUSED));
+
+        t.bind(sandbox, name, sandbox_address.clone(), InodePin::none()).unwrap();
+        t.get_mut(sandbox).unwrap().rx = 20;
+        assert_eq!(t.resolve_dgram_dest(&sandbox_address), Ok((sandbox, 20)));
+        t.close(sandbox);
+        assert_eq!(t.resolve_dgram_dest(&host_address), Ok((host, 10)));
+    }
+
+    #[test]
+    fn pathname_lookup_uses_mount_and_inode() {
+        let mut t = UnixTable::new();
+        let name = UnixName::Path(b"/run/log.sock".to_vec());
+        let a = t.alloc(SockType::Dgram, creds(1));
+        let b = t.alloc(SockType::Dgram, creds(2));
+        let c = t.alloc(SockType::Dgram, creds(3));
+        let addresses = [
+            UnixAddress::Path { mount_id: 1, inode: 2 },
+            UnixAddress::Path { mount_id: 3, inode: 2 },
+            UnixAddress::Path { mount_id: 1, inode: 4 },
+        ];
+
+        for (i, (id, address)) in [a, b, c].into_iter().zip(addresses.iter()).enumerate() {
+            t.begin_path_bind(id).unwrap();
+            t.finish_path_bind(id, Ok((name.clone(), address.clone(), InodePin::none()))).unwrap();
+            t.close(id); // release the bind operation's reference
+            let queue = 10 + i as u32;
+            t.get_mut(id).unwrap().rx = queue;
+            assert_eq!(t.resolve_dgram_dest(address), Ok((id, queue)));
+        }
+        t.close(a);
+        assert_eq!(t.resolve_dgram_dest(&addresses[1]), Ok((b, 11)));
+        assert_eq!(t.resolve_dgram_dest(&addresses[2]), Ok((c, 12)));
+    }
+
+    #[test]
     fn bind_then_lookup() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Stream, creds(1));
         let name = UnixName::Abstract(b"svc".to_vec());
-        t.bind(s, name.clone()).unwrap();
-        assert!(t.is_bound(&name));
+        t.bind_test(s, name.clone()).unwrap();
+        assert!(t.names.contains_key(&test_address(&name)));
         assert_eq!(t.get(s).unwrap().state, SockState::Bound);
         assert_eq!(t.name_count(), 1);
     }
@@ -655,8 +718,8 @@ mod names {
         let a = t.alloc(SockType::Stream, creds(1));
         let b = t.alloc(SockType::Stream, creds(2));
         let name = UnixName::Path(b"/tmp/s".to_vec());
-        t.bind(a, name.clone()).unwrap();
-        assert_eq!(t.bind(b, name).unwrap_err(), libc_errno::EADDRINUSE);
+        t.bind_test(a, name.clone()).unwrap();
+        assert_eq!(t.bind_test(b, name).unwrap_err(), libc_errno::EADDRINUSE);
     }
 
     /// **A daemon must be able to restart.** Once the holder closes, the name is
@@ -668,13 +731,13 @@ mod names {
         let mut t = UnixTable::new();
         let name = UnixName::Path(b"/tmp/s".to_vec());
         let a = t.alloc(SockType::Stream, creds(1));
-        t.bind(a, name.clone()).unwrap();
+        t.bind_test(a, name.clone()).unwrap();
         t.close(a);
-        assert!(!t.is_bound(&name));
+        assert!(!t.names.contains_key(&test_address(&name)));
         assert_eq!(t.name_count(), 0, "name-table entry leaked past its socket");
 
         let b = t.alloc(SockType::Stream, creds(2));
-        t.bind(b, name).unwrap();
+        t.bind_test(b, name).unwrap();
     }
 
     /// Closing a socket must only release the name if the name still points at
@@ -686,15 +749,15 @@ mod names {
         let mut t = UnixTable::new();
         let name = UnixName::Path(b"/tmp/s".to_vec());
         let old = t.alloc(SockType::Stream, creds(1));
-        t.bind(old, name.clone()).unwrap();
+        t.bind_test(old, name.clone()).unwrap();
         // Simulate "the name was force-rebound": drop the old holder's claim,
         // rebind to a new socket, then let the old socket finish closing.
         t.close(old);
         let new = t.alloc(SockType::Stream, creds(2));
-        t.bind(new, name.clone()).unwrap();
+        t.bind_test(new, name.clone()).unwrap();
         // A second (stale) close of the old id must not touch the new binding.
         t.close(old);
-        assert!(t.is_bound(&name));
+        assert!(t.names.contains_key(&test_address(&name)));
         assert_eq!(t.get(new).unwrap().name, name);
     }
 
@@ -702,16 +765,16 @@ mod names {
     fn bind_unnamed_is_einval() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Stream, creds(1));
-        assert_eq!(t.bind(s, UnixName::Unnamed).unwrap_err(), libc_errno::EINVAL);
+        assert_eq!(t.bind_test(s, UnixName::Unnamed).unwrap_err(), libc_errno::EINVAL);
     }
 
     #[test]
     fn rebinding_a_bound_socket_is_einval() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Stream, creds(1));
-        t.bind(s, UnixName::Abstract(b"a".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"a".to_vec())).unwrap();
         assert_eq!(
-            t.bind(s, UnixName::Abstract(b"b".to_vec())).unwrap_err(),
+            t.bind_test(s, UnixName::Abstract(b"b".to_vec())).unwrap_err(),
             libc_errno::EINVAL
         );
     }
@@ -720,7 +783,7 @@ mod names {
     fn bind_on_a_missing_socket_is_ebadf() {
         let mut t = UnixTable::new();
         assert_eq!(
-            t.bind(404, UnixName::Abstract(b"a".to_vec())).unwrap_err(),
+            t.bind_test(404, UnixName::Abstract(b"a".to_vec())).unwrap_err(),
             libc_errno::EBADF
         );
         // The failed bind must not have taken the name.
@@ -746,7 +809,7 @@ mod listen {
     fn dgram_cannot_listen() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Dgram, creds(1));
-        t.bind(s, UnixName::Abstract(b"d".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"d".to_vec())).unwrap();
         assert_eq!(t.listen(s, 5).unwrap_err(), libc_errno::EOPNOTSUPP);
     }
 
@@ -758,7 +821,7 @@ mod listen {
         let mut t = UnixTable::new();
         for backlog in [0, -1] {
             let s = t.alloc(SockType::Stream, creds(1));
-            t.bind(s, UnixName::Abstract(vec![backlog as u8])).unwrap();
+            t.bind_test(s, UnixName::Abstract(vec![backlog as u8])).unwrap();
             t.listen(s, backlog).unwrap();
             assert_eq!(t.get(s).unwrap().backlog_max, DEFAULT_BACKLOG);
         }
@@ -770,7 +833,7 @@ mod listen {
     fn huge_backlog_is_capped() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Stream, creds(1));
-        t.bind(s, UnixName::Abstract(b"s".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"s".to_vec())).unwrap();
         t.listen(s, 1_000_000).unwrap();
         assert_eq!(t.get(s).unwrap().backlog_max, MAX_BACKLOG);
     }
@@ -779,7 +842,7 @@ mod listen {
     fn listening_socket_reports_state_and_readiness() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::SeqPacket, creds(1));
-        t.bind(s, UnixName::Abstract(b"s".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"s".to_vec())).unwrap();
         t.listen(s, 4).unwrap();
         assert_eq!(t.get(s).unwrap().state, SockState::Listening);
         assert!(!t.get(s).unwrap().accept_ready(), "empty backlog is not ready");
@@ -795,7 +858,7 @@ mod rendezvous {
 
     fn listener(t: &mut UnixTable, name: &[u8], backlog: i32) -> u32 {
         let s = t.alloc(SockType::Stream, creds(1));
-        t.bind(s, UnixName::Abstract(name.to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(name.to_vec())).unwrap();
         t.listen(s, backlog).unwrap();
         s
     }
@@ -808,7 +871,7 @@ mod rendezvous {
         let mut t = UnixTable::new();
         let c = t.alloc(SockType::Stream, creds(2));
         assert_eq!(
-            t.connect(c, &UnixName::Abstract(b"nope".to_vec()), creds(2))
+            t.connect(c, &test_address(&UnixName::Abstract(b"nope".to_vec())), creds(2))
                 .unwrap_err(),
             libc_errno::ECONNREFUSED
         );
@@ -821,10 +884,10 @@ mod rendezvous {
     fn connect_to_bound_but_unlistening_is_econnrefused() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Stream, creds(1));
-        t.bind(s, UnixName::Abstract(b"svc".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"svc".to_vec())).unwrap();
         let c = t.alloc(SockType::Stream, creds(2));
         assert_eq!(
-            t.connect(c, &UnixName::Abstract(b"svc".to_vec()), creds(2))
+            t.connect(c, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(2))
                 .unwrap_err(),
             libc_errno::ECONNREFUSED
         );
@@ -838,10 +901,10 @@ mod rendezvous {
         let mut t = UnixTable::new();
         let l = listener(&mut t, b"svc", 1);
         let c1 = t.alloc(SockType::Stream, creds(2));
-        t.connect(c1, &UnixName::Abstract(b"svc".to_vec()), creds(2)).unwrap();
+        t.connect(c1, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(2)).unwrap();
         let c2 = t.alloc(SockType::Stream, creds(3));
         assert_eq!(
-            t.connect(c2, &UnixName::Abstract(b"svc".to_vec()), creds(3))
+            t.connect(c2, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(3))
                 .unwrap_err(),
             libc_errno::EAGAIN
         );
@@ -853,7 +916,7 @@ mod rendezvous {
         let mut t = UnixTable::new();
         let l = listener(&mut t, b"svc", 4);
         let c = t.alloc(SockType::Stream, creds(2));
-        let out = t.connect(c, &UnixName::Abstract(b"svc".to_vec()), creds(2)).unwrap();
+        let out = t.connect(c, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(2)).unwrap();
         let ConnectOutcome::Queued { listener: got_l, server_sock } = out else {
             panic!("expected Queued, got {out:?}");
         };
@@ -875,7 +938,7 @@ mod rendezvous {
         let mut t = UnixTable::new();
         listener(&mut t, b"svc", 4);
         let c = t.alloc(SockType::Stream, creds(2));
-        t.connect(c, &UnixName::Abstract(b"svc".to_vec()), creds(2)).unwrap();
+        t.connect(c, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(2)).unwrap();
         assert_eq!(t.get(c).unwrap().state, SockState::Connected);
         assert!(t.get(c).unwrap().peer.is_some());
     }
@@ -902,11 +965,11 @@ mod rendezvous {
     fn mismatched_socket_types_are_eprototype() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::SeqPacket, creds(1));
-        t.bind(s, UnixName::Abstract(b"svc".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"svc".to_vec())).unwrap();
         t.listen(s, 4).unwrap();
         let c = t.alloc(SockType::Stream, creds(2));
         assert_eq!(
-            t.connect(c, &UnixName::Abstract(b"svc".to_vec()), creds(2))
+            t.connect(c, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(2))
                 .unwrap_err(),
             libc_errno::EPROTOTYPE
         );
@@ -917,7 +980,7 @@ mod rendezvous {
         let mut t = UnixTable::new();
         let c = t.alloc(SockType::Stream, creds(2));
         assert_eq!(
-            t.connect(c, &UnixName::Unnamed, creds(2)).unwrap_err(),
+            t.connect(c, &test_address(&UnixName::Unnamed), creds(2)).unwrap_err(),
             libc_errno::EINVAL
         );
     }
@@ -931,7 +994,7 @@ mod rendezvous {
         let name = UnixName::Abstract(b"svc".to_vec());
         let l = listener(&mut t, b"svc", 4);
         let c = t.alloc(SockType::Stream, creds(2));
-        t.connect(c, &name, creds(2)).unwrap();
+        t.connect(c, &test_address(&name), creds(2)).unwrap();
         let p = t.accept(l).unwrap();
         assert_eq!(t.get(c).unwrap().peer_name, name);
         assert_eq!(t.get(p.server_sock).unwrap().name, name);
@@ -943,9 +1006,9 @@ mod rendezvous {
     fn dgram_connect_only_records_a_peer() {
         let mut t = UnixTable::new();
         let srv = t.alloc(SockType::Dgram, creds(1));
-        t.bind(srv, UnixName::Abstract(b"log".to_vec())).unwrap();
+        t.bind_test(srv, UnixName::Abstract(b"log".to_vec())).unwrap();
         let c = t.alloc(SockType::Dgram, creds(2));
-        let out = t.connect(c, &UnixName::Abstract(b"log".to_vec()), creds(2)).unwrap();
+        let out = t.connect(c, &test_address(&UnixName::Abstract(b"log".to_vec())), creds(2)).unwrap();
         assert_eq!(out, ConnectOutcome::DgramPeerSet { peer: srv });
         assert_eq!(t.get(c).unwrap().state, SockState::Connected);
         assert!(t.get(srv).unwrap().backlog.is_empty());
@@ -961,7 +1024,7 @@ mod dgram {
 
     fn bound_dgram(t: &mut UnixTable, name: &[u8], queue: u32) -> u32 {
         let s = t.alloc(SockType::Dgram, creds(1));
-        t.bind(s, UnixName::Abstract(name.to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(name.to_vec())).unwrap();
         t.attach_dgram_queue(s, queue);
         s
     }
@@ -971,7 +1034,7 @@ mod dgram {
         let mut t = UnixTable::new();
         let srv = bound_dgram(&mut t, b"log", 42);
         let (sock, queue) = t
-            .resolve_dgram_dest(&UnixName::Abstract(b"log".to_vec()))
+            .resolve_dgram_dest(&test_address(&UnixName::Abstract(b"log".to_vec())))
             .unwrap();
         assert_eq!(sock, srv);
         assert_eq!(queue, 42, "sender did not find the receiver's queue");
@@ -985,7 +1048,7 @@ mod dgram {
     fn sendto_unbound_name_is_econnrefused() {
         let t = UnixTable::new();
         assert_eq!(
-            t.resolve_dgram_dest(&UnixName::Path(b"/dev/log".to_vec()))
+            t.resolve_dgram_dest(&test_address(&UnixName::Path(b"/dev/log".to_vec())))
                 .unwrap_err(),
             libc_errno::ECONNREFUSED
         );
@@ -998,9 +1061,9 @@ mod dgram {
     fn sendto_a_stream_socket_is_eprototype() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Stream, creds(1));
-        t.bind(s, UnixName::Abstract(b"svc".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"svc".to_vec())).unwrap();
         assert_eq!(
-            t.resolve_dgram_dest(&UnixName::Abstract(b"svc".to_vec()))
+            t.resolve_dgram_dest(&test_address(&UnixName::Abstract(b"svc".to_vec())))
                 .unwrap_err(),
             libc_errno::EPROTOTYPE
         );
@@ -1013,10 +1076,10 @@ mod dgram {
     fn sendto_a_queueless_socket_is_econnrefused() {
         let mut t = UnixTable::new();
         let s = t.alloc(SockType::Dgram, creds(1));
-        t.bind(s, UnixName::Abstract(b"q".to_vec())).unwrap();
+        t.bind_test(s, UnixName::Abstract(b"q".to_vec())).unwrap();
         // No attach_dgram_queue.
         assert_eq!(
-            t.resolve_dgram_dest(&UnixName::Abstract(b"q".to_vec()))
+            t.resolve_dgram_dest(&test_address(&UnixName::Abstract(b"q".to_vec())))
                 .unwrap_err(),
             libc_errno::ECONNREFUSED
         );
@@ -1026,7 +1089,7 @@ mod dgram {
     fn sendto_unnamed_destination_is_edestaddrreq() {
         let t = UnixTable::new();
         assert_eq!(
-            t.resolve_dgram_dest(&UnixName::Unnamed).unwrap_err(),
+            t.resolve_dgram_dest(&test_address(&UnixName::Unnamed)).unwrap_err(),
             libc_errno::EDESTADDRREQ
         );
     }
@@ -1047,7 +1110,7 @@ mod dgram {
         let mut t = UnixTable::new();
         bound_dgram(&mut t, b"log", 42);
         let c = t.alloc(SockType::Dgram, creds(2));
-        t.connect(c, &UnixName::Abstract(b"log".to_vec()), creds(2)).unwrap();
+        t.connect(c, &test_address(&UnixName::Abstract(b"log".to_vec())), creds(2)).unwrap();
         assert_eq!(t.dgram_default_dest(c).unwrap(), 42);
     }
 
@@ -1111,12 +1174,12 @@ mod credentials {
     fn peer_credentials_are_from_connect_time() {
         let mut t = UnixTable::new();
         let l = t.alloc(SockType::Stream, creds(1));
-        t.bind(l, UnixName::Abstract(b"svc".to_vec())).unwrap();
+        t.bind_test(l, UnixName::Abstract(b"svc".to_vec())).unwrap();
         t.listen(l, 4).unwrap();
 
         let c = t.alloc(SockType::Stream, creds(7));
         let connect_time = creds(7);
-        t.connect(c, &UnixName::Abstract(b"svc".to_vec()), connect_time).unwrap();
+        t.connect(c, &test_address(&UnixName::Abstract(b"svc".to_vec())), connect_time).unwrap();
         let p = t.accept(l).unwrap();
 
         assert_eq!(p.client_creds, connect_time);
@@ -1213,13 +1276,13 @@ mod lifecycle {
     fn closing_a_listener_returns_its_queued_server_sockets() {
         let mut t = UnixTable::new();
         let l = t.alloc(SockType::Stream, creds(1));
-        t.bind(l, UnixName::Abstract(b"svc".to_vec())).unwrap();
+        t.bind_test(l, UnixName::Abstract(b"svc".to_vec())).unwrap();
         t.listen(l, 4).unwrap();
 
         let mut expected = Vec::new();
         for pid in 2..5u32 {
             let c = t.alloc(SockType::Stream, creds(pid));
-            let out = t.connect(c, &UnixName::Abstract(b"svc".to_vec()), creds(pid)).unwrap();
+            let out = t.connect(c, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(pid)).unwrap();
             if let ConnectOutcome::Queued { server_sock, .. } = out {
                 expected.push(server_sock);
             }
@@ -1239,10 +1302,10 @@ mod lifecycle {
         let mut t = UnixTable::new();
         for round in 0..20u32 {
             let l = t.alloc(SockType::Stream, creds(1));
-            t.bind(l, UnixName::Abstract(b"svc".to_vec())).unwrap();
+            t.bind_test(l, UnixName::Abstract(b"svc".to_vec())).unwrap();
             t.listen(l, 4).unwrap();
             let c = t.alloc(SockType::Stream, creds(2));
-            t.connect(c, &UnixName::Abstract(b"svc".to_vec()), creds(2)).unwrap();
+            t.connect(c, &test_address(&UnixName::Abstract(b"svc".to_vec())), creds(2)).unwrap();
             let p = t.accept(l).unwrap();
             t.pair(c, p.server_sock, 100 + round, 200 + round);
 

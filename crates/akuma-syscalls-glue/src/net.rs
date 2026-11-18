@@ -251,8 +251,7 @@ fn egress_allowed(ip: [u8; 4]) -> bool {
     ip != METADATA_IP || akuma_exec::process::caller_is_host_root()
 }
 
-/// Ports below this are the privileged ones: only uid 0 binds them, as on
-/// Linux, so an unprivileged program cannot stand in for sshd or a web server.
+/// Only host root can bind privileged ports on the shared smoltcp stack.
 #[cfg(feature = "smoltcp")]
 const UNPRIVILEGED_PORT_START: u16 = 1024;
 
@@ -276,7 +275,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
     akuma_primitives::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
     if addr.port != 0
         && addr.port < UNPRIVILEGED_PORT_START
-        && !akuma_exec::process::current_creds().is_root()
+        && !akuma_exec::process::caller_is_host_root()
     {
         return neg_errno(libc_errno::EACCES);
     }

@@ -980,38 +980,22 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
             }
             ENOSYS
         }
-        nr::SCHED_SETAFFINITY => 0,
-        // setpriority(which, who, prio) — we don't schedule by nice value; accept it.
-        nr::SETPRIORITY => 0,
+        // Scheduling policy setters accept requests without changing policy.
+        nr::SCHED_SETAFFINITY | nr::SCHED_SETPARAM | nr::SCHED_SETSCHEDULER => {
+            if proc::task_visible(args[0] as u32) { 0 } else { ESRCH }
+        }
+        // Only PRIO_PROCESS (0) names a task. Group and user priorities are stubs.
+        nr::SETPRIORITY => {
+            if args[0] as u32 != 0 || proc::task_visible(args[1] as u32) { 0 } else { ESRCH }
+        }
         // getpriority(which, who) — the raw syscall returns `20 - nice` (kept >= 0 so
         // a real nice can't look like an errno); musl computes the caller-visible nice
         // as `20 - ret`. Return 20 => normal priority (nice 0). Leaving this
         // unimplemented returned ENOSYS, which rustc's threadpool then used as a
         // pointer → [WILD-DA] SIGSEGV that intermittently killed a build unit
         // (docs/AKUMA_SELF_HOSTING.md §7i).
-        nr::GETPRIORITY => 20,
-        // sched_setparam(pid, *param) — we don't implement real-time scheduling
-        // params; accept unconditionally and ignore the pointer.
-        nr::SCHED_SETPARAM => { 0 }
-        // sched_setscheduler(pid, policy, *param) — args[1] is `policy`, an int,
-        // not a pointer. This arm predates the named constant above and was
-        // dispatched under the raw literal `119`; its body writes a zero
-        // `sched_priority` into `args[1]` treated as a user pointer, which is the
-        // shape of `sched_getparam`'s OUT-param (unistd nr 121, currently
-        // undispatched — falls through to the `_` arm's `ENOSYS`), not
-        // `sched_setscheduler`'s. In practice this is harmless: `policy` is a
-        // tiny int (0-6), so `write_user_val` almost always rejects it as an
-        // unmapped address and the `let _ =` discards the error, leaving `0`
-        // (success) either way — but the logic itself answers the wrong
-        // syscall. Flagged, not fixed, in this pass — naming the constant
-        // (rather than the raw `119`) is what made the mismatch visible.
-        nr::SCHED_SETSCHEDULER => {
-            let param_ptr = args[1] as usize;
-            if param_ptr != 0 {
-                let zero: i32 = 0;
-                let _ = write_user_val(param_ptr as u64, &zero);
-            }
-            0
+        nr::GETPRIORITY => {
+            if args[0] as u32 != 0 || proc::task_visible(args[1] as u32) { 20 } else { ESRCH }
         }
         nr::SCHED_YIELD => {
             akuma_exec::threading::yield_now();
@@ -1031,6 +1015,9 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         #[cfg(feature = "sc-sysv-ipc")]
         nr::MSGSND => msgqueue::sys_msgsnd(args[0] as u32, args[1], args[2] as usize, args[3] as i32),
         nr::SCHED_GETAFFINITY => {
+            if !proc::task_visible(args[0] as u32) {
+                return ESRCH;
+            }
             let mask_ptr = args[2] as usize;
             // glibc asks with up to 128 bytes and grows on `EINVAL`; nothing needs
             // more than a page, and the size is a kernel allocation.

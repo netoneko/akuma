@@ -61,6 +61,15 @@ the box's recorded `creator_pid`.
 | `MOUNT_IN_NS` | caller must be box 0. With fstype `overlay` at `/`, the target box must additionally have **no processes** and a still-pristine root | `EPERM` |
 | `MOUNT` | caller must be box 0 (since 2026-08-11 — a boxed process could previously mount into its own namespace) | `EPERM` |
 | `UMOUNT2` | caller must be box 0 (since 2026-08-11 — a box could previously unmount anything but `/`); real since 2026-08-24, always `EBUSY` on `/` | `EPERM` |
+| `sethostname`, `setdomainname` | Host root | `EPERM` |
+| `syslog` (amd64) | Host root for reading, clearing and querying unread log bytes | `EPERM` |
+| Internet `bind` to ports 1–1023 on smoltcp | Host root | `EACCES` |
+| Process-targeted resource limits, priority and scheduling | Caller can see the target's box | `ESRCH` |
+
+Abstract AF_UNIX names are local to the caller's box. Pathname AF_UNIX sockets
+use the mount and inode resolved through the caller's filesystem view.
+`/proc/mounts` and `/proc/<pid>/mountinfo` list only namespace mounts when
+the target has its own root.
 
 `SubdirFs` resolves `.`/`..` and clamps at the virtual root before prefixing, so
 a `..` cannot ascend out of `box_root` even if a caller reaches the filesystem

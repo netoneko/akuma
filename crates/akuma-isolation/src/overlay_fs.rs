@@ -541,9 +541,16 @@ impl Filesystem for OverlayFs {
         self.upper.set_times(path, atime_secs, mtime_secs)
     }
 
-    fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+    fn create_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
+        if self.find(path).is_some() {
+            return Err(FsError::AlreadyExists);
+        }
         self.prepare_create(path)?;
         self.upper.create_socket_node(path)
+    }
+
+    fn lookup_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
+        self.read_layer(path)?.lookup_socket_node(path)
     }
 
     /// A hard link in the merged view: copy the source up, then link in the

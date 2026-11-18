@@ -8,4 +8,5 @@ description = "Virtual filesystem traits, types, and in-memory filesystem for no
 workspace = true
 
 [dependencies]
+akuma-primitives = { path = "../akuma-primitives" }
 spinning_top = "0.3"

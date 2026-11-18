@@ -161,7 +161,12 @@ impl<B: JournalStorage> Filesystem for JournaledFilesystem<B> {
     fn remove_file(&self, path: &str) -> Result<(), FsError> { self.mutate(|fs| fs.remove_file(path)) }
     fn remove_dir(&self, path: &str) -> Result<(), FsError> { self.mutate(|fs| fs.remove_dir(path)) }
     fn create_symlink(&self, path: &str, target: &str) -> Result<(), FsError> { self.mutate(|fs| fs.create_symlink(path, target)) }
-    fn create_socket_node(&self, path: &str) -> Result<(), FsError> { self.mutate(|fs| fs.create_socket_node(path)) }
+    fn create_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
+        self.mutate(|fs| fs.create_socket_node(path))
+    }
+    fn lookup_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
+        self.inner.lookup_socket_node(path)
+    }
     fn rename(&self, old: &str, new: &str) -> Result<(), FsError> { self.mutate(|fs| fs.rename(old, new)) }
     fn link(&self, old: &str, new: &str) -> Result<(), FsError> { self.mutate(|fs| fs.link(old, new)) }
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> { self.mutate(|fs| fs.chmod(path, mode)) }

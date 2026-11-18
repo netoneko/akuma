@@ -586,6 +586,20 @@ fn socket_node_on_existing_path_is_already_exists() {
     ));
 }
 
+#[test]
+fn bound_socket_inode_stays_distinct_after_unlink_and_rebind() {
+    let fs = mount_empty();
+    let bound = fs.create_socket_node("/s.sock").unwrap();
+    fs.rename("/s.sock", "/renamed.sock").unwrap();
+    let looked_up = fs.lookup_socket_node("/renamed.sock").unwrap();
+    assert_eq!(bound.inode(), looked_up.inode());
+
+    fs.remove_file("/renamed.sock").unwrap();
+    assert!(matches!(fs.lookup_socket_node("/renamed.sock"), Err(akuma_vfs::FsError::NotFound)));
+    let replacement = fs.create_socket_node("/s.sock").unwrap();
+    assert_ne!(bound.inode(), replacement.inode());
+}
+
 /// A daemon must be able to unlink its own stale node and rebind.
 ///
 /// `remove_file` rejects directories; a socket node is not one, but it is also
@@ -3818,7 +3832,7 @@ fn clean_ext3_image_reads_and_rejects_all_mutations() {
     assert_eq!(fs.remove_file("/hello"), Err(FsError::ReadOnly));
     assert_eq!(fs.remove_dir("/dir"), Err(FsError::ReadOnly));
     assert_eq!(fs.create_symlink("/link", "/hello"), Err(FsError::ReadOnly));
-    assert_eq!(fs.create_socket_node("/socket"), Err(FsError::ReadOnly));
+    assert!(matches!(fs.create_socket_node("/socket"), Err(FsError::ReadOnly)));
     assert_eq!(fs.rename("/hello", "/new"), Err(FsError::ReadOnly));
     assert_eq!(fs.link("/hello", "/new"), Err(FsError::ReadOnly));
     assert_eq!(fs.chmod("/hello", 0o600), Err(FsError::ReadOnly));
