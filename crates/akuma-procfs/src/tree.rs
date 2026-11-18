@@ -212,6 +212,93 @@ impl NetFile {
     }
 }
 
+/// `/proc/sys/kernel/*`: the sysctls a namespace-aware program reads before it
+/// dares to run. bubblewrap reads `overflowuid`/`overflowgid` unconditionally at
+/// start and refuses to go on without them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SysKernelFile {
+    OverflowUid,
+    OverflowGid,
+}
+
+impl SysKernelFile {
+    pub const ALL: [Self; 2] = [Self::OverflowUid, Self::OverflowGid];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::OverflowUid => "overflowuid",
+            Self::OverflowGid => "overflowgid",
+        }
+    }
+
+    /// The file's bytes. Linux's default for both is the `nobody` id, 65534.
+    #[must_use]
+    pub const fn contents(self) -> &'static [u8] {
+        b"65534\n"
+    }
+}
+
+/// The namespaces `/proc/<pid>/ns/` names. Akuma has boxes, not Linux namespaces,
+/// so these report the box the process is in: two processes show the same
+/// `mnt`/`pid`/`net`/`ipc`/`uts` link exactly when they share a box.
+/// bubblewrap opens the directory and `readlink`s entries to learn whether it
+/// is already inside the namespaces it was asked to create.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NsFile {
+    Cgroup,
+    Ipc,
+    Mnt,
+    Net,
+    Pid,
+    User,
+    Uts,
+}
+
+impl NsFile {
+    pub const ALL: [Self; 7] =
+        [Self::Cgroup, Self::Ipc, Self::Mnt, Self::Net, Self::Pid, Self::User, Self::Uts];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Cgroup => "cgroup",
+            Self::Ipc => "ipc",
+            Self::Mnt => "mnt",
+            Self::Net => "net",
+            Self::Pid => "pid",
+            Self::User => "user",
+            Self::Uts => "uts",
+        }
+    }
+
+    /// The inode number of the host's namespace of this kind (Linux's own
+    /// initial ones), which a box-0 process reports.
+    #[must_use]
+    pub const fn host_inode(self) -> u64 {
+        match self {
+            Self::Pid => 4_026_531_836,
+            Self::User => 4_026_531_837,
+            Self::Uts => 4_026_531_838,
+            Self::Ipc => 4_026_531_839,
+            Self::Mnt => 4_026_531_840,
+            Self::Net => 4_026_531_992,
+            Self::Cgroup => 4_026_531_835,
+        }
+    }
+
+    /// The inode a process in `box_id` reports: the host's for box 0 and for the
+    /// kinds a box does not separate (`user`, `cgroup`), a per-box one otherwise.
+    #[must_use]
+    pub const fn inode_in_box(self, box_id: u64) -> u64 {
+        match self {
+            Self::User | Self::Cgroup => self.host_inode(),
+            _ if box_id == 0 => self.host_inode(),
+            _ => 4_026_600_000 + (box_id % 1_000_000) * 16 + self.host_inode() % 16,
+        }
+    }
+}
+
 /// The files inside a `<pid>/` (or `<tgid>/task/<tid>/`) directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PidFile {
@@ -315,9 +402,16 @@ pub enum Node {
     Net(NetFile),
     SysvipcDir,
     SysvipcMsg,
+    /// `/proc/sys`, `/proc/sys/kernel` and the files in it.
+    SysDir,
+    SysKernelDir,
+    SysKernel(SysKernelFile),
     Pid(PidDir),
     PidFile(PidDir, PidFile),
     FdDir(PidDir),
+    /// `<pid>/ns`, and `<pid>/ns/<name>` (a symlink reading `name:[inode]`).
+    NsDir(PidDir),
+    Ns(PidDir, NsFile),
     /// `<pid>/fd/<n>`, a symlink.
     Fd(PidDir, u32),
     /// `<tgid>/task`, listing the group's live thread ids.
@@ -331,12 +425,15 @@ impl Node {
             Self::Root
             | Self::NetDir
             | Self::SysvipcDir
+            | Self::SysDir
+            | Self::SysKernelDir
             | Self::Pid(_)
             | Self::FdDir(_)
+            | Self::NsDir(_)
             | Self::TaskDir(_) => Kind::Dir,
-            Self::SelfLink | Self::Fd(..) => Kind::Symlink,
+            Self::SelfLink | Self::Fd(..) | Self::Ns(..) => Kind::Symlink,
             Self::PidFile(_, f) => f.kind(),
-            Self::Global(_) | Self::Net(_) | Self::SysvipcMsg => Kind::File,
+            Self::Global(_) | Self::Net(_) | Self::SysvipcMsg | Self::SysKernel(_) => Kind::File,
         }
     }
 
@@ -344,7 +441,7 @@ impl Node {
     #[must_use]
     pub const fn owner(self) -> Option<Pid> {
         match self {
-            Self::Pid(v) | Self::PidFile(v, _) | Self::FdDir(v) | Self::Fd(v, _) => Some(v.pid),
+            Self::Pid(v) | Self::PidFile(v, _) | Self::FdDir(v) | Self::Fd(v, _) | Self::NsDir(v) | Self::Ns(v, _) => Some(v.pid),
             Self::TaskDir(tgid) => Some(tgid),
             _ => None,
         }
@@ -366,9 +463,14 @@ impl Node {
             Self::Net(f) => write!(out, "net/{}", f.name()),
             Self::SysvipcDir => out.write_str("sysvipc"),
             Self::SysvipcMsg => out.write_str("sysvipc/msg"),
+            Self::SysDir => out.write_str("sys"),
+            Self::SysKernelDir => out.write_str("sys/kernel"),
+            Self::SysKernel(f) => write!(out, "sys/kernel/{}", f.name()),
             Self::Pid(v) => write!(out, "{}", v.pid),
             Self::PidFile(v, f) => write!(out, "{}/{}", v.pid, f.name()),
             Self::FdDir(v) => write!(out, "{}/fd", v.pid),
+            Self::NsDir(v) => write!(out, "{}/ns", v.pid),
+            Self::Ns(v, f) => write!(out, "{}/ns/{}", v.pid, f.name()),
             Self::Fd(v, n) => write!(out, "{}/fd/{n}", v.pid),
             Self::TaskDir(tgid) => write!(out, "{tgid}/task"),
         }
@@ -484,6 +586,14 @@ pub fn resolve<M: ProcModel + ?Sized>(m: &M, path: &str) -> Option<Node> {
             None => Some(Node::NetDir),
             Some(name) => NetFile::ALL.into_iter().find(|f| f.name() == name).map(Node::Net),
         },
+        "sys" => match rest {
+            None => Some(Node::SysDir),
+            Some("kernel") => Some(Node::SysKernelDir),
+            Some(r) => r
+                .strip_prefix("kernel/")
+                .and_then(|n| SysKernelFile::ALL.into_iter().find(|f| f.name() == n))
+                .map(Node::SysKernel),
+        },
         "sysvipc" if m.features().sysvipc => match rest {
             None => Some(Node::SysvipcDir),
             Some("msg") => Some(Node::SysvipcMsg),
@@ -517,6 +627,15 @@ fn resolve_in_pid<M: ProcModel + ?Sized>(m: &M, view: PidDir, rest: Option<&str>
                     let n = parse_num(n)?;
                     fd_exists(m, view.pid, n).then_some(Node::Fd(view, n))
                 }
+            }
+        }
+        "ns" => {
+            if !visible(m, view.pid) {
+                return None;
+            }
+            match rest {
+                None => Some(Node::NsDir(view)),
+                Some(n) => NsFile::ALL.into_iter().find(|f| f.name() == n).map(|f| Node::Ns(view, f)),
             }
         }
         "task" => {
@@ -613,6 +732,7 @@ pub fn list_node<M: ProcModel + ?Sized>(
             if m.features().sysvipc {
                 emit("sysvipc", Kind::Dir);
             }
+            emit("sys", Kind::Dir);
             if m.current_tgid().is_some() {
                 emit("self", Kind::Symlink);
             }
@@ -626,6 +746,16 @@ pub fn list_node<M: ProcModel + ?Sized>(
         }
         Node::SysvipcDir => {
             emit("msg", Kind::File);
+            Ok(())
+        }
+        Node::SysDir => {
+            emit("kernel", Kind::Dir);
+            Ok(())
+        }
+        Node::SysKernelDir => {
+            for f in SysKernelFile::ALL {
+                emit(f.name(), Kind::File);
+            }
             Ok(())
         }
         Node::TaskDir(tgid) => {
@@ -642,9 +772,16 @@ pub fn list_node<M: ProcModel + ?Sized>(
             });
             Ok(())
         }
+        Node::NsDir(_) => {
+            for f in NsFile::ALL {
+                emit(f.name(), Kind::Symlink);
+            }
+            Ok(())
+        }
         Node::Pid(view) => {
             if visible(m, view.pid) {
                 emit("fd", Kind::Dir);
+                emit("ns", Kind::Dir);
                 if task_dir_exists(m, view) {
                     emit("task", Kind::Dir);
                 }
@@ -660,7 +797,9 @@ pub fn list_node<M: ProcModel + ?Sized>(
         | Node::Global(_)
         | Node::Net(_)
         | Node::SysvipcMsg
+        | Node::SysKernel(_)
         | Node::PidFile(..)
+        | Node::Ns(..)
         | Node::Fd(..) => Err(ListError::NotADirectory),
     }
 }

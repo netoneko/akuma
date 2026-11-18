@@ -325,6 +325,26 @@ fn canonical(path: &str) -> Canonical<'_> {
 /// inode of its own ancestor `<tgid>` — `find` and `rg --follow` read an
 /// ancestor's `(st_dev, st_ino)` reappearing below it as a filesystem loop.
 /// The old hash was of the aliased path, which made it exactly that.
+/// What `readlink /proc/<pid>/ns/<name>` says: `name:[inode]`, written into
+/// `buf` (no allocation). `None` when the process is gone.
+fn ns_link(pid: Pid, f: tree::NsFile, buf: &mut [u8; 40]) -> Option<&[u8]> {
+    let box_id = process::lookup_process_shared(pid)?.box_id;
+    let mut pos = 0;
+    let _ = write!(
+        akuma_primitives::console::FmtBuf { buf: &mut buf[..], pos: &mut pos },
+        "{}:[{}]",
+        f.name(),
+        f.inode_in_box(box_id)
+    );
+    Some(&buf[..pos])
+}
+
+/// `sys/kernel/<name>` (relative to the mount) as the file it names.
+fn sys_kernel_file(path: &str) -> Option<tree::SysKernelFile> {
+    let name = path.strip_prefix("sys/kernel/")?;
+    tree::SysKernelFile::ALL.into_iter().find(|f| f.name() == name)
+}
+
 fn node_inode(node: Node) -> u64 {
     let mut buf = [0u8; CANONICAL_MAX];
     let len = write_canonical(node, &mut buf);
@@ -337,7 +357,7 @@ fn node_inode(node: Node) -> u64 {
         mix(b);
     }
     let thread_of = match node {
-        Node::Pid(v) | Node::PidFile(v, _) | Node::FdDir(v) | Node::Fd(v, _) => v.thread_of,
+        Node::Pid(v) | Node::PidFile(v, _) | Node::FdDir(v) | Node::Fd(v, _) | Node::NsDir(v) | Node::Ns(v, _) => v.thread_of,
         _ => None,
     };
     if let Some(tgid) = thread_of {
@@ -801,7 +821,7 @@ impl ProcFilesystem {
         const LINK: u32 = 0o120_777;
 
         Ok(match node {
-            Node::Root | Node::NetDir | Node::SysvipcDir | Node::Pid(_) | Node::FdDir(_) => {
+            Node::Root | Node::NetDir | Node::SysvipcDir | Node::SysDir | Node::SysKernelDir | Node::Pid(_) | Node::FdDir(_) | Node::NsDir(_) => {
                 meta(DIR, 0, None)
             }
             // A link count of `2 + threads`, as on Linux — Chromium reads
@@ -855,6 +875,11 @@ impl ProcFilesystem {
                 }
             },
             Node::Net(_) | Node::SysvipcMsg => meta(RO, 0, None),
+            Node::Ns(v, f) => {
+                let mut buf = [0u8; 40];
+                meta(LINK, ns_link(v.pid, f, &mut buf).map_or(0, <[u8]>::len) as u64, None)
+            }
+            Node::SysKernel(f) => meta(RO, f.contents().len() as u64, None),
             Node::PidFile(v, f) => match f {
                 PidFile::Mounts => {
                     let mut probe = [0u8; 2048];
@@ -1059,6 +1084,13 @@ pub fn proc_fd_description(path: &str) -> Option<String> {
     };
 
     let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() == 3 && parts[1] == "ns" {
+        let pid: Pid = parts[0].parse().ok()?;
+        let f = tree::NsFile::ALL.into_iter().find(|f| f.name() == parts[2])?;
+        let mut buf = [0u8; 40];
+        let text = ns_link(pid, f, &mut buf)?;
+        return Some(String::from(core::str::from_utf8(text).ok()?));
+    }
     if parts.len() == 3 && parts[1] == "fd" {
         let pid: Pid = parts[0].parse().ok()?;
         let fd: u32 = parts[2].parse().ok()?;
@@ -1154,6 +1186,15 @@ impl Filesystem for ProcFilesystem {
         // /proc/meminfo, /proc/stat, /proc/uptime, /proc/loadavg — rendered
         // straight into the caller's buffer, no intermediate `Vec`: this is
         // what busybox `top`/`free` re-`read()` on every refresh.
+        if let Some(f) = sys_kernel_file(path) {
+            let data = f.contents();
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(data.len() - offset);
+            buf[..n].copy_from_slice(&data[offset..offset + n]);
+            return Ok(n);
+        }
         if path == "cpuinfo" {
             return Ok(cpuinfo_read(offset, buf));
         }
@@ -1438,6 +1479,9 @@ impl Filesystem for ProcFilesystem {
         // exists for callers that want the whole file as a `Vec` (e.g. `cat`
         // via a full-file read), so the one allocation below is the trait
         // boundary's, not this renderer's.
+        if let Some(f) = sys_kernel_file(path) {
+            return Ok(f.contents().to_vec());
+        }
         if path == "cpuinfo" {
             let mut v = alloc::vec![0u8; cpuinfo_len()];
             let n = cpuinfo_read(0, &mut v);
