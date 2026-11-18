@@ -55,7 +55,8 @@ pub(super) fn bind(fd: u32) -> Option<u64> {
 }
 
 /// `sendto`/`sendmsg` on a netlink socket: queue an acknowledgement for each message that asked for one.
-pub(super) fn send(fd: u32, buf_ptr: u64, len: usize) -> Option<u64> {
+pub(super) fn send(fd: u32, buf_ptr: UserAddr, len: usize) -> Option<u64> {
+    let buf_ptr = buf_ptr.get();
     let acks = acks_of(fd)?;
     if len > 4096 {
         return Some(Errno::EMSGSIZE.ret());
@@ -85,7 +86,8 @@ pub(super) fn send(fd: u32, buf_ptr: u64, len: usize) -> Option<u64> {
 
 /// `recvfrom`/`recvmsg` on a netlink socket: the oldest acknowledgement, or `EAGAIN` when there is none (this stub
 /// never blocks: an ack is queued by the send that earns it).
-pub(super) fn recv(fd: u32, buf_ptr: u64, len: usize) -> Option<u64> {
+pub(super) fn recv(fd: u32, buf_ptr: UserAddr, len: usize) -> Option<u64> {
+    let buf_ptr = buf_ptr.get();
     let acks = acks_of(fd)?;
     let Some(req) = acks.pop() else { return Some(EAGAIN) };
     let mut ack = [0u8; ACK_LEN];

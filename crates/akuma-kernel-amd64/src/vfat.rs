@@ -25,6 +25,7 @@
 //! plausible.
 
 use crate::fd::errno;
+use akuma_syscalls_glue::UserAddr;
 use akuma_vfat::{BlockDevice, Vfat};
 use alloc::string::String;
 use alloc::sync::Arc;
@@ -93,8 +94,8 @@ fn nvme_partition(source: &str) -> Option<u32> {
 /// Serve `mount(source, target, fstype, flags, data)` if `fstype` is a FAT
 /// spelling. `None`: not ours, hand the call to glue.
 #[must_use]
-pub fn try_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) -> Option<u64> {
-    let fstype = crate::uaccess::read_cstr(fstype_ptr, 64)?;
+pub fn try_mount(source_ptr: UserAddr, target_ptr: UserAddr, fstype_ptr: UserAddr, flags: u64) -> Option<u64> {
+    let fstype = crate::uaccess::read_cstr(fstype_ptr.get(), 64)?;
     let fstype = String::from_utf8(fstype).ok()?;
     // A remount names no new device: glue flips the flags of whatever is mounted there.
     if !is_fat_type(&fstype) || flags & akuma_vfs::MS_REMOUNT != 0 {
@@ -103,13 +104,13 @@ pub fn try_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) 
     Some(mount_fat(source_ptr, target_ptr, flags))
 }
 
-fn mount_fat(source_ptr: u64, target_ptr: u64, flags: u64) -> u64 {
+fn mount_fat(source_ptr: UserAddr, target_ptr: UserAddr, flags: u64) -> u64 {
     let Some(root) = akuma_exec::process::host_root() else {
         return errno::EPERM;
     };
     let (Some(target), Some(source)) = (
-        crate::uaccess::read_cstr(target_ptr, 256).and_then(|b| String::from_utf8(b).ok()),
-        crate::uaccess::read_cstr(source_ptr, 64).and_then(|b| String::from_utf8(b).ok()),
+        crate::uaccess::read_cstr(target_ptr.get(), 256).and_then(|b| String::from_utf8(b).ok()),
+        crate::uaccess::read_cstr(source_ptr.get(), 64).and_then(|b| String::from_utf8(b).ok()),
     ) else {
         return errno::EFAULT;
     };

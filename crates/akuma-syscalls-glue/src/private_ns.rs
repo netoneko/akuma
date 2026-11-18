@@ -90,7 +90,8 @@ pub fn clone_namespace(flags: u64) -> Result<Option<(u64, Arc<akuma_isolation::N
 }
 
 /// `mount(2)` by the builder of a private namespace. Acts on that namespace only.
-pub(super) fn mount(tok: NsCreator, source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) -> SysResult {
+pub(super) fn mount(tok: NsCreator, source_ptr: UserAddr, target_ptr: UserAddr, fstype_ptr: UserAddr, flags: u64) -> SysResult {
+    let (source_ptr, target_ptr, fstype_ptr) = (source_ptr.get(), target_ptr.get(), fstype_ptr.get());
     // Propagation changes (`mount --make-rslave /`) have nothing to do: a private namespace shares no subtree.
     if flags & MS_PROPAGATION != 0 && flags & (MS_BIND | MS_REMOUNT) == 0 {
         return Ok(0);
@@ -181,7 +182,8 @@ pub(super) fn umount(target: &str) -> Option<SysResult> {
 }
 
 /// `pivot_root(new_root, put_old)`: only the builder of a private namespace, once.
-pub(super) fn pivot_root(new_ptr: u64, old_ptr: u64) -> SysResult {
+pub(super) fn pivot_root(new_ptr: UserAddr, old_ptr: UserAddr) -> SysResult {
+    let (new_ptr, old_ptr) = (new_ptr.get(), old_ptr.get());
     let Some(tok) = akuma_exec::process::ns_creator() else { return Err(Errno::EPERM) };
     let new_root = absolute(&copy_from_user_str(new_ptr, 4096)?);
     let put_old = absolute(&copy_from_user_str(old_ptr, 4096)?);

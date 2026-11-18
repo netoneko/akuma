@@ -971,7 +971,7 @@ pub fn sys_read(fd_num: u64, buf_ptr: UserAddr, count: usize) -> u64 {
         }
         #[cfg(feature = "sc-eventfd")]
         akuma_exec::process::FileDescriptor::SignalFd { mask } => {
-            super::signalfd::signalfd_read(mask, buf_ptr, count, super::net::fd_is_nonblock(fd_num as u32))
+            super::signalfd::signalfd_read(mask, UserAddr::new(buf_ptr), count, super::net::fd_is_nonblock(fd_num as u32))
         }
         #[cfg(feature = "sc-eventfd")]
         akuma_exec::process::FileDescriptor::EventFd(efd_id) => {

@@ -191,7 +191,7 @@ pub(super) fn sys_mount(
         // The one boxed process that may mount: the builder of a private namespace, into that namespace only.
         #[cfg(feature = "sc-private-ns")]
         if let Some(tok) = akuma_exec::process::ns_creator() {
-            return super::private_ns::mount(tok, source_ptr, target_ptr, fstype_ptr, flags);
+            return super::private_ns::mount(tok, UserAddr::new(source_ptr), UserAddr::new(target_ptr), UserAddr::new(fstype_ptr), flags);
         }
         // A mount refused inside a private namespace is worth a line: it is a locked namespace (after `pivot_root`)
         // and the caller is a program that expected to be able to mount.
@@ -411,7 +411,7 @@ fn build_bind(data_ptr: UserAddr, read_only: bool) -> Result<alloc::sync::Arc<dy
 /// `pivot_root(new_root, put_old)` — see `private_ns`. Refused for everyone but the builder of a private namespace.
 #[cfg(feature = "sc-private-ns")]
 pub(super) fn sys_pivot_root(new_ptr: UserAddr, old_ptr: UserAddr) -> SysResult {
-    super::private_ns::pivot_root(new_ptr.get(), old_ptr.get())
+    super::private_ns::pivot_root(new_ptr, old_ptr)
 }
 
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: UserAddr, target_len: usize, fstype_ptr: UserAddr, fstype_len: usize, data_ptr: UserAddr) -> SysResult {

@@ -636,7 +636,12 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
         Syscall::Mount => {
             // FAT spellings are this kernel's (feature `vfat`); everything else is glue's.
             #[cfg(feature = "vfat")]
-            let ours = crate::vfat::try_mount(a1, a2, a3, a4);
+            let ours = crate::vfat::try_mount(
+                akuma_syscalls_glue::UserAddr::new(a1),
+                akuma_syscalls_glue::UserAddr::new(a2),
+                akuma_syscalls_glue::UserAddr::new(a3),
+                a4,
+            );
             #[cfg(not(feature = "vfat"))]
             let ours: Option<u64> = None;
             ours.unwrap_or_else(|| to_glue(call, [a1, a2, a3, a4, a5, 0]))

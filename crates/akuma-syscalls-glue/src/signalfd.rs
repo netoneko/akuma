@@ -45,7 +45,8 @@ fn record(sig: u32) -> [u8; SSI_SIZE] {
 }
 
 /// `read` on a signalfd, in syscall-return form.
-pub fn signalfd_read(mask: u64, buf_ptr: u64, count: usize, nonblock: bool) -> u64 {
+pub fn signalfd_read(mask: u64, buf_ptr: UserAddr, count: usize, nonblock: bool) -> u64 {
+    let buf_ptr = buf_ptr.get();
     if count < SSI_SIZE {
         return EINVAL;
     }

@@ -589,7 +589,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, de
         return flat(unix_send_user(fd, UserAddr::new(buf_ptr), len, _flags, dest_addr, addr_len));
     }
     #[cfg(feature = "sc-private-ns")]
-    if let Some(r) = super::netlink::send(fd, buf_ptr, len) {
+    if let Some(r) = super::netlink::send(fd, UserAddr::new(buf_ptr), len) {
         return r;
     }
     let _net_bkl = NetBklGuard::new();
@@ -689,7 +689,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, 
         return unix_recv_user(fd, UserAddr::new(buf_ptr), len, _flags).0;
     }
     #[cfg(feature = "sc-private-ns")]
-    if let Some(r) = super::netlink::recv(fd, buf_ptr, len) {
+    if let Some(r) = super::netlink::recv(fd, UserAddr::new(buf_ptr), len) {
         return r;
     }
     let _net_bkl = NetBklGuard::new();
@@ -777,7 +777,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, _d
         return flat(unix_send_user(fd, buf_ptr, len, _flags, _dest_addr, _addr_len));
     }
     #[cfg(feature = "sc-private-ns")]
-    if let Some(r) = super::netlink::send(fd, buf_ptr.get(), len) {
+    if let Some(r) = super::netlink::send(fd, buf_ptr, len) {
         return r;
     }
     EBADF
@@ -789,7 +789,7 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, 
         return unix_recv_user(fd, buf_ptr, len, _flags).0;
     }
     #[cfg(feature = "sc-private-ns")]
-    if let Some(r) = super::netlink::recv(fd, buf_ptr.get(), len) {
+    if let Some(r) = super::netlink::recv(fd, buf_ptr, len) {
         return r;
     }
     EBADF
