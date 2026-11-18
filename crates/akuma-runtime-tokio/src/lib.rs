@@ -64,12 +64,12 @@ static KERNEL: akuma_primitives::OnceCopy<Kernel> = akuma_primitives::OnceCopy::
 /// `None` keeps the file absent rather than empty.
 #[cfg(feature = "procfs-diag")]
 fn pid_auxv_of(pid: u32) -> Option<alloc::vec::Vec<(u64, u64)>> {
-    let direct = akuma_exec::process::with_process(pid, |p| p.auxv.clone()).flatten();
+    let direct = akuma_exec::process::with_process(pid, |p| p.auxv.lock().clone()).flatten();
     if direct.is_some() {
         return direct;
     }
     let tgid = akuma_exec::process::with_process(pid, |p| p.tgid)?;
-    akuma_exec::process::with_process(tgid, |p| p.auxv.clone()).flatten()
+    akuma_exec::process::with_process(tgid, |p| p.auxv.lock().clone()).flatten()
 }
 
 /// Register the kernel's half and install every hook a tokio kernel needs. Call

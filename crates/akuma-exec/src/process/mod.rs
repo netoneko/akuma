@@ -823,7 +823,7 @@ pub struct Process {
     /// the `procfs-diag` feature — where the file stays *absent rather than
     /// empty*, the `maps` rule.
     #[cfg(feature = "procfs-diag")]
-    pub auxv: Option<Vec<(u64, u64)>>,
+    pub auxv: Spinlock<Option<Vec<(u64, u64)>>>,
     pub fds: Arc<SharedFdTable>,
     pub thread_id: OptTidCell,
     pub spawner_pid: Option<Pid>,
@@ -1031,7 +1031,7 @@ impl Process {
             initial_brk: AtomicUsize::new(parent.initial_brk.load(Ordering::Relaxed)),
             memory: parent.memory.clone(),
             #[cfg(feature = "procfs-diag")]
-            auxv: parent.auxv.clone(),
+            auxv: Spinlock::new(parent.auxv.lock().clone()),
             cwd: StrCell::new(parent.cwd.get()),
             root: StrCell::new(parent.root.get()),
             stdin: parent.stdin.clone(),   // shared
@@ -4240,7 +4240,7 @@ pub fn make_test_process(pid: u32) -> alloc::boxed::Box<Process> {
         pid, pgid: PidCell::new(pid), tgid: pid,
         state: AtomicProcessState::new(ProcessState::Ready),
         #[cfg(feature = "procfs-diag")]
-        auxv: None,
+        auxv: Spinlock::new(None),
         address_space: ProcAddressSpace::new(addr_space),
         image: Spinlock::new(ProcessImage {
             name: "test".to_string(),

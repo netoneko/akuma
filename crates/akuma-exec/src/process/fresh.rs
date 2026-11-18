@@ -113,7 +113,7 @@ impl Process {
             dynamic_page_tables: Vec::new(),
             mmap_regions: AssistedSpinlock::new(mmap_regions),
             #[cfg(feature = "procfs-diag")]
-            auxv: None,
+            auxv: Spinlock::new(None),
             fds,
             thread_id: OptTidCell::new_live(thread_id),
             // Set when spawned by another process.

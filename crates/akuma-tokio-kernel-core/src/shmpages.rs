@@ -31,8 +31,6 @@ use akuma_primitives::FileKey;
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use akuma_fpcache_rw::{Generations, Key, Publish, Refs, Table, write_span, zero_span};
-use akuma_primitives::irq::with_irqs_disabled;
-use spinning_top::Spinlock;
 
 static TABLE: akuma_irq_lock::IrqSpinlock<Table> = akuma_irq_lock::IrqSpinlock::new(Table::new());
 
@@ -84,7 +82,9 @@ fn with_table<R>(f: impl FnOnce(&mut Table) -> R) -> R {
 
 /// The key for page `index` of `inode` on the root filesystem.
 pub fn key(inode: u32, index: u64) -> Key {
-    Key::new(ROOT_MOUNT.load(Ordering::Relaxed), inode, index as usize * 4096)
+    // The fields, not `Key::new(FileKey, ..)`: a zero mount or inode (no root yet, no inode) must still give a key, an
+    // unshareable one, which `FileKey` cannot express.
+    Key { inode, mount_id: ROOT_MOUNT.load(Ordering::Relaxed), offset: index as usize * 4096 }
 }
 
 /// The frame for `key` with a reference taken for the caller's mapping, which
@@ -195,10 +195,10 @@ fn active() -> bool {
 /// frame itself (a write-back handing `write_at` the physmap) is skipped:
 /// copying it onto itself could undo a peer's store landing in between.
 fn wrote(key: FileKey, offset: usize, data: &[u8]) {
-    let (mount_id, inode) = key.parts();
+    let (_, inode) = key.parts();
     GENS.bump(inode);
     with_table(|t| {
-        t.for_each_in(mount_id, inode, offset, offset.saturating_add(data.len()), |page_off, pa| {
+        t.for_each_in(key, offset, offset.saturating_add(data.len()), |page_off, pa| {
             let Some(s) = write_span(page_off, offset, data.len()) else {
                 return;
             };
@@ -216,11 +216,11 @@ fn wrote(key: FileKey, offset: usize, data: &[u8]) {
 /// `MappedFileHooks::zeroed`: bytes `[from, to)` of the file read zero now
 /// (truncate, hole punch), and so must the mapped frames.
 fn zeroed(key: FileKey, from: usize, to: usize) {
-    let (mount_id, inode) = key.parts();
+    let (_, inode) = key.parts();
     static ZEROS: [u8; 4096] = [0; 4096];
     GENS.bump(inode);
     with_table(|t| {
-        t.for_each_in(mount_id, inode, from, to, |page_off, pa| {
+        t.for_each_in(key, from, to, |page_off, pa| {
             if let Some((a, b)) = zero_span(page_off, from, to) {
                 let _ = akuma_mmu::copy_to_phys(pa + a, &ZEROS[..b - a]);
             }

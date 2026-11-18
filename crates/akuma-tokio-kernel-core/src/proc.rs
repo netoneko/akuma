@@ -226,7 +226,7 @@ pub fn bind_init<M: Proc>(path: &str, ti: &TaskImage) -> Option<usize> {
     // pid 1 never execve'd, so this registration is the only retention point.
     #[cfg(feature = "procfs-diag")]
     akuma_exec::process::with_process(1, |p| {
-        p.auxv = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
     });
     INIT_TID.store(tid, Relaxed);
     Some(tid)
@@ -513,7 +513,13 @@ pub fn thread<M: Proc>(flags: u64, stack: u64, ptid: u64, ctid: u64, tls: u64) -
     }
     // The drain is paid at entry, by the one path that consumes `Process` rows.
     collect::<M>();
-    match akuma_exec::process::clone_thread(stack, tls, ptid, ctid, flags) {
+    match akuma_exec::process::clone_thread(
+        stack,
+        tls,
+        akuma_syscalls_glue::UserAddr::new(ptid),
+        akuma_syscalls_glue::UserAddr::new(ctid),
+        flags,
+    ) {
         Ok(tid) => u64::from(tid),
         Err(msg) => {
             safe_print!(160, "[clone] thread refused: {}\n", msg);
@@ -534,7 +540,7 @@ pub fn fork<M: Proc>(child_stack: u64) -> u64 {
     }
     collect::<M>();
     let child_pid = akuma_exec::process::allocate_pid();
-    match akuma_exec::process::fork_process(child_pid, child_stack) {
+    match akuma_exec::process::fork_process(child_pid, akuma_syscalls_glue::UserAddr::new(child_stack)) {
         Ok(pid) => u64::from(pid),
         Err(msg) => {
             safe_print!(192, "[forkp] refused: {}\n", msg);
@@ -583,7 +589,15 @@ const SHEBANG_MAX_DEPTH: usize = 4;
 pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> {
     let cur = M::current_slot();
     let mut budget = akuma_syscalls_proc::exec::Budget::new(MAX_STRS, STR_MAX, ARG_BYTES_MAX);
-    let req = akuma_syscalls_glue::execve::read_request(path, argv, envp, ARGV_MAX, ENV_MAX, &mut budget)?;
+    let req = akuma_syscalls_glue::execve::read_request(
+        akuma_syscalls_glue::UserAddr::new(path),
+        akuma_syscalls_glue::UserAddr::new(argv),
+        akuma_syscalls_glue::UserAddr::new(envp),
+        ARGV_MAX,
+        ENV_MAX,
+        &mut budget,
+    )
+    .map_err(akuma_primitives::errno::Errno::ret)?;
     // The loader takes `&str`: an argument that is not UTF-8 cannot reach it.
     let utf8 = |v: Vec<Vec<u8>>| v.into_iter().map(String::from_utf8).collect::<Result<Vec<String>, _>>();
     let (Ok(mut argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
@@ -657,7 +671,7 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
     // (`Process::inherit_from`); this overwrites it at exec, as Linux's does.
     #[cfg(feature = "procfs-diag")]
     akuma_exec::process::with_process(pid, |p| {
-        p.auxv = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
     });
     Ok(ti)
 }

@@ -773,18 +773,24 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, 
 // socket cannot exist without smoltcp, so anything else is EBADF.
 #[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_sendto(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, _dest_addr: u64, _addr_len: usize) -> u64 {
-    let buf_ptr = buf_ptr.get();
     if fd_is_unix_socket(fd) {
         return flat(unix_send_user(fd, buf_ptr, len, _flags, _dest_addr, _addr_len));
+    }
+    #[cfg(feature = "sc-private-ns")]
+    if let Some(r) = super::netlink::send(fd, buf_ptr.get(), len) {
+        return r;
     }
     EBADF
 }
 
 #[cfg(not(feature = "smoltcp"))]
 pub(super) fn sys_recvfrom(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, _src_addr: u64, _addr_len_ptr: UserAddr) -> u64 {
-    let buf_ptr = buf_ptr.get();
     if fd_is_unix_socket(fd) {
         return unix_recv_user(fd, buf_ptr, len, _flags).0;
+    }
+    #[cfg(feature = "sc-private-ns")]
+    if let Some(r) = super::netlink::recv(fd, buf_ptr.get(), len) {
+        return r;
     }
     EBADF
 }

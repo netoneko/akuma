@@ -1813,8 +1813,8 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
         // Off by default (R6); PHASE-2-GETCPU research artifact, D55/D58.
         #[cfg(feature = "getcpu")]
         akuma_syscalls_abi::x86_64::GETCPU => akuma_syscalls_glue::sched::sys_getcpu(
-            fr.arg1(),
-            fr.arg2(),
+            akuma_syscalls_glue::UserAddr::new(fr.arg1()),
+            akuma_syscalls_glue::UserAddr::new(fr.arg2()),
             ring3::cpu_index() as u32,
         ),
         ring3::nr::PAUSE => akuma_syscalls_glue::sys_pause(),

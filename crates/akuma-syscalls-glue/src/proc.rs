@@ -1,4 +1,7 @@
 use super::*;
+// Used only by the box syscalls, which are `akuma-native`'s: a platform kernel builds glue without it (and the workspace
+// denies `unused_imports`).
+#[cfg(feature = "akuma-native")]
 use akuma_exec::process::box_access::{BoxId, CallerBox, SpawnBox};
 
 // Maps child PID → the parent thread's generation-tagged WakeHandle for processes

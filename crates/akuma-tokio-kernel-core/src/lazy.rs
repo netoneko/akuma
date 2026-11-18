@@ -136,8 +136,9 @@ pub fn fill<M: Kernel>(root: u64, va: u64, files: bool) -> Fill {
     // private, which is still correct.
     if let Some(f) = share
         && filled == 4096
+        && let Some(key) = akuma_primitives::FileKey::try_from_raw(FPCACHE_MOUNT, f.inode)
     {
-        akuma_fpcache::insert(FPCACHE_MOUNT, f.inode, f.index as usize * 4096, akuma_mmap::PhysFrame::new(pa), true);
+        akuma_fpcache::insert(key, f.index as usize * 4096, akuma_mmap::PhysFrame::new(pa), true);
     }
     Fill::Present
 }

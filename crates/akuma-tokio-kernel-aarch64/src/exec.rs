@@ -34,7 +34,9 @@ fn exec_runtime() -> ExecRuntime {
         read_file: |path| akuma_vfs_glue::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| akuma_vfs_glue::read_at(path, off, buf).map_err(|_| -1),
         read_at_by_inode: |mount_id, ino, off, buf| {
-            akuma_vfs_glue::read_at_by_mount_inode(mount_id, ino, off, buf).map_err(|_| -1)
+            // A zero mount or inode names no file: the hook's old `-1`.
+            let key = akuma_primitives::FileKey::try_from_raw(mount_id, ino).ok_or(-1)?;
+            akuma_vfs_glue::read_at_by_mount_inode(key, off, buf).map_err(|_| -1)
         },
         resolve_symlinks: akuma_vfs_glue::resolve_symlinks,
         resolve_file_id: |path| akuma_vfs_glue::resolve_file_id(path).ok_or(-1),
