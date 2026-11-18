@@ -241,14 +241,36 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: U
 #[cfg(feature = "smoltcp")]
 const METADATA_IP: [u8; 4] = [169, 254, 169, 254];
 
-/// Whether the caller may send to `ip`. Everything is allowed but one address:
-/// the metadata service, which only the host root may reach. A service that
-/// is compromised, or a program in a box, must not be able to read the
-/// machine's cloud credentials with one HTTP request
-/// (`docs/archive/SECURITY_AUDIT_2026_11_16.md` H4).
+/// Destination policy for the shared IPv4 stack.
+#[cfg(feature = "smoltcp")]
+fn destination_allowed(ip: [u8; 4], private_ns: bool, host_root: bool) -> bool {
+    if private_ns && (ip[0] == 127 || ip == [0; 4]) {
+        return false;
+    }
+    ip != METADATA_IP || host_root
+}
+
+#[cfg(all(test, feature = "smoltcp"))]
+mod destination_tests {
+    use super::destination_allowed;
+
+    #[test]
+    fn private_namespaces_cannot_address_shared_loopback() {
+        for ip in [[127, 0, 0, 1], [127, 255, 255, 254], [0, 0, 0, 0]] {
+            assert!(!destination_allowed(ip, true, false));
+            assert!(destination_allowed(ip, false, true));
+            assert!(destination_allowed(ip, false, false));
+        }
+        assert!(destination_allowed([10, 0, 2, 2], true, false));
+        assert!(!destination_allowed([169, 254, 169, 254], true, false));
+        assert!(destination_allowed([169, 254, 169, 254], false, true));
+    }
+}
+
 #[cfg(feature = "smoltcp")]
 fn egress_allowed(ip: [u8; 4]) -> bool {
-    ip != METADATA_IP || akuma_exec::process::caller_is_host_root()
+    let private_ns = akuma_exec::box_registry::is_private_ns(super::caller_box_and_pid().0);
+    destination_allowed(ip, private_ns, akuma_exec::process::caller_is_host_root())
 }
 
 /// Only host root can bind privileged ports on the shared smoltcp stack.

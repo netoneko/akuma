@@ -83,6 +83,12 @@ impl Creds {
         self.uid == 0 && !self.caps_dropped
     }
 
+    /// Whether the process explicitly discarded its capabilities.
+    #[must_use]
+    pub const fn capabilities_dropped(&self) -> bool {
+        self.caps_dropped
+    }
+
     /// `capset` with empty effective and permitted sets. One-way.
     pub const fn drop_capabilities(&mut self) {
         self.caps_dropped = true;
@@ -135,7 +141,7 @@ impl Creds {
         if uid == self.uid {
             return Ok(());
         }
-        if !self.is_root() {
+        if !self.has_capabilities() {
             return Err(CredError::Perm);
         }
         self.uid = uid;
@@ -160,7 +166,7 @@ impl Creds {
         if gid == self.gid {
             return Ok(());
         }
-        if !self.is_root() {
+        if !self.has_capabilities() {
             return Err(CredError::Perm);
         }
         self.gid = gid;
@@ -176,7 +182,7 @@ impl Creds {
         if groups == self.groups() {
             return Ok(());
         }
-        if !self.is_root() {
+        if !self.has_capabilities() {
             return Err(CredError::Perm);
         }
         self.groups = [0; NGROUPS];

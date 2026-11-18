@@ -219,6 +219,9 @@ mod tests {
         assert!(!may(&dropped, &other, MAY_READ));
         assert!(!may_chmod(&dropped, &other));
         assert!(!may_chown(&dropped, &own, Some(1000), None));
+        assert_eq!(dropped.set_uid(1000), Err(crate::creds::CredError::Perm));
+        assert_eq!(dropped.set_gid(1000), Err(crate::creds::CredError::Perm));
+        assert_eq!(dropped.set_groups(&[1000]), Err(crate::creds::CredError::Perm));
         assert!(may(&Creds::ROOT, &other, MAY_READ));
         assert!(may_chmod(&Creds::ROOT, &other));
         assert!(may_chown(&Creds::ROOT, &own, Some(1000), None));
