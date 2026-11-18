@@ -6,7 +6,7 @@
 //!   climb back to, so a drop is permanent by construction rather than by a check.
 //!   Any call that would split them — `seteuid(1000)` from root, which on Linux
 //!   keeps a saved 0 to return to — is refused with `EPERM`.
-//! - **Only uid 0 may change anything**, and it may change each id exactly once
+//! - **Only uid 0 with capabilities may change anything**, and it may change each id exactly once
 //!   in effect: after `setuid(1000)` nothing is uid 0 any more, so nothing can
 //!   change again.
 //! - **Re-setting the current value always succeeds.** musl implements
@@ -154,7 +154,7 @@ impl Creds {
     }
 
     /// `setresgid(2)` / `setregid(2)` — the [`Self::set_resuid`] rule, gated on
-    /// uid 0 (Linux's `CAP_SETGID`).
+    /// uid 0 with capabilities (Linux's `CAP_SETGID`).
     pub fn set_resgid(
         &mut self,
         r: Option<u32>,

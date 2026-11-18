@@ -71,6 +71,20 @@ use the mount and inode resolved through the caller's filesystem view.
 `/proc/mounts` and `/proc/<pid>/mountinfo` list only namespace mounts when
 the target has its own root.
 
+On the shared smoltcp stack, a private mount namespace cannot initiate IPv4
+traffic to `127.0.0.0/8` or `0.0.0.0`. Box 0 can use loopback normally.
+Connected sockets inherited from the parent remain usable. A private namespace
+therefore has no independently usable loopback network on this stack. Native
+smoltcp sockets currently support IPv4 only. Other network destinations retain
+their existing policy, including the metadata-address restriction.
+
+An explicit empty `capset` enables DAC checks for that credential state even
+when the global DAC switch is off. The dropped process retains uid 0 ownership
+and mode-bit permissions, but loses file permission overrides and cannot change
+its uid, gid or supplementary groups. Fork copies the state, threads share it,
+and exec retains it. A root-owned `0600` file remains readable by uid 0 after a
+drop. Ordinary host root keeps its overrides.
+
 `SubdirFs` resolves `.`/`..` and clamps at the virtual root before prefixing, so
 a `..` cannot ascend out of `box_root` even if a caller reaches the filesystem
 without going through `with_fs`. Mount targets are canonicalized because

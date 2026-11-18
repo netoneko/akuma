@@ -36,7 +36,7 @@ fn attr_of(path: &str) -> Option<Attr> {
 }
 
 /// The caller's credentials, but only if a check could refuse: `None` means
-/// "allowed, nothing to read". Root needs the object only for exec.
+/// "allowed, nothing to read". A caller with capabilities needs the object only for exec.
 fn subject(want: u32) -> Option<Creds> {
     let c = akuma_exec::process::current_creds();
     if !dac::enforcing() && !c.capabilities_dropped() {

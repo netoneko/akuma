@@ -14,8 +14,9 @@ through the caller's VFS view and keyed by mount ID and pinned inode.
 Process-targeted limit, priority and scheduling calls apply box visibility.
 `/proc/mounts` skips the global table when the namespace has its own root.
 
-Loopback service isolation and capability-aware DAC remain open (items 4 and
-6). The accepted uid/gid map writes in item 8 remain a compatibility stub.
+Items 4 and 6 now use the shared-stack loopback and capability-aware DAC
+policies described in `docs/reference/subsystems/containers.md`. The accepted
+uid/gid map writes in item 8 remain a compatibility stub.
 
 ## 1. What is gated today
 
