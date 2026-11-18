@@ -523,7 +523,7 @@ fn bypassed() -> bool {
 }
 
 #[cfg(not(kernel_tests))]
-#[inline(always)]
+#[inline]
 const fn bypassed() -> bool {
     false
 }
