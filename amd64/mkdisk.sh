@@ -758,5 +758,15 @@ printf '<html><body><h1>Akuma/amd64</h1><p>httpd, over virtio-net.</p></body></h
 # their output to `/tmp`, so this target's tcc port follows the same path
 # rather than inventing a different convention.
 "$DEBUGFS" -w -R "mkdir /tmp" "$IMG" >/dev/null 2>&1
+"$DEBUGFS" -w -R "sif /tmp mode 041777" "$IMG" >/dev/null 2>&1
+
+# The mount points a sandbox needs: `/dev` `/sys` `/run` (and `/proc`, `/tmp` above). `bwrap --ro-bind / / --dev /dev
+# --proc /proc` creates each as a mount point inside a read-only bind of `/`, where it cannot create anything, so
+# they have to be real directories on the root filesystem already (`docs/archive/BWRAP_ON_BOXES.md`). Akuma serves
+# `/dev` nodes and `/proc` itself, but still needs the empty directory underneath. A root already formatted with an
+# older image gets them from `overlays/ryzen/install-bwrap.sh`.
+for d in dev sys run; do
+    "$DEBUGFS" -w -R "mkdir /$d" "$IMG" >/dev/null 2>&1
+done
 
 echo "$IMG: ${SIZE_MIB} MiB ext2, /bin/hello, /probe.txt$([ -n "$PAWS" ] && echo ", /bin/paws ($(wc -c < "$PAWS" | tr -d ' ') bytes)")$([ -n "$SSHD" ] && echo ", /bin/sshd")$([ -n "$SSH_CLI" ] && echo ", /bin/ssh")$([ -n "$HERD" ] && echo ", /bin/herd (sshd enabled)")$([ -n "$HGET" ] && echo ", /bin/hget")$([ -n "$WALL" ] && echo ", /bin/wall")$([ -n "$BOX" ] && echo ", /bin/box")$([ -n "$WIFI" ] && echo ", /bin/wifi")$([ -n "$KLOGD" ] && echo ", /bin/klogd")$([ -n "$POWERSAVED" ] && echo ", /bin/powersaved")$([ -f "$AKUMA_CLI" ] && echo ", /bin/akuma")"
