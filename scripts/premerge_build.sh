@@ -4,6 +4,7 @@
 #   scripts/premerge_build.sh                 # all of them, keep going past a failure, summary at the end
 #   scripts/premerge_build.sh --list          # the names, one per line
 #   scripts/premerge_build.sh --only denver   # steps whose name contains any of the comma-separated words
+#   scripts/premerge_build.sh --emit-steps    # name|fast|cargo args, one per line (scripts/gate.py reads the matrix from here)
 #   scripts/premerge_build.sh --fast          # skip the second feature set of each kernel (one build per kernel/arch)
 #
 # Exit status 0 only if every step built. Logs: $LOGDIR (default /tmp/premerge-build-<head>/<step>.log); a failed step
@@ -56,6 +57,7 @@ while [ $# -gt 0 ]; do
     --only) only="$2"; shift ;;
     --fast) fast=1 ;;
     --list) list=1 ;;
+    --emit-steps) printf '%s\n' "${STEPS[@]}"; exit 0 ;;
     -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
     *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
   esac
@@ -71,6 +73,7 @@ head=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 LOGDIR=${LOGDIR:-/tmp/premerge-build-$head}
 mkdir -p "$LOGDIR"
 dirty=$(git status --porcelain --untracked-files=no 2>/dev/null | wc -l | tr -d ' ')
+[ "$(git config core.hooksPath 2>/dev/null)" = scripts/git-hooks ] || echo "warning: the pre-commit hook is not installed in this clone (scripts/install-hooks.sh)" >&2
 echo "premerge_build: $head ($dirty modified tracked files), logs in $LOGDIR"
 [ "$dirty" != 0 ] && echo "  note: the tree is dirty; this builds what is on disk, not what is committed"
 

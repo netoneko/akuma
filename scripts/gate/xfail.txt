@@ -1,0 +1,12 @@
+# Known failures of scripts/gate.py: kernel<TAB>capability<TAB>reason. A listed failure does not fail the gate;
+# a listed capability that passes does (XPASS), so every line is deleted the day it is fixed.
+# Kernel is the job's column: akuma/amd64, taoxichuan/amd64, ...; capability is a gateprobe check, `selftests`,
+# `build`, `host-tests` or a ratchet name (budgets, addr_params, ...).
+taoxichuan/amd64	tcp_loopback	connect/accept over 127.0.0.1 never completes (bind and getsockname work); every other capability passes. Needs a kernel fix; gate found it 2026-11-19.
+shanghai/amd64	tcp_loopback	same as taoxichuan: loopback connect/accept hangs
+denver/amd64	tcp_loopback	same as taoxichuan: loopback connect/accept hangs
+akuma/amd64	tcp_loopback	flaky: passes alone and when run first, times out after the spawn checks have run (2026-11-19); a hang the in-kernel suites do not see
+repo	budgets	copy/mut budgets in docs/reference/{copy,mut}-budget.json are stale on main (ext2 +10, vfs +4, tokio-kernel-core +5, ...): review and run scripts/check_budgets.py --update. Found by the gate 2026-11-19.
+taoxichuan/amd64	many_threads	flaky: the guest stops making progress at ~23 live threads when earlier checks have already run and exited threads and children (terminated slots in the [threads] high-water lines); passes alone (initargs=gateprobe,many_threads). Found by the gate 2026-11-19; suspect thread-slot reuse.
+shanghai/amd64	many_threads	flaky: the guest stops making progress at ~23 live threads when earlier checks have already run and exited threads and children (terminated slots in the [threads] high-water lines); passes alone (initargs=gateprobe,many_threads). Found by the gate 2026-11-19; suspect thread-slot reuse.
+denver/amd64	many_threads	flaky: the guest stops making progress at ~23 live threads when earlier checks have already run and exited threads and children (terminated slots in the [threads] high-water lines); passes alone (initargs=gateprobe,many_threads). Found by the gate 2026-11-19; suspect thread-slot reuse.

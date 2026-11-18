@@ -9,6 +9,7 @@ Start from the symptom or task on the left.
 
 | You are... | Read |
 |---|---|
+| About to **merge to main**, or a shared crate (`akuma-syscalls-glue`, `akuma-exec`, `akuma-user-access`, `akuma-tokio-kernel-core`) changed | [`merge-gate.md`](merge-gate.md) — `scripts/gate.py`: all 16 kernel builds, every amd64 kernel booted on `gateprobe`, a capability x kernel matrix, ~2-5 min; `xfail.txt` for known failures |
 | Booting a VM and connecting via SSH | [`boot-and-connect.md`](boot-and-connect.md) |
 | Testing Akuma/amd64 on **ryzen** (the Lenovo laptop), unattended: boot once, log to its NVMe disk, come back to Pop | [`../../overlays/ryzen/README.md`](../../overlays/ryzen/README.md) — `bootctl set-oneshot`, the `qemu.sh DISK=nvme` rehearsal with ryzen's exact GPT (**run it before every metal boot**), `autoreboot`, reading `/var/log/ryzen` from p3, and the delay side channel for boots that leave no log |
 | Run the unmodified `firecracker` on Akuma (`/dev/kvm`; TCG rehearsal, then the ryzen) | [`run-firecracker-on-akuma.md`](run-firecracker-on-akuma.md) |

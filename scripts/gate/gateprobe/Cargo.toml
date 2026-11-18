@@ -1,0 +1,15 @@
+[package]
+name = "gateprobe"
+version = "0.1.0"
+edition = "2021"
+description = "The per-kernel capability probe: one static musl binary, std only, one PASS/FAIL line per capability"
+
+# Its own workspace: built on the host for x86_64-unknown-linux-musl (no C toolchain needed for a
+# pure-std program) and run as `init=` by scripts/gate.py.
+[workspace]
+
+[dependencies]
+
+[profile.release]
+opt-level = 2
+panic = "abort"
