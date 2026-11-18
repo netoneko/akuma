@@ -78,6 +78,7 @@ pub mod flags;
 pub mod io;
 pub mod net;
 pub mod nr;
+pub mod seccomp;
 pub mod proc;
 pub mod sched;
 pub mod signal;
@@ -127,7 +128,7 @@ mod tests {
             ("SET_TID_ADDRESS", SET_TID_ADDRESS), ("EXIT_GROUP", EXIT_GROUP),
             ("RT_SIGPROCMASK", RT_SIGPROCMASK), ("RT_SIGACTION", RT_SIGACTION),
             ("RT_SIGRETURN", RT_SIGRETURN), ("RT_SIGSUSPEND", RT_SIGSUSPEND),
-            ("GETRANDOM", GETRANDOM), ("GETCWD", GETCWD), ("FCNTL", FCNTL),
+            ("SECCOMP", SECCOMP), ("GETRANDOM", GETRANDOM), ("GETCWD", GETCWD), ("FCNTL", FCNTL),
             ("DUP", DUP), ("FSTATFS", FSTATFS), ("STATFS", STATFS), ("DUP3", DUP3),
             ("PIPE2", PIPE2), ("NEWFSTATAT", NEWFSTATAT), ("FACCESSAT", FACCESSAT),
             ("CLOCK_GETTIME", CLOCK_GETTIME), ("CLOCK_SETTIME", CLOCK_SETTIME),

@@ -289,6 +289,7 @@ dependencies = [
  "akuma-phys",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-syscalls",
  "akuma-syscalls-linux",
  "akuma-trap-aarch64",
 ]
@@ -321,6 +322,7 @@ dependencies = [
  "akuma-mmu",
  "akuma-pmm",
  "akuma-primitives",
+ "akuma-seccomp",
  "akuma-slot-table",
  "akuma-syscalls-linux",
  "akuma-syscalls-log",
@@ -1035,6 +1037,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "akuma-seccomp"
+version = "0.1.0"
+
+[[package]]
 name = "akuma-selftest"
 version = "0.1.0"
 
@@ -1091,6 +1097,7 @@ dependencies = [
 name = "akuma-syscalls"
 version = "0.1.0"
 dependencies = [
+ "akuma-seccomp",
  "akuma-syscalls-linux",
 ]
 
@@ -1128,6 +1135,7 @@ dependencies = [
  "akuma-pod",
  "akuma-primitives",
  "akuma-reclock",
+ "akuma-seccomp",
  "akuma-syscalls",
  "akuma-syscalls-eventfd",
  "akuma-syscalls-ipc",

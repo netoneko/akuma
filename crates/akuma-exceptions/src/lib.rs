@@ -1406,6 +1406,17 @@ pub fn syscall_is_non_restartable(nr: u64) -> bool {
 /// rt_sigframe on the user stack and redirecting ELR to the handler.
 /// Returns true if delivery succeeded (caller should return signal number as x0).
 fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault: bool, entry_esr: u64) -> bool {
+    deliver_signal_frame(frame, signal, fault_addr, is_fault, entry_esr, None)
+}
+
+fn deliver_signal_frame(
+    frame: FrameHandle,
+    signal: u32,
+    fault_addr: u64,
+    is_fault: bool,
+    entry_esr: u64,
+    seccomp: Option<akuma_syscalls::seccomp::Trap>,
+) -> bool {
     // Record the delivery for the blocking-syscall EINTR path BEFORE anything can
     // return early. `take_pending_signal` has already cleared the pending bit at
     // every caller, so this record is the only remaining evidence that this thread
@@ -1534,7 +1545,7 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
     // (asyncPreempt2 may grow the goroutine stack into goroutine variables).
     // Re-pend the signal so it is retried at the next syscall boundary, by
     // which time mstart will have called sigaltstack.
-    if (action.flags & SA_ONSTACK) != 0 && alt_sp == 0 {
+    if (action.flags & SA_ONSTACK) != 0 && alt_sp == 0 && seccomp.is_none() {
         safe_print!(128,
             "[signal] sig {} needs sigaltstack but slot {} has none — re-pending\n",
             signal, thread_slot);
@@ -1542,32 +1553,31 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
         return false;
     }
 
-    if alt_sp != 0 {
-        let alt_lo = alt_sp as usize;
-        let alt_hi = alt_lo + alt_size as usize;
-        if user_sp >= alt_lo && user_sp < alt_hi {
-            if !is_fault {
-                // Non-fault signal (e.g. SIGURG async preemption) arrived while Go's
-                // signal handler is running on sigaltstack.  Re-pend it for delivery
-                // after sigreturn instead of silently dropping it.  Mirrors the
-                // existing re-pend path for when sigaltstack isn't configured yet
-                // (lines above).  The caller will NOT kill the process.
-                safe_print!(128,
-                    "[signal] sig {} re-entrant on sigaltstack (sp={:#x} in [{:#x},{:#x})) \
-                     — re-pending\n",
-                    signal, user_sp, alt_lo, alt_hi);
-                akuma_exec::threading::pend_signal_for_thread(thread_slot, signal);
-            } else {
-                // Fatal signal (e.g. re-entrant SIGSEGV) while inside a signal handler —
-                // genuine unrecoverable crash.  The data-abort caller falls through to
-                // return_to_kernel(-11).
-                safe_print!(128,
-                    "[signal] sig {} re-entrant FAULT at {:#x} (sp={:#x} on sigaltstack \
-                     [{:#x},{:#x})) — killing process\n",
-                    signal, fault_addr, user_sp, alt_lo, alt_hi);
-            }
-            return false;
+    let alt_lo = alt_sp as usize;
+    let alt_hi = alt_lo.saturating_add(alt_size as usize);
+    let already_on_altstack = alt_sp != 0 && (alt_lo..alt_hi).contains(&user_sp);
+    if seccomp.is_none() && already_on_altstack {
+        if !is_fault {
+            // Non-fault signal (e.g. SIGURG async preemption) arrived while Go's
+            // signal handler is running on sigaltstack.  Re-pend it for delivery
+            // after sigreturn instead of silently dropping it.  Mirrors the
+            // existing re-pend path for when sigaltstack isn't configured yet
+            // (lines above).  The caller will NOT kill the process.
+            safe_print!(128,
+                "[signal] sig {} re-entrant on sigaltstack (sp={:#x} in [{:#x},{:#x})) \
+                 — re-pending\n",
+                signal, user_sp, alt_lo, alt_hi);
+            akuma_exec::threading::pend_signal_for_thread(thread_slot, signal);
+        } else {
+            // Fatal signal (e.g. re-entrant SIGSEGV) while inside a signal handler —
+            // genuine unrecoverable crash.  The data-abort caller falls through to
+            // return_to_kernel(-11).
+            safe_print!(128,
+                "[signal] sig {} re-entrant FAULT at {:#x} (sp={:#x} on sigaltstack \
+                 [{:#x},{:#x})) — killing process\n",
+                signal, fault_addr, user_sp, alt_lo, alt_hi);
         }
+        return false;
     }
 
     // If SA_ONSTACK is set and a sigaltstack is configured, deliver on the
@@ -1576,14 +1586,17 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
     // arrived on; without it, Go panics with "handler not on signal stack".
     let stack_top = if (action.flags & SA_ONSTACK) != 0
         && alt_sp != 0
+        && !already_on_altstack
         && alt_size >= SIGFRAME_SIZE as u64
     {
-        (alt_sp + alt_size) as usize
+        alt_hi
     } else {
         user_sp
     };
 
-    let new_sp = (stack_top - SIGFRAME_SIZE) & !0xF;
+    let Some(new_sp) = stack_top.checked_sub(SIGFRAME_SIZE).map(|sp| sp & !0xF) else {
+        return false;
+    };
 
     if signal_trace_enabled() {
         safe_print!(256,
@@ -1620,7 +1633,11 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
     sf.info.si_errno = 0;
     const CLD_EXITED: i32 = 1;
     const CLD_KILLED: i32 = 2;
-    if signal == 17 /* SIGCHLD */ {
+    if let Some(info) = seccomp {
+        sf.info.si_code = akuma_syscalls::seccomp::SYS_SECCOMP;
+        sf.info.si_errno = i32::from(info.errno);
+        sf.info.fields.set_sigsys(info.call_addr, info.syscall, info.arch);
+    } else if signal == 17 /* SIGCHLD */ {
         // Fill the `_sigchld` union arm. The payload was stashed by
         // `raise_sigchld_for_parent` in the per-thread `LAST_SIGCHLD` side-channel;
         // peek (not take) so a signal that re-pends (SA_ONSTACK before sigaltstack)
@@ -1644,7 +1661,7 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
     // ucontext.uc_stack (stack_t) — Go runtime reads this to determine
     // whether the signal arrived on the sigaltstack.  All-zero confuses
     // Go's panic recovery and can produce corrupted SP/PSTATE on sigreturn.
-    let on_altstack = stack_top != user_sp;
+    let on_altstack = already_on_altstack || stack_top != user_sp;
     sf.uc.uc_stack.ss_sp = alt_sp;
     sf.uc.uc_stack.ss_flags = if on_altstack { sigframe::SS_ONSTACK } else { 0 };
     sf.uc.uc_stack.ss_size = alt_size;
@@ -1738,6 +1755,10 @@ fn try_deliver_signal(frame: FrameHandle, signal: u32, fault_addr: u64, is_fault
     // Also apply the additional mask from sigaction(2): sa_mask is the set of signals
     // blocked while this handler runs.  SIGKILL (bit 8) and SIGSTOP (bit 18) are immune.
     akuma_exec::threading::or_thread_signal_mask(action.mask & !((1u64 << 8) | (1u64 << 18)));
+
+    if seccomp.is_some() && action.flags & 0x8000_0000 /* SA_RESETHAND */ != 0 {
+        proc.signal_actions.actions.lock()[idx] = akuma_exec::process::SignalAction::default();
+    }
 
     if signal_trace_enabled() {
         safe_print!(128, "[signal] Delivering sig {} to handler {:#x} (restorer={:#x})\n",
@@ -2027,6 +2048,7 @@ pub struct ExceptionHooks {
     /// path (whole thread group, the ordering that fixed the orphaned-CLONE_VM
     /// leak). Never returns.
     pub sys_exit_group: fn(i32) -> !,
+    pub sys_exit_thread: fn(i32) -> !,
     /// `src/syscall/proc.rs` `notify_child_channel_exited_pub`.
     pub notify_child_channel_exited: fn(u32, i32),
     /// `src/syscall/proc.rs` `vfork_complete`.
@@ -3574,8 +3596,48 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
                 fatal_signal_group_exit(-4) // never returns
             }
 
-            // rt_sigreturn (NR 139): restore saved context from signal frame
-            if syscall_num == 139 {
+            use akuma_syscalls::seccomp::{AUDIT_ARCH_AARCH64, Decision, SIGSYS, SyscallData};
+
+            let args = [frame_ref.x0, frame_ref.x1, frame_ref.x2, frame_ref.x3, frame_ref.x4, frame_ref.x5];
+            let data = SyscallData {
+                nr: syscall_num as i32,
+                arch: AUDIT_ARCH_AARCH64,
+                instruction_pointer: frame_ref.elr_el1,
+                args,
+            };
+            let decision = akuma_exec::process::current_process_shared()
+                .map_or(Decision::Dispatch, |p| akuma_syscalls::seccomp::decide(&data, p.seccomp.evaluate(&data)));
+            let denied = match decision {
+                Decision::Dispatch => None,
+                Decision::LogAndDispatch => {
+                    safe_print!(96, "[seccomp] pid={} nr={} LOG\n",
+                        akuma_exec::process::read_current_pid().unwrap_or(0), syscall_num);
+                    None
+                }
+                Decision::Return(result) => Some(result),
+                Decision::KillThread => {
+                    akuma_exec::bkl::reset_dropped_windows();
+                    (hooks().sys_exit_thread)(-(SIGSYS as i32))
+                }
+                Decision::KillProcess => {
+                    akuma_exec::bkl::reset_dropped_windows();
+                    fatal_signal_group_exit(-(SIGSYS as i32))
+                }
+                Decision::Trap(info) => {
+                    let _held = akuma_exec::bkl::DroppedWindowPause::new();
+                    let mask = akuma_exec::threading::thread_signal_mask();
+                    if mask & (1u64 << (SIGSYS - 1)) == 0
+                        && deliver_signal_frame(frame, SIGSYS, 0, false, 0, Some(info))
+                    {
+                        return u64::from(SIGSYS);
+                    }
+                    akuma_exec::bkl::reset_dropped_windows();
+                    fatal_signal_group_exit(-(SIGSYS as i32))
+                }
+            };
+
+            // rt_sigreturn (NR 139): restore the frame only after the filter allows it.
+            if syscall_num == akuma_syscalls_linux::nr::RT_SIGRETURN && denied.is_none() {
                 if let Some(saved_x0) = do_rt_sigreturn(frame) {
                     // Linux delivers pending signals on every return to user mode,
                     // including after rt_sigreturn. Without this check, a SIGURG
@@ -3619,18 +3681,7 @@ fn rust_sync_el0_handler_inner(frame: FrameHandle, esr: u64, far: u64) -> u64 {
 
             // Save trap frame pointer so fork/clone can read full register state
             akuma_exec::threading::set_current_trap_frame(frame.as_ptr().cast_const());
-            let args = [
-                frame_ref.x0,
-                frame_ref.x1,
-                frame_ref.x2,
-                frame_ref.x3,
-                frame_ref.x4,
-                frame_ref.x5,
-            ];
-
-            // Handle syscall
-            let hooks = hooks();
-            let ret = (hooks.handle_syscall)(syscall_num, &args);
+            let ret = denied.unwrap_or_else(|| (hooks().handle_syscall)(syscall_num, &args));
 
             // SYNC TLS: If the syscall modified TPIDR_EL0 (e.g. SET_TPIDR_EL0),
             // update the trap frame so the change persists after register restoration.

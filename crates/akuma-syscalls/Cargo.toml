@@ -16,8 +16,6 @@ debug-info = []
 workspace = true
 
 [dependencies]
-# The only dependency, and deliberately the zero-dependency one: this crate
-# classifies syscall NUMBERS, so it needs the number table and nothing else.
-# Depending on anything with kernel state here would rebuild the second kernel
-# `AKUMA_EXTRACT_SYSCALLS.md` §7 exists to refuse.
+# ABI and policy evaluation only. Kernel state stays with each caller.
+akuma-seccomp = { path = "../akuma-seccomp" }
 akuma-syscalls-linux = { path = "../akuma-syscalls-linux" }

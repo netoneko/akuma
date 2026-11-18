@@ -122,6 +122,7 @@ impl Process {
             terminal_state,
             box_id: 0,
             creds: Arc::new(SharedCreds::new(creds)),
+            seccomp: super::Seccomp::default(),
             namespace: akuma_isolation::global_namespace(),
             channel: ChannelCell::new(channel),
             delegate_pid: OptPidCell::new(None),

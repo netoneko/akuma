@@ -13,13 +13,13 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1669
-- **Docs contributing at least one fix:** 486
+- **Total distinct fixes counted:** 1670
+- **Docs contributing at least one fix:** 487
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 257 | 15.4% | 39 |
+| Syscall / ABI Compatibility Audits | 258 | 15.4% | 40 |
 | Memory & Virtual Memory | 205 | 12.3% | 73 |
 | Scheduler & Process Management | 156 | 9.3% | 52 |
 | SMP & Locking | 142 | 8.5% | 61 |
@@ -34,7 +34,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Misc / Cross-cutting | 95 | 5.7% | 27 |
 | Console & Terminal | 63 | 3.8% | 22 |
 | Containers | 69 | 4.1% | 13 |
-| **Total** | **1669** | **100.0%** | **486** |
+| **Total** | **1670** | **100.0%** | **487** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -55,7 +55,10 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (257 fixes, 39 docs)
+## Syscall / ABI Compatibility Audits (258 fixes, 40 docs)
+
+### docs/archive/SECCOMP.md
+- Codex could not install its seccomp filter. Native amd64 and AArch64 now install and enforce filters across exec, including on the signal return path.
 
 ### docs/archive/GOLANG_MISSING_SYSCALLS.md
 (44 items with explicit `**Status:** Fixed/Implemented` markers — trusted directly per task instructions; includes items 1–14, the 15–18 batch (rt_sigreturn state restore, fork/vfork_complete race, user_va_limit), 19–21, 23–25, 27, 29–32, 37, 39–46, 49–52, 54–55, 57. Items 22/26/28/33 don't exist in the doc's numbering; 34/35/36 duplicate 30/31/32; 38/47/53/56 are explicitly not-fixed or tests-only and excluded.)

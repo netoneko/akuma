@@ -863,6 +863,7 @@ fn net(call: Syscall, a: [u64; 6]) -> Option<u64> {
 fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
     let [a1, a2, a3, a4, a5, a6] = a;
     Some(match call {
+        Syscall::Seccomp => to_glue(call, [a1, a2, a3, 0, 0, 0]),
         Syscall::Prctl => to_glue(call, [a1, a2, a3, a4, a5, 0]),
         // `rustc` sizes its codegen thread pool from this one, so an `ENOSYS`
         // was quietly making every in-guest build single-threaded.

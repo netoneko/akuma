@@ -60,6 +60,7 @@ pub const RT_SIGACTION: u64 = 134;
 pub const RT_SIGRETURN: u64 = 139;
 pub const RT_SIGSUSPEND: u64 = 133;
 pub const RT_SIGPENDING: u64 = 136;
+pub const SECCOMP: u64 = 277;
 pub const GETRANDOM: u64 = 278;
 pub const GETCWD: u64 = 17;
 pub const FCNTL: u64 = 25;

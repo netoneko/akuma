@@ -9,6 +9,7 @@ here are original. Fonts and the `akuma-fbcon` dependencies have their own file:
 
 | Where | Derived from | Licence | Notice |
 |---|---|---|---|
+| `crates/akuma-seccomp/src/bpf.rs` | NetBSD `sys/net/bpf.h` | BSD-3-Clause | Below |
 | `crates/akuma-rtw89` | Linux `drivers/net/wireless/realtek/rtw89/` (v6.17) | GPL-2.0 OR BSD-3-Clause, used as BSD-3-Clause | In `crates/akuma-rtw89/src/lib.rs` |
 | `userspace/rumpkernel/rumpuser/src/fiber.rs` | NetBSD `lib/librumpuser/rumpfiber.c`, itself partly from Xen MiniOS `sched.c` | BSD-2-Clause, and MIT (Xen MiniOS) | Below |
 | `userspace/rumpkernel/rumpuser/virtif_user_instr.c` | NetBSD `sys/rump/net/lib/libvirtif/virtif_user.c` (instrumentation added) | BSD-2-Clause | Below |
@@ -172,6 +173,46 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
 FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
 DEALINGS IN THE SOFTWARE.
+```
+
+### NetBSD `sys/net/bpf.h` (University of California Regents)
+
+The classic BPF encodings and instruction layout in `akuma-seccomp` come from
+NetBSD CVS revision 1.82, Git commit `57b869a1b1e93e77e35bfee34f52e94075019aac`.
+Include this notice in materials accompanying binary distributions of Akuma.
+
+```text
+Copyright (c) 1990, 1991, 1993
+        The Regents of the University of California.  All rights reserved.
+
+This code is derived from the Stanford/CMU enet packet filter,
+(net/enet.c) distributed as part of 4.3BSD, and code contributed
+to Berkeley by Steven McCanne and Van Jacobson both of Lawrence
+Berkeley Laboratory.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions
+are met:
+1. Redistributions of source code must retain the above copyright
+   notice, this list of conditions and the following disclaimer.
+2. Redistributions in binary form must reproduce the above copyright
+   notice, this list of conditions and the following disclaimer in the
+   documentation and/or other materials provided with the distribution.
+3. Neither the name of the University nor the names of its contributors
+   may be used to endorse or promote products derived from this software
+   without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE REGENTS AND CONTRIBUTORS ``AS IS'' AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+ARE DISCLAIMED.  IN NO EVENT SHALL THE REGENTS OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+SUCH DAMAGE.
 ```
 
 ## Written from observation, not copied

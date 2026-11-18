@@ -1,0 +1,9 @@
+[package]
+name = "akuma-seccomp"
+version = "0.1.0"
+edition = "2024"
+description = "Classic BPF validation and evaluation for seccomp"
+license = "BSD-2-Clause AND BSD-3-Clause"
+
+[lints]
+workspace = true

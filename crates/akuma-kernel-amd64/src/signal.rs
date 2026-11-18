@@ -308,6 +308,7 @@ enum Cause {
     User,
     /// `si_code` is `SEGV_MAPERR`/`SEGV_ACCERR`/`SI_KERNEL`; `addr` is `%cr2`.
     Fault { si_code: i32, addr: u64 },
+    Seccomp(akuma_syscalls::seccomp::Trap),
 }
 
 /// `si_code` values this kernel produces for a fault.
@@ -505,6 +506,28 @@ fn sanitize_rflags(f: u64) -> u64 {
 /// instruction, so the check is the guard.
 fn user_rip_ok(va: u64) -> bool {
     (0x1000..crate::uaccess::USER_END).contains(&va)
+}
+
+/// Synchronous SIGSYS for a seccomp trap. Save the original syscall number
+/// in RAX for the handler, matching the native Linux amd64 ABI.
+pub fn deliver_seccomp_trap(info: akuma_syscalls::seccomp::Trap, nr: u64) -> bool {
+    let sig = akuma_syscalls::seccomp::SIGSYS;
+    let idx = (sig - 1) as usize;
+    let Some(proc) = current_process_shared() else { return false };
+    let action = proc.signal_actions.actions.lock()[idx];
+    let SignalHandler::UserFn(entry) = action.handler else { return false };
+    if threading::thread_signal_mask() & (1u64 << idx) != 0 {
+        return false;
+    }
+    let Some(cur) = crate::sched::read_current_uctx(|u| Regs::load(u, nr, false)) else {
+        return false;
+    };
+    let tid = threading::current_thread_id();
+    let Some(next) = build_frame(&cur, sig, entry, &action, tid, Cause::Seccomp(info), None) else {
+        return false;
+    };
+    enter_handler(sig, idx, &action, proc, tid);
+    crate::sched::with_current_uctx(|u| next.store(u)).is_some()
 }
 
 /// Run the pending-signal check at a `syscall` return. Returns the value ring 3
@@ -1115,6 +1138,12 @@ fn build_frame(
             // `si_addr` is the first word of the union, which is what the
             // `_sigfault` arm puts there.
             frame.info.fields[0] = addr;
+        }
+        Cause::Seccomp(info) => {
+            frame.info.si_code = akuma_syscalls::seccomp::SYS_SECCOMP;
+            frame.info.si_errno = i32::from(info.errno);
+            frame.info.fields[0] = info.call_addr;
+            frame.info.fields[1] = u64::from(info.syscall.cast_unsigned()) | (u64::from(info.arch) << 32);
         }
     }
 

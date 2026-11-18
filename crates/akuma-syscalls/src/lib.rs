@@ -66,6 +66,7 @@
 
 use akuma_syscalls_linux::nr;
 
+pub mod seccomp;
 pub mod slot;
 
 /// The build's diagnostic gates, as data.
