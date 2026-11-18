@@ -40,6 +40,8 @@ pub mod cmd {
     pub const SIOCGIFNETMASK: u32 = 0x891b;
     pub const SIOCGIFMTU: u32 = 0x8921;
     pub const SIOCGIFHWADDR: u32 = 0x8927;
+    /// `SIOCGIFINDEX`: the interface's index (musl's `if_nametoindex`, on an `AF_UNIX` datagram socket).
+    pub const SIOCGIFINDEX: u32 = 0x8933;
 
 }
 
@@ -165,7 +167,8 @@ pub fn siocgifreq_reply(
     out: &mut UnionBytes,
 ) -> Result<usize, ReplyError> {
     let want = ifname(req_name);
-    let iface = ifaces.iter().find(|f| f.name == want).ok_or(ReplyError::NoDevice)?;
+    let position = ifaces.iter().position(|f| f.name == want).ok_or(ReplyError::NoDevice)?;
+    let iface = &ifaces[position];
     *out = [0; 24];
     let n = match cmd {
         cmd::SIOCGIFFLAGS => {
@@ -177,6 +180,11 @@ pub fn siocgifreq_reply(
         cmd::SIOCGIFBRDADDR => sockaddr_in(out, iface.broadcast),
         cmd::SIOCGIFMTU => {
             out[..4].copy_from_slice(&i32::try_from(iface.mtu).unwrap_or(i32::MAX).to_ne_bytes());
+            4
+        }
+        // 1-based, in `SIOCGIFCONF` order: `lo` is 1, as on Linux.
+        cmd::SIOCGIFINDEX => {
+            out[..4].copy_from_slice(&i32::try_from(position + 1).unwrap_or(i32::MAX).to_ne_bytes());
             4
         }
         cmd::SIOCGIFHWADDR => {

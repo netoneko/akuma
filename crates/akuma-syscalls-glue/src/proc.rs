@@ -1441,6 +1441,48 @@ pub(super) fn sys_getppid() -> u64 {
 }
 
 
+/// `capset(hdr, data)`: accepted, with one effect. A call that empties both the effective and the permitted set
+/// (`bwrap --cap-drop ALL`, which codex then checks with `capget`) is remembered: `capget` reports no capabilities
+/// from then on. Anything else is an accepted no-op, as before: privilege-dropping wrappers treat a failure here as
+/// fatal (`docs/archive/DEVBOX_ISSUES.md` Issue 15). Uid 0 keeps its file permission overrides either way.
+pub(super) fn sys_capset(hdr_ptr: UserAddr, data_ptr: UserAddr) -> u64 {
+    const CAP_V1: u32 = 0x1998_0330;
+    const CAP_V2: u32 = 0x2007_1026;
+    const CAP_V3: u32 = 0x2008_0522;
+    let (hdr_ptr, data_ptr) = (hdr_ptr.get(), data_ptr.get());
+    if hdr_ptr == 0 || data_ptr == 0 || !validate_user_ptr(hdr_ptr, 8) {
+        return 0;
+    }
+    let mut version: u32 = 0;
+    if read_user_into(&mut version, hdr_ptr).is_err() {
+        return EFAULT;
+    }
+    let slots = match version {
+        CAP_V1 => 1,
+        CAP_V2 | CAP_V3 => 2,
+        _ => return 0,
+    };
+    // `{effective, permitted, inheritable}` per 32-bit slot.
+    let mut words = [0u32; 6];
+    // Only as many bytes as the version's layout has: a v1 buffer may end at a page boundary.
+    let read = if slots == 1 {
+        let mut one = [0u32; 3];
+        let r = read_user_into(&mut one, data_ptr);
+        words[..3].copy_from_slice(&one);
+        r
+    } else {
+        read_user_into(&mut words, data_ptr)
+    };
+    if read.is_err() {
+        return EFAULT;
+    }
+    let emptied = (0..slots).all(|s| words[s * 3] == 0 && words[s * 3 + 1] == 0);
+    if emptied && let Some(proc) = akuma_exec::process::current_process_shared() {
+        proc.creds.update(akuma_isolation::creds::Creds::drop_capabilities);
+    }
+    0
+}
+
 /// `capget`: report a full-root capability set, with real version negotiation.
 ///
 /// The old stub zeroed 24 bytes of `data` and returned 0 for any input. Both
@@ -1503,7 +1545,7 @@ pub(super) fn sys_capget(hdr_ptr: UserAddr, data_ptr: UserAddr) -> u64 {
     // Linux clears the permitted and effective sets when a process drops from
     // uid 0 to anything else, and libcap-ng/`setpriv` read them to decide the
     // drop happened. procfs's `Cap*` lines say the same (`cred::caps_for`).
-    let root = akuma_exec::process::current_creds().is_root();
+    let root = akuma_exec::process::current_creds().has_capabilities();
     let mut caps = [0u32; 6];
     for slot in 0..slots {
         let (eff, perm, inh) = if !root {

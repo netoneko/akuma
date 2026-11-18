@@ -220,6 +220,9 @@ pub enum FileDescriptor {
     /// framing, no name.
     UnixSocket { rx: u32, tx: u32, sock: u32 },
     EventFd(u32),
+    /// `socket(AF_NETLINK, _, NETLINK_ROUTE)`: accepts requests and acknowledges them, changing nothing. Exists so a
+    /// sandbox's loopback setup (`bwrap --unshare-net`) can complete; see `akuma-syscalls-glue`'s `netlink`.
+    NetlinkRoute(alloc::sync::Arc<NetlinkAcks>),
     /// `signalfd4(2)`: reads return the pending signals in `mask` as
     /// `signalfd_siginfo` records. Plain data: a `dup` copies it, and there is
     /// no table entry to refcount (the signals themselves are per-thread state).
@@ -434,6 +437,73 @@ impl KernelFile {
     #[must_use]
     pub const fn file_key(&self) -> Option<akuma_primitives::FileKey> {
         akuma_primitives::FileKey::try_from_raw(self.mount_id, self.inode)
+    }
+}
+
+/// The acknowledgements a `NETLINK_ROUTE` stub socket owes its caller: the 16-byte `nlmsghdr` of each acknowledged
+/// request, in order. A fixed ring of atomics (this crate holds no locks); one producer (`sendto`) and one consumer
+/// (`recvfrom`) per socket, which is how the descriptor is used.
+pub struct NetlinkAcks {
+    slots: [[core::sync::atomic::AtomicU64; 2]; Self::CAP],
+    head: core::sync::atomic::AtomicU32,
+    tail: core::sync::atomic::AtomicU32,
+}
+
+impl NetlinkAcks {
+    const CAP: usize = 8;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        use core::sync::atomic::{AtomicU32, AtomicU64};
+        const SLOT: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        Self { slots: [SLOT; Self::CAP], head: AtomicU32::new(0), tail: AtomicU32::new(0) }
+    }
+
+    /// Queue an acknowledgement for the request whose header is `hdr`. `false` when the ring is full.
+    pub fn push(&self, hdr: [u8; 16]) -> bool {
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        let head = self.head.load(Acquire);
+        if head.wrapping_sub(self.tail.load(Acquire)) as usize >= Self::CAP {
+            return false;
+        }
+        let slot = &self.slots[head as usize % Self::CAP];
+        slot[0].store(u64::from_ne_bytes(hdr[..8].try_into().unwrap_or([0; 8])), Release);
+        slot[1].store(u64::from_ne_bytes(hdr[8..].try_into().unwrap_or([0; 8])), Release);
+        self.head.store(head.wrapping_add(1), Release);
+        true
+    }
+
+    /// The oldest unread acknowledged request header, if any.
+    pub fn pop(&self) -> Option<[u8; 16]> {
+        use core::sync::atomic::Ordering::{Acquire, Release};
+        let tail = self.tail.load(Acquire);
+        if tail == self.head.load(Acquire) {
+            return None;
+        }
+        let slot = &self.slots[tail as usize % Self::CAP];
+        let mut hdr = [0u8; 16];
+        hdr[..8].copy_from_slice(&slot[0].load(Acquire).to_ne_bytes());
+        hdr[8..].copy_from_slice(&slot[1].load(Acquire).to_ne_bytes());
+        self.tail.store(tail.wrapping_add(1), Release);
+        Some(hdr)
+    }
+
+    /// Whether a read would return something.
+    #[must_use]
+    pub fn has_reply(&self) -> bool {
+        self.tail.load(core::sync::atomic::Ordering::Acquire) != self.head.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl core::fmt::Debug for NetlinkAcks {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("NetlinkAcks")
+    }
+}
+
+impl Default for NetlinkAcks {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

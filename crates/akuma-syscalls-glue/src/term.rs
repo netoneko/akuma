@@ -64,6 +64,8 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
     const SIOCGIFMTU: u32 = super::net::SIOCGIFMTU;
     #[cfg(feature = "smoltcp")]
     const SIOCGIFHWADDR: u32 = super::net::SIOCGIFHWADDR;
+    #[cfg(feature = "smoltcp")]
+    const SIOCGIFINDEX: u32 = super::net::SIOCGIFINDEX;
 
     if akuma_config::SYSCALL_DEBUG_INFO_ENABLED {
         akuma_primitives::safe_print!(128, "[syscall] ioctl(fd={}, cmd=0x{:x}, arg=0x{:x})\n", fd, cmd, arg);
@@ -232,6 +234,17 @@ pub fn sys_ioctl(fd: u32, cmd: u32, arg: u64) -> u64 {
                 return ENOTTY;
             }
             return super::net::sys_ioctl_siocgifconf(arg);
+        }
+        // musl's `if_nametoindex` asks an AF_UNIX datagram socket, so this one answers on either family.
+        #[cfg(feature = "smoltcp")]
+        SIOCGIFINDEX => {
+            if !matches!(
+                proc.get_fd(fd),
+                Some(akuma_exec::process::FileDescriptor::Socket(_) | akuma_exec::process::FileDescriptor::UnixSocket { .. })
+            ) {
+                return ENOTTY;
+            }
+            return super::net::sys_ioctl_siocgifreq(cmd, arg);
         }
         #[cfg(feature = "smoltcp")]
         SIOCGIFFLAGS | SIOCGIFADDR | SIOCGIFBRDADDR | SIOCGIFNETMASK | SIOCGIFMTU | SIOCGIFHWADDR => {

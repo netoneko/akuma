@@ -121,6 +121,8 @@ pub mod eventfd;
 pub mod signalfd;
 #[cfg(feature = "sc-private-ns")]
 pub mod private_ns;
+#[cfg(feature = "sc-private-ns")]
+mod netlink;
 pub mod log;
 #[cfg(feature = "sc-sysv-ipc")]
 pub mod msgqueue;
@@ -1080,7 +1082,7 @@ pub fn handle_syscall(syscall_num: u64, args: &[u64; 6]) -> u64 {
         nr::CAPGET => proc::sys_capget(UserAddr::new(args[0]), UserAddr::new(args[1])),
         // `capset` stays an accepted no-op — see the `CAPSET` doc comment. The
         // id setters are real since 2026-10-14 (`cred.rs`).
-        nr::CAPSET => 0,
+        nr::CAPSET => proc::sys_capset(UserAddr::new(args[0]), UserAddr::new(args[1])),
         nr::SETUID => cred::sys_setuid(args[0]),
         nr::SETGID => cred::sys_setgid(args[0]),
         nr::SETRESUID => cred::sys_setresuid(args[0], args[1], args[2]),

@@ -2817,7 +2817,8 @@ pub fn fstat_fill(fd: u32) -> Result<Stat, Errno> {
             // Stat from constants (or forwards cross-core, which must keep the BKL).
             let _vfs_bkl = VfsBklGuard::new();
             if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&f.path, f.file_key()) {
-                stat = Stat { st_dev: 1, st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: meta.nlink(), st_uid: meta.uid, st_gid: meta.gid, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
+                let dev = f.file_key().map_or_else(|| akuma_vfs_glue::mount_id_of(&f.path).unwrap_or(0), |k| k.parts().0);
+                stat = Stat { st_dev: st_dev_of_mount(dev), st_ino: meta.inode, st_size: meta.size as i64, st_mode: meta.mode, st_nlink: meta.nlink(), st_uid: meta.uid, st_gid: meta.gid, st_blksize: 4096, st_blocks: ((meta.size as i64) + 511) / 512, st_atime: meta.accessed.unwrap_or(0) as i64, st_mtime: meta.modified.unwrap_or(0) as i64, st_ctime: meta.created.unwrap_or(0) as i64, ..Default::default() };
                 if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                     akuma_primitives::safe_print!(256, "[syscall] fstat(fd={}, file={}) size={} mode=0o{:o}\n", fd, &f.path, meta.size, meta.mode);
                 }
@@ -2907,6 +2908,17 @@ akuma_exec::process::FileDescriptor::RumpSocket { .. }) => {
     if res == 0 { Ok(stat) } else { Err(errno_of(res)) }
 }
 
+/// The `st_dev` a file on mount `mount` reports: `makedev(0, mount)` in Linux's encoding, which is the `0:<id>` that
+/// `/proc/<pid>/mountinfo` prints for the same mount (codex matches the two). `0` — a synthetic node — keeps
+/// reporting device 1, as every file did before there was a per-mount number.
+fn st_dev_of_mount(mount: u32) -> u64 {
+    if mount == 0 {
+        return 1;
+    }
+    let m = u64::from(mount);
+    (m & 0xff) | ((m & !0xff) << 12)
+}
+
 pub(super) fn sys_fstat(fd: u32, stat_ptr: UserAddr) -> u64 {
     let stat_ptr = stat_ptr.get();
     if !validate_user_ptr(stat_ptr, core::mem::size_of::<Stat>()) { return EFAULT; }
@@ -2980,12 +2992,12 @@ pub fn newfstatat_fill(dirfd: i32, path: &str, flags: u32) -> Result<Stat, Errno
 
         let final_path = if follow { akuma_vfs_glue::resolve_symlinks(&resolved_path) } else { resolved_path };
 
-        if let Ok(meta) = akuma_vfs_glue::metadata(&final_path) {
+        if let Ok((meta, mount)) = akuma_vfs_glue::metadata_with_mount(&final_path) {
             if akuma_config::SYSCALL_DEBUG_IO_ENABLED {
                 akuma_primitives::safe_print!(128, "[syscall] newfstatat({}) mode=0o{:o} size={}\n", final_path, meta.mode, meta.size);
             }
             stat = Stat { 
-                st_dev: 1,
+                st_dev: st_dev_of_mount(mount),
                 st_ino: meta.inode,
                 st_size: meta.size as i64, 
                 st_mode: meta.mode, 
@@ -3340,6 +3352,9 @@ pub fn sys_statx(dirfd: i32, path_ptr: UserAddr, flags: u32, _mask: u32, buf_ptr
 
     let follow = flags & akuma_syscalls_linux::flags::at::AT_SYMLINK_NOFOLLOW == 0;
 
+    // The mount the answer came from, for `stx_dev`/`stx_mnt_id` (the `0:<id>` `mountinfo` prints). `0` for a
+    // synthetic node, which reports device 1 as before.
+    let mut mount_of_answer: u32 = fd_mount;
     let (mode, ino, size, nlink, atime, mtime, ctime, rdev_major, rdev_minor, uid, gid) =
         // The second copy of `sys_newfstatat`'s device arms, now the same
         // single lookup — see the comment there.
@@ -3350,7 +3365,12 @@ pub fn sys_statx(dirfd: i32, path_ptr: UserAddr, flags: u32, _mask: u32, buf_ptr
             (0o120777u16, 1, target.len() as u64, 1, 0, 0, 0, 0, 0, 0, 0)
         } else {
             let final_path = if follow { akuma_vfs_glue::resolve_symlinks(&resolved_path) } else { resolved_path };
-            if let Ok(meta) = akuma_vfs_glue::metadata_open_file(&final_path, akuma_primitives::FileKey::try_from_raw(fd_mount, fd_inode)) {
+            let found = if fd_inode == 0 {
+                akuma_vfs_glue::metadata_with_mount(&final_path).map(|(m, id)| { mount_of_answer = id; m })
+            } else {
+                akuma_vfs_glue::metadata_open_file(&final_path, akuma_primitives::FileKey::try_from_raw(fd_mount, fd_inode))
+            };
+            if let Ok(meta) = found {
                 (meta.mode as u16, meta.inode, meta.size,
                  meta.nlink(),
                  meta.accessed.unwrap_or(0) as i64,
@@ -3389,10 +3409,10 @@ pub fn sys_statx(dirfd: i32, path_ptr: UserAddr, flags: u32, _mask: u32, buf_ptr
         stx_mtime: StatxTimestamp { tv_sec: mtime, ..Default::default() },
         stx_rdev_major: rdev_major,
         stx_rdev_minor: rdev_minor,
-        // The device the file lives on: 0:1, matching `sys_newfstatat`'s `st_dev`.
+        // The device the file lives on: `0:<mount id>`, matching `sys_newfstatat`'s `st_dev` and `mountinfo`.
         stx_dev_major: 0,
-        stx_dev_minor: 1,
-        stx_mnt_id: 1,
+        stx_dev_minor: if mount_of_answer == 0 { 1 } else { mount_of_answer },
+        stx_mnt_id: u64::from(if mount_of_answer == 0 { 1 } else { mount_of_answer }),
         ..Default::default()
     };
 

@@ -339,6 +339,28 @@ fn ns_link(pid: Pid, f: tree::NsFile, buf: &mut [u8; 40]) -> Option<&[u8]> {
     Some(&buf[..pos])
 }
 
+/// `/proc/<pid>/fdinfo/<fd>`: `pos`, `flags` and `mnt_id`, as `proc(5)` has them. `mnt_id` is the mount the open
+/// file's path resolves to, the number `mountinfo` prints for it (0 for a descriptor that is not a file).
+/// codex compares these to check that its app-server socket directory is on a mount of its own.
+fn fdinfo_bytes(pid: Pid, fd: u32) -> Option<Vec<u8>> {
+    let proc = process::lookup_process_shared(pid)?;
+    let (pos, mnt) = match proc.get_fd(fd)? {
+        process::FileDescriptor::File(f) => (f.pos(), crate::mount_id_of(&f.path).unwrap_or(0)),
+        _ => (0, 0),
+    };
+    Some(format!("pos:\t{pos}\nflags:\t0100002\nmnt_id:\t{mnt}\nino:\t0\n").into_bytes())
+}
+
+/// `<pid>/fdinfo/<n>` (relative to the mount) as `(pid, n)`.
+fn fdinfo_target(path: &str) -> Option<(Pid, u32)> {
+    let mut parts = path.splitn(3, '/');
+    let pid = parts.next()?.parse().ok()?;
+    if parts.next()? != "fdinfo" {
+        return None;
+    }
+    Some((pid, parts.next()?.parse().ok()?))
+}
+
 /// `sys/kernel/<name>` (relative to the mount) as the file it names.
 fn sys_kernel_file(path: &str) -> Option<tree::SysKernelFile> {
     let name = path.strip_prefix("sys/kernel/")?;
@@ -357,7 +379,7 @@ fn node_inode(node: Node) -> u64 {
         mix(b);
     }
     let thread_of = match node {
-        Node::Pid(v) | Node::PidFile(v, _) | Node::FdDir(v) | Node::Fd(v, _) | Node::NsDir(v) | Node::Ns(v, _) => v.thread_of,
+        Node::Pid(v) | Node::PidFile(v, _) | Node::FdDir(v) | Node::Fd(v, _) | Node::FdinfoDir(v) | Node::Fdinfo(v, _) | Node::NsDir(v) | Node::Ns(v, _) => v.thread_of,
         _ => None,
     };
     if let Some(tgid) = thread_of {
@@ -789,7 +811,18 @@ impl ProcFilesystem {
     /// or directory` ~45 times a page (2026-10-09; the failure is non-fatal in
     /// Chromium's source, `AdjustRendererOOMScore` only `PLOG(ERROR)`s it).
     /// Reading `0` is the truthful answer for a kernel that never kills by score.
-    const OOM_FILES: [&'static str; 3] = ["oom_score_adj", "oom_adj", "oom_score"];
+    const OOM_FILES: [&'static str; 6] =
+        ["oom_score_adj", "oom_adj", "oom_score", "uid_map", "gid_map", "setgroups"];
+
+    /// The bytes of one of [`Self::OOM_FILES`]: `0` for the oom files, the identity mapping for the id maps, `allow`
+    /// for `setgroups`. Writes to all of them are accepted and dropped.
+    fn const_file_bytes(path: &str) -> &'static [u8] {
+        match path.rsplit('/').next() {
+            Some("uid_map" | "gid_map") => b"         0          0 4294967295\n",
+            Some("setgroups") => b"allow\n",
+            _ => b"0\n",
+        }
+    }
 
     /// `metadata` before ownership is applied — see `Filesystem::metadata`
     /// below. The node has already been resolved, so existence and the box
@@ -821,7 +854,7 @@ impl ProcFilesystem {
         const LINK: u32 = 0o120_777;
 
         Ok(match node {
-            Node::Root | Node::NetDir | Node::SysvipcDir | Node::SysDir | Node::SysKernelDir | Node::Pid(_) | Node::FdDir(_) | Node::NsDir(_) => {
+            Node::Root | Node::NetDir | Node::SysvipcDir | Node::SysDir | Node::SysKernelDir | Node::Pid(_) | Node::FdDir(_) | Node::FdinfoDir(_) | Node::NsDir(_) => {
                 meta(DIR, 0, None)
             }
             // A link count of `2 + threads`, as on Linux — Chromium reads
@@ -880,6 +913,7 @@ impl ProcFilesystem {
                 meta(LINK, ns_link(v.pid, f, &mut buf).map_or(0, <[u8]>::len) as u64, None)
             }
             Node::SysKernel(f) => meta(RO, f.contents().len() as u64, None),
+            Node::Fdinfo(v, fd) => meta(RO, fdinfo_bytes(v.pid, fd).map_or(0, |b| b.len()) as u64, None),
             Node::PidFile(v, f) => match f {
                 PidFile::Mounts => {
                     let mut probe = [0u8; 2048];
@@ -890,6 +924,8 @@ impl ProcFilesystem {
                     meta(RO, crate::render_mountinfo(caller_box_id(), Some(v.pid)).len() as u64, None)
                 }
                 PidFile::OomScoreAdj | PidFile::OomAdj | PidFile::OomScore => meta(RW, 2, None),
+                PidFile::UidMap | PidFile::GidMap => meta(RW, ProcFilesystem::const_file_bytes("uid_map").len() as u64, None),
+                PidFile::Setgroups => meta(RW, ProcFilesystem::const_file_bytes("setgroups").len() as u64, None),
                 PidFile::Maps | PidFile::Statm | PidFile::Auxv => {
                     let data = pid_address_space_file(v.pid, f.name()).ok_or(FsError::NotFound)?;
                     meta(RO, data.len() as u64, None)
@@ -982,6 +1018,7 @@ impl ProcFilesystem {
             FileDescriptor::TimerFd(_) => String::from("anon_inode:[timerfd]"),
             FileDescriptor::EventFd(_) => String::from("anon_inode:[eventfd]"),
             FileDescriptor::SignalFd { .. } => String::from("anon_inode:[signalfd]"),
+            FileDescriptor::NetlinkRoute(_) => String::from("socket:[netlink]"),
             FileDescriptor::DevNull => String::from("/dev/null"),
             FileDescriptor::DevUrandom => String::from("/dev/urandom"),
             FileDescriptor::DevZero => String::from("/dev/zero"),
@@ -1218,6 +1255,21 @@ impl Filesystem for ProcFilesystem {
             return Ok(n);
         }
 
+        // <pid>/fdinfo/<n>.
+        if let Some((pid, fd)) = fdinfo_target(path) {
+            let target = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
+            if caller_box_id() != 0 && target.box_id != caller_box_id() {
+                return Err(FsError::NotFound);
+            }
+            let data = fdinfo_bytes(pid, fd).ok_or(FsError::NotFound)?;
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let n = buf.len().min(data.len() - offset);
+            buf[..n].copy_from_slice(&data[offset..offset + n]);
+            return Ok(n);
+        }
+
         // <pid>/mountinfo — the same view with ids and options.
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
@@ -1300,7 +1352,7 @@ impl Filesystem for ProcFilesystem {
             if !Self::oom_visible(pid) {
                 return Err(FsError::NotFound);
             }
-            let data = b"0\n";
+            let data = Self::const_file_bytes(path);
             if offset >= data.len() {
                 return Ok(0);
             }
@@ -1598,6 +1650,15 @@ impl Filesystem for ProcFilesystem {
                 }
         }
 
+        // <pid>/fdinfo/<n> (see `read_at`).
+        if let Some((pid, fd)) = fdinfo_target(path) {
+            let target = process::lookup_process_shared(pid).ok_or(FsError::NotFound)?;
+            if current_box_id != 0 && target.box_id != current_box_id {
+                return Err(FsError::NotFound);
+            }
+            return fdinfo_bytes(pid, fd).ok_or(FsError::NotFound);
+        }
+
         // <pid>/mountinfo (see `read_at`).
         {
             let parts: Vec<&str> = path.splitn(2, '/').collect();
@@ -1626,7 +1687,7 @@ impl Filesystem for ProcFilesystem {
             if !Self::oom_visible(pid) {
                 return Err(FsError::NotFound);
             }
-            return Ok(b"0\n".to_vec());
+            return Ok(Self::const_file_bytes(path).to_vec());
         }
 
         // Handle <pid>/cmdline and <pid>/status
@@ -1671,6 +1732,9 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        // `self/…` is the caller's pid, as `read_at` already treats it.
+        let canon = canonical(path);
+        let path = canon.as_str();
         if path.trim_start_matches('/') == "dac" {
             return Self::write_dac(data).map(|_| ());
         }
@@ -1687,6 +1751,8 @@ impl Filesystem for ProcFilesystem {
     }
 
     fn write_at(&self, path: &str, _offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        let canon = canonical(path);
+        let path = canon.as_str();
         if path.trim_start_matches('/') == "dac" {
             return Self::write_dac(data);
         }

@@ -45,6 +45,10 @@ pub struct Creds {
     groups: [u32; NGROUPS],
     ngroups: u8,
     umask: u16,
+    /// `capset` emptied the effective and permitted sets (`bwrap --cap-drop ALL`). One-way, like an id drop.
+    /// `capget` then reports no capabilities. It does **not** take away uid 0's file permission overrides: there is
+    /// no capability model finer than "uid 0 or not" (`docs/archive/BWRAP_ON_BOXES.md`).
+    caps_dropped: bool,
 }
 
 impl Creds {
@@ -56,6 +60,7 @@ impl Creds {
         groups: [0; NGROUPS],
         ngroups: 0,
         umask: DEFAULT_UMASK,
+        caps_dropped: false,
     };
 
     #[must_use]
@@ -71,6 +76,17 @@ impl Creds {
     #[must_use]
     pub const fn is_root(&self) -> bool {
         self.uid == 0
+    }
+
+    /// Whether `capget` reports capabilities: root, and not dropped by `capset`.
+    #[must_use]
+    pub const fn has_capabilities(&self) -> bool {
+        self.uid == 0 && !self.caps_dropped
+    }
+
+    /// `capset` with empty effective and permitted sets. One-way.
+    pub const fn drop_capabilities(&mut self) {
+        self.caps_dropped = true;
     }
 
     #[must_use]
@@ -292,5 +308,14 @@ mod tests {
         let t = s.clone();
         s.update(|c| c.set_uid(5)).unwrap();
         assert_eq!(t.get().uid(), 5);
+    }
+
+    #[test]
+    fn dropping_capabilities_is_one_way_and_leaves_the_uid() {
+        let mut c = Creds::ROOT;
+        assert!(c.has_capabilities());
+        c.drop_capabilities();
+        assert!(!c.has_capabilities());
+        assert!(c.is_root(), "uid 0 keeps its file permissions; only the reported capabilities go");
     }
 }

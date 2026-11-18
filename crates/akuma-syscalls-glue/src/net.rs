@@ -588,6 +588,10 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, de
     if fd_is_unix_socket(fd) {
         return flat(unix_send_user(fd, UserAddr::new(buf_ptr), len, _flags, dest_addr, addr_len));
     }
+    #[cfg(feature = "sc-private-ns")]
+    if let Some(r) = super::netlink::send(fd, buf_ptr, len) {
+        return r;
+    }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
     let mut kernel_buf = match alloc_net_bounce(len) {
@@ -683,6 +687,10 @@ pub(super) fn sys_recvfrom(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, 
     // dropping the BKL — see sys_sendto.
     if fd_is_unix_socket(fd) {
         return unix_recv_user(fd, UserAddr::new(buf_ptr), len, _flags).0;
+    }
+    #[cfg(feature = "sc-private-ns")]
+    if let Some(r) = super::netlink::recv(fd, buf_ptr, len) {
+        return r;
     }
     let _net_bkl = NetBklGuard::new();
     if !validate_user_ptr(buf_ptr, len) { return EFAULT; }
@@ -2018,6 +2026,10 @@ pub fn run_net_bounce_tests() {
 /// stack, or `ENETDOWN` when it is compiled out.
 pub(super) fn dispatch_socket(domain: i32, sock_type: i32, proto: i32) -> u64 {
     const AF_UNIX: i32 = 1;
+    #[cfg(feature = "sc-private-ns")]
+    if super::netlink::is_netlink(domain) {
+        return super::netlink::socket(sock_type, proto);
+    }
     if domain == AF_UNIX {
         let cloexec = sock_type & 0x8_0000 != 0;
         let nonblock = sock_type & 0x800 != 0;
@@ -2037,6 +2049,10 @@ pub(super) fn dispatch_socket(domain: i32, sock_type: i32, proto: i32) -> u64 {
 /// `bind(2)`.
 pub(super) fn dispatch_bind(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
     let addr_ptr = addr_ptr.get();
+    #[cfg(feature = "sc-private-ns")]
+    if let Some(r) = super::netlink::bind(fd) {
+        return r;
+    }
     if fd_is_unix_socket(fd) {
         return flat(super::unixsock::sys_bind(fd, UserAddr::new(addr_ptr), len));
     }
@@ -2164,6 +2180,8 @@ pub(super) const SIOCGIFNETMASK: u32 = 0x891b;
 pub(super) const SIOCGIFMTU: u32 = 0x8921;
 #[cfg(feature = "smoltcp")]
 pub(super) const SIOCGIFHWADDR: u32 = 0x8927;
+#[cfg(feature = "smoltcp")]
+pub(super) const SIOCGIFINDEX: u32 = 0x8933;
 
 /// The two synthetic interfaces (`lo` fixed, `eth0` from the live smoltcp
 /// snapshot). The layout below — netmask/broadcast math, the `IFF_*` combos,

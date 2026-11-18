@@ -314,6 +314,11 @@ pub enum PidFile {
     OomScoreAdj,
     OomAdj,
     OomScore,
+    /// `uid_map`, `gid_map`, `setgroups`: what a user-namespace setup (`bwrap --unshare-user`) writes. Akuma has one
+    /// set of credentials, so they read as the identity mapping and swallow writes.
+    UidMap,
+    GidMap,
+    Setgroups,
     Maps,
     Statm,
     /// The raw auxv the process was exec'd with (`/proc/<pid>/auxv`), when
@@ -325,7 +330,7 @@ pub enum PidFile {
 
 impl PidFile {
     /// Listing order inside a pid directory (after `fd` and `task`).
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::Cmdline,
         Self::Status,
         Self::Stat,
@@ -335,6 +340,9 @@ impl PidFile {
         Self::OomScoreAdj,
         Self::OomAdj,
         Self::OomScore,
+        Self::UidMap,
+        Self::GidMap,
+        Self::Setgroups,
         Self::Maps,
         Self::Statm,
         Self::Auxv,
@@ -353,6 +361,9 @@ impl PidFile {
             Self::OomScoreAdj => "oom_score_adj",
             Self::OomAdj => "oom_adj",
             Self::OomScore => "oom_score",
+            Self::UidMap => "uid_map",
+            Self::GidMap => "gid_map",
+            Self::Setgroups => "setgroups",
             Self::Maps => "maps",
             Self::Statm => "statm",
             Self::Auxv => "auxv",
@@ -414,6 +425,9 @@ pub enum Node {
     Pid(PidDir),
     PidFile(PidDir, PidFile),
     FdDir(PidDir),
+    /// `<pid>/fdinfo` and `<pid>/fdinfo/<n>` (`pos`, `flags`, `mnt_id`).
+    FdinfoDir(PidDir),
+    Fdinfo(PidDir, u32),
     /// `<pid>/ns`, and `<pid>/ns/<name>` (a symlink reading `name:[inode]`).
     NsDir(PidDir),
     Ns(PidDir, NsFile),
@@ -434,10 +448,12 @@ impl Node {
             | Self::SysKernelDir
             | Self::Pid(_)
             | Self::FdDir(_)
+            | Self::FdinfoDir(_)
             | Self::NsDir(_)
             | Self::TaskDir(_) => Kind::Dir,
             Self::SelfLink | Self::Fd(..) | Self::Ns(..) => Kind::Symlink,
             Self::PidFile(_, f) => f.kind(),
+            Self::Fdinfo(..) => Kind::File,
             Self::Global(_) | Self::Net(_) | Self::SysvipcMsg | Self::SysKernel(_) => Kind::File,
         }
     }
@@ -446,7 +462,7 @@ impl Node {
     #[must_use]
     pub const fn owner(self) -> Option<Pid> {
         match self {
-            Self::Pid(v) | Self::PidFile(v, _) | Self::FdDir(v) | Self::Fd(v, _) | Self::NsDir(v) | Self::Ns(v, _) => Some(v.pid),
+            Self::Pid(v) | Self::PidFile(v, _) | Self::FdDir(v) | Self::Fd(v, _) | Self::FdinfoDir(v) | Self::Fdinfo(v, _) | Self::NsDir(v) | Self::Ns(v, _) => Some(v.pid),
             Self::TaskDir(tgid) => Some(tgid),
             _ => None,
         }
@@ -474,6 +490,8 @@ impl Node {
             Self::Pid(v) => write!(out, "{}", v.pid),
             Self::PidFile(v, f) => write!(out, "{}/{}", v.pid, f.name()),
             Self::FdDir(v) => write!(out, "{}/fd", v.pid),
+            Self::FdinfoDir(v) => write!(out, "{}/fdinfo", v.pid),
+            Self::Fdinfo(v, n) => write!(out, "{}/fdinfo/{n}", v.pid),
             Self::NsDir(v) => write!(out, "{}/ns", v.pid),
             Self::Ns(v, f) => write!(out, "{}/ns/{}", v.pid, f.name()),
             Self::Fd(v, n) => write!(out, "{}/fd/{n}", v.pid),
@@ -634,6 +652,18 @@ fn resolve_in_pid<M: ProcModel + ?Sized>(m: &M, view: PidDir, rest: Option<&str>
                 }
             }
         }
+        "fdinfo" => {
+            if !visible(m, view.pid) {
+                return None;
+            }
+            match rest {
+                None => Some(Node::FdinfoDir(view)),
+                Some(n) => {
+                    let n = parse_num(n)?;
+                    fd_exists(m, view.pid, n).then_some(Node::Fdinfo(view, n))
+                }
+            }
+        }
         "ns" => {
             if !visible(m, view.pid) {
                 return None;
@@ -777,6 +807,17 @@ pub fn list_node<M: ProcModel + ?Sized>(
             });
             Ok(())
         }
+        Node::FdinfoDir(view) => {
+            // The same descriptors `fd/` lists.
+            emit("0", Kind::File);
+            emit("1", Kind::File);
+            m.for_each_fd(view.pid, &mut |fd| {
+                if fd > 1 {
+                    emit(Num::new(fd).as_str(), Kind::File);
+                }
+            });
+            Ok(())
+        }
         Node::NsDir(_) => {
             for f in NsFile::ALL {
                 emit(f.name(), Kind::Symlink);
@@ -786,6 +827,7 @@ pub fn list_node<M: ProcModel + ?Sized>(
         Node::Pid(view) => {
             if visible(m, view.pid) {
                 emit("fd", Kind::Dir);
+                emit("fdinfo", Kind::Dir);
                 emit("ns", Kind::Dir);
                 if task_dir_exists(m, view) {
                     emit("task", Kind::Dir);
@@ -805,6 +847,7 @@ pub fn list_node<M: ProcModel + ?Sized>(
         | Node::SysKernel(_)
         | Node::PidFile(..)
         | Node::Ns(..)
+        | Node::Fdinfo(..)
         | Node::Fd(..) => Err(ListError::NotADirectory),
     }
 }

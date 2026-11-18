@@ -176,10 +176,11 @@ impl<const MAX: usize> MountSet<MAX> {
         Ok(())
     }
 
-    /// Every mount as `(path, source, flags, filesystem)`, for copying one view into another namespace. Allocates.
+    /// Every mount as `(path, source, flags, filesystem, id)`, for copying one view into another namespace or listing
+    /// it. Allocates.
     #[must_use]
-    pub fn entries(&self) -> Vec<(String, Option<String>, u64, Arc<dyn Filesystem>)> {
-        self.mounts.iter().map(|m| (m.path.clone(), m.source.clone(), m.flags, m.fs.clone())).collect()
+    pub fn entries(&self) -> Vec<(String, Option<String>, u64, Arc<dyn Filesystem>, u32)> {
+        self.mounts.iter().map(|m| (m.path.clone(), m.source.clone(), m.flags, m.fs.clone(), m.id)).collect()
     }
 
     /// Remove the mount at `prefix` and every mount beneath it (`umount2(MNT_DETACH)` of a subtree). Returns how many

@@ -357,7 +357,7 @@ pub fn private_ns_pivot(tok: akuma_primitives::NsCreator, new_root: &str, put_ol
     let mut set = ns.mount.lock();
     let mut after = set.rebased(new_root, root_fs, r.flags);
     if let (Some(rel), Some(view)) = (&attach, old_view) {
-        for (path, source, flags, fs) in view {
+        for (path, source, flags, fs, _) in view {
             let at = if path == "/" { rel.clone() } else { alloc::format!("{rel}{path}") };
             let _ = after.mount_with(&at, source.as_deref(), flags, fs);
         }
@@ -1170,6 +1170,16 @@ pub fn file_size(path: &str) -> Result<u64, FsError> {
     with_fs(path, |fs, rel| fs.metadata(rel).map(|m| m.size))
 }
 
+/// [`metadata`] and the id of the mount that answered, for `stat`'s `st_dev`. `0` for the synthetic nodes (device
+/// nodes, `/dev/pts`, the mtab), which keep reporting device 1.
+pub fn metadata_with_mount(path: &str) -> Result<(Metadata, u32), FsError> {
+    if mtab_rows(path).is_some() || dev_node(path).is_some() || pts_metadata(path).is_some() {
+        return metadata(path).map(|m| (m, 0));
+    }
+    let r = resolve_mount(path).ok_or(FsError::NotFound)?;
+    r.fs.metadata(&r.rel).map(|m| (m, r.id)).or_else(|e| dev_dir_metadata(path).map(|m| (m, 0)).ok_or(e))
+}
+
 /// Get metadata for a path
 pub fn metadata(path: &str) -> Result<Metadata, FsError> {
     if let Some(rows) = mtab_rows(path) {
@@ -1876,6 +1886,13 @@ pub fn render_mounts(viewer_box_id: u64, target_pid: Option<u32>, buf: &mut [u8]
     render_mounts_inner(viewer_box_id, target_pid, buf)
 }
 
+/// The id of the mount `path` resolves to in the caller's view (`/proc/<pid>/fdinfo`'s `mnt_id`), the same number
+/// `mountinfo` prints for that mount.
+#[must_use]
+pub fn mount_id_of(path: &str) -> Option<u32> {
+    resolve_mount(path).map(|r| r.id)
+}
+
 /// `/proc/<pid>/mountinfo` for `target_pid`.
 ///
 /// One line per mount in the process's view — its own namespace, plus
@@ -1888,7 +1905,7 @@ pub fn render_mounts(viewer_box_id: u64, target_pid: Option<u32>, buf: &mut [u8]
 #[must_use]
 pub fn render_mountinfo(viewer_box_id: u64, target_pid: Option<u32>) -> Vec<u8> {
     use core::fmt::Write as _;
-    let mut rows: Vec<(String, Option<String>, u64, Arc<dyn Filesystem>)> = Vec::new();
+    let mut rows: Vec<(String, Option<String>, u64, Arc<dyn Filesystem>, u32)> = Vec::new();
     let mut ns_has_root = false;
     if let Some(pid) = target_pid
         && let Some(proc) = akuma_exec::process::lookup_process_shared(pid)
@@ -1909,8 +1926,7 @@ pub fn render_mountinfo(viewer_box_id: u64, target_pid: Option<u32>) -> Vec<u8> 
     // Shallow first, so a parent's id exists before its children name it.
     rows.sort_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)));
     let mut out = String::new();
-    for (i, (path, source, flags, fs)) in rows.iter().enumerate() {
-        let id = 100 + i;
+    for (i, (path, source, flags, fs, id)) in rows.iter().enumerate() {
         let parent = rows[..i]
             .iter()
             .enumerate()
@@ -1918,7 +1934,7 @@ pub fn render_mountinfo(viewer_box_id: u64, target_pid: Option<u32>) -> Vec<u8> 
             .find(|(_, (p, ..))| {
                 path.strip_prefix(p.trim_end_matches('/')).is_some_and(|r| r.starts_with('/'))
             })
-            .map_or(id, |(j, _)| 100 + j);
+            .map_or(*id, |(_, r)| r.4);
         let opts = if flags & MS_RDONLY != 0 { "ro" } else { "rw" };
         // A box never sees where a mount came from (as in `render_mounts`).
         let src = if viewer_box_id == 0 { source.as_deref().unwrap_or("none") } else { "none" };
