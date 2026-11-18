@@ -94,12 +94,13 @@ the inner stage); the test uses the command line codex's runtime generates inste
 
 ## What this does not enforce (said out loud)
 
-* **Network.** `--unshare-net` is accepted, a `NETLINK_ROUTE` socket acknowledges its `lo` setup, and the box still shares
-  the host stack. What stops a codex sandbox from connecting is codex's own seccomp filter (restricted mode). A sandbox
-  without it can reach the host's loopback services.
+* **Network.** `--unshare-net` is accepted, and `NETLINK_ROUTE` acknowledges its `lo` setup. A private mount namespace
+  shares the smoltcp stack but cannot initiate IPv4 loopback traffic. It has no independent loopback service. Connected
+  sockets passed in by the parent remain usable. Codex's restricted mode also installs a network seccomp filter.
 * **Seccomp** is separate work (`docs/archive/SECCOMP.md`); this feature does not depend on it, codex's stage does.
-* **User namespaces / uid maps.** One set of credentials. `uid_map`/`gid_map`/`setgroups` accept writes and change
-  nothing; a dropped-capability uid 0 reports no capabilities but keeps uid 0's file overrides.
+* **User namespaces / uid maps.** `uid_map`/`gid_map`/`setgroups` accept writes and change nothing. A uid-0 process that
+  drops capabilities loses DAC overrides and retains ordinary uid-0 owner permissions, including access to its own 0600
+  files. File checks for that process apply even when global DAC enforcement is off.
 * **PID namespace.** `--unshare-pid` is accepted; the box sees the pids it always saw (the `/proc` view is box-filtered).
 * **`--perms`, `--size`, `--remount-ro` on a tmpfs** are accepted; `codex-daemon-UID` therefore shows as an empty,
   writable tmpfs rather than mode 000. `MS_REC` is ignored: a bind is of one mount's view.

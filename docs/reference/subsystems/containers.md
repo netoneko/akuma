@@ -67,7 +67,10 @@ the box's recorded `creator_pid`.
 | Process-targeted resource limits, priority and scheduling | Caller can see the target's box | `ESRCH` |
 
 Abstract AF_UNIX names are local to the caller's box. Pathname AF_UNIX sockets
-use the mount and inode resolved through the caller's filesystem view.
+use the mount ID and inode resolved through the caller's filesystem view. Both
+must match the listener's identity, including when the pathname is exposed by
+a bind mount. An already-open Unix socket can be inherited across a namespace
+transition and remains usable.
 `/proc/mounts` and `/proc/<pid>/mountinfo` list only namespace mounts when
 the target has its own root.
 

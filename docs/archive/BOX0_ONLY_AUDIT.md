@@ -44,6 +44,9 @@ Two shapes. **Host root only** (`akuma_exec::process::host_root()`: box 0 *and* 
 
 ## 2. Candidates: not refused today, probably should be
 
+This section records the original audit findings. The follow-up status at the top of this document and the containers
+reference describe the current policy.
+
 Priority is for a sandbox whose processes are uid 0 and **share the host network stack** (`--unshare-net` is not a
 namespace, `docs/archive/BWRAP_ON_BOXES.md` § not enforced).
 
