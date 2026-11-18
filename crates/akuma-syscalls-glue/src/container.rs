@@ -361,6 +361,32 @@ fn build_overlay(data_ptr: UserAddr) -> Result<alloc::sync::Arc<dyn akuma_vfs_gl
     Ok(alloc::sync::Arc::new(OverlayFs::new(upper, layers)))
 }
 
+/// A bind mount for a box's namespace: the host directory named by the data
+/// string, seen under the mount point. `bind-ro` refuses every mutation
+/// (`EROFS`). It is a `SubdirFs` over the **global** root, like an overlay
+/// layer, so `..` clamps at the bound directory and the box never sees outside it.
+///
+/// This is what a sandbox's `--bind`/`--ro-bind` maps onto. Directories only: a
+/// mount needs a directory on both ends.
+#[cfg(feature = "sc-containers")]
+fn build_bind(data_ptr: UserAddr, read_only: bool) -> Result<alloc::sync::Arc<dyn akuma_vfs_glue::Filesystem>, Errno> {
+    let data_ptr = data_ptr.get();
+    if data_ptr == 0 {
+        return Err(Errno::EINVAL);
+    }
+    let source = copy_from_user_str(data_ptr, 4096)?;
+    let source = akuma_vfs_glue::canonicalize_path(&source);
+    if !akuma_vfs_glue::metadata(&source).is_ok_and(|m| m.is_dir) {
+        return Err(Errno::ENOTDIR);
+    }
+    let root_fs = akuma_vfs_glue::get_root_fs().ok_or(Errno::ENODEV)?;
+    Ok(alloc::sync::Arc::new(if read_only {
+        akuma_isolation::subdir_fs::SubdirFs::new_read_only(root_fs, &source)
+    } else {
+        akuma_isolation::subdir_fs::SubdirFs::new(root_fs, &source)
+    }))
+}
+
 pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: UserAddr, target_len: usize, fstype_ptr: UserAddr, fstype_len: usize, data_ptr: UserAddr) -> SysResult {
     let target_ptr = target_ptr.get();
     let fstype_ptr = fstype_ptr.get();
@@ -384,6 +410,8 @@ pub(super) fn sys_mount_in_ns(box_id: u64, target_ptr: UserAddr, target_len: usi
         "proc" => alloc::sync::Arc::new(akuma_vfs_glue::proc::ProcFilesystem::new()),
         "tmpfs" => alloc::sync::Arc::new(akuma_vfs::MemoryFilesystem::new()),
         "overlay" => build_overlay(UserAddr::new(data_ptr))?,
+        "bind" => build_bind(UserAddr::new(data_ptr), false)?,
+        "bind-ro" => build_bind(UserAddr::new(data_ptr), true)?,
         _ => return Err(Errno::ENODEV),
     };
 

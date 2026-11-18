@@ -75,6 +75,9 @@ macro_rules! full_path {
 pub struct SubdirFs {
     inner: Arc<dyn Filesystem>,
     prefix: String,
+    /// A read-only bind: every method that would change the inner filesystem
+    /// answers `FsError::ReadOnly` (`EROFS`) instead of reaching it.
+    read_only: bool,
 }
 
 impl SubdirFs {
@@ -84,7 +87,15 @@ impl SubdirFs {
         Self {
             inner,
             prefix: String::from(prefix),
+            read_only: false,
         }
+    }
+
+    /// The same view with every mutation refused: the `--ro-bind` of a sandbox.
+    /// Reads, `stat` and directory listing are forwarded as usual.
+    #[must_use]
+    pub fn new_read_only(inner: Arc<dyn Filesystem>, prefix: &str) -> Self {
+        Self { read_only: true, ..Self::new(inner, prefix) }
     }
 }
 
@@ -104,6 +115,9 @@ impl Filesystem for SubdirFs {
     }
 
     fn write_file(&self, path: &str, data: &[u8]) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.write_file(p, data)
     }
@@ -115,6 +129,9 @@ impl Filesystem for SubdirFs {
     }
 
     fn write_at(&self, path: &str, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.write_at(p, offset, data)
     }
@@ -123,6 +140,9 @@ impl Filesystem for SubdirFs {
     /// default is a read-size-then-`write_at` that loses lines between two
     /// concurrent appenders.
     fn append(&self, path: &str, data: &[u8]) -> Result<(usize, usize), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.append(p, data)
     }
@@ -134,36 +154,57 @@ impl Filesystem for SubdirFs {
     /// `apk add` died on its first large file ("Failed to create usr/bin/curl:
     /// I/O error"). Fixed 2026-10-15 while building `box build`.
     fn truncate(&self, path: &str, length: u64) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.truncate(p, length)
     }
 
     fn fallocate(&self, path: &str, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.fallocate(p, mode, offset, len)
     }
 
     fn set_times(&self, path: &str, atime_secs: Option<u64>, mtime_secs: Option<u64>) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.set_times(p, atime_secs, mtime_secs)
     }
 
     fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.create_socket_node(p)
     }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.create_dir(p)
     }
 
     fn remove_file(&self, path: &str) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.remove_file(p)
     }
 
     fn remove_dir(&self, path: &str) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.remove_dir(p)
     }
@@ -179,6 +220,9 @@ impl Filesystem for SubdirFs {
     }
 
     fn create_symlink(&self, link_path: &str, target: &str) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, link_path);
         self.inner.create_symlink(p, target)
     }
@@ -194,22 +238,34 @@ impl Filesystem for SubdirFs {
     }
 
     fn chmod(&self, path: &str, mode: u32) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.chmod(p, mode)
     }
 
     fn chown(&self, path: &str, uid: Option<u32>, gid: Option<u32>) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(p, &self.prefix, path);
         self.inner.chown(p, uid, gid)
     }
 
     fn link(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(old, &self.prefix, old_path);
         full_path!(new, &self.prefix, new_path);
         self.inner.link(old, new)
     }
 
     fn rename(&self, old_path: &str, new_path: &str) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         full_path!(old, &self.prefix, old_path);
         full_path!(new, &self.prefix, new_path);
         self.inner.rename(old, new)
@@ -242,14 +298,23 @@ impl Filesystem for SubdirFs {
 
     /// Forwarded unchanged, for the same reason as `read_at_by_inode`.
     fn write_at_by_inode(&self, inode: u32, offset: usize, data: &[u8]) -> Result<usize, FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         self.inner.write_at_by_inode(inode, offset, data)
     }
 
     fn truncate_by_inode(&self, inode: u32, length: u64) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         self.inner.truncate_by_inode(inode, length)
     }
 
     fn fallocate_by_inode(&self, inode: u32, mode: i32, offset: u64, len: u64) -> Result<(), FsError> {
+        if self.read_only {
+            return Err(FsError::ReadOnly);
+        }
         self.inner.fallocate_by_inode(inode, mode, offset, len)
     }
 }
@@ -354,6 +419,26 @@ mod tests {
         let rec = Recorder::new();
         let fs = SubdirFs::new(rec.clone(), "/srv/rumpbox");
         (rec, fs)
+    }
+
+    #[test]
+    fn a_read_only_bind_refuses_every_mutation_and_forwards_reads() {
+        let rec = Recorder::new();
+        let fs = SubdirFs::new_read_only(rec.clone(), "/srv/rumpbox");
+        assert_eq!(fs.write_file("/a", b"x"), Err(FsError::ReadOnly));
+        assert_eq!(fs.write_at("/a", 0, b"x"), Err(FsError::ReadOnly));
+        assert_eq!(fs.append("/a", b"x"), Err(FsError::ReadOnly));
+        assert_eq!(fs.truncate("/a", 0), Err(FsError::ReadOnly));
+        assert_eq!(fs.create_dir("/d"), Err(FsError::ReadOnly));
+        assert_eq!(fs.remove_file("/a"), Err(FsError::ReadOnly));
+        assert_eq!(fs.remove_dir("/d"), Err(FsError::ReadOnly));
+        assert_eq!(fs.rename("/a", "/b"), Err(FsError::ReadOnly));
+        assert_eq!(fs.chmod("/a", 0o777), Err(FsError::ReadOnly));
+        assert_eq!(fs.create_symlink("/l", "/a"), Err(FsError::ReadOnly));
+        assert_eq!(fs.write_at_by_inode(1, 0, b"x"), Err(FsError::ReadOnly));
+        assert_eq!(rec.last(), "", "a refused mutation must not reach the inner filesystem");
+        assert!(fs.read_file("/etc/passwd").is_ok());
+        assert_eq!(rec.last(), "/srv/rumpbox/etc/passwd");
     }
 
     #[test]
