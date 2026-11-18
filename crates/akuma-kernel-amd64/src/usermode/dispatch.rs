@@ -642,9 +642,11 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
                 akuma_syscalls_glue::UserAddr::new(a3),
                 a4,
             );
+            #[cfg(feature = "vfat")]
+            let handled = ours.unwrap_or_else(|| to_glue(call, [a1, a2, a3, a4, a5, 0]));
             #[cfg(not(feature = "vfat"))]
-            let ours: Option<u64> = None;
-            ours.unwrap_or_else(|| to_glue(call, [a1, a2, a3, a4, a5, 0]))
+            let handled = to_glue(call, [a1, a2, a3, a4, a5, 0]);
+            handled
         }
         Syscall::Umount2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `pivot_root(new_root, put_old)` — glue's arm (`sc-private-ns`); `EPERM` for everyone but the builder of a

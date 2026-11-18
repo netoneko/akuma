@@ -2717,6 +2717,7 @@ fn sys_fork() -> u64 {
 }
 
 /// [`sys_fork`], with the child born into `into` (`clone(CLONE_NEWNS)`'s private namespace) when given.
+#[allow(clippy::needless_pass_by_value)] // the namespace is consumed only by the cfg-gated arms
 fn sys_fork_into(into: Option<(u64, alloc::sync::Arc<akuma_isolation::Namespace>)>) -> u64 {
     use crate::fd::errno;
 

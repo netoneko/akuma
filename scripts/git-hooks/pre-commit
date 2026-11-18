@@ -45,6 +45,8 @@ for crate in crates/*/; do
     # x86_64 host it is linted for the kernel's own target instead.
     target="$HOST_TARGET"
     case "$name" in akuma-psci) target=aarch64-unknown-none ;; esac
+    # akuma-kernel-glue needs the root kernel's feature set to build at all; the root clippy below lints it.
+    case "$HOST_TARGET:$name" in aarch64-*:*) ;; *:akuma-kernel-glue) continue ;; esac
     cargo clippy -p "$name" --target "$target" -- -D warnings || exit 1
 done
 

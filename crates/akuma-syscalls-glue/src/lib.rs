@@ -406,8 +406,9 @@ pub use akuma_primitives::errno::Errno;
 /// (`docs/archive/TYPE_SYSTEM_SAFETY_REPORT.md` §1).
 pub type SysResult = Result<u64, Errno>;
 
-/// Decode a negated-errno `u64` (what a plain `-> u64` arm returns) into an [`Errno`], for the few helpers that still
-/// produce one. A value that is not in the ABI's error range is a bug in the helper; it reports `EIO`.
+/// Decode a negated-errno `u64` into an [`Errno`].
+///
+/// What a plain `-> u64` arm returns, for the few helpers that still produce one. A value that is not in the ABI's error range is a bug in the helper; it reports `EIO`.
 pub fn errno_of(ret: u64) -> Errno {
     Errno::from_negated(ret).unwrap_or(Errno::EIO)
 }

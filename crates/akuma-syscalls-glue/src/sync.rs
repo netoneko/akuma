@@ -423,9 +423,9 @@ fn futex_dequeue(key: (u32, usize), tid: usize) {
 /// `typenum` stall in `archive/SELFHOST_DEVBOX_SMOLTCP.md`). Requeue never
 /// crosses `tgid`, so the search is bounded to this thread group's queues.
 fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
-    (if let Some(k) = FUTEX_WAITERS.lock().remove_anywhere(tgid, tid) {
-            fe(tid, FE_RMANY, k.1);
-        });
+    if let Some(k) = FUTEX_WAITERS.lock().remove_anywhere(tgid, tid) {
+        fe(tid, FE_RMANY, k.1);
+    }
 }
 
 /// Dump the whole futex waiter table: every `(tgid, uaddr)` key and the tids queued on it.

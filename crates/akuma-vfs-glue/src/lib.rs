@@ -1905,6 +1905,7 @@ pub fn mount_id_of(path: &str) -> Option<u32> {
 /// Allocates (a `Vec` of rows, bounded by the mounts there are): this is a procfs read, whose `Vec<u8>` result is
 /// an allocation anyway.
 #[must_use]
+#[allow(clippy::useless_let_if_seq)]
 pub fn render_mountinfo(viewer_box_id: u64, target_pid: Option<u32>) -> Vec<u8> {
     use core::fmt::Write as _;
     let mut rows: Vec<(String, Option<String>, u64, Arc<dyn Filesystem>, u32)> = Vec::new();

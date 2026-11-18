@@ -862,6 +862,7 @@ impl<D: BlockDevice> State<D> {
         }
     }
 
+    #[allow(clippy::unused_self)]
     fn metadata_of(&self, n: &Node) -> Metadata {
         match n {
             Node::Root => Metadata {
