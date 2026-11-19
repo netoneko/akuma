@@ -768,6 +768,8 @@ Then:
   there breaks them silently (`docs/archive/DENVER_BUILD_BREAKAGE.md`). `--only <word>` runs a subset, `--fast` one
   build per kernel/arch, `--list` the names. A new kernel or build target goes in its `STEPS` list. It is a build gate,
   not a test run: host tests, clippy and the `scripts/check_*.py` budgets are separate.
+- **Every merge into `main` also prunes `proposals/FUTURE_WORK.md`** (`docs/runbooks/future-work-scan.md` § 4): delete what the
+  branch fixed, add what it opened, regenerate the inventory. Same discipline as `BUG_FIX_LIST.md`.
 - **Never rewrite history**: no `reset`, `rebase`, `commit --amend` or force-push, in this repo or any submodule. A
   mistake is fixed by a new commit.
 - **Docs-only commits use `git commit --no-verify`.** A commit whose every path is Markdown or under `docs/` or

@@ -36,6 +36,11 @@ For each hit, in order:
 
 ## 4. When to run it
 
+- **On every merge into `main`, same as the bug-fix list** (`update-bug-fix-list.md`): before the merge, walk the curated
+  section of `proposals/FUTURE_WORK.md` against the branch, delete each entry the branch closed (naming the commit or
+  test in the commit message, not in the file), add the entries the branch opened, and regenerate the inventory
+  (`scripts/future_work_scan.py`, then `--check` exits 0). A fixed item left in the list is worse than a missing one.
+
 - After a large change, to see which documents it made stale (the scan is cheap).
 - Before planning a sprint, to seed the list.
 - Not in the pre-commit hook: a stale inventory is information, not an error, and failing every doc edit would train people
