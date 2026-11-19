@@ -321,9 +321,39 @@ fn stack_growth() -> Result<String, String> {
     Ok(format!("recursed 12000 frames on an 8 MiB thread stack ({v})"))
 }
 
-fn many_threads() -> Result<String, String> {
-    let n = 48;
-    let hs: Vec<_> = (0..n).map(|i| thread::spawn(move || { thread::sleep(Duration::from_millis(20)); i })).collect();
+fn spawn_churn() -> Result<String, String> {
+    // Far more sequential children than any table has slots: each is waited for, so every slot must come back.
+    let me = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
+    for i in 0..120 {
+        let st = Command::new(&me).args(["--child", "exit7"]).status().map_err(|e| format!("spawn #{i}: {e}"))?;
+        if st.code() != Some(7) {
+            return Err(format!("child #{i} status {:?}", st.code()));
+        }
+    }
+    Ok("120 sequential children, each waited for".into())
+}
+
+fn thread_churn() -> Result<String, String> {
+    // Far more sequential threads than any table has slots: each is joined, so every slot must come back.
+    for i in 0..200u32 {
+        let v = thread::Builder::new().spawn(move || i * 2).map_err(|e| format!("spawn #{i}: {e}"))?
+            .join().map_err(|_| format!("thread #{i} panicked"))?;
+        if v != i * 2 {
+            return Err(format!("thread #{i} returned {v}"));
+        }
+    }
+    Ok("200 sequential threads, each joined".into())
+}
+
+fn alive_at_once(n: usize) -> Result<String, String> {
+    // `n` threads that are all alive together (a barrier holds them until the last one has started).
+    let barrier = Arc::new(std::sync::Barrier::new(n + 1));
+    let mut hs = Vec::new();
+    for i in 0..n {
+        let b = barrier.clone();
+        hs.push(thread::Builder::new().spawn(move || { b.wait(); i }).map_err(|e| format!("spawn #{i} of {n}: {e}"))?);
+    }
+    barrier.wait();
     let mut sum = 0;
     for h in hs {
         sum += h.join().map_err(|_| "a thread panicked".to_string())?;
@@ -332,6 +362,16 @@ fn many_threads() -> Result<String, String> {
         return Err(format!("sum {sum}"));
     }
     Ok(format!("{n} threads alive at once"))
+}
+
+fn many_threads() -> Result<String, String> {
+    alive_at_once(32)
+}
+
+/// Past the tokio kernels' 48-slot spawn ring (`NSLOTS`): a capacity limit, not a leak (`spawn_churn` and
+/// `thread_churn` show every slot comes back). tokio's blocking pool may ask for 512 threads.
+fn threads_128() -> Result<String, String> {
+    alive_at_once(128)
 }
 
 fn udp_loopback() -> Result<String, String> {
@@ -452,9 +492,13 @@ const CHECKS: &[(&str, Check)] = &[
     ("env_args_cwd", env_args_cwd),
     ("stack_growth", stack_growth),
     ("udp_loopback", udp_loopback),
+    ("spawn_churn", spawn_churn),
+    ("thread_churn", thread_churn),
     ("many_threads", many_threads),
     // Last: on the tokio kernels the blocked connect wedges the guest, and must not hide the checks before it.
     ("tcp_loopback", tcp_loopback),
+    // After everything: past the capacity it leaves its blocked threads behind and nothing else can spawn.
+    ("threads_128", threads_128),
 ];
 
 fn main() {

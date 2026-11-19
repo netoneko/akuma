@@ -20,6 +20,36 @@ pub trait NetMachine: 'static {
     fn wait_lap();
     /// Fill `buf` with the best entropy the machine has.
     fn rng_fill(buf: &mut [u8]);
+    /// Whether the caller is a task the scheduler can park: a user thread inside a syscall, not the boot
+    /// task, the idle thread or an interrupt. A wait lap that can park does, so the thread that would
+    /// satisfy the wait (the peer end of a loopback connection, a sleeper whose deadline passed) can run;
+    /// a lap that cannot park halts. Defaults to `false`: the halting lap, as before.
+    fn can_park() -> bool {
+        false
+    }
+}
+
+/// How long a parked wait lap sleeps: the tick is 10 ms, so a shorter deadline is not honoured sooner;
+/// 1 ms makes the lap end at the first tick or wake pass.
+const LAP_PARK_US: u64 = 1_000;
+
+/// One bounded idle moment of a socket wait: **park** when the scheduler can switch away from this thread,
+/// otherwise halt.
+///
+/// Halting alone starves every other thread of the process. Ring-0 code is not preempted on these kernels
+/// (the tick only switches a thread it interrupted in ring 3), so a thread blocked in `accept` that only
+/// pumps and halts keeps its core, and a sibling whose `nanosleep` deadline has passed is never readied
+/// there: the sleeper stays WAITING with a past deadline and the wake pass that would ready it runs only on
+/// a yield. `std`'s `TcpListener::accept` on one thread with a `connect` after a `sleep` on another hung
+/// for that reason (`docs/archive/TOKIO_KERNELS_LOOPBACK_STARVATION.md`); the main amd64 kernel's
+/// `net_blocking_relax` makes the same distinction ("a sleeper whose deadline has passed needs the
+/// scheduler, not a halt").
+fn lap<M: NetMachine>() {
+    if M::can_park() {
+        akuma_threading::schedule_blocking(M::uptime_us().saturating_add(LAP_PARK_US));
+    } else {
+        M::wait_lap();
+    }
 }
 
 /// The stack is up; until then [`netpoll`] is a no-op (a tick can come first).
@@ -84,7 +114,7 @@ fn lap_note<M: NetMachine>(dur_us: u64) {
 fn park_until<M: NetMachine>(deadline_us: u64) {
     while M::uptime_us() < deadline_us {
         netpoll::<M>();
-        M::wait_lap();
+        lap::<M>();
     }
 }
 
@@ -95,14 +125,14 @@ fn park_until<M: NetMachine>(deadline_us: u64) {
 fn blocking_relax<M: NetMachine>() {
     for _ in 0..64 {
         netpoll::<M>();
-        M::wait_lap();
+        lap::<M>();
     }
 }
 
 /// Never a bare pause: every yield lap keeps the pump alive.
 fn yield_now<M: NetMachine>() {
     netpoll::<M>();
-    M::wait_lap();
+    lap::<M>();
 }
 
 /// A waker that does nothing: the wait loops poll, nothing is parked for one.

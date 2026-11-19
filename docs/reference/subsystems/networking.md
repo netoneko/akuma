@@ -489,6 +489,74 @@ against real Linux too (`docker run --platform linux/arm64 alpine`) — the A/B
 this file's philosophy asks for. Not yet wired into the boot suite or
 `docs/runbooks/verify-trim-fat-change.md`'s Tier 3 table.
 
+## Stacks, loopback, namespaces and the threads that drive them
+
+One picture of how a socket call reaches a wire (or a loopback ring), which namespace decides what, and **which
+thread moves the packets**. Nothing in the stack takes the NIC's interrupt, so "who pumps" is the first question
+for any hang.
+
+```text
+ USERSPACE                (a "namespace" here is a box: box_id + its mount namespace; there is no net namespace)
+ ┌───────────────────────┐  ┌───────────────────────────────┐  ┌──────────────────────────────────┐
+ │ box 0 (host root)     │  │ box N, private mount ns       │  │ box M, stack=rump                │
+ │ AF_INET sockets       │  │ AF_INET sockets               │  │ AF_INET sockets                  │
+ │ may use 127.0.0.0/8   │  │ private_loopback=true: may NOT│  └───────────────┬──────────────────┘
+ └──────────┬────────────┘  │ initiate 127.0.0.0/8 or 0.0.0.0│                 │ intercept_box_syscall
+            │               │ (inherited fds keep the parent's│                 ▼ (src/rump_proxy.rs)
+            │               │  policy)                      │       sysproxy ─► /bin/rump_server ◄─ NIC1 tap
+            │               └──────────────┬────────────────┘       (NetBSD stack, its own loopback)
+            └──────────────┬───────────────┘
+                           │ AF_UNIX ──► akuma-net-unix (pipes, no NIC, no smoltcp; abstract names are per box)
+                           ▼ AF_INET
+ ┌─ akuma-net ───────────────────────────────────────────────────────────────────────────────────────┐
+ │ SOCKET_TABLE  one per KERNEL, shared by every native box: KernelSocket{ box_id, private_loopback,  │
+ │               bind_ip, wakers, … }      lock order: SOCKET_TABLE ─► NETWORK                        │
+ │ wait_until(cond): { poll() ×≤64 ; cond? ; blocking_relax() }   ← every blocking accept/connect/recv│
+ │                                                                                                    │
+ │ NETWORK (spinlock) ─ ONE smoltcp Interface per kernel: addrs = DHCP/static + 127.0.0.1/8           │
+ │      iface.poll() loops ingress ⇄ egress until idle; a loopback SYN, SYN-ACK and ACK all complete  │
+ │      inside ONE poll()                                                                             │
+ └───────────────────────────────────────────┬────────────────────────────────────────────────────────┘
+                                             ▼
+ ┌─ akuma-net-nic ───────────────────────────────────────────────────────────────────────────────────┐
+ │ LoopbackAwareDevice                                                                                │
+ │   TX token: frame src/dst is 127.x ─► LoopbackRing (32 slots × 2 KB, no alloc) ─┐  (diverted)      │
+ │             otherwise ─────────────────────────────────────────────────────────┼─► ExternalDevice │
+ │   RX: pops the ring first, then the wire; a 127.x frame FROM the wire is a martian and is dropped  │
+ │ ExternalDevice = Virtio (NO RX IRQ, one posted buffer) | Rtl8169 | Queued (wifi) | Absent          │
+ └────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Loopback never leaves the kernel and never reaches a namespace boundary:** all boxes share the one interface, the one
+ring and the one socket table. The "private loopback" rule is a **policy on the socket** (`private_loopback`, checked
+at `connect`/`sendto`), not a second loopback network. A private namespace therefore has no loopback of its own.
+
+### Who calls `smoltcp_net::poll()` (the pump)
+
+| kernel | pumps | the thread that blocks in `accept`/`connect`/`recv` |
+|---|---|---|
+| main, AArch64 | async-main netpoll drain (`while poll()` ≤64, then `schedule_blocking(NETPOLL_PARK_US)`; a loopback push rings `wake_netpoll`), `wait_until` laps, `epoll`/`ppoll`/`pselect6`, post-op flush | parks: `park_until = schedule_blocking`; other threads run |
+| main, amd64 | `netpoll_daemon` thread (`crates/akuma-kernel-amd64/src/net.rs`), `wait_until` laps, epoll | `net_blocking_relax`: drops the BKL and halts, **but yields to the scheduler when a sleeper's deadline is due** |
+| Taoxichuan / Shanghai / Denver, amd64 | the 100 Hz tick handler (one lap per tick), each core's idle thread (one lap per idle iteration), every `wait_until` lap; **no daemon thread**; a loopback push rings nothing (`wake_netpoll` is a no-op), the frame waits for the next lap | since 2026-11-19 the lap **parks** (`schedule_blocking`, 1 ms) when `NetMachine::can_park()`; before, it pumped and halted holding the core |
+| Taoxichuan / Shanghai / Denver, AArch64 | the tick (core 0), the idle thread, `wait_until` laps | **still pumps and halts** (`can_park` defaults to `false`; not changed because it cannot be booted off a Mac) |
+
+`netpoll` is one lap at a time (`IN_LAP`): the tick and a task-context pump never run it together, and the one that finds it
+taken just returns.
+
+### What this predicts
+
+* A **loopback connect completes in one `poll()`**, so a single thread that connects and then accepts always works
+  (the tokio kernels passed that all along). The thing that can fail is the *other thread*: a blocked waiter occupies a core,
+  and on a kernel that does not preempt ring 0 only the waiter's own yields let a sibling (the connecting thread, or a
+  `nanosleep` whose deadline passed) run. "The pump is starved" and "the scheduler is starved" look identical from outside;
+  the pump here was fine.
+* `KernelSocket::wakers` are a latency optimisation. Every wait re-checks its predicate each lap, so a hang is never a
+  dropped waker: it is a waiter that never runs again, or a predicate that never becomes true.
+* Namespaces change **policy**, not plumbing: nothing about a box changes which thread pumps, which ring a frame uses or
+  which lock it takes.
+
+Incident: [`../../archive/TOKIO_KERNELS_LOOPBACK_STARVATION.md`](../../archive/TOKIO_KERNELS_LOOPBACK_STARVATION.md).
+
 ## Port forwarding (host → guest)
 
 `scripts/cargo_runner.sh` sets up SLIRP `hostfwd` rules:

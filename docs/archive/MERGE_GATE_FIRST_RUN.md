@@ -4,6 +4,10 @@
 branch `box0-followup` (x86_64 dev box, KVM), found the following. Nothing here is fixed by the gate; each is a line in
 `scripts/gate/xfail.txt` until it is.
 
+> **Corrected 2026-11-19 (later):** the `tcp_loopback` hang was a blocking `accept` starving its sibling thread, fixed in
+> `docs/archive/TOKIO_KERNELS_LOOPBACK_STARVATION.md`; `many_threads` was the 48-slot spawn ring (a capacity limit), not a
+> thread-slot reuse bug. The two bullets below describe what the gate saw first.
+
 ## Platform kernels, amd64, `gateprobe` as `init=` (Taoxichuan, Shanghai, Denver)
 * **`tcp_loopback`** (accept/connect over 127.0.0.1, 64 KiB echo, half-close): the connect never completes and the guest
   wedges. `bind`, `getsockname` and a non-blocking `accept` work (`tcp_bind` passes), and UDP over loopback passes.

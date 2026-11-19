@@ -74,6 +74,8 @@ transition and remains usable.
 `/proc/mounts` and `/proc/<pid>/mountinfo` list only namespace mounts when
 the target has its own root.
 
+(Diagram of how boxes, the one smoltcp stack, the loopback ring and the pump threads relate: [`networking.md`](networking.md) § "Stacks, loopback, namespaces and the threads that drive them".)
+
 On the shared smoltcp stack, a private mount namespace cannot initiate IPv4
 traffic to `127.0.0.0/8` or `0.0.0.0`. Box 0 can use loopback normally.
 Sockets inherited from the parent retain their original loopback policy, including

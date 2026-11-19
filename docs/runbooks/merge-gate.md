@@ -20,7 +20,8 @@ kernels that share its crates, and no build sees a behaviour change.
 `gateprobe` capabilities: `threads` (clone + futex), `time` (sleep, wall clock), `memory` (mmap, brk, mremap, demand
 faults), `files`, `files_meta` (symlink, link, chmod, truncate, pread/pwrite, holes), `big_file` (8 MiB), `tcp_bind`,
 `spawn_wait`, `spawn_many`, `threads_and_children`, `pipe_throughput` (4 MiB), `signal_kill`, `env_args_cwd`,
-`stack_growth`, `udp_loopback`, `many_threads` (48 live), `tcp_loopback`. Order matters: the probe prints as it goes and a
+`stack_growth`, `udp_loopback`, `spawn_churn` (120 sequential children), `thread_churn` (200 sequential threads),
+`many_threads` (32 alive together), `tcp_loopback`, `threads_128` (capacity: an xfail on the tokio kernels' 48-slot ring). Order matters: the probe prints as it goes and a
 wedged guest hides every check after the wedge, so hang-prone checks run last. Add one in `scripts/gate/gateprobe/src/main.rs`; the gate picks the name up from `--list`.
 
 Boots use QEMU microvm + KVM on a **snapshot** of a shared read-only image, so they run side by side. A boot job kills only
