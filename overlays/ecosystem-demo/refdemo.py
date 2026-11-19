@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--git-server-bin", type=Path, help="reuse a previously built reference git-server binary; skips Cargo build")
     ap.add_argument("--scala-interpreted", action="store_true",
                     help="run scala-cli and its Java children with -Xint (Denver JVM workaround)")
+    ap.add_argument("--scala-assembly", action="store_true",
+                    help="package the board and start it directly with java")
     a = ap.parse_args()
     ref = a.ref.resolve()
     java_env = "JAVA_TOOL_OPTIONS=-Xint " if a.scala_interpreted else ""
@@ -90,11 +92,11 @@ def main():
         else:
             t = time.monotonic()
             r, o = bx(g1, "rust", "rust", "cd /work/git-server && export CARGO_NET_GIT_FETCH_WITH_CLI=true && "
-                      "cargo build --release --locked 2>&1 | tail -15", timeout=3000)
+                      "cargo build --release --locked 2>&1", timeout=3000)
             if r != 0 or "Finished" not in o:
                 info("cargo build attempt 1 failed (kept for the record)", o[-600:])
                 r, o = bx(g1, "rust", "rust", "cd /work/git-server && export CARGO_NET_GIT_FETCH_WITH_CLI=true && "
-                          "cargo build --release --locked 2>&1 | tail -15", timeout=3000)
+                          "cargo build --release --locked 2>&1", timeout=3000)
             info("cargo build --release --locked (git-server), wall", f"{time.monotonic() - t:.0f}s")
             check("rust box: the git server builds with cargo (crates.io + the pinned git dependency)",
                   r == 0 and "Finished" in o and "error" not in o.lower().replace("error:", "ERR:").split("finished")[0][-300:], o)
@@ -102,14 +104,18 @@ def main():
         t = time.monotonic()
         r, o = bx(g1, "scala", "scala", f"{java_env}scala-cli version --cli-version 2>&1 | head -3", timeout=600)
         check("scala box: scala-cli (JVM jar, v1.19.0) runs", r == 0 and "1.19" in o, o)
-        r, o = bx(g1, "scala", "scala", f"cd /work/task-board && {java_env}scala-cli compile Main.scala --server=false 2>&1 | tail -8", timeout=3000)
+        r, o = bx(g1, "scala", "scala", f"cd /work/task-board && {java_env}scala-cli compile Main.scala --server=false 2>&1", timeout=3000)
         info("scala-cli compile (task-board; Scala 3.3.6 + ujson from Maven Central), wall", f"{time.monotonic() - t:.0f}s")
         check("scala box: the task board compiles with scala-cli (dependencies from Maven Central)", r == 0 and "rror" not in o and "xception" not in o, o)
+        if a.scala_assembly:
+            r, o = bx(g1, "scala", "scala", f"cd /work/task-board && {java_env}scala-cli --power package Main.scala --server=false --assembly -o /work/board.jar 2>&1", timeout=3000)
+            check("scala box: task board assembly is packaged", r == 0 and "Wrote" in o, o)
 
         # --- run -----------------------------------------------------------------------------------
         bx(g1, "rust", "rust", "mkdir -p /work/repos && for n in rust scala python; do git init -q --bare --initial-branch=main /work/repos/$n.git; done; echo provisioned")
         g1.run("/sbin/eco-box daemon rust rust 'cd /work && GIT_ROOT=/work/repos PORT=8081 /work/git-server/target/release/akuma-demo-git-server > /work/git.log 2>&1'")
-        g1.run(f"/sbin/eco-box daemon scala scala 'cd /work/task-board && {java_env}scala-cli run Main.scala --server=false > /work/board.log 2>&1'")
+        board_command = "java -jar /work/board.jar" if a.scala_assembly else "scala-cli run Main.scala --server=false"
+        g1.run(f"/sbin/eco-box daemon scala scala 'cd /work/task-board && {java_env}{board_command} > /work/board.log 2>&1'")
         # The services live in the boxes `gitsrv` / `board`: same boxes as the builds (a container id is its writable layer); nothing may `eco-box exec` them afterwards, it closes the box.
         time.sleep(1)
         board_url, git_url = d.service_url(8082), d.service_url(8081)
