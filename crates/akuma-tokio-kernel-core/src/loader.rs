@@ -194,6 +194,10 @@ pub fn place_segment<M: Loader + lazy::Kernel>(
     if last > USER_TOP {
         return None;
     }
+    // Denver container records reserve the upper inode bits for a mount slot.
+    // Large root inodes must load eagerly, rather than alias a mounted file.
+    #[cfg(feature = "containers")]
+    let inode = inode.filter(|&node| node < (1 << 24));
     // A file record names a whole file page: `p_offset` congruent to `p_vaddr`.
     let inode = inode.filter(|&node| seg.offset.wrapping_sub(seg.vaddr).trailing_zeros() >= 12 && lazy::pin::<M>(root, node, first, last));
     let file_end = seg.vaddr + seg.filesz;
@@ -406,7 +410,7 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
         Err(_) => return None,
     };
 
-    let aux = [
+    let aux: &[(u64, u64)] = &[
         (st::AT_BASE, at_base),
         (st::AT_PHDR, prog.phdr_va),
         (st::AT_PHENT, akuma_elf_exec::PHENT),
@@ -431,7 +435,7 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
     #[cfg(feature = "vsyscall")]
     let aux: &[(u64, u64)] = &{
         let mut grown: Vec<(u64, u64)> = Vec::with_capacity(aux.len() + 1);
-        grown.extend_from_slice(&aux);
+        grown.extend_from_slice(aux);
         if let Some(vdso) = M::VDSO_BASE {
             grown.push((st::AT_SYSINFO_EHDR, vdso));
         }
@@ -446,13 +450,13 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
     #[cfg(feature = "procfs-diag")]
     let aux_len = aux.len().min(AUXV_PAIRS_MAX);
     #[cfg(feature = "procfs-diag")]
-    for (dst, &(k, v)) in aux_retained.iter_mut().zip(aux.iter()).take(AUXV_PAIRS_MAX) {
-        *dst = [k, v];
+    for (dst, &pair) in aux_retained.iter_mut().zip(aux.iter()).take(AUXV_PAIRS_MAX) {
+        *dst = pair.into();
     }
     let mut block: Vec<u8> = Vec::new();
     block.try_reserve_exact(block_pages * 4096).ok()?;
     block.resize(block_pages * 4096, 0);
-    let sp = build_stack(&mut block, USER_STACK_TOP, argv, env, &aux);
+    let sp = build_stack(&mut block, USER_STACK_TOP, argv, env, aux);
 
     let stack_pages = (USER_STACK_PAGES as usize).max(block_pages + 4);
     let stack_base = USER_STACK_TOP - stack_pages as u64 * 4096;

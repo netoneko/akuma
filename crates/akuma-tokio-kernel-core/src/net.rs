@@ -24,6 +24,7 @@ pub trait NetMachine: 'static {
     /// task, the idle thread or an interrupt. A wait lap that can park does, so the thread that would
     /// satisfy the wait (the peer end of a loopback connection, a sleeper whose deadline passed) can run;
     /// a lap that cannot park halts. Defaults to `false`: the halting lap, as before.
+    #[must_use]
     fn can_park() -> bool {
         false
     }

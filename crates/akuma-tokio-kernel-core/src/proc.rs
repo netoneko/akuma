@@ -26,7 +26,11 @@ use crate::task::Task;
 use crate::{mm, tree};
 
 /// Ring slots: threading tids `0..NSLOTS` (0 is the boot thread).
+#[cfg(not(feature = "containers"))]
 pub const NSLOTS: usize = 48;
+// The demo runs a JVM and multiple boxed toolchains concurrently.
+#[cfg(feature = "containers")]
+pub const NSLOTS: usize = 256;
 
 const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
@@ -226,7 +230,7 @@ pub fn bind_init<M: Proc>(path: &str, ti: &TaskImage) -> Option<usize> {
     // pid 1 never execve'd, so this registration is the only retention point.
     #[cfg(feature = "procfs-diag")]
     akuma_exec::process::with_process(1, |p| {
-        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().copied().map(Into::into).collect());
     });
     INIT_TID.store(tid, Relaxed);
     Some(tid)
@@ -687,7 +691,7 @@ pub fn exec_strs<M: Proc>(path: String, mut argv_s: Vec<String>, env_s: &[String
     // (`Process::inherit_from`); this overwrites it at exec, as Linux's does.
     #[cfg(feature = "procfs-diag")]
     akuma_exec::process::with_process(pid, |p| {
-        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().copied().map(Into::into).collect());
     });
     Ok(ti)
 }

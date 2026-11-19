@@ -212,7 +212,7 @@ class Guest:
 
     def start(self):
         cmdline = ("virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 "
-                   "init=/bin/herd " + self.extra).strip()
+                   f"init=/bin/herd epoch={int(time.time())} " + self.extra).strip()
         fwd = f"hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22," + "".join(
             f"hostfwd=tcp:127.0.0.1:{h}-:{g}," for g, h in self.forwards.items())
         net = f"user,id=n0,net=169.254.0.0/16,host={HOST_ALIAS},dhcpstart=169.254.0.15,dns=169.254.0.3,{fwd}guestfwd=tcp:{META_IP}:80-cmd:nc 127.0.0.1 {self.md_port}"

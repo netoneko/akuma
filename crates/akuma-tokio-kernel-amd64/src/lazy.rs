@@ -210,16 +210,16 @@ impl core_lazy::Kernel for Amd64 {
 /// A box's files in a lazy record (`--features containers`).
 ///
 /// A record names a file by one `u32`. The root filesystem's files keep their inode number (the top bits clear); a file
-/// on any other mount, which is every file a box maps, is `slot << 28 | inode`, where `slot` indexes the mount ids seen
-/// so far (mount ids are never reused, so a slot never names a different mount than it did). Fifteen mounts, inode
-/// numbers below 2^28: past either the file is refused (`ENODEV`), as every boxed file was before.
+/// on any other mount, which is every file a box maps, is `slot << 24 | inode`, where `slot` indexes the mount ids seen
+/// so far (mount ids are never reused, so a slot never names a different mount than it did). 255 mounts per boot, inode
+/// numbers below 2^24: past either the file is refused (`ENODEV`), as every boxed file was before.
 #[cfg(feature = "containers")]
 pub mod boxfile {
     use core::sync::atomic::{AtomicU32, Ordering};
 
-    pub const INODE_BITS: u32 = 28;
+    pub const INODE_BITS: u32 = 24;
     pub const INODE_MASK: u32 = (1 << INODE_BITS) - 1;
-    const SLOTS: usize = 15;
+    const SLOTS: usize = 255;
     static MOUNTS: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
 
     /// The record's file number for `(mount_id, inode)`, taking a slot for the mount if it has none.

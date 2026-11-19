@@ -1062,6 +1062,9 @@ fn fd_inode(fd: u64) -> Option<u32> {
     })??;
     let inode = if kf.inode() != 0 { kf.inode() } else { root_fs().resolve_inode(&kf.path).ok()? };
     let md = root_fs().metadata_by_inode(inode).ok()?;
+    // High bits identify box mounts in lazy records; do not alias a root inode.
+    #[cfg(feature = "containers")]
+    if inode > lazy::boxfile::INODE_MASK { return None; }
     (!md.is_dir).then_some(inode)
 }
 
@@ -1616,7 +1619,7 @@ fn tokio_surface(nr: u64, args: [u64; 6]) -> Option<u64> {
     // Akuma's private x86 ABI occupies a separate range from Linux calls.
     #[cfg(feature = "containers")]
     if let Some(private) = nr.checked_sub(0x1000)
-        && matches!(private, 315 | 316 | 317 | 318 | 324 | 325 | 326)
+        && matches!(private, 301 | 302 | 303 | 305 | 315 | 316 | 317 | 318 | 319 | 324 | 325 | 326)
     {
         return Some(akuma_syscalls_glue::handle_syscall(private, &args));
     }

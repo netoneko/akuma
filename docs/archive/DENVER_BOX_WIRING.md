@@ -51,8 +51,8 @@ inside the box failed with `ENOMEM` ("sh: out of memory").
 user-layout regions, no brk or mmap window, so every `mprotect`/`mmap` range failed `user_ok`.
 
 **Fix.**
-- The lazy record's inode field is a mount-qualified file number, `slot<<28 | inode` (`akuma_tokio_kernel_amd64::lazy::boxfile`, 15
-  slots, slot 0 = root). `Kernel` gained `read_file`, `file_size`, `pin_inode` and `shareable`; reads go through
+- The lazy record's inode field is a mount-qualified file number, `slot<<24 | inode` (`akuma_tokio_kernel_amd64::lazy::boxfile`, 255
+  slots per boot, slot 0 = root; originally 15 slots). `Kernel` gained `read_file`, `file_size`, `pin_inode` and `shareable`; reads go through
   `akuma_vfs_glue::read_at_by_mount_inode` and the process's namespace. Boxed files never enter `akuma_fpcache` or `shmpages`.
   Writable `MAP_SHARED` of a boxed file is still refused (`ENODEV`).
 - `twin_enter_user` re-loads a spawn child whose task record has no regions through `proc::exec_strs` (path from the `Process`, argv
@@ -76,5 +76,30 @@ handed over (0 = keep the current root until the bind sets the real one). The sp
 `1.19.0`; `scripts/gate.py --only taoxichuan,shanghai,denver` PASS (the Tokio core changed under all three).
 
 **Still open.** scala-cli *compile* with Maven Central, `cargo` with the network and seccomp/private namespaces inside a Denver box are
-untested (no box networking on Denver yet); the JVM gate with `containers` on; Denver's missing `herd`/bootstrap overlay and its guest
-driver for the demo.
+untested at that point (see the network probe below); the JVM gate with `containers` on; the demo bootstrap and its guest driver (subsequently exercised below).
+
+## Box network probe (2026-11-19)
+
+`denver/probe-box-network.py` boots the `containers` kernel with a virtio NIC and a disposable ext2 image. A process spawned inside a registered box connects to QEMU SLIRP's host alias and makes an HTTP request to a temporary host server. On the featured amd64 build in the reproduction above, DHCP configured `10.0.2.15` and the probe reported `REGISTER PASS`, `SPAWN PASS`, `BOX_NET_PASS`, `KILL PASS`, and `RESULT PASS`. Run it with:
+
+```sh
+DENVER_KERNEL="$PWD/target/x86_64-unknown-none/release/denver" denver/probe-box-network.py
+```
+
+It requires QEMU, a C compiler, e2fsprogs, Python 3, and a free host TCP port. It exercises outbound IPv4 TCP and HTTP from a box, not DNS, TLS, internet access, inbound forwarding, network isolation, or the actual demo services. Those remain to be checked on Denver. The ecosystem launcher boots `/bin/herd`; the Denver run below exercises that same bootstrap and userspace. The existing successful reference-demo run used the main amd64 kernel and must not be attributed to Denver.
+
+## Herd and demo guest verification (2026-11-19)
+
+The existing demo images and herd configuration boot on Denver after routing herd's private spawn, wait, kill, time and uptime ABI calls to the existing shared handlers. Both guests fetched the bootstrap through metadata and reached SSH. Supplying `epoch=` from the launcher fixed TLS certificate validation; DNS and HTTPS then passed from the guest and each of the rust, scala and python boxes, including crates.io and Maven Central. Cross-guest HTTP reached both boxed servers through the launcher's forwards.
+
+Repeated `eco-box` launches exhausted the original 15 mount IDs: the mount IDs are never reused, and dynamic libraries began failing with `ENODEV`. The experimental encoding now allows 255 mount IDs at the cost of limiting inode numbers to 24 bits, Box file mappings above that range are refused; root executable pages above it load eagerly and root file mappings are refused. The mount table still exhausts permanently on a long boot. A lifetime-aware mapping identity is needed for an unrestricted deployment.
+
+The original 48 task slots prevented the capacity workload from forking. The opt-in container profile now has 256 slots and matching BKL depth storage. The corrected capacity test builds the load program in its own box and checks that 150 JVM threads and 60 sleeper processes started; Scala and Cargo builds completed beside them, with 248 live user threads observed. The first capacity test's apparent pass was invalid: it compiled the JVM load program in a different box. The rest of the launcher verification, including metadata bootstrap, toolchains and cross-guest traffic, passed in the same run. The unboxed fake-model Codex command-tool probe passed on a combined `containers,codex` build. Codex 0.169.0 also ran inside the Scala box and successfully executed a fake-model command that wrote and read a file; this used `danger-full-access`. Real provider credentials and sandboxing remain unverified.
+
+### Reference service rehearsal and remaining blocker
+
+The reference Rust git server built inside the rust box with crates.io and its pinned Git dependency in 1,375 seconds. The binary was saved as `/var/tmp/akuma-eco/denver-reference-git-server` (SHA-256 `ebeeac12a32b76f5b12c3ae8aeb567f3f42262c0575a19f9f346275a3fe9cb1a`). The normal scala-cli compile crashed in HotSpot (captured in `/var/tmp/akuma-eco/denver-scala-hs_err.log`). A repeat with `JAVA_TOOL_OPTIONS=-Xint` compiled the task board, including Maven downloads, but the service did not become reachable.
+
+A trace-enabled repeat on the rebuilt disks recorded `[execve] non-leader thread slot=4` immediately followed by another thread faulting at the `ret` following musl's futex syscall, with its stack unmapped. The full captured console is `/var/tmp/akuma-eco/denver-reference-exec-trace.log`. This matches the class of failure already fixed on the main amd64 kernel in `EXEC_FROM_THREAD_DETACH.md`: the Tokio exec path replaces the shared address space without ending or detaching the other threads. The trace identifies the immediate relationship; it is not yet a tested Tokio fix. The reference service acceptance suite has **not** passed on Denver. `refdemo.py --scala-interpreted --git-server-bin PATH` permits a repeat without rebuilding the Rust server, and reports the reused binary's digest. Do not treat interpreter mode as a fix for service startup.
+
+The demo host root now uses a real `/var/run` directory. Previously the Alpine symlink caused Denver herd to fail to create its token and leave start/stop unauthenticated. A fresh Denver boot created a nonempty mode-600 token, and the full verification against rebuilt guest disks passed **58 checks**, including a token check on each guest. The rebuilt disks and manifest are in `/var/tmp/akuma-eco/denver-ready`; they are distinct from the older default `$ECO_WORK/out` images.

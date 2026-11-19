@@ -204,8 +204,8 @@ pub fn sigreturn(f: &mut Frame) -> u64 {
         let g = |i: usize| word(&uc, (UC_MCTX / 8) + 1 + i);
         let (usp, upc) = (g(31), g(32));
         if usp < USER_TOP && upc < USER_TOP {
-            for i in 0..31 {
-                f.x[i] = g(i);
+            for (i, reg) in f.x.iter_mut().enumerate() {
+                *reg = g(i);
             }
             f.sp = usp;
             f.elr = upc;

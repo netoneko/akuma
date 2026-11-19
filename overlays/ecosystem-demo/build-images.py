@@ -229,6 +229,12 @@ def common_overlay(root: Path):
     (root / "etc/apk/arch").write_text(ARCH + "\n")
     for d in ("tmp", "work", "root", "run", "proc", "dev", "sys"):
         (root / d).mkdir(exist_ok=True)
+    # Denver cannot create /var/run/herd through Alpine's /var/run -> /run symlink.
+    # Keep herd's control token in a real directory on both guest kernels.
+    var_run = root / "var/run"
+    if var_run.is_symlink():
+        var_run.unlink()
+    var_run.mkdir(parents=True, exist_ok=True)
     (root / "tmp").chmod(0o1777)
 
 
@@ -420,6 +426,12 @@ def userspace_into(root: Path):
     for d in ("tmp", "run", "proc", "dev", "sys", "root", "var/lib/box/layers", "var/lib/box/images",
               "var/lib/box/containers", "var/lib/agents"):
         (root / d).mkdir(parents=True, exist_ok=True)
+    # Denver cannot create /var/run/herd through Alpine's /var/run -> /run symlink.
+    # Keep herd's control token in a real directory on both guest kernels.
+    var_run = root / "var/run"
+    if var_run.is_symlink():
+        var_run.unlink()
+    var_run.mkdir(parents=True, exist_ok=True)
     (root / "tmp").chmod(0o1777)
     (root / "var/lib/agents").chmod(0o700)
 

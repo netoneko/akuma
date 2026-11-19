@@ -44,7 +44,10 @@ static NEXT: AtomicU32 = AtomicU32::new(0);
 static SERVING: AtomicU32 = AtomicU32::new(0);
 /// The owner's recursion depth (only the owner writes it).
 static DEPTH: AtomicU32 = AtomicU32::new(0);
-/// Threads whose depth is kept across a switch (tid-indexed).
+/// Threads whose depth is kept across a switch (tid-indexed), including room for idle/core slots.
+#[cfg(feature = "process")]
+pub const THREAD_SLOTS: usize = crate::proc::NSLOTS + 128;
+#[cfg(not(feature = "process"))]
 pub const THREAD_SLOTS: usize = 128;
 /// Per-thread depth, saved at a switch away.
 static THREAD_DEPTH: [AtomicU32; THREAD_SLOTS] = [const { AtomicU32::new(0) }; THREAD_SLOTS];

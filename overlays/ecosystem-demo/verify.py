@@ -69,6 +69,8 @@ def main(args, run_dir, Demo):
 
         # --- bootstrap result ----------------------------------------------------------------
         for g, agents in ((g1, ["rust", "scala"]), (g2, ["python"])):
+            rc, o = g.run("test -s /var/run/herd/control.token && stat -c %a /var/run/herd/control.token")
+            check(f"guest{g.n}: herd control token exists and is root-only", rc == 0 and o.strip() == "600", o)
             rc, o = g.run("cat /run/eco/bootstrap.rc; ls -l /var/lib/agents; for a in /var/lib/agents/*; do ls -l $a/secrets $a/prompts; done; "
                           "grep -c ssh-ed25519 /etc/sshd/authorized_keys")
             check(f"guest{g.n}: bootstrap script verified and run (rc 0), agents installed", o.startswith("0") and all(a in o for a in agents), o)
@@ -212,13 +214,22 @@ def main(args, run_dir, Demo):
 def cap(g1, d):
     """A JVM + a Scala build + a Codex-sized process count on this kernel (448-thread table)."""
     rc, o = g1.run("grep -c . /proc/cpuinfo >/dev/null; echo ok")
-    src = ("object T { def main(a: Array[String]): Unit = { val n = a(0).toInt; val ts = (1 to n).map(i => new Thread(() => Thread.sleep(25000))); "
+    src = ("object T { def main(a: Array[String]): Unit = { val n = a(0).toInt; val ts = (1 to n).map(i => new Thread(() => Thread.sleep(120000))); "
            "ts.foreach(_.start()); println(s\"threads started $n\"); ts.foreach(_.join()) } }")
-    bx(g1, "scala", "scala", f"cd /tmp && echo '{src}' > T.scala && scalac T.scala")
-    # 1. 24 sleeper processes (a Codex-sized process fan-out) + JVM with 150 threads + a cargo build in the rust box.
+    rc, o = bx(g1, "jvm-load", "scala", f"cd /tmp && echo '{src}' > T.scala && scalac T.scala")
+    check("capacity: JVM load program compiles in its own box", rc == 0, o)
+    # The load box has its own writable layer; compile the program there before starting it.
     g1.run("/sbin/eco-box daemon jvm-load scala 'cd /tmp && scala -cp . T 150 > /tmp/t.out 2>&1'")
-    g1.run("/sbin/eco-box daemon sleep-load rust 'for i in $(seq 1 60); do sleep 40 & done; wait'")
+    g1.run("/sbin/eco-box daemon sleep-load rust 'for i in $(seq 1 60); do sleep 120 & done; wait'")
     time.sleep(8)
+    rc, load = g1.run("cat /var/lib/box/containers/jvm-load/upper/tmp/t.out 2>/dev/null; ps | grep -c '[s]leep 120'")
+    lines = load.strip().splitlines()
+    try:
+        sleepers = int(lines[-1])
+    except (ValueError, IndexError):
+        sleepers = 0
+    check("capacity: JVM started 150 threads and 60 sleeper processes are running",
+          "threads started 150" in load and sleepers >= 60, load)
     t = time.monotonic()
     rc, o = bx(g1, "scala", "scala", "cd /tmp && mkdir -p b && cd b && for i in 1 2 3; do echo \"object B$i { def f = $i }\" > B$i.scala; done && scalac *.scala && echo scala-build-ok")
     check("capacity: a Scala build completes beside a JVM with 150 threads and 60 sleeper processes", rc == 0 and "scala-build-ok" in o, o)

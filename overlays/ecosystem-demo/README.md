@@ -54,3 +54,18 @@ output once, for the akuma userspace binaries (herd, sshd, ssh, box); it runs it
 * **apk** inside a box talks to a pinned mirror served by the launcher (`http://169.254.0.2:8000/v3.22/{main,community}`), the
   same files the images were built from. A package that was not cached 404s.
 * **Output from a box** goes through a file (E1): `eco-box exec` reads it from the container's upper directory.
+
+## Denver QEMU experiment
+
+The launcher can use the same herd bootstrap on an experimental amd64 Denver kernel:
+
+```sh
+cargo build -p denver --target x86_64-unknown-none --release --features containers,codex
+python3 overlays/ecosystem-demo/build-images.py all
+export ECO_KERNEL="$PWD/target/x86_64-unknown-none/release/denver"
+python3 overlays/ecosystem-demo/launch.py verify
+python3 overlays/ecosystem-demo/boxed-codex-probe.py
+python3 overlays/ecosystem-demo/refdemo.py --ref ../akuma-demo-reference-impl --scala-interpreted
+```
+
+The interpreter option permits scala-cli compilation after an observed JVM crash; service startup still fails on Denver when a non-leader thread execs. The reference acceptance run is not yet green. `--git-server-bin PATH` can reuse a previously built reference binary and reports its digest, skipping the in-guest Cargo build. The launcher supplies the host's current Unix time to each guest for TLS certificate validation. It uses snapshot disks; work inside the VMs is discarded at teardown. The `containers` profile is experimental. Box mapping identities are limited to 255 distinct mounts per boot and 24-bit inode numbers; repeated box recreation can exhaust the limit. This is not a production isolation guarantee. The boxed Codex probe supplies local binaries and a model cache to a disposable guest, uses a fake model, and disables the sandbox. The demo images and driver do not yet launch the planned real boxed Codex sessions, and actual provider credentials and models have not been validated. See `docs/archive/DENVER_BOX_WIRING.md` and `docs/archive/DENVER_CODEX_TOOLS.md`.
