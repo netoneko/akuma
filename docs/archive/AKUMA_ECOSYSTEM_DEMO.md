@@ -165,3 +165,57 @@ Akuma-host backend, then the Scala service (keep Rust and Python).
 isolation with concurrent agents, cross-VM TCP, JVM and Rust toolchains under load, many threads and processes, TLS to a model
 API, and a Python test run over the network. Anything that fails is a gate probe waiting to be written
 (`docs/runbooks/merge-gate.md`).
+
+## Build order and the dry run (decided 2026-11-19)
+
+### Backend order
+
+1. **QEMU, on the ryzen** (this doc's first target): build the images and the launcher here, where the whole loop is local
+   and fast (KVM, `scripts/gate.py`-style boots on a snapshot of a read-only image).
+2. **Akuma VMs** (the SVM hypervisor on the ryzen), once the same images pass on QEMU.
+3. **Firecracker**, last, as polish: its network and block setup differ and it is the backend with the most to re-learn.
+
+Nothing moves to the next backend until the dry run below passes on the current one.
+
+### Set everything up beforehand, then prove an agent can do the job
+
+An agent that fails because the image lacked `git` or the dependencies were not cached tells us nothing about the agent.
+So **the demo is rehearsed by us, by hand, before any agent sees it**, on the exact images the agents will get:
+
+1. **Stage the environment** (no agent): build the guest images and the launcher; give each box its tools, its dependency
+   cache and an empty workspace.
+2. **We write the three services ourselves** (Rust, Scala, and the Python test suite from the contract below). Stage the
+   sources into the boxes the way an agent would receive a task, compile them, run them, and run the Python suite from guest 2
+   against both. Fix every gap the image, the box or the kernel shows. Keep these sources: they are the reference solution
+   and the oracle for the agents' results.
+3. **Hand each agent an empty box** with the same tools and ask it to repeat what we did: write, build, run, commit. Compare
+   against the reference. A failure here is either an agent failure (record it) or an environment failure (fix the image and
+   rerun from step 2; the dry run is not done until step 3 needs no environment fixes).
+
+The gate's `gateprobe` pattern applies: each thing the rehearsal needed that was missing becomes a probe or an image check, so
+the next image build proves it.
+
+### Roots and tools
+
+* **One root per language box.** The Rust box and the Scala box each get their own root filesystem (own `box` image/layers,
+  own writable upper), not a shared one with both toolchains: the Rust root carries `rustc`/`cargo` and its registry cache;
+  the Scala root carries the JDK, Scala and its dependency cache. Isolation, image size and "what the agent can see" all
+  follow from that, and it exercises `box`'s per-box roots rather than a shared tree. Guest 2 (Python) is a third image.
+* **Agents get ordinary developer tools**, not a stripped sandbox: `bash`, `git` (so they can commit their work in their
+  workspace; the transcript includes the log), `apk` (so they can install what they find missing, with the package mirror or a
+  prepopulated local cache reachable), plus coreutils, `curl`, an editor-less workflow is fine. Never bake credentials in; the
+  git identity is a throwaway one set at launch.
+* The workspace is a **git repository per agent**, created empty at launch, so "the agent's work" is a commit history that
+  survives the run and can be diffed against the reference solution.
+
+### Checklist before step 3 (agents)
+
+| check | how | done when |
+|---|---|---|
+| image per root builds reproducibly | a build script; source revision and digest recorded | rebuilt twice, same digest |
+| tools present in every root | `bash`, `git`, `apk`, `curl`, the language toolchain run in each box | a script runs them, exits 0 |
+| dependencies reachable offline or via the mirror | build the reference service with the network policy the agent will have | clean build from an empty workspace |
+| the reference Rust and Scala services pass the Python suite from guest 2 | manual run, then scripted | 100% of the contract's cases |
+| guest 2 reaches guest 1's `:8081`/`:8082` | the launcher's preflight | `curl /health` from guest 2 |
+| an empty box can be handed out and reset | launcher | box recreated from the image in seconds, workspace empty |
+| the kernel handles the load | `scripts/gate.py`-style probes for what the rehearsal exercised (threads, processes, TLS, big builds) | no kernel-side surprises during step 2 |
