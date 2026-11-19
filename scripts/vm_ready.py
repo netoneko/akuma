@@ -39,22 +39,28 @@ def ssh_port(instance=0):
     return 2222 + 100 * int(instance)
 
 
-def ssh_probe(port, timeout=6):
-    """One round-trip. True only if the guest actually ran our command."""
+def ssh_probe(port, timeout=6, host="localhost", identity=None):
+    """One round-trip. True only if the guest actually ran our command.
+
+    `host`/`identity` default to the forwarded-port case every older harness
+    uses; the ecosystem demo's guests sit on a bridge (no hostfwd) and take
+    the launch key from the metadata service.
+    """
+    key = ["-i", str(identity), "-o", "IdentitiesOnly=yes"] if identity else []
     try:
         r = subprocess.run(
-            ["ssh", "-q", "-o", "StrictHostKeyChecking=no",
+            ["ssh", "-q", *key, "-o", "StrictHostKeyChecking=no",
              "-o", "UserKnownHostsFile=/dev/null",
              "-o", f"ConnectTimeout={max(2, int(timeout) - 1)}",
              "-o", "BatchMode=yes",
-             "-p", str(port), "root@localhost", "echo __VM_READY__"],
+             "-p", str(port), f"root@{host}", "echo __VM_READY__"],
             capture_output=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
         return False
     return b"__VM_READY__" in r.stdout
 
 
-def wait_ready(port=2222, timeout=480, interval=3, proc=None):
+def wait_ready(port=2222, timeout=480, interval=3, proc=None, host="localhost", identity=None):
     """Block until the guest answers ssh. Returns True/False, never raises.
 
     `proc`: optional `subprocess.Popen` for the QEMU process. If it has exited,
@@ -62,7 +68,7 @@ def wait_ready(port=2222, timeout=480, interval=3, proc=None):
     """
     deadline = time.time() + timeout
     while time.time() < deadline:
-        if ssh_probe(port):
+        if ssh_probe(port, host=host, identity=identity):
             return True
         if proc is not None and proc.poll() is not None:
             return False

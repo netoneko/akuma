@@ -1,0 +1,60 @@
+#!/bin/sh
+# eco-box: run things in an agent's box and get their output back.
+#
+#   eco-box exec NAME IMAGE CMD...   run CMD (one shell string) in box NAME, print its output, exit with its status
+#   eco-box daemon NAME IMAGE CMD...  start CMD detached in box NAME (no output)
+#   eco-box destroy NAME             stop the box and delete its writable layer (workspace included)
+#   eco-box exists NAME
+#
+# NAME is both the container id and the AGENT: its secrets (/var/lib/agents/NAME/secrets/*) are
+# passed to THIS box as environment variables and to no other. The workspace /work is a git
+# repository created empty on the first run (ws-init) and kept in the container's upper layer.
+#
+# Output goes through a file in the box's /tmp and is read from the container's upper
+# directory on the host, because `box run`'s stdout is not delivered to an ssh exec session
+# (proposals/FUTURE_WORK.md, B-box-stdout). Replace this with plain `box run` when that is fixed.
+BOXES=/var/lib/box/containers
+cmd="$1"; shift
+case "$cmd" in
+exec)
+    name="$1"; image="$2"; shift 2
+    c="$BOXES/$name"; up="$c/upper"
+    mkdir -p "$up/tmp"
+    rm -f "$up/tmp/.eco.out" "$up/tmp/.eco.rc"
+    set -- "$*"
+    script="ws-init >/dev/null 2>&1; { $1
+} >/tmp/.eco.out 2>&1; echo \$? >/tmp/.eco.rc"
+    sdir="/var/lib/agents/$name/secrets"
+    # Positional parameters carry the -e flags so a secret value with spaces survives.
+    set --
+    if [ -d "$sdir" ]; then
+        for f in "$sdir"/*; do
+            [ -f "$f" ] || continue
+            set -- "$@" -e "$(basename "$f")=$(cat "$f")"
+        done
+    fi
+    box close "$name" >/dev/null 2>&1
+    box run --name "$name" -e "AGENT_NAME=$name" "$@" "$image" /bin/sh -c "$script" >/dev/null 2>&1
+    cat "$up/tmp/.eco.out" 2>/dev/null
+    rc=$(cat "$up/tmp/.eco.rc" 2>/dev/null)
+    [ -n "$rc" ] || { echo "[eco-box] the box produced no exit status" >&2; exit 255; }
+    exit "$rc"
+    ;;
+daemon)
+    # eco-box daemon NAME IMAGE CMD...: start CMD detached in box NAME (same writable layer as `exec`).
+    name="$1"; image="$2"; shift 2
+    box close "$name" >/dev/null 2>&1
+    box run -d --name "$name" -e "AGENT_NAME=$name" "$image" /bin/sh -c "ws-init >/dev/null 2>&1; $*" >/dev/null 2>&1
+    ;;
+destroy)
+    box close "$1" >/dev/null 2>&1
+    rm -rf "$BOXES/$1"
+    ;;
+exists)
+    [ -d "$BOXES/$1/upper" ]
+    ;;
+*)
+    echo "usage: eco-box exec NAME IMAGE CMD... | daemon NAME IMAGE CMD... | destroy NAME | exists NAME" >&2
+    exit 2
+    ;;
+esac
