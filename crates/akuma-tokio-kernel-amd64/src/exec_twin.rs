@@ -407,6 +407,11 @@ fn twin_bind_child_task(
 /// parent's TLS pointer in hardware, fork semantics.
 fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     let cur = crate::exec_twin::current_slot();
+    // The task record (not the bind table) is the root's authority — a real
+    // child that has exec'd must enter on the NEW image's root.
+    if cur != crate::exec_twin::NO_SLOT && cur < crate::child::NSLOTS + 1 {
+        crate::set_task_slot(crate::child::sched_task_slot_of(cur));
+    }
     // A `spawn` child (a box's first process): its image was placed by `akuma-exec`'s loader, which knows nothing of this
     // kernel's task record (no regions, no break or mmap window), so every memory call of the program would refuse. Load
     // it again the way `execve` does, which fills the record.
@@ -429,11 +434,6 @@ fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     }
     // (session pg: `[tmp] enter` print removed with the sw-to print — same
     // pre-gate-boot readability pass, PLAN-pg §5.)
-    // The task record (not the bind table) is the root's authority — a real
-    // child that has exec'd must enter on the NEW image's root.
-    if cur != crate::exec_twin::NO_SLOT && cur < crate::child::NSLOTS + 1 {
-        crate::set_task_slot(crate::child::sched_task_slot_of(cur));
-    }
     let root = crate::child::sched_root_of(cur);
     let ef = akuma_ring3_amd64::EntryFrame {
         r15: ctx.regs[11],

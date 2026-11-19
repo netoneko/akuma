@@ -64,6 +64,17 @@ libakuma/linux-abi`, since stock `box` uses the Akuma-private syscall ABI Denver
 `rustc -O h.rs && ./h` and `cargo new && cargo build && ./demo`; in the `scala` box `java -version` (OpenJDK 21.0.11) and
 `java H.java` (source launcher compiles and runs). All four Denver and three Shanghai/Taoxichuan kernel builds pass.
 
-**Still open.** A *second* `box run` in one boot panics (`activate: root does not share the live kernel slot 511`, `box` exec after a
-previous box exited). The python box was not run (no image of that name on the scratch disk). scala-cli, seccomp and private
-namespaces, the JVM gates with `containers` on, and Denver's missing `herd`/bootstrap overlay for the demo are untested.
+**Second box in one boot (fixed the same day).** `box run` twice panicked in `activate` ("root does not share the live kernel slot
+511", the root being a freed frame's garbage). Cause: `akuma-exec`'s `spawn` publishes the child's thread *before* its
+`bind_child_task` (the closure is the child), and the first switch to it loads the slot's task-record root; a reused slot still
+held the previous process's freed root. Fix: `zombie_root` (core `proc.rs`) writes 0 into the record when the process's root is
+handed over (0 = keep the current root until the bind sets the real one). The spawn-child re-load also reads the task record
+*after* `set_task_slot`; before, it read the previous task's record, which only worked by luck.
+
+**Verified after the fix.** `rustc`, `cargo build`, `java`/`java H.java` back to back in one boot (three `box run`s); the python box
+(`python3 -c ...` with `json, sqlite3, ssl` imports, Python 3.12) on `guest2.img`; `scala-cli version` in the scala box prints
+`1.19.0`; `scripts/gate.py --only taoxichuan,shanghai,denver` PASS (the Tokio core changed under all three).
+
+**Still open.** scala-cli *compile* with Maven Central, `cargo` with the network and seccomp/private namespaces inside a Denver box are
+untested (no box networking on Denver yet); the JVM gate with `containers` on; Denver's missing `herd`/bootstrap overlay and its guest
+driver for the demo.

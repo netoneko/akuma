@@ -783,6 +783,10 @@ fn zombie_root<M: Proc>(slot: usize, pid: u32) {
     });
     let own = OWNED_ROOT.with_mut(|t| core::mem::replace(&mut t[slot], 0));
     let root = if own != 0 { own } else { M::record_root(task_of(slot)) };
+    // The record outlives the process (the slot is reused). A `spawn` child runs before its bind (`akuma-exec` publishes the thread
+    // first), and the switch to it loads this record's root: a freed one (reissued, garbage) panics `activate`. 0 = "keep the
+    // current root" until the bind writes the real one.
+    M::with_task_slot(task_of(slot), |t| t.root_pa = 0);
     if root == 0 || ZOMBIE_ROOT.with(|z| z.iter().any(|&(p, _)| p == pid)) {
         return;
     }
