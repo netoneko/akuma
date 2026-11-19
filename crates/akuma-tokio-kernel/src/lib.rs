@@ -21,6 +21,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "large-virtual-reservations", target_arch = "aarch64", target_os = "none"))]
+compile_error!("large virtual reservations are not yet implemented on aarch64");
+
 #[cfg(all(feature = "containers", target_arch = "aarch64", target_os = "none"))]
 compile_error!("Tokio box integration is not yet implemented on aarch64");
 

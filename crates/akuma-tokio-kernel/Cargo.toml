@@ -24,6 +24,7 @@ smp = ["akuma-tokio-kernel-amd64/smp", "akuma-tokio-kernel-aarch64/smp"]
 shell = ["akuma-tokio-kernel-amd64/shell", "akuma-tokio-kernel-aarch64/shell"]
 # Box plumbing, currently implemented only for amd64.
 containers = ["akuma-tokio-kernel-amd64/containers"]
+large-virtual-reservations = ["akuma-tokio-kernel-amd64/large-virtual-reservations"]
 # aarch64 under Firecracker (its memory map differs from QEMU virt's; the binary must also link at
 # 0x8030_0000). amd64 boots Firecracker through PVH and needs nothing.
 platform-firecracker = ["akuma-tokio-kernel-aarch64/platform-firecracker"]

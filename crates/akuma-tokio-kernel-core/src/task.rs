@@ -15,7 +15,8 @@ use akuma_primitives::cell::BorrowCell;
 /// places. 16 pages — far more than musl's startup touches, and cheap.
 pub const USER_STACK_TOP: u64 = 0x0000_7000_0000_0000;
 pub const USER_STACK_PAGES: u64 = 16;
-/// The anonymous `mmap` slab's size: 16 GiB of address space.
+/// The anonymous `mmap` slab's size: 16 GiB normally, or 2 TiB with the
+/// optional large-virtual-reservations profile.
 ///
 /// `brk` and anonymous `mmap` each get a fixed slab, registered as user
 /// regions up front so every user-pointer check is one range scan. Sized by what the heaviest guest needs, not by what hello needs: rustc's
@@ -30,7 +31,11 @@ pub const USER_STACK_PAGES: u64 = 16;
 /// the stack `mmap`, which musl's `pthread_create` reports as `EAGAIN` ("failed to spawn work
 /// thread", an ICE) with 2 GiB of RAM still free (`docs/archive/TAOXICHUAN_BUGS_FOUND_2026_10_30.md`).
 /// Address space only: a page costs memory when it is mapped, not when it is reserved.
+#[cfg(not(feature = "large-virtual-reservations"))]
 pub const MMAP_SLAB: u64 = 0x4_0000_0000;
+/// Two TiB of virtual addresses, with mapping sizes bounded in the mmap arm.
+#[cfg(feature = "large-virtual-reservations")]
+pub const MMAP_SLAB: u64 = 0x200_0000_0000;
 /// Hole-table size per task (the mmap slab's holes in [`UserLayout`]).
 pub const MAX_HOLES: usize = 64;
 /// `MAP_SHARED` mappings tracked per task: writable file ones (written back) and

@@ -14,6 +14,10 @@ akuma-jvm-kernel = { path = "../crates/akuma-jvm-kernel", features = ["no-tests"
 [features]
 # Experimental until the Denver box acceptance probe passes.
 containers = ["akuma-jvm-kernel/containers"]
+large-virtual-reservations = ["akuma-jvm-kernel/large-virtual-reservations"]
+# Opt-in amd64 profile for the Codex command-tool guest probe. Sandboxing
+# still needs seccomp/private-namespace support; this profile is not a sandbox.
+codex = ["large-virtual-reservations", "wx-relaxed", "vsyscall", "procfs-diag", "fold-regpreserve", "lazy-release-sweep", "sysinfo", "getcpu", "fault-signal", "shell"]
 # The JIT-permitting W^X relaxation (PHASE-2-WX, G1): the policy this kernel exists to carry,
 # relayed 1:1 down the front crate. Off by default (R6): the phase-0 default build (console,
 # disk, net, smp) is unchanged; the gate kernel is `--features wx-relaxed` (rig: denver-wx).

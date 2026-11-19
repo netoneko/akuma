@@ -23,6 +23,8 @@ process = ["lazy", "dep:akuma-exec", "dep:akuma-threading", "dep:akuma-syscalls-
 # and the exec/init paths retain them on the Process. Needs `process` (the
 # retention points are its exec paths) and `akuma-exec` with the same feature.
 containers = ["process"]
+# Larger VA placement window for runtimes with large aligned reservations.
+large-virtual-reservations = ["process"]
 procfs-diag = ["process", "akuma-exec/procfs-diag"]
 # ext2 as the root filesystem: `shmpages::inode_freed`, ext2's inode-freed hook.
 disk = ["shmpages", "dep:akuma-fpcache"]

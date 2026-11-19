@@ -26,6 +26,7 @@ smp = ["akuma-tokio-kernel/smp"]
 shell = ["akuma-tokio-kernel/shell"]
 # Optional box support, relayed to the machine implementation.
 containers = ["akuma-tokio-kernel/containers"]
+large-virtual-reservations = ["akuma-tokio-kernel/large-virtual-reservations"]
 # Compile the boot self-tests of the shared crates out.
 no-tests = ["akuma-tokio-kernel/no-tests"]
 # Name every syscall that answers a negative errno on the console.
