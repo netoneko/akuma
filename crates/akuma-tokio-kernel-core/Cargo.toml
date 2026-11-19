@@ -22,6 +22,7 @@ process = ["lazy", "dep:akuma-exec", "dep:akuma-threading", "dep:akuma-syscalls-
 # `/proc/<pid>/auxv` retention (PHASE-2-PROCFS D28): TaskImage carries the pairs
 # and the exec/init paths retain them on the Process. Needs `process` (the
 # retention points are its exec paths) and `akuma-exec` with the same feature.
+containers = ["process"]
 procfs-diag = ["process", "akuma-exec/procfs-diag"]
 # ext2 as the root filesystem: `shmpages::inode_freed`, ext2's inode-freed hook.
 disk = ["shmpages", "dep:akuma-fpcache"]

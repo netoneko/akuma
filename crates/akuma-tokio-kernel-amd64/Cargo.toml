@@ -62,6 +62,8 @@ getcpu = []
 fault-signal = []
 # What a shell and its tools call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-runtime-tokio/shell"]
+# Experimental shared box integration; the Tokio spawn adapter is under development.
+containers = ["akuma-syscalls-glue/sc-containers", "akuma-syscalls-glue/exec", "akuma-syscalls-glue/akuma-native", "akuma-vfs-glue/sc-containers", "akuma-tokio-kernel-core/containers"]
 # Syscall middleware (`Kernel::middleware`, B22): one optional table of hooks around dispatch. Off by default.
 middleware = ["dep:akuma-middleware", "akuma-tokio-kernel-core/middleware"]
 # Refuse every dynamically linked image at build time, EPERM (`akuma-elf-exec`'s `refuse-dynamic`). Off by default.

@@ -21,6 +21,9 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+#[cfg(all(feature = "containers", target_arch = "aarch64", target_os = "none"))]
+compile_error!("Tokio box integration is not yet implemented on aarch64");
+
 /// Syscall middleware (B22): one optional table of hooks around the kernel's syscall dispatch, registered with
 /// `Kernel::middleware`. Only with the `middleware` feature, which is off by default.
 #[cfg(feature = "middleware")]

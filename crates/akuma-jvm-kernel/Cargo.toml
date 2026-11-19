@@ -24,6 +24,8 @@ net = ["akuma-tokio-kernel/net"]
 smp = ["akuma-tokio-kernel/smp"]
 # What busybox and bash call and no tokio program does (`akuma-runtime-tokio`'s `shell`).
 shell = ["akuma-tokio-kernel/shell"]
+# Optional box support, relayed to the machine implementation.
+containers = ["akuma-tokio-kernel/containers"]
 # Compile the boot self-tests of the shared crates out.
 no-tests = ["akuma-tokio-kernel/no-tests"]
 # Name every syscall that answers a negative errno on the console.

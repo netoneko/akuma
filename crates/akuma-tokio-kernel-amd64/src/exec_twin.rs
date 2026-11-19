@@ -262,7 +262,10 @@ fn exec_runtime() -> ExecRuntime {
         print_str: crate::console::puts,
         // The ext2 root, read through this kernel's own paths. `resolve_inode`
         // + `read_at_by_inode` are the same bytes ring 3 already gets.
+        #[cfg(not(feature = "containers"))]
         read_file: |path| crate::root_fs().read_file(path).map_err(|_| -1),
+        #[cfg(feature = "containers")]
+        read_file: |path| akuma_vfs_glue::read_file(path).map_err(|_| -1),
         read_at: |path, off, buf| {
             crate::root_fs()
                 .resolve_inode(path)
@@ -276,7 +279,10 @@ fn exec_runtime() -> ExecRuntime {
         // (`resolve_effective`), so the resolved answer for a path IS the
         // resolved path — identity-with-a-resolver, the same stance amd64's
         // comment takes for its `fd.rs`.
+        #[cfg(not(feature = "containers"))]
         resolve_symlinks: crate::resolve_effective,
+        #[cfg(feature = "containers")]
+        resolve_symlinks: akuma_vfs_glue::resolve_symlinks,
         // The pipes: M3's table already exists, and its two lifecycle arms
         // plus the kernel-memory write are exactly what these hooks ask for.
         // The descriptor table is `akuma-exec`'s, and every table behind it is
@@ -324,11 +330,20 @@ fn exec_runtime() -> ExecRuntime {
         pty_clone_ref: |_, _| {},
         pty_close: |_, _| {},
         flock_release: akuma_syscalls_glue::flock::flock_release,
-        // No box/container namespace registry; `None` is what AArch64 answers
-        // with the feature off.
+        // The lean build has no box namespace. The optional profile shares
+        // the VFS registry and per-thread spawn override with the main kernel.
+        #[cfg(not(feature = "containers"))]
         get_box_namespace: |_| None,
+        #[cfg(feature = "containers")]
+        get_box_namespace: akuma_vfs_glue::get_box_namespace,
+        #[cfg(not(feature = "containers"))]
         set_spawn_namespace: |_| {},
+        #[cfg(feature = "containers")]
+        set_spawn_namespace: akuma_vfs_glue::set_spawn_namespace,
+        #[cfg(not(feature = "containers"))]
         clear_spawn_namespace: || {},
+        #[cfg(feature = "containers")]
+        clear_spawn_namespace: akuma_vfs_glue::clear_spawn_namespace,
         // No rump boxes on this target.
         rump_socket_clone_ref: |_, _| {},
         // No mount table yet: no `(mount id, inode)` pair to give. A stub, as

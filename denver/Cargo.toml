@@ -12,6 +12,8 @@ workspace = true
 akuma-jvm-kernel = { path = "../crates/akuma-jvm-kernel", features = ["no-tests"] }
 
 [features]
+# Experimental until the Denver box acceptance probe passes.
+containers = ["akuma-jvm-kernel/containers"]
 # The JIT-permitting W^X relaxation (PHASE-2-WX, G1): the policy this kernel exists to carry,
 # relayed 1:1 down the front crate. Off by default (R6): the phase-0 default build (console,
 # disk, net, smp) is unchanged; the gate kernel is `--features wx-relaxed` (rig: denver-wx).
