@@ -14,6 +14,11 @@ use crate::task::{MMAP_BASE, Task, USER_TOP};
 
 const EINVAL: u64 = 22;
 const ENOMEM: u64 = 12;
+const EEXIST: u64 = 17;
+// Every page in these operations is walked or recorded individually. Bound
+// work in the larger virtual window until sparse range operations are wired.
+#[cfg(feature = "large-virtual-reservations")]
+const MAX_MAP_OPERATION: u64 = 0x4_0000_0000;
 
 /// A negative errno as a syscall return.
 const fn e(code: u64) -> u64 {
@@ -66,6 +71,8 @@ pub fn mprotect_arm<M: Mm>(addr: u64, len: u64, prot: u64) -> u64 {
     if len == 0 {
         return 0;
     }
+    #[cfg(feature = "large-virtual-reservations")]
+    if len > MAX_MAP_OPERATION { return e(ENOMEM); }
     let pages = len.div_ceil(4096);
     if len > u64::MAX / 2 || !M::with_task(|t| t.layout.user_ok(addr, pages * 4096)) {
         return e(ENOMEM);
@@ -224,6 +231,8 @@ pub fn madvise_arm<M: Mm>(addr: u64, len: u64, advice: u64) -> u64 {
         Action::Fail(errno) => errno,
         Action::Ignore | Action::Willneed => 0,
         Action::Dontneed => {
+            #[cfg(feature = "large-virtual-reservations")]
+            if len > MAX_MAP_OPERATION { return e(EINVAL); }
             let (start, pages) = madvise::dontneed_zero_range(addr as usize, len as usize);
             let (start, end) = (start as u64, (start + pages * 4096) as u64);
             if pages == 0 {
@@ -284,6 +293,8 @@ fn free_dropped<M: Mm>(frames: &[u64]) {
 /// Ranges outside the slab (the brk area, a stack) are accepted and ignored.
 #[must_use]
 pub fn munmap_arm<M: Mm>(addr: u64, len: u64) -> u64 {
+    #[cfg(feature = "large-virtual-reservations")]
+    if len > MAX_MAP_OPERATION { return e(EINVAL); }
     let (addr, end) = match M::with_task(|t| t.layout.munmap(addr, len)) {
         Err(_) => return e(EINVAL),
         Ok(None) => return 0,
@@ -313,6 +324,8 @@ pub fn munmap_arm<M: Mm>(addr: u64, len: u64) -> u64 {
 /// pinned divergence: Linux allows it).
 #[must_use]
 pub fn mremap_arm<M: Mm>(old: u64, old_sz: u64, new_sz: u64, flags: u64) -> u64 {
+    #[cfg(feature = "large-virtual-reservations")]
+    if old_sz > MAX_MAP_OPERATION || new_sz > MAX_MAP_OPERATION { return e(ENOMEM); }
     const EFAULT: u64 = 14;
     if new_sz == 0 || flags & 2 != 0 || old & 0xFFF != 0 {
         return e(EINVAL);
@@ -429,7 +442,7 @@ pub fn brk_arm<M: Mm>(want: u64) -> u64 {
 #[must_use]
 #[allow(clippy::too_many_lines)] // one syscall's whole decision, in Linux's order
 pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<u32>, off: u64) -> u64 {
-    use akuma_syscalls_linux::flags::map::{MAP_ANONYMOUS, MAP_FIXED, MAP_SHARED};
+    use akuma_syscalls_linux::flags::map::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_SHARED};
     const ENODEV: u64 = 19;
     const EIO: u64 = 5;
     // Linux refuses an offset that is not a page multiple, mapping or not.
@@ -458,7 +471,37 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
     let Some(pages) = akuma_user_layout::page_span(len) else {
         return e(ENOMEM);
     };
-    let base = if flags & u64::from(MAP_FIXED) != 0 && M::with_task(|t| t.layout.in_slab(addr, pages)) {
+    // The current lazy representation allocates one page-table leaf for every
+    // reserved page. Bound individual requests until sparse region records are
+    // available: huge speculative reservations must not exhaust physical RAM.
+    #[cfg(feature = "large-virtual-reservations")]
+    if pages > MAX_MAP_OPERATION { return e(ENOMEM); }
+    let no_replace = flags & u64::from(MAP_FIXED_NOREPLACE) != 0;
+    let fixed = no_replace || flags & u64::from(MAP_FIXED) != 0;
+    if fixed && (addr == 0 || addr & 0xfff != 0 || addr.checked_add(pages).is_none_or(|end| end > USER_TOP)) {
+        return e(EINVAL);
+    }
+    let within_slab = M::with_task(|t| t.layout.in_slab(addr, pages));
+    if no_replace && !within_slab {
+        // This layout cannot represent arbitrary external mappings. For the
+        // newly supported NOREPLACE flag, never silently return another address.
+        // Preserve the existing MAP_FIXED behavior until external mappings are
+        // implemented; some current users rely on its historical fallback.
+        if M::with_task(|t| t.layout.regions().iter().any(|&(lo, hi)| lo < addr + pages && addr < hi)) {
+            return e(EEXIST);
+        }
+        return e(ENOMEM);
+    }
+    if no_replace {
+        let mut va = addr;
+        while va < addr + pages {
+            if M::leaf(root, va).is_some_and(|entry| entry & crate::lazy_record::VALID != 0 || lazy::is_lazy(entry)) {
+                return e(EEXIST); // present and reserved pages both count
+            }
+            va += 4096;
+        }
+    }
+    let base = if fixed && within_slab {
         // Replacing whatever was there: the old frames go back, and the range
         // leaves the hole table. A shared file mapping under it keeps what was
         // written to it.
@@ -470,12 +513,20 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
             release_pages::<M>(root, addr, addr + pages);
             M::with_task(|t| {
                 t.layout.forget_shared_within(addr, addr + pages);
-                t.layout.carve(addr, addr + pages);
             });
         }
+        M::with_task(|t| t.layout.claim_fixed(addr, addr + pages));
         addr
     } else {
-        match M::with_task(|t| t.layout.alloc(pages)) {
+        #[cfg(feature = "large-virtual-reservations")]
+        let allocation = M::with_task(|t| {
+            if pages >= 0x1_0000_0000 {
+                t.layout.alloc_aligned(pages, 0x100_0000_0000).or_else(|| t.layout.alloc(pages))
+            } else { t.layout.alloc(pages) }
+        });
+        #[cfg(not(feature = "large-virtual-reservations"))]
+        let allocation = M::with_task(|t| t.layout.alloc(pages));
+        match allocation {
             Some(b) => b,
             None => return e(ENOMEM),
         }

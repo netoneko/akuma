@@ -153,7 +153,10 @@ pub fn runtime<M: NetMachine>() -> NetRuntime {
         park_until: park_until::<M>,
         current_waker: noop_waker,
         current_core_id: || 0,
+        #[cfg(not(feature = "containers"))]
         current_box_id: || 0,
+        #[cfg(feature = "containers")]
+        current_box_id: || akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id),
         is_current_interrupted: || false,
         rng_fill: M::rng_fill,
         current_thread_id: || 0,

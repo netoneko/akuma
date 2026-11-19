@@ -82,6 +82,8 @@ pub fn read_link_target<M: lazy::Kernel>(path: &str) -> Option<String> {
 
 /// `path` with its symlinks resolved (8 hops at most).
 pub fn resolve_effective<M: lazy::Kernel>(path: &str) -> String {
+    #[cfg(feature = "containers")]
+    if in_box() { return akuma_vfs_glue::resolve_symlinks(path); }
     akuma_vfs::resolve_symlink_chain(path, 8, read_link_target::<M>)
 }
 
@@ -89,6 +91,21 @@ pub fn resolve_effective<M: lazy::Kernel>(path: &str) -> String {
 /// larger image is read in 1 MiB steps through its inode. One heap block of the
 /// file's size either way, allocated fallibly.
 pub fn read_image<M: lazy::Kernel>(path: &str) -> Result<Vec<u8>, akuma_vfs::FsError> {
+    #[cfg(feature = "containers")]
+    if in_box() {
+        let len = akuma_vfs_glue::file_size(path)? as usize;
+        let mut data = Vec::new();
+        data.try_reserve_exact(len).map_err(|_| akuma_vfs::FsError::NoSpace)?;
+        data.resize(len, 0);
+        let mut off = 0;
+        while off < len {
+            let end = (off + (1 << 20)).min(len);
+            let n = akuma_vfs_glue::read_at(path, off, &mut data[off..end])?;
+            if n == 0 { return Err(akuma_vfs::FsError::Internal); }
+            off += n;
+        }
+        return Ok(data);
+    }
     let fs = M::root_fs();
     let md = fs.metadata(path)?;
     if md.size <= 16 * 1024 * 1024 {
@@ -128,6 +145,11 @@ pub enum PinnedReadError {
 /// # Errors
 /// [`PinnedReadError`]. A path with no inode (`/proc` files, a built-in) is read without a pin (inert).
 pub fn read_image_pinned<M: lazy::Kernel>(path: &str) -> Result<(Vec<u8>, akuma_primitives::TextPin), PinnedReadError> {
+    #[cfg(feature = "containers")]
+    if in_box() {
+        let pin = akuma_vfs_glue::text_pin(path).map_err(|()| PinnedReadError::TableFull)?;
+        return read_image::<M>(path).map(|image| (image, pin)).map_err(PinnedReadError::Read);
+    }
     let fs = M::root_fs();
     let pin = match fs.resolve_inode(path) {
         Ok(ino) => akuma_primitives::TextPin::try_new(fs.identity(), ino).ok_or(PinnedReadError::TableFull)?,
@@ -348,7 +370,7 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
 
     // From the verified bytes only: no inode, so no lazy file page is read from the file later and the path is not looked up again
     // (a `rename` between the read and here would name another inode).
-    let image_inode = if from_image { None } else { M::root_fs().resolve_inode(path).ok() };
+    let image_inode = if from_image || boxed_image() { None } else { M::root_fs().resolve_inode(path).ok() };
     for seg in &segs[..n] {
         let (first, last) = place_segment::<M>(root, image, seg, &segs[..n], image_inode)?;
         add_region::<M>(first, last);
@@ -369,7 +391,7 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
                 return None;
             };
             let mut hi = akuma_elf_exec::INTERP_BASE;
-            let ldso_inode = if from_image { None } else { M::root_fs().resolve_inode(&eff).ok() };
+            let ldso_inode = if from_image || boxed_image() { None } else { M::root_fs().resolve_inode(&eff).ok() };
             for seg in &isegs[..n] {
                 hi = hi.max(place_segment::<M>(root, &ldso, seg, &isegs[..n], ldso_inode)?.1);
             }
@@ -465,4 +487,18 @@ fn load_task_inner<M: Loader>(argv: &[&str], env: &[&str], image: &[u8], path: &
         #[cfg(feature = "procfs-diag")]
         aux_len,
     })
+}
+
+/// File-backed lazy records name the host root's inodes, so boxed execs load
+/// eagerly until those records can carry a namespace-aware mount identity.
+fn boxed_image() -> bool {
+    #[cfg(feature = "containers")]
+    { in_box() }
+    #[cfg(not(feature = "containers"))]
+    { false }
+}
+
+#[cfg(feature = "containers")]
+fn in_box() -> bool {
+    akuma_exec::process::current_process_shared().is_some_and(|p| p.box_id != 0)
 }
