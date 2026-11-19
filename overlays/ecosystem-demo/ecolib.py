@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """Shared host-side pieces of the ecosystem demo launcher (see README.md).
 
-Everything here runs inside ONE unprivileged user+network namespace
-(`unshare --map-root-user --net`): no sudo, nothing on the host's own network is
-touched, and tearing the namespace down removes the bridge, the taps
-and every server below with it.
+Each guest runs behind QEMU user-mode networking (SLIRP): no privileges, and the guest has the host's
+internet through QEMU's NAT, which is what a box needs to reach a model API or Maven Central. Three
+QEMU features replace a bridge:
 
-    br0   10.77.0.1/24 and 169.254.169.254/32   the host's side of the segment
-    tapN  one per guest, enslaved to br0        a single L2 segment, so guest 2
-                                                reaches guest 1 directly
-    DhcpServer  a fixed lease per MAC           (the kernel speaks DHCP; dnsmasq cannot
-                                                 drop groups inside a user namespace)
-    MetadataServer  :80 on 169.254.169.254      EC2-IMDS-shaped, per-guest data
-    MirrorServer    :8000 on 10.77.0.1          the pinned Alpine apk cache
+    hostfwd   host 127.0.0.1:P -> guest :22 (ssh) and :8081/:8082 (the services). Guest 2 reaches guest 1
+              at http://169.254.0.2:P, because SLIRP maps its `host=` address to the host's loopback.
+    guestfwd  the guest's 169.254.169.254:80 -> this guest's own MetadataServer. One server per guest.
+    169.254.0.2  the host as the guest sees it: the pinned apk mirror is served on 127.0.0.1:8000.
 
-The namespace has no route to the internet. That is deliberate for stage 1 (the
-images must not need it), and it is the gap a later stage has to close (model
-API access) with a NAT the launcher cannot create without privilege.
+The SLIRP network is 169.254.0.0/16 (not the default 10.0.2.0/24) because guestfwd only accepts an
+address inside that network and the metadata service must be at its real address, 169.254.169.254.
+
+The same shape (a per-guest forward for ssh and services, a metadata endpoint) is what Firecracker's
+MMDS + tap setup provides, so the guest images do not change between backends.
 """
 import dataclasses
 import hashlib
@@ -35,37 +33,18 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).resolve().parent
-SUBNET = "10.77.0.0/24"
-HOST_IP = "10.77.0.1"
 META_IP = "169.254.169.254"
+HOST_ALIAS = "169.254.0.2"   # the host as a guest sees it (SLIRP `host=`)
 MIRROR_PORT = 8000
-
-# --------------------------------------------------------------------- namespace
-
-
-def in_namespace() -> bool:
-    return os.environ.get("ECO_IN_NS") == "1"
-
-
-def enter_namespace():
-    """Re-exec this script inside a fresh user+net namespace (once)."""
-    if in_namespace():
-        return
-    env = dict(os.environ, ECO_IN_NS="1")
-    os.execvpe("unshare", ["unshare", "--map-root-user", "--net", "--kill-child",
-                           sys.executable, *sys.argv], env)
-
 
 def sh(*args, check=True, **kw):
     return subprocess.run(args, check=check, text=True, **kw)
 
 
-def mac_for(n: int) -> str:
-    return f"52:54:00:77:00:{n:02x}"
-
-
-def ip_for(n: int) -> str:
-    return f"10.77.0.{10 + n}"
+def free_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 # ------------------------------------------------------------------- metadata
@@ -92,17 +71,17 @@ class GuestMeta:
 
 
 class MetadataServer:
-    """An EC2-IMDSv2-shaped endpoint with one data set per guest.
+    """An EC2-IMDSv2-shaped endpoint for ONE guest, started by the launcher per guest.
 
-    One listener serves every guest and picks the data set by the *peer address*,
-    which is how the real service tells instances apart. Starting it "per guest"
-    means `add_guest`, which is what the launcher does for each guest it boots.
-    Requests are logged by (method, path, status) and never by body or token, so
-    the log can be kept and read without leaking a secret.
+    It listens on a host loopback port; QEMU's guestfwd carries the guest's
+    169.254.169.254:80 to it, so the guest uses the real address. Requests are logged
+    by (method, path, status) and never by body or token, so the log can be kept and
+    read without leaking a secret.
     """
 
-    def __init__(self, bind=(META_IP, 80), require_token=True):
-        self.guests: dict[str, GuestMeta] = {}
+    def __init__(self, guest: "GuestMeta", bind=("127.0.0.1", 0), require_token=True):
+        self.guest = guest
+        self.guests = {}
         self.tokens: dict[str, float] = {}
         self.require_token = require_token
         outer = self
@@ -121,7 +100,7 @@ class MetadataServer:
                 self.wfile.write(body)
 
             def do_PUT(self):
-                g = outer.guests.get(self.client_address[0])
+                g = outer.guest
                 if g is None or self.path != "/latest/api/token":
                     return self._send(404)
                 tok = secrets.token_hex(16)
@@ -130,7 +109,7 @@ class MetadataServer:
                 self._send(200, tok.encode())
 
             def do_GET(self):
-                g = outer.guests.get(self.client_address[0])
+                g = outer.guest
                 if g is None:
                     return self._send(404)
                 if outer.require_token:
@@ -149,8 +128,9 @@ class MetadataServer:
         self.httpd = S(bind, H)
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
-    def add_guest(self, g: GuestMeta):
-        self.guests[g.ip] = g
+    @property
+    def port(self) -> int:
+        return self.httpd.server_address[1]
 
     def start(self):
         self.thread.start()
@@ -198,130 +178,56 @@ class MetadataServer:
         return 404, b""
 
 
-# --------------------------------------------------------------------- network
+# ---------------------------------------------------------------------- mirror
 
 
-class DhcpServer:
-    """Fixed-lease DHCP on br0: DISCOVER -> OFFER, REQUEST -> ACK, nothing else."""
+class MirrorServer:
+    """The pinned apk mirror, on 127.0.0.1:8000 (the guest's http://169.254.0.2:8000)."""
 
-    def __init__(self, leases: dict):
-        self.leases = {m.lower(): ip for m, ip in leases.items()}   # MAC -> IP
-        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"br0")
-        self.sock.bind(("0.0.0.0", 67))
-        self.log = []
-        self.thread = threading.Thread(target=self.loop, daemon=True)
-
-    def start(self):
-        self.thread.start()
+    def __init__(self, directory: Path, run_dir: Path):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", str(MIRROR_PORT), "--bind", "127.0.0.1", "--directory", str(directory)],
+            stdout=open(run_dir / "mirror.log", "wb"), stderr=subprocess.STDOUT)
 
     def stop(self):
-        self.sock.close()
-
-    def loop(self):
-        while True:
-            try:
-                pkt, _ = self.sock.recvfrom(1500)
-            except OSError:
-                return
-            if len(pkt) < 241 or pkt[0] != 1 or pkt[236:240] != b"\x63\x82\x53\x63":
-                continue
-            mac = ":".join(f"{b:02x}" for b in pkt[28:34])
-            ip = self.leases.get(mac)
-            mtype, i = None, 240
-            while i < len(pkt) and pkt[i] != 255:
-                if pkt[i] == 0:
-                    i += 1
-                    continue
-                if pkt[i] == 53:
-                    mtype = pkt[i + 2]
-                i += 2 + pkt[i + 1]
-            if ip is None or mtype not in (1, 3):
-                continue
-            reply_type = 2 if mtype == 1 else 5
-            self.log.append((mac, "OFFER" if mtype == 1 else "ACK", ip))
-            a = socket.inet_aton
-            opts = (bytes([53, 1, reply_type]) + bytes([54, 4]) + a(HOST_IP) +
-                    bytes([51, 4]) + (3600).to_bytes(4, "big") + bytes([1, 4]) + a("255.255.255.0") +
-                    bytes([3, 4]) + a(HOST_IP) + bytes([6, 4]) + a(HOST_IP) + b"\xff")
-            out = (bytes([2, 1, 6, 0]) + pkt[4:8] + b"\0\0\x80\0" + b"\0" * 4 + a(ip) + a(HOST_IP) +
-                   b"\0" * 4 + pkt[28:44] + b"\0" * 192 + b"\x63\x82\x53\x63" + opts)
-            try:
-                self.sock.sendto(out, ("255.255.255.255", 68))
-            except OSError:
-                pass
-
-
-class Network:
-    """br0 + taps + DHCP + the apk mirror, inside the namespace."""
-
-    def __init__(self, run_dir: Path, mirror_dir: Path | None, guests: int):
-        self.run_dir = run_dir
-        self.mirror_dir = mirror_dir
-        self.n = guests
-        self.procs: list[subprocess.Popen] = []
-
-    def up(self):
-        sh("ip", "link", "set", "lo", "up")
-        sh("ip", "link", "add", "br0", "type", "bridge")
-        sh("ip", "addr", "add", f"{HOST_IP}/24", "dev", "br0")
-        sh("ip", "addr", "add", f"{META_IP}/32", "dev", "br0")
-        sh("ip", "link", "set", "br0", "up")
-        for i in range(1, self.n + 1):
-            sh("ip", "tuntap", "add", "dev", f"tap{i}", "mode", "tap")
-            sh("ip", "link", "set", f"tap{i}", "master", "br0")
-            sh("ip", "link", "set", f"tap{i}", "up")
-        self.dhcp = DhcpServer({mac_for(i): ip_for(i) for i in range(1, self.n + 1)})
-        self.dhcp.start()
-        if self.mirror_dir is not None:
-            self.procs.append(subprocess.Popen(
-                [sys.executable, "-m", "http.server", str(MIRROR_PORT), "--bind", HOST_IP,
-                 "--directory", str(self.mirror_dir)],
-                stdout=open(self.run_dir / "mirror.log", "wb"), stderr=subprocess.STDOUT))
-
-    def down(self):
-        if getattr(self, 'dhcp', None):
-            self.dhcp.stop()
-        for p in self.procs:
-            p.terminate()
-        for p in self.procs:
-            try:
-                p.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                p.kill()
+        self.proc.terminate()
+        self.proc.wait(timeout=5)
 
 
 # ----------------------------------------------------------------------- guest
 
 
 class Guest:
-    """One QEMU+KVM guest on the main amd64 kernel, started and stopped by us."""
+    """One QEMU+KVM guest on the main amd64 kernel behind SLIRP, started and stopped by us."""
 
-    def __init__(self, n, disk, kernel, run_dir, key, mem=3072, smp=2, cmdline_extra=""):
+    def __init__(self, n, disk, kernel, run_dir, key, md_port, mem=3072, smp=2, forwards=(), cmdline_extra=""):
         self.n, self.disk, self.kernel = n, Path(disk), Path(kernel)
         self.run_dir, self.key = Path(run_dir), Path(key)
         self.mem, self.smp, self.extra = mem, smp, cmdline_extra
-        self.ip, self.mac = ip_for(n), mac_for(n)
+        self.md_port = md_port
+        self.ssh_port = free_port()
+        self.forwards = {p: free_port() for p in forwards}       # guest port -> host port
         self.proc = None
         self.serial = self.run_dir / f"guest{n}.serial.log"
 
     def start(self):
         cmdline = ("virtio_mmio.device=512@0xfeb00000:5 virtio_mmio.device=512@0xfeb00200:6 "
                    "init=/bin/herd " + self.extra).strip()
+        fwd = f"hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22," + "".join(
+            f"hostfwd=tcp:127.0.0.1:{h}-:{g}," for g, h in self.forwards.items())
+        net = f"user,id=n0,net=169.254.0.0/16,host={HOST_ALIAS},dhcpstart=169.254.0.15,dns=169.254.0.3,{fwd}guestfwd=tcp:{META_IP}:80-cmd:nc 127.0.0.1 {self.md_port}"
         args = ["qemu-system-x86_64", "-M", "microvm", "-accel", "kvm", "-cpu", "host",
                 "-global", "virtio-mmio.force-legacy=false", "-kernel", str(self.kernel),
                 "-m", str(self.mem), "-smp", str(self.smp),
                 "-drive", f"id=d0,file={self.disk},format=raw,if=none,snapshot=on",
                 "-device", "virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0",
-                "-netdev", f"tap,id=n0,ifname=tap{self.n},script=no,downscript=no",
-                "-device", f"virtio-net-device,netdev=n0,mac={self.mac},bus=virtio-mmio-bus.1",
+                "-netdev", net,
+                "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1",
                 "-append", cmdline, "-serial", f"file:{self.serial}", "-display", "none",
                 "-no-reboot"]
         (self.run_dir / f"guest{self.n}.qemu.cmd").write_text(shlex.join(args) + "\n")
         # Its own process group: teardown signals this QEMU and nothing else.
-        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+        self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.run_dir / f"guest{self.n}.qemu.log", "wb"),
                                      start_new_session=True)
 
     def stop(self):
@@ -333,11 +239,11 @@ class Guest:
                 os.killpg(self.proc.pid, signal.SIGKILL)
                 self.proc.wait()
 
-    def ssh_argv(self, *cmd, port=22, user="root", extra=()):
-        return ["ssh", "-i", str(self.key), "-p", str(port), "-o", "BatchMode=yes",
+    def ssh_argv(self, *cmd, user="root", extra=()):
+        return ["ssh", "-i", str(self.key), "-p", str(self.ssh_port), "-o", "BatchMode=yes",
                 "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=3",
                 "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "LogLevel=ERROR", *extra, f"{user}@{self.ip}", *cmd]
+                "-o", "LogLevel=ERROR", *extra, f"{user}@127.0.0.1", *cmd]
 
     def run(self, command: str, timeout=120, check=False):
         """Run a shell command in the guest's host root over ssh; (rc, stdout+stderr)."""
@@ -351,7 +257,7 @@ class Guest:
         """Readiness is a completed ssh round-trip (scripts/vm_ready.py), never a log marker."""
         sys.path.insert(0, str(ROOT / "scripts"))
         import vm_ready
-        if not vm_ready.wait_ready(22, timeout, 2, self.proc, host=self.ip, identity=self.key):
+        if not vm_ready.wait_ready(self.ssh_port, timeout, 2, self.proc, host="127.0.0.1", identity=self.key):
             raise RuntimeError(f"guest{self.n} not ready after {timeout}s (see {self.serial})")
 
 

@@ -6,7 +6,7 @@
 
 Needs the images from `build-images.py all` ($ECO_WORK/out by default) and the main amd64 kernel
 (`cargo build -p akuma --target x86_64-unknown-none --release --no-default-features --features headless,no-tests`).
-Runs itself inside an unprivileged user+net namespace (see ecolib.py); it kills only its own QEMUs.
+Unprivileged: QEMU user networking only (see ecolib.py). It kills only its own QEMUs.
 
 Secrets are random per run, exist only in the metadata server's memory and the guests' root-only
 files, and are never printed or written to a log; `verify` checks that.
@@ -29,15 +29,18 @@ KERNEL = Path(os.environ.get("ECO_KERNEL", E.ROOT / "target/x86_64-unknown-none/
 BOOTSTRAP = E.HERE / "bootstrap/bootstrap.sh"
 
 AGENTS = {1: ["rust", "scala"], 2: ["python"]}
+SERVICE_PORTS = (8081, 8082)
 
 
 class Demo:
+    """Two guests, each with its own metadata server, ssh forward and (guest 1) service forwards."""
+
     def __init__(self, out: Path, run_dir: Path, mem=3072, smp=2, tamper=False):
         self.out, self.run_dir, self.mem, self.smp = out, run_dir, mem, smp
         self.key = run_dir / "launch-key"
         self.pub = E.gen_key(self.key)
-        self.net = E.Network(run_dir, WORK / "cache/mirror", 2)
-        self.md = E.MetadataServer()
+        self.mirror = None
+        self.mds: dict[int, E.MetadataServer] = {}
         self.guests: dict[int, E.Guest] = {}
         self.secret_values: dict[str, str] = {}
         script = BOOTSTRAP.read_bytes()
@@ -51,28 +54,43 @@ class Demo:
                     prompts={"task.md": f"# Task for the {a} agent\nThis is a stage-1 placeholder prompt (no agent runs yet).\n"},
                     secrets={"AGENT_TOKEN": tok})
             sha = ("0" * 64) if (tamper and n == 2) else self.script_sha
-            self.md.add_guest(E.GuestMeta(f"guest{n}", E.ip_for(n), self.pub, bootstrap=script,
-                                          bootstrap_sha256=sha, agents=agents))
+            self.mds[n] = E.MetadataServer(E.GuestMeta(f"guest{n}", "169.254.0.15", self.pub, bootstrap=script,
+                                                       bootstrap_sha256=sha, agents=agents))
+
+    def md_log(self, n):
+        return self.mds[n].guest.log
+
+    def start_guest(self, n):
+        g = E.Guest(n, self.out / f"guest{n}.img", KERNEL, self.run_dir, self.key, self.mds[n].port,
+                    mem=self.mem, smp=self.smp, forwards=SERVICE_PORTS if n == 1 else (),
+                    cmdline_extra="strace_err" if os.environ.get("ECO_STRACE") else "")
+        self.guests[n] = g
+        g.start()
+        return g
+
+    def service_url(self, port, seen_from=2):
+        """The URL of guest 1's service as guest `seen_from` must use it: the host (169.254.0.2) and the forwarded port."""
+        return f"http://{E.HOST_ALIAS}:{self.guests[1].forwards[port]}"
 
     def up(self, which=(1, 2)):
-        self.net.up()
-        self.md.start()
+        self.mirror = E.MirrorServer(WORK / "cache/mirror", self.run_dir)
+        for m in self.mds.values():
+            m.start()
         for n in which:
-            g = E.Guest(n, self.out / f"guest{n}.img", KERNEL, self.run_dir, self.key, mem=self.mem, smp=self.smp,
-                        cmdline_extra="strace_err" if os.environ.get("ECO_STRACE") else "")
-            self.guests[n] = g
-            g.start()
+            self.start_guest(n)
         for n in which:
             self.guests[n].wait_ready(300)
 
     def down(self):
         for g in self.guests.values():
             g.stop()
-        try:
-            self.md.stop()
-        except Exception:
-            pass
-        self.net.down()
+        for m in self.mds.values():
+            try:
+                m.stop()
+            except Exception:
+                pass
+        if self.mirror:
+            self.mirror.stop()
 
 
 def main():
@@ -83,14 +101,14 @@ def main():
     ap.add_argument("--smp", type=int, default=2)
     ap.add_argument("--report", type=Path)
     a = ap.parse_args()
-    E.enter_namespace()
     run_dir = Path(tempfile.mkdtemp(prefix="eco-run-", dir=WORK))
     if a.cmd == "up":
         d = Demo(a.out, run_dir, a.mem, a.smp)
         try:
             d.up()
-            print(f"guests up: guest1={E.ip_for(1)} guest2={E.ip_for(2)} key={d.key} run_dir={run_dir}")
-            print(f"ssh from another terminal: nsenter --preserve-credentials -U -n -t {os.getpid()} ssh -i {d.key} root@{E.ip_for(1)}")
+            for n, g in d.guests.items():
+                print(f"guest{n}: ssh -i {d.key} -p {g.ssh_port} root@127.0.0.1", flush=True)
+            print(f"guest 1 services as guest 2 sees them: {d.service_url(8081)} {d.service_url(8082)}; run_dir={run_dir}", flush=True)
             while True:
                 time.sleep(3600)
         except KeyboardInterrupt:

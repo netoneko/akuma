@@ -31,23 +31,26 @@ output once, for the akuma userspace binaries (herd, sshd, ssh, box); it runs it
 | `common/` | files every box root gets (`ws-init`: the empty git workspace) |
 | `guest/` | the host root's overlay: `instance-key`, `eco-bootstrap`, `eco-box`, herd services |
 | `bootstrap/bootstrap.sh` | the script the metadata service delivers; installs extra ssh keys, per-agent prompts and secrets |
-| `ecolib.py` | namespace, bridge/taps, DHCP, metadata server, apk mirror, QEMU guest |
+| `ecolib.py` | metadata server (per guest), apk mirror, QEMU guest (SLIRP, hostfwd/guestfwd) |
 | `launch.py`, `verify.py` | the launcher and the stage-1 checks |
+| `refdemo.py` | stage 2: build and run the reference services in the boxes, run their acceptance suite from guest 2 |
 
 ## Design decisions
 
-* **Network: a bridge + tap per guest inside an unprivileged user+net namespace** (`unshare --map-root-user --net`).
-  Not SLIRP (each guest would sit behind its own private NAT and guest 2 could not reach guest 1), not
-  `-netdev socket` (the kernel supports one NIC per guest, so a second NIC for the segment is not available, and one NIC must
-  also carry the metadata service). Not a host bridge: no sudo here, and the namespace tears everything down with it.
-  Cost: the guests have no internet (E3 in `proposals/FUTURE_WORK.md`).
-* **Metadata** is served on the real address `169.254.169.254:80` (bridge-local), IMDSv2, **one data set per guest chosen by
-  peer address**, which is how the real service tells instances apart. "Per guest" is `MetadataServer.add_guest`.
+* **Network: QEMU user networking (SLIRP) per guest, no privileges.** The guest gets the host's internet through
+  QEMU's NAT (what a box needs for a model API, crates.io, Maven Central). Three QEMU features do the rest:
+  `hostfwd` (host loopback port -> guest ssh and, for guest 1, :8081/:8082), `guestfwd` (the guest's 169.254.169.254:80 ->
+  that guest's own metadata server, one server per guest) and `host=169.254.0.2` (the host as a guest sees it, which is
+  where guest 2 reaches guest 1's services: `http://169.254.0.2:<forwarded port>`; a guest reaches its own services the
+  same way). The SLIRP network is 169.254.0.0/16 because `guestfwd` only accepts an address inside it. It also maps to
+  Firecracker's shape (a forward per service, a metadata endpoint). An earlier bridge + unprivileged-namespace design
+  worked but had no internet and was replaced (see `docs/archive/AKUMA_ECOSYSTEM_DEMO.md`).
+* **Metadata** is the real address `169.254.169.254:80`, IMDSv2, **one server and data set per guest**.
 * **Bootstrap integrity**: the script comes from `/latest/user-data`, its sha256 from `/latest/meta-data/bootstrap-sha256`;
   `eco-bootstrap` refuses a mismatch. Both come from the same service, so this guards the script's storage and transit, not a
   compromised service. The kernel has no `/proc/cmdline`, so the boot line cannot carry the digest.
 * **Secrets** are random per run, held in the metadata server's memory, written root-only (700/600) once, and passed by
   `eco-box exec NAME ...` as environment variables of the box NAME only. They are never in an image or a log; `verify` greps for them.
-* **apk** inside a box talks to a pinned mirror served from the namespace (`http://10.77.0.1:8000/v3.22/{main,community}`), the
+* **apk** inside a box talks to a pinned mirror served by the launcher (`http://169.254.0.2:8000/v3.22/{main,community}`), the
   same files the images were built from. A package that was not cached 404s.
 * **Output from a box** goes through a file (E1): `eco-box exec` reads it from the container's upper directory.

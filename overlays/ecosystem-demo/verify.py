@@ -46,14 +46,12 @@ def main(args, run_dir, Demo):
     d = Demo(out, run_dir, args.mem, args.smp, tamper=True)
     try:
         # --- bootstrap integrity: guest 2 first with a WRONG digest -------------------------
-        d.net.up()
-        d.md.start()
+        d.mirror = E.MirrorServer(__import__("launch").WORK / "cache/mirror", run_dir)
+        for m in d.mds.values():
+            m.start()
         t0 = time.monotonic()
-        import os
         for n in (1, 2):
-            g = E.Guest(n, out / f"guest{n}.img", __import__("launch").KERNEL, run_dir, d.key, mem=args.mem, smp=args.smp)
-            d.guests[n] = g
-            g.start()
+            d.start_guest(n)
         for n in (1, 2):
             d.guests[n].wait_ready(300)
         info("boot to ssh-ready (both guests, parallel)", f"{time.monotonic() - t0:.1f}s")
@@ -63,11 +61,9 @@ def main(args, run_dir, Demo):
         check("tampered bootstrap script (wrong sha256) is refused: no bootstrap.rc success, no agent data",
               not o.startswith("0") and "python" not in g2.run("ls /var/lib/agents")[1] and "bootstrap.sh" not in o, o)
         g2.stop()
-        d.md.guests[E.ip_for(2)].bootstrap_sha256 = d.script_sha
-        d.md.guests[E.ip_for(2)].log.clear()
-        g2 = E.Guest(2, out / "guest2.img", __import__("launch").KERNEL, run_dir, d.key, mem=args.mem, smp=args.smp)
-        d.guests[2] = g2
-        g2.start()
+        d.mds[2].guest.bootstrap_sha256 = d.script_sha
+        d.mds[2].guest.log.clear()
+        g2 = d.start_guest(2)
         g2.wait_ready(300)
         time.sleep(3)
 
@@ -80,17 +76,16 @@ def main(args, run_dir, Demo):
             lines = [l for l in o.splitlines() if l.strip()]
             check(f"guest{g.n}: secrets are root-only (dirs 700, files 600)",
                   lines and all(l.split()[0] in ("700", "600") and l.split()[1] == "root" for l in lines), o)
-            log = d.md.guests[g.ip].log
+            log = d.md_log(g.n)
             gets = [p for (_, p, c) in log if c == 200]
             check(f"guest{g.n}: each secret fetched exactly once", all(
                 sum(1 for p in gets if p.endswith(f"/agents/{a}/secrets/AGENT_TOKEN")) == 1 for a in agents), log)
-        d_pre = {n: len(d.md.guests[E.ip_for(n)].log) for n in (1, 2)}
-
+        
         # --- the toolchains, each in its own box ----------------------------------------------
         common = ("bash --version | head -1; git --version; apk --version; curl --version | head -1; "
                   "ls --version | head -1; ")
         tools = {
-            (g1, "rust", "rust"): ("rustc --version; cargo --version; " + common, ["rustc 1.87", "cargo 1.87", "GNU bash", "git version", "apk-tools", "curl 8", "GNU coreutils"]),
+            (g1, "rust", "rust"): ("rustc --version; cargo --version; " + common, ["rustc 1.96", "cargo 1.96", "GNU bash", "git version", "apk-tools", "curl 8", "GNU coreutils"]),
             (g1, "scala", "scala"): ("java -version 2>&1 | head -1; scala -version 2>&1 | head -1; " + common, ["openjdk version \"21", "Scala", "GNU bash", "git version", "apk-tools", "curl 8", "GNU coreutils"]),
             (g2, "python", "python"): ("python3 --version; pytest --version 2>&1 | head -1; " + common, ["Python 3.12", "pytest 8", "GNU bash", "git version", "apk-tools", "curl 8", "GNU coreutils"]),
         }
@@ -148,12 +143,12 @@ def main(args, run_dir, Demo):
 
         # --- isolation ------------------------------------------------------------------------
         tok = d.secret_values
-        before = len(d.md.guests[E.ip_for(1)].log)
+        before = len(d.md_log(1))
         rc, o = g1.run("curl -s -m 5 -o /dev/null -w '%{http_code}' -X PUT http://169.254.169.254/latest/api/token")
         check("control: the host root (uid 0, host box) CAN reach the metadata address", o.strip().endswith("200"), o)
-        mid = len(d.md.guests[E.ip_for(1)].log)
+        mid = len(d.md_log(1))
         rc, o = bx(g1, "rust", "rust", "curl -s -m 5 -o /dev/null -w 'http=%{http_code}' -X PUT http://169.254.169.254/latest/api/token; echo \" curl_rc=$?\"")
-        after = len(d.md.guests[E.ip_for(1)].log)
+        after = len(d.md_log(1))
         check("from inside a box the metadata address is unreachable (no HTTP answer; the server saw nothing)",
               "http=200" not in o and "http=000" in o and after == mid, f"{o} log {mid}->{after}")
         rc, o = bx(g1, "scala", "scala", "curl -s -m 5 -o /dev/null -w 'http=%{http_code}' http://169.254.169.254/latest/meta-data/agents/rust/secrets/AGENT_TOKEN")
@@ -198,9 +193,9 @@ def main(args, run_dir, Demo):
             g1.run(f"/sbin/eco-box daemon {name} {image} 'busybox-extras httpd -f -p 0.0.0.0:{port} -h /work/site'")
         time.sleep(3)
         for port, name in ((8081, "rust"), (8082, "scala")):
-            rc, o = g2.run(f"curl -s -m 10 http://{E.ip_for(1)}:{port}/index.html")
+            rc, o = g2.run(f"curl -s -m 10 {d.service_url(port)}/index.html")
             check(f"guest 2 reaches guest 1 :{port} (busybox-extras httpd in the {name} box)", f"served-by-{name}" in o, o)
-        rc, o = bx(g2, "python", "python", f"curl -s -m 10 http://{E.ip_for(1)}:8081/index.html; curl -s -m 10 http://{E.ip_for(1)}:8082/index.html")
+        rc, o = bx(g2, "python", "python", f"curl -s -m 10 {d.service_url(8081)}/index.html; curl -s -m 10 {d.service_url(8082)}/index.html")
         check("guest 2's python box reaches both services too", "served-by-rust" in o and "served-by-scala" in o, o)
         g1.run("/sbin/eco-box destroy rust; /sbin/eco-box destroy scala")
 

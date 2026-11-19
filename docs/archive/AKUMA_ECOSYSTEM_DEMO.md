@@ -296,3 +296,46 @@ overlays/ecosystem-demo/build-images.py repro
 overlays/ecosystem-demo/launch.py verify
 scripts/gate.py
 ```
+
+## Stage 2 outcome (2026-11-19, branch `ecosystem-demo-stage1`): internet, then the reference services
+
+Goal: give the boxes internet, download dependencies there (Maven for the Scala board, cargo + a git dependency for the Rust git
+server), run the reference services and the reference acceptance suite (`akuma-demo-reference-impl/tests/test_remote.py`) from
+guest 2. Driver: `overlays/ecosystem-demo/refdemo.py`. **Status: not finished; the Scala board cannot be started because a guest
+kernel panics (E7). The git half works.**
+
+### Networking was replaced, not extended
+
+The bridge + unprivileged-namespace design had no way out and the box has no network setting of its own (a box uses its
+guest's stack), so the launcher was the place to fix it. Instead of a userspace NAT (nft redirect + relay), each guest now uses
+QEMU user networking: internet through QEMU's NAT; `hostfwd` for ssh and guest 1's :8081/:8082; `guestfwd` for the metadata
+address (one server per guest); `host=169.254.0.2` is the host as seen by a guest, which is how guest 2 reaches guest 1 and
+how a service pushes to the git service on the same guest. The SLIRP network is 169.254.0.0/16 because `guestfwd` only accepts
+addresses inside it. The stage-1 checks (`launch.py verify`) were ported and re-run on it.
+
+### What passed
+
+* `https://example.com` (DNS + TLS) from the rust, scala and python boxes; the rust box reaches `index.crates.io` and Maven Central.
+  The guest's host root had no `/etc/resolv.conf` (boxes get one injected), so `curl` there failed until the root got one.
+* **Rust git server**: `cargo build --release --locked` of the reference `git-server` in the rust box, with crates.io and the
+  pinned GitHub git dependency, **~305-365 s** with `-smp 2`; the server starts, `GET /healthz` answers from guest 2, the
+  reference suite's git test passes, a box on guest 1 pushes to it through `169.254.0.2:<port>`.
+* **scala-cli** (JVM jar, behind a launcher) runs and compiles the task board's dependencies from Maven Central, once the JVM
+  has trust anchors (below).
+
+### What was wrong, and what was done
+
+| symptom | cause | action |
+|---|---|---|
+| `cargo` refused crates: rustc 1.87 | Alpine's rust is older than the pinned crates need | the official `rust-1.96.0` musl toolchain (sha256-pinned) replaces Alpine's `rust`/`cargo` in the rust root |
+| scala-cli (native) `Failed to create the main Isolate (code 8)` | GraalVM native image fails to start here | scala-cli runs as its JVM jar (`scala-cli.jar`, pinned) |
+| scala-cli jar: `directories are not supported on Akuma` | `uname` sysname `Akuma` becomes `os.name` | launcher passes `-Dos.name=Linux` (E8) |
+| every JVM https download failed (`trustAnchors ... non-empty`) | Alpine builds `cacerts` in a trigger; triggers do not run in these roots | `build-images.py` writes `/etc/ssl/certs/java/cacerts` (JKS, fixed timestamp, byte-reproducible) from the root's CA bundle |
+| `cargo build` sometimes: `extern location ... .rlib does not exist` | not understood (E9) | recorded; `refdemo.py` retries once and prints attempt 1 |
+| **guest 1 kernel panic** during `scala-cli run` of the board | ring-0 `#PF` in `Process::with_address_space` (`sys_mmap`), right after `[execve] from a non-leader thread with live siblings` | **stopped**: fixing it is a kernel change beyond an isolated fix (E7); not patched |
+
+### Open
+
+* Board service on :8082 and the full acceptance suite (needs E7 fixed or `scala-cli run` replaced by a pre-built class run
+  with plain `java`, which avoids the `execve`-from-thread path; not tried).
+* Firecracker still needs the same shape (tap + MMDS) in stage 3.

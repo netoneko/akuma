@@ -167,6 +167,8 @@ def fetch(relock=False):
     download(s["url"], CACHE / "src" / Path(s["url"]).name, s["sha256"])
     for d in SPEC["scala_deps"]:
         download(d["url"], CACHE / "src" / Path(d["url"]).name, d["sha256"])
+    for k in ("rust_toolchain", "scala_cli"):
+        download(SPEC[k]["url"], CACHE / "src" / Path(SPEC[k]["url"]).name, SPEC[k]["sha256"])
     lock_check(relock)
 
 
@@ -223,7 +225,7 @@ def common_overlay(root: Path):
     shutil.copytree(HERE / "common", root, dirs_exist_ok=True, symlinks=True)
     (root / "etc/apk").mkdir(parents=True, exist_ok=True)
     (root / "etc/apk/repositories").write_text(
-        "".join(f"http://10.77.0.1:8000/{BRANCH}/{r}\n" for r in REPOS))
+        "".join(f"http://169.254.0.2:8000/{BRANCH}/{r}\n" for r in REPOS))
     (root / "etc/apk/arch").write_text(ARCH + "\n")
     for d in ("tmp", "work", "root", "run", "proc", "dev", "sys"):
         (root / d).mkdir(exist_ok=True)
@@ -256,6 +258,56 @@ def rust_extras(root: Path):
         '[source.vendored-sources]\ndirectory = "/opt/cargo-vendor"\n\n[net]\noffline = true\n')
     shutil.copy(HERE / "images/rust-deps/Cargo.toml", root / "opt/cargo-vendor.Cargo.toml")
     shutil.copy(HERE / "images/rust-deps/Cargo.lock", root / "opt/cargo-vendor.Cargo.lock")
+
+
+def rust_toolchain(root: Path):
+    """The official rustc/cargo/rust-std (musl host) in /usr/local: Alpine's rust lags the crates the demo pins."""
+    t = SPEC["rust_toolchain"]
+    tmp = CACHE / "rust-unpack"
+    shutil.rmtree(tmp, ignore_errors=True)
+    tmp.mkdir(parents=True)
+    run("tar", "xJf", CACHE / "src" / Path(t["url"]).name, "-C", tmp, "--strip-components=1")
+    run("sh", tmp / "install.sh", f"--prefix={root}/usr/local", "--disable-ldconfig",
+        "--components=rustc,cargo,rust-std-x86_64-unknown-linux-musl")
+    shutil.rmtree(tmp)
+
+
+def java_cacerts(root: Path):
+    """Fill /etc/ssl/certs/java/cacerts from the root's CA bundle, deterministically.
+
+    Alpine builds that store in a trigger (update-ca-certificates + p11-kit `trust`), and triggers do not
+    run in these roots, so the JVM had NO trust anchors: every https download in scala-cli/Maven failed
+    ("the trustAnchors parameter must be non-empty"). The JKS format is simple: magic, version 2, entries
+    (tag 2 = trusted cert), then SHA-1 over the UTF-16BE password, a fixed string and everything before it.
+    Timestamps are the fixed epoch, so the file is byte-reproducible.
+    """
+    import base64, struct
+    pem = (root / "etc/ssl/certs/ca-certificates.crt").read_text()
+    certs = [base64.b64decode("".join(m.split())) for m in
+             re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", pem, re.S)]
+    body = struct.pack(">IIi", 0xFEEDFEED, 2, len(certs))
+    for i, der in enumerate(certs):
+        alias = f"ca{i:04d}".encode()
+        body += struct.pack(">I", 2) + struct.pack(">H", len(alias)) + alias + struct.pack(">q", EPOCH * 1000)
+        body += struct.pack(">H", 5) + b"X.509" + struct.pack(">I", len(der)) + der
+    pw = "changeit".encode("utf-16-be")
+    body += hashlib.sha1(pw + b"Mighty Aphrodite" + body).digest()
+    dest = root / "etc/ssl/certs/java/cacerts"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(body)
+    log("java cacerts:", len(certs), "certificates")
+
+
+def scala_cli(root: Path):
+    """scala-cli as its JVM jar behind a launcher: the native image fails on this kernel (GraalVM isolate, code 8)."""
+    c = SPEC["scala_cli"]
+    d = root / "opt/scala-cli"
+    d.mkdir(parents=True, exist_ok=True)
+    shutil.copy(CACHE / "src" / Path(c["url"]).name, d / "scala-cli.jar")
+    w = root / "usr/local/bin/scala-cli"
+    w.parent.mkdir(parents=True, exist_ok=True)
+    w.write_text('#!/bin/sh\n# os.name comes from the kernel uname sysname ("Akuma"); the coursier directories library refuses it.\nexec java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar "$@"\n')
+    w.chmod(0o755)
 
 
 def scala_extras(root: Path):
@@ -324,10 +376,14 @@ def build_roots(out: Path) -> dict:
         finish_busybox(root)
         if name != "host":
             common_overlay(root)
+        if name == "rust":
+            rust_toolchain(root)
         if name == "rust" and SPEC.get("rust_cargo_cache"):
             rust_extras(root)   # opt-in: --with-cargo-cache (or "rust_cargo_cache": true in spec.json)
         if name == "scala":
             scala_extras(root)
+            java_cacerts(root)
+            scala_cli(root)
         if name == "host":
             userspace_into(root)
         normalize(root)
@@ -345,6 +401,8 @@ def fetch_if_needed():
     if not (CACHE / "tools/apk.static").exists() or not LOCK.exists():
         fetch()
     else:
+        for k in ("rust_toolchain", "scala_cli"):      # sources added after the cache was first filled
+            download(SPEC[k]["url"], CACHE / "src" / Path(SPEC[k]["url"]).name, SPEC[k]["sha256"])
         lock_check()
 
 

@@ -24,8 +24,6 @@
   "images": {
     "rust": {
       "packages": [
-        "rust",
-        "cargo",
         "gcc",
         "musl-dev"
       ],
@@ -67,5 +65,14 @@
     "ssh",
     "box"
   ],
-  "rust_cargo_cache": false
+  "rust_cargo_cache": false,
+  "rust_toolchain": {
+    "version": "1.96.0",
+    "url": "https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-musl.tar.xz",
+    "sha256": "8b4db404e24a82be906170b7b64bd69807e72e59d8371bac2a7f0ade75b39697"
+  },
+  "scala_cli": {
+    "url": "https://github.com/VirtusLab/scala-cli/releases/download/v1.19.0/scala-cli.jar",
+    "sha256": "7092aad0a7a04485fe8a3fe9ef8f732d21ce3be0f60e6576e478ade03f05d38e"
+  }
 }
