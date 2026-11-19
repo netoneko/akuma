@@ -574,6 +574,11 @@ const ARG_BYTES_MAX: usize = 1024 * 1024;
 /// `#!` hops followed before ENOEXEC (Linux's `BINPRM_MAX_RECURSION`).
 const SHEBANG_MAX_DEPTH: usize = 4;
 
+/// The path an exec request names (the one field [`exec_strs`] needs of a request).
+struct ExecPath {
+    path: String,
+}
+
 /// `execve(path, argv, envp)` up to the crossing.
 ///
 /// The request read, `#!`
@@ -587,7 +592,6 @@ const SHEBANG_MAX_DEPTH: usize = 4;
 ///
 /// The negative errno `execve` returns.
 pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> {
-    let cur = M::current_slot();
     let mut budget = akuma_syscalls_proc::exec::Budget::new(MAX_STRS, STR_MAX, ARG_BYTES_MAX);
     let req = akuma_syscalls_glue::execve::read_request(
         akuma_syscalls_glue::UserAddr::new(path),
@@ -600,9 +604,21 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
     .map_err(akuma_primitives::errno::Errno::ret)?;
     // The loader takes `&str`: an argument that is not UTF-8 cannot reach it.
     let utf8 = |v: Vec<Vec<u8>>| v.into_iter().map(String::from_utf8).collect::<Result<Vec<String>, _>>();
-    let (Ok(mut argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
+    let (Ok(argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
         return Err(e(EFAULT));
     };
+    exec_strs::<M>(req.path, argv_s, &env_s)
+}
+
+/// [`exec`] with the request already in kernel memory: the entry for a process the kernel itself starts, whose image
+/// another loader placed (a `spawn`, which has no tokio task record to run on).
+///
+/// # Errors
+///
+/// The negative errno `execve` returns.
+pub fn exec_strs<M: Proc>(path: String, mut argv_s: Vec<String>, env_s: &[String]) -> Result<TaskImage, u64> {
+    let cur = M::current_slot();
+    let req = ExecPath { path };
     let mut effective = loader::resolve_effective::<M>(&req.path);
     // Each image is marked as being executed BEFORE its bytes are read (`ETXTBSY`), so the file cannot be rewritten between the read and
     // the mark; the pin of the image that finally loads is installed in the task record below, the others (a script) drop here.

@@ -180,7 +180,7 @@ pub fn adopt_text<M: Mm>(pin: akuma_primitives::TextPin) {
 /// alone. That is the main kernel's loader's rule (`akuma-elf`'s
 /// `map_segment_eager`, first mapping wins).
 #[must_use]
-pub fn place_segment<M: Loader>(
+pub fn place_segment<M: Loader + lazy::Kernel>(
     root: u64,
     image: &[u8],
     seg: &LoadSeg,
@@ -195,7 +195,7 @@ pub fn place_segment<M: Loader>(
         return None;
     }
     // A file record names a whole file page: `p_offset` congruent to `p_vaddr`.
-    let inode = inode.filter(|&node| seg.offset.wrapping_sub(seg.vaddr).trailing_zeros() >= 12 && lazy::pin(root, node, first, last));
+    let inode = inode.filter(|&node| seg.offset.wrapping_sub(seg.vaddr).trailing_zeros() >= 12 && lazy::pin::<M>(root, node, first, last));
     let file_end = seg.vaddr + seg.filesz;
     let mut pva = first;
     while pva < last {

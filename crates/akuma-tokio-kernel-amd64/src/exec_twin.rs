@@ -407,6 +407,26 @@ fn twin_bind_child_task(
 /// parent's TLS pointer in hardware, fork semantics.
 fn twin_enter_user(ctx: &akuma_exec::process::UserContext) -> ! {
     let cur = crate::exec_twin::current_slot();
+    // A `spawn` child (a box's first process): its image was placed by `akuma-exec`'s loader, which knows nothing of this
+    // kernel's task record (no regions, no break or mmap window), so every memory call of the program would refuse. Load
+    // it again the way `execve` does, which fills the record.
+    #[cfg(feature = "containers")]
+    if cur != crate::exec_twin::NO_SLOT
+        && cur < crate::child::NSLOTS + 1
+        && crate::with_task(|t| t.layout.regions().is_empty())
+        && let Some(ti) = respawn_through_exec(ctx, cur)
+    {
+        let ef = akuma_ring3_amd64::EntryFrame {
+            r15: 0, r14: 0, r13: 0, r12: 0, rbp: 0, rbx: 0, r10: 0, r8: 0, r9: 0,
+            rdx: 0, rsi: 0, rdi: 0, rax: 0,
+            rip: ti.entry,
+            rflags: 0x202,
+            rsp: ti.sp,
+        };
+        let _ = akuma_cpu::msr::set_fs_base(0);
+        crate::sched::set_slot_fs(cur, 0);
+        enter_user_on(ti.root_pa, &ef);
+    }
     // (session pg: `[tmp] enter` print removed with the sw-to print — same
     // pre-gate-boot readability pass, PLAN-pg §5.)
     // The task record (not the bind table) is the root's authority — a real
@@ -508,4 +528,58 @@ fn exec_config() -> ExecConfig {
         pthread_kill_eintr_enabled: false,
         shared_file_pages_enabled: false,  // no file-page cache
     }
+}
+
+/// The image a `spawn` child was started with, loaded again through [`akuma_tokio_kernel_core::proc::exec_strs`]: path from the
+/// `Process`, argv and the environment from the SysV stack `akuma-exec` built at `ctx.sp` (`argc`, `argv[]`, 0,
+/// `envp[]`, 0). `None` leaves the child as `akuma-exec` loaded it.
+#[cfg(feature = "containers")]
+fn respawn_through_exec(ctx: &akuma_exec::process::UserContext, cur: usize) -> Option<akuma_tokio_kernel_core::loader::TaskImage> {
+    use alloc::string::String;
+    use alloc::vec::Vec;
+    let proc = akuma_exec::process::current_process_shared()?;
+    let exe = proc.image.lock().exe.clone();
+    let walk = crate::TaskWalk { root: crate::child::sched_root_of(cur) };
+    let word = |va: u64| -> Option<u64> {
+        let mut b = [0u8; 8];
+        akuma_user_walk::copy_from(&walk, &mut b, va).then(|| u64::from_le_bytes(b))
+    };
+    let cstr = |va: u64| -> Option<String> {
+        let mut out = Vec::new();
+        let mut at = va;
+        while out.len() < 1 << 16 {
+            let mut b = [0u8; 1];
+            if !akuma_user_walk::copy_from(&walk, &mut b, at) {
+                return None;
+            }
+            if b[0] == 0 {
+                return String::from_utf8(out).ok();
+            }
+            out.push(b[0]);
+            at += 1;
+        }
+        None
+    };
+    let argc = word(ctx.sp)?;
+    if argc > 4096 {
+        return None;
+    }
+    let mut argv = Vec::new();
+    for i in 0..argc {
+        argv.push(cstr(word(ctx.sp + 8 + i * 8)?)?);
+    }
+    let mut env = Vec::new();
+    let mut at = ctx.sp + 8 + (argc + 1) * 8;
+    for _ in 0..4096 {
+        let p = word(at)?;
+        if p == 0 {
+            break;
+        }
+        env.push(cstr(p)?);
+        at += 8;
+    }
+    if argv.is_empty() {
+        argv.push(exe.clone());
+    }
+    akuma_tokio_kernel_core::proc::exec_strs::<crate::lazy::Amd64>(exe, argv, &env).ok()
 }

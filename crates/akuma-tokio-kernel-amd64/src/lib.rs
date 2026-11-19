@@ -1065,6 +1065,21 @@ fn fd_inode(fd: u64) -> Option<u32> {
     (!md.is_dir).then_some(inode)
 }
 
+/// [`fd_inode`] for a boxed process: the mount-qualified file number of the regular file `fd` was opened on
+/// (`lazy::boxfile`), `None` for anything else, a descriptor with no resolved identity included.
+#[cfg(feature = "containers")]
+fn fd_box_file(fd: u64) -> Option<u32> {
+    use akuma_exec::process::FileDescriptor;
+    let kf = akuma_exec::process::current_process_shared()?.with_fd(fd as u32, |d| match d {
+        FileDescriptor::File(f) => Some(f.clone()),
+        _ => None,
+    })??;
+    let key = kf.file_key()?;
+    let md = akuma_vfs_glue::metadata_open_file(&kf.path, Some(key)).ok()?;
+    let (mount, inode) = key.parts();
+    (!md.is_dir).then(|| lazy::boxfile::pack(mount, inode)).flatten()
+}
+
 /// The task records (`akuma_tokio_kernel_core::task`), reached only through [`with_task`] /
 /// [`with_task_slot`] / [`task_root_of`]: a closure never calls anything that reaches a task
 /// record again (`user_ok`, the user copies, `add_region`, the page-table walkers, every
@@ -1761,15 +1776,21 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         akuma_syscalls_abi::x86_64::MMAP => {
             let (flags, fd) = (fr.arg4(), fr.arg5());
-            // FilePage identifies only an inode in the host root. Never interpret
-            // a boxed file's inode against that root: it could disclose a host
-            // file (or write it back on MAP_SHARED). Fail closed until the lazy
-            // mapping carries the open file's mount identity.
+            // A boxed process's file is on a mount of its namespace, not the host root: the record names it by a
+            // mount-qualified number (`lazy::boxfile`). A writable `MAP_SHARED` mapping stays refused (`ENODEV`): the
+            // shared-page table and its write-back are keyed by root-filesystem inodes.
             #[cfg(feature = "containers")]
             if flags & ring3::mmap::MAP_ANONYMOUS == 0
                 && akuma_exec::process::current_process_shared().is_some_and(|p| p.box_id != 0)
             {
-                return e(ring3::err::ENODEV);
+                const MAP_SHARED: u64 = 0x01;
+                if flags & MAP_SHARED != 0 && fr.arg3() & ring3::mmap::PROT_WRITE != 0 {
+                    return e(ring3::err::ENODEV);
+                }
+                let Some(file) = fd_box_file(fd) else {
+                    return e(ring3::err::ENODEV);
+                };
+                return mm::mmap_arm::<lazy::Amd64>(fr.arg1(), fr.arg2(), fr.arg3(), flags, Some(file), fr.arg6());
             }
             // The descriptor is the process's; the decision is core's (`mm::mmap_arm`).
             let file = if flags & ring3::mmap::MAP_ANONYMOUS == 0 { fd_inode(fd) } else { None };

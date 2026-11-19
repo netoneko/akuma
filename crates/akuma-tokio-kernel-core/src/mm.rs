@@ -465,8 +465,7 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
         (false, Some(node)) => Some(node),
         (false, None) => return e(ENODEV),
     };
-    let fs = M::root_fs();
-    let fsize = fnode.map_or(0, |node| fs.metadata_by_inode(node).map_or(0, |md| md.size));
+    let fsize = fnode.map_or(0, |node| M::file_size(node).unwrap_or(0));
     let root = M::task_root();
     let Some(pages) = akuma_user_layout::page_span(len) else {
         return e(ENOMEM);
@@ -557,7 +556,7 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
     };
     let lazy_ok = !shared_anon
         && lazy::fits(first, pages / 4096)
-        && fnode.is_none_or(|node| lazy::pin(root, node, base, base + pages));
+        && fnode.is_none_or(|node| lazy::pin::<M>(root, node, base, base + pages));
     if lazy_ok {
         if !lazy::reserve::<M>(root, base, pages, first) {
             release_pages::<M>(root, base, base + pages);
@@ -575,7 +574,7 @@ pub fn mmap_arm<M: Mm>(addr: u64, len: u64, prot: u64, flags: u64, file: Option<
                 let foff = off + (page - base);
                 let mut done = 0usize;
                 while done < 4096 {
-                    let got = match fs.read_at_by_inode(node, (foff + done as u64) as usize, &mut frame.bytes_mut()[done..]) {
+                    let got = match M::read_file(node, (foff + done as u64) as usize, &mut frame.bytes_mut()[done..]) {
                         Ok(g) => g,
                         Err(_) => return e(EIO),
                     };

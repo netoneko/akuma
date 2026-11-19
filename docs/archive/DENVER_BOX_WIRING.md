@@ -1,6 +1,6 @@
 # Denver box wiring: experimental amd64 slice
 
-Status: **incomplete; do not use for isolation**. The `containers` feature is opt-in. It is not enabled by Denver's defaults, because passing the small probe below is not evidence that all filesystem, process and network boundaries are correct. The aarch64 implementation is not wired; selecting the feature for an aarch64 kernel is a compile error. Other Tokio kernels remain unchanged unless they explicitly select the feature.
+Status: **file mappings and a real dynamic box workload work (2026-11-19, see the last section); still opt-in, do not use for isolation yet**. The `containers` feature is opt-in. It is not enabled by Denver's defaults, because passing the small probe below is not evidence that all filesystem, process and network boundaries are correct. The aarch64 implementation is not wired; selecting the feature for an aarch64 kernel is a compile error. Other Tokio kernels remain unchanged unless they explicitly select the feature.
 
 ## Approach
 
@@ -38,3 +38,32 @@ default" list has been done since: namespace-aware file mappings, the real `box`
 Tokio gates with `containers` on, seccomp and private-namespace plumbing. Denver also has no `herd` and no `/etc/herd` services,
 which the demo's bootstrap overlay relies on. The demo's guests therefore stay on the main amd64 kernel until Denver's file
 mappings carry a box's `FileKey` (`AKUMA_ECOSYSTEM_DEMO.md`, decision 2026-11-19).
+
+## Boxed file mappings and real box roots (2026-11-19)
+
+The restriction above is lifted. Incident-style detail: symptom, cause, fix and verification.
+
+**Symptom.** A dynamic musl program in a Denver box died on its first library `mmap` (`ENODEV`); once that was lifted, `mprotect`
+inside the box failed with `ENOMEM` ("sh: out of memory").
+
+**Cause 1 (mappings).** Lazy PTE records, the pin table, `akuma_fpcache` and `shmpages` named files by root-filesystem inode only.
+**Cause 2 (regions).** A box's first process is started by `akuma-exec`'s `spawn`, whose loader fills no Tokio task record: no
+user-layout regions, no brk or mmap window, so every `mprotect`/`mmap` range failed `user_ok`.
+
+**Fix.**
+- The lazy record's inode field is a mount-qualified file number, `slot<<28 | inode` (`akuma_tokio_kernel_amd64::lazy::boxfile`, 15
+  slots, slot 0 = root). `Kernel` gained `read_file`, `file_size`, `pin_inode` and `shareable`; reads go through
+  `akuma_vfs_glue::read_at_by_mount_inode` and the process's namespace. Boxed files never enter `akuma_fpcache` or `shmpages`.
+  Writable `MAP_SHARED` of a boxed file is still refused (`ENODEV`).
+- `twin_enter_user` re-loads a spawn child whose task record has no regions through `proc::exec_strs` (path from the `Process`, argv
+  and environment from the SysV stack `akuma-exec` built), which fills the record the way `execve` does.
+
+**Verified** (Denver `containers` build, scratch image with the demo's Alpine roots, `box` built with `--features
+libakuma/linux-abi`, since stock `box` uses the Akuma-private syscall ABI Denver does not serve):
+`denver/probe-boxes-qemu.sh` PASS (`FILE_MMAP_PASS`, `SHARED_WRITE_REFUSED_PASS`); in the `rust` box `cargo 1.96.0`, `rustc 1.96.0`,
+`rustc -O h.rs && ./h` and `cargo new && cargo build && ./demo`; in the `scala` box `java -version` (OpenJDK 21.0.11) and
+`java H.java` (source launcher compiles and runs). All four Denver and three Shanghai/Taoxichuan kernel builds pass.
+
+**Still open.** A *second* `box run` in one boot panics (`activate: root does not share the live kernel slot 511`, `box` exec after a
+previous box exited). The python box was not run (no image of that name on the scratch disk). scala-cli, seccomp and private
+namespaces, the JVM gates with `containers` on, and Denver's missing `herd`/bootstrap overlay for the demo are untested.

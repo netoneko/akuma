@@ -179,6 +179,84 @@ impl core_lazy::Kernel for Amd64 {
     fn task_root() -> u64 {
         crate::task_root()
     }
+    #[cfg(feature = "containers")]
+    fn read_file(file: u32, offset: usize, out: &mut [u8]) -> Result<usize, akuma_vfs::FsError> {
+        match boxfile::key(file) {
+            boxfile::Loc::Root => crate::root_fs().read_at_by_inode(file, offset, out),
+            boxfile::Loc::Mounted(key) => akuma_vfs_glue::read_at_by_mount_inode(key, offset, out),
+            boxfile::Loc::Gone => Err(akuma_vfs::FsError::NotFound),
+        }
+    }
+    #[cfg(feature = "containers")]
+    fn file_size(file: u32) -> Option<u64> {
+        match boxfile::key(file) {
+            boxfile::Loc::Root => crate::root_fs().metadata_by_inode(file).ok().map(|md| md.size),
+            boxfile::Loc::Mounted(key) => akuma_vfs_glue::metadata_open_file("", Some(key)).ok().map(|md| md.size),
+            boxfile::Loc::Gone => None,
+        }
+    }
+    #[cfg(feature = "containers")]
+    fn pin_inode(file: u32) -> u32 {
+        // Over-pins the same number on the root (the pin table is keyed by inode alone, as a file descriptor's is).
+        file & boxfile::INODE_MASK
+    }
+    #[cfg(feature = "containers")]
+    fn shareable(file: u32) -> bool {
+        // The file-page cache and the shared-page table are invalidated by root-filesystem inode numbers.
+        file >> boxfile::INODE_BITS == 0
+    }
+}
+
+/// A box's files in a lazy record (`--features containers`).
+///
+/// A record names a file by one `u32`. The root filesystem's files keep their inode number (the top bits clear); a file
+/// on any other mount, which is every file a box maps, is `slot << 28 | inode`, where `slot` indexes the mount ids seen
+/// so far (mount ids are never reused, so a slot never names a different mount than it did). Fifteen mounts, inode
+/// numbers below 2^28: past either the file is refused (`ENODEV`), as every boxed file was before.
+#[cfg(feature = "containers")]
+pub mod boxfile {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    pub const INODE_BITS: u32 = 28;
+    pub const INODE_MASK: u32 = (1 << INODE_BITS) - 1;
+    const SLOTS: usize = 15;
+    static MOUNTS: [AtomicU32; SLOTS] = [const { AtomicU32::new(0) }; SLOTS];
+
+    /// The record's file number for `(mount_id, inode)`, taking a slot for the mount if it has none.
+    #[must_use]
+    pub fn pack(mount_id: u32, inode: u32) -> Option<u32> {
+        if mount_id == 0 || inode == 0 || inode > INODE_MASK {
+            return None;
+        }
+        for (i, m) in MOUNTS.iter().enumerate() {
+            match m.compare_exchange(0, mount_id, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => return Some(((i as u32 + 1) << INODE_BITS) | inode),
+                Err(cur) if cur == mount_id => return Some(((i as u32 + 1) << INODE_BITS) | inode),
+                Err(_) => {}
+            }
+        }
+        None
+    }
+
+    /// Where a mount-qualified file number lives.
+    pub enum Loc {
+        /// The root filesystem.
+        Root,
+        /// A mount of a box namespace: its mount and inode.
+        Mounted(akuma_primitives::FileKey),
+        /// A slot nothing took (cannot happen for a packed number).
+        Gone,
+    }
+
+    #[must_use]
+    pub fn key(file: u32) -> Loc {
+        let slot = (file >> INODE_BITS) as usize;
+        if slot == 0 {
+            return Loc::Root;
+        }
+        let mount = MOUNTS.get(slot - 1).map_or(0, |m| m.load(Ordering::Acquire));
+        akuma_primitives::FileKey::try_from_raw(mount, file & INODE_MASK).map_or(Loc::Gone, Loc::Mounted)
+    }
 }
 
 pub fn fill(root: u64, va: u64, files: bool) -> Fill {

@@ -25,10 +25,10 @@ timeout 30s qemu-system-x86_64 -M microvm -cpu max -global virtio-mmio.force-leg
     -append 'virtio_mmio.device=512@0xfeb00000:5 smp=1 init=/bin/parent' \
     -serial mon:stdio -display none -no-reboot > "$D/log" 2>&1 || rc=$?
 cat "$D/log"
-for marker in 'REGISTER PASS' 'SPAWN PASS' 'BOX_READ_PASS' 'HOST_HIDDEN_PASS' 'FILE_MMAP_REFUSED_PASS' 'INNER_EXEC_PASS' 'KILL PASS' 'Denver: exit code 0'; do
+for marker in 'REGISTER PASS' 'SPAWN PASS' 'BOX_READ_PASS' 'HOST_HIDDEN_PASS' 'FILE_MMAP_PASS' 'SHARED_WRITE_REFUSED_PASS' 'INNER_EXEC_PASS' 'KILL PASS' 'Denver: exit code 0'; do
     if ! grep -Fq "$marker" "$D/log"; then echo "FAIL: missing $marker" >&2; exit 1; fi
 done
-if grep -Eq '(^|[[:space:]])(REGISTER FAIL|SPAWN FAIL|BOX_READ_FAIL|HOST_HIDDEN_FAIL|FILE_MMAP_REFUSED_FAIL|EXEC_FAIL|KILL FAIL)' "$D/log"; then
+if grep -Eq '(^|[[:space:]])(REGISTER FAIL|SPAWN FAIL|BOX_READ_FAIL|HOST_HIDDEN_FAIL|FILE_MMAP_FAIL|SHARED_WRITE_REFUSED_FAIL|EXEC_FAIL|KILL FAIL)' "$D/log"; then
     echo 'FAIL: guest reported a failed check' >&2; exit 1
 fi
 case ${rc:-0} in 0|124) ;; *) echo "FAIL: QEMU exited ${rc}" >&2; exit 1 ;; esac
