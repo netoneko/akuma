@@ -312,7 +312,7 @@ def scala_cli(root: Path):
     shutil.copy(CACHE / "src" / Path(c["url"]).name, d / "scala-cli.jar")
     w = root / "usr/local/bin/scala-cli"
     w.parent.mkdir(parents=True, exist_ok=True)
-    w.write_text('#!/bin/sh\n# os.name comes from the kernel uname sysname ("Akuma"); the coursier directories library refuses it.\nexec java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar "$@"\n')
+    shutil.copy(ROOT / "overlays/ecosystem-demo/scala/usr/local/bin/scala-cli", w)
     w.chmod(0o755)
 
 
