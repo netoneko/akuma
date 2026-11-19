@@ -24,3 +24,17 @@ DENVER_KERNEL="$PWD/target/x86_64-unknown-none/release/denver" denver/probe-boxe
 ```
 
 The probe needs `cc`, `mke2fs`, `debugfs`, and `qemu-system-x86_64`. It uses no credentials or external network. Denver parks after init exits, so the script terminates its own QEMU at the timeout after checking the output.
+
+## Rerun (2026-11-19, branch `ecosystem-demo-stage1`)
+
+Asked whether the Denver boxes were finished, the probe in "Reproduce" was rerun on the current tree (the build command above, then
+`denver/probe-boxes-qemu.sh`): `RESULT PASS`, with REGISTER, SPAWN, BOX_READ, HOST_HIDDEN, INNER_EXEC and KILL passing, and
+`FILE_MMAP_REFUSED_PASS` (the serial log shows `[err] s2 nr=9 -19`: `mmap` of a file inside a box answers `ENODEV`).
+
+That is the same result as at the time of writing, and it is **not** "finished": the probe uses a static, libc-free program, and
+what passes is the refusal. Every dynamically linked program in a box dies on its first library `mmap`, which rules out the
+ecosystem demo's roots (Alpine rust/cargo, JDK + scala-cli, python are all dynamic musl). Nothing in the "Before enabling by
+default" list has been done since: namespace-aware file mappings, the real `box` userspace and overlay mounts, the Denver JVM and
+Tokio gates with `containers` on, seccomp and private-namespace plumbing. Denver also has no `herd` and no `/etc/herd` services,
+which the demo's bootstrap overlay relies on. The demo's guests therefore stay on the main amd64 kernel until Denver's file
+mappings carry a box's `FileKey` (`AKUMA_ECOSYSTEM_DEMO.md`, decision 2026-11-19).
