@@ -960,7 +960,28 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         }
         // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
         // forked) task replaces its own image in place. See `sys_execve`.
-        Syscall::Execve => sys_execve(akuma_syscalls_glue::UserAddr::new(a1), akuma_syscalls_glue::UserAddr::new(a2), akuma_syscalls_glue::UserAddr::new(a3)),
+        Syscall::Execve => {
+            // From a thread with live siblings the exec cannot replace the group's address space
+            // under them: detach (see `sys_execve_detached`).
+            if !crate::thread::current_is_main()
+                && current_process().is_some_and(|p| crate::thread::live_count(p.tgid) > 1)
+            {
+                return Some(match sys_execve_detached() {
+                    // The old image is gone, as on Linux: end the whole old group, the way
+                    // `exit_group` from a thread does. (Leaving only this thread would strand
+                    // the others, and the leader's `pthread_join` on it, for good.)
+                    Ok(()) => {
+                        if let Some(p) = akuma_exec::process::current_process_shared() {
+                            crate::thread::exit_group_from_thread(p.tgid, 0);
+                        }
+                        exit_current_group();
+                        0
+                    }
+                    Err(e) => e,
+                });
+            }
+            sys_execve(akuma_syscalls_glue::UserAddr::new(a1), akuma_syscalls_glue::UserAddr::new(a2), akuma_syscalls_glue::UserAddr::new(a3))
+        }
         Syscall::Clone => {
             // `CLONE_VM` is the fork/thread fork in the road, and the only one:
             // with it the caller wants to share an address space

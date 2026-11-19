@@ -1734,7 +1734,12 @@ fn run_process(first: &UserContext) -> ! {
     // SAFETY: both are addresses the loader (or `Image::new`) mapped
     // user-accessible in the address space the scheduler installed for this
     // task, and every program this kernel runs ends in exit_group.
-    let mut status = enter_user(first.pc, first.sp, forked_child);
+    let detached = forked_child && current_process().is_some_and(|p| detach_is_pending(p.pid));
+    let mut status = if detached {
+        run_detached_exec(current_process().map_or(0, |p| p.pid))
+    } else {
+        enter_user(first.pc, first.sp, forked_child)
+    };
     if crate::sched::read_current_uctx(|u| u.leave) == Some(SECCOMP_THREAD_EXIT)
         && let Some(proc) = current_process()
     {
@@ -2525,6 +2530,148 @@ fn exec_load_errno(e: &str) -> u64 {
         return errno::ENOENT;
     }
     errno::ENOEXEC
+}
+
+/// **`execve` from a thread that is not the group leader, with other threads alive: detach.**
+///
+/// This kernel keeps a process's address space in its *leader's* `Process`, so an exec from a
+/// non-leader replaced the whole group's space under its siblings, which kept running on frames the
+/// replacement freed and faulted in ring 0 (`sys_mmap` in `Process::with_address_space`, E7:
+/// `scala-cli run` on a JVM, `docs/archive/EXEC_FROM_THREAD_DETACH.md`). Linux ends the other
+/// threads and lets the caller take over the leader's identity; this kernel has no leader transfer
+/// (future work, same doc).
+///
+/// **Detach** is the Denver-style answer: the exec'd image becomes a process of its own and the old
+/// group is left as it was. The caller forks (copy-on-write, a new pid that is its own group's
+/// leader, with its own copy of the descriptor table), the *child* runs the `execve` as an ordinary
+/// leader on its first entry ([`run_detached_exec`]) and reports whether it worked; on success the
+/// whole old group ends, as `exit_group` from a thread does; on failure the caller returns the errno, as
+/// `execve` does, with its own state untouched.
+///
+/// Divergence from Linux, deliberate: the exec'd program has a **new pid**, so a parent `wait4`ing
+/// the old one is told the old image ended (status 0) when the exec happened, not when the new
+/// program exits.
+const DETACH_SLOTS: usize = 8;
+const DETACH_PENDING: i64 = i64::MIN;
+
+struct DetachSlot {
+    /// The child's pid; 0 = free.
+    pid: u32,
+    /// [`DETACH_PENDING`], 0 (the exec happened) or the negative errno `execve` returned.
+    result: i64,
+    parent: Option<akuma_exec::threading::WakeHandle>,
+}
+
+static DETACH: Spinlock<[DetachSlot; DETACH_SLOTS]> = Spinlock::new(
+    [const { DetachSlot { pid: 0, result: DETACH_PENDING, parent: None } }; DETACH_SLOTS],
+);
+
+/// Reserve a slot for `pid` *before* the child exists, so it cannot run first and find nothing.
+fn detach_register(pid: u32) -> bool {
+    let me = akuma_exec::threading::current_wake_handle();
+    akuma_primitives::irq::with_irqs_disabled(|| {
+        let mut t = DETACH.lock();
+        t.iter_mut().find(|e| e.pid == 0).is_some_and(|e| {
+            *e = DetachSlot { pid, result: DETACH_PENDING, parent: Some(me) };
+            true
+        })
+    })
+}
+
+fn detach_forget(pid: u32) {
+    akuma_primitives::irq::with_irqs_disabled(|| {
+        if let Some(e) = DETACH.lock().iter_mut().find(|e| e.pid == pid) {
+            e.pid = 0;
+            e.parent = None;
+        }
+    });
+}
+
+fn detach_is_pending(pid: u32) -> bool {
+    akuma_primitives::irq::with_irqs_disabled(|| DETACH.lock().iter().any(|e| e.pid == pid && e.result == DETACH_PENDING))
+}
+
+/// The child's verdict, and the wake of the parent waiting for it.
+fn detach_post(pid: u32, result: i64) {
+    let parent = akuma_primitives::irq::with_irqs_disabled(|| {
+        DETACH.lock().iter_mut().find(|e| e.pid == pid).and_then(|e| {
+            e.result = result;
+            e.parent.take()
+        })
+    });
+    if let Some(h) = parent {
+        akuma_exec::threading::wake_by_handle(h);
+    }
+}
+
+fn detach_take_result(pid: u32) -> Option<i64> {
+    akuma_primitives::irq::with_irqs_disabled(|| {
+        let mut t = DETACH.lock();
+        let e = t.iter_mut().find(|e| e.pid == pid)?;
+        if e.result == DETACH_PENDING {
+            return None;
+        }
+        let r = e.result;
+        e.pid = 0;
+        Some(r)
+    })
+}
+
+/// The calling thread's `execve`, run as a detached process. `Ok(())`: the exec happened and the
+/// caller must leave; `Err(errno)`: it did not, and the caller returns that.
+fn sys_execve_detached() -> Result<(), u64> {
+    use crate::fd::errno;
+    let child_pid = alloc_pid();
+    if !detach_register(child_pid) {
+        return Err(errno::EAGAIN);
+    }
+    crate::drivers::hypervisor_note_fork();
+    if let Err(e) = akuma_syscalls_glue::proc::retry_while_full(|| akuma_exec::process::fork_process(child_pid, UserAddr::new(0))) {
+        serial::puts("  [execve] detach: fork failed: ");
+        serial::puts(e);
+        serial::puts("\n");
+        detach_forget(child_pid);
+        return Err(errno::ENOMEM);
+    }
+    loop {
+        if let Some(r) = detach_take_result(child_pid) {
+            return if r == 0 { Ok(()) } else { Err(r.cast_unsigned()) };
+        }
+        // The child died before it reported: nobody will wake us.
+        if akuma_exec::process::with_process(child_pid, |_| ()).is_none() {
+            detach_forget(child_pid);
+            return Err(errno::ENOMEM);
+        }
+        akuma_exec::threading::park_indefinitely();
+    }
+}
+
+/// The child's first entry when [`sys_execve_detached`] forked it: run the parent's `execve` (the
+/// arguments are the registers the fork copied, and the strings are in the child's copy of the
+/// parent's memory) and enter the new image. `Some(status)`: the exec failed and the child is
+/// over; `None` never — success does not return here until the new program leaves ring 3.
+fn run_detached_exec(pid: u32) -> u64 {
+    let args = crate::sched::read_current_uctx(|u| (u.saved_regs[0], u.saved_regs[1], u.saved_regs[2]));
+    let Some((path, argv, envp)) = args else {
+        detach_post(pid, crate::fd::errno::ENOSYS.cast_signed());
+        return 127;
+    };
+    let r = sys_execve(UserAddr::new(path), UserAddr::new(argv), UserAddr::new(envp));
+    if r != 0 {
+        detach_post(pid, r.cast_signed());
+        return 127;
+    }
+    // `Amd64Exec::enter` armed the syscall return path's `.Lexec_return`; there is no syscall return
+    // here, so take the entry it recorded and enter the new image directly, and spend the flag.
+    let entry = crate::sched::with_current_uctx(|u| {
+        u.exec_pending = 0;
+        (u.user_rip, u.user_rsp)
+    });
+    detach_post(pid, 0);
+    match entry {
+        Some((rip, rsp)) => enter_user(rip, rsp, false),
+        None => 127,
+    }
 }
 
 /// `execve(path, argv, envp)` — x86_64 syscall 59: glue's `execve::run` over

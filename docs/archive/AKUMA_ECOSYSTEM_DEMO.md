@@ -301,8 +301,9 @@ scripts/gate.py
 
 Goal: give the boxes internet, download dependencies there (Maven for the Scala board, cargo + a git dependency for the Rust git
 server), run the reference services and the reference acceptance suite (`akuma-demo-reference-impl/tests/test_remote.py`) from
-guest 2. Driver: `overlays/ecosystem-demo/refdemo.py`. **Status: not finished; the Scala board cannot be started because a guest
-kernel panics (E7). The git half works.**
+guest 2. Driver: `overlays/ecosystem-demo/refdemo.py`. **Status: passes (2026-11-19, after the E7 detach fix below): both services run and the reference acceptance suite
+passes from guest 2 (`refdemo.py`: 19 ok/info, 0 failed).** Before the fix the Scala board could not be started because a guest
+kernel panicked (E7).
 
 ### Networking was replaced, not extended
 
@@ -332,10 +333,9 @@ addresses inside it. The stage-1 checks (`launch.py verify`) were ported and re-
 | scala-cli jar: `directories are not supported on Akuma` | `uname` sysname `Akuma` becomes `os.name` | launcher passes `-Dos.name=Linux` (E8) |
 | every JVM https download failed (`trustAnchors ... non-empty`) | Alpine builds `cacerts` in a trigger; triggers do not run in these roots | `build-images.py` writes `/etc/ssl/certs/java/cacerts` (JKS, fixed timestamp, byte-reproducible) from the root's CA bundle |
 | `cargo build` sometimes: `extern location ... .rlib does not exist` | not understood (E9) | recorded; `refdemo.py` retries once and prints attempt 1 |
-| **guest 1 kernel panic** during `scala-cli run` of the board | ring-0 `#PF` in `Process::with_address_space` (`sys_mmap`), right after `[execve] from a non-leader thread with live siblings` | **stopped**: fixing it is a kernel change beyond an isolated fix (E7); not patched |
+| **guest 1 kernel panic** during `scala-cli run` of the board | `execve` from a non-leader thread replaced the group's address space under its siblings (`[execve] from a non-leader thread with live siblings`, then a ring-0 `#PF` in `sys_mmap`) | **fixed by detach**: the exec runs as a new process and the old group ends (E7, `docs/archive/EXEC_FROM_THREAD_DETACH.md`); the Linux-style handler is future work (E7b) |
 
 ### Open
 
-* Board service on :8082 and the full acceptance suite (needs E7 fixed or `scala-cli run` replaced by a pre-built class run
-  with plain `java`, which avoids the `execve`-from-thread path; not tried).
+* The exec'd program has a new pid (E7 detach); the Linux-style `execve` from a thread is E7b in `proposals/FUTURE_WORK.md`.
 * Firecracker still needs the same shape (tap + MMDS) in stage 3.
