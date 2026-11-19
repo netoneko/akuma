@@ -186,6 +186,22 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         _ => {}
     }
 
+    // `getcpu(2)` — 309 on x86_64, 168 asm-generic, so it is NOT in the identical-number
+    // list below and has no `Syscall` row (`akuma_syscalls_abi::x86_64::GETCPU` is a
+    // hand-written const for exactly this reason). musl's `sched_getcpu` and HotSpot ask
+    // for it at startup; on `ENOSYS` HotSpot falls back to the legacy vsyscall page
+    // (0xffffffffff600800), which this kernel does not map, and the JVM dies with SIGSEGV
+    // before `main` (`docs/archive/AKUMA_ECOSYSTEM_DEMO.md`, stage 1). The decision and the
+    // user copies are glue's host-tested `sys_getcpu`, the same function Denver wires behind
+    // its `getcpu` feature; the calling core comes from this machine half.
+    if nr == akuma_syscalls_abi::x86_64::GETCPU {
+        return akuma_syscalls_glue::sched::sys_getcpu(
+            akuma_syscalls_glue::UserAddr::new(a1),
+            akuma_syscalls_glue::UserAddr::new(a2),
+            crate::smp::cpu_index_u32(),
+        );
+    }
+
     // The **shared-number** syscalls, and nothing else.
     //
     // A third category next to the x86-only legacy list above and the neutral

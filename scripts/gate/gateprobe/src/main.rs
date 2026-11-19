@@ -364,6 +364,37 @@ fn alive_at_once(n: usize) -> Result<String, String> {
     Ok(format!("{n} threads alive at once"))
 }
 
+/// `getcpu(2)` through the raw syscall (musl's `sched_getcpu` and HotSpot ask for it at startup; on ENOSYS
+/// HotSpot falls back to the legacy vsyscall page and the JVM dies with SIGSEGV before `main`).
+/// The main amd64 kernel answered ENOSYS until stage 1 of `docs/archive/AKUMA_ECOSYSTEM_DEMO.md`.
+fn getcpu() -> Result<String, String> {
+    let mut cpu: u32 = u32::MAX;
+    let mut node: u32 = u32::MAX;
+    let ret: i64;
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!("syscall", inlateout("rax") 309i64 => ret,
+            in("rdi") &mut cpu as *mut u32, in("rsi") &mut node as *mut u32, in("rdx") 0usize,
+            lateout("rcx") _, lateout("r11") _, options(nostack));
+    }
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        core::arch::asm!("svc 0", in("x8") 168i64, inlateout("x0") &mut cpu as *mut u32 as i64 => ret,
+            in("x1") &mut node as *mut u32, in("x2") 0usize, options(nostack));
+    }
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    {
+        ret = 0;
+    }
+    if ret != 0 {
+        return Err(format!("getcpu returned {ret}"));
+    }
+    if cpu >= 4096 || node >= 4096 {
+        return Err(format!("implausible cpu={cpu} node={node}"));
+    }
+    Ok(format!("cpu={cpu} node={node}"))
+}
+
 fn many_threads() -> Result<String, String> {
     alive_at_once(32)
 }
@@ -479,6 +510,7 @@ fn threads_and_children() -> Result<String, String> {
 const CHECKS: &[(&str, Check)] = &[
     ("threads", threads),
     ("time", time),
+    ("getcpu", getcpu),
     ("memory", memory),
     ("files", files),
     ("tcp_bind", tcp_bind),

@@ -6,3 +6,6 @@ akuma/amd64	tcp_loopback	flaky: passes alone and when run first, times out after
 taoxichuan/amd64	threads_128	capacity: the spawn ring is NSLOTS=48 (crates/akuma-tokio-kernel-core/src/proc.rs); clone past it answers EAGAIN, and std panics. Not a leak (spawn_churn/thread_churn pass). tokio blocking pools can ask for 512.
 shanghai/amd64	threads_128	capacity: spawn ring is 48 slots, as taoxichuan
 denver/amd64	threads_128	capacity: spawn ring is 48 slots, as taoxichuan
+taoxichuan/amd64	getcpu	not wired: the tokio kernels serve getcpu only behind their off-by-default `getcpu` feature (crates/akuma-tokio-kernel-amd64/src/lib.rs, PHASE-2-GETCPU); the main amd64 kernel gained the arm for the ecosystem demo (JVM)
+shanghai/amd64	getcpu	not wired: the tokio kernels serve getcpu only behind their off-by-default `getcpu` feature (crates/akuma-tokio-kernel-amd64/src/lib.rs, PHASE-2-GETCPU); the main amd64 kernel gained the arm for the ecosystem demo (JVM)
+denver/amd64	getcpu	not wired: the tokio kernels serve getcpu only behind their off-by-default `getcpu` feature (crates/akuma-tokio-kernel-amd64/src/lib.rs, PHASE-2-GETCPU); the main amd64 kernel gained the arm for the ecosystem demo (JVM)
