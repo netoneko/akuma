@@ -219,3 +219,11 @@ the next image build proves it.
 | guest 2 reaches guest 1's `:8081`/`:8082` | the launcher's preflight | `curl /health` from guest 2 |
 | an empty box can be handed out and reset | launcher | box recreated from the image in seconds, workspace empty |
 | the kernel handles the load | `scripts/gate.py`-style probes for what the rehearsal exercised (threads, processes, TLS, big builds) | no kernel-side surprises during step 2 |
+
+### Decision: guest 1 is the main amd64 kernel (2026-11-19)
+
+Guest 1 runs **Akuma (the main amd64 kernel)**, not Denver: it has herd, `box` and the bootstrap overlay, which the boxes
+for B and C need and Denver lacks (`KERNEL_CONVERGENCE.md`). This resolves option (a) above; (b) and (c) are dropped for now.
+The open risk it leaves is whether a JDK and Scala run on it: stage 1 tests that before building the Scala image, and a
+failure is reported with the failing syscall rather than answered by switching kernels. Guest 2 (Python tests) uses the same
+kernel and bootstrap so one image mechanism covers the demo; revisit only if Python cannot run there.
