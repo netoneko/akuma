@@ -227,3 +227,72 @@ for B and C need and Denver lacks (`KERNEL_CONVERGENCE.md`). This resolves optio
 The open risk it leaves is whether a JDK and Scala run on it: stage 1 tests that before building the Scala image, and a
 failure is reported with the failing syscall rather than answered by switching kernels. Guest 2 (Python tests) uses the same
 kernel and bootstrap so one image mechanism covers the demo; revisit only if Python cannot run there.
+
+## Stage 1 outcome (2026-11-19, branch `ecosystem-demo-stage1`)
+
+**Status: stage 1 passes on QEMU+KVM on the ryzen with the main amd64 kernel as both guests; no agent, no demo application.**
+Code and runbook: [`overlays/ecosystem-demo/`](../../overlays/ecosystem-demo/README.md). This section records what is true now; the
+sections above are the plan it executed.
+
+### What passed
+
+`overlays/ecosystem-demo/launch.py verify` (36 checks, 0 failed on the last run): tampered bootstrap refused; bootstrap verified and run
+on both guests; secrets root-only (700/600) and fetched exactly once; rust (`rustc`/`cargo` 1.87), scala (OpenJDK 21, Scala 3.3.6, a gson
+jar from the dependency cache) and python (3.12, pytest 8) toolchains run **each in its own box**, alongside bash, git, apk, curl and GNU
+coreutils; one-line compile-and-run in each box (toolchain checks only); `git init` + commit in the empty `/work` with the throwaway
+identity; `apk add jq` from the pinned local mirror; a box destroyed and recreated from its image with an empty workspace in **0.3 s**;
+from inside a box the metadata address is unreachable (the host root reaches it; the server logged nothing for the box); a box cannot
+read another agent's secret (host `/var/lib/agents`, `/proc/*/environ` of a running sibling, its own filesystem); no secret value in
+either disk image or any launcher/serial log; guest 2 (and its python box) reaches guest 1 `:8081`/`:8082`, served from the rust and
+scala boxes by stock `busybox-extras httpd`.
+
+Boot to ssh-ready for both guests in parallel: 21 s. Scala hello (compile + run): 3.2 s. A Scala build beside a JVM with 150 threads and
+60 sleeper processes, plus a cargo build: both pass; the kernel logged **113 live user threads at its last high-water step of 512**
+(a lower bound, E6).
+
+### Kernel gaps, and what was done
+
+| gap | syscall / errno | status |
+|---|---|---|
+| **JVM dies before `main`**: `SIGSEGV at pc=0xffffffffff600800` | `getcpu` (x86_64 nr 309) returned `-38 ENOSYS` (`strace_err`: `nr=309 -> -38`); HotSpot then falls back to the legacy vsyscall page, which is not mapped | **fixed**: one arm in `crates/akuma-kernel-amd64/src/usermode/dispatch.rs` calling the existing, host-tested `akuma_syscalls_glue::sched::sys_getcpu`; gate probe `getcpu` added. Kernels that depended on the old behaviour: only the main amd64 kernel was changed; taoxichuan/shanghai/denver amd64 are unchanged (denver wires it behind its `getcpu` feature) |
+| box child stdout not delivered to an ssh exec session | none (no errno; output lost) | **open**, E1 in `proposals/FUTURE_WORK.md`; `eco-box` captures via a file |
+| path through a relative directory symlink inside an overlay box fails | `ENOENT` | **open**, E2; the scala root has no such link |
+| no outbound route / NAT for the bridge | n/a | **open**, E3 |
+
+### Images
+
+Identity of a root is the sha256 of its uncompressed, name-sorted tar (owner 0, fixed mtime). Rebuilt twice from the pinned inputs, **all four
+roots are byte-identical**; the **guest disk images are not** (E4: `mkfs.ext2 -d` copies host ctime/atime). `MANIFEST.json` in the output
+directory records the source revision, the spec and lock digests, the akuma userspace inputs and every digest. This run:
+
+| root | diff id (sha256 of tar) | packages |
+|---|---|---|
+| host (herd, sshd, box, curl, busybox) | `416c80905e54a8762e2c863b8304dbc574cf8bfbfd66e56efe57514a87c10723` | 21 |
+| rust (rustc, cargo, gcc, musl-dev; no cargo cache by default) | `06ada2e3466d4ee9301f58928a09d3c71200e8a4ea9edb7e14851d8a481eba14` | 62 |
+| scala (OpenJDK 21, Scala 3.3.6, gson) | `4dad3b8f157bf3db0409b9638cfca2405f21f9794dad5321422086603f5549a1` | 71 |
+| python (python3, pytest, requests) | `8c45712eccada082a30232134867cb1214442f2c5a214441860b9b8d22780cb5` | 78 |
+
+Digests move with the source revision of the akuma userspace binaries (herd embeds its revision) and with the pinned lock; the numbers
+above are from a tree with this branch's uncommitted-at-build changes, so re-run `build-images.py all` and read `MANIFEST.json` rather than
+trusting this table after the next commit.
+
+### Decisions that changed the plan
+
+* The guests share a **bridge + tap inside an unprivileged namespace** (README there explains why not SLIRP, `-netdev socket` or a host bridge).
+  Consequence: no internet in the guests (E3), so `apk` uses a pinned local mirror.
+* Cargo's offline registry cache is **off by default** (requested); `build-images.py --with-cargo-cache` vendors `images/rust-deps`.
+* The Scala "dependency cache" is the distribution's own jars plus `/opt/deps/gson-2.11.0.jar`; there is no sbt/scala-cli or Maven cache. The
+  reference services in `../akuma-demo-reference-impl` use `scala-cli` and a pinned git crate, so **they do not build in these images yet**; adding
+  `scala-cli` and its caches (or vendoring the `gitserver` crate with `--with-cargo-cache`) is the next stage's job.
+* "Only the launcher of the agent that owns a secret passes it on" is `eco-box exec NAME ...` reading `/var/lib/agents/NAME/secrets/*`. The value is
+  visible in the `box run -e` argv of the host root while it runs.
+
+### Reproduce
+
+```sh
+cargo build -p akuma --target x86_64-unknown-none --release --no-default-features --features headless,no-tests
+overlays/ecosystem-demo/build-images.py fetch && overlays/ecosystem-demo/build-images.py all
+overlays/ecosystem-demo/build-images.py repro
+overlays/ecosystem-demo/launch.py verify
+scripts/gate.py
+```

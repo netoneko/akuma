@@ -65,6 +65,19 @@ Read the document for the inventory and the order. Open items that came out of t
 | C5 | Tokio kernels have no boxes (`current_box_id` is 0) | the ecosystem demo and nested boxes need them | convergence step 4, or the demo uses the main kernel |
 | C6 | The gate boots amd64 only | aarch64 kernels are built, not booted | an aarch64 rig that runs under the budget (the Mac, or KVM on an aarch64 host) |
 
+### Ecosystem demo, stage 1 (`docs/archive/AKUMA_ECOSYSTEM_DEMO.md`)
+
+Found while building and verifying the three images on the main amd64 kernel (2026-11-19). Not fixed on this branch.
+
+| # | Item | Why it matters | What closes it |
+|---|---|---|---|
+| E1 | **`box run` / `box use` / `box open` child output never reaches an ssh exec session** (not with `-tt` either, not through a pipe or a file redirect of `box` itself, not on the serial console). The container runs and its files appear in `containers/<id>/upper`; only its stdout/stderr is lost. `box`'s own `print()` lines do arrive. `scripts/box_amd64_suite.py` expects the output, so this is a regression or an environment difference, not bisected | an agent's launcher or a harness cannot read what a boxed command printed; `eco-box` works around it by writing to a file in the box and reading it from the host | bisect against the suite on `headless` (the `sshd` pty change `53e06880` is the first suspect), then delete `eco-box`'s file capture |
+| E2 | A path **through a relative directory symlink inside an overlay box** does not resolve (`cd /opt/scala/bin` ENOENT where `/opt/scala -> scala3-3.3.6`; the real path works). Plain-filesystem symlinks were not tested | scala's launcher scripts `cd "$(dirname $0)/.."`; any image built from a tarball with such links breaks silently | a box probe in `scripts/box_amd64_suite.py`, then the overlay resolver; the image build avoids the link |
+| E3 | **No NAT or outbound route for a guest on the demo's bridge**: the launcher's namespace has no internet. Stage 1 needs none (apk comes from a pinned local mirror) | agents need model APIs (`AKUMA_ECOSYSTEM_DEMO.md` step 3) and creating a NAT takes privilege the launcher does not have | a root-owned one-time `nft`/tap helper, or a userspace NAT in the launcher |
+| E4 | The guest disk image is **not byte-reproducible** (the root layers are): `mkfs.ext2 -d` copies each file's host ctime/atime into the inode. `scripts/gate`-style identity is the layer digest | "rebuilt twice, same digest" holds for the roots only | build the ext2 image with `debugfs` and fixed times, or declare the layer digest the image identity |
+| E5 | `sshd` spins on `accept`: a 3700/s `unlinkat` + `nanosleep` + `accept` loop at idle on every guest (`[PSTATS] PID 4`) | burns a core of every demo guest | find the poll in `userspace/sshd` |
+| E6 | The kernel logs `peak live user threads` only at high-water steps; the capacity number in the demo doc is a lower bound | the 448-thread headroom claim is unmeasured at the top | a `/proc` or syscall counter for peak threads |
+
 ## Inventory
 
 <!-- BEGIN GENERATED -->
