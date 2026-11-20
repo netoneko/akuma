@@ -191,7 +191,7 @@ ECO_ACCEL=tcg ECO_CPU=max ECO_QEMU_EXTRA='-d int,cpu_reset -D /tmp/q.log' ...
 
 ## Still open
 
-Nothing known for `scala-cli run` as of 2026-11-20 (the full demo passes). The `TRAMP-MISMATCH` warning, the gate's `check_budgets` growth, and removing the launcher workaround and `--scala-interpreted` (not yet done) remain.
+Nothing known for `scala-cli run` as of 2026-11-20 (the full demo passes). The launcher's Denver special case and `--scala-interpreted` are retired (the image was rebuilt; the default `refdemo.py` run passes 18/0 with `scala-cli run` execing the application itself). The `TRAMP-MISMATCH` warning remains.
 
 ## Background
 

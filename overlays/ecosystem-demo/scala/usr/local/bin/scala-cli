@@ -1,35 +1,5 @@
 #!/bin/sh
-# Scala CLI's JVM needs Linux as os.name for coursier's directories library.
-# Denver cannot safely exec from a JVM worker while its siblings are alive.
-# Let Scala CLI produce the application argv, then exec it from this shell.
-if [ "$(uname -n)" = denver ] && [ "${1-}" = run ]; then
-    shift
-    for arg do
-        case "$arg" in
-            --) break ;;
-            --command|--command=*|--watch|--watch=*|-w|--restart|--restart=*|--revolver)
-                exec java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar run "$@" ;;
-        esac
-    done
-    # --command prints one argument per line; embedded newlines cannot be decoded.
-    newline='
-'
-    case "$PWD" in *"$newline"*) echo 'scala-cli: newline in working directory is unsupported on Denver' >&2; exit 1;; esac
-    for arg do
-        case "$arg" in *"$newline"*) echo 'scala-cli: newline in arguments is unsupported on Denver' >&2; exit 1;; esac
-    done
-    argv_file=$(mktemp /tmp/scala-cli-argv.XXXXXXXXXX) || exit 1
-    trap 'rm -f "$argv_file"' EXIT HUP INT TERM
-    java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar run --command "$@" > "$argv_file"
-    rc=$?
-    [ "$rc" -eq 0 ] || exit "$rc"
-    set --
-    while IFS= read -r arg || [ -n "$arg" ]; do
-        set -- "$@" "$arg"
-    done < "$argv_file"
-    [ "$#" -gt 0 ] && [ -n "$1" ] || { echo 'scala-cli: empty application command' >&2; exit 1; }
-    rm -f "$argv_file"
-    trap - EXIT HUP INT TERM
-    exec "$@"
-fi
+# Scala CLI's JVM needs Linux as os.name for coursier's directories library (the kernel's uname sysname is Akuma).
+# `scala-cli run` execs the application itself: Denver's execve from a non-leader thread works since 2026-11-20
+# (docs/archive/DENVER_SCALA_CLI_CRASHES.md), so no per-kernel special case is left.
 exec java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar "$@"
