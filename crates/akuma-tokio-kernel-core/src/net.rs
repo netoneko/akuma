@@ -30,27 +30,17 @@ pub trait NetMachine: 'static {
     }
 }
 
-/// How long a parked wait lap sleeps: the tick is 10 ms, so a shorter deadline is not honoured sooner;
-/// 1 ms makes the lap end at the first tick or wake pass.
-const LAP_PARK_US: u64 = 1_000;
+struct Wait<M>(core::marker::PhantomData<M>);
 
-/// One bounded idle moment of a socket wait: **park** when the scheduler can switch away from this thread,
-/// otherwise halt.
-///
-/// Halting alone starves every other thread of the process. Ring-0 code is not preempted on these kernels
-/// (the tick only switches a thread it interrupted in ring 3), so a thread blocked in `accept` that only
-/// pumps and halts keeps its core, and a sibling whose `nanosleep` deadline has passed is never readied
-/// there: the sleeper stays WAITING with a past deadline and the wake pass that would ready it runs only on
-/// a yield. `std`'s `TcpListener::accept` on one thread with a `connect` after a `sleep` on another hung
-/// for that reason (`docs/archive/TOKIO_KERNELS_LOOPBACK_STARVATION.md`); the main amd64 kernel's
-/// `net_blocking_relax` makes the same distinction ("a sleeper whose deadline has passed needs the
-/// scheduler, not a halt").
-fn lap<M: NetMachine>() {
-    if M::can_park() {
-        akuma_threading::schedule_blocking(M::uptime_us().saturating_add(LAP_PARK_US));
-    } else {
-        M::wait_lap();
-    }
+impl<M: NetMachine> akuma_net::wait_hooks::Machine for Wait<M> {
+    fn now() -> u64 { M::uptime_us() }
+    fn yield_thread() { M::wait_lap(); }
+    fn park(deadline_us: u64) { akuma_threading::schedule_blocking(deadline_us); }
+    fn halt() { M::wait_lap(); }
+    fn deadline() -> akuma_net::wait_hooks::Deadline { akuma_net::wait_hooks::Deadline::Pump }
+    fn pump() { netpoll::<M>(); }
+    fn relax_laps() -> usize { 64 }
+    fn can_park() -> bool { M::can_park() }
 }
 
 /// The stack is up; until then [`netpoll`] is a no-op (a tick can come first).
@@ -110,32 +100,6 @@ fn lap_note<M: NetMachine>(dur_us: u64) {
     }
 }
 
-/// A wait loop's backstop between re-checks: every lap pumps, since nothing
-/// else would wake a waiter (no NIC interrupt).
-fn park_until<M: NetMachine>(deadline_us: u64) {
-    while M::uptime_us() < deadline_us {
-        netpoll::<M>();
-        lap::<M>();
-    }
-}
-
-/// One lap of a socket waiter with nothing to do. It pumps too: a waiter that
-/// reaches this hook between predicate laps (a send buffer full, the peer's
-/// ACK not yet drained) must keep the only pump alive, or the guest deadlocks
-/// with its RX ring unposted and its TX unflushed.
-fn blocking_relax<M: NetMachine>() {
-    for _ in 0..64 {
-        netpoll::<M>();
-        lap::<M>();
-    }
-}
-
-/// Never a bare pause: every yield lap keeps the pump alive.
-fn yield_now<M: NetMachine>() {
-    netpoll::<M>();
-    lap::<M>();
-}
-
 /// A waker that does nothing: the wait loops poll, nothing is parked for one.
 fn noop_waker() -> core::task::Waker {
     core::task::Waker::noop().clone()
@@ -149,9 +113,9 @@ pub fn runtime<M: NetMachine>() -> NetRuntime {
     NetRuntime {
         uptime_us: M::uptime_us,
         utc_seconds: || None, // nothing in akuma-net reads it
-        yield_now: yield_now::<M>,
-        blocking_relax: blocking_relax::<M>,
-        park_until: park_until::<M>,
+        yield_now: akuma_net::wait_hooks::yield_now::<Wait<M>>,
+        blocking_relax: akuma_net::wait_hooks::blocking_relax::<Wait<M>>,
+        park_until: akuma_net::wait_hooks::park_until::<Wait<M>>,
         current_waker: noop_waker,
         current_core_id: || 0,
         #[cfg(not(feature = "containers"))]

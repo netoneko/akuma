@@ -93,23 +93,6 @@ fn utc_seconds() -> Option<u64> {
     crate::clock::utc_seconds()
 }
 
-/// Spin until `deadline_us`, yielding so anything else runnable makes progress.
-///
-/// The AArch64 version marks the thread WAITING so a socket wake can target it
-/// directly. There is no such state here, so a parked waiter polls — which is
-/// the same trade the block driver makes, and for the same reason.
-fn park_until(deadline_us: u64) {
-    // Cap the spin so a stalled clock (the LAPIC timer masked, e.g. between two
-    // self-test stages) degrades to "return and let the caller re-check" rather
-    // than "hang": `wait_until` re-evaluates its condition and re-drains the
-    // stack immediately after this returns, so an early return is always safe.
-    let mut guard = 0u32;
-    while uptime_us() < deadline_us && guard < 100_000 {
-        guard += 1;
-        crate::sched::yield_now();
-    }
-}
-
 /// A waker that does nothing.
 ///
 /// `NetRuntime` wants one because the AArch64 stack parks threads and wakes them
@@ -226,93 +209,22 @@ pub fn rng_fill_checked(buf: &mut [u8]) -> bool {
     true
 }
 
-/// One lap of a socket waiter that has nothing to do — `NetRuntime::blocking_relax`.
-///
-/// **Not `yield_now`, and the difference is the whole point.** `akuma-net`'s
-/// `wait_park` states the contract this hook has to meet: the relax "DROPS the
-/// Big Kernel Lock across the wait … so a peer's async-main poller can drive
-/// the RX that satisfies `condition`", and it names what happens otherwise —
-/// "a plain `yield_now` would spin holding it, freezing every peer core — the
-/// meow->LLM `connect`+recv wedge". This target supplied that plain `yield_now`
-/// until 2026-09-19, so it had the wedge the comment describes.
-///
-/// `yield_now` cannot meet the contract on this kernel and it is not a bug in
-/// `yield_now`: it opens a 4-`pause` drop window, **re-takes the lock**, and
-/// then switches with it held (`sched.rs`, "the switch requires the BKL"), which
-/// is correct for a yield and useless for a wait. A socket waiter that has
-/// nothing to do must be *off* the lock for as long as it has nothing to do,
-/// because the thread that will give it something — the netpoll daemon — needs
-/// the lock to run.
-///
-/// What it measured like: a request whose server thinks for ~5 s before sending
-/// its first byte (a model completion) would stall the whole box. `meow` sat in
-/// state `R` burning 33 s of CPU on a 5-second call, the TLS transport
-/// (`libakuma-tls`, which retries `WouldBlock` with no sleep by design, on the
-/// premise that "the kernel already blocks") span through it, and the stream
-/// ended in `TlsError(IoError)`. Four of ten one-line prompts failed that way,
-/// one of them five times in a row — while the *same* TLS stack fetched
-/// github and a 401 from the *same* host cleanly every time, because neither
-/// response has a multi-second silent window for the livelock to form in.
-///
-/// `allow_tick` is exactly the primitive: drop the BKL, `sti; hlt`, take it
-/// back — added 2026-09-17 for the sibling case (the netpoll daemon parking
-/// BKL-held, which produced the same `[BKL] stuck` storm). No `yield_now`
-/// first, matching the AArch64 net path, where removing the yield measured
-/// +27 % req/s (`akuma_threading::blocking_relax_net`). The waiter wakes on the
-/// next tick or any device interrupt and `wait_until` re-checks its condition
-/// per lap, which is the re-check contract `allow_tick` requires of its callers.
-fn net_blocking_relax() {
-    // **The timer check is not an optimisation — it is the whole safety
-    // argument, and leaving it out bricked the box on 2026-09-19.**
-    //
-    // `allow_tick` only *halts* (and only a halt releases the lock) when
-    // `lapic::timer_running()`. With the timer stopped it falls back to
-    // `sti; nop; cli` — a one-instruction window that **keeps the BKL held**,
-    // which is strictly worse here than the `yield_now` this replaced, because
-    // `yield_now` at least opens a drop window and switches. A socket waiter
-    // spinning on a held lock starves the netpoll daemon that would satisfy it,
-    // so the wait can never end: a livelock with no exit.
-    //
-    // The boot path is exactly where the timer is off. `boot::self_tests` calls
-    // `lapic::stop_timer()` and restarts it only around the SNTP sync (see the
-    // netpoll-lap check below), and the clock bootstrap resolves `pool.ntp.org`
-    // in that window. Measured, on the metal: a permanent
-    // `[BKL] stuck: owner=2 waiter=1/3/4 tag=502` storm with
-    // `dns: no resolver answered` — a box that prints forever, serves nothing,
-    // and needs a power cycle. The console was the only evidence; ssh never
-    // came up.
-    //
-    // So: halt when a halt is available, and otherwise do exactly what this
-    // target did before, rather than something new and worse.
-    //
-    // **On the wifi link, yield first.** Everything above assumes the waiter's
-    // own `poll()` is what moves frames, which is true of a NIC the stack
-    // reads itself. The wifi station's frames move only when its daemon runs
-    // (`akuma-drivers-amd64`'s `rtw89_sta.rs`, `ExternalDevice::Queued`), and kernel code is not
-    // preempted on this target: a blocking `connect`/`recv` that only halts
-    // keeps the core from that daemon, so its SYN-ACK sits in the card's
-    // receive ring until the connect times out. Measured on ryzen 2026-10-06:
-    // the daemon lapped twice in 10 s while `nc` waited (1000 times
-    // otherwise), and every outbound TCP connect failed while sshd (epoll,
-    // which parks) and DNS (`poll(2)`) worked.
-    if crate::drivers::wireless_is_link() {
-        crate::sched::yield_now();
+// The timer and wireless checks preserve the daemon scheduling requirements
+// described in UDP_REPLY_WAIT_TIMER_STORM.md and the wifi connect incident.
+struct SocketWait;
+impl akuma_net::wait_hooks::Machine for SocketWait {
+    fn now() -> u64 { uptime_us() }
+    fn yield_thread() { crate::sched::yield_now(); }
+    fn park(_: u64) { unreachable!() }
+    fn halt() { crate::sched::allow_tick(); }
+    fn deadline() -> akuma_net::wait_hooks::Deadline {
+        akuma_net::wait_hooks::Deadline::Yield { max_laps: 100_000 }
     }
-    // **A sleeper whose deadline has passed needs the scheduler, not a halt.**
-    // Only the yield path runs the wake pass; `allow_tick` does not, so a waiter
-    // that only halts leaves the sleeper `WAITING` with a past deadline, and
-    // `lapic::arm_deadline` then arms a 1-count one-shot every lap: an interrupt
-    // storm with the sleeper (the netpoll daemon among them) starved. Measured
-    // as `nc -u -w 2` hanging after a UDP reply (`docs/archive/UDP_REPLY_WAIT_TIMER_STORM.md`).
-    if akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), uptime_us()) {
-        crate::sched::yield_now();
-        return;
+    fn wake_due() -> bool {
+        akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), uptime_us())
     }
-    if crate::lapic::timer_running() {
-        crate::sched::allow_tick();
-    } else {
-        crate::sched::yield_now();
-    }
+    fn halt_available() -> bool { crate::lapic::timer_running() }
+    fn yield_before_relax() -> bool { crate::drivers::wireless_is_link() }
 }
 
 /// The twelve `NetRuntime` hooks this target fills — see the module header for
@@ -321,9 +233,9 @@ fn net_runtime() -> NetRuntime {
     NetRuntime {
         uptime_us,
         utc_seconds,
-        yield_now: crate::sched::yield_now,
-        blocking_relax: net_blocking_relax,
-        park_until,
+        yield_now: akuma_net::wait_hooks::yield_now::<SocketWait>,
+        blocking_relax: akuma_net::wait_hooks::blocking_relax::<SocketWait>,
+        park_until: akuma_net::wait_hooks::park_until::<SocketWait>,
         current_waker: noop_waker,
         current_core_id: crate::smp::cpu_index_u32,
         current_box_id: || 0,
