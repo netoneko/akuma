@@ -161,6 +161,20 @@ boots all pass (getcpu and threads_128 are the listed xfails); `check_budgets` f
 touch; the main-kernel boots pass once `hello.elf` is built; the Clojure `--with-jvm` gate could not run (no Docker for
 `build-image.sh`).
 
+### Cause found and fixed: a non-leader `execve` left the calling thread on the old root (2026-11-20, last)
+
+The `clone`/`execve` race was a wrong diagnosis. `proc::exec_strs` gives the new root to the group leader's `Process`, but when
+a non-leader thread calls `execve` it continues as the group's only thread on a `Process` of its own, and that record's
+address-space view stayed the old root. `clone_thread` reads the parent's view, so every thread the new image created (the
+board JVM's) started on the freed root: `[RUN-REFUSED] ... holds a replaced root`, then the `code=0x15` fault. Fix: `exec_strs`
+points the caller's own `Process` at the new root too (`disown_space(slot_pid(caller), root)`). `kill_siblings` also rescans
+until a pass finds no live sibling (a `clone` finishing in the lock-released wait could add one), which is correct but was not
+this bug.
+
+Verified: `refdemo.py --scala-direct` passes in full, 18 ok / 0 failed, including `scala-cli run` serving the board and the
+reference acceptance suite from the Python box. No `RUN-REFUSED`, no `[Fault]`. Two `TRAMP-MISMATCH` lines remain per run
+(the thread-id map disagrees with the table scan and the trampoline falls back); harmless here, not investigated.
+
 ## Reproduce
 
 ```sh
@@ -177,8 +191,7 @@ ECO_ACCEL=tcg ECO_CPU=max ECO_QEMU_EXTRA='-d int,cpu_reset -D /tmp/q.log' ...
 
 ## Still open
 
-The `clone`/`execve` window described under Defect B, Defect C's cause, and a proof that Defect A's change survives `scala-cli run`. The launcher workaround and
-`--scala-interpreted` stay until all three are closed.
+Nothing known for `scala-cli run` as of 2026-11-20 (the full demo passes). The `TRAMP-MISMATCH` warning, the gate's `check_budgets` growth, and removing the launcher workaround and `--scala-interpreted` (not yet done) remain.
 
 ## Background
 

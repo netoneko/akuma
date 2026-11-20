@@ -368,44 +368,57 @@ fn group_leader(cur: usize) -> usize {
 /// thread publishes the group's status there.
 pub fn kill_siblings<M: Proc>(cur: usize, lead: usize) {
     let tgid = slot_tgid(cur);
-    let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
-    for (s, ask) in asked.iter_mut().enumerate() {
-        let spid = slot_pid(s);
-        if s == cur || !slot_in_use(s) || slot_tgid(s) != tgid || (spid == tgid && s != lead) {
-            continue;
-        }
-        if akuma_threading::is_thread_terminated(s) {
-            continue;
-        }
-        if !stop_in_place(s, spid, s == lead) {
-            akuma_threading::request_thread_kill(s);
-            *ask = spid;
-        }
-    }
     let start = M::uptime_us();
     let mut warned = false;
-    while asked.iter().any(|&p| p != 0) {
-        for (s, p) in asked.iter_mut().enumerate() {
-            if *p == 0 {
+    // Rescan until a pass finds no live sibling. The wait below releases the kernel lock, and a
+    // sibling already on a core can finish a `clone` in that window: its new thread was not in
+    // the pass that asked its creator to end, and left alone it runs on the root the `execve`
+    // replaces (the `RUN-REFUSED` / Denver `scala-cli run` failure,
+    // `docs/archive/DENVER_SCALA_CLI_CRASHES.md`). The pass that finds nothing never releases the
+    // lock, so no `clone` can land between it and the caller's commit.
+    loop {
+        let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
+        let mut live = false;
+        for (s, ask) in asked.iter_mut().enumerate() {
+            let spid = slot_pid(s);
+            if s == cur || !slot_in_use(s) || slot_tgid(s) != tgid || (spid == tgid && s != lead) {
                 continue;
             }
-            if akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p || stop_in_place(s, *p, s == lead) {
-                *p = 0;
+            if akuma_threading::is_thread_terminated(s) {
+                continue;
+            }
+            live = true;
+            if !stop_in_place(s, spid, s == lead) {
+                akuma_threading::request_thread_kill(s);
+                *ask = spid;
             }
         }
-        // User mode reaches the kernel at least once a tick. A thread that does
-        // not is reported, never ended where it runs.
-        if !warned && M::uptime_us().saturating_sub(start) > 2_000_000 {
-            warned = true;
-            for (s, _) in asked.iter().enumerate().filter(|(_, p)| **p != 0) {
-                safe_print!(96, "[exit_group] slot {} still on a core after 2 s; waiting\n", s);
-            }
+        if !live {
+            return;
         }
-        M::unlocked(|| {
-            for _ in 0..2000 {
-                core::hint::spin_loop();
+        while asked.iter().any(|&p| p != 0) {
+            for (s, p) in asked.iter_mut().enumerate() {
+                if *p == 0 {
+                    continue;
+                }
+                if akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p || stop_in_place(s, *p, s == lead) {
+                    *p = 0;
+                }
             }
-        });
+            // User mode reaches the kernel at least once a tick. A thread that does
+            // not is reported, never ended where it runs.
+            if !warned && M::uptime_us().saturating_sub(start) > 2_000_000 {
+                warned = true;
+                for (s, _) in asked.iter().enumerate().filter(|(_, p)| **p != 0) {
+                    safe_print!(96, "[exit_group] slot {} still on a core after 2 s; waiting\n", s);
+                }
+            }
+            M::unlocked(|| {
+                for _ in 0..2000 {
+                    core::hint::spin_loop();
+                }
+            });
+        }
     }
 }
 
@@ -689,8 +702,15 @@ pub fn exec_strs<M: Proc>(path: String, mut argv_s: Vec<String>, env_s: &[String
     }
     // The registered Process's shared root view goes stale with the old image. The space
     // belongs to the group's leader slot, which is `cur` unless a thread called.
+    // A non-leader caller keeps running as the group's only thread, on a `Process` of its own whose
+    // address-space view is still the old root: `clone_thread` reads that view, so every thread the new
+    // image then creates would start on the freed root (`RUN-REFUSED`, Denver `scala-cli run`).
+    let caller = cur;
     let cur = owner;
     let pid = slot_pid(cur);
+    if caller != owner {
+        let _ = disown_space(slot_pid(caller), ti.root_pa);
+    }
     let first_exec = OWNED_ROOT.with(|t| t[cur]) == 0;
     if disown_space(pid, ti.root_pa) {
         // A fork child's first exec: the root it ran on is the fork clone, every
