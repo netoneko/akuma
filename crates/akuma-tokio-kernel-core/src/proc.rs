@@ -669,11 +669,27 @@ pub fn exec_strs<M: Proc>(path: String, mut argv_s: Vec<String>, env_s: &[String
         Err(loader::LoadError::NoMem) => return Err(e(ENOMEM)),
     };
     loader::adopt_text::<M>(text);
+    // `execve` ends every other thread of the group first (Linux's `de_thread`): they run on
+    // the space being replaced, and left alone they fault on frames the replacement frees
+    // (`docs/archive/TOKIO_KERNELS_EXEC_FROM_THREAD.md`). The image is loaded, so a failed exec
+    // above killed nothing. The leader is stopped like the rest but keeps its slot and
+    // `Process`: the group's identity, its wait status and its address space stay there, and a
+    // non-leader caller continues as the group's only thread, on the leader's record.
+    let owner = group_leader(cur);
+    kill_siblings::<M>(cur, owner);
     if let Some(p) = akuma_exec::process::current_process_shared() {
         let argv_bytes: Vec<Vec<u8>> = argv_s.iter().map(|a| a.clone().into_bytes()).collect();
         akuma_syscalls_glue::execve::commit(p, &effective, &argv_bytes);
     }
-    // The registered Process's shared root view goes stale with the old image.
+    if owner != cur {
+        if let Some(lp) = akuma_exec::process::lookup_process_shared(slot_pid(owner)) {
+            let argv_bytes: Vec<Vec<u8>> = argv_s.iter().map(|a| a.clone().into_bytes()).collect();
+            akuma_syscalls_glue::execve::commit(lp, &effective, &argv_bytes);
+        }
+    }
+    // The registered Process's shared root view goes stale with the old image. The space
+    // belongs to the group's leader slot, which is `cur` unless a thread called.
+    let cur = owner;
     let pid = slot_pid(cur);
     let first_exec = OWNED_ROOT.with(|t| t[cur]) == 0;
     if disown_space(pid, ti.root_pa) {

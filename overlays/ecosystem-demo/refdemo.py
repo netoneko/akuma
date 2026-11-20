@@ -48,6 +48,8 @@ def main():
     ap.add_argument("--git-server-bin", type=Path, help="reuse a previously built reference git-server binary; skips Cargo build")
     ap.add_argument("--scala-interpreted", action="store_true",
                     help="run scala-cli and its Java children with -Xint (Denver JVM workaround)")
+    ap.add_argument("--scala-direct", action="store_true",
+                    help="run the board with the scala-cli jar itself (no launcher workaround), to exercise `scala-cli run`'s own exec")
     ap.add_argument("--scala-assembly", action="store_true",
                     help="package the board and start it directly with java")
     a = ap.parse_args()
@@ -114,7 +116,9 @@ def main():
         # --- run -----------------------------------------------------------------------------------
         bx(g1, "rust", "rust", "mkdir -p /work/repos && for n in rust scala python; do git init -q --bare --initial-branch=main /work/repos/$n.git; done; echo provisioned")
         g1.run("/sbin/eco-box daemon rust rust 'cd /work && GIT_ROOT=/work/repos PORT=8081 /work/git-server/target/release/akuma-demo-git-server > /work/git.log 2>&1'")
-        board_command = "java -jar /work/board.jar" if a.scala_assembly else "scala-cli run Main.scala --server=false"
+        board_command = ("java -jar /work/board.jar" if a.scala_assembly else
+                         "java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar run Main.scala --server=false" if a.scala_direct else
+                         "scala-cli run Main.scala --server=false")
         g1.run(f"/sbin/eco-box daemon scala scala 'cd /work/task-board && {java_env}{board_command} > /work/board.log 2>&1'")
         # The services live in the boxes `gitsrv` / `board`: same boxes as the builds (a container id is its writable layer); nothing may `eco-box exec` them afterwards, it closes the box.
         time.sleep(1)
