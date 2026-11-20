@@ -4093,6 +4093,12 @@ impl UserAddressSpace {
     /// kernel's own PML4 slots, so `self.root` maps everything the kernel
     /// needs before the next line executes.
     pub fn activate(&self) {
+        // The checked load: a root that does not share the live kernel slots would otherwise
+        // triple-fault on the next instruction fetch (a freed or reused root, seen on Denver
+        // under a JVM), with no message at all.
+        #[cfg(target_os = "none")]
+        akuma_pagetable::amd64::activate::<KernelPhysMap>(self.root as u64);
+        #[cfg(not(target_os = "none"))]
         x86_write_cr3(self.root as u64);
     }
 

@@ -216,7 +216,7 @@ class Guest:
         fwd = f"hostfwd=tcp:127.0.0.1:{self.ssh_port}-:22," + "".join(
             f"hostfwd=tcp:127.0.0.1:{h}-:{g}," for g, h in self.forwards.items())
         net = f"user,id=n0,net=169.254.0.0/16,host={HOST_ALIAS},dhcpstart=169.254.0.15,dns=169.254.0.3,{fwd}guestfwd=tcp:{META_IP}:80-cmd:nc 127.0.0.1 {self.md_port}"
-        args = ["qemu-system-x86_64", "-M", "microvm", "-accel", "kvm", "-cpu", "host",
+        args = ["qemu-system-x86_64", "-M", "microvm", "-accel", os.environ.get("ECO_ACCEL", "kvm"), "-cpu", os.environ.get("ECO_CPU", "host"),
                 "-global", "virtio-mmio.force-legacy=false", "-kernel", str(self.kernel),
                 "-m", str(self.mem), "-smp", str(self.smp),
                 "-drive", f"id=d0,file={self.disk},format=raw,if=none,snapshot=on",
@@ -224,7 +224,7 @@ class Guest:
                 "-netdev", net,
                 "-device", "virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1",
                 "-append", cmdline, "-serial", f"file:{self.serial}", "-display", "none",
-                "-no-reboot"]
+                "-no-reboot", *os.environ.get("ECO_QEMU_EXTRA", "").split()]
         (self.run_dir / f"guest{self.n}.qemu.cmd").write_text(shlex.join(args) + "\n")
         # Its own process group: teardown signals this QEMU and nothing else.
         self.proc = subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=open(self.run_dir / f"guest{self.n}.qemu.log", "wb"),
