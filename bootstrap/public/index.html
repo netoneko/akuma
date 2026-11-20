@@ -53,6 +53,7 @@
   .stats-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; border:1px solid var(--line); background:var(--line); }
   .stat { background:var(--panel); padding:1.7rem; }
   .stat strong { display:block; color:var(--cyan); font:700 clamp(2rem,3.5vw,3.4rem)/1 Arial,Helvetica,sans-serif; letter-spacing:-.04em; }
+  .stat .open-models { color:var(--pink); }
   .stat p { color:var(--muted); font-size:.75rem; line-height:1.6; margin:1rem 0 0; }
   .stat a { color:var(--ink); }
   .section { padding:6rem 0; }
@@ -93,7 +94,7 @@
     <div>
       <div class="eyebrow">Bohemian operating system</div>
       <h1 id="hero-title">Compose<br><span>your own</span> kernel</h1>
-      <p class="intro">A Rust kernel that builds itself. A platform kernel assembled from crates. <strong>Akuma is an experiment in making the whole stack our own.</strong></p>
+      <p class="intro">A platform kernel assembled from crates to fit your runtime. <strong>Akuma is an experiment at building a durable and minimal operating system that can sustain its own development needs.</strong></p>
       <div class="hero-links"><a class="button primary" href="#talks">EXPLORE THE TALKS <span aria-hidden="true">↘</span></a><a class="button" href="https://github.com/netoneko/akuma">VIEW THE SOURCE <span aria-hidden="true">↗</span></a></div>
     </div>
     <div class="terminal" aria-label="Example source code">
@@ -239,8 +240,12 @@ _/                                    \_     Beans System Debauchery:
     <div class="stats-grid">
       <div class="stat"><strong>136,052</strong><p>production Rust code lines in <code>src/</code>, <code>crates/</code> and <code>taoxichuan/src/</code>. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
       <div class="stat"><strong>73,840</strong><p>test Rust code lines in the same source scope, counted separately from production. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong class="open-models">99.25%</strong><p>of production Rust code lines are outside <code>unsafe</code> blocks in that scope. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong>330</strong><p>production <code>unsafe</code> sites counted across the same Rust source scope. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong class="open-models">3 / 4</strong><p>kernels initially built with mostly <span class="open-models">open models</span>: Denver, Taoxichuan and Shanghai.</p></div>
       <div class="stat"><strong>1,688</strong><p>distinct fixes recorded in the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
       <div class="stat"><strong>139</strong><p>distinct Taoxichuan fixes recorded in its separate audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/TAOXICHUAN_BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
+      <div class="stat"><strong>495</strong><p>investigation documents contribute fixes to the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
     </div>
   </section>
 </main>
