@@ -1,7 +1,7 @@
 # Denver: why `scala-cli` does not run normally in a box (investigation, 2026-11-20)
 
 Branch `ecosystem-demo-stage1`. Kernel: Denver (`containers,codex`), QEMU microvm + KVM, guest images in
-`/var/tmp/akuma-eco/denver-ready`. Status: **partly open**. Defect A has a change, Defect B is fixed at its first-run window, Defect C is open. The launcher in `overlays/ecosystem-demo/scala/usr/local/bin/scala-cli` and `-Xint` hide the symptoms; they
+`/var/tmp/akuma-eco/denver-ready`. Status: **fixed for `scala-cli run`** (2026-11-20: the reference demo passes in full). Defect A and B's cause is the non-leader `execve` leaving the caller on the old root (last section before Reproduce), Defect C is the `sysretq` register clobber on the fault-signal sigreturn. The launcher in `overlays/ecosystem-demo/scala/usr/local/bin/scala-cli` and `-Xint` hide the symptoms; they
 are workarounds, not fixes, and this document is the record of what is actually wrong.
 
 ## Symptoms
@@ -10,7 +10,7 @@ are workarounds, not fixes, and this document is the record of what is actually 
 2. `scala-cli compile` sometimes dies in HotSpot; `JAVA_TOOL_OPTIONS=-Xint` hid it.
 3. The earlier trace showed `[execve] non-leader thread` followed by a sibling faulting on an unmapped stack.
 
-## Defect A: `execve` from a non-leader thread (change made, not yet proven end to end)
+## Defect A: `execve` from a non-leader thread (fixed; proven by `scala-cli run`)
 
 The Tokio kernels (`akuma-tokio-kernel-core/src/proc.rs`, `exec_strs`) replaced the group's address space under live
 sibling threads; Denver had no `de_thread`. The main amd64 kernel fixed the same class by detaching
@@ -88,7 +88,7 @@ first run, not a removal of the window: a clone that publishes after this check 
 replaced root, now a named panic (the checked `activate`) rather than a triple fault. Closing that fully needs `clone` and
 `execve` to exclude each other, or `kill_siblings` to see a half-created thread. Open.
 
-## Defect C: the HotSpot SEGV (open, probably not the kernel mapping)
+## Defect C: the HotSpot SEGV (fixed: see "Cause found and fixed ... `sysretq` ate `rcx`/`r11`")
 
 `hs_err`: `SEGV_MAPERR` reading `0x600019001230`, in interpreted `AbstractValidatingLambdaMetafactory.checkDescriptor`.
 Checked first because it looked like an unmapped heap page: it is not. `-Xlog:cds` in the box shows the compressed-oop base

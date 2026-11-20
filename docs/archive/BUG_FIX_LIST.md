@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1688
-- **Docs contributing at least one fix:** 495
+- **Total distinct fixes counted:** 1692
+- **Docs contributing at least one fix:** 497
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 261 | 15.5% | 43 |
+| Syscall / ABI Compatibility Audits | 261 | 15.4% | 43 |
 | Memory & Virtual Memory | 205 | 12.1% | 73 |
-| Scheduler & Process Management | 157 | 9.3% | 53 |
+| Scheduler & Process Management | 160 | 9.5% | 54 |
 | SMP & Locking | 142 | 8.4% | 61 |
-| Networking | 104 | 6.2% | 38 |
+| Networking | 104 | 6.1% | 38 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.5% | 6 |
 | Toolchain & Self-Hosting | 94 | 5.6% | 14 |
 | SSH | 56 | 3.3% | 23 |
 | VFS & Filesystem | 150 | 8.9% | 49 |
 | Boot & Drivers | 144 | 8.5% | 25 |
-| Signals & Exceptions | 50 | 3.0% | 20 |
+| Signals & Exceptions | 51 | 3.0% | 21 |
 | Misc / Cross-cutting | 98 | 5.8% | 28 |
 | Console & Terminal | 63 | 3.7% | 22 |
 | Containers | 79 | 4.7% | 15 |
-| **Total** | **1688** | **100.0%** | **495** |
+| **Total** | **1692** | **100.0%** | **497** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -722,7 +722,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `akuma-mmu` range checks wrapped `va_start + len + PAGE_SIZE - 1`; `page_span` treats a wrapping range as not mapped
 - `prefault_user_range` and `madvise(WILLNEED)` rounded unchecked; `checked_add` plus `page_ceil`
 
-## Scheduler & Process Management (157 fixes, 53 docs)
+## Scheduler & Process Management (160 fixes, 54 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -990,6 +990,11 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/EXEC_FROM_THREAD_DETACH.md
 - `execve` from a non-leader thread replaced the thread group's address space under its live siblings (the amd64 kernel keeps the space in the leader's `Process` and `stop_siblings` drained only for the leader), so siblings faulted in ring 3 or panicked ring 0 inside `sys_mmap`; the caller now runs detached (`usermode::sys_execve_detached`) and the group is left alone
+
+### docs/archive/DENVER_SCALA_CLI_CRASHES.md
+- The tokio kernels' `execve` from a non-leader thread replaced the group's address space under live sibling threads; the exec now ends every other thread first (`kill_siblings`, rescanning until no sibling is live) and the leader slot owns the new root.
+- A thread cloned just before its group's `execve` loaded the freed root and triple-faulted the Denver guest; `Process::run` now ends a thread whose root is not its leader's.
+- A non-leader `execve` left the calling thread's own `Process` on the old root, so every thread the new image created started on the freed root (`scala-cli run` died after its exec); the caller's view now points at the new root.
 
 ## SMP & Locking (142 fixes, 61 docs)
 
@@ -2284,7 +2289,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - The multiboot2 path applied the `idlesleep` policy only inside `start_secondaries`' closure, which the full-suite boot never runs; both entries apply the command-line policies
 
-## Signals & Exceptions (50 fixes, 20 docs)
+## Signals & Exceptions (51 fixes, 21 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -2376,6 +2381,9 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - Every group `SIGKILL` cost 2 s on AArch64: each thread's `kill_thread_group` grace-waited for siblings in their own grace waits; `claim_group_exit` makes the first caller do the teardown
 - amd64 `kill` could return `EINTR` without sending (glue's dispatch prologue), orphaning a child; signal senders are exempt from the gate
+
+### docs/archive/DENVER_SCALA_CLI_CRASHES.md
+- The fault-signal `rt_sigreturn` resumed through `sysretq`, which loads `rcx`/`r11` with `rip`/`rflags` (`0x246`), so HotSpot read `0x246` as an object reference after a null-check or safepoint SIGSEGV in compiled code; the exit now leaves by `iretq` with the interrupted `rcx`/`r11`.
 
 ## Misc / Cross-cutting (98 fixes, 28 docs)
 
@@ -2848,4 +2856,4 @@ Also scanned 2026-11-17 (merging `ec2-setup-review` into `ouch`, the T-series ty
 
 Also scanned 2026-11-18 (`more-improvements`: real bubblewrap and codex's sandbox on private mount namespaces, the three platform kernels building again, herd, the seccomp and mmap-pilot merges). Counted above: CLOCK_GETTIME_EINTR_ON_SIGNAL (Syscall / ABI), DEVFS_KVM_NODES_NOT_LISTED (VFS), BWRAP_ON_BOXES (Containers: two defects among the features it records), DENVER_BUILD_BREAKAGE (Misc: the three shared-crate fixes; the three in the tokio-kernel crates are in `TAOXICHUAN_BUG_FIX_LIST.md`), and GETPPID_RETURNED_THREAD_PID and SECCOMP, listed already. No counted fix at that scan: BOX0_ONLY_AUDIT (an audit then; its follow-up fixes are counted since 2026-11-20), MMAPLAZY_PROPERTY_TEST_PILOT (the method found no defect; a deliberately broken kernel was the control), EXT3_EXT4_IMPLEMENTATION (a feature record). Fix-shaped commits with no archive doc to cite, so uncounted: `62a4d766` herd (`enable` copied instead of linking, so an edited config did nothing until a disable and enable; `start` ran the previous config; no `reload`; recorded in `userspace/herd/README.md`'s roadmap) and `e6fbd10c` (that roadmap). The signalfd, private-namespace, procfs (`ns`, `mountinfo`, `fdinfo`, `uid_map`), netlink, `capset` and per-mount `st_dev` commits add missing features and are not bugs.
 
-Also scanned 2026-11-20 (`ecosystem-demo-stage1`, 39 commits: the box-0 policy follow-up, the merge gate, the ecosystem demo stages 1-2, Denver box wiring). Counted above: BOX0_ONLY_AUDIT's follow-up (Containers, 8 bullets), AKUMA_ECOSYSTEM_DEMO (the `getcpu` arm; Syscall / ABI) and EXEC_FROM_THREAD_DETACH (Scheduler). The tokio kernels' fixes (TOKIO_KERNELS_LOOPBACK_STARVATION, DENVER_BOX_WIRING) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: AKUMA_NESTED_BOXES, KERNEL_CONVERGENCE (proposals), DENVER_CODEX_TOOLS (a feature), MERGE_GATE_FIRST_RUN (findings; its fixes are the two tokio docs and the budget ratchet, `7ffa9165`, stale numbers rather than a defect). Fix-shaped commits with no archive doc, uncounted: `97b60eae` (sshd spun at ~3700 syscalls/s when idle in the cooperative loop; it blocks in `poll`; recorded as E5 in `proposals/FUTURE_WORK.md`), the demo image builder's JKS `cacerts` generation (a rig change), and the clippy rot fixes of `aadd4a76`/`4b508eb1`/`99300fe0` (the hook had never been installed; recorded in MERGE_GATE_FIRST_RUN).
+Also scanned 2026-11-20 (`ecosystem-demo-stage1`, 39 commits: the box-0 policy follow-up, the merge gate, the ecosystem demo stages 1-2, Denver box wiring). Counted above: BOX0_ONLY_AUDIT's follow-up (Containers, 8 bullets), AKUMA_ECOSYSTEM_DEMO (the `getcpu` arm; Syscall / ABI) and EXEC_FROM_THREAD_DETACH (Scheduler). The tokio kernels' fixes (TOKIO_KERNELS_LOOPBACK_STARVATION, DENVER_BOX_WIRING) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: AKUMA_NESTED_BOXES, KERNEL_CONVERGENCE (proposals), DENVER_CODEX_TOOLS (a feature), MERGE_GATE_FIRST_RUN (findings; its fixes are the two tokio docs and the budget ratchet, `7ffa9165`, stale numbers rather than a defect). Fix-shaped commits with no archive doc, uncounted: `97b60eae` (sshd spun at ~3700 syscalls/s when idle in the cooperative loop; it blocks in `poll`; recorded as E5 in `proposals/FUTURE_WORK.md`), the demo image builder's JKS `cacerts` generation (a rig change), and the clippy rot fixes of `aadd4a76`/`4b508eb1`/`99300fe0` (the hook had never been installed; recorded in MERGE_GATE_FIRST_RUN). Also: DENVER_SCALA_CLI_CRASHES (2026-11-20, Scheduler & Process Management 3, Signals & Exceptions 1): the tokio kernels' execve from a non-leader thread, the first-run guard, the caller's stale root, and the fault-signal sigreturn's `rcx`/`r11`.
