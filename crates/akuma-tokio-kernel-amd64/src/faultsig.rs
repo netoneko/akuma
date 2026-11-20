@@ -46,10 +46,9 @@
 //! the instruction would re-execute and fault again), an unwritable stack, or a
 //! full per-slot frame LIFO. The kill path is unchanged code.
 //!
-//! Recorded limit: the restore cannot put `%rcx`/`%r11` back (the syscall exit
-//! is `sysret` — both are architecturally consumed, and the async path clobbers
-//! them across every handler return today, which guest programs already
-//! tolerate). The FPU image restore means the interrupted XMM state survives
+//! `%rcx`/`%r11` are put back too: `sysret` consumes both, so the restore arms
+//! `ring3::set_exit_rcx_r11` and the stub exits by `iretq` (the async path still
+//! clobbers them across a handler return). The FPU image restore means the interrupted XMM state survives
 //! the handler.
 
 use akuma_exec::process::{SignalHandler, MAX_SIGNALS};
@@ -499,6 +498,9 @@ pub fn sync_sigreturn(fr: &mut ring3::SyscallFrame) -> Option<(u64, u64)> {
     fr.rax = get(&buf, greg(13));
     fr.user_rip = rip;
     fr.user_rflags = (get(&buf, greg(17)) & 0x0000_0CD5) | 0x202;
+    // `sysretq` would load `rcx`/`r11` with rip/rflags, clobbering the interrupted values
+    // (HotSpot's compiled code keeps oops there; it read `0x246`): leave by `iretq` instead.
+    ring3::set_exit_rcx_r11(get(&buf, greg(14)), get(&buf, greg(3)));
     akuma_exec::threading::set_thread_signal_mask(get(&buf, OFF_SIGMASK));
     // The interrupted call's own answer, and the `%rsp` it resumes with —
     // the caller stamps the return stack (its `set_return_rsp`).

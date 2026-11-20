@@ -133,6 +133,22 @@ kernel write to a user address with that value); compare the fault-signal sigret
 interrupted ones for a thread that took a HotSpot safepoint or null-check signal; run the same program on the main amd64
 kernel with `-Xlog` identical to confirm it does not take the path.
 
+### Cause found and fixed (2026-11-20, later still): `sysretq` ate `rcx`/`r11` on the fault-signal sigreturn
+
+The lead was right. `faultsig::sync_sigreturn` restored the interrupted registers from the ucontext, but the syscall exit is
+`sysretq`, which loads `rcx` with `rip` and `r11` with `rflags` (`0x246`). The module header recorded this as a limit
+("the restore cannot put `%rcx`/`%r11` back"). HotSpot's implicit null checks and safepoint polls reach it as SIGSEGV in
+compiled code that keeps live values in `rcx`/`r11`, so after the handler returned a register held `0x246`; that is why
+`-Xint` and C1-only never crashed.
+
+Fix: `akuma_ring3_amd64::set_exit_rcx_r11` arms a one-shot per-CPU flag (offsets 40/48/56 of `PerCpu`) and `syscall_entry`
+leaves by `iretq` with those two registers loaded; `sync_sigreturn` arms it from `gregs[REG_RCX]`/`gregs[REG_R11]`. The
+async-signal path still clobbers them (unchanged).
+
+Verified: `refdemo.py --scala-direct` no longer produces any `[Fault]`/SIGSEGV; `scala-cli compile` of the task board runs
+to completion in 33 s. **Still open:** `scala-cli run` then does not bring the board up within the harness's 600 s
+(board.log stays at the dependency hint); not yet diagnosed whether that is a hang or the run's child exec (Defect A's path).
+
 ## Reproduce
 
 ```sh
