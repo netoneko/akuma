@@ -13,6 +13,7 @@ Nothing here is application code of ours: the sources are the user's reference i
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -125,7 +126,7 @@ def main():
         board_url, git_url = d.service_url(8082), d.service_url(8081)
         info("URLs as guest 2 uses them", f"board {board_url}  git {git_url}")
         ok_git = ok_board = False
-        for i in range(240):
+        for i in range(int(os.environ.get("BOARD_WAIT_ITERS", "240"))):
             if i and i % 60 == 0:
                 _, lg = g1.run("tail -c 600 /var/lib/box/containers/scala/upper/work/board.log")
                 info(f"board.log after {i * 5}s", lg)

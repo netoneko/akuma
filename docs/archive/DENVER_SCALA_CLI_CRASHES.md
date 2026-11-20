@@ -147,7 +147,19 @@ async-signal path still clobbers them (unchanged).
 
 Verified: `refdemo.py --scala-direct` no longer produces any `[Fault]`/SIGSEGV; `scala-cli compile` of the task board runs
 to completion in 33 s. **Still open:** `scala-cli run` then does not bring the board up within the harness's 600 s
-(board.log stays at the dependency hint); not yet diagnosed whether that is a hang or the run's child exec (Defect A's path).
+(board.log stays at the dependency hint). Diagnosed on the live guest: scala-cli's `run` execs the board JVM from the
+launcher (tgid 279, Defect A's path) and the board never listens. The console shows, in order, `[RUN-REFUSED] thread pid=347
+of tgid=279 holds a replaced root` (the first-run guard ending a thread cloned just before the group's execve),
+`[TRAMP-MISMATCH] THREAD_PID_MAP=.. but table scan found 279` repeating, then `[Fault] PageFault rip=0x30068341 code=0x15`
+(instruction fetch from a mapped non-executable page, `rax=-14` after a futex, so right after a syscall return) and
+`slot 4 killed (SIGSEGV)`. This is the `clone`/`execve` window the Defect B section lists as open: closing it needs the two to
+exclude each other, plus `THREAD_PID_MAP` kept consistent across the exec. `refdemo.py` takes `BOARD_WAIT_ITERS` to reach its
+own diagnostics sooner.
+
+Gates run on this change (2026-11-20): `scripts/gate.py` builds (16/16), host tests, Denver/shanghai/taoxichuan gateprobe
+boots all pass (getcpu and threads_128 are the listed xfails); `check_budgets` fails on growth in crates this change did not
+touch; the main-kernel boots pass once `hello.elf` is built; the Clojure `--with-jvm` gate could not run (no Docker for
+`build-image.sh`).
 
 ## Reproduce
 
