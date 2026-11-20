@@ -5,11 +5,13 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Akuma</title>
 <style>
-  html, body { height: 100%; margin: 0; background: #000; }
-  body { display: grid; place-items: center; }
+  html { height: 100%; }
+  body { min-height: 100%; margin: 0; background: #000; display: grid; place-items: center; }
+  main { display: grid; gap: 1rem; width: min(36rem, calc(100% - 2rem)); padding: 2rem 0; }
+  h1 { color: #888; font: 1rem/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; margin: 1rem 0 0; }
   a {
     color: #fff;
-    font: 1rem/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font: 1rem/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
     letter-spacing: 0.08em;
     text-decoration: none;
     padding: 0.8rem 1.2rem;
@@ -19,6 +21,14 @@
 </style>
 </head>
 <body>
-<a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a>
+<main>
+  <a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a>
+  <h1>Talks</h1>
+  <a href="/self-hosting-rust-kernel/">Self-hosting a Rust kernel</a>
+  <a href="/600-bugs/">AI will write 600 bugs and I will write 600 more</a>
+  <a href="/deck/">An AI agent in 4 MB of RAM</a>
+  <a href="/denver/">Beans in Denver: Fresh Kernel from a Crate?</a>
+  <a href="/demo/">Building an ecosystem with agents</a>
+</main>
 </body>
 </html>
