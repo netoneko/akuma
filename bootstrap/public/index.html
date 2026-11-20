@@ -67,6 +67,7 @@
   .talk-meta span:last-child { color:var(--muted); }
   .talk-banner { color:var(--cyan); font:400 clamp(.36rem, .8vw, .65rem)/1.15 var(--mono); white-space:pre; margin:2.5rem 0 2rem; overflow-x:auto; }
   .talk-banner.akuma { color:var(--pink); }
+  .talk-banner.denver { color:var(--pink); }
   .talk h3 { font:700 clamp(1.7rem,3vw,2.8rem)/1 Arial,Helvetica,sans-serif; letter-spacing:-.045em; margin:auto 0 .8rem; max-width:24rem; }
   .talk p { color:var(--muted); font-size:.78rem; line-height:1.65; max-width:31rem; margin:0; }
   .talk .go { display:block; margin-top:1.8rem; color:var(--cyan); font-size:.72rem; letter-spacing:.07em; }
@@ -134,7 +135,7 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
     </div>
   </section>
   <section class="capabilities" aria-labelledby="capabilities-title">
-    <div class="section-head"><div><span class="label">00 / the kernel family</span><h2 id="capabilities-title">Shared roots.<br>Different missions.</h2></div><p>A family of kernels composed from shared foundations, each built to explore a different part of the stack.</p></div>
+    <div class="section-head"><div><span class="label">00 / the kernel family</span><h2 id="capabilities-title">Shared roots.<br>Different missions.</h2></div><p>A family of kernels composed from shared foundations, each built to run a specific runtime.</p></div>
     <div class="kernel-tiles" aria-label="Kernel capabilities as tiles">
       <article class="kernel-tile"><h3>Akuma</h3><p class="kernel-description">Linux ABI compatible OS and hypervisor. Runs on AWS and on amd64 Ryzen laptop and is used to develop itself and other kernels</p><pre class="kernel-art" aria-label="Akuma banner">                      =#=      .-
                       +*#*:.:-**
@@ -200,7 +201,7 @@ _/                                    \_     Beans System Debauchery:
     <div class="talks">
       <a class="talk" href="/denver/">
         <div class="talk-meta"><span>01 / the guest</span><span>Platform kernel ↗</span></div>
-        <pre class="talk-banner" aria-label="Denver logo">   /\        /\        /\        /\        /\
+        <pre class="talk-banner denver" aria-label="Denver logo">   /\        /\        /\        /\        /\
   /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
  /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
 _/                                    \_     Beans System Debauchery:
