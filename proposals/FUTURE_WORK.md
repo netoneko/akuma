@@ -58,7 +58,6 @@ Read the document for the inventory and the order. Open items that came out of t
 
 | # | Item | Why it matters | What closes it |
 |---|---|---|---|
-| C1 | Socket wait hooks now share `akuma-net::wait_hooks` behind machine adapters; the adapters retain the different daemon and polling models. **Open:** boot verification on AArch64 | the tokio copy lacked a rule the main one had (`TOKIO_KERNELS_LOOPBACK_STARVATION.md`) | boot the shared hooks on AArch64 |
 | C2 | `NetMachine::can_park` is `false` on the AArch64 platform kernels (taoxichuan, shanghai, denver): a blocking `accept` there still pumps and halts | the same cross-thread hang is expected; not booted because it needs the Mac | set it, boot `scripts/gate.py`'s `gateprobe` on the aarch64 kernels |
 | C3 | The tokio kernels' spawn ring is 48 slots (`NSLOTS`); `clone` past it is `EAGAIN` | JVM and tokio blocking pools want hundreds; gate `threads_128` is an expected failure | the ring sized by feature, or the main kernel's thread table |
 | C4 | The main amd64 kernel's `tcp_loopback` timed out once after the spawn checks (listed `flaky:` in `scripts/gate/xfail.txt`) | a hang the in-kernel suite does not see | reproduce under the gate, find the thread that does not run |

@@ -12,6 +12,8 @@ The kernels:
 | **main** | `akuma` on aarch64 and amd64 (`src/`, `crates/akuma-kernel-glue`, `crates/akuma-kernel-amd64`) | threading and process model of its own (`akuma-exec`), BKL, boxes and namespaces (`akuma-isolation`), a `netpoll` thread, 448-thread table on amd64, an in-kernel boot suite |
 | **tokio** | `taoxichuan`, `shanghai`, `denver` on amd64 and aarch64 (`crates/akuma-tokio-kernel*`) | composed from `akuma-tokio-kernel-core` behind a machine trait; spawn ring of 48 slots; no boxes; no `netpoll` thread (tick, idle lap and wait laps); smaller and easier to reason about |
 
+**C1 update (2026-11-20):** `akuma-net::wait_hooks` now supplies the shared socket wait hooks through machine adapters. On AArch64 QEMU TCG, the main kernel and taoxichuan both passed `gateprobe`'s `udp_loopback` and `tcp_loopback` (64 KiB echo and half-close) with two virtual CPUs; both also passed a separate sleeping-child accept/connect probe. The separate AArch64 tokio parking issue C2 remains open.
+
 ## What is already shared (and is why the gate's capability matrix is identical)
 
 `akuma-syscalls-*` families, `akuma-net` and `akuma-net-nic` (smoltcp, loopback ring), `akuma-threading` (the scheduler
