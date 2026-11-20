@@ -378,21 +378,22 @@ pub fn kill_siblings<M: Proc>(cur: usize, lead: usize) {
     // lock, so no `clone` can land between it and the caller's commit.
     loop {
         let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
-        let mut live = false;
-        for (s, ask) in asked.iter_mut().enumerate() {
-            let spid = slot_pid(s);
-            if s == cur || !slot_in_use(s) || slot_tgid(s) != tgid || (spid == tgid && s != lead) {
-                continue;
-            }
-            if akuma_threading::is_thread_terminated(s) {
-                continue;
-            }
-            live = true;
-            if !stop_in_place(s, spid, s == lead) {
-                akuma_threading::request_thread_kill(s);
-                *ask = spid;
-            }
-        }
+        let live = asked
+            .iter_mut()
+            .enumerate()
+            .filter(|&(s, _)| {
+                let spid = slot_pid(s);
+                !(s == cur || !slot_in_use(s) || slot_tgid(s) != tgid || (spid == tgid && s != lead) || akuma_threading::is_thread_terminated(s))
+            })
+            .map(|(s, ask)| {
+                let spid = slot_pid(s);
+                if !stop_in_place(s, spid, s == lead) {
+                    akuma_threading::request_thread_kill(s);
+                    *ask = spid;
+                }
+            })
+            .count()
+            > 0;
         if !live {
             return;
         }
