@@ -111,6 +111,28 @@ Candidates not yet tested: wrong page contents after copy-on-write or `mprotect`
 polling-page protections), user register or FP state lost across a signal or thread switch, a stale TLB entry on a core.
 Defect B and Defect C may share a cause (a wrong or stale root or mapping); that is a hypothesis, not a finding.
 
+### Where it stands after the Defect B fix (2026-11-20, later)
+
+With the first-run guard in, the default variant no longer takes the guest down; it dies in the JVM, deterministically,
+at the same pc (`0x600011289c6a`), exit 139 within ~15 s, `[Fault] slot 24 killed (SIGSEGV)` on the console. New
+facts:
+
+* The faulting instruction is `cmp rax,[rcx]` in the template interpreter (an `invokevirtual`), with `rcx` loaded from the
+  interpreter's expression stack: that stack slot holds `0x600019001230`, the decoding of narrow oop `0x246`. So a word
+  the JVM wrote as an object reference now reads `0x246`.
+* **`0x246` is the x86 `RFLAGS` a `syscall` leaves in `r11`** (the fault dump shows `r11=0x246`). A kernel-side write of a
+  saved flags word into user memory, or a user register restored from the wrong frame slot, is the natural source. Not
+  proven; it is the lead, and the value is too specific to be chance.
+* The checks already ruled out: mapping size (above), oop encoding (`-XX:-UseCompressedOops` still crashes), SMP (smp=1
+  still crashes), C1-only and `-Xint` (no crash there, so the corruption needs compiled code or the tiered machinery).
+* Signal frames: `push_handler` skips the red zone and the synchronous-fault path (`faultsig`, feature `fault-signal`) restores
+  from the `ucontext`, which is what HotSpot edits. Both were read, not yet instrumented.
+
+Next steps, in order: watch for the first write of `0x246` into JVM memory (a user-memory watch under TCG, or log every
+kernel write to a user address with that value); compare the fault-signal sigreturn's restored registers with the
+interrupted ones for a thread that took a HotSpot safepoint or null-check signal; run the same program on the main amd64
+kernel with `-Xlog` identical to confirm it does not take the path.
+
 ## Reproduce
 
 ```sh
