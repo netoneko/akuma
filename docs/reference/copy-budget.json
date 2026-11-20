@@ -21,7 +21,7 @@
   "crates/akuma-syscalls-glue-amd64": 1,
   "crates/akuma-syscalls-ipc": 2,
   "crates/akuma-tokio-kernel-aarch64": 2,
-  "crates/akuma-tokio-kernel-amd64": 2,
+  "crates/akuma-tokio-kernel-amd64": 5,
   "crates/akuma-tokio-kernel-core": 5,
   "crates/akuma-tty": 4,
   "crates/akuma-vfs": 12,
