@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="theme-color" content="#090a0e">
 <meta name="description" content="Akuma: a self-hosting Rust kernel, and experiments in building operating systems from crates.">
-<title>Akuma — kernels all the way down</title>
+<title>Akuma — composable platform kernel</title>
 <style>
   :root { color-scheme: dark; --bg:#090a0e; --panel:#101219; --ink:#eeeee9; --muted:#a1a4aa; --line:#32363d; --pink:#ff3c78; --cyan:#71e8dd; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
   * { box-sizing:border-box; }
@@ -23,7 +23,7 @@
   .hero { display:grid; grid-template-columns:1.1fr .9fr; gap:4rem; align-items:center; padding:clamp(5rem,10vw,9rem) 0 5rem; }
   .eyebrow, .label { color:var(--cyan); font-size:.7rem; letter-spacing:.16em; text-transform:uppercase; }
   .eyebrow::before { content:'●'; color:var(--pink); margin-right:.75rem; }
-  h1 { font-family:Arial,Helvetica,sans-serif; font-size:clamp(4rem,10vw,9rem); letter-spacing:-.075em; line-height:.82; margin:1.8rem 0; text-transform:uppercase; }
+  h1 { font-family:Arial,Helvetica,sans-serif; font-size:clamp(3.2rem,8vw,7.2rem); letter-spacing:-.075em; line-height:.82; margin:1.8rem 0; text-transform:uppercase; }
   h1 span { color:var(--pink); }
   .intro { color:#c2c4c7; max-width:38rem; font-size:clamp(.95rem,1.35vw,1.12rem); line-height:1.75; }
   .intro strong { color:var(--ink); font-weight:500; }
@@ -41,23 +41,10 @@
   .terminal-code b { color:var(--cyan); font-weight:normal; }
   .terminal-code .dim { color:#777d85; }
   .capabilities { border-top:1px solid var(--line); padding:5rem 0 0; }
-  .matrix-wrap { overflow-x:auto; border:1px solid var(--line); background:#0d0f14; }
-  .matrix { width:100%; min-width:660px; border-collapse:collapse; text-align:center; font-size:.75rem; }
-  .matrix th, .matrix td { padding:1.15rem 1rem; border-bottom:1px solid var(--line); }
-  .matrix thead th { color:var(--muted); font-size:.63rem; font-weight:400; letter-spacing:.1em; text-transform:uppercase; }
-  .matrix th:first-child, .matrix td:first-child { text-align:left; }
-  .matrix tbody tr:last-child td { border-bottom:0; }
-  .matrix tbody tr:hover { background:#171820; }
-  .kernel-name { color:var(--ink); font-weight:bold; }
-  .kernel-name span { color:var(--pink); display:inline-block; width:2rem; }
-  .supported { color:var(--cyan); font-size:1rem; }
-  .experimental { color:#ffac79; font-size:1rem; }
-  .unknown { color:#62666e; }
-  .matrix-note { color:var(--muted); font-size:.7rem; line-height:1.8; margin:1.2rem 0 0; }
-  .matrix-note b { font-weight:400; }
   .kernel-tiles { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); margin-top:2.5rem; }
   .kernel-tile { min-width:0; background:var(--panel); padding:1.5rem; }
   .kernel-tile h3 { margin:0; font:700 1.5rem Arial,Helvetica,sans-serif; }
+  .kernel-description { color:var(--muted); font-size:.75rem; line-height:1.65; margin:.7rem 0 0; }
   .kernel-art { color:var(--cyan); font:400 .48rem/1.15 var(--mono); white-space:pre; overflow-x:auto; min-height:8.5rem; margin:1.5rem 0; }
   .kernel-tile:nth-child(odd) .kernel-art { color:var(--pink); }
   .features { display:flex; flex-wrap:wrap; gap:.5rem; }
@@ -93,7 +80,7 @@
   footer a { color:var(--ink); text-decoration:none; }
   footer a:hover { color:var(--cyan); }
   @media (max-width:800px) { .hero { grid-template-columns:1fr; gap:3rem; padding-top:4rem; } .terminal { max-width:35rem; } .akuma-logo { font-size:clamp(.45rem,1.25vw,.7rem); } .talks,.more,.kernel-tiles { grid-template-columns:1fr; } .stats-grid { grid-template-columns:repeat(2,1fr); } .talk { min-height:340px; } .talk-banner { font-size:clamp(.36rem, 1.5vw, .65rem); } .section-head { align-items:start; flex-direction:column; } }
-  @media (max-width:480px) { .wrap { width:calc(100% - 2rem); } .top-links { gap:.8rem; font-size:.63rem; } h1 { font-size:clamp(3.5rem,16vw,5rem); } .section { padding:4rem 0; } .terminal-inner { padding:1.5rem 1rem; } }
+  @media (max-width:480px) { .wrap { width:calc(100% - 2rem); } .top-links { gap:.8rem; font-size:.63rem; } h1 { font-size:clamp(2.8rem,12.8vw,4rem); } .section { padding:4rem 0; } .terminal-inner { padding:1.5rem 1rem; } }
 </style>
 </head>
 <body>
@@ -105,23 +92,35 @@
   <section class="hero" aria-labelledby="hero-title">
     <div>
       <div class="eyebrow">Bohemian operating system</div>
-      <h1 id="hero-title">Kernels<br>all the way <span>down.</span></h1>
+      <h1 id="hero-title">Compose<br><span>your own</span> kernel</h1>
       <p class="intro">A Rust kernel that builds itself. A platform kernel assembled from crates. <strong>Akuma is an experiment in making the whole stack our own.</strong></p>
       <div class="hero-links"><a class="button primary" href="#talks">EXPLORE THE TALKS <span aria-hidden="true">↘</span></a><a class="button" href="https://github.com/netoneko/akuma">VIEW THE SOURCE <span aria-hidden="true">↗</span></a></div>
     </div>
-    <div class="terminal" aria-label="Taoxichuan source code">
-      <div class="terminal-bar"><span>taoxichuan / src / main.rs</span><span>rust</span></div>
-      <div class="terminal-inner"><pre class="source-code"><code>//! Taoxichuan (淘熙川): the kernel the minimal-self-hosting experiment built, now one file over
-//! `akuma-tokio-kernel` (its machine moved to `akuma-tokio-kernel-amd64` in B15).
-
-#![no_std]
+    <div class="terminal" aria-label="Example source code">
+      <div class="terminal-bar"><span>main.rs</span><span>rust</span></div>
+      <div class="terminal-inner">
+        <pre class="akuma-logo" aria-label="Akuma logo">                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+                  ::::---#@%%*</pre>
+        <pre class="source-code"><code>#![no_std]
 #![no_main]
 
 akuma_tokio_kernel::entry!(main);
 
 fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
     kernel
-        .name(&quot;Taoxichuan&quot;)
+        .name(&quot;Akuma&quot;)
         .banner(include_str!(&quot;banner.txt&quot;))
         .console()
         .disk()
@@ -129,26 +128,14 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
         .smp()
         .run_init()
 }
-</code></pre></div>
+</code></pre>
+      </div>
     </div>
   </section>
   <section class="capabilities" aria-labelledby="capabilities-title">
     <div class="section-head"><div><span class="label">00 / the kernel family</span><h2 id="capabilities-title">Shared roots.<br>Different missions.</h2></div><p>A family of kernels composed from shared foundations, each built to explore a different part of the stack.</p></div>
-    <div class="matrix-wrap" role="region" aria-label="Kernel capabilities" tabindex="0">
-      <table class="matrix">
-        <thead><tr><th scope="col">Kernel</th><th scope="col">Rust / Tokio</th><th scope="col">Python</th><th scope="col">amd64</th><th scope="col">aarch64</th><th scope="col">JVM</th><th scope="col">Containers</th><th scope="col">KVM host</th></tr></thead>
-        <tbody>
-          <tr><td class="kernel-name"><span>悪</span>Akuma</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td></tr>
-          <tr><td class="kernel-name"><span>D</span>Denver</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="experimental" aria-label="Experimental">◐</td><td class="unknown" aria-label="Not shown as supported">—</td></tr>
-          <tr><td class="kernel-name"><span>T</span>Taoxichuan</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="unknown" aria-label="Not shown as supported">—</td><td class="unknown" aria-label="Not shown as supported">—</td><td class="unknown" aria-label="Not shown as supported">—</td></tr>
-          <tr><td class="kernel-name"><span>S</span>Shanghai</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="supported" aria-label="Supported">●</td><td class="unknown" aria-label="Not shown as supported">—</td><td class="unknown" aria-label="Not shown as supported">—</td><td class="unknown" aria-label="Not shown as supported">—</td></tr>
-        </tbody>
-      </table>
-    </div>
-    <p class="matrix-note"><b class="supported">●</b> Supported &nbsp; · &nbsp; <b class="experimental">◐</b> Experimental &nbsp; · &nbsp; <b class="unknown">—</b> Not shown as supported</p>
-
     <div class="kernel-tiles" aria-label="Kernel capabilities as tiles">
-      <article class="kernel-tile"><h3>Akuma</h3><pre class="kernel-art" aria-label="Akuma banner">                      =#=      .-
+      <article class="kernel-tile"><h3>Akuma</h3><p class="kernel-description">Linux ABI compatible OS and hypervisor. Runs on AWS and on amd64 Ryzen laptop and is used to develop itself and other kernels</p><pre class="kernel-art" aria-label="Akuma banner">                      =#=      .-
                       +*#*:.:-**
                       +%%#%##***
                       +%%%#%%#**.
@@ -162,13 +149,13 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
  ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
          .--+**%@@@@@%@@%%@@%*       :-.
                   ::::---#@%%*</pre><div class="features"><span>Rust / Tokio</span><span>Python</span><span>amd64</span><span>aarch64</span><span>JVM</span><span>Containers</span><span>KVM host</span></div></article>
-      <article class="kernel-tile"><h3>Denver</h3><pre class="kernel-art" aria-label="Denver banner">   /\        /\        /\        /\        /\
+      <article class="kernel-tile"><h3>Denver</h3><p class="kernel-description">A JVM platform kernel composed from Akuma crates, built to run Clojure and Scala.</p><pre class="kernel-art" aria-label="Denver banner">   /\        /\        /\        /\        /\
   /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
  /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
 _/                                    \_     Beans System Debauchery:
   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       kernel for Clojure
 </pre><div class="features"><span>Rust / Tokio</span><span>Python</span><span>amd64</span><span>aarch64</span><span>JVM</span><span class="partial">Containers · experimental</span></div></article>
-      <article class="kernel-tile"><h3>Taoxichuan</h3><pre class="kernel-art" aria-label="Taoxichuan banner">                                   ||==================||
+      <article class="kernel-tile"><h3>Taoxichuan</h3><p class="kernel-description">A self-hosting kernel born from an experiment with open models.</p><pre class="kernel-art" aria-label="Taoxichuan banner">                                   ||==================||
        )  (                        ||   TAOXICHUAN     ||
       (    )                       ||                  ||
      )  (  (                       ||        陶        ||
@@ -185,7 +172,7 @@ _/                                    \_     Beans System Debauchery:
 │  • Booted under Akuma&#x27;s hypervisor on Akuma&#x27;s metal    │
 └────────────────────────────────────────────────────────┘
 </pre><div class="features"><span>Rust / Tokio</span><span>Python</span><span>amd64</span><span>aarch64</span></div></article>
-      <article class="kernel-tile"><h3>Shanghai</h3><pre class="kernel-art" aria-label="Shanghai banner">
+      <article class="kernel-tile"><h3>Shanghai</h3><p class="kernel-description">A small tutorial kernel assembled from the Tokio kernel building blocks.</p><pre class="kernel-art" aria-label="Shanghai banner">
             |                                                      ___
             |                   |                                 /   \
          .-----.               /_\           ___________         /     \
@@ -248,15 +235,15 @@ _/                                    \_     Beans System Debauchery:
     </div>
   </section>
   <section class="section" aria-labelledby="stats-title">
-    <div class="section-head"><div><span class="label">02 / by the numbers</span><h2 id="stats-title">Code &amp;<br>consequences.</h2></div><p>Snapshots from the experiments: the code we share, the surfaces we audit, and the kernels we build.</p></div>
+    <div class="section-head"><div><span class="label">02 / by the numbers</span><h2 id="stats-title">Stats</h2></div><p>A snapshot of the code and the bugs we have found along the way.</p></div>
     <div class="stats-grid">
-      <div class="stat"><strong>93%</strong><p>of Taoxichuan's live lines were already live in the Akuma host. <a href="/self-hosting-rust-kernel/">Self-hosting talk ↗</a></p></div>
-      <div class="stat"><strong>87 / 117</strong><p>crates forbade unsafe code in the November 2026 audit. <a href="/self-hosting-rust-kernel/">Self-hosting talk ↗</a></p></div>
-      <div class="stat"><strong>~1,750</strong><p>auditable lines of kernel Rust added for the Denver platform experiment. <a href="/denver/">Denver talk ↗</a></p></div>
-      <div class="stat"><strong>2.4 MiB</strong><p>for the Denver kernel, as one ELF in the talk's build. <a href="/denver/">Denver talk ↗</a></p></div>
+      <div class="stat"><strong>136,052</strong><p>production Rust code lines in <code>src/</code>, <code>crates/</code> and <code>taoxichuan/src/</code>. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong>73,840</strong><p>test Rust code lines in the same source scope, counted separately from production. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong>1,688</strong><p>distinct fixes recorded in the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
+      <div class="stat"><strong>139</strong><p>distinct Taoxichuan fixes recorded in its separate audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/TAOXICHUAN_BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
     </div>
   </section>
 </main>
-<footer><div class="wrap footer-inner"><span>悪魔 / AKUMA &nbsp;·&nbsp; BUILT TO BUILD ITSELF</span><a href="https://github.com/netoneko/akuma">SOURCE CODE ↗</a></div></footer>
+<footer><div class="wrap footer-inner"><span>悪魔 / AKUMA &nbsp;·&nbsp; BSD 2-Clause</span><a href="https://github.com/netoneko/akuma">SOURCE CODE ↗</a></div></footer>
 </body>
 </html>
