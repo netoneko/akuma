@@ -47,15 +47,12 @@ def main():
     ap.add_argument("--mem", type=int, default=3072)
     ap.add_argument("--smp", type=int, default=2)
     ap.add_argument("--git-server-bin", type=Path, help="reuse a previously built reference git-server binary; skips Cargo build")
-    ap.add_argument("--scala-interpreted", action="store_true",
-                    help="run scala-cli and its Java children with -Xint (Denver JVM workaround)")
     ap.add_argument("--scala-direct", action="store_true",
                     help="run the board with the scala-cli jar itself (no launcher workaround), to exercise `scala-cli run`'s own exec")
     ap.add_argument("--scala-assembly", action="store_true",
                     help="package the board and start it directly with java")
     a = ap.parse_args()
     ref = a.ref.resolve()
-    java_env = "JAVA_TOOL_OPTIONS=-Xint " if a.scala_interpreted else ""
     run_dir = Path(tempfile.mkdtemp(prefix="eco-ref-", dir=launch.WORK))
     d = launch.Demo(a.out, run_dir, a.mem, a.smp)
     rc = 1
@@ -105,13 +102,13 @@ def main():
                   r == 0 and "Finished" in o and "error" not in o.lower().replace("error:", "ERR:").split("finished")[0][-300:], o)
 
         t = time.monotonic()
-        r, o = bx(g1, "scala", "scala", f"{java_env}scala-cli version --cli-version 2>&1 | head -3", timeout=600)
+        r, o = bx(g1, "scala", "scala", f"scala-cli version --cli-version 2>&1 | head -3", timeout=600)
         check("scala box: scala-cli (JVM jar, v1.19.0) runs", r == 0 and "1.19" in o, o)
-        r, o = bx(g1, "scala", "scala", f"cd /work/task-board && {java_env}scala-cli compile Main.scala --server=false 2>&1", timeout=3000)
+        r, o = bx(g1, "scala", "scala", f"cd /work/task-board && scala-cli compile Main.scala --server=false 2>&1", timeout=3000)
         info("scala-cli compile (task-board; Scala 3.3.6 + ujson from Maven Central), wall", f"{time.monotonic() - t:.0f}s")
         check("scala box: the task board compiles with scala-cli (dependencies from Maven Central)", r == 0 and "rror" not in o and "xception" not in o, o)
         if a.scala_assembly:
-            r, o = bx(g1, "scala", "scala", f"cd /work/task-board && {java_env}scala-cli --power package Main.scala --server=false --assembly -o /work/board.jar 2>&1", timeout=3000)
+            r, o = bx(g1, "scala", "scala", f"cd /work/task-board && scala-cli --power package Main.scala --server=false --assembly -o /work/board.jar 2>&1", timeout=3000)
             check("scala box: task board assembly is packaged", r == 0 and "Wrote" in o, o)
 
         # --- run -----------------------------------------------------------------------------------
@@ -120,7 +117,7 @@ def main():
         board_command = ("java -jar /work/board.jar" if a.scala_assembly else
                          "java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar run Main.scala --server=false" if a.scala_direct else
                          "scala-cli run Main.scala --server=false")
-        g1.run(f"/sbin/eco-box daemon scala scala 'cd /work/task-board && {java_env}{board_command} > /work/board.log 2>&1'")
+        g1.run(f"/sbin/eco-box daemon scala scala 'cd /work/task-board && {board_command} > /work/board.log 2>&1'")
         # The services live in the boxes `gitsrv` / `board`: same boxes as the builds (a container id is its writable layer); nothing may `eco-box exec` them afterwards, it closes the box.
         time.sleep(1)
         board_url, git_url = d.service_url(8082), d.service_url(8081)
