@@ -1225,6 +1225,19 @@ impl Process {
             loop { crate::threading::yield_now(); }
         }
 
+        // A thread cloned just before its group's `execve` is not yet a published slot, so the exec
+        // could not stop it, and its space is a view of the root the exec replaced (and freed): loading
+        // it triple-faults the machine (`docs/archive/DENVER_SCALA_CLI_CRASHES.md`). The group has a new
+        // image; this thread belongs to the old one and ends instead of running.
+        if self.pid != self.tgid
+            && let Some(lead) = lookup_process_shared(self.tgid)
+            && lead.address_space.ttbr0() != self.address_space.ttbr0()
+        {
+            crate::safe_print!(128, "[RUN-REFUSED] thread pid={} of tgid={} holds a replaced root; ending it\n", self.pid, self.tgid);
+            crate::threading::mark_current_terminated();
+            loop { crate::threading::yield_now(); }
+        }
+
         self.state.store(ProcessState::Running);
 
         // Activate the user address space

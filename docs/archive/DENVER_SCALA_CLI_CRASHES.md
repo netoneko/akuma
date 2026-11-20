@@ -1,8 +1,7 @@
 # Denver: why `scala-cli` does not run normally in a box (investigation, 2026-11-20)
 
 Branch `ecosystem-demo-stage1`. Kernel: Denver (`containers,codex`), QEMU microvm + KVM, guest images in
-`/var/tmp/akuma-eco/denver-ready`. Status: **open**. Two defects are separated below; one has a change, one is localised
-but not fixed. The launcher in `overlays/ecosystem-demo/scala/usr/local/bin/scala-cli` and `-Xint` hide the symptoms; they
+`/var/tmp/akuma-eco/denver-ready`. Status: **partly open**. Defect A has a change, Defect B is fixed at its first-run window, Defect C is open. The launcher in `overlays/ecosystem-demo/scala/usr/local/bin/scala-cli` and `-Xint` hide the symptoms; they
 are workarounds, not fixes, and this document is the record of what is actually wrong.
 
 ## Symptoms
@@ -21,7 +20,7 @@ caller's, owns the new root (`disown_space`, `adopt_exec_root`, `OWNED_ROOT`). A
 group's only thread. `overlays/ecosystem-demo/execthread-probe.py` passes 12/12 on Denver with it. **That proves little**:
 the same probe passed intermittently before. Not yet shown: `scala-cli run` execing the compiled application.
 
-## Defect B: the guest triple-faults after a failed `ldconfig` exec (localised, open)
+## Defect B: the guest triple-faults when a thread cloned before an `execve` starts (fixed at the first-run window)
 
 ### What was observed
 
@@ -64,15 +63,30 @@ parent commit), so it is not a regression from it.
 
   A silent triple fault is now a named panic. That is the fix for the *silence*; the bad root itself is not fixed.
 
-### What is known and not known
+### Cause (found 2026-11-20) and fix
 
-* The callers of `UserAddressSpace::activate` in this tree are `Process::run`, `run_registered_process` (the spawn path
-  `akuma-exec` uses for boxes and `posix_spawn`) and glue's `enter`. The sequence (JVM, then `ldconfig`, then the
-  `TRAMP-MISMATCH` of a spawn child) points at a spawn child whose `Process` still names a root that has been freed or
-  never had the kernel half. The same family as the "second box in one boot" panic in `DENVER_BOX_WIRING.md`
-  (`zombie_root`, a slot's task-record root outliving its process).
-* Not yet known: which process, which root, who freed it. Next step: print pid, thread and root at the panic and walk
-  `OWNED_ROOT` / the task record / `disown_space` for that pid.
+Temporary `[activate]`/`[root]` prints (pid, tgid, root at every `Process::run`, every exec, every zombie root) gave the
+sequence, with pid 85 the JVM and slot 3 one of its Java threads:
+
+```
+[activate] run pid=167 tgid=85 root=0x210d7000          a thread of 85 starting, on 85's root
+[root] exec pid=85 slot=4 caller=3 old=0x210d7000 new=0x2a5c1000     the JVM thread execs the compiled application
+[activate] run pid=170 tgid=85 root=0x210d7000          a thread cloned BEFORE the exec starts, on the OLD root
+[PANIC] ... root does not share the live kernel slot 511
+```
+
+A thread's `Process` holds a *view* of its leader's root taken at `clone`. `execve` replaced the group's root and the
+old one was freed, but a thread that was cloned just before and had not yet run is not a published slot, so
+`kill_siblings` (which walks in-use slots) could not stop it. Its first `Process::run` then loaded the freed root. Not
+specific to scala-cli: any multithreaded program that execs while another thread is mid-`clone` can hit it; a JVM's
+`Runtime.exec`/launcher does exactly that.
+
+Fix (`akuma-exec/src/process/mod.rs`, `Process::run`): a thread (`pid != tgid`) whose view of the root differs from its
+group leader's current root belongs to the replaced image and ends (`[RUN-REFUSED] thread ... holds a replaced root`)
+instead of running. Verified: the same run no longer loses the guest; the refusal fires for pid 170. It is a guard at the
+first run, not a removal of the window: a clone that publishes after this check and before the activate can still load a
+replaced root, now a named panic (the checked `activate`) rather than a triple fault. Closing that fully needs `clone` and
+`execve` to exclude each other, or `kill_siblings` to see a half-created thread. Open.
 
 ## Defect C: the HotSpot SEGV (open, probably not the kernel mapping)
 
@@ -113,7 +127,7 @@ ECO_ACCEL=tcg ECO_CPU=max ECO_QEMU_EXTRA='-d int,cpu_reset -D /tmp/q.log' ...
 
 ## Still open
 
-Defect B's root, Defect C's cause, and a proof that Defect A's change survives `scala-cli run`. The launcher workaround and
+The `clone`/`execve` window described under Defect B, Defect C's cause, and a proof that Defect A's change survives `scala-cli run`. The launcher workaround and
 `--scala-interpreted` stay until all three are closed.
 
 ## Background
