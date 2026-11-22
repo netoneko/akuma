@@ -16,7 +16,7 @@
 //! which `e2fsck` reported after the guest's hard reboot. The RTC is a
 //! seed, not the truth — it drifts, and may hold local time on a machine
 //! that dual-boots Windows — so SNTP still runs and overrides it
-//! ([`RTC_ONLY`]) in RAM. It no longer writes the chip: the write-back
+//! ([`BOOT_SEED_ONLY`]) in RAM. It no longer writes the chip: the write-back
 //! (Linux's `sync_cmos_clock`, in the tree 2026-10-12..2026-10-23) was the
 //! kernel's only hand on firmware-owned CMOS — the SET window a reset could
 //! land in, the century register 0x32 hardcoded rather than read from ACPI —
@@ -151,12 +151,21 @@ pub fn set_unix_us(_root: akuma_primitives::HostRoot, us: u64) {
     wall::set_utc_time_us(us, uptime);
 }
 
-/// The wall clock came from the CMOS RTC and nothing has corrected it yet:
+/// The wall clock came from the RTC or command line and SNTP has not corrected it:
 /// [`sync_tick`] keeps trying SNTP while this is set, and clears it on
 /// success. Cleared too by a ring-3 `settimeofday`? No — that path does not
 /// come through here; a userspace-set clock counts as corrected only once
 /// SNTP lands, which costs one harmless extra sync.
-static RTC_ONLY: AtomicBool = AtomicBool::new(false);
+static BOOT_SEED_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// A boot-supplied clock overrides the RTC; SNTP may subsequently correct it.
+pub fn seed_from_cmdline(line: &str) {
+    if let Some(us) = akuma_params::epoch_us(line) {
+        set_unix_us(akuma_primitives::HostRoot::kernel_boot(), us);
+        BOOT_SEED_ONLY.store(true, Ordering::Relaxed);
+        serial::puts("  clock: seeded from epoch=; SNTP will correct it\n");
+    }
+}
 
 /// Seed the wall clock from the CMOS RTC, if the machine has one that holds
 /// a believable date. Prints one line either way. Safe to call before the
@@ -172,7 +181,7 @@ pub fn seed_from_rtc() {
         Ok(dt) => {
             if let Some(secs) = akuma_cmos_rtc::unix_seconds(&dt) {
                 set_unix_us(akuma_primitives::HostRoot::kernel_boot(), secs * 1_000_000);
-                RTC_ONLY.store(true, Ordering::Relaxed);
+                BOOT_SEED_ONLY.store(true, Ordering::Relaxed);
                 serial::puts("  clock: seeded from the CMOS RTC (");
                 put_date(&dt);
                 serial::puts(" UTC); SNTP will correct it\n");
@@ -335,7 +344,7 @@ pub fn sync_status() -> (SyncOutcome, u64) {
 /// fires on the first lap after the address lands instead of waiting out a
 /// retry interval that elapsed while there was nothing to try.
 pub fn sync_tick() {
-    if is_synced() && !RTC_ONLY.load(Ordering::Relaxed) {
+    if is_synced() && !BOOT_SEED_ONLY.load(Ordering::Relaxed) {
         return;
     }
     if akuma_net::smoltcp_net::interface_snapshot().ip == [0, 0, 0, 0] {
@@ -399,7 +408,7 @@ fn report_outcome(outcome: SyncOutcome, ctx: &str) {
     }
     match outcome {
         SyncOutcome::Ok => {
-            RTC_ONLY.store(false, Ordering::Relaxed);
+            BOOT_SEED_ONLY.store(false, Ordering::Relaxed);
             serial::puts("  clock: synced via SNTP (");
             serial::puts(NTP_HOST);
             serial::puts(", ");

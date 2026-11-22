@@ -5,4 +5,3 @@
 taoxichuan/amd64	getcpu	not wired: the tokio kernels serve getcpu only behind their off-by-default `getcpu` feature (crates/akuma-tokio-kernel-amd64/src/lib.rs, PHASE-2-GETCPU); the main amd64 kernel gained the arm for the ecosystem demo (JVM)
 shanghai/amd64	getcpu	not wired: the tokio kernels serve getcpu only behind their off-by-default `getcpu` feature (crates/akuma-tokio-kernel-amd64/src/lib.rs, PHASE-2-GETCPU); the main amd64 kernel gained the arm for the ecosystem demo (JVM)
 denver/amd64	getcpu	not wired: the tokio kernels serve getcpu only behind their off-by-default `getcpu` feature (crates/akuma-tokio-kernel-amd64/src/lib.rs, PHASE-2-GETCPU); the main amd64 kernel gained the arm for the ecosystem demo (JVM)
-akuma/amd64	time	flaky: the guest wall clock is sometimes seconds-since-boot ("wall clock 5s is before 2020") although epoch= is on the command line; about 1 boot in 6 (2026-11-22, C7 in proposals/FUTURE_WORK.md)
