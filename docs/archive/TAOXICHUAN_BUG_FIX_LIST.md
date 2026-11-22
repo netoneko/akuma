@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 139
-- **Docs contributing at least one fix:** 47
+- **Total distinct fixes counted:** 140
+- **Docs contributing at least one fix:** 48
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 40 | 28.8% | 7 |
+| Syscalls, Files & Pipes | 40 | 28.6% | 7 |
 | Exec & ELF Loading | 12 | 8.6% | 5 |
-| Processes, Fork, Threads & Scheduling | 36 | 25.9% | 11 |
-| Memory & Copy-on-Write | 20 | 14.4% | 8 |
+| Processes, Fork, Threads & Scheduling | 36 | 25.7% | 11 |
+| Memory & Copy-on-Write | 20 | 14.3% | 8 |
 | Signals | 6 | 4.3% | 3 |
-| Networking & Readiness | 5 | 3.6% | 3 |
+| Networking & Readiness | 6 | 4.3% | 4 |
 | SMP, Time & Boot | 12 | 8.6% | 6 |
-| Build & Integration | 8 | 5.8% | 4 |
-| **Total** | **139** | **100.0%** | **47** |
+| Build & Integration | 8 | 5.7% | 4 |
+| **Total** | **140** | **100.0%** | **48** |
 
 **Largest single write-ups:**
 
@@ -236,7 +236,10 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/DENVER_BRANCH_FIXES.md
 - a synchronous ring-3 fault killed the task instead of reaching its SIGSEGV handler, so `javac`'s JIT-compiled implicit null checks died; `faultsig.rs` ports the metal's fault-to-signal path and restores from the ucontext at `rt_sigreturn` (`fault-signal`, `bdf3a2b2`)
 
-## Networking & Readiness (5 fixes, 3 docs)
+## Networking & Readiness (6 fixes, 4 docs)
+
+### docs/archive/AARCH64_TOKIO_SOCKET_PARK.md
+- AArch64 platform socket waits halted instead of parking user tasks, starving a loopback peer on one CPU; published user tasks now use timed scheduler parks.
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `getsockname` wrote `sin_family` in host byte order (`to_be_bytes`), so c-ares read `0x0200` (stage 9)

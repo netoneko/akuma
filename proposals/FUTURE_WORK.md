@@ -58,7 +58,6 @@ Read the document for the inventory and the order. Open items that came out of t
 
 | # | Item | Why it matters | What closes it |
 |---|---|---|---|
-| C2 | `NetMachine::can_park` is `false` on the AArch64 platform kernels (taoxichuan, shanghai, denver): a blocking `accept` there still pumps and halts | the same cross-thread hang is expected; not booted because it needs the Mac | set it, boot `scripts/gate.py`'s `gateprobe` on the aarch64 kernels |
 | C5 | Taoxichuan and Shanghai have no boxes (`current_box_id` is 0); Denver has them (`docs/archive/DENVER_BOX_WIRING.md`), but a writable `MAP_SHARED` of a boxed file is `ENODEV`, and seccomp and private namespaces in a Denver box are untested | the ecosystem demo and nested boxes need them | convergence step 4, or the demo uses the main kernel or Denver |
 | C6 | The gate boots amd64 only | aarch64 kernels are built, not booted | an aarch64 rig that runs under the budget (the Mac, or KVM on an aarch64 host) |
 | C7 | The main amd64 kernel's gateprobe `time` check fails in about 1 boot in 6 with `wall clock 5s is before 2020`: the guest's wall clock is seconds-since-boot although `epoch=` is on the command line | the gate is red on a flake that is not the thing under test | find why the epoch from the command line is sometimes not applied (race with the clock init or the cmdline parse) |

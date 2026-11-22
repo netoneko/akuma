@@ -12,7 +12,7 @@ The kernels:
 | **main** | `akuma` on aarch64 and amd64 (`src/`, `crates/akuma-kernel-glue`, `crates/akuma-kernel-amd64`) | threading and process model of its own (`akuma-exec`), BKL, boxes and namespaces (`akuma-isolation`), a `netpoll` thread, 448-thread table on amd64, an in-kernel boot suite |
 | **tokio** | `taoxichuan`, `shanghai`, `denver` on amd64 and aarch64 (`crates/akuma-tokio-kernel*`) | composed from `akuma-tokio-kernel-core` behind a machine trait; spawn ring of 48 slots; no boxes; no `netpoll` thread (tick, idle lap and wait laps); smaller and easier to reason about |
 
-**C1 update (2026-11-20):** `akuma-net::wait_hooks` now supplies the shared socket wait hooks through machine adapters. On AArch64 QEMU TCG, the main kernel and taoxichuan both passed `gateprobe`'s `udp_loopback` and `tcp_loopback` (64 KiB echo and half-close) with two virtual CPUs; both also passed a separate sleeping-child accept/connect probe. The separate AArch64 tokio parking issue C2 remains open.
+**C1 update (2026-11-20):** `akuma-net::wait_hooks` now supplies the shared socket wait hooks through machine adapters. On AArch64 QEMU TCG, the main kernel and taoxichuan both passed `gateprobe`'s `udp_loopback` and `tcp_loopback` (64 KiB echo and half-close) with two virtual CPUs; both also passed a separate sleeping-child accept/connect probe. The AArch64 tokio parking issue was subsequently fixed; see [AARCH64_TOKIO_SOCKET_PARK.md](AARCH64_TOKIO_SOCKET_PARK.md).
 
 ## What is already shared (and is why the gate's capability matrix is identical)
 
@@ -32,7 +32,7 @@ core), `akuma-user-access`, `akuma-mmu` / `akuma-user-space` / `akuma-cow` (memo
 | **Locking** | BKL (`akuma-bkl`) | the machine's own lock, `bkl_enter`/`bkl_leave` around switches | different rules for "may this thread park here"; the `can_park` gate exists because of it |
 | **Dispatch** | `akuma-syscalls-glue` (aarch64), `-glue-amd64` | `akuma-syscalls-*` families called from `akuma-tokio-kernel-*` | a signature change in glue breaks the platform kernels silently; fixed only by building them |
 | **Self-test** | 851 in-kernel tests | none; the gate's `gateprobe` from outside | tokio kernels learn of a regression only when someone runs the gate |
-| **aarch64 boot** | boots on the author's Mac | built only | `can_park` is still `false` on the aarch64 tokio kernels; nobody here can boot them |
+| **aarch64 boot** | booted | taoxichuan loopback booted on QEMU TCG at SMP=1 and SMP=2 | see [AARCH64_TOKIO_SOCKET_PARK.md](AARCH64_TOKIO_SOCKET_PARK.md) |
 
 ## Why now
 
