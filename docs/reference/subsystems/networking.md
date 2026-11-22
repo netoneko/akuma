@@ -159,6 +159,10 @@ returns `EAFNOSUPPORT` for any domain but `AF_INET` (2) — which is the `errno:
 97` line servers print when they try to bind `::` first. See
 `archive/DEVBOX_ISSUES.md` Issue 9.
 
+The AArch64 platform kernels park published user tasks during socket waits, with
+short timed wakeups to pump the network. Boot and idle contexts use bounded halt
+laps. See [the incident record](../../archive/AARCH64_TOKIO_SOCKET_PARK.md).
+
 ## The native data path
 
 Everything below is the **smoltcp** stack only. The rump stack's data path is

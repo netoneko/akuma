@@ -21,6 +21,11 @@ impl NetMachine for Aarch64Net {
     fn rng_fill(buf: &mut [u8]) {
         crate::fs::rng_fill(buf);
     }
+    fn can_park() -> bool {
+        // Only a published user task can switch away. DHCP runs on the boot
+        // thread before init is bound; idle slots must not park here either.
+        akuma_tokio_kernel_core::proc::is_real_task::<crate::mm::Aarch64>()
+    }
 }
 
 /// One lap of the stack (a no-op until the stack is up).
