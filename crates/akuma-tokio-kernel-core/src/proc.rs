@@ -690,6 +690,15 @@ pub fn exec_strs<M: Proc>(path: String, mut argv_s: Vec<String>, env_s: &[String
     // `Process`: the group's identity, its wait status and its address space stay there, and a
     // non-leader caller continues as the group's only thread, on the leader's record.
     let owner = group_leader(cur);
+    // A non-leader caller stops the leader below. A stopped leader is a TERMINATED slot, and `claim_slot` hands
+    // those to the next `clone`: the new image's first thread took it, `group_leader` then found no leader, and the
+    // image's `exit_group` published its status on the caller's thread record while the real parent waited on the
+    // leader's pid forever (every threaded `exec` target hung at exit: Denver `scala-cli run` of a program that
+    // exits; `docs/archive/TOKIO_EXEC_LEADER_SLOT_REUSE.md`). Hold the slot as `task_exit_code` does, before the
+    // leader stops; the reap releases it.
+    if owner != cur {
+        akuma_exec::process::hold_exited_thread_slot(slot_pid(owner), owner);
+    }
     kill_siblings::<M>(cur, owner);
     if let Some(p) = akuma_exec::process::current_process_shared() {
         let argv_bytes: Vec<Vec<u8>> = argv_s.iter().map(|a| a.clone().into_bytes()).collect();

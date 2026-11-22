@@ -13,15 +13,15 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1694
-- **Docs contributing at least one fix:** 499
+- **Total distinct fixes counted:** 1695
+- **Docs contributing at least one fix:** 500
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
 | Syscall / ABI Compatibility Audits | 261 | 15.4% | 43 |
 | Memory & Virtual Memory | 205 | 12.1% | 73 |
-| Scheduler & Process Management | 160 | 9.4% | 54 |
+| Scheduler & Process Management | 161 | 9.5% | 55 |
 | SMP & Locking | 142 | 8.4% | 61 |
 | Networking | 105 | 6.2% | 39 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
@@ -722,7 +722,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `akuma-mmu` range checks wrapped `va_start + len + PAGE_SIZE - 1`; `page_span` treats a wrapping range as not mapped
 - `prefault_user_range` and `madvise(WILLNEED)` rounded unchecked; `checked_add` plus `page_ceil`
 
-## Scheduler & Process Management (160 fixes, 54 docs)
+## Scheduler & Process Management (161 fixes, 55 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -995,6 +995,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - The tokio kernels' `execve` from a non-leader thread replaced the group's address space under live sibling threads; the exec now ends every other thread first (`kill_siblings`, rescanning until no sibling is live) and the leader slot owns the new root.
 - A thread cloned just before its group's `execve` loaded the freed root and triple-faulted the Denver guest; `Process::run` now ends a thread whose root is not its leader's.
 - A non-leader `execve` left the calling thread's own `Process` on the old root, so every thread the new image created started on the freed root (`scala-cli run` died after its exec); the caller's view now points at the new root.
+
+### docs/archive/TOKIO_EXEC_LEADER_SLOT_REUSE.md
+- `execve` from a non-leader thread stopped the leader without holding its ring slot, so the new image's first `clone` took it and the image's `exit_group` published its status on the caller's thread record while the real parent waited on the leader's pid: every threaded exec target (`scala-cli run` of a program that exits) hung at exit on the tokio kernels; `exec_strs` now takes `hold_exited_thread_slot` before `kill_siblings`, as `task_exit_code` does
 
 ## SMP & Locking (142 fixes, 61 docs)
 
@@ -2863,3 +2866,5 @@ Also scanned 2026-11-17 (merging `ec2-setup-review` into `ouch`, the T-series ty
 Also scanned 2026-11-18 (`more-improvements`: real bubblewrap and codex's sandbox on private mount namespaces, the three platform kernels building again, herd, the seccomp and mmap-pilot merges). Counted above: CLOCK_GETTIME_EINTR_ON_SIGNAL (Syscall / ABI), DEVFS_KVM_NODES_NOT_LISTED (VFS), BWRAP_ON_BOXES (Containers: two defects among the features it records), DENVER_BUILD_BREAKAGE (Misc: the three shared-crate fixes; the three in the tokio-kernel crates are in `TAOXICHUAN_BUG_FIX_LIST.md`), and GETPPID_RETURNED_THREAD_PID and SECCOMP, listed already. No counted fix at that scan: BOX0_ONLY_AUDIT (an audit then; its follow-up fixes are counted since 2026-11-20), MMAPLAZY_PROPERTY_TEST_PILOT (the method found no defect; a deliberately broken kernel was the control), EXT3_EXT4_IMPLEMENTATION (a feature record). Fix-shaped commits with no archive doc to cite, so uncounted: `62a4d766` herd (`enable` copied instead of linking, so an edited config did nothing until a disable and enable; `start` ran the previous config; no `reload`; recorded in `userspace/herd/README.md`'s roadmap) and `e6fbd10c` (that roadmap). The signalfd, private-namespace, procfs (`ns`, `mountinfo`, `fdinfo`, `uid_map`), netlink, `capset` and per-mount `st_dev` commits add missing features and are not bugs.
 
 Also scanned 2026-11-20 (`ecosystem-demo-stage1`, 39 commits: the box-0 policy follow-up, the merge gate, the ecosystem demo stages 1-2, Denver box wiring). Counted above: BOX0_ONLY_AUDIT's follow-up (Containers, 8 bullets), AKUMA_ECOSYSTEM_DEMO (the `getcpu` arm; Syscall / ABI) and EXEC_FROM_THREAD_DETACH (Scheduler). The tokio kernels' fixes (TOKIO_KERNELS_LOOPBACK_STARVATION, DENVER_BOX_WIRING) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: AKUMA_NESTED_BOXES, KERNEL_CONVERGENCE (proposals), DENVER_CODEX_TOOLS (a feature), MERGE_GATE_FIRST_RUN (findings; its fixes are the two tokio docs and the budget ratchet, `7ffa9165`, stale numbers rather than a defect). Fix-shaped commits with no archive doc, uncounted: `97b60eae` (sshd spun at ~3700 syscalls/s when idle in the cooperative loop; it blocks in `poll`; recorded as E5 in `proposals/FUTURE_WORK.md`), the demo image builder's JKS `cacerts` generation (a rig change), and the clippy rot fixes of `aadd4a76`/`4b508eb1`/`99300fe0` (the hook had never been installed; recorded in MERGE_GATE_FIRST_RUN). Also: DENVER_SCALA_CLI_CRASHES (2026-11-20, Scheduler & Process Management 3, Signals & Exceptions 1): the tokio kernels' execve from a non-leader thread, the first-run guard, the caller's stale root, and the fault-signal sigreturn's `rcx`/`r11`. Also scanned 2026-11-22 (the merge of C2, C3, C4, C7): counted AMD64_SOCKET_WAIT_STARVATION (Networking, 1) and AMD64_BOOT_EPOCH (Boot & Drivers, 1); AARCH64_TOKIO_SOCKET_PARK is in `TAOXICHUAN_BUG_FIX_LIST.md`. Uncounted: the C3 spawn-ring change (48 to 256 slots, a capacity limit with no archive doc; `2b6c71d3`) and the gateprobe stage/sent/served/echoed counters (a rig change).
+
+Also scanned 2026-11-22 (the ecosystem demo's agent trials, `demo-trial-run`): counted TOKIO_EXEC_LEADER_SLOT_REUSE (Scheduler & Process Management, 1). AKUMA_ECOSYSTEM_DEMO_AGENT_TRIAL is a findings write-up and AKUMA_ECOSYSTEM_DEMO's stage-3 section a status note: no counted fix. The trial's rig changes (`ECO_HEADROOM_MB`, the apk relock, `agents.py`, `rework.py`, `judge.py`, `scalarun.py`) are not fixes.
