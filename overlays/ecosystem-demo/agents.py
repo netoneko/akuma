@@ -215,7 +215,7 @@ def main():
             tar = subprocess.Popen(["tar", "-C", str(ref), "-czf", "-", "tests"], stdout=subprocess.PIPE)
             subprocess.run(g[2].ssh_argv("tar xzf - -C /var/lib/box/containers/oracle/upper/work"), stdin=tar.stdout, check=False)
             tar.wait()
-            r, o = bx(g[2], "oracle", "python", f"cd /work/tests && python3 test_remote.py --board-url {board_url} --git-url {git_url} >/tmp/oracle.out 2>&1; rc=$?; tail -40 /tmp/oracle.out; exit $rc", timeout=900)
+            r, o = bx(g[2], "oracle", "python", f"cd /work/tests && python3 test_remote.py --board-url {board_url} --git-url {git_url} >/tmp/oracle.out 2>&1; rc=$?; tail -40 /tmp/oracle.out; (exit $rc)", timeout=900)
             oracle = dict(rc=r, output=o)
             print(f"[A] reference suite against the agents' services: rc={r}\n{o}", flush=True)
 

@@ -4,7 +4,7 @@ Branch `demo-trial-run` (litter). Driver `overlays/ecosystem-demo/agents.py`, fe
 briefs in `overlays/ecosystem-demo/briefs/`. Plan and stages 1-2: [`AKUMA_ECOSYSTEM_DEMO.md`](AKUMA_ECOSYSTEM_DEMO.md).
 Run artifacts (not in the repo): `$ECO_WORK/agent-runs/<stamp>/` (transcripts, workspaces, briefs, `result.json`).
 
-**Status: round 1 done; rework round (C fixes its board from D's report) in progress, see the last section.**
+**Status: round 1 and the rework round are done. Round 1: git passes, board fails. After one feedback round the board passes both D's suite and the reference suite.**
 
 ## What was run
 
@@ -79,15 +79,40 @@ changed. The seventh, error precedence between a bad body and a missing id, is a
 an automated test (its NOTES say so), while the brief asked it to "test every error rule": it used an ad-hoc `curl` matrix whose
 coverage was shallower than D's. The rework round below tests whether feedback closes the gap.
 
-## Rework round (in progress)
+## Rework round (done)
 
 `rework.py --run <round-1 dir>`: C's committed workspace is restored into a fresh scala box; its brief is the original plus D's
-failure list and "the contract is authoritative: reproduce each, fix, re-test, commit"; C runs again; A starts the board and runs D's
-committed board tests against it from guest 2. Result, token cost and diff: *to be filled in.*
+failure list (the "Failed" section of `REPORT.md`) and "the contract is authoritative: reproduce each, fix, re-test, commit"; C runs
+again; A starts the board and runs D's committed board tests from guest 2. Then `judge.py` re-judges the saved work of B and C with
+the reference suite alone (no agents, no credentials).
+
+| | round 1 (C) | rework (C) |
+|---|---|---|
+| wall | 1878 s | **224 s** |
+| Codex commands (non-zero exit) | 114 (40) | 21 (9) |
+| tokens in / out | 11.4 M / 32 k | 0.48 M / 3.9 k |
+| D's 40 board tests | 33 pass, 7 fail | **40 pass** |
+| reference suite (board + git, B's git service) | board fails | **OK, 2 of 2** (`judge.py`, 51 s) |
+
+The fix was two commits' worth, 6 added and 2 removed lines in `project.scala`: `PATCH` now validates the fields *before* the
+lookup (`case None => errors.invalid`), and a message `POST` to a nonexistent id returns 404 before its body is read. So the
+seven failures were one cause, the order of checks: the contract's validation was reachable only after a not-found. Feedback
+closed it in under four minutes and one twentieth of the tokens, because the report named the cases and the contract was
+unambiguous about all but the precedence case.
+
+**What this says about the brief.** The first-round defect was not a missing requirement (the contract states it) but an
+unverified one: C tested with an ad-hoc `curl` matrix and never wrote the invalid-field-on-existing-id case. The brief asked it to
+cover "every error rule"; GLM judged that done. The contract still has one gap worth closing: **precedence between a bad body and a
+missing id** (the rework chose 404 first for messages and 400 first for `PATCH`; the reference suite accepts both). Spell it out
+in `spec/SPEC.md` or accept either.
+
+Environment notes from the rework: none new. (`rework.py`, `agents.py` and `judge.py` originally ended their in-box script with
+`exit $rc`, which skips `eco-box`'s status file and made the reported exit status 255 while the output said `OK`; fixed to
+`(exit $rc)`. Round 1's oracle line `rc=0` came from `tail`, fixed earlier.)
 
 ## Next
 
-* Finish the rework write-up; decide whether the contract needs the error-precedence rule (400 vs 404) spelled out.
+* Decide whether the contract spells out the error-precedence rule (400 vs 404).
 * Rerun the whole trial on **Denver guests** (`containers` feature, `ECO_KERNEL`), same briefs, to compare.
 * The `apply_patch` symlink, the Scala brief's `--server=false`, and a probe for the `curl` `000` failures.
 

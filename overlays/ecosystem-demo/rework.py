@@ -84,7 +84,7 @@ def main():
             subprocess.run(g2.ssh_argv("tar xzf - -C /var/lib/box/containers/python/upper/work"), stdin=tar.stdout)
             tar.wait()
             r, o = bx(g2, "python", "python",
-                      f"cd /work && BOARD_URL={board} GIT_URL=http://127.0.0.1:1 python3 -m pytest -q tests/test_board.py -p no:cacheprovider >/tmp/p.out 2>&1; rc=$?; tail -25 /tmp/p.out; exit $rc",
+                      f"cd /work && BOARD_URL={board} GIT_URL=http://127.0.0.1:1 python3 -m pytest -q tests/test_board.py -p no:cacheprovider >/tmp/p.out 2>&1; rc=$?; tail -25 /tmp/p.out; (exit $rc)",
                       timeout=900)
             print(f"[A] D's board tests against the reworked board: rc={r}\n{o}", flush=True)
         for f, dest in (("tmp/transcript.jsonl", "transcript.jsonl"), ("tmp/stderr.log", "stderr.log")):
