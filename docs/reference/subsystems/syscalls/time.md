@@ -42,6 +42,10 @@ resolution and ignores `clock_id` entirely.
 
 ## where the clock comes from
 
+The main amd64 kernel seeds its clock from a valid `epoch=<unix seconds>` boot
+parameter when supplied, overriding the CMOS seed before init starts. SNTP may
+subsequently correct that seed. See [the C7 investigation](../../../archive/AMD64_BOOT_EPOCH.md).
+
 Both clocks this crate reads are `akuma_primitives::clock`'s:
 
 | | what it is | who installs it |

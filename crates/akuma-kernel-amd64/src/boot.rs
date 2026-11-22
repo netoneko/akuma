@@ -129,6 +129,7 @@ pub fn install_shared_sinks() {
     // reason this function exists (below). SNTP corrects it once there is a
     // network; without one this is the clock.
     crate::clock::seed_from_rtc();
+    crate::clock::seed_from_cmdline(akuma_params::line());
     // `/proc/cpuinfo`'s block renderer. Here, not beside `power::init`: that one
     // is called from both boot paths separately, and the metal (multiboot2) path
     // is the one that read bare `processor : N` blocks on 2026-10-09 because the

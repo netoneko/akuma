@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1693
-- **Docs contributing at least one fix:** 498
+- **Total distinct fixes counted:** 1694
+- **Docs contributing at least one fix:** 499
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
 | Syscall / ABI Compatibility Audits | 261 | 15.4% | 43 |
 | Memory & Virtual Memory | 205 | 12.1% | 73 |
-| Scheduler & Process Management | 160 | 9.5% | 54 |
+| Scheduler & Process Management | 160 | 9.4% | 54 |
 | SMP & Locking | 142 | 8.4% | 61 |
 | Networking | 105 | 6.2% | 39 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.5% | 6 |
-| Toolchain & Self-Hosting | 94 | 5.6% | 14 |
+| Toolchain & Self-Hosting | 94 | 5.5% | 14 |
 | SSH | 56 | 3.3% | 23 |
 | VFS & Filesystem | 150 | 8.9% | 49 |
-| Boot & Drivers | 144 | 8.5% | 25 |
+| Boot & Drivers | 145 | 8.6% | 26 |
 | Signals & Exceptions | 51 | 3.0% | 21 |
 | Misc / Cross-cutting | 98 | 5.8% | 28 |
 | Console & Terminal | 63 | 3.7% | 22 |
 | Containers | 79 | 4.7% | 15 |
-| **Total** | **1693** | **100.0%** | **498** |
+| **Total** | **1694** | **100.0%** | **499** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -2094,7 +2094,10 @@ aren't recorded anywhere else.)
 ### docs/archive/DEVFS_KVM_NODES_NOT_LISTED.md
 - `/dev/kvm0` and `/dev/kvm` were opened by the kernel's own `openat` arm but never in the devfs table, so `ls /dev` and `stat` showed neither and the hypervisor looked unwired; `DevProbe` gained `kvm_ctl`/`kvm_api` and the table the two root-only nodes (boxes still see neither)
 
-## Boot & Drivers (144 fixes, 25 docs)
+## Boot & Drivers (145 fixes, 26 docs)
+
+### docs/archive/AMD64_BOOT_EPOCH.md
+- The main amd64 kernel ignored the supplied `epoch=`; it now seeds the wall clock before init and permits SNTP correction.
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
