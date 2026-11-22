@@ -39,6 +39,8 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
 SPEC = json.loads((HERE / "images/spec.json").read_text())
 WORK = Path(os.environ.get("ECO_WORK", "/var/tmp/akuma-eco"))
+# Free space inside each guest disk beyond the roots (sparse: costs the host nothing until used). Stage 1 had 400 MB; agents building crates and JVM projects need far more.
+HEADROOM_MB = int(os.environ.get("ECO_HEADROOM_MB", "400"))
 CACHE = WORK / "cache"
 MIRROR = CACHE / "mirror"
 BRANCH, ARCH, EPOCH = SPEC["alpine"], SPEC["arch"], SPEC["epoch"]
@@ -486,7 +488,7 @@ def build_disk(out: Path, guest: int, info: dict) -> Path:
     sh += [f"cp -a {meta}/var/lib/box/images/. {stage}/var/lib/box/images/" if members else "true"]
     uuid = f"0000ec00-0000-4000-8000-00000000000{guest}"
     sh += [
-        f"MB=$(( $(du -sm {stage} | cut -f1) * 13 / 10 + 400 ))",
+        f"MB=$(( $(du -sm {stage} | cut -f1) * 13 / 10 + {HEADROOM_MB} ))",
         f"truncate -s ${{MB}}M {img}",
         f"mkfs.ext2 -q -F -b 4096 -i 8192 -L eco-guest{guest} -U {uuid} "
         f"-E root_owner=0:0,hash_seed={uuid},lazy_itable_init=0 -d {stage} {img}",

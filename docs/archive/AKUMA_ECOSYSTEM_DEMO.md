@@ -339,3 +339,25 @@ addresses inside it. The stage-1 checks (`launch.py verify`) were ported and re-
 
 * The exec'd program has a new pid (E7 detach); the Linux-style `execve` from a thread is E7b in `proposals/FUTURE_WORK.md`.
 * Firecracker still needs the same shape (tap + MMDS) in stage 3.
+
+## Stage 3 trial: three Codex agents (2026-11-22, branch `demo-trial-run`)
+
+Driver: `overlays/ecosystem-demo/agents.py` (A, the coordinator, is the script, not a model). Each agent gets its **own brief**
+(`overlays/ecosystem-demo/briefs/`, the contract section(s) it needs appended), delivered through the metadata service and copied into
+its box; Codex runs inside the box on the main amd64 kernel (`sandbox_mode = danger-full-access`, `code_mode_host`). Credentials are
+per-agent secrets: the Z.ai key for the GLM agents, the Codex ChatGPT login (base64) for B. Z.ai serves the Responses API at
+`https://api.z.ai/api/v1` (`wire_api = "responses"`; the coding-plan chat endpoint is not what Codex 0.169 can use).
+
+| agent | box / guest | model | result |
+|---|---|---|---|
+| B | rust, guest 1 | gpt-6.1-terra | Git Smart HTTP service, 1 commit, **734 s**; passes the reference git test |
+| C | scala, guest 1 | glm-5.3-flash | task board, 9 commits, **1878 s**; **fails** the reference board test (PATCH with an invalid value returns 404, contract says 400) |
+| D | python, guest 2 | glm-5.3-flash | 46-test suite, 5 commits, **455 s**; its `REPORT.md` found the same board defects (7 failing checks) and passed all 5 git checks |
+
+D's independent verdict and the reference suite agree. Two services reachable from guest 2 across the SLIRP host alias, started by A
+from each agent's `/work/run.sh`.
+
+Environment faults found by the trial (the dry run's purpose): the guest disks had 400 MB headroom, so the first run died with
+`ENOSPC` inside Codex; `build-images.py` now takes `ECO_HEADROOM_MB` (used 6144). Alpine's APKINDEX had moved, so
+`fetch --relock` was needed. Stage-1 `verify` still fails one capacity check (a Scala build beside 150 JVM threads gets `EAGAIN`
+from `pthread_create`; peak 257 of 512 kernel threads), not exercised by the agents' runs. No agent was intervened on.
