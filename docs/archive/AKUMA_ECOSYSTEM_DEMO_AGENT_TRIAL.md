@@ -9,8 +9,8 @@ Run artifacts (not in the repo): `$ECO_WORK/agent-runs/<stamp>/` (transcripts, w
 ## What was run
 
 Three Codex 0.169 agents, each in its own `box` with its own root, on the **main amd64 kernel** as both guests (QEMU+KVM, 4 GB, 2 CPUs
-each), stage-2 networking (SLIRP, host alias `169.254.0.2`). **Denver was not used**: this exercises the shared userspace (`box`,
-Codex, rustc/cargo, the JDK) on the main kernel; the same trial on Denver guests (`ECO_KERNEL`, `containers` feature) is the next run.
+each), stage-2 networking (SLIRP, host alias `169.254.0.2`). **Denver was not used in round 1**: it exercises the shared userspace (`box`,
+Codex, rustc/cargo, the JDK) on the main kernel; round 2 below repeats it on Denver guests.
 
 | agent | box, guest | model | task |
 |---|---|---|---|
@@ -110,10 +110,45 @@ Environment notes from the rework: none new. (`rework.py`, `agents.py` and `judg
 `exit $rc`, which skips `eco-box`'s status file and made the reported exit status 255 while the output said `OK`; fixed to
 `(exit $rc)`. Round 1's oracle line `rc=0` came from `tail`, fixed earlier.)
 
+## Round 2: the same trial on Denver guests (2026-11-22)
+
+Same briefs, scripts and models; only the guest kernel changed (`ECO_KERNEL=target/x86_64-unknown-none/release/denver`, built with
+`--features containers,codex`). GLM quota before: 5 h window 32 %, week 6 % (`scripts/kvm/goose/zai_usage.py`); after: 36 % / 7 %.
+
+| agent | main kernel (round 1) | Denver (round 2) |
+|---|---|---|
+| B rust (`gpt-6.1-terra`) | 734 s, 19 commands | **327 s**, 14 commands; git service built and **UP**, answers from guest 2 |
+| C scala (`glm-5.3-flash`) | 1878 s, 9 commits, board up (7 defects) | **hung, timed out at 2400 s (rc=124)**; its commit has 3 files but the board never started |
+| D python (`glm-5.3-flash`) | 455 s, 46 tests | 213 s; 5 git checks pass, 39 board tests fail with `Empty reply from server` (nothing listening); D correctly called it a deployment defect |
+
+Rust and `cargo build` on Denver therefore work, and faster than on the main kernel in this run (the hosts were not otherwise idle, so
+treat the ratio as indicative, not measured). The Scala board did not come up, so the reference oracle was not run.
+
+**The hang, as observed in the live guest** (Codex alive and polling `write_stdin` every 30 s, 323 session events, one open
+connection to z.ai; no out-of-memory: 2.9 of 4 GB free, 5.4 GB disk free, nothing in the serial log): the chain was
+`codex` -> `scala-cli.jar run --server=false . --main-class TaskBoard` (JVM) -> the Scala 3 compiler JVM
+(`dotty.tools.dotc.Main`). Load average 0.00, the compiler's CPU time frozen at about 3 s (mostly JIT threads) for 30+ minutes,
+no sockets open in the guest besides Codex's, and the compiler's stdout is `/dev/pts/0` (Codex's pty). `SIGQUIT` to the compiler
+made the serial log print `socket(domain=10): unsupported` / `bind(port=0)` pairs (IPv6 refused, retried over IPv4: the JVM's
+signal path is alive). Codex kept spending about 25 k input tokens per poll while waiting.
+
+**Not reproduced by hand, cause unknown.** `scalahang.py` boots guest 1 only and starts a Scala service with `scala-cli run`:
+the rework round's JDK-only board answers `/health` in 37 s on Denver today **and** on Denver built before `be5b2d86`
+(socket wait hooks), so today's merges (C3's slot ring, the shared wait hooks) are not implicated for that workload. C's actual
+project (`//> using dep com.lihaoyi::ujson:3.3.0`) did not hang in the repro: it **failed to compile** (7 errors, `geny` not
+found) on Denver, pre-merge Denver and the main kernel alike, i.e. a dependency-resolution problem in that repro, not a kernel
+difference, so that comparison proves nothing about the hang. What differs in the real run and is not yet tried: Codex's pty as
+stdout, the process tree under a Codex exec session, and the ujson artifacts resolved in the agent's session. Next: run the same
+project with a pty (`ssh -t`) and with the ujson jars pre-cached, and under Codex without an agent (`codex exec` with the fake
+model, `boxed-codex-probe.py`).
+
+Environment notes added by this round: `apply_patch: not found` costs C its first command again (open, see above); `ps -o pcpu`
+is unsupported in the busybox `ps` (agents work around it); `ps` shows `etime` frozen (identical for every process) on Denver.
+
 ## Next
 
 * Decide whether the contract spells out the error-precedence rule (400 vs 404).
-* Rerun the whole trial on **Denver guests** (`containers` feature, `ECO_KERNEL`), same briefs, to compare.
+* Find the Denver Scala hang (see round 2), then rerun C.
 * The `apply_patch` symlink, the Scala brief's `--server=false`, and a probe for the `curl` `000` failures.
 
 ## Background
