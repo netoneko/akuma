@@ -26,10 +26,10 @@ use crate::task::Task;
 use crate::{mm, tree};
 
 /// Ring slots: threading tids `0..NSLOTS` (0 is the boot thread).
-#[cfg(not(feature = "containers"))]
-pub const NSLOTS: usize = 48;
-// The demo runs a JVM and multiple boxed toolchains concurrently.
-#[cfg(feature = "containers")]
+///
+/// 256 on every tokio kernel: a JVM or a tokio blocking pool asks for hundreds of threads at once, and the
+/// cost of a slot is a few static bytes plus a 16 KiB trap stack in the amd64 half's `.bss`, not memory
+/// until it is used. (It was 48 unless `containers` was on, and `clone` past it answered `EAGAIN`.)
 pub const NSLOTS: usize = 256;
 
 const EPERM: u64 = 1;

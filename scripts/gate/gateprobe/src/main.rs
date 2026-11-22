@@ -399,8 +399,7 @@ fn many_threads() -> Result<String, String> {
     alive_at_once(32)
 }
 
-/// Past the tokio kernels' 48-slot spawn ring (`NSLOTS`): a capacity limit, not a leak (`spawn_churn` and
-/// `thread_churn` show every slot comes back). tokio's blocking pool may ask for 512 threads.
+/// Past the old 48-slot spawn ring (`NSLOTS` is 256 now): tokio's blocking pool may ask for hundreds of threads.
 fn threads_128() -> Result<String, String> {
     alive_at_once(128)
 }

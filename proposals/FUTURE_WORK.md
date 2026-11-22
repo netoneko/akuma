@@ -59,7 +59,6 @@ Read the document for the inventory and the order. Open items that came out of t
 | # | Item | Why it matters | What closes it |
 |---|---|---|---|
 | C2 | `NetMachine::can_park` is `false` on the AArch64 platform kernels (taoxichuan, shanghai, denver): a blocking `accept` there still pumps and halts | the same cross-thread hang is expected; not booted because it needs the Mac | set it, boot `scripts/gate.py`'s `gateprobe` on the aarch64 kernels |
-| C3 | The tokio kernels' spawn ring is 48 slots (`NSLOTS`); `clone` past it is `EAGAIN` | JVM and tokio blocking pools want hundreds; gate `threads_128` is an expected failure | the ring sized by feature, or the main kernel's thread table |
 | C4 | The main amd64 kernel's `tcp_loopback` timed out once after the spawn checks (listed `flaky:` in `scripts/gate/xfail.txt`) | a hang the in-kernel suite does not see | reproduce under the gate, find the thread that does not run |
 | C5 | Taoxichuan and Shanghai have no boxes (`current_box_id` is 0); Denver has them (`docs/archive/DENVER_BOX_WIRING.md`), but a writable `MAP_SHARED` of a boxed file is `ENODEV`, and seccomp and private namespaces in a Denver box are untested | the ecosystem demo and nested boxes need them | convergence step 4, or the demo uses the main kernel or Denver |
 | C6 | The gate boots amd64 only | aarch64 kernels are built, not booted | an aarch64 rig that runs under the budget (the Mac, or KVM on an aarch64 host) |
