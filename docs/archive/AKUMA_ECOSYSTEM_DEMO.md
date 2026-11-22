@@ -143,7 +143,7 @@ lands.
 
 **What it does need, found while reading the tree:**
 
-* **Boxes on the guest kernel.** Denver (a tokio kernel) has no box support: no `box` syscalls, `current_box_id` is `0`
+* **Boxes on the guest kernel.** *(Correction 2026-11-22: Denver has an opt-in (solid, not experimental) `containers` feature, `DENVER_BOX_WIRING.md`; the sentence below is the 2026-11-19 planning state and is stale for Denver. Taoxichuan and Shanghai still have none.)* Denver (a tokio kernel) had no box support: no `box` syscalls, `current_box_id` is `0`
   (`KERNEL_CONVERGENCE.md`). So "box: rust" and "box: scala" on a Denver guest do not exist today. Three ways out, in order of
   cost: (a) guest 1 is the **main amd64 kernel** (boxes, `box`, Codex already run there) if a JDK/Scala toolchain works on it,
   unverified; (b) B and C run as plain processes with separate workspaces and the demo says so; (c) wire the box registry into

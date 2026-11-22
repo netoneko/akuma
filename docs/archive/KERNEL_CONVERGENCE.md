@@ -38,7 +38,7 @@ core), `akuma-user-access`, `akuma-mmu` / `akuma-user-space` / `akuma-cow` (memo
 
 * **Nested boxes** (`AKUMA_NESTED_BOXES.md`) need a box registry, a per-namespace socket policy and a builder authority. Those
   exist on one family only. Building them there deepens the split; building them where both can reach them is convergence.
-* **The demo** (`AKUMA_ECOSYSTEM_DEMO.md`) runs agents in boxes on Denver guests, and Denver has no boxes. Either the guest is
+* **The demo** (`AKUMA_ECOSYSTEM_DEMO.md`) runs agents in boxes on Denver guests, and Denver has no boxes *(by default; correction 2026-11-22: the opt-in `containers` feature wires them, `DENVER_BOX_WIRING.md`)*. Either the guest is
   the main kernel (boxes yes, JVM unverified) or Denver gains boxes. That is the same decision.
 * The tokio kernels now sit inside the merge gate; the first run found three of their bugs in one afternoon. Drift will keep
   surfacing at that rate until the surfaces above are one implementation.
