@@ -145,10 +145,39 @@ model, `boxed-codex-probe.py`).
 Environment notes added by this round: `apply_patch: not found` costs C its first command again (open, see above); `ps -o pcpu`
 is unsupported in the busybox `ps` (agents work around it); `ps` shows `etime` frozen (identical for every process) on Denver.
 
+### Round 2 follow-up: `scala-cli run` on Denver, narrowed (2026-11-22)
+
+`scalarun.py` (plain or under a Codex exec session), `scalahang.py`, `reaperprobe.py` and `execthread-probe.py` against the Denver
+kernel from this branch (`containers,codex`) and the main amd64 kernel, same images, no agent unless stated.
+
+| test | main kernel | Denver |
+|---|---|---|
+| `scala-cli run` of a **server** (the rework board, `/health`) | n/a | answers in 37 s |
+| plain, a program that **exits** (JDK-only hello; `ujson` hello) | not run | **prints its output (`PLAIN_OK 55`) and the command never completes** |
+| plain, C's project (7 compile errors) | n/a | finishes in 33 s, errors printed |
+| under a Codex exec session (pty), C's project | **finishes, 64 s** | **hangs** |
+| under a Codex exec session, `ujson` hello | not run | **hangs** |
+| `wait4` from a thread other than the forking one (4 layouts, Python) | all reaped | all reaped |
+| threaded `execve` probe (host and box, success and failure, 3 each) | 0 failures | 0 failures |
+
+* **Not a regression from this session's merges.** `git bisect` over the 7 kernel-touching commits since `e00744db` (the commit the docs
+  say ran `scala-cli run` on Denver) found every one hanging on the `ujson` hello, **including `e00744db` itself**. The docs'
+  passing runs all ran *servers*, which never have to exit; no earlier test ran a program that terminates.
+* **The work completes; the process does not.** In the hello tree the app JVM has printed and finished (a zombie, `Z`, child of the
+  `scala-cli` JVM) and the parent JVM, left with one thread, never reaps it. Servers, plain compile errors and Rust (`cargo
+  build`, B's whole run) are fine. That also explains C's trial: it was not compiling, it was waiting on a build that had already
+  failed (under Codex's pty, where even the error exit hangs).
+* **Not the mechanisms tested here.** Cross-thread `wait4` and the static threaded-exec program both pass on Denver, so the stall
+  needs something the JVM does that those do not (a `jspawnhelper`/`vfork` spawn, signals, the process-reaper thread count, the
+  pty hangup). Open: a reproducer without a JVM, or a `strace_err`/serial trace of the final `wait4`/`exit_group`, on Denver.
+* **Consequence for the demo:** a Denver Scala agent can build and run a *server* (the reference board does), but an agent's own
+  test loop (`scala-cli run` of anything that exits, a compile error under Codex) stalls it. Until fixed, rerun C with the brief
+  telling it to run the board only in the background with output to a file, or run C's box on the main kernel.
+
 ## Next
 
 * Decide whether the contract spells out the error-precedence rule (400 vs 404).
-* Find the Denver Scala hang (see round 2), then rerun C.
+* Find why a terminating `scala-cli run` never completes on Denver (follow-up above), then rerun C on Denver.
 * The `apply_patch` symlink, the Scala brief's `--server=false`, and a probe for the `curl` `000` failures.
 
 ## Background
