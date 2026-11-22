@@ -224,7 +224,13 @@ impl akuma_net::wait_hooks::Machine for SocketWait {
         akuma_threading::wake_is_due(akuma_threading::earliest_wake_time(), uptime_us())
     }
     fn halt_available() -> bool { crate::lapic::timer_running() }
-    fn yield_before_relax() -> bool { crate::drivers::wireless_is_link() }
+    // A waiter that halts without yielding starves a READY thread: kernel code is not preempted here, so
+    // with as many waiting threads as cores (client, server and reader of a loopback echo) the third never
+    // runs, and the peer a waiter needs sits behind it until a timeout wakes the pass (C4,
+    // `docs/archive/AMD64_SOCKET_WAIT_STARVATION.md`). Yield first whenever anything is runnable.
+    fn yield_before_relax() -> bool {
+        crate::drivers::wireless_is_link() || akuma_threading::runnable_exists()
+    }
 }
 
 /// The twelve `NetRuntime` hooks this target fills — see the module header for

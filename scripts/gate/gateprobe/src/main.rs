@@ -417,11 +417,26 @@ fn udp_loopback() -> Result<String, String> {
     Ok("datagram delivered with the right source".into())
 }
 
+/// How far a check got, for the timeout line: a hang names the step it never left (the C4 hunt).
+static STAGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+static SENT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static SERVED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static ECHOED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn stage(n: usize) {
+    STAGE.store(n, std::sync::atomic::Ordering::SeqCst);
+}
+
 fn tcp_loopback() -> Result<String, String> {
+    stage(1); // bind
     let l = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
     let addr = l.local_addr().map_err(|e| format!("addr: {e}"))?;
+    stage(2); // server thread spawned
     let srv = thread::spawn(move || -> std::io::Result<usize> {
+        stage(3); // server thread running, in accept
         let (mut s, _) = l.accept()?;
+        stage(4); // accepted, echoing
         let mut total = 0;
         let mut buf = [0u8; 4096];
         loop {
@@ -430,20 +445,45 @@ fn tcp_loopback() -> Result<String, String> {
                 return Ok(total);
             }
             total += n;
+            SERVED.store(total, std::sync::atomic::Ordering::SeqCst);
             s.write_all(&buf[..n])?;
         }
     });
+    stage(5); // connecting
     let mut c = TcpStream::connect(addr).map_err(|e| format!("connect: {e}"))?;
+    stage(6); // connected
     let data: Vec<u8> = (0..65_536u32).map(|i| (i % 253) as u8).collect();
     let mut echoed = Vec::new();
     let mut rd = c.try_clone().map_err(|e| format!("clone: {e}"))?;
     let reader = thread::spawn(move || {
         let mut v = Vec::new();
-        let _ = rd.read_to_end(&mut v);
+        let mut b = [0u8; 4096];
+        while let Ok(n) = rd.read(&mut b) {
+            if n == 0 {
+                break;
+            }
+            v.extend_from_slice(&b[..n]);
+            ECHOED.store(v.len(), std::sync::atomic::Ordering::SeqCst);
+        }
         v
     });
-    c.write_all(&data).map_err(|e| format!("send: {e}"))?;
+    stage(7); // client sending
+    // One `write_all` of the whole buffer, as before; the wrapper only counts what each `write` accepted.
+    struct Counting<'a>(&'a mut TcpStream);
+    impl Write for Counting<'_> {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            let n = self.0.write(b)?;
+            SENT.fetch_add(n, std::sync::atomic::Ordering::SeqCst);
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.0.flush()
+        }
+    }
+    Counting(&mut c).write_all(&data).map_err(|e| format!("send: {e}"))?;
+    stage(8); // sent, half-closing
     c.shutdown(std::net::Shutdown::Write).map_err(|e| format!("shutdown: {e}"))?;
+    stage(9); // waiting for the reader
     echoed.extend(reader.join().map_err(|_| "reader panicked".to_string())?);
     let served = srv.join().map_err(|_| "server panicked".to_string())?.map_err(|e| format!("server: {e}"))?;
     if echoed != data || served != data.len() {
@@ -590,7 +630,7 @@ fn main() {
             }
             Err(_) => {
                 failed += 1;
-                println!("GATE {name} FAIL timed out after 20s");
+                println!("GATE {name} FAIL timed out after 20s (stage {}, sent {} served {} echoed {})", STAGE.load(std::sync::atomic::Ordering::SeqCst), SENT.load(std::sync::atomic::Ordering::SeqCst), SERVED.load(std::sync::atomic::Ordering::SeqCst), ECHOED.load(std::sync::atomic::Ordering::SeqCst));
             }
         }
         let _ = std::io::stdout().flush();

@@ -13,8 +13,8 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1692
-- **Docs contributing at least one fix:** 497
+- **Total distinct fixes counted:** 1693
+- **Docs contributing at least one fix:** 498
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -23,7 +23,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Memory & Virtual Memory | 205 | 12.1% | 73 |
 | Scheduler & Process Management | 160 | 9.5% | 54 |
 | SMP & Locking | 142 | 8.4% | 61 |
-| Networking | 104 | 6.1% | 38 |
+| Networking | 105 | 6.2% | 39 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.5% | 6 |
 | Toolchain & Self-Hosting | 94 | 5.6% | 14 |
@@ -34,7 +34,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Misc / Cross-cutting | 98 | 5.8% | 28 |
 | Console & Terminal | 63 | 3.7% | 22 |
 | Containers | 79 | 4.7% | 15 |
-| **Total** | **1692** | **100.0%** | **497** |
+| **Total** | **1693** | **100.0%** | **498** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1272,7 +1272,7 @@ aren't recorded anywhere else.)
 ### docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md
 - xHCI `KEYS` deadlocked one core (unmasked reader preempted onto the pump spinning on the masked producer's lock); now an `IrqSpinlock`
 
-## Networking (104 fixes, 38 docs)
+## Networking (105 fixes, 39 docs)
 
 ### docs/archive/KVM_RELAY_SYN_STALL.md
 - The KVM host relay wedged on the ryzen under overlapping sessions: a forward slot reused one source port for every connection and the gateway's TCP sent its SYN once (no retransmit), so a guest holding the previous connection on that tuple never answered, the slot stayed `connecting`, the listen backlog filled and the port refused. Fixed with a rotating source-port generation per slot and a SYN retry (4 s) that gives up by resetting the client (`Gateway::fwd_reopen`, `relay.rs`); the SYNs a first 1.5 s retry chased were slow, not lost
@@ -1454,6 +1454,9 @@ aren't recorded anywhere else.)
 - AF_INET `sendmsg` sent and `recvmsg` filled only the first iovec
 - `msg_iovlen` was unbounded into an infallible `vec!` (up to 64 GiB); over `UIO_MAXIOV` is `EMSGSIZE`
 - UDP blocking `recv` ignored `SO_RCVTIMEO` (a fixed 10 s), and socket timeouts expired as `ETIMEDOUT` instead of `EAGAIN`
+
+### docs/archive/AMD64_SOCKET_WAIT_STARVATION.md
+- the main amd64 kernel's socket wait halted without yielding while another thread was READY, and ring 0 is not preempted there: with more waiting threads than cores (loopback echo client, server and reader) the peer a waiter needed never ran until an unrelated timeout, so `tcp_loopback` stalled for 20 s in about 1 boot in 8; `SocketWait::yield_before_relax` now yields when `runnable_exists()`
 
 ## Userspace Apps & Libraries (59 fixes, 25 docs)
 
