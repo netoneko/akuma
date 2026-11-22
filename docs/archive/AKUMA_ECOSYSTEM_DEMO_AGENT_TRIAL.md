@@ -180,10 +180,25 @@ The static `execpost` probe exposed leader-slot reuse after a non-leader `execve
 
 A remaining Codex-session stall was traced separately to missing Tokio PTY reference hooks, which could report hangup while the slave was still open and stop output draining. See [TOKIO_PTY_REFERENCE_HANG.md](TOKIO_PTY_REFERENCE_HANG.md). After the fix, the JDK hello returned 0 and the broken C project returned 1 for compile errors under Codex; the full agent trial has not been rerun.
 
+## Round 3: agent C on Denver after the two fixes (2026-11-22/23)
+
+Denver (`containers,codex`) at `89f4c33a` (the exec leader-slot fix `64a55fab` and the PTY reference fix), agent C alone
+(`agents.py --only scala`), the same brief, `glm-5.3-flash`.
+
+| | round 2 (before the fixes) | round 3 |
+|---|---|---|
+| agent finished | no: stalled 40 minutes in `scala-cli run` | **rc=0 after 1178 s** |
+| board answers `/health` from guest 2 | not reached | **yes** |
+| reference suite (`judge.py`, both services, from guest 2) | not run | **rc=0, 2 of 2 tests, 67 s** (B's round-2 git service + this board) |
+
+The agent's own loop (`scala-cli run`, compile, curl its endpoints, edit, repeat) ran under Codex's pty without a stall for the
+whole 20 minutes. This closes the round 2 question: the Denver stall was the two kernel defects, not the brief or the model.
+The "git service NOT answering" line of this run is expected: only the Scala agent was started.
+
 ## Next
 
 * Decide whether the contract spells out the error-precedence rule (400 vs 404).
-* Rerun C on Denver after validating the two fixes above.
+* Run the full three-agent trial on Denver once more (B and D were not rerun in round 3).
 * The `apply_patch` symlink, the Scala brief's `--server=false`, and a probe for the `curl` `000` failures.
 
 ## Background
