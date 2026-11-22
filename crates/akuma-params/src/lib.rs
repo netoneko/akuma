@@ -19,6 +19,13 @@
 
 pub mod init;
 
+/// The boot-supplied Unix time in microseconds, if valid and representable.
+#[must_use]
+pub fn epoch_us(line: &str) -> Option<u64> {
+    let secs = Params::new(line, "").value("epoch")?.parse::<u64>().ok()?;
+    secs.checked_mul(1_000_000).filter(|&us| us != 0)
+}
+
 use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
 
 use akuma_primitives::{OnceCopy, TakeOnce};
@@ -185,6 +192,14 @@ mod tests {
     use super::*;
 
     const LINE: &str = "init=/bin/herd smp=4 mw.nodl.log=0 mw.signed.key=ab12 mw.nodlx.log=9 xmw.nodl.log=7";
+
+    #[test]
+    fn epoch_is_a_whole_representable_nonzero_seconds_token() {
+        assert_eq!(epoch_us("xepoch=12 epoch=1700000000 init=/bin/x"), Some(1_700_000_000_000_000));
+        for line in ["", "epoch=", "epoch=0", "epoch=-1", "epoch=abc", "epoch=18446744073709551615"] {
+            assert_eq!(epoch_us(line), None, "{line}");
+        }
+    }
 
     #[test]
     fn a_view_sees_only_its_namespace() {

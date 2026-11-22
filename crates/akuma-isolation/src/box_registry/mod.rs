@@ -52,10 +52,12 @@ use akuma_primitives::Pid;
 pub struct BoxId(pub u64);
 
 impl BoxId {
-    pub const HOST: BoxId = BoxId(0);
+    pub const HOST: Self = Self(0);
 }
 
-/// The box a *caller* is in, as distinct from the box it is acting on. The access rule is directional (an ancestor may
+/// The box a *caller* is in, as distinct from the box it is acting on.
+///
+/// The access rule is directional (an ancestor may
 /// act on a descendant, not the reverse), so `can_access_box(source, target)` with its two ids swapped used to compile
 /// and silently invert the policy; they are different types now.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

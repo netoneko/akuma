@@ -130,6 +130,8 @@ pub(super) fn sys_socket(domain: i32, sock_type: i32, _proto: i32) -> u64 {
         return EINVAL;
     }
     if let Some(idx) = socket::alloc_socket(base_type) {
+        let private = akuma_exec::box_registry::is_private_ns(super::caller_box_and_pid().0);
+        socket::set_private_loopback(idx, private);
         if let Some(proc) = akuma_exec::process::current_process_shared() {
             let fd = proc.alloc_fd(akuma_exec::process::FileDescriptor::Socket(idx));
             if cloexec {
@@ -241,18 +243,39 @@ pub(super) fn sys_socketpair(domain: i32, sock_type: i32, _proto: i32, sv_ptr: U
 #[cfg(feature = "smoltcp")]
 const METADATA_IP: [u8; 4] = [169, 254, 169, 254];
 
-/// Whether the caller may send to `ip`. Everything is allowed but one address:
-/// the metadata service, which only the host root may reach. A service that
-/// is compromised, or a program in a box, must not be able to read the
-/// machine's cloud credentials with one HTTP request
-/// (`docs/archive/SECURITY_AUDIT_2026_11_16.md` H4).
+/// Destination policy for the shared IPv4 stack.
 #[cfg(feature = "smoltcp")]
-fn egress_allowed(ip: [u8; 4]) -> bool {
-    ip != METADATA_IP || akuma_exec::process::caller_is_host_root()
+fn destination_allowed(ip: [u8; 4], private_ns: bool, host_root: bool) -> bool {
+    if private_ns && (ip[0] == 127 || ip == [0; 4]) {
+        return false;
+    }
+    ip != METADATA_IP || host_root
 }
 
-/// Ports below this are the privileged ones: only uid 0 binds them, as on
-/// Linux, so an unprivileged program cannot stand in for sshd or a web server.
+#[cfg(all(test, feature = "smoltcp"))]
+mod destination_tests {
+    use super::destination_allowed;
+
+    #[test]
+    fn private_namespaces_cannot_address_shared_loopback() {
+        for ip in [[127, 0, 0, 1], [127, 255, 255, 254], [0, 0, 0, 0]] {
+            assert!(!destination_allowed(ip, true, false));
+            assert!(destination_allowed(ip, false, true));
+            assert!(destination_allowed(ip, false, false));
+        }
+        assert!(destination_allowed([10, 0, 2, 2], true, false));
+        assert!(!destination_allowed([169, 254, 169, 254], true, false));
+        assert!(destination_allowed([169, 254, 169, 254], false, true));
+    }
+}
+
+#[cfg(feature = "smoltcp")]
+fn egress_allowed(idx: usize, ip: [u8; 4]) -> bool {
+    let private_ns = socket::with_socket(idx, |sock| sock.private_loopback).unwrap_or(true);
+    destination_allowed(ip, private_ns, akuma_exec::process::caller_is_host_root())
+}
+
+/// Only host root can bind privileged ports on the shared smoltcp stack.
 #[cfg(feature = "smoltcp")]
 const UNPRIVILEGED_PORT_START: u16 = 1024;
 
@@ -276,7 +299,7 @@ pub(super) fn sys_bind(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
     akuma_primitives::safe_print!(96, "[syscall] bind(fd={}, port={}, ip={}.{}.{}.{})\n", fd, addr.port, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3]);
     if addr.port != 0
         && addr.port < UNPRIVILEGED_PORT_START
-        && !akuma_exec::process::current_creds().is_root()
+        && !akuma_exec::process::caller_is_host_root()
     {
         return neg_errno(libc_errno::EACCES);
     }
@@ -378,16 +401,16 @@ pub(super) fn sys_connect(fd: u32, addr_ptr: UserAddr, len: usize) -> u64 {
         return EFAULT;
     }
     let addr = sa.to_addr();
-    if !egress_allowed(addr.ip) {
+    let idx = match get_socket_from_fd(fd) {
+        Some(i) => i,
+        None => return not_a_socket(fd),
+    };
+    if !egress_allowed(idx, addr.ip) {
         return neg_errno(libc_errno::EACCES);
     }
     if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
         akuma_primitives::safe_print!(96, "[syscall] connect(fd={}, ip={}.{}.{}.{}:{})\n", fd, addr.ip[0], addr.ip[1], addr.ip[2], addr.ip[3], addr.port);
     }
-    let idx = match get_socket_from_fd(fd) {
-        Some(i) => i,
-        None => return not_a_socket(fd),
-    };
     let nonblock = fd_is_nonblock(fd);
     match socket::socket_connect(idx, addr, nonblock) {
         Ok(()) => {
@@ -623,7 +646,7 @@ pub(super) fn sys_sendto(fd: u32, buf_ptr: UserAddr, len: usize, _flags: i32, de
                 return EFAULT;
             }
             let a = sa.to_addr();
-            if !egress_allowed(a.ip) {
+            if !egress_allowed(idx, a.ip) {
                 return neg_errno(libc_errno::EACCES);
             }
             // Gated like the DNS trace directly below it — this fires on EVERY
@@ -1417,7 +1440,7 @@ pub(super) fn sys_sendmsg(fd: u32, msg_ptr: UserAddr, _flags: i32) -> u64 {
                 msg.msg_name,
             );
             let a = sa.to_addr();
-            if !egress_allowed(a.ip) {
+            if !egress_allowed(idx, a.ip) {
                 return neg_errno(libc_errno::EACCES);
             }
             a

@@ -1,0 +1,11 @@
+#!/bin/sh
+# ws-init: make /work an (empty) git repository with a throwaway identity, once.
+# The identity comes from the launcher (AGENT_NAME) and is never a real person.
+cd /work || exit 1
+if [ ! -d .git ]; then
+    git init -q .
+    git config user.name "${AGENT_NAME:-agent} (demo)"
+    git config user.email "${AGENT_NAME:-agent}@demo.invalid"
+    git config init.defaultBranch main
+    echo "[ws-init] empty repository in /work for ${AGENT_NAME:-agent}"
+fi

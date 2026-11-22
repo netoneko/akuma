@@ -61,6 +61,37 @@ the box's recorded `creator_pid`.
 | `MOUNT_IN_NS` | caller must be box 0. With fstype `overlay` at `/`, the target box must additionally have **no processes** and a still-pristine root | `EPERM` |
 | `MOUNT` | caller must be box 0 (since 2026-08-11 — a boxed process could previously mount into its own namespace) | `EPERM` |
 | `UMOUNT2` | caller must be box 0 (since 2026-08-11 — a box could previously unmount anything but `/`); real since 2026-08-24, always `EBUSY` on `/` | `EPERM` |
+| `sethostname`, `setdomainname` | Host root | `EPERM` |
+| `syslog` (amd64) | Host root for reading, clearing and querying unread log bytes | `EPERM` |
+| Internet `bind` to ports 1–1023 on smoltcp | Host root | `EACCES` |
+| Process-targeted resource limits, priority and scheduling | Caller can see the target's box | `ESRCH` |
+
+Abstract AF_UNIX names are local to the box in which the socket was created. Pathname AF_UNIX sockets
+use the mount ID and inode resolved through the caller's filesystem view. Both
+must match the listener's identity, including when the pathname is exposed by
+a bind mount. An already-open Unix socket can be inherited across a namespace
+transition and remains usable.
+`/proc/mounts` and `/proc/<pid>/mountinfo` list only namespace mounts when
+the target has its own root.
+
+(Diagram of how boxes, the one smoltcp stack, the loopback ring and the pump threads relate: [`networking.md`](networking.md) § "Stacks, loopback, namespaces and the threads that drive them".)
+
+On the shared smoltcp stack, a private mount namespace cannot initiate IPv4
+traffic to `127.0.0.0/8` or `0.0.0.0`. Box 0 can use loopback normally.
+Sockets inherited from the parent retain their original loopback policy, including
+when connected or used for an addressed UDP send after the transition. Passing such
+a socket intentionally gives the recipient access to that socket's original context;
+launchers must close descriptors they do not intend to share. A private namespace
+therefore has no independently usable loopback network on this stack. Native
+smoltcp sockets currently support IPv4 only. Other network destinations retain
+their existing policy, including the metadata-address restriction.
+
+An explicit empty `capset` enables DAC checks for that credential state even
+when the global DAC switch is off. The dropped process retains uid 0 ownership
+and mode-bit permissions, but loses file permission overrides and cannot change
+its uid, gid or supplementary groups. Fork copies the state, threads share it,
+and exec retains it. A root-owned `0600` file remains readable by uid 0 after a
+drop. Ordinary host root keeps its overrides.
 
 `SubdirFs` resolves `.`/`..` and clamps at the virtual root before prefixing, so
 a `..` cannot ascend out of `box_root` even if a caller reaches the filesystem

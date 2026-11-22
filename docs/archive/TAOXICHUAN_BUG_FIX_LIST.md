@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 135
-- **Docs contributing at least one fix:** 44
+- **Total distinct fixes counted:** 140
+- **Docs contributing at least one fix:** 48
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 40 | 29.6% | 7 |
-| Exec & ELF Loading | 12 | 8.9% | 5 |
-| Processes, Fork, Threads & Scheduling | 35 | 25.9% | 10 |
-| Memory & Copy-on-Write | 18 | 13.3% | 7 |
-| Signals | 6 | 4.4% | 3 |
-| Networking & Readiness | 4 | 3.0% | 2 |
-| SMP, Time & Boot | 12 | 8.9% | 6 |
-| Build & Integration | 8 | 5.9% | 4 |
-| **Total** | **135** | **100.0%** | **44** |
+| Syscalls, Files & Pipes | 40 | 28.6% | 7 |
+| Exec & ELF Loading | 12 | 8.6% | 5 |
+| Processes, Fork, Threads & Scheduling | 36 | 25.7% | 11 |
+| Memory & Copy-on-Write | 20 | 14.3% | 8 |
+| Signals | 6 | 4.3% | 3 |
+| Networking & Readiness | 6 | 4.3% | 4 |
+| SMP, Time & Boot | 12 | 8.6% | 6 |
+| Build & Integration | 8 | 5.7% | 4 |
+| **Total** | **140** | **100.0%** | **48** |
 
 **Largest single write-ups:**
 
@@ -124,7 +124,7 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE.md
 - `place_segment` built a page two `PT_LOAD`s share eagerly for each segment in turn, so the second replaced the first's frame, dropping its exec bit and its bytes (sshd's `.text` tail read as zeros, an instruction abort at start); it copies every overlapping segment into the page and keeps the first mapping, as the main kernel does
 
-## Processes, Fork, Threads & Scheduling (35 fixes, 10 docs)
+## Processes, Fork, Threads & Scheduling (36 fixes, 11 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `child_enter` (naked asm) loaded `ef.rsi` early and kept dereferencing the loaded value: a page fault at `cr2=0x20` on the first real SPAWN (stage 6B)
@@ -181,7 +181,10 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 - `exit_group`'s `kill_siblings` decided from the state word whether a sibling was executing, but on the hooked scheduler the `ON_CPU` gate says that: a thread another core had just picked, and the leader (marked terminated unconditionally by `task_exit_code`), kept running in user mode while the reap freed its frames, so killtree faulted in about half the smp=4 boots; `x86_hold_off_cpu` holds the gate, and a thread that cannot be held is asked to end itself
 - The amd64 fault report read `CR2` live after `lazy::fill`, which can park on a disk read, so it (and `grow_user_stack`) could act on another task's fault address; it is captured once at entry
 
-## Memory & Copy-on-Write (18 fixes, 7 docs)
+### docs/archive/DENVER_BOX_WIRING.md
+- a second `box run` in one boot panicked in `activate` because a reused slot's task record still held the previous process's freed root (`spawn` publishes the thread before `bind_child_task`); `zombie_root` zeroes the record when the root is handed over, and the spawn-child re-load reads the record after `set_task_slot`
+
+## Memory & Copy-on-Write (20 fixes, 8 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `mmap` demanded `fd == -1` for `MAP_ANONYMOUS` while libakuma passes 0 (Linux ignores it), so sshd's first allocation answered `ENODEV` (stage 4)
@@ -215,6 +218,10 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 - the W^X policy refused RWX and RW to R+X, which is HotSpot's code cache, so the JVM died at init; `wx-relaxed` answers Allow (`RWX PASS rw_to_rx=42`)
 - no legacy vsyscall page and no vDSO, so `libjvm.so`'s hardcoded `0xffffffffff600800` took a ring-3 instruction fault (`code=0x14`); the page is mapped user-RX from the kernel root and an exports-free vDSO ELF is disclosed as `AT_SYSINFO_EHDR` (`vsyscall`)
 
+### docs/archive/DENVER_BOX_WIRING.md
+- lazy PTE records, the pin table, `akuma_fpcache` and `shmpages` named files by root-filesystem inode only, so a dynamic musl program in a Denver box died on its first library `mmap` (`ENODEV`); the record's inode field is now mount-qualified (`slot<<24 | inode`) and reads go through the process's namespace
+- a box's first process (started by `akuma-exec`'s `spawn`) had no task-record regions, so every `mprotect`/`mmap` range failed `user_ok` ("sh: out of memory"); `twin_enter_user` re-loads it through `proc::exec_strs`
+
 ## Signals (6 fixes, 3 docs)
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
@@ -229,7 +236,10 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 ### docs/archive/DENVER_BRANCH_FIXES.md
 - a synchronous ring-3 fault killed the task instead of reaching its SIGSEGV handler, so `javac`'s JIT-compiled implicit null checks died; `faultsig.rs` ports the metal's fault-to-signal path and restores from the ucontext at `rt_sigreturn` (`fault-signal`, `bdf3a2b2`)
 
-## Networking & Readiness (4 fixes, 2 docs)
+## Networking & Readiness (6 fixes, 4 docs)
+
+### docs/archive/AARCH64_TOKIO_SOCKET_PARK.md
+- AArch64 platform socket waits halted instead of parking user tasks, starving a loopback peer on one CPU; published user tasks now use timed scheduler parks.
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `getsockname` wrote `sin_family` in host byte order (`to_be_bytes`), so c-ares read `0x0200` (stage 9)
@@ -238,6 +248,9 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ### docs/archive/TAOXICHUAN_TOKIO_MULTI_EPOLL_FINDING.md
 - an edge-triggered eventfd reported only its first wake: mio's waker is written on every wake and never read, so a rising-edge-only model lost the rest and tokio's multi-thread runtime progressed only on its timeout; `epoll::on_eventfd_written` re-arms every `EPOLLET` entry naming the eventfd (GET 24,968 ms -> 53 ms)
+
+### docs/archive/TOKIO_KERNELS_LOOPBACK_STARVATION.md
+- a blocking `accept` ran the wait loop's idle hooks (pump and halt) without offering the core to the scheduler, and ring 0 is not preempted on these kernels, so the sibling thread sleeping before its `connect` was never readied and loopback accept/connect across threads wedged on Taoxichuan, Shanghai and Denver; `NetMachine::can_park` makes a wait lap call `schedule_blocking`
 
 ## SMP, Time & Boot (12 fixes, 6 docs)
 
@@ -355,6 +368,7 @@ Scanned 2026-11-02, closing `rust-org-il-experiment`.
   UNLINKED_FILE_SPACE_RETURNED_LATE's Taoxichuan pin range here and its ext2 drain in `BUG_FIX_LIST.md`; the dated note in
   TAOXICHUAN_LAZY_MMAP points at it and adds no fix.
 - **Scanned 2026-11-08** (closing `post-release-improvements`). Counted above: TAOXICHUAN_BKL_NESTED_TICKET_DEADLOCK, TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE, TAOXICHUAN_LOADER_SHARED_SEGMENT_PAGE, INFINITY_ON_TAOXICHUAN's aarch64 stack growth and TAOXICHUAN_B21_AARCH64's build break. TAOXICHUAN_B21_AARCH64's other entries are steps and measurements; its aarch64 `mremap` was a syscall the kernel had never served, and its `CR2` fix is counted under TAOXICHUAN_KILL_SIBLINGS_ON_CPU_RACE. TAOXICHUAN_SYSCALL_MIDDLEWARE is a capability (the middleware crates, `signed-exec`, `no-dynamic-loading`); the rig bugs it records (a signed-assets directory named like the staged kernel, a 32 MB gate image filled by five probe copies) and TAOXICHUAN_B21_AARCH64's Alpine-mirror 404 are tooling, uncounted. The `ETXTBSY` and signal fixes it led to are in `BUG_FIX_LIST.md`.
+- **Scanned 2026-11-20** (`ecosystem-demo-stage1`). Counted above: TOKIO_KERNELS_LOOPBACK_STARVATION and DENVER_BOX_WIRING (three fixes: boxed file mappings, spawn-child regions, the second box's stale root). The main-kernel fixes of the same branch (EXEC_FROM_THREAD_DETACH, `getcpu`, the box-0 policy) are in `BUG_FIX_LIST.md`.
 
 
 ## Background

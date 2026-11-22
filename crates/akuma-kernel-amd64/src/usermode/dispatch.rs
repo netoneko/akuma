@@ -186,6 +186,22 @@ pub fn syscall_dispatch(nr: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64, a6
         _ => {}
     }
 
+    // `getcpu(2)` — 309 on x86_64, 168 asm-generic, so it is NOT in the identical-number
+    // list below and has no `Syscall` row (`akuma_syscalls_abi::x86_64::GETCPU` is a
+    // hand-written const for exactly this reason). musl's `sched_getcpu` and HotSpot ask
+    // for it at startup; on `ENOSYS` HotSpot falls back to the legacy vsyscall page
+    // (0xffffffffff600800), which this kernel does not map, and the JVM dies with SIGSEGV
+    // before `main` (`docs/archive/AKUMA_ECOSYSTEM_DEMO.md`, stage 1). The decision and the
+    // user copies are glue's host-tested `sys_getcpu`, the same function Denver wires behind
+    // its `getcpu` feature; the calling core comes from this machine half.
+    if nr == akuma_syscalls_abi::x86_64::GETCPU {
+        return akuma_syscalls_glue::sched::sys_getcpu(
+            akuma_syscalls_glue::UserAddr::new(a1),
+            akuma_syscalls_glue::UserAddr::new(a2),
+            crate::smp::cpu_index_u32(),
+        );
+    }
+
     // The **shared-number** syscalls, and nothing else.
     //
     // A third category next to the x86-only legacy list above and the neutral
@@ -642,9 +658,11 @@ fn fs(call: Syscall, a: [u64; 6]) -> Option<u64> {
                 akuma_syscalls_glue::UserAddr::new(a3),
                 a4,
             );
+            #[cfg(feature = "vfat")]
+            let handled = ours.unwrap_or_else(|| to_glue(call, [a1, a2, a3, a4, a5, 0]));
             #[cfg(not(feature = "vfat"))]
-            let ours: Option<u64> = None;
-            ours.unwrap_or_else(|| to_glue(call, [a1, a2, a3, a4, a5, 0]))
+            let handled = to_glue(call, [a1, a2, a3, a4, a5, 0]);
+            handled
         }
         Syscall::Umount2 => to_glue(call, [a1, a2, 0, 0, 0, 0]),
         // `pivot_root(new_root, put_old)` — glue's arm (`sc-private-ns`); `EPERM` for everyone but the builder of a
@@ -942,7 +960,28 @@ fn process(call: Syscall, a: [u64; 6]) -> Option<u64> {
         }
         // `execve(path, argv, envp)` — x86_64 59: the current (spawned or
         // forked) task replaces its own image in place. See `sys_execve`.
-        Syscall::Execve => sys_execve(akuma_syscalls_glue::UserAddr::new(a1), akuma_syscalls_glue::UserAddr::new(a2), akuma_syscalls_glue::UserAddr::new(a3)),
+        Syscall::Execve => {
+            // From a thread with live siblings the exec cannot replace the group's address space
+            // under them: detach (see `sys_execve_detached`).
+            if !crate::thread::current_is_main()
+                && current_process().is_some_and(|p| crate::thread::live_count(p.tgid) > 1)
+            {
+                return Some(match sys_execve_detached() {
+                    // The old image is gone, as on Linux: end the whole old group, the way
+                    // `exit_group` from a thread does. (Leaving only this thread would strand
+                    // the others, and the leader's `pthread_join` on it, for good.)
+                    Ok(()) => {
+                        if let Some(p) = akuma_exec::process::current_process_shared() {
+                            crate::thread::exit_group_from_thread(p.tgid, 0);
+                        }
+                        exit_current_group();
+                        0
+                    }
+                    Err(e) => e,
+                });
+            }
+            sys_execve(akuma_syscalls_glue::UserAddr::new(a1), akuma_syscalls_glue::UserAddr::new(a2), akuma_syscalls_glue::UserAddr::new(a3))
+        }
         Syscall::Clone => {
             // `CLONE_VM` is the fork/thread fork in the road, and the only one:
             // with it the caller wants to share an address space

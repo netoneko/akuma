@@ -123,11 +123,9 @@ pub fn eventfd_close(id: u32) {
 }
 
 pub fn eventfd_add_poller(id: u32, tid: usize) {
-    (|| {
-        if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
-            efd.pollers.insert(tid, wake_handle_for_thread(tid));
-        }
-    })();
+    if let Some(efd) = EVENTFDS.lock().get_mut(&id) {
+        efd.pollers.insert(tid, wake_handle_for_thread(tid));
+    }
 }
 
 pub(super) fn sys_eventfd2(initval: u32, flags: u32) -> u64 {

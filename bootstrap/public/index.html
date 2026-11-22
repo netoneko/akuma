@@ -2,23 +2,254 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Akuma</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#090a0e">
+<meta name="description" content="Akuma: a self-hosting Rust kernel, and experiments in building operating systems from crates.">
+<title>Akuma — composable platform kernel</title>
 <style>
-  html, body { height: 100%; margin: 0; background: #000; }
-  body { display: grid; place-items: center; }
-  a {
-    color: #fff;
-    font: 1rem/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-    letter-spacing: 0.08em;
-    text-decoration: none;
-    padding: 0.8rem 1.2rem;
-    border: 1px solid #333;
-  }
-  a:hover, a:focus-visible { border-color: #fff; outline: none; }
+  :root { color-scheme: dark; --bg:#090a0e; --panel:#101219; --ink:#eeeee9; --muted:#a1a4aa; --line:#32363d; --pink:#ff3c78; --cyan:#71e8dd; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+  * { box-sizing:border-box; }
+  html { background:var(--bg); }
+  body { margin:0; color:var(--ink); font-family:var(--mono); background:radial-gradient(ellipse at 85% 10%,#2c1324 0,transparent 36%),linear-gradient(#ffffff06 1px,transparent 1px),var(--bg); background-size:auto,100% 44px,auto; }
+  a { color:inherit; }
+  a:focus-visible { outline:2px solid var(--cyan); outline-offset:4px; }
+  .wrap { width:min(1240px,calc(100% - 3rem)); margin:auto; }
+  .topbar { min-height:76px; display:flex; align-items:center; justify-content:space-between; gap:1rem; border-bottom:1px solid var(--line); }
+  .brand { display:flex; align-items:center; gap:.7rem; text-decoration:none; font-weight:800; letter-spacing:.15em; }
+  .brand-mark { color:var(--pink); font-size:1.8rem; line-height:1; }
+  .top-links { display:flex; gap:1.5rem; align-items:center; font-size:.72rem; text-transform:uppercase; letter-spacing:.1em; }
+  .top-links a { text-decoration:none; color:#c8c9cb; }
+  .top-links a:hover { color:var(--cyan); }
+  .hero { display:grid; grid-template-columns:1.1fr .9fr; gap:4rem; align-items:center; padding:clamp(5rem,10vw,9rem) 0 5rem; }
+  .eyebrow, .label { color:var(--cyan); font-size:.7rem; letter-spacing:.16em; text-transform:uppercase; }
+  .eyebrow::before { content:'●'; color:var(--pink); margin-right:.75rem; }
+  h1 { font-family:Arial,Helvetica,sans-serif; font-size:clamp(3.2rem,8vw,7.2rem); letter-spacing:-.075em; line-height:.82; margin:1.8rem 0; text-transform:uppercase; }
+  h1 span { color:var(--pink); }
+  .intro { color:#c2c4c7; max-width:38rem; font-size:clamp(.95rem,1.35vw,1.12rem); line-height:1.75; }
+  .intro strong { color:var(--ink); font-weight:500; }
+  .hero-links { display:flex; flex-wrap:wrap; gap:1rem; margin-top:2.2rem; }
+  .button { display:inline-flex; align-items:center; gap:1.5rem; padding:1rem 1.15rem; text-decoration:none; font-size:.75rem; font-weight:bold; letter-spacing:.04em; border:1px solid #5d6065; transition:background .15s,color .15s,border-color .15s; }
+  .button.primary { color:#090a0e; background:var(--cyan); border-color:var(--cyan); }
+  .button:hover { background:var(--pink); border-color:var(--pink); color:#090a0e; }
+  .terminal { border:1px solid #54515a; background:#0d0f15; box-shadow:12px 12px 0 #ff3c7818; min-width:0; }
+  .terminal-bar { display:flex; justify-content:space-between; gap:1rem; border-bottom:1px solid var(--line); padding:.8rem 1rem; color:var(--muted); font-size:.65rem; letter-spacing:.1em; text-transform:uppercase; }
+  .terminal-bar span:last-child { color:var(--pink); }
+  .terminal-inner { padding:1.4rem; overflow:hidden; }
+  .source-code { overflow-x:auto; margin:0; color:#d1d3d6; font:.7rem/1.65 var(--mono); white-space:pre; }
+  .akuma-logo { color:var(--pink); font:bold clamp(.4rem,.8vw,.7rem)/1.12 var(--mono); margin:0 auto 2rem; width:max-content; max-width:100%; }
+  .terminal-code { color:#b8b9bd; border-top:1px solid var(--line); padding-top:1.25rem; font-size:.72rem; line-height:2; }
+  .terminal-code b { color:var(--cyan); font-weight:normal; }
+  .terminal-code .dim { color:#777d85; }
+  .capabilities { border-top:1px solid var(--line); padding:5rem 0 0; }
+  .kernel-tiles { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); margin-top:2.5rem; }
+  .kernel-tile { min-width:0; background:var(--panel); padding:1.5rem; }
+  .kernel-tile h3 { margin:0; font:700 1.5rem Arial,Helvetica,sans-serif; }
+  .kernel-description { color:var(--muted); font-size:.75rem; line-height:1.65; margin:.7rem 0 0; }
+  .kernel-art { color:var(--cyan); font:400 .48rem/1.15 var(--mono); white-space:pre; overflow-x:auto; min-height:8.5rem; margin:1.5rem 0; }
+  .kernel-tile:nth-child(odd) .kernel-art { color:var(--pink); }
+  .features { display:flex; flex-wrap:wrap; gap:.5rem; }
+  .features span { border:1px solid #3b4149; padding:.4rem .55rem; color:#c9cccf; font-size:.65rem; }
+  .features .partial { color:#ffac79; border-color:#765743; }
+  .stats-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:1px; border:1px solid var(--line); background:var(--line); }
+  .stat { background:var(--panel); padding:1.7rem; }
+  .stat strong { display:block; color:var(--cyan); font:700 clamp(2rem,3.5vw,3.4rem)/1 Arial,Helvetica,sans-serif; letter-spacing:-.04em; }
+  .stat .open-models { color:var(--pink); }
+  .stat p { color:var(--muted); font-size:.75rem; line-height:1.6; margin:1rem 0 0; }
+  .stat a { color:var(--ink); }
+  .section { padding:6rem 0; }
+  .section-head { display:flex; align-items:end; justify-content:space-between; gap:2rem; margin-bottom:2rem; }
+  .section-head h2 { font:700 clamp(2.2rem,5vw,4.5rem)/.95 Arial,Helvetica,sans-serif; letter-spacing:-.055em; margin:.8rem 0 0; text-transform:uppercase; }
+  .section-head p { color:var(--muted); max-width:22rem; line-height:1.6; font-size:.8rem; margin:0; }
+  .talks { display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line); border:1px solid var(--line); }
+  .talk { background:var(--panel); padding:clamp(1.5rem,3vw,2.5rem); display:flex; flex-direction:column; min-width:0; min-height:380px; text-decoration:none; transition:background .2s; }
+  .talk:hover { background:#1a1921; }
+  .talk-meta { display:flex; justify-content:space-between; gap:1rem; color:var(--cyan); font-size:.68rem; letter-spacing:.1em; text-transform:uppercase; }
+  .talk-meta span:last-child { color:var(--muted); }
+  .talk-banner { color:var(--cyan); font:400 clamp(.36rem, .8vw, .65rem)/1.15 var(--mono); white-space:pre; margin:2.5rem 0 2rem; overflow-x:auto; }
+  .talk-banner.akuma { color:var(--pink); }
+  .talk-banner.denver { color:var(--pink); }
+  .talk h3 { font:700 clamp(1.7rem,3vw,2.8rem)/1 Arial,Helvetica,sans-serif; letter-spacing:-.045em; margin:auto 0 .8rem; max-width:24rem; }
+  .talk p { color:var(--muted); font-size:.78rem; line-height:1.65; max-width:31rem; margin:0; }
+  .talk .go { display:block; margin-top:1.8rem; color:var(--cyan); font-size:.72rem; letter-spacing:.07em; }
+  .talk:hover .go { color:var(--pink); }
+  .more { display:grid; grid-template-columns:1fr 1fr; gap:1px; border:1px solid var(--line); border-top:0; background:var(--line); }
+  .more a { display:flex; justify-content:space-between; gap:1.5rem; align-items:center; background:#0d0f14; padding:1.5rem; text-decoration:none; line-height:1.5; font-size:.8rem; }
+  .more a:hover { background:#1a1921; color:var(--cyan); }
+  .more small { display:block; color:var(--muted); text-transform:uppercase; letter-spacing:.1em; font-size:.62rem; margin-bottom:.5rem; }
+  .arrow { color:var(--pink); font-size:1.2rem; }
+  footer { border-top:1px solid var(--line); padding:2rem 0 3rem; color:var(--muted); font-size:.68rem; line-height:1.7; }
+  .footer-inner { display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
+  footer a { color:var(--ink); text-decoration:none; }
+  footer a:hover { color:var(--cyan); }
+  @media (max-width:800px) { .hero { grid-template-columns:1fr; gap:3rem; padding-top:4rem; } .terminal { max-width:35rem; } .akuma-logo { font-size:clamp(.45rem,1.25vw,.7rem); } .talks,.more,.kernel-tiles { grid-template-columns:1fr; } .stats-grid { grid-template-columns:repeat(2,1fr); } .talk { min-height:340px; } .talk-banner { font-size:clamp(.36rem, 1.5vw, .65rem); } .section-head { align-items:start; flex-direction:column; } }
+  @media (max-width:480px) { .wrap { width:calc(100% - 2rem); } .top-links { gap:.8rem; font-size:.63rem; } h1 { font-size:clamp(2.8rem,12.8vw,4rem); } .section { padding:4rem 0; } .terminal-inner { padding:1.5rem 1rem; } }
 </style>
 </head>
 <body>
-<a href="https://github.com/netoneko/akuma">github.com/netoneko/akuma</a>
+<header class="wrap topbar">
+  <a class="brand" href="/" aria-label="Akuma home"><span class="brand-mark" aria-hidden="true">悪</span> AKUMA</a>
+  <nav class="top-links" aria-label="Main navigation"><a href="#talks">Talks</a><a href="https://github.com/netoneko/akuma">GitHub ↗</a></nav>
+</header>
+<main class="wrap">
+  <section class="hero" aria-labelledby="hero-title">
+    <div>
+      <div class="eyebrow">Bohemian operating system</div>
+      <h1 id="hero-title">Compose<br><span>your own</span> kernel</h1>
+      <p class="intro">A platform kernel assembled from crates to fit your runtime. <strong>Akuma is an experiment at building a durable and minimal operating system that can sustain its own development needs.</strong></p>
+      <div class="hero-links"><a class="button primary" href="#talks">EXPLORE THE TALKS <span aria-hidden="true">↘</span></a><a class="button" href="https://github.com/netoneko/akuma">VIEW THE SOURCE <span aria-hidden="true">↗</span></a></div>
+    </div>
+    <div class="terminal" aria-label="Example source code">
+      <div class="terminal-bar"><span>main.rs</span><span>rust</span></div>
+      <div class="terminal-inner">
+        <pre class="akuma-logo" aria-label="Akuma logo">                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+                  ::::---#@%%*</pre>
+        <pre class="source-code"><code>#![no_std]
+#![no_main]
+
+akuma_tokio_kernel::entry!(main);
+
+fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
+    kernel
+        .name(&quot;Akuma&quot;)
+        .banner(include_str!(&quot;banner.txt&quot;))
+        .console()
+        .disk()
+        .net()
+        .smp()
+        .run_init()
+}
+</code></pre>
+      </div>
+    </div>
+  </section>
+  <section class="capabilities" aria-labelledby="capabilities-title">
+    <div class="section-head"><div><span class="label">00 / the kernel family</span><h2 id="capabilities-title">Shared roots.<br>Different missions.</h2></div><p>A family of kernels composed from shared foundations, each built to run a specific runtime.</p></div>
+    <div class="kernel-tiles" aria-label="Kernel capabilities as tiles">
+      <article class="kernel-tile"><h3>Akuma</h3><p class="kernel-description">Linux ABI compatible OS and hypervisor. Runs on AWS and on amd64 Ryzen laptop and is used to develop itself and other kernels</p><pre class="kernel-art" aria-label="Akuma banner">                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+                  ::::---#@%%*</pre><div class="features"><span>Rust / Tokio</span><span>Python</span><span>amd64</span><span>aarch64</span><span>JVM</span><span>Containers</span><span>KVM host</span></div></article>
+      <article class="kernel-tile"><h3>Denver</h3><p class="kernel-description">A JVM platform kernel composed from Akuma crates, built to run Clojure and Scala.</p><pre class="kernel-art" aria-label="Denver banner">   /\        /\        /\        /\        /\
+  /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
+ /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
+_/                                    \_     Beans System Debauchery:
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       kernel for Clojure
+</pre><div class="features"><span>Rust / Tokio</span><span>Python</span><span>amd64</span><span>aarch64</span><span>JVM</span><span class="partial">Containers · experimental</span></div></article>
+      <article class="kernel-tile"><h3>Taoxichuan</h3><p class="kernel-description">A self-hosting kernel born from an experiment with open models.</p><pre class="kernel-art" aria-label="Taoxichuan banner">                                   ||==================||
+       )  (                        ||   TAOXICHUAN     ||
+      (    )                       ||                  ||
+     )  (  (                       ||        陶        ||
+     /\/\/\/\                      ||        溪        ||
+    /        \                     ||        川        ||
+   /          \                    ||                  ||
+  /   .-&quot;&quot;-.   \                   ||    KILN-FIRE     ||
+ |   /      \   |                  ||     MARKET       ||
+ |__|________|__|                  ||==================||
+                                   ||                  ||
+===================================||==================||=
+┌──────────────────────────────────||──────────────────||┐
+│  • Fired in Akuma&#x27;s kiln                               │
+│  • Booted under Akuma&#x27;s hypervisor on Akuma&#x27;s metal    │
+└────────────────────────────────────────────────────────┘
+</pre><div class="features"><span>Rust / Tokio</span><span>Python</span><span>amd64</span><span>aarch64</span></div></article>
+      <article class="kernel-tile"><h3>Shanghai</h3><p class="kernel-description">A small tutorial kernel assembled from the Tokio kernel building blocks.</p><pre class="kernel-art" aria-label="Shanghai banner">
+            |                                                      ___
+            |                   |                                 /   \
+         .-----.               /_\           ___________         /     \
+        ( ==o== )              | |          |  _______  |       /       \
+         &#x27;-----&#x27;              /___\         |  /     \  |      /         \
+            |                 |   |         |   /   \   |     |           |
+     .-------------.         /_____\        |    /_\    |     |           |
+    /               \        |     |        |           |     |___________|
+   |     ===o===     |      /_______\       |           |     |           |
+    \               /       |       |       |           |     |           |
+     &#x27;-------------&#x27;       /_________\      |           |     |___________|
+        //     \\          |         |      |___________|     |           |
+       //       \\         |         |      |           |     |           |
+      //         \\        |         |      |           |     |___________|
+     //           \\       |         |      |           |     |           |
+    //             \\      |         |      |           |     |           |
+ __________________________________________________________________________
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+</pre><div class="features"><span>Rust / Tokio</span><span>Python</span><span>amd64</span><span>aarch64</span></div></article>
+    </div>
+  </section>
+  <section class="section" id="talks" aria-labelledby="talks-title">
+    <div class="section-head"><div><span class="label">01 / field notes</span><h2 id="talks-title">Experiments</h2></div><p>Talks and experiments from the strange places you can go when you build your own operating system.</p></div>
+    <div class="talks">
+      <a class="talk" href="/denver/">
+        <div class="talk-meta"><span>01 / the guest</span><span>Platform kernel ↗</span></div>
+        <pre class="talk-banner denver" aria-label="Denver logo">   /\        /\        /\        /\        /\
+  /  \  /\  /  \  /\  /  \  /\  /  \          D E N V E R
+ /    \/  \/    \/  \/    \/  \/    \        https://akuma.sh/
+_/                                    \_     Beans System Debauchery:
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~       kernel for Clojure</pre>
+        <h3>Beans in Denver: Fresh Kernel from a Crate?</h3>
+        <p>A JVM platform kernel assembled from Akuma's Rust crates. Java, Clojure, Scala, and a little system debauchery.</p>
+        <span class="go">ENTER THE TALK ↗</span>
+      </a>
+      <a class="talk" href="/self-hosting-rust-kernel/">
+        <div class="talk-meta"><span>02 / the host</span><span>Self-hosting ↗</span></div>
+        <pre class="talk-banner akuma" aria-label="Akuma logo">                      =#=      .-
+                      +*#*:.:-**
+                      +%%#%##***
+                      +%%%#%%#**.
+                      +%@@@%%%+*:
+          :::::--=+++*%@%@%%%%*-
+     :-+##%%%%%%%%@%@#%%@%%%%##%+
+  .=##%%%%%%%%%@@@@@%#%%@%%%@@@%%-
+.*%%%%%%%@%%%%@%@@@@%%%%@%%%%%@@#-
+%@%%%%%%%%%%@%%%%%@@@%%%@@@@@%%%#+
+*%%%%%@%@@%@@@%%%%#%@@@@@@@%%@@%@@@*+--
+ ::=+*#@@@@@@@@@@@%%%%%%@%%@#----=**@%@#
+         .--+**%@@@@@%@@%%@@%*       :-.
+                  ::::---#@%%*</pre>
+        <h3>Self-hosting a Rust kernel</h3>
+        <p>Rust, open models, and an operating system that can compile its own source. Then we go one kernel deeper.</p>
+        <span class="go">ENTER THE TALK ↗</span>
+      </a>
+    </div>
+    <div class="more">
+      <a href="/demo/"><span><small>03 / ecosystem demo · TBD</small>Building an ecosystem with agents</span><span class="arrow" aria-hidden="true">↗</span></a>
+      <a href="/600-bugs/"><span><small>04 / a cautionary tale</small>AI will write 600 bugs and I will write 600 more</span><span class="arrow" aria-hidden="true">↗</span></a>
+    </div>
+  </section>
+  <section class="section" aria-labelledby="stats-title">
+    <div class="section-head"><div><span class="label">02 / by the numbers</span><h2 id="stats-title">Stats</h2></div><p>A snapshot of the code and the bugs we have found along the way.</p></div>
+    <div class="stats-grid">
+      <div class="stat"><strong>136,052</strong><p>production Rust code lines in <code>src/</code>, <code>crates/</code> and <code>taoxichuan/src/</code>. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong>73,840</strong><p>test Rust code lines in the same source scope, counted separately from production. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong class="open-models">99.25%</strong><p>of production Rust code lines are outside <code>unsafe</code> blocks in that scope. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong>330</strong><p>production <code>unsafe</code> sites counted across the same Rust source scope. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong class="open-models">3 / 4</strong><p>kernels initially built with mostly <span class="open-models">open models</span>: Denver, Taoxichuan and Shanghai.</p></div>
+      <div class="stat"><strong>1,688</strong><p>distinct fixes recorded in the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
+      <div class="stat"><strong>139</strong><p>distinct Taoxichuan fixes recorded in its separate audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/TAOXICHUAN_BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
+      <div class="stat"><strong>495</strong><p>investigation documents contribute fixes to the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
+    </div>
+  </section>
+</main>
+<footer><div class="wrap footer-inner"><span>悪魔 / AKUMA &nbsp;·&nbsp; BSD 2-Clause</span><a href="https://github.com/netoneko/akuma">SOURCE CODE ↗</a></div></footer>
 </body>
 </html>

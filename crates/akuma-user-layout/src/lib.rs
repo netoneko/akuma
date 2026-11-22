@@ -238,9 +238,35 @@ impl<const REGIONS: usize, const HOLES: usize, const SHARED: usize> Layout<REGIO
         self.holes.alloc(&mut self.mmap_cur, self.mmap_end, bytes)
     }
 
+    /// Allocate at an aligned address at or above the cursor, preserving the
+    /// skipped slab range for subsequent ordinary allocations.
+    pub fn alloc_aligned(&mut self, bytes: u64, alignment: u64) -> Option<u64> {
+        if !alignment.is_power_of_two() { return None; }
+        let start = self.mmap_cur.checked_add(alignment - 1)? & !(alignment - 1);
+        let end = start.checked_add(bytes)?;
+        if !self.in_slab(start, bytes) { return None; }
+        self.claim_fixed(start, end);
+        Some(start)
+    }
+
     /// `[start, end)` is mapped again (a `MAP_FIXED` landed there): it leaves the holes.
     pub fn carve(&mut self, start: u64, end: u64) {
         self.holes.carve(start, end);
+    }
+
+    /// Account for an exact-address mapping within the slab. If it lies above
+    /// the bump cursor, preserve the skipped range as a hole; otherwise remove
+    /// the mapped range from the existing holes. The caller validates the range
+    /// and handles page-table overlap before invoking this method.
+    pub fn claim_fixed(&mut self, start: u64, end: u64) {
+        let old_cur = self.mmap_cur;
+        if start > old_cur {
+            self.mmap_cur = end;
+            self.holes.add(&mut self.mmap_cur, old_cur, start);
+        } else {
+            self.holes.carve(start, end);
+            self.note_mapped(end);
+        }
     }
 
     /// `[start, end)` was unmapped: lower the cursor when it touches it, else record a hole.
@@ -487,6 +513,30 @@ mod tests {
         let mut full = layout();
         let top = full.alloc(SIZE).unwrap();
         assert_eq!(full.mremap(top, SIZE, SIZE + 0x1000), Ok(Mremap::Move { release_old: true }), "would pass the slab");
+    }
+
+    #[test]
+    fn aligned_alloc_keeps_the_prefix_available() {
+        let mut l = layout();
+        assert_eq!(l.alloc(PAGE), Some(BASE));
+        let aligned = l.alloc_aligned(PAGE, 4 * PAGE).unwrap();
+        assert_eq!(aligned % (4 * PAGE), 0);
+        assert_eq!(l.alloc(3 * PAGE), Some(BASE + PAGE));
+        assert_eq!(l.alloc(PAGE), Some(aligned + PAGE));
+        assert_eq!(l.alloc_aligned(PAGE, 3), None);
+    }
+
+    #[test]
+    fn fixed_claim_keeps_the_skipped_gap_and_carves_reused_holes() {
+        let mut l = layout();
+        let first = l.alloc(PAGE).unwrap();
+        l.claim_fixed(BASE + 4 * PAGE, BASE + 5 * PAGE);
+        assert_eq!(l.alloc(3 * PAGE), Some(first + PAGE), "gap before fixed map stays reusable");
+        assert_eq!(l.alloc(PAGE), Some(BASE + 5 * PAGE), "fixed map is not handed out again");
+        l.release(BASE + PAGE, BASE + 4 * PAGE);
+        l.claim_fixed(BASE + 2 * PAGE, BASE + 3 * PAGE);
+        assert_eq!(l.alloc(PAGE), Some(BASE + PAGE));
+        assert_eq!(l.alloc(PAGE), Some(BASE + 3 * PAGE));
     }
 
     #[test]

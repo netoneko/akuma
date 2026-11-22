@@ -192,7 +192,7 @@ struct DevNodeFile((&'static str, u32, u32));
 
 #[cfg(feature = "sc-private-ns")]
 impl Filesystem for DevNodeFile {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "devnode"
     }
     fn read_dir(&self, _path: &str) -> Result<Vec<DirEntry>, FsError> {
@@ -1402,16 +1402,21 @@ pub fn create_symlink(link_path: &str, target: &str) -> Result<(), FsError> {
     Ok(())
 }
 
-/// Create the socket node for an AF_UNIX pathname `bind(2)`.
-///
-/// No in-memory fallback, unlike [`create_symlink`]: a socket node's whole
-/// purpose is that `stat` reports `S_ISSOCK` and `unlink` removes it, and a
-/// kernel-side table entry gives neither. If the mounted filesystem cannot
-/// represent the type, the caller is told so and can decide — falling back to a
-/// regular file is the substitution that made a conformant client refuse to
-/// connect to a working socket (`docs/archive/UNIX_SOCKET_IMPROVEMENTS.md` G7).
-pub fn create_socket_node(path: &str) -> Result<(), FsError> {
-    with_fs_write(path, |fs, rel| fs.create_socket_node(rel))
+/// Create and pin a pathname socket node in the caller's mount namespace.
+pub fn create_socket_node(path: &str) -> Result<(u32, akuma_primitives::InodePin), FsError> {
+    let mount = resolve_mount(path).ok_or(FsError::NotFound)?;
+    if mount.flags & MS_RDONLY != 0 {
+        return Err(FsError::ReadOnly);
+    }
+    let inode = mount.fs.create_socket_node(&mount.rel)?;
+    Ok((mount.id, inode))
+}
+
+/// Pin the node found by resolving a socket pathname in the caller's view.
+pub fn lookup_socket_node(path: &str) -> Result<(u32, akuma_primitives::InodePin), FsError> {
+    let mount = resolve_mount(path).ok_or(FsError::NotFound)?;
+    let inode = mount.fs.lookup_socket_node(&mount.rel)?;
+    Ok((mount.id, inode))
 }
 
 pub fn read_symlink(path: &str) -> Option<String> {
@@ -1870,11 +1875,8 @@ pub fn stats_for_path(path: &str) -> Result<FsView, FsError> {
 /// (whose namespace decides the mount set), as seen by `viewer_box_id`, into
 /// `buf`; returns the byte count written.
 ///
-/// Mount set = the target's namespace mounts, then any global mounts whose
-/// path the namespace does not already cover — the same set the target can
-/// actually *resolve* (`with_fs` tries the namespace, then falls back to the
-/// global table), so the listing cannot advertise a mount the target cannot
-/// reach, nor hide one it can.
+/// List the target's namespace mounts. A namespace with its own root covers
+/// every path, so the global table is only consulted for views without one.
 ///
 /// Box policy (`docs/archive/MOUNT_MISSING_SYSCALLS.md` §2): a boxed viewer
 /// learns *which* paths are mounted into it, never *where they came from* —
@@ -1903,6 +1905,7 @@ pub fn mount_id_of(path: &str) -> Option<u32> {
 /// Allocates (a `Vec` of rows, bounded by the mounts there are): this is a procfs read, whose `Vec<u8>` result is
 /// an allocation anyway.
 #[must_use]
+#[allow(clippy::useless_let_if_seq)]
 pub fn render_mountinfo(viewer_box_id: u64, target_pid: Option<u32>) -> Vec<u8> {
     use core::fmt::Write as _;
     let mut rows: Vec<(String, Option<String>, u64, Arc<dyn Filesystem>, u32)> = Vec::new();
@@ -1997,7 +2000,14 @@ fn render_mounts_inner(viewer_box_id: u64, target_pid: Option<u32>, buf: &mut [u
         && proc.box_id != 0
     {
         let ns_mount = proc.namespace.mount.lock();
-        ns_mount.for_each_mount(|row| emit(&mut w, &mut seen, true, viewer_box_id, row));
+        let mut has_root = false;
+        ns_mount.for_each_mount(|row| {
+            has_root |= row.path == "/";
+            emit(&mut w, &mut seen, true, viewer_box_id, row);
+        });
+        if has_root {
+            return pos;
+        }
     }
 
     let table = MOUNT_TABLE.lock();

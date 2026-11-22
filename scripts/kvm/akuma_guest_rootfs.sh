@@ -16,7 +16,7 @@
 #       SERVE=1      a *service* guest (`kvmserve`): sshd on port 22 and a script that never
 #                    ends (no AKUMA-GUEST-DONE). Needs a built sshd (SSHD=, default
 #                    userspace/target/x86_64-unknown-none/release/sshd; the amd64 build is
-#                    `cargo build -p sshd --no-default-features --features akuma,emergency-paws,builtin-paws
+#                    `cargo build -p sshd --features builtin-paws
 #                    --target x86_64-unknown-none --release` in userspace/).
 #       AUTHORIZED_KEYS=FILE   keys sshd accepts for root (default: target/.../amd64-ssh-test-key.pub);
 #                    kvm-akuma-stage.sh adds the ryzen Akuma's own /etc/sshd/authorized_keys.

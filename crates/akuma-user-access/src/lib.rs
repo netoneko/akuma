@@ -523,7 +523,7 @@ fn bypassed() -> bool {
 }
 
 #[cfg(not(kernel_tests))]
-#[inline(always)]
+#[inline]
 const fn bypassed() -> bool {
     false
 }
@@ -728,6 +728,7 @@ impl UserAddr {
     }
 
     /// `self + bytes`, or `EFAULT` if the address wraps.
+    #[allow(clippy::should_implement_trait)] // checked, fallible: not `Add`
     pub fn add(self, bytes: u64) -> Result<Self, Errno> {
         self.0.checked_add(bytes).map(Self).ok_or(EFAULT)
     }
@@ -749,7 +750,7 @@ impl UserAddr {
 }
 
 impl From<UserAddr> for u64 {
-    fn from(a: UserAddr) -> u64 {
+    fn from(a: UserAddr) -> Self {
         a.0
     }
 }

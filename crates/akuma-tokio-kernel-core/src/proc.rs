@@ -26,7 +26,11 @@ use crate::task::Task;
 use crate::{mm, tree};
 
 /// Ring slots: threading tids `0..NSLOTS` (0 is the boot thread).
-pub const NSLOTS: usize = 48;
+///
+/// 256 on every tokio kernel: a JVM or a tokio blocking pool asks for hundreds of threads at once, and the
+/// cost of a slot is a few static bytes plus a 16 KiB trap stack in the amd64 half's `.bss`, not memory
+/// until it is used. (It was 48 unless `containers` was on, and `clone` past it answered `EAGAIN`.)
+pub const NSLOTS: usize = 256;
 
 const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
@@ -226,7 +230,7 @@ pub fn bind_init<M: Proc>(path: &str, ti: &TaskImage) -> Option<usize> {
     // pid 1 never execve'd, so this registration is the only retention point.
     #[cfg(feature = "procfs-diag")]
     akuma_exec::process::with_process(1, |p| {
-        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().copied().map(Into::into).collect());
     });
     INIT_TID.store(tid, Relaxed);
     Some(tid)
@@ -364,44 +368,58 @@ fn group_leader(cur: usize) -> usize {
 /// thread publishes the group's status there.
 pub fn kill_siblings<M: Proc>(cur: usize, lead: usize) {
     let tgid = slot_tgid(cur);
-    let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
-    for (s, ask) in asked.iter_mut().enumerate() {
-        let spid = slot_pid(s);
-        if s == cur || !slot_in_use(s) || slot_tgid(s) != tgid || (spid == tgid && s != lead) {
-            continue;
-        }
-        if akuma_threading::is_thread_terminated(s) {
-            continue;
-        }
-        if !stop_in_place(s, spid, s == lead) {
-            akuma_threading::request_thread_kill(s);
-            *ask = spid;
-        }
-    }
     let start = M::uptime_us();
     let mut warned = false;
-    while asked.iter().any(|&p| p != 0) {
-        for (s, p) in asked.iter_mut().enumerate() {
-            if *p == 0 {
-                continue;
-            }
-            if akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p || stop_in_place(s, *p, s == lead) {
-                *p = 0;
-            }
+    // Rescan until a pass finds no live sibling. The wait below releases the kernel lock, and a
+    // sibling already on a core can finish a `clone` in that window: its new thread was not in
+    // the pass that asked its creator to end, and left alone it runs on the root the `execve`
+    // replaces (the `RUN-REFUSED` / Denver `scala-cli run` failure,
+    // `docs/archive/DENVER_SCALA_CLI_CRASHES.md`). The pass that finds nothing never releases the
+    // lock, so no `clone` can land between it and the caller's commit.
+    loop {
+        let mut asked = [0u32; NSLOTS]; // the pid asked to end, per slot; 0 = none
+        let live = asked
+            .iter_mut()
+            .enumerate()
+            .filter(|&(s, _)| {
+                let spid = slot_pid(s);
+                !(s == cur || !slot_in_use(s) || slot_tgid(s) != tgid || (spid == tgid && s != lead) || akuma_threading::is_thread_terminated(s))
+            })
+            .map(|(s, ask)| {
+                let spid = slot_pid(s);
+                if !stop_in_place(s, spid, s == lead) {
+                    akuma_threading::request_thread_kill(s);
+                    *ask = spid;
+                }
+            })
+            .count()
+            > 0;
+        if !live {
+            return;
         }
-        // User mode reaches the kernel at least once a tick. A thread that does
-        // not is reported, never ended where it runs.
-        if !warned && M::uptime_us().saturating_sub(start) > 2_000_000 {
-            warned = true;
-            for (s, _) in asked.iter().enumerate().filter(|(_, p)| **p != 0) {
-                safe_print!(96, "[exit_group] slot {} still on a core after 2 s; waiting\n", s);
+        while asked.iter().any(|&p| p != 0) {
+            for (s, p) in asked.iter_mut().enumerate() {
+                if *p == 0 {
+                    continue;
+                }
+                if akuma_threading::is_thread_terminated(s) || slot_pid(s) != *p || stop_in_place(s, *p, s == lead) {
+                    *p = 0;
+                }
             }
+            // User mode reaches the kernel at least once a tick. A thread that does
+            // not is reported, never ended where it runs.
+            if !warned && M::uptime_us().saturating_sub(start) > 2_000_000 {
+                warned = true;
+                for (s, _) in asked.iter().enumerate().filter(|(_, p)| **p != 0) {
+                    safe_print!(96, "[exit_group] slot {} still on a core after 2 s; waiting\n", s);
+                }
+            }
+            M::unlocked(|| {
+                for _ in 0..2000 {
+                    core::hint::spin_loop();
+                }
+            });
         }
-        M::unlocked(|| {
-            for _ in 0..2000 {
-                core::hint::spin_loop();
-            }
-        });
     }
 }
 
@@ -574,6 +592,11 @@ const ARG_BYTES_MAX: usize = 1024 * 1024;
 /// `#!` hops followed before ENOEXEC (Linux's `BINPRM_MAX_RECURSION`).
 const SHEBANG_MAX_DEPTH: usize = 4;
 
+/// The path an exec request names (the one field [`exec_strs`] needs of a request).
+struct ExecPath {
+    path: String,
+}
+
 /// `execve(path, argv, envp)` up to the crossing.
 ///
 /// The request read, `#!`
@@ -587,7 +610,6 @@ const SHEBANG_MAX_DEPTH: usize = 4;
 ///
 /// The negative errno `execve` returns.
 pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> {
-    let cur = M::current_slot();
     let mut budget = akuma_syscalls_proc::exec::Budget::new(MAX_STRS, STR_MAX, ARG_BYTES_MAX);
     let req = akuma_syscalls_glue::execve::read_request(
         akuma_syscalls_glue::UserAddr::new(path),
@@ -600,9 +622,21 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
     .map_err(akuma_primitives::errno::Errno::ret)?;
     // The loader takes `&str`: an argument that is not UTF-8 cannot reach it.
     let utf8 = |v: Vec<Vec<u8>>| v.into_iter().map(String::from_utf8).collect::<Result<Vec<String>, _>>();
-    let (Ok(mut argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
+    let (Ok(argv_s), Ok(env_s)) = (utf8(req.argv), utf8(req.envp)) else {
         return Err(e(EFAULT));
     };
+    exec_strs::<M>(req.path, argv_s, &env_s)
+}
+
+/// [`exec`] with the request already in kernel memory: the entry for a process the kernel itself starts, whose image
+/// another loader placed (a `spawn`, which has no tokio task record to run on).
+///
+/// # Errors
+///
+/// The negative errno `execve` returns.
+pub fn exec_strs<M: Proc>(path: String, mut argv_s: Vec<String>, env_s: &[String]) -> Result<TaskImage, u64> {
+    let cur = M::current_slot();
+    let req = ExecPath { path };
     let mut effective = loader::resolve_effective::<M>(&req.path);
     // Each image is marked as being executed BEFORE its bytes are read (`ETXTBSY`), so the file cannot be rewritten between the read and
     // the mark; the pin of the image that finally loads is installed in the task record below, the others (a script) drop here.
@@ -649,12 +683,35 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
         Err(loader::LoadError::NoMem) => return Err(e(ENOMEM)),
     };
     loader::adopt_text::<M>(text);
+    // `execve` ends every other thread of the group first (Linux's `de_thread`): they run on
+    // the space being replaced, and left alone they fault on frames the replacement frees
+    // (`docs/archive/TOKIO_KERNELS_EXEC_FROM_THREAD.md`). The image is loaded, so a failed exec
+    // above killed nothing. The leader is stopped like the rest but keeps its slot and
+    // `Process`: the group's identity, its wait status and its address space stay there, and a
+    // non-leader caller continues as the group's only thread, on the leader's record.
+    let owner = group_leader(cur);
+    kill_siblings::<M>(cur, owner);
     if let Some(p) = akuma_exec::process::current_process_shared() {
         let argv_bytes: Vec<Vec<u8>> = argv_s.iter().map(|a| a.clone().into_bytes()).collect();
         akuma_syscalls_glue::execve::commit(p, &effective, &argv_bytes);
     }
-    // The registered Process's shared root view goes stale with the old image.
+    if owner != cur {
+        if let Some(lp) = akuma_exec::process::lookup_process_shared(slot_pid(owner)) {
+            let argv_bytes: Vec<Vec<u8>> = argv_s.iter().map(|a| a.clone().into_bytes()).collect();
+            akuma_syscalls_glue::execve::commit(lp, &effective, &argv_bytes);
+        }
+    }
+    // The registered Process's shared root view goes stale with the old image. The space
+    // belongs to the group's leader slot, which is `cur` unless a thread called.
+    // A non-leader caller keeps running as the group's only thread, on a `Process` of its own whose
+    // address-space view is still the old root: `clone_thread` reads that view, so every thread the new
+    // image then creates would start on the freed root (`RUN-REFUSED`, Denver `scala-cli run`).
+    let caller = cur;
+    let cur = owner;
     let pid = slot_pid(cur);
+    if caller != owner {
+        let _ = disown_space(slot_pid(caller), ti.root_pa);
+    }
     let first_exec = OWNED_ROOT.with(|t| t[cur]) == 0;
     if disown_space(pid, ti.root_pa) {
         // A fork child's first exec: the root it ran on is the fork clone, every
@@ -671,7 +728,7 @@ pub fn exec<M: Proc>(path: u64, argv: u64, envp: u64) -> Result<TaskImage, u64> 
     // (`Process::inherit_from`); this overwrites it at exec, as Linux's does.
     #[cfg(feature = "procfs-diag")]
     akuma_exec::process::with_process(pid, |p| {
-        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().map(|&[k, v]| (k, v)).collect());
+        *p.auxv.lock() = Some(ti.aux[..ti.aux_len].iter().copied().map(Into::into).collect());
     });
     Ok(ti)
 }
@@ -767,6 +824,10 @@ fn zombie_root<M: Proc>(slot: usize, pid: u32) {
     });
     let own = OWNED_ROOT.with_mut(|t| core::mem::replace(&mut t[slot], 0));
     let root = if own != 0 { own } else { M::record_root(task_of(slot)) };
+    // The record outlives the process (the slot is reused). A `spawn` child runs before its bind (`akuma-exec` publishes the thread
+    // first), and the switch to it loads this record's root: a freed one (reissued, garbage) panics `activate`. 0 = "keep the
+    // current root" until the bind writes the real one.
+    M::with_task_slot(task_of(slot), |t| t.root_pa = 0);
     if root == 0 || ZOMBIE_ROOT.with(|z| z.iter().any(|&(p, _)| p == pid)) {
         return;
     }

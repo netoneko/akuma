@@ -41,7 +41,13 @@ for crate in crates/*/; do
     # other arch); it is linted below for its own target instead.
     case "$name" in akuma-kernel-amd64) continue ;; esac
     echo "clippy: $name"
-    cargo clippy -p "$name" --target "$HOST_TARGET" -- -D warnings || exit 1
+    # akuma-psci is `smc`/`hvc` assembly end to end: it only assembles for AArch64, so on an
+    # x86_64 host it is linted for the kernel's own target instead.
+    target="$HOST_TARGET"
+    case "$name" in akuma-psci) target=aarch64-unknown-none ;; esac
+    # akuma-kernel-glue needs the root kernel's feature set to build at all; the root clippy below lints it.
+    case "$HOST_TARGET:$name" in aarch64-*:*) ;; *:akuma-kernel-glue) continue ;; esac
+    cargo clippy -p "$name" --target "$target" -- -D warnings || exit 1
 done
 
 echo "clippy: akuma (amd64, headless)"
@@ -57,8 +63,33 @@ echo "clippy: akuma (extreme-size profile, --no-default-features)"
 cargo clippy --profile extreme-size --no-default-features \
     --features no-tests,smoltcp -- -D warnings || exit 1
 
+# Platform kernels (taoxichuan, shanghai, denver) share akuma-syscalls-glue, akuma-exec and
+# akuma-tokio-kernel-core with the main kernel, so a signature change there breaks them with no
+# other signal (docs/archive/HOW_MAIN_BROKE_2026_11.md). They cannot sit in `default-members`: cargo
+# unifies features across one resolve and that breaks akuma-kernel-tests-aarch64. So each is checked
+# on its own, on both architectures (`cargo check`, not a full build; premerge_build.sh builds them).
+# Set SKIP_PLATFORM_KERNELS=1 to skip (e.g. a docs-adjacent change).
+if [ -z "$SKIP_PLATFORM_KERNELS" ]; then
+    for k in taoxichuan shanghai denver; do
+        for t in aarch64-unknown-none x86_64-unknown-none; do
+            echo "check: $k ($t)"
+            cargo check -p "$k" --target "$t" || exit 1
+        done
+    done
+fi
+
 echo "tests"
-cargo test --target "$HOST_TARGET" || exit 1
+# Per crate, because the AArch64 kernel-side crates only compile on an AArch64 host. On any other
+# host (x86_64 Linux) they are skipped here; their clippy ran above and premerge_build.sh builds them.
+for crate in crates/*/; do
+    name="$(basename "$crate")"
+    case "$name" in akuma-kernel-amd64) continue ;; esac
+    case "$HOST_TARGET" in
+        aarch64-*) ;;
+        *) case "$name" in akuma-kernel-glue|akuma-boot-amd64) continue ;; esac ;;
+    esac
+    cargo test -p "$name" --target "$HOST_TARGET" || exit 1
+done
 
 # akuma-ssh-crypto moved to userspace/ (its only consumer is userspace/sshd), so
 # the crates/*/ loop above no longer reaches it.

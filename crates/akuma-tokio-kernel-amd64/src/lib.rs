@@ -1062,7 +1062,25 @@ fn fd_inode(fd: u64) -> Option<u32> {
     })??;
     let inode = if kf.inode() != 0 { kf.inode() } else { root_fs().resolve_inode(&kf.path).ok()? };
     let md = root_fs().metadata_by_inode(inode).ok()?;
+    // High bits identify box mounts in lazy records; do not alias a root inode.
+    #[cfg(feature = "containers")]
+    if inode > lazy::boxfile::INODE_MASK { return None; }
     (!md.is_dir).then_some(inode)
+}
+
+/// [`fd_inode`] for a boxed process: the mount-qualified file number of the regular file `fd` was opened on
+/// (`lazy::boxfile`), `None` for anything else, a descriptor with no resolved identity included.
+#[cfg(feature = "containers")]
+fn fd_box_file(fd: u64) -> Option<u32> {
+    use akuma_exec::process::FileDescriptor;
+    let kf = akuma_exec::process::current_process_shared()?.with_fd(fd as u32, |d| match d {
+        FileDescriptor::File(f) => Some(f.clone()),
+        _ => None,
+    })??;
+    let key = kf.file_key()?;
+    let md = akuma_vfs_glue::metadata_open_file(&kf.path, Some(key)).ok()?;
+    let (mount, inode) = key.parts();
+    (!md.is_dir).then(|| lazy::boxfile::pack(mount, inode)).flatten()
 }
 
 /// The task records (`akuma_tokio_kernel_core::task`), reached only through [`with_task`] /
@@ -1342,6 +1360,7 @@ fn copy_to_user(dst_va: u64, src: &[u8]) -> bool {
 }
 
 /// Resolve symlinks (bounded) on the root: `akuma_tokio_kernel_core::loader`'s, the one walker.
+#[cfg(not(feature = "containers"))]
 fn resolve_effective(path: &str) -> alloc::string::String {
     akuma_tokio_kernel_core::loader::resolve_effective::<lazy::Amd64>(path)
 }
@@ -1597,6 +1616,17 @@ fn console_stdio_write(nr: u64, a: [u64; 6]) -> Option<u64> {
 /// (`akuma-syscalls-glue-amd64`: open flags, `struct stat`, the legacy numbers), which
 /// answers `None` for what it does not know.
 fn tokio_surface(nr: u64, args: [u64; 6]) -> Option<u64> {
+    // Akuma's private x86 ABI occupies a separate range from Linux calls.
+    #[cfg(feature = "containers")]
+    if let Some(private) = nr.checked_sub(0x1000)
+        && matches!(private, 301 | 302 | 303 | 305 | 315 | 316 | 317 | 318 | 319 | 324 | 325 | 326)
+    {
+        return Some(akuma_syscalls_glue::handle_syscall(private, &args));
+    }
+    #[cfg(feature = "containers")]
+    if let Some(call @ (akuma_syscalls_abi::Syscall::Mount | akuma_syscalls_abi::Syscall::Umount2)) = akuma_syscalls_abi::Syscall::from_x86_64(nr) {
+        return Some(akuma_syscalls_glue::handle_syscall(call.to_aarch64(), &args));
+    }
     if let Some(r) = akuma_runtime_tokio::serve_shared(nr, args) {
         return Some(r);
     }
@@ -1749,6 +1779,22 @@ fn dispatch_after_fold(fr: &mut ring3::SyscallFrame) -> u64 {
         }
         akuma_syscalls_abi::x86_64::MMAP => {
             let (flags, fd) = (fr.arg4(), fr.arg5());
+            // A boxed process's file is on a mount of its namespace, not the host root: the record names it by a
+            // mount-qualified number (`lazy::boxfile`). A writable `MAP_SHARED` mapping stays refused (`ENODEV`): the
+            // shared-page table and its write-back are keyed by root-filesystem inodes.
+            #[cfg(feature = "containers")]
+            if flags & ring3::mmap::MAP_ANONYMOUS == 0
+                && akuma_exec::process::current_process_shared().is_some_and(|p| p.box_id != 0)
+            {
+                const MAP_SHARED: u64 = 0x01;
+                if flags & MAP_SHARED != 0 && fr.arg3() & ring3::mmap::PROT_WRITE != 0 {
+                    return e(ring3::err::ENODEV);
+                }
+                let Some(file) = fd_box_file(fd) else {
+                    return e(ring3::err::ENODEV);
+                };
+                return mm::mmap_arm::<lazy::Amd64>(fr.arg1(), fr.arg2(), fr.arg3(), flags, Some(file), fr.arg6());
+            }
             // The descriptor is the process's; the decision is core's (`mm::mmap_arm`).
             let file = if flags & ring3::mmap::MAP_ANONYMOUS == 0 { fd_inode(fd) } else { None };
             mm::mmap_arm::<lazy::Amd64>(fr.arg1(), fr.arg2(), fr.arg3(), flags, file, fr.arg6())

@@ -74,7 +74,7 @@ use akuma_exec::threading::{WakeHandle, wake_by_handle, wake_handle_for_thread};
 use akuma_net::socket::libc_errno;
 use akuma_net_unix::{
     self as unix, ConnectOutcome, Pending, SOCKADDR_UN_LEN, SockAddrUn, SockState, SockType,
-    Ucred, UnixName, UnixTable, plan_read, plan_write,
+    Ucred, UnixAddress, UnixName, UnixTable, plan_read, plan_write,
 };
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
@@ -454,7 +454,12 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
         return ESRCH;
     };
     let creds = current_creds();
-    let sock = with_table(|t| t.alloc(ty, creds));
+    let namespace_id = super::caller_box_and_pid().0;
+    let sock = with_table(|t| {
+        let sock = t.alloc(ty, creds);
+        t.get_mut(sock).unwrap().namespace_id = namespace_id;
+        sock
+    });
     // A datagram socket gets its receive queue right away, not at `bind`.
     // Anyone who learns its name can send to it, and it must also be able to
     // receive a *reply* while still unbound — which is what a `syslog(3)`-style
@@ -489,9 +494,12 @@ pub fn sys_socket_unix(sock_type: i32, cloexec: bool, nonblock: bool) -> u64 {
 pub fn socketpair_alloc(sock_type: i32, px: u32, py: u32) -> Option<(u32, u32)> {
     let ty = SockType::from_raw(sock_type & 0xFF)?;
     let creds = current_creds();
+    let namespace_id = super::caller_box_and_pid().0;
     Some(with_table(|t| {
         let a = t.alloc(ty, creds);
         let b = t.alloc(ty, creds);
+        t.get_mut(a).unwrap().namespace_id = namespace_id;
+        t.get_mut(b).unwrap().namespace_id = namespace_id;
         // Endpoint a reads px and writes py; the peer is mirrored.
         t.pair(a, b, px, py);
         (a, b)
@@ -510,72 +518,69 @@ pub fn socketpair_rollback(a: u32, b: u32) {
 // bind / listen
 // ============================================================================
 
+fn socket_path(name: &[u8]) -> Result<String, Errno> {
+    let path = core::str::from_utf8(name).map_err(|_| Errno::EINVAL)?;
+    super::fs::resolve_path_at(akuma_syscalls_linux::flags::at::AT_FDCWD, path)
+}
+
+fn socket_destination(sock: u32, name: &UnixName) -> Result<(UnixAddress, akuma_primitives::InodePin), Errno> {
+    let address = match name {
+        UnixName::Unnamed => UnixAddress::Unnamed,
+        UnixName::Abstract(name) => UnixAddress::Abstract {
+            box_id: with_table(|t| t.get(sock).map(|s| s.namespace_id)).ok_or(Errno::EBADF)?,
+            name: name.clone(),
+        },
+        UnixName::Path(name) => {
+            let path = akuma_vfs_glue::resolve_symlinks(&socket_path(name)?);
+            super::perm::check_open(&path, akuma_exec::process::open_flags::O_WRONLY)?;
+            let (mount_id, pin) = akuma_vfs_glue::lookup_socket_node(&path).map_err(|e| match e {
+                akuma_vfs_glue::FsError::NotAFile | akuma_vfs_glue::FsError::NotSupported => {
+                    Errno::ECONNREFUSED
+                }
+                _ => super::fs::fs_error_to_errno(e),
+            })?;
+            return Ok((UnixAddress::Path { mount_id, inode: pin.inode() }, pin));
+        }
+    };
+    Ok((address, akuma_primitives::InodePin::none()))
+}
+
 /// `bind(2)` on an AF_UNIX socket.
-///
-/// A pathname bind has to touch the filesystem as well as the name table, and
-/// the order is deliberate: **the name table claim comes first**. If the node
-/// were created first and the table claim then failed with `EADDRINUSE`, the
-/// failed `bind` would have left a file behind that nothing owns — the exact
-/// stale node that makes the *next* daemon start look like a live conflict.
 pub fn sys_bind(fd: u32, addr_ptr: UserAddr, addrlen: usize) -> SysResult {
-    let addr_ptr = addr_ptr.get();
     let Some(sock) = fd_sock(fd) else {
         return if fd_parts(fd).is_some() { Err(Errno::EOPNOTSUPP) } else { Err(Errno::ENOTSOCK) };
     };
-    let name = read_sockaddr(UserAddr::new(addr_ptr), addrlen)?;
-    // Binding a path creates a directory entry, so it needs write and search on
-    // the parent (`EACCES`), checked before the name is claimed in the table.
-    if let Some(p) = name.path_bytes().and_then(|b| core::str::from_utf8(b).ok())
-        && p.starts_with('/')
-    {
-        super::perm::check_create(p)?;
-    }
-    // A filesystem name whose node exists but whose socket does not is stale:
-    // a daemon died without unlinking. Linux reports EADDRINUSE and expects the
-    // daemon to unlink first, so a client sees a node it cannot connect to
-    // rather than silently talking to the wrong process.
-    if let Err(e) = with_table(|t| t.bind(sock, name.clone())) {
-        return Err(Errno::new(e));
-    }
-    if let Some(path) = name.path_bytes()
-        && let Ok(p) = core::str::from_utf8(path)
-    {
-        create_socket_node(p);
-    }
-    if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
-        if let Some(path) = name.path_bytes() {
-            akuma_primitives::safe_print!(160, "[unix] bind(fd={}) path len={}\n", fd, path.len());
-        } else {
-            akuma_primitives::safe_print!(96, "[unix] bind(fd={}) abstract\n", fd);
-        }
-    }
-    Ok(0)
-}
+    let name = read_sockaddr(addr_ptr, addrlen)?;
+    let Some(path_bytes) = name.path_bytes() else {
+        let (address, pin) = socket_destination(sock, &name)?;
+        with_table(|t| t.bind(sock, name, address, pin)).map_err(Errno::new)?;
+        return Ok(0);
+    };
 
-/// Create the filesystem presence for a pathname bind: a real `S_IFSOCK` node.
-///
-/// The type bits are the point. An earlier version created an ordinary empty
-/// file, and `nettest-unix path` — diffing against its Linux control arm —
-/// reported `mode=0o100644 S_ISSOCK=false`: a client that checks `S_ISSOCK`
-/// before connecting, which is the normal thing to do, would refuse to talk to
-/// a socket that was working perfectly.
-///
-/// A failure here is logged and **not** propagated. The name is already claimed
-/// in the table at this point, and `connect` resolves against that table rather
-/// than against the inode, so the socket works either way — a rootfs that
-/// cannot make the node (read-only, or a filesystem without the type) should
-/// not turn a working `bind` into a failure. What it does cost is the userspace
-/// conventions: `stat`, `unlink` and `ls` will not see the path.
-fn create_socket_node(path: &str) {
-    if let Err(e) = akuma_vfs_glue::create_socket_node(path) {
-        let _ = e;
-        akuma_primitives::safe_print!(
-            112,
-            "[unix] bind: S_IFSOCK node create failed (name is still bound)\n"
-        );
-    } else if path.starts_with('/') {
-        super::perm::own_new(path);
+    let path = socket_path(path_bytes)?;
+    // Follow symlinks in the parent. A symlink at the final component is an
+    // existing entry, so bind fails even when the symlink is dangling.
+    let (_, leaf) = akuma_vfs_glue::split_path(&path);
+    if leaf.is_empty() {
+        return Err(Errno::EADDRINUSE);
     }
+    let parent = akuma_vfs_glue::resolve_symlinks(super::perm::parent_of(&path));
+    let path = akuma_vfs_glue::resolve_path(&parent, leaf);
+    super::perm::check_create(&path)?;
+
+    with_table(|t| t.begin_path_bind(sock)).map_err(Errno::new)?;
+    let binding = akuma_vfs_glue::create_socket_node(&path)
+        .map(|(mount_id, pin)| {
+            super::perm::own_new(&path);
+            (name, UnixAddress::Path { mount_id, inode: pin.inode() }, pin)
+        })
+        .map_err(|e| match e {
+            akuma_vfs_glue::FsError::AlreadyExists => libc_errno::EADDRINUSE,
+            _ => super::fs::fs_error_to_errno(e).code(),
+        });
+    let result = with_table(|t| t.finish_path_bind(sock, binding));
+    unix_sock_close(sock);
+    result.map(|()| 0).map_err(Errno::new)
 }
 
 /// `listen(2)`.
@@ -615,7 +620,10 @@ pub fn sys_connect(fd: u32, addr_ptr: UserAddr, addrlen: usize) -> SysResult {
     let nonblock = super::net::fd_is_nonblock(fd);
 
     loop {
-        let outcome = with_table(|t| t.connect(sock, &name, creds));
+        let outcome = {
+            let (address, _pin) = socket_destination(sock, &name)?;
+            with_table(|t| t.connect(sock, &address, creds))
+        };
         match outcome {
             Ok(ConnectOutcome::DgramPeerSet { .. }) => {
                 if akuma_config::SYSCALL_DEBUG_NET_ENABLED {
@@ -1075,10 +1083,16 @@ pub fn unix_sendto_anc(
     // Resolve the queue on every call. A destination that goes away between two
     // sends must fail the second one, not the first.
     let queue = match dest {
-        Some(name) => match with_table(|t| t.resolve_dgram_dest(name)) {
-            Ok((_, q)) => q,
-            Err(e) => return neg_errno(e),
-        },
+        Some(name) => {
+            let (address, _pin) = match socket_destination(sock, name) {
+                Ok(destination) => destination,
+                Err(e) => return e.ret(),
+            };
+            match with_table(|t| t.resolve_dgram_dest(&address)) {
+                Ok((_, q)) => q,
+                Err(e) => return neg_errno(e),
+            }
+        }
         None => match with_table(|t| t.dgram_default_dest(sock)) {
             Ok(q) => q,
             Err(e) => return neg_errno(e),

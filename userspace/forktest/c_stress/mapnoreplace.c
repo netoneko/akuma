@@ -13,11 +13,12 @@
  *   over the stack          EEXIST
  *
  * Build: x86_64-linux-musl-gcc -O2 -static -o mapnoreplace mapnoreplace.c
- * Run:   ./mapnoreplace       (PASS/FAIL per case, exit 0 iff all pass)
+ * Run:   ./mapnoreplace [free-address]  (default 0x5b5b00000000; exit 0 iff all pass)
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -38,9 +39,9 @@ static void *nr(void *at, size_t len) {
     return mmap(at, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
 }
 
-int main(void) {
+int main(int argc, char **argv) {
     char buf[96];
-    void *want = (void *)0x5b5b00000000ULL;
+    void *want = (void *)(uintptr_t)(argc > 1 ? strtoull(argv[1], NULL, 0) : 0x5b5b00000000ULL);
     void *p = nr(want, 65536);
     snprintf(buf, sizeof buf, "(got %p)", p);
     check("free address", p == want, buf);
@@ -50,7 +51,24 @@ int main(void) {
     void *q = nr(want, 4096);
     snprintf(buf, sizeof buf, "(got %p errno %d)", q, errno);
     check("same address again", q == MAP_FAILED && errno == EEXIST, buf);
-    if (p == want) check("first mapping intact", *(volatile int *)p == 42, "");
+    if (p == want) {
+        check("first mapping intact", *(volatile int *)p == 42, "");
+        munmap(p, 65536);
+        void *again = nr(want, 65536);
+        check("reuse after munmap", again == want, "");
+        if (again == want) munmap(again, 65536);
+    }
+
+    void *reserved = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (reserved == MAP_FAILED) {
+        check("reserve PROT_NONE", 0, "");
+    } else {
+        errno = 0;
+        void *over = nr(reserved, 4096);
+        check("over PROT_NONE", over == MAP_FAILED && errno == EEXIST, "");
+        if (over != MAP_FAILED) munmap(over, 4096);
+        munmap(reserved, 4096);
+    }
 
     errno = 0;
     void *text = (void *)((uintptr_t)&main & ~(uintptr_t)4095);

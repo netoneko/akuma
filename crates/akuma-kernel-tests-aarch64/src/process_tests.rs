@@ -6501,7 +6501,7 @@ fn test_process_memory_isolated_except_cow() {
     // The invariant itself: a frame visible in two spaces is read-only in each and counted as shared.
     let spaces: [&Vec<(usize, usize, u64)>; 3] = [&a_after, &b_after, &c_after];
     for (i, mine) in spaces.iter().enumerate() {
-        for &(_, pa, f) in mine.iter() {
+        for &(_, pa, f) in *mine {
             let elsewhere = spaces.iter().enumerate().any(|(j, other)| j != i && other.iter().any(|&(_, p, _)| p == pa));
             if elsewhere {
                 if f & flags::AP_RO_ALL != flags::AP_RO_ALL {

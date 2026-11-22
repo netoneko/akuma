@@ -239,7 +239,9 @@ impl SysKernelFile {
     }
 }
 
-/// The namespaces `/proc/<pid>/ns/` names. Akuma has boxes, not Linux namespaces,
+/// The namespaces `/proc/<pid>/ns/` names.
+///
+/// Akuma has boxes, not Linux namespaces,
 /// so these report the box the process is in: two processes show the same
 /// `mnt`/`pid`/`net`/`ipc`/`uts` link exactly when they share a box.
 /// bubblewrap opens the directory and `readlink`s entries to learn whether it

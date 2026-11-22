@@ -69,10 +69,10 @@ pub struct Errno(core::num::NonZeroU16);
 impl Errno {
     /// An errno from its positive value. Panics (at compile time in a `const`) on zero or a value over `u16::MAX`.
     #[must_use]
-    pub const fn new(code: i32) -> Errno {
+    pub const fn new(code: i32) -> Self {
         assert!(code > 0 && code <= u16::MAX as i32, "errno must be a positive u16");
         match core::num::NonZeroU16::new(code as u16) {
-            Some(n) => Errno(n),
+            Some(n) => Self(n),
             None => unreachable!(),
         }
     }
@@ -80,16 +80,16 @@ impl Errno {
     /// An errno from a raw nonzero code that crossed an asm boundary (the copy trampoline's return). A value that is not
     /// a valid errno becomes `EFAULT`, which is what the trampoline's nonzero return means.
     #[must_use]
-    pub const fn from_raw(code: u64) -> Errno {
-        if code == 0 || code > u16::MAX as u64 { Errno::EFAULT } else { Errno::new(code as i32) }
+    pub const fn from_raw(code: u64) -> Self {
+        if code == 0 || code > u16::MAX as u64 { Self::EFAULT } else { Self::new(code as i32) }
     }
 
     /// Decode a syscall return value in the ABI's error form (`x0 = -errno`, a value in `-4095..=-1`). `None` for
     /// anything else, which is a success value and not an error.
     #[must_use]
-    pub const fn from_negated(ret: u64) -> Option<Errno> {
-        let v = ret as i64;
-        if v >= -4095 && v <= -1 { Some(Errno::new((-v) as i32)) } else { None }
+    pub const fn from_negated(ret: u64) -> Option<Self> {
+        let v = ret.cast_signed();
+        if v >= -4095 && v <= -1 { Some(Self::new((-v) as i32)) } else { None }
     }
 
     /// The positive value (`14` for `EFAULT`).

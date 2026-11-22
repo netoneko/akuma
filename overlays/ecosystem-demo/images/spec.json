@@ -1,0 +1,78 @@
+{
+  "alpine": "v3.22",
+  "arch": "x86_64",
+  "epoch": 1700000000,
+  "common": [
+    "alpine-baselayout",
+    "alpine-keys",
+    "busybox-static",
+    "bash",
+    "git",
+    "curl",
+    "coreutils",
+    "apk-tools",
+    "ca-certificates-bundle",
+    "busybox-extras"
+  ],
+  "host": [
+    "alpine-baselayout",
+    "alpine-keys",
+    "busybox-static",
+    "curl",
+    "ca-certificates-bundle"
+  ],
+  "images": {
+    "rust": {
+      "packages": [
+        "gcc",
+        "musl-dev"
+      ],
+      "guest": 1
+    },
+    "scala": {
+      "packages": [
+        "openjdk21-jdk"
+      ],
+      "guest": 1
+    },
+    "python": {
+      "packages": [
+        "python3",
+        "py3-pytest",
+        "py3-requests"
+      ],
+      "guest": 2
+    }
+  },
+  "extras": [
+    "jq",
+    "tree"
+  ],
+  "scala": {
+    "url": "https://github.com/scala/scala3/releases/download/3.3.6/scala3-3.3.6.tar.gz",
+    "sha256": "7267524240ee289976fed1b8bc08c0045d5d290d3faee07c6b7137a4252b5b97",
+    "dir": "scala3-3.3.6"
+  },
+  "scala_deps": [
+    {
+      "url": "https://repo1.maven.org/maven2/com/google/code/gson/gson/2.11.0/gson-2.11.0.jar",
+      "sha256": "57928d6e5a6edeb2abd3770a8f95ba44dce45f3b23b7a9dc2b309c581552a78b"
+    }
+  ],
+  "userspace": [
+    "herd",
+    "sshd",
+    "ssh",
+    "box"
+  ],
+  "rust_cargo_cache": false,
+  "rust_toolchain": {
+    "version": "1.96.0",
+    "url": "https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-musl.tar.xz",
+    "sha256": "8b4db404e24a82be906170b7b64bd69807e72e59d8371bac2a7f0ade75b39697"
+  },
+  "scala_cli": {
+    "url": "https://github.com/VirtusLab/scala-cli/releases/download/v1.19.0/scala-cli.jar",
+    "sha256": "7092aad0a7a04485fe8a3fe9ef8f732d21ce3be0f60e6576e478ade03f05d38e"
+  }
+}

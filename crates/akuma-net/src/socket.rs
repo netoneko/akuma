@@ -188,6 +188,9 @@ pub struct KernelSocket {
     /// connect, and scopes `EADDRINUSE` through [`bind_addrs_overlap`].
     pub bind_ip: [u8; 4],
     pub box_id: u64,
+    /// Whether this socket was created under the private shared-stack policy.
+    /// This belongs to the socket, so fork/exec and descriptor passing retain it.
+    pub private_loopback: bool,
     /// `TCP_NODELAY` option (disable Nagle's algorithm)
     pub tcp_nodelay: bool,
     /// `SO_KEEPALIVE` option
@@ -250,6 +253,7 @@ impl KernelSocket {
             bind_port: None,
             bind_ip: INADDR_ANY,
             box_id,
+            private_loopback: false,
             tcp_nodelay: true,  // We disable Nagle by default
             keepalive: false,
             rcvtimeo_us: None,
@@ -271,6 +275,7 @@ impl KernelSocket {
             bind_port: None,
             bind_ip: INADDR_ANY,
             box_id,
+            private_loopback: false,
             tcp_nodelay: false,
             keepalive: false,
             rcvtimeo_us: None,
@@ -309,6 +314,7 @@ impl KernelSocket {
             bind_port: Some(port),
             bind_ip: ip,
             box_id,
+            private_loopback: false,
             tcp_nodelay: true,
             keepalive: false,
             rcvtimeo_us: None,
@@ -409,6 +415,16 @@ where F: FnOnce(&KernelSocket) -> R
     with_table(|table| {
         table.get(idx).and_then(|slot| slot.as_ref()).map(f)
     })
+}
+
+/// Set the creating namespace's loopback policy before exposing the descriptor.
+#[cfg(feature = "smoltcp")]
+pub fn set_private_loopback(idx: usize, private: bool) {
+    with_table(|table| {
+        if let Some(Some(sock)) = table.get_mut(idx) {
+            sock.private_loopback = private;
+        }
+    });
 }
 
 /// Boot-suite hook: run [`wait_until`]'s exact wait discipline against a
@@ -1155,7 +1171,10 @@ pub fn socket_listen(idx: usize, backlog: usize) -> Result<(), i32> {
                 _ => {}
             }
 
-            KernelSocket::new_listener(ip, port, backlog).map_or(Err(libc_errno::ENOMEM), |new_sock| {
+            KernelSocket::new_listener(ip, port, backlog).map_or(Err(libc_errno::ENOMEM), |mut new_sock| {
+                new_sock.private_loopback = sock.private_loopback;
+                new_sock.box_id = sock.box_id;
+                new_sock.refs = sock.refs;
                 table[idx] = Some(new_sock);
                 Ok(())
             })
@@ -1305,8 +1324,8 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
         wait_until(|| has_pending_connection(idx), None)?;
     }
 
-    let (handle, addr) = with_table(|table| {
-        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port, .. }, bind_ip, .. })) = table.get_mut(idx) {
+    let (handle, addr, private_loopback, box_id) = with_table(|table| {
+        if let Some(Some(KernelSocket { inner: SocketType::Listener { handles, local_port, .. }, bind_ip, private_loopback, box_id, .. })) = table.get_mut(idx) {
              let endpoint = listen_endpoint(*bind_ip, *local_port);
              for (i, &handle) in handles.iter().enumerate() {
                 let state =
@@ -1329,19 +1348,19 @@ pub fn socket_accept(idx: usize, nonblock: bool) -> Result<(usize, SocketAddrV4)
                             })
                         })
                     }).flatten().flatten().unwrap_or(SocketAddrV4::new([0;4], 0));
-                    return Some((h, remote));
+                    return Some((h, remote, *private_loopback, *box_id));
                 }
              }
         }
         None
     }).ok_or(libc_errno::ECONNABORTED)?;
 
-    let current_box_id = (runtime().current_box_id)();
     let new_sock = KernelSocket { 
         inner: SocketType::Stream(handle), 
         bind_port: None,
         bind_ip: INADDR_ANY,
-        box_id: current_box_id,
+        box_id,
+        private_loopback,
         tcp_nodelay: true,
         keepalive: false,
         rcvtimeo_us: None,

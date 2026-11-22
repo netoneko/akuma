@@ -396,13 +396,13 @@ fn futex_requeue_table(
     max_wake: u32,
     max_requeue: u32,
 ) -> (Vec<QueuedWaiter>, usize) {
-    (|| {
+    {
         let (to_wake, requeued) = FUTEX_WAITERS.lock().requeue(key1, key2, max_wake, max_requeue);
         for h in &requeued {
             fe(h.tid(), FE_RQ, key2.1);
         }
         (to_wake, requeued.len())
-    })()
+    }
 }
 
 /// Remove `tid` from `key`'s waiter queue, dropping the queue if it empties.
@@ -423,11 +423,9 @@ fn futex_dequeue(key: (u32, usize), tid: usize) {
 /// `typenum` stall in `archive/SELFHOST_DEVBOX_SMOLTCP.md`). Requeue never
 /// crosses `tgid`, so the search is bounded to this thread group's queues.
 fn futex_remove_tid_anywhere(tgid: u32, tid: usize) {
-    (|| {
-        if let Some(k) = FUTEX_WAITERS.lock().remove_anywhere(tgid, tid) {
-            fe(tid, FE_RMANY, k.1);
-        }
-    })();
+    if let Some(k) = FUTEX_WAITERS.lock().remove_anywhere(tgid, tid) {
+        fe(tid, FE_RMANY, k.1);
+    }
 }
 
 /// Dump the whole futex waiter table: every `(tgid, uaddr)` key and the tids queued on it.

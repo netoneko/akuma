@@ -15,6 +15,7 @@
 extern crate alloc;
 
 pub mod runtime;
+pub mod wait_hooks;
 /// Re-exported so `crate::safe_print!(…)` resolves here as it does in
 /// `akuma-virtio`. This crate prints with `safe_print!` rather than `log::`:
 /// the `log` dependency exists for **smoltcp**, and it is deliberately built

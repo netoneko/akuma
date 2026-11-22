@@ -37,6 +37,35 @@ pub trait Kernel: UserPages {
     fn root_fs() -> &'static dyn akuma_vfs::Filesystem;
     /// The page-table root the syscall path acts on now.
     fn task_root() -> u64;
+
+    // A lazy record names a file by one `u32`. On the root filesystem that is its inode number, and these four defaults
+    // are all a kernel with one filesystem needs. A kernel with mount namespaces (Denver with `containers`) packs a
+    // mount slot into the number's top bits and answers here for the files of a box's mounts: the number is opaque to
+    // everything in this crate except these methods.
+
+    /// Read from the file a record names. Short at EOF, as `read_at_by_inode`.
+    ///
+    /// # Errors
+    /// The filesystem's: the mount is gone, or the read failed.
+    fn read_file(file: u32, offset: usize, out: &mut [u8]) -> Result<usize, akuma_vfs::FsError> {
+        Self::root_fs().read_at_by_inode(file, offset, out)
+    }
+    /// The size of the file a record names; `None` when it cannot be stat'ed.
+    #[must_use]
+    fn file_size(file: u32) -> Option<u64> {
+        Self::root_fs().metadata_by_inode(file).ok().map(|md| md.size)
+    }
+    /// The inode number the pin table is told about (`InodePin`).
+    #[must_use]
+    fn pin_inode(file: u32) -> u32 {
+        file
+    }
+    /// Whether the file-page cache and the shared-page table may hold this file's frames. Both are invalidated by
+    /// *root filesystem* inode numbers, so a file on another mount must not enter them.
+    #[must_use]
+    fn shareable(_file: u32) -> bool {
+        true
+    }
 }
 
 /// Write lazy leaves for `[base, base + len)`, the page at `base` being `first`.
@@ -97,13 +126,13 @@ pub fn fill<M: Kernel>(root: u64, va: u64, files: bool) -> Fill {
     }
     let (write, exec) = (page.write, page.exec);
     // A `MAP_SHARED` writable file page: one frame for every mapper (`shmpages`).
-    if let Some(f) = page.file.filter(|f| f.shared) {
+    if let Some(f) = page.file.filter(|f| f.shared && M::shareable(f.inode)) {
         return fill_shared::<M>(root, va, f, write, exec);
     }
     // A read-only file page is shared through the file-page cache: one frame
     // per `(inode, offset)` however many processes map it (amd64's rule, and
     // the same eligibility - see `akuma_fpcache`'s module docs).
-    let share = page.file.filter(|_| !page.write && akuma_fpcache::cap() > 0);
+    let share = page.file.filter(|f| !page.write && akuma_fpcache::cap() > 0 && M::shareable(f.inode));
     if let Some(f) = share
         && let Some(key) = akuma_primitives::FileKey::try_from_raw(FPCACHE_MOUNT, f.inode)
         && let Some((frame, _)) = akuma_fpcache::lookup_and_ref(key, f.index as usize * 4096, page.exec)
@@ -211,7 +240,7 @@ fn alloc_frame<M: UserPages>(zeroed: bool) -> Option<M::Frame> {
 fn read_file_page<M: Kernel>(f: lazy::FilePage, out: &mut [u8; 4096]) -> Option<usize> {
     let mut done = 0usize;
     while done < out.len() {
-        match M::root_fs().read_at_by_inode(f.inode, f.index as usize * 4096 + done, &mut out[done..]) {
+        match M::read_file(f.inode, f.index as usize * 4096 + done, &mut out[done..]) {
             Ok(0) => break,
             Ok(n) => done += n,
             Err(_) => return None,
@@ -317,6 +346,9 @@ fn move_leaf<M: UserPages>(root: u64, from: u64, to: u64) -> bool {
 /// Under the kernel lock, as `TASKS` is.
 struct Pin {
     root: u64,
+    /// The record's file number (what `unpin_released` compares against).
+    key: u32,
+    /// Holds the real inode alive ([`Kernel::pin_inode`]).
     pin: akuma_primitives::InodePin,
     lo: u64,
     hi: u64,
@@ -325,11 +357,9 @@ struct Pin {
 static PINS: akuma_primitives::cell::BorrowCell<alloc::vec::Vec<Pin>> =
     akuma_primitives::cell::BorrowCell::new(alloc::vec::Vec::new());
 
-/// Pin `inode` for `root`, for records in `[lo, hi)`. `false` when the table
-/// cannot grow - the caller maps the file eagerly instead.
-pub fn pin(root: u64, inode: u32, lo: u64, hi: u64) -> bool {
+pub fn pin<M: Kernel>(root: u64, inode: u32, lo: u64, hi: u64) -> bool {
     PINS.with_mut(|p| {
-        if let Some(e) = p.iter_mut().find(|e| e.root == root && e.pin.inode() == inode) {
+        if let Some(e) = p.iter_mut().find(|e| e.root == root && e.key == inode) {
             e.lo = e.lo.min(lo);
             e.hi = e.hi.max(hi);
             return true;
@@ -337,14 +367,11 @@ pub fn pin(root: u64, inode: u32, lo: u64, hi: u64) -> bool {
         if p.try_reserve(1).is_err() {
             return false;
         }
-        p.push(Pin { root, pin: akuma_primitives::InodePin::new(inode), lo, hi });
+        p.push(Pin { root, key: inode, pin: akuma_primitives::InodePin::new(M::pin_inode(inode)), lo, hi });
         true
     })
 }
 
-/// A fork child's address space holds every lazy page its parent did, at the
-/// same addresses. `false` when the table cannot grow; whatever was added is
-/// kept, and goes with `child`'s root.
 pub fn fork_pins(parent: u64, child: u64) -> bool {
     PINS.with_mut(|p| {
         let n = p.iter().filter(|e| e.root == parent).count();
@@ -353,7 +380,7 @@ pub fn fork_pins(parent: u64, child: u64) -> bool {
         }
         for i in 0..p.len() {
             if p[i].root == parent {
-                let e = Pin { root: child, pin: p[i].pin.clone(), lo: p[i].lo, hi: p[i].hi };
+                let e = Pin { root: child, key: p[i].key, pin: p[i].pin.clone(), lo: p[i].lo, hi: p[i].hi };
                 p.push(e);
             }
         }
@@ -412,7 +439,7 @@ pub fn unpin_released<M: UserPages>(root: u64, start: u64, end: u64, keep: impl 
                 e.hi = start;
             }
             if n < cand.len() {
-                cand[n] = (e.pin.inode(), e.lo, e.hi);
+                cand[n] = (e.key, e.lo, e.hi);
                 n += 1;
             }
         }
@@ -423,7 +450,7 @@ pub fn unpin_released<M: UserPages>(root: u64, start: u64, end: u64, keep: impl 
         if lo < hi && (names_inode::<M>(root, lo, hi, inode) || keep(inode, lo, hi)) {
             continue;
         }
-        PINS.with_mut(|p| p.retain(|e| !(e.root == root && e.pin.inode() == inode)));
+        PINS.with_mut(|p| p.retain(|e| !(e.root == root && e.key == inode)));
         dropped = true;
     }
     dropped

@@ -53,7 +53,7 @@ const LOCK_BUDGET: u32 = 1 << 22;
 ///
 /// 64 KiB covers a whole boot's worth of output comfortably and costs nothing
 /// but `.bss`.
-const KLOG_CAP: usize = 64 * 1024;
+pub const KLOG_CAP: usize = 64 * 1024;
 
 /// # Why its own lock, and why `try_lock` on the write path
 ///
@@ -138,7 +138,7 @@ pub fn replay_klog_tail_to_fb(max: usize) {
 }
 
 /// Total bytes currently retrievable from [`klog_snapshot_from`]. For
-/// `SYSLOG_ACTION_SIZE_UNREAD` / `SIZE_BUFFER`.
+/// `SYSLOG_ACTION_SIZE_UNREAD`.
 #[must_use]
 pub fn klog_len() -> usize {
     klog_lock().map_or(0, |r| r.len())

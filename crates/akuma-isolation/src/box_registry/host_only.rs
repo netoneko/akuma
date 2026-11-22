@@ -139,6 +139,7 @@ pub fn private_ns_building(_box_id: u64) -> bool {
 pub fn is_private_ns(_box_id: u64) -> bool {
     false
 }
+#[must_use]
 pub fn lock_private_ns(_box_id: u64) -> bool {
     false
 }

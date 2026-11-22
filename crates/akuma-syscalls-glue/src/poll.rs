@@ -870,7 +870,7 @@ mod stdin_starved {
     }
 
     fn dump_instance(proc: &akuma_exec::process::Process, efd: u32, id: u32) {
-        let entries = (|| {
+        let entries = {
             let table = super::EPOLL_TABLE.lock();
             let mut out = [None; 24];
             if let Some(inst) = table.get(&id) {
@@ -879,7 +879,7 @@ mod stdin_starved {
                 }
             }
             out
-        })();
+        };
         akuma_primitives::safe_print!(64, "[stdin-starved]  epfd={}:\n", efd);
         for (fd, e) in entries.iter().flatten() {
             let kind = proc.get_fd(*fd);
@@ -1047,11 +1047,9 @@ pub fn sys_epoll_pwait(epfd: u32, events_ptr: UserAddr, maxevents: i32, timeout:
             // HUP/ERR to force both handlers to run, and dereferenced a connection
             // object it had already torn down along with the fd. Prune instead.
             if akuma_exec::process::current_process_shared().is_none_or(|p| p.get_fd(fd).is_none()) {
-                (|| {
-                    if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
-                        inst.prune(fd);
-                    }
-                })();
+                if let Some(inst) = EPOLL_TABLE.lock().get_mut(&epoll_id) {
+                    inst.prune(fd);
+                }
                 continue;
             }
 

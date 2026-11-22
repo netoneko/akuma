@@ -5,7 +5,7 @@
 //! layer only chooses *which* check a call needs
 //! (`docs/archive/UNIX_PERMISSIONS.md` §6).
 //!
-//! uid 0 bypasses every check except "execute a file with no execute bit at
+//! A process with capabilities bypasses every check except "execute a file with no execute bit at
 //! all". All existing workloads run as uid 0, which is why turning enforcement
 //! on is a no-op for them: only a process that has dropped can be refused.
 //!
@@ -64,7 +64,7 @@ pub fn set_enforcing(on: bool) {
 /// "other" may do anything. Linux does the same.
 #[must_use]
 pub fn may(c: &Creds, a: &Attr, want: u32) -> bool {
-    if c.is_root() {
+    if c.has_capabilities() {
         // Root may search any directory, but executes a file only if somebody
         // could: some execute bit must be set.
         return want & MAY_EXEC == 0 || a.is_dir() || a.mode & 0o111 != 0;
@@ -96,20 +96,20 @@ pub fn may_delete(c: &Creds, dir: &Attr, victim: &Attr) -> bool {
 /// The sticky-directory half of [`may_delete`] alone.
 #[must_use]
 pub fn sticky_allows(c: &Creds, dir: &Attr, victim: &Attr) -> bool {
-    dir.mode & S_ISVTX == 0 || c.is_root() || c.uid() == victim.uid || c.uid() == dir.uid
+    dir.mode & S_ISVTX == 0 || c.has_capabilities() || c.uid() == victim.uid || c.uid() == dir.uid
 }
 
 /// May `c` change the mode of `a`? Root or the owner.
 #[must_use]
 pub fn may_chmod(c: &Creds, a: &Attr) -> bool {
-    c.is_root() || c.uid() == a.uid
+    c.has_capabilities() || c.uid() == a.uid
 }
 
 /// The mode a `chmod` by `c` actually stores: a non-root caller that is not in
 /// the file's group cannot set `S_ISGID` (Linux silently clears it).
 #[must_use]
 pub fn chmod_mode(c: &Creds, a: &Attr, mode: u32) -> u32 {
-    if !c.is_root() && !c.in_group(a.gid) {
+    if !c.has_capabilities() && !c.in_group(a.gid) {
         mode & !S_ISGID
     } else {
         mode
@@ -123,7 +123,7 @@ pub fn chmod_mode(c: &Creds, a: &Attr, mode: u32) -> u32 {
 /// setuid-on-exec bit would be laundered, and Linux refuses it too.
 #[must_use]
 pub fn may_chown(c: &Creds, a: &Attr, uid: Option<u32>, gid: Option<u32>) -> bool {
-    if c.is_root() {
+    if c.has_capabilities() {
         return true;
     }
     if uid.is_some_and(|u| u != a.uid) {
@@ -139,7 +139,7 @@ pub fn may_chown(c: &Creds, a: &Attr, uid: Option<u32>, gid: Option<u32>) -> boo
 /// an arbitrary time needs ownership (`utimensat(2)`).
 #[must_use]
 pub fn may_set_times(c: &Creds, a: &Attr, to_now: bool) -> bool {
-    c.is_root() || c.uid() == a.uid || to_now && may(c, a, MAY_WRITE)
+    c.has_capabilities() || c.uid() == a.uid || to_now && may(c, a, MAY_WRITE)
 }
 
 /// May a process with `sender` credentials signal one with `target`'s?
@@ -206,6 +206,25 @@ mod tests {
         assert!(!may(&r, &file(0o644, 0, 0), MAY_EXEC));
         assert!(may(&r, &file(0o100, 1000, 1000), MAY_EXEC), "any x bit will do");
         assert!(may(&r, &dir(0o000, 1000, 1000), MAY_EXEC), "search is not exec");
+    }
+
+    #[test]
+    fn dropped_root_uses_owner_and_mode_permissions() {
+        let mut dropped = Creds::ROOT;
+        dropped.drop_capabilities();
+        let own = file(0o600, 0, 0);
+        let other = file(0o600, 1000, 1000);
+        assert!(may(&dropped, &own, MAY_READ | MAY_WRITE));
+        assert!(may_chmod(&dropped, &own));
+        assert!(!may(&dropped, &other, MAY_READ));
+        assert!(!may_chmod(&dropped, &other));
+        assert!(!may_chown(&dropped, &own, Some(1000), None));
+        assert_eq!(dropped.set_uid(1000), Err(crate::creds::CredError::Perm));
+        assert_eq!(dropped.set_gid(1000), Err(crate::creds::CredError::Perm));
+        assert_eq!(dropped.set_groups(&[1000]), Err(crate::creds::CredError::Perm));
+        assert!(may(&Creds::ROOT, &other, MAY_READ));
+        assert!(may_chmod(&Creds::ROOT, &other));
+        assert!(may_chown(&Creds::ROOT, &own, Some(1000), None));
     }
 
     #[test]

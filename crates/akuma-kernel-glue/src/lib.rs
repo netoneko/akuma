@@ -140,6 +140,17 @@ fn rndr_fill(buf: &mut [u8]) -> bool {
     akuma_primitives::rng::fill_from_words(buf, akuma_cpu::rng::rndr).is_ok()
 }
 
+#[cfg(target_os = "none")]
+struct SocketWait;
+#[cfg(target_os = "none")]
+impl akuma_net::wait_hooks::Machine for SocketWait {
+    fn now() -> u64 { timer::uptime_us() }
+    fn yield_thread() { threading::yield_now(); }
+    fn park(deadline_us: u64) { threading::schedule_blocking(deadline_us); }
+    fn halt() { threading::blocking_relax_net(); }
+    fn deadline() -> akuma_net::wait_hooks::Deadline { akuma_net::wait_hooks::Deadline::Park }
+}
+
 /// The network stack's randomness (`NetRuntime::rng_fill`): the kernel pool.
 ///
 /// On a machine with no entropy source the pool answers nothing, and the stack
@@ -1595,17 +1606,17 @@ fn run_async_main() -> ! {
         akuma_net::NetRuntime {
             uptime_us: timer::uptime_us,
             utc_seconds: timer::utc_seconds,
-            yield_now: threading::yield_now,
+            yield_now: akuma_net::wait_hooks::yield_now::<SocketWait>,
             // NOT `threading::blocking_relax` — the socket variant, which skips the
             // `yield_now` before halting. Worth +27 % req/s and half the p90 here,
             // and unsafe kernel-wide (it wedges the spawn/reap path at SMP=4).
             // Rationale and the A/B numbers: `threading::blocking_relax_net`.
-            blocking_relax: threading::blocking_relax_net,
+            blocking_relax: akuma_net::wait_hooks::blocking_relax::<SocketWait>,
             // The blocking-socket waiter's park. Unlike `blocking_relax` this
             // marks the thread WAITING, which is what lets `wake_all()` on the
             // socket target it directly instead of leaving it to notice on a
             // timer — see `NetRuntime::park_until`.
-            park_until: threading::schedule_blocking,
+            park_until: akuma_net::wait_hooks::park_until::<SocketWait>,
             current_waker: || threading::get_waker_for_thread(threading::current_thread_id()),
             current_core_id: akuma_exec::bkl::current_core_id,
             current_box_id: || process::current_process_shared().map_or(0, |p| p.box_id),

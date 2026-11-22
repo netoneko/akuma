@@ -153,6 +153,7 @@ fn gicr_sgi(off: usize) -> usize {
 /// `extreme` profile (which chose that addressing mode) while working on
 /// `release` (which happened to emit `str w, [x, #off]`). Forcing the
 /// instruction form here makes GICv3 MMIO ISV-safe on every build profile.
+#[cfg(target_arch = "aarch64")]
 #[inline]
 pub fn mmio_w32(addr: usize, val: u32) {
     // SAFETY: `addr` is a device-mapped GIC MMIO register.
@@ -161,6 +162,7 @@ pub fn mmio_w32(addr: usize, val: u32) {
             options(nostack, preserves_flags));
     }
 }
+#[cfg(target_arch = "aarch64")]
 #[inline]
 #[must_use]
 pub fn mmio_r32(addr: usize) -> u32 {
@@ -173,6 +175,20 @@ pub fn mmio_r32(addr: usize) -> u32 {
     val
 }
 
+/// Off AArch64 there is no GIC to poke (host `cargo test` of the crates that depend on this one):
+/// a write is dropped and a read is zero. Deliberately not a volatile access to an arbitrary address.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+pub fn mmio_w32(_addr: usize, _val: u32) {}
+
+/// See [`mmio_w32`]: reads zero off AArch64.
+#[cfg(not(target_arch = "aarch64"))]
+#[inline]
+#[must_use]
+pub fn mmio_r32(_addr: usize) -> u32 {
+    0
+}
+
 // ============================================================================
 // CPU interface — EL1 system registers (ICC_*_EL1)
 //
@@ -181,6 +197,9 @@ pub fn mmio_r32(addr: usize) -> u32 {
 // AArch64 toolchain regardless of GICv3 mnemonic support.
 // ============================================================================
 
+// Off AArch64 (a host `cargo test` of a dependent) there is no CPU interface: a read is zero and a
+// write is dropped, with the same shape as the real macros.
+#[cfg(target_arch = "aarch64")]
 macro_rules! read_sysreg {
     ($enc:literal) => {{
         let v: u64;
@@ -192,6 +211,7 @@ macro_rules! read_sysreg {
     }};
 }
 
+#[cfg(target_arch = "aarch64")]
 macro_rules! write_sysreg {
     ($enc:literal, $val:expr) => {{
         let v: u64 = $val;
@@ -199,6 +219,22 @@ macro_rules! write_sysreg {
         unsafe {
             core::arch::asm!(concat!("msr ", $enc, ", {0}"), in(reg) v, options(nomem, nostack));
         }
+    }};
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+macro_rules! read_sysreg {
+    ($enc:literal) => {{
+        let _ = $enc;
+        0u64
+    }};
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+macro_rules! write_sysreg {
+    ($enc:literal, $val:expr) => {{
+        let _ = $enc;
+        let _: u64 = $val;
     }};
 }
 

@@ -19,7 +19,7 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TARGET = os.path.join(ROOT, "proposals", "FUTURE_WORK.md")
 BEGIN, END = "<!-- BEGIN GENERATED -->", "<!-- END GENERATED -->"
-SKIP_DIRS = {"target", ".git", "node_modules", "overlays"}
+SKIP_DIRS = {"target", ".git", "node_modules", "overlays", ".claude"}
 SELF = {os.path.join("proposals", "FUTURE_WORK.md"), os.path.join("scripts", "future_work_scan.py")}
 
 MARK = re.compile(

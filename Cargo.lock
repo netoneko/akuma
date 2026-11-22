@@ -1517,6 +1517,7 @@ dependencies = [
 name = "akuma-vfs"
 version = "0.1.0"
 dependencies = [
+ "akuma-primitives",
  "spinning_top",
 ]
 

@@ -753,7 +753,14 @@ Then:
   only: pushing to `main` (`git push origin main`, `HEAD:main`, a merge into it) still needs the user's explicit
   permission, every time.** If you are on `main`, branch first and push the branch. A push also publishes any commit of
   the user's that is ahead of origin; that is expected.
-- **Before merging to `main`, run `scripts/premerge_build.sh`** and get every step to PASS. It builds every kernel and feature set
+- **Run `scripts/install-hooks.sh` once in every clone** (it sets `core.hooksPath`; the pre-commit hook was uninstalled for
+  weeks and clippy rotted in ten crates). The hook also `cargo check`s `taoxichuan`, `shanghai` and `denver` on both architectures.
+- **Before merging to `main`, run `scripts/gate.py`** (every kernel built, every amd64 kernel booted, a capability matrix;
+  `docs/runbooks/merge-gate.md`) **and get it green.** It runs `premerge_build.sh`'s sixteen builds itself, in parallel.
+  A change to `akuma-syscalls-glue`, `akuma-exec`, `akuma-user-access` or `akuma-tokio-kernel-core` also runs
+  `scripts/gate.py --with-jvm`. A commit that changes behaviour on one architecture names, in its message, every
+  kernel that depended on the old behaviour (`git grep` the crate's dependents). A ratchet reaching "budget 0" lands
+  only with a green `scripts/gate.py` in the same change. The older rule, still true: `scripts/premerge_build.sh` is the build half. It builds every kernel and feature set
   with `--release`: the main kernel on aarch64 and amd64 (headless, the ryzen set, server, the devbox and rump-devbox
   sets) and the platform kernels `taoxichuan`, `shanghai` (with its middleware sets) and `denver` (default and JVM sets)
   on both architectures. `cargo build` at the root never reaches the platform kernels (they are not `default-members`),
@@ -761,6 +768,8 @@ Then:
   there breaks them silently (`docs/archive/DENVER_BUILD_BREAKAGE.md`). `--only <word>` runs a subset, `--fast` one
   build per kernel/arch, `--list` the names. A new kernel or build target goes in its `STEPS` list. It is a build gate,
   not a test run: host tests, clippy and the `scripts/check_*.py` budgets are separate.
+- **Every merge into `main` also prunes `proposals/FUTURE_WORK.md`** (`docs/runbooks/future-work-scan.md` § 4): delete what the
+  branch fixed, add what it opened, regenerate the inventory. Same discipline as `BUG_FIX_LIST.md`.
 - **Never rewrite history**: no `reset`, `rebase`, `commit --amend` or force-push, in this repo or any submodule. A
   mistake is fixed by a new commit.
 - **Docs-only commits use `git commit --no-verify`.** A commit whose every path is Markdown or under `docs/` or

@@ -20,6 +20,27 @@ pub trait NetMachine: 'static {
     fn wait_lap();
     /// Fill `buf` with the best entropy the machine has.
     fn rng_fill(buf: &mut [u8]);
+    /// Whether the caller is a task the scheduler can park: a user thread inside a syscall, not the boot
+    /// task, the idle thread or an interrupt. A wait lap that can park does, so the thread that would
+    /// satisfy the wait (the peer end of a loopback connection, a sleeper whose deadline passed) can run;
+    /// a lap that cannot park halts. Defaults to `false`: the halting lap, as before.
+    #[must_use]
+    fn can_park() -> bool {
+        false
+    }
+}
+
+struct Wait<M>(core::marker::PhantomData<M>);
+
+impl<M: NetMachine> akuma_net::wait_hooks::Machine for Wait<M> {
+    fn now() -> u64 { M::uptime_us() }
+    fn yield_thread() { M::wait_lap(); }
+    fn park(deadline_us: u64) { akuma_threading::schedule_blocking(deadline_us); }
+    fn halt() { M::wait_lap(); }
+    fn deadline() -> akuma_net::wait_hooks::Deadline { akuma_net::wait_hooks::Deadline::Pump }
+    fn pump() { netpoll::<M>(); }
+    fn relax_laps() -> usize { 64 }
+    fn can_park() -> bool { M::can_park() }
 }
 
 /// The stack is up; until then [`netpoll`] is a no-op (a tick can come first).
@@ -79,32 +100,6 @@ fn lap_note<M: NetMachine>(dur_us: u64) {
     }
 }
 
-/// A wait loop's backstop between re-checks: every lap pumps, since nothing
-/// else would wake a waiter (no NIC interrupt).
-fn park_until<M: NetMachine>(deadline_us: u64) {
-    while M::uptime_us() < deadline_us {
-        netpoll::<M>();
-        M::wait_lap();
-    }
-}
-
-/// One lap of a socket waiter with nothing to do. It pumps too: a waiter that
-/// reaches this hook between predicate laps (a send buffer full, the peer's
-/// ACK not yet drained) must keep the only pump alive, or the guest deadlocks
-/// with its RX ring unposted and its TX unflushed.
-fn blocking_relax<M: NetMachine>() {
-    for _ in 0..64 {
-        netpoll::<M>();
-        M::wait_lap();
-    }
-}
-
-/// Never a bare pause: every yield lap keeps the pump alive.
-fn yield_now<M: NetMachine>() {
-    netpoll::<M>();
-    M::wait_lap();
-}
-
 /// A waker that does nothing: the wait loops poll, nothing is parked for one.
 fn noop_waker() -> core::task::Waker {
     core::task::Waker::noop().clone()
@@ -118,12 +113,15 @@ pub fn runtime<M: NetMachine>() -> NetRuntime {
     NetRuntime {
         uptime_us: M::uptime_us,
         utc_seconds: || None, // nothing in akuma-net reads it
-        yield_now: yield_now::<M>,
-        blocking_relax: blocking_relax::<M>,
-        park_until: park_until::<M>,
+        yield_now: akuma_net::wait_hooks::yield_now::<Wait<M>>,
+        blocking_relax: akuma_net::wait_hooks::blocking_relax::<Wait<M>>,
+        park_until: akuma_net::wait_hooks::park_until::<Wait<M>>,
         current_waker: noop_waker,
         current_core_id: || 0,
+        #[cfg(not(feature = "containers"))]
         current_box_id: || 0,
+        #[cfg(feature = "containers")]
+        current_box_id: || akuma_exec::process::current_process_shared().map_or(0, |p| p.box_id),
         is_current_interrupted: || false,
         rng_fill: M::rng_fill,
         current_thread_id: || 0,

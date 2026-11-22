@@ -1,0 +1,5 @@
+#!/bin/sh
+# Scala CLI's JVM needs Linux as os.name for coursier's directories library (the kernel's uname sysname is Akuma).
+# `scala-cli run` execs the application itself: Denver's execve from a non-leader thread works since 2026-11-20
+# (docs/archive/DENVER_SCALA_CLI_CRASHES.md), so no per-kernel special case is left.
+exec java -Dos.name=Linux -jar /opt/scala-cli/scala-cli.jar "$@"

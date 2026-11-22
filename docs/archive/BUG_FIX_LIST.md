@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1678
-- **Docs contributing at least one fix:** 492
+- **Total distinct fixes counted:** 1694
+- **Docs contributing at least one fix:** 499
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 260 | 15.4% | 42 |
-| Memory & Virtual Memory | 205 | 12.2% | 73 |
-| Scheduler & Process Management | 156 | 9.3% | 52 |
-| SMP & Locking | 142 | 8.5% | 61 |
-| Networking | 104 | 6.2% | 38 |
+| Syscall / ABI Compatibility Audits | 261 | 15.4% | 43 |
+| Memory & Virtual Memory | 205 | 12.1% | 73 |
+| Scheduler & Process Management | 160 | 9.4% | 54 |
+| SMP & Locking | 142 | 8.4% | 61 |
+| Networking | 105 | 6.2% | 39 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
-| Rump Kernel & Syscall Proxy | 26 | 1.6% | 6 |
-| Toolchain & Self-Hosting | 94 | 5.6% | 14 |
+| Rump Kernel & Syscall Proxy | 26 | 1.5% | 6 |
+| Toolchain & Self-Hosting | 94 | 5.5% | 14 |
 | SSH | 56 | 3.3% | 23 |
 | VFS & Filesystem | 150 | 8.9% | 49 |
-| Boot & Drivers | 144 | 8.6% | 25 |
-| Signals & Exceptions | 50 | 3.0% | 20 |
+| Boot & Drivers | 145 | 8.6% | 26 |
+| Signals & Exceptions | 51 | 3.0% | 21 |
 | Misc / Cross-cutting | 98 | 5.8% | 28 |
-| Console & Terminal | 63 | 3.8% | 22 |
-| Containers | 71 | 4.2% | 14 |
-| **Total** | **1678** | **100.0%** | **492** |
+| Console & Terminal | 63 | 3.7% | 22 |
+| Containers | 79 | 4.7% | 15 |
+| **Total** | **1694** | **100.0%** | **499** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -55,7 +55,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (260 fixes, 42 docs)
+## Syscall / ABI Compatibility Audits (261 fixes, 43 docs)
 
 ### docs/archive/TOKIO_KERNEL_GATES_RERUN.md
 - `read_user_cstr` prefaulted a page-aligned string start on aarch64 only (`9cc41207`); on the tokio kernels, whose ring-0 fault handler fills only zero pages, `open` of a lazily mapped `.rodata` path returned `EFAULT` and tokioprobe's DNS lookup failed with `Invalid flags`; the prefault runs on every architecture again (found through Taoxichuan)
@@ -363,6 +363,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/CLOCK_GETTIME_EINTR_ON_SIGNAL.md
 - The syscall prologue answered `EINTR` to every syscall while the thread's interrupt flag was set and the first syscall consumed it, so a `clock_gettime` (which Linux never fails with `EINTR`) landed in the window between a signal's post and its handler frame and panicked codex's TUI on a resize; `never_interrupted` now lists the calls that cannot block (`clock_gettime`, the id getters, `uname`, `sysinfo`, `getrandom`, `getrlimit`, ...) so they no longer consume the flag
+
+### docs/archive/AKUMA_ECOSYSTEM_DEMO.md
+- `getcpu` (x86_64 nr 309) was unserved on the main amd64 kernel, so HotSpot fell back to the unmapped legacy vsyscall page and the JVM died before `main` with `SIGSEGV at pc=0xffffffffff600800`; the kernel serves it, and the gate probe has a `getcpu` check
 
 ## Memory & Virtual Memory (205 fixes, 73 docs)
 
@@ -719,7 +722,7 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 - `akuma-mmu` range checks wrapped `va_start + len + PAGE_SIZE - 1`; `page_span` treats a wrapping range as not mapped
 - `prefault_user_range` and `madvise(WILLNEED)` rounded unchecked; `checked_add` plus `page_ceil`
 
-## Scheduler & Process Management (156 fixes, 52 docs)
+## Scheduler & Process Management (160 fixes, 54 docs)
 
 ### docs/archive/GO_FORK_EXEC_FIXES.md
 - 1: PROCESS_INFO_ADDR overwritten by `cow_share_range`
@@ -984,6 +987,14 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 ### docs/archive/GETPPID_RETURNED_THREAD_PID.md
 
 - `getppid` returned the forking thread's pid, not its thread-group id, so codex's post-`PR_SET_PDEATHSIG` parent check failed on every command forked from a tokio worker and the child SIGTERM'd itself (`exited 143 in 0ms`); `sys_getppid` now resolves the parent thread to its tgid.
+
+### docs/archive/EXEC_FROM_THREAD_DETACH.md
+- `execve` from a non-leader thread replaced the thread group's address space under its live siblings (the amd64 kernel keeps the space in the leader's `Process` and `stop_siblings` drained only for the leader), so siblings faulted in ring 3 or panicked ring 0 inside `sys_mmap`; the caller now runs detached (`usermode::sys_execve_detached`) and the group is left alone
+
+### docs/archive/DENVER_SCALA_CLI_CRASHES.md
+- The tokio kernels' `execve` from a non-leader thread replaced the group's address space under live sibling threads; the exec now ends every other thread first (`kill_siblings`, rescanning until no sibling is live) and the leader slot owns the new root.
+- A thread cloned just before its group's `execve` loaded the freed root and triple-faulted the Denver guest; `Process::run` now ends a thread whose root is not its leader's.
+- A non-leader `execve` left the calling thread's own `Process` on the old root, so every thread the new image created started on the freed root (`scala-cli run` died after its exec); the caller's view now points at the new root.
 
 ## SMP & Locking (142 fixes, 61 docs)
 
@@ -1261,7 +1272,7 @@ aren't recorded anywhere else.)
 ### docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md
 - xHCI `KEYS` deadlocked one core (unmasked reader preempted onto the pump spinning on the masked producer's lock); now an `IrqSpinlock`
 
-## Networking (104 fixes, 38 docs)
+## Networking (105 fixes, 39 docs)
 
 ### docs/archive/KVM_RELAY_SYN_STALL.md
 - The KVM host relay wedged on the ryzen under overlapping sessions: a forward slot reused one source port for every connection and the gateway's TCP sent its SYN once (no retransmit), so a guest holding the previous connection on that tuple never answered, the slot stayed `connecting`, the listen backlog filled and the port refused. Fixed with a rotating source-port generation per slot and a SYN retry (4 s) that gives up by resetting the client (`Gateway::fwd_reopen`, `relay.rs`); the SYNs a first 1.5 s retry chased were slow, not lost
@@ -1443,6 +1454,9 @@ aren't recorded anywhere else.)
 - AF_INET `sendmsg` sent and `recvmsg` filled only the first iovec
 - `msg_iovlen` was unbounded into an infallible `vec!` (up to 64 GiB); over `UIO_MAXIOV` is `EMSGSIZE`
 - UDP blocking `recv` ignored `SO_RCVTIMEO` (a fixed 10 s), and socket timeouts expired as `ETIMEDOUT` instead of `EAGAIN`
+
+### docs/archive/AMD64_SOCKET_WAIT_STARVATION.md
+- the main amd64 kernel's socket wait halted without yielding while another thread was READY, and ring 0 is not preempted there: with more waiting threads than cores (loopback echo client, server and reader) the peer a waiter needed never ran until an unrelated timeout, so `tcp_loopback` stalled for 20 s in about 1 boot in 8; `SocketWait::yield_before_relax` now yields when `runnable_exists()`
 
 ## Userspace Apps & Libraries (59 fixes, 25 docs)
 
@@ -2080,7 +2094,10 @@ aren't recorded anywhere else.)
 ### docs/archive/DEVFS_KVM_NODES_NOT_LISTED.md
 - `/dev/kvm0` and `/dev/kvm` were opened by the kernel's own `openat` arm but never in the devfs table, so `ls /dev` and `stat` showed neither and the hypervisor looked unwired; `DevProbe` gained `kvm_ctl`/`kvm_api` and the table the two root-only nodes (boxes still see neither)
 
-## Boot & Drivers (144 fixes, 25 docs)
+## Boot & Drivers (145 fixes, 26 docs)
+
+### docs/archive/AMD64_BOOT_EPOCH.md
+- The main amd64 kernel ignored the supplied `epoch=`; it now seeds the wall clock before init and permits SNTP correction.
 
 ### docs/archive/AKUMA_FIRECRACKER_KVM.md
 (The Firecracker/KVM port. §3.1's `GICD_IROUTER` aliasing is counted under `GICD_IROUTER_ALIASING.md` below, the deep-dive it points at; §3.11 is explicitly "not a bug" (two hypervisors racing for host port 2222); §5.2 (nondeterministic `akuma_net::init` hang) and §5.3 (spinning DHCP settle loop) are open.)
@@ -2278,7 +2295,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - The multiboot2 path applied the `idlesleep` policy only inside `start_secondaries`' closure, which the full-suite boot never runs; both entries apply the command-line policies
 
-## Signals & Exceptions (50 fixes, 20 docs)
+## Signals & Exceptions (51 fixes, 21 docs)
 
 ### docs/archive/CTRL_C_SIGINT_DELIVERY.md
 - Ctrl-C never interrupted a foreground child over `ssh -tt` (repro: `tail -f`): **no line discipline in the tree generated `SIGINT` at all**. Fixed in the kernel as a process-group broadcast; the first attempt — patching sshd to target `foreground_pgid` as a single pid — was wrong and is recorded as such
@@ -2370,6 +2387,9 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - Every group `SIGKILL` cost 2 s on AArch64: each thread's `kill_thread_group` grace-waited for siblings in their own grace waits; `claim_group_exit` makes the first caller do the teardown
 - amd64 `kill` could return `EINTR` without sending (glue's dispatch prologue), orphaning a child; signal senders are exempt from the gate
+
+### docs/archive/DENVER_SCALA_CLI_CRASHES.md
+- The fault-signal `rt_sigreturn` resumed through `sysretq`, which loads `rcx`/`r11` with `rip`/`rflags` (`0x246`), so HotSpot read `0x246` as an object reference after a null-check or safepoint SIGSEGV in compiled code; the exit now leaves by `iretq` with the interrupted `rcx`/`r11`.
 
 ## Misc / Cross-cutting (98 fixes, 28 docs)
 
@@ -2661,7 +2681,7 @@ aren't recorded anywhere else.)
 ### docs/archive/AKUMA_MULTIARCH_ATTEMPT_0.md
 - amd64 `setpgid` outside a pty session was a no-op, so `^C` on the serial console reached an empty foreground group; the shared spawn gives each child a group and amd64 uses glue's `setpgid`/`getpgid`
 
-## Containers (71 fixes, 14 docs)
+## Containers (79 fixes, 15 docs)
 
 ### docs/archive/BOX_DOCKER_COMPAT.md
 - `bootstrap/bin/tar` was never deployed by `userspace/build.sh`, so `/bin/tar` was a busybox applet whose hardlinks go through `link()` — which `sys_linkat` implements as a full file copy that also loses the mode — turning a 1.9 MB busybox layer into 467.7 MB of `0644` copies that a shell's `PATH` search then refused with "Permission denied"; fixed by linking in `akuma_tar`, which applies the archived mode bits (layer store 467.7 MB → 4.1 MB)
@@ -2698,6 +2718,16 @@ aren't recorded anywhere else.)
 - `box grab`'s `waitpid` loop could never tell that its target had exited, because `reattach` does not reparent the grabbed pid — `wait4`/`waitpid` on a non-child pid returns the same "nothing to report" as "still running"; fixed by falling back to a `kill(pid, 0)` liveness probe when `waitpid` reports nothing
 - reattaching to a full-screen app left it looking frozen or misdrawn because nothing told it its terminal had effectively changed; `sys_reattach` now copies the caller's `term_width`/`term_height` onto the target's `TerminalState` and sends `SIGWINCH` on every successful reattach, matching `screen`/`tmux`'s attach behavior
 - `-d`-detaching a previous holder was a raw crate-internal force-stop (`kill_process_with_signal` manipulating process state directly, no disposition-aware signal path, no terminal cleanup) instead of a real kill, so the displaced client's terminal was left in whatever raw/alt-screen state the grabbed app had put it in; fixed by moving the detach to the syscall boundary, writing a terminal-reset escape sequence into the previous holder's channel while the connection is still up, then delivering a real `SIGTERM` through `sys_kill` so the previous holder runs its normal `exit_group` teardown
+
+### docs/archive/BOX0_ONLY_AUDIT.md
+- kernel log reads, clears and the unread-size query were open to any boxed process on amd64; they require host root
+- `sethostname`/`setdomainname` and binding a shared-smoltcp privileged port were allowed from a box; both require host root on both architectures
+- AF_UNIX abstract names were one global namespace, so a box could connect to or squat another's; they are scoped to the box that created the socket
+- AF_UNIX pathname sockets were resolved against the global tree; they resolve through the caller's VFS view and are keyed by mount id and pinned inode
+- process-targeted limit, priority and scheduling calls reached processes outside the caller's box; they apply box visibility
+- `/proc/mounts` listed the global mount table inside a namespace that has its own root; it skips the table then
+- a private mount namespace shares the smoltcp stack, so its sockets could reach host loopback services; sockets created there cannot initiate IPv4 loopback traffic, and inherited sockets keep their creating box's policy, unconnected ones included
+- a uid-0 process that dropped its capabilities kept uid 0's DAC overrides (and the check was skipped when global DAC enforcement was off); it loses the overrides, keeps ordinary owner access, and the check applies across fork and exec
 
 ---
 
@@ -2830,4 +2860,6 @@ Also scanned 2026-11-16 (closing `ouch`, 29 commits ahead of main, 27 of them no
 
 Also scanned 2026-11-17 (merging `ec2-setup-review` into `ouch`, the T-series type-safety work): counted above: TYPE_SAFETY_DEFECTS_2026_11_17 (six defects found by the sweep, split across Memory, SMP and Scheduler; the same fixes were previously recorded only in `docs/reference/safety-types.md`). No counted fix: AWS_ENA_DRIVER (a decision and plan; `crates/akuma-net-ena` is not connected to the kernel, so the commit `ena: track ring phase across wraps` is new code in an unused crate, named here as uncounted), TYPE_SYSTEM_SAFETY_REPORT, NEWTYPE_AUDIT and UNSAFE_OWNERSHIP_TYPES_DESIGN (proposals and a design, with in-place corrections), and the `IrqSpinlock` migration of ~30 locks (hardening of locks the audit found no live hang in, except `KEYS`, counted above).
 
-Also scanned 2026-11-18 (`more-improvements`: real bubblewrap and codex's sandbox on private mount namespaces, the three platform kernels building again, herd, the seccomp and mmap-pilot merges). Counted above: CLOCK_GETTIME_EINTR_ON_SIGNAL (Syscall / ABI), DEVFS_KVM_NODES_NOT_LISTED (VFS), BWRAP_ON_BOXES (Containers: two defects among the features it records), DENVER_BUILD_BREAKAGE (Misc: the three shared-crate fixes; the three in the tokio-kernel crates are in `TAOXICHUAN_BUG_FIX_LIST.md`), and GETPPID_RETURNED_THREAD_PID and SECCOMP, listed already. No counted fix: BOX0_ONLY_AUDIT (an audit: it lists candidates and changes nothing), MMAPLAZY_PROPERTY_TEST_PILOT (the method found no defect; a deliberately broken kernel was the control), EXT3_EXT4_IMPLEMENTATION (a feature record). Fix-shaped commits with no archive doc to cite, so uncounted: `62a4d766` herd (`enable` copied instead of linking, so an edited config did nothing until a disable and enable; `start` ran the previous config; no `reload`; recorded in `userspace/herd/README.md`'s roadmap) and `e6fbd10c` (that roadmap). The signalfd, private-namespace, procfs (`ns`, `mountinfo`, `fdinfo`, `uid_map`), netlink, `capset` and per-mount `st_dev` commits add missing features and are not bugs.
+Also scanned 2026-11-18 (`more-improvements`: real bubblewrap and codex's sandbox on private mount namespaces, the three platform kernels building again, herd, the seccomp and mmap-pilot merges). Counted above: CLOCK_GETTIME_EINTR_ON_SIGNAL (Syscall / ABI), DEVFS_KVM_NODES_NOT_LISTED (VFS), BWRAP_ON_BOXES (Containers: two defects among the features it records), DENVER_BUILD_BREAKAGE (Misc: the three shared-crate fixes; the three in the tokio-kernel crates are in `TAOXICHUAN_BUG_FIX_LIST.md`), and GETPPID_RETURNED_THREAD_PID and SECCOMP, listed already. No counted fix at that scan: BOX0_ONLY_AUDIT (an audit then; its follow-up fixes are counted since 2026-11-20), MMAPLAZY_PROPERTY_TEST_PILOT (the method found no defect; a deliberately broken kernel was the control), EXT3_EXT4_IMPLEMENTATION (a feature record). Fix-shaped commits with no archive doc to cite, so uncounted: `62a4d766` herd (`enable` copied instead of linking, so an edited config did nothing until a disable and enable; `start` ran the previous config; no `reload`; recorded in `userspace/herd/README.md`'s roadmap) and `e6fbd10c` (that roadmap). The signalfd, private-namespace, procfs (`ns`, `mountinfo`, `fdinfo`, `uid_map`), netlink, `capset` and per-mount `st_dev` commits add missing features and are not bugs.
+
+Also scanned 2026-11-20 (`ecosystem-demo-stage1`, 39 commits: the box-0 policy follow-up, the merge gate, the ecosystem demo stages 1-2, Denver box wiring). Counted above: BOX0_ONLY_AUDIT's follow-up (Containers, 8 bullets), AKUMA_ECOSYSTEM_DEMO (the `getcpu` arm; Syscall / ABI) and EXEC_FROM_THREAD_DETACH (Scheduler). The tokio kernels' fixes (TOKIO_KERNELS_LOOPBACK_STARVATION, DENVER_BOX_WIRING) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: AKUMA_NESTED_BOXES, KERNEL_CONVERGENCE (proposals), DENVER_CODEX_TOOLS (a feature), MERGE_GATE_FIRST_RUN (findings; its fixes are the two tokio docs and the budget ratchet, `7ffa9165`, stale numbers rather than a defect). Fix-shaped commits with no archive doc, uncounted: `97b60eae` (sshd spun at ~3700 syscalls/s when idle in the cooperative loop; it blocks in `poll`; recorded as E5 in `proposals/FUTURE_WORK.md`), the demo image builder's JKS `cacerts` generation (a rig change), and the clippy rot fixes of `aadd4a76`/`4b508eb1`/`99300fe0` (the hook had never been installed; recorded in MERGE_GATE_FIRST_RUN). Also: DENVER_SCALA_CLI_CRASHES (2026-11-20, Scheduler & Process Management 3, Signals & Exceptions 1): the tokio kernels' execve from a non-leader thread, the first-run guard, the caller's stale root, and the fault-signal sigreturn's `rcx`/`r11`. Also scanned 2026-11-22 (the merge of C2, C3, C4, C7): counted AMD64_SOCKET_WAIT_STARVATION (Networking, 1) and AMD64_BOOT_EPOCH (Boot & Drivers, 1); AARCH64_TOKIO_SOCKET_PARK is in `TAOXICHUAN_BUG_FIX_LIST.md`. Uncounted: the C3 spawn-ring change (48 to 256 slots, a capacity limit with no archive doc; `2b6c71d3`) and the gateprobe stage/sent/served/echoed counters (a rig change).

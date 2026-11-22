@@ -318,13 +318,10 @@ pub(super) fn sys_uname(buf: u64) -> u64 {
 
 /// `sethostname(name, len)` / `setdomainname(name, len)` (`domain` selects).
 ///
-/// Linux order: privilege, then length, then the user copy. Root only here —
-/// there are no capabilities in this kernel, and uid 0 is what
-/// `akuma_isolation::creds` calls privileged. The name is the `len` bytes given,
-/// not NUL-scanned. Per-box UTS namespaces do not exist: the name is global, as
-/// `uname` always was.
+/// The name is machine-wide, so only host root can set it. Check privilege,
+/// then length, then copy the exact bytes supplied by the caller.
 pub(super) fn sys_sethostname(name: u64, len: u64, domain: bool) -> u64 {
-    if !akuma_exec::process::current_creds().is_root() {
+    if !akuma_exec::process::caller_is_host_root() {
         return EPERM;
     }
     if len > akuma_syscalls_linux::uts::NAME_MAX as u64 {
@@ -1364,7 +1361,19 @@ pub(super) fn sys_waitid(idtype: u32, id: u32, infop: u64, options: i32) -> u64 
     }
 }
 
-pub(super) fn sys_prlimit64(_pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64 {
+/// Process IDs take precedence over thread slots, as in amd64 affinity.
+pub(super) fn task_visible(id: u32) -> bool {
+    use akuma_exec::process::{caller_can_see_process, lookup_process_shared, pid_for_thread};
+    id == 0
+        || lookup_process_shared(id)
+            .or_else(|| pid_for_thread(id as usize).and_then(lookup_process_shared))
+            .is_some_and(caller_can_see_process)
+}
+
+pub(super) fn sys_prlimit64(pid: u32, resource: u32, _new_rlim: u64, old_rlim: u64) -> u64 {
+    if !task_visible(pid) {
+        return ESRCH;
+    }
     if old_rlim != 0 {
         use akuma_syscalls_linux::proc::rlimit::RLIM_INFINITY;
         let (cur, max) = match resource {

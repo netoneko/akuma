@@ -6,6 +6,29 @@ audit lists every call the tree refuses (or filters) for a process outside box 0
 and probably should be. It was done by reading the code at `c54f5fa2`; each candidate says whether I confirmed it by
 reading or only suspect it.
 
+Follow-up: items 1–3, 5, 7 and 11 were addressed. Kernel log reads, clears and
+unread size require host root on amd64. The hostname, domain name and shared
+smoltcp privileged ports require host root on both architectures. AF_UNIX
+abstract names are scoped to the box in which the socket was created. Pathname sockets are resolved
+through the caller's VFS view and keyed by mount ID and pinned inode.
+Process-targeted limit, priority and scheduling calls apply box visibility.
+`/proc/mounts` skips the global table when the namespace has its own root.
+
+Items 4 and 6 now use the shared-stack loopback and capability-aware DAC
+policies described in `docs/reference/subsystems/containers.md`. The accepted
+uid/gid map writes in item 8 remain a compatibility stub.
+
+Verification on 2026-11-19: the full 16-target kernel build matrix and
+`check_addr_params.py` passed. On amd64 and AArch64 QEMU guests,
+`scripts/bwrap_suite.py` passed all 14 cases, including Codex 0.169.0's
+inner stage, the shared-loopback denial, host loopback, and dropped-capability
+file access. `scripts/box0_dac_inheritance.c` additionally checked ordinary
+uid-0 owner access and denial of another owner's file before and after fork
+and exec; host root could read that file. `scripts/box0_socket_inheritance.c`
+checked the inherited and newly-created socket policies on both architectures.
+The private namespace shares the network stack and has no independent
+loopback; native smoltcp currently supports IPv4 only.
+
 ## 1. What is gated today
 
 Two shapes. **Host root only** (`akuma_exec::process::host_root()`: box 0 *and* uid 0, the `HostRoot` token); and
@@ -31,6 +54,9 @@ Two shapes. **Host root only** (`akuma_exec::process::host_root()`: box 0 *and* 
 | SysV message queues | keyed `(box_id, msqid)` | `akuma-syscalls-ipc` |
 
 ## 2. Candidates: not refused today, probably should be
+
+This section records the original audit findings. The follow-up status at the top of this document and the containers
+reference describe the current policy.
 
 Priority is for a sandbox whose processes are uid 0 and **share the host network stack** (`--unshare-net` is not a
 namespace, `docs/archive/BWRAP_ON_BOXES.md` § not enforced).

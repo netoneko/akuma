@@ -190,6 +190,10 @@ pub fn fork_arm(fr: &ring3::SyscallFrame) -> u64 {
 /// its thread keeps running), then the crossing.
 pub fn exec_real_task(fr: &ring3::SyscallFrame) -> u64 {
     let cur = crate::exec_twin::current_slot();
+    #[cfg(feature = "trace-err")]
+    if proc::is_thread_task() {
+        akuma_primitives::safe_print!(96, "[execve] non-leader thread slot={}\n", cur);
+    }
     let ti = match proc::exec::<Amd64>(fr.arg1(), fr.arg2(), fr.arg3()) {
         Ok(ti) => ti,
         Err(r) => return r,

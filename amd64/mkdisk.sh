@@ -161,16 +161,11 @@ if (cd userspace && cargo build -q --manifest-path tcc/Cargo.toml --target x86_6
     [ -f userspace/tcc/dist/libtcc1-amd64.tar ] && TCC_LIBTCC1="userspace/tcc/dist/libtcc1-amd64.tar"
 fi
 
-# sshd, WITHOUT `fork-sessions` (a default feature): this target has no `fork`,
-# so the cooperative single-process executor is the only one that runs. `akuma`
-# is kept — it is what pulls in `libakuma` and its `net-async` — but the default
-# set that also brings `fork-sessions` is dropped. `emergency-paws` is re-added
-# explicitly for the same reason `akuma` is: `--no-default-features` drops it
-# too, and this is the build most likely to need it — a `/bin/sh` link dropped
-# by a full `/bin` directory (see the `expand_dir` comment below) is exactly
-# what leaves a session with "failed to spawn '/bin/sh'" and nothing else to
-# try.
-if (cd userspace && cargo build -q -p sshd --no-default-features --features akuma,emergency-paws,builtin-paws \
+# sshd with its default features, `fork-sessions` included: every target has `fork`, so a session is
+# a process (isolation, a second core). `builtin-paws` is the one extra; the defaults carry `akuma` and
+# `emergency-paws` (a `/bin/sh` link dropped by a full `/bin` directory — see the `expand_dir` comment
+# below — is what leaves a session with "failed to spawn '/bin/sh'" and nothing else to try).
+if (cd userspace && cargo build -q -p sshd --features builtin-paws \
         --target x86_64-unknown-none --release 2>/dev/null); then
     SSHD=$(find userspace/target/x86_64-unknown-none/release -maxdepth 1 -name sshd -type f | head -1)
     # The **client**, from the same package's second `[[bin]]`. `cargo build -p

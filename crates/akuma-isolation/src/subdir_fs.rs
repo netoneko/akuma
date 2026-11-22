@@ -177,12 +177,17 @@ impl Filesystem for SubdirFs {
         self.inner.set_times(p, atime_secs, mtime_secs)
     }
 
-    fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+    fn create_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
         if self.read_only {
             return Err(FsError::ReadOnly);
         }
         full_path!(p, &self.prefix, path);
         self.inner.create_socket_node(p)
+    }
+
+    fn lookup_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
+        full_path!(p, &self.prefix, path);
+        self.inner.lookup_socket_node(p)
     }
 
     fn create_dir(&self, path: &str) -> Result<(), FsError> {
@@ -406,9 +411,9 @@ mod tests {
             self.record(path);
             Ok(())
         }
-        fn create_socket_node(&self, path: &str) -> Result<(), FsError> {
+        fn create_socket_node(&self, path: &str) -> Result<akuma_primitives::InodePin, FsError> {
             self.record(path);
-            Ok(())
+            Ok(akuma_primitives::InodePin::none())
         }
         fn stats(&self) -> Result<FsStats, FsError> {
             Err(FsError::NotSupported)

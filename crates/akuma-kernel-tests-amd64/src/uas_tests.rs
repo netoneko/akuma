@@ -689,7 +689,7 @@ pub fn isolation_except_cow_test(t: &mut Suite) {
     let spaces = [&la, &lb, &lc];
     let mut sharing_is_safe = true;
     for (i, mine) in spaces.iter().enumerate() {
-        for l in mine.iter() {
+        for l in *mine {
             let elsewhere = spaces.iter().enumerate().any(|(j, o)| j != i && o.iter().any(|x| x.pa == l.pa));
             if elsewhere && (l.prot.write || !l.cow || akuma_pmm::cow_ref_get(l.pa) < 2) {
                 sharing_is_safe = false;

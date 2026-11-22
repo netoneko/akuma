@@ -326,7 +326,16 @@ fn serve(listener: TcpListener, ssh_config: config::SshdConfig) -> ! {
         }
 
         if !did_work {
-            sleep_ms(1);
+            if sessions.is_empty() {
+                // Idle: nothing to poll but the listener, so block until a connection
+                // arrives instead of `sleep_ms(1)` (~3 syscalls a millisecond on every
+                // idle guest — `[PSTATS]` showed ~3700/s, E5). One second at most.
+                let mut fds = [PollFd { fd: listener.as_raw_fd(), events: POLLIN, revents: 0 }];
+                let _ = poll(&mut fds, 1000);
+            } else {
+                // Live sessions are polled round-robin and have no fd to wait on here.
+                sleep_ms(1);
+            }
         }
     }
 }

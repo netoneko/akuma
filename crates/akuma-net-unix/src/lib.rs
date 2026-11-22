@@ -76,7 +76,7 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, VecDeque};
 use alloc::vec::Vec;
 
-use akuma_primitives::errno as libc_errno;
+use akuma_primitives::{InodePin, errno as libc_errno};
 
 pub mod scm;
 
@@ -228,6 +228,15 @@ impl UnixName {
             _ => None,
         }
     }
+}
+
+/// Lookup identity for a decoded socket address. Pathname identity comes
+/// from the caller's VFS view. The original name is kept for getsockname.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UnixAddress {
+    Unnamed,
+    Abstract { box_id: u64, name: Vec<u8> },
+    Path { mount_id: u32, inode: u32 },
 }
 
 /// Linux `struct sockaddr_un`, as it crosses the syscall boundary.
@@ -629,9 +638,13 @@ pub struct Pending {
 #[derive(Debug, Clone)]
 pub struct UnixSock {
     pub ty: SockType,
+    /// Namespace identity captured at socket creation, retained on inheritance.
+    pub namespace_id: u64,
     pub state: SockState,
     /// This socket's own bound name, reported by `getsockname`.
     pub name: UnixName,
+    binding: Option<(UnixAddress, InodePin)>,
+    binding_path: bool,
     /// The peer's bound name, reported by `getpeername`. An accepted server
     /// endpoint's peer is usually `Unnamed` (clients rarely bind), which is
     /// what Linux reports too.
@@ -662,8 +675,11 @@ impl UnixSock {
     pub fn new(ty: SockType, creds: Ucred) -> Self {
         Self {
             ty,
+            namespace_id: 0,
             state: SockState::Unbound,
             name: UnixName::Unnamed,
+            binding: None,
+            binding_path: false,
             peer_name: UnixName::Unnamed,
             rx: 0,
             tx: 0,
@@ -713,10 +729,8 @@ pub enum ConnectOutcome {
 #[derive(Debug, Default)]
 pub struct UnixTable {
     socks: BTreeMap<u32, UnixSock>,
-    /// Bound name → socket id. Covers both namespaces; the `UnixName` variant
-    /// keeps them from colliding, so an abstract `"foo"` and a path `"foo"` are
-    /// different keys.
-    names: BTreeMap<UnixName, u32>,
+    /// Resolved address → socket id.
+    names: BTreeMap<UnixAddress, u32>,
     /// Framing metadata keyed by the pipe id carrying the bytes.
     channels: BTreeMap<u32, Channel>,
     next_id: u32,
@@ -807,11 +821,8 @@ impl UnixTable {
         // `collect` from an empty iterator does not allocate, so the common
         // case — a socket with no queued connections — costs nothing here.
         let orphans: Vec<u32> = s.backlog.iter().map(|p| p.server_sock).collect();
-        // Only release the name if it still maps to *this* socket. A daemon
-        // that died and restarted may have rebound the same name to a new
-        // socket, and releasing it here would silently unbind the live one.
-        if s.name != UnixName::Unnamed && names.get(&s.name) == Some(&id) {
-            names.remove(&s.name);
+        if let Some((address, _)) = &s.binding {
+            names.remove(address);
         }
         self.socks.remove(&id);
         // Tell the peer its other end is gone, so a `send` there reports
@@ -827,38 +838,52 @@ impl UnixTable {
 
     // ---- names -------------------------------------------------------------
 
-    /// `bind(2)`.
-    ///
-    /// `EINVAL` for an unnamed address (Linux's autobind, deliberately not
-    /// implemented — see [`SockAddrUn::decode`]) or for a socket that is
-    /// already bound. `EADDRINUSE` for a name another live socket holds; a
-    /// name whose holder has closed is free again, which is what lets a daemon
-    /// restart.
-    pub fn bind(&mut self, id: u32, name: UnixName) -> Result<(), i32> {
-        if name == UnixName::Unnamed {
-            return Err(libc_errno::EINVAL);
-        }
-        if self.names.contains_key(&name) {
-            return Err(libc_errno::EADDRINUSE);
-        }
+    /// Reserve the socket during pathname creation and hold it open across
+    /// filesystem I/O. The caller releases this reference after finishing.
+    pub fn begin_path_bind(&mut self, id: u32) -> Result<(), i32> {
         let s = self.socks.get_mut(&id).ok_or(libc_errno::EBADF)?;
-        if s.name != UnixName::Unnamed {
+        if s.name != UnixName::Unnamed || s.binding_path {
             return Err(libc_errno::EINVAL);
         }
-        s.name = name.clone();
-        if s.state == SockState::Unbound {
-            s.state = SockState::Bound;
-        }
-        self.names.insert(name, id);
+        s.binding_path = true;
+        s.refs += 1;
         Ok(())
     }
 
-    /// Whether a name is currently bound by a live socket. The kernel needs
-    /// this to decide whether a *filesystem* node it found is a live socket or
-    /// a stale file left by a dead daemon.
-    #[must_use]
-    pub fn is_bound(&self, name: &UnixName) -> bool {
-        self.names.contains_key(name)
+    pub fn finish_path_bind(
+        &mut self,
+        id: u32,
+        binding: Result<(UnixName, UnixAddress, InodePin), i32>,
+    ) -> Result<(), i32> {
+        self.socks.get_mut(&id).ok_or(libc_errno::EBADF)?.binding_path = false;
+        let (name, address, pin) = binding?;
+        self.bind(id, name, address, pin)
+    }
+
+    pub fn bind(
+        &mut self,
+        id: u32,
+        name: UnixName,
+        address: UnixAddress,
+        pin: InodePin,
+    ) -> Result<(), i32> {
+        if address == UnixAddress::Unnamed {
+            return Err(libc_errno::EINVAL);
+        }
+        if self.names.contains_key(&address) {
+            return Err(libc_errno::EADDRINUSE);
+        }
+        let s = self.socks.get_mut(&id).ok_or(libc_errno::EBADF)?;
+        if s.name != UnixName::Unnamed || s.binding_path {
+            return Err(libc_errno::EINVAL);
+        }
+        s.name = name;
+        s.binding = Some((address.clone(), pin));
+        if s.state == SockState::Unbound {
+            s.state = SockState::Bound;
+        }
+        self.names.insert(address, id);
+        Ok(())
     }
 
     /// `listen(2)`. `EINVAL` for a socket that was never bound (there is
@@ -897,14 +922,14 @@ impl UnixTable {
     pub fn connect(
         &mut self,
         id: u32,
-        name: &UnixName,
+        address: &UnixAddress,
         creds: Ucred,
     ) -> Result<ConnectOutcome, i32> {
-        if *name == UnixName::Unnamed {
+        if *address == UnixAddress::Unnamed {
             return Err(libc_errno::EINVAL);
         }
         let ty = self.socks.get(&id).ok_or(libc_errno::EBADF)?.ty;
-        let target = *self.names.get(name).ok_or(libc_errno::ECONNREFUSED)?;
+        let target = *self.names.get(address).ok_or(libc_errno::ECONNREFUSED)?;
 
         if !ty.is_connection_oriented() {
             // SOCK_DGRAM connect only records a default destination.
@@ -912,7 +937,7 @@ impl UnixTable {
             if t.ty != SockType::Dgram {
                 return Err(libc_errno::EPROTOTYPE);
             }
-            let peer_name = name.clone();
+            let peer_name = t.name.clone();
             let s = self.socks.get_mut(&id).ok_or(libc_errno::EBADF)?;
             s.peer = Some(target);
             s.peer_name = peer_name;
@@ -938,20 +963,22 @@ impl UnixTable {
         // immediately (Linux behaviour — a client may write before the server
         // accepts, and those bytes must be buffered, not lost).
         let listener_creds = self.socks[&target].creds;
+        let listener_namespace = self.socks[&target].namespace_id;
         let listener_name = self.socks[&target].name.clone();
         let server_sock = self.alloc(ty, listener_creds);
         {
             let srv = self.socks.get_mut(&server_sock).ok_or(libc_errno::EBADF)?;
+            srv.namespace_id = listener_namespace;
             srv.state = SockState::Connected;
             srv.peer = Some(id);
-            srv.name = listener_name;
+            srv.name = listener_name.clone();
             srv.peer_creds = creds;
         }
         {
             let cli = self.socks.get_mut(&id).ok_or(libc_errno::EBADF)?;
             cli.state = SockState::Connected;
             cli.peer = Some(server_sock);
-            cli.peer_name = name.clone();
+            cli.peer_name = listener_name;
             cli.peer_creds = listener_creds;
         }
         let listener = self.socks.get_mut(&target).ok_or(libc_errno::EBADF)?;
@@ -984,11 +1011,11 @@ impl UnixTable {
     /// - bound, but not a datagram socket → `EPROTOTYPE`: the name exists and
     ///   belongs to something, but sending a datagram at a stream listener
     ///   would put bytes into a queue framed by different rules.
-    pub fn resolve_dgram_dest(&self, name: &UnixName) -> Result<(u32, u32), i32> {
-        if *name == UnixName::Unnamed {
+    pub fn resolve_dgram_dest(&self, address: &UnixAddress) -> Result<(u32, u32), i32> {
+        if *address == UnixAddress::Unnamed {
             return Err(libc_errno::EDESTADDRREQ);
         }
-        let target = *self.names.get(name).ok_or(libc_errno::ECONNREFUSED)?;
+        let target = *self.names.get(address).ok_or(libc_errno::ECONNREFUSED)?;
         let s = self.socks.get(&target).ok_or(libc_errno::ECONNREFUSED)?;
         if s.ty != SockType::Dgram {
             return Err(libc_errno::EPROTOTYPE);

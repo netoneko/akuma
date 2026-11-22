@@ -110,10 +110,18 @@ pub struct PerCpu {
     index: core::sync::atomic::AtomicU32,
     lapic_id: core::sync::atomic::AtomicU32,
     slot: core::sync::atomic::AtomicU64,
+    /// Non-zero: the next syscall exit leaves by `iretq` with `RCX`/`R11` taken from
+    /// `exit_rcx`/`exit_r11` (a `sysretq` consumes both). Consumed by the stub.
+    exit_iret: core::sync::atomic::AtomicU64,
+    exit_rcx: core::sync::atomic::AtomicU64,
+    exit_r11: core::sync::atomic::AtomicU64,
 }
 
 #[cfg(target_arch = "x86_64")]
 const _: () = {
+    assert!(core::mem::offset_of!(PerCpu, exit_iret) == 40);
+    assert!(core::mem::offset_of!(PerCpu, exit_rcx) == 48);
+    assert!(core::mem::offset_of!(PerCpu, exit_r11) == 56);
     assert!(core::mem::offset_of!(PerCpu, self_ptr) == 0);
     assert!(core::mem::offset_of!(PerCpu, user_rsp) == 8);
     assert!(core::mem::offset_of!(PerCpu, syscall_top) == 16);
@@ -134,6 +142,9 @@ impl PerCpu {
             index: core::sync::atomic::AtomicU32::new(0),
             lapic_id: core::sync::atomic::AtomicU32::new(0),
             slot: core::sync::atomic::AtomicU64::new(0),
+            exit_iret: core::sync::atomic::AtomicU64::new(0),
+            exit_rcx: core::sync::atomic::AtomicU64::new(0),
+            exit_r11: core::sync::atomic::AtomicU64::new(0),
         }
     }
 }
@@ -286,6 +297,18 @@ pub fn user_rsp_stash() -> u64 {
     // discipline that owns every write to this static (the stub's own asm
     // included). The ordering carries no inter-core promise on purpose.
     this_cpu().user_rsp.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Make this core's next syscall exit an `iretq` that hands the user `rcx` and `r11` these
+/// values instead of `rip`/`rflags` (what `sysretq` forces). For a `rt_sigreturn` that must
+/// put the interrupted registers back exactly. One-shot; the stub clears it.
+#[cfg(target_arch = "x86_64")]
+pub fn set_exit_rcx_r11(rcx: u64, r11: u64) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let c = this_cpu();
+    c.exit_rcx.store(rcx, Relaxed);
+    c.exit_r11.store(r11, Relaxed);
+    c.exit_iret.store(1, Relaxed);
 }
 
 /// Redirect the stub's user-`RSP` stash (see [`user_rsp_stash`]).
@@ -442,12 +465,30 @@ pub extern "C" fn syscall_entry() {
         "mov rcx, [rsp + 8]",
         "mov r11, [rsp + 16]",
         "mov rax, [rsp]",
+        "cmp qword ptr gs:[40], 0",
+        "jne 2f",
         // Back to the user stack — from the stash, not from the frame: the
         // user stack was never touched.
         "mov rsp, qword ptr gs:[8]",
         "swapgs",
         "sysretq",
+        // `iretq` exit (`set_exit_rcx_r11`): the frame goes on the kernel stack, then RCX/R11
+        // are loaded with the values the user had, which `sysretq` cannot give back.
+        "2:",
+        "mov qword ptr gs:[40], 0",
+        "push {uss}",
+        "push qword ptr gs:[8]",
+        "push r11",
+        "push {ucs}",
+        "push rcx",
+        "mov rax, [rsp + 40]",
+        "mov rcx, qword ptr gs:[48]",
+        "mov r11, qword ptr gs:[56]",
+        "swapgs",
+        "iretq",
         dispatch = sym DISPATCH,
+        uss = const akuma_gdt::USER_SS as usize,
+        ucs = const akuma_gdt::USER_CS as usize,
     );
 }
 

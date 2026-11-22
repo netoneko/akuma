@@ -6,7 +6,7 @@
 //!   climb back to, so a drop is permanent by construction rather than by a check.
 //!   Any call that would split them — `seteuid(1000)` from root, which on Linux
 //!   keeps a saved 0 to return to — is refused with `EPERM`.
-//! - **Only uid 0 may change anything**, and it may change each id exactly once
+//! - **Only uid 0 with capabilities may change anything**, and it may change each id exactly once
 //!   in effect: after `setuid(1000)` nothing is uid 0 any more, so nothing can
 //!   change again.
 //! - **Re-setting the current value always succeeds.** musl implements
@@ -46,8 +46,7 @@ pub struct Creds {
     ngroups: u8,
     umask: u16,
     /// `capset` emptied the effective and permitted sets (`bwrap --cap-drop ALL`). One-way, like an id drop.
-    /// `capget` then reports no capabilities. It does **not** take away uid 0's file permission overrides: there is
-    /// no capability model finer than "uid 0 or not" (`docs/archive/BWRAP_ON_BOXES.md`).
+    /// `capget` then reports no capabilities and DAC no longer grants capability overrides.
     caps_dropped: bool,
 }
 
@@ -82,6 +81,12 @@ impl Creds {
     #[must_use]
     pub const fn has_capabilities(&self) -> bool {
         self.uid == 0 && !self.caps_dropped
+    }
+
+    /// Whether the process explicitly discarded its capabilities.
+    #[must_use]
+    pub const fn capabilities_dropped(&self) -> bool {
+        self.caps_dropped
     }
 
     /// `capset` with empty effective and permitted sets. One-way.
@@ -136,7 +141,7 @@ impl Creds {
         if uid == self.uid {
             return Ok(());
         }
-        if !self.is_root() {
+        if !self.has_capabilities() {
             return Err(CredError::Perm);
         }
         self.uid = uid;
@@ -149,7 +154,7 @@ impl Creds {
     }
 
     /// `setresgid(2)` / `setregid(2)` — the [`Self::set_resuid`] rule, gated on
-    /// uid 0 (Linux's `CAP_SETGID`).
+    /// uid 0 with capabilities (Linux's `CAP_SETGID`).
     pub fn set_resgid(
         &mut self,
         r: Option<u32>,
@@ -161,7 +166,7 @@ impl Creds {
         if gid == self.gid {
             return Ok(());
         }
-        if !self.is_root() {
+        if !self.has_capabilities() {
             return Err(CredError::Perm);
         }
         self.gid = gid;
@@ -177,7 +182,7 @@ impl Creds {
         if groups == self.groups() {
             return Ok(());
         }
-        if !self.is_root() {
+        if !self.has_capabilities() {
             return Err(CredError::Perm);
         }
         self.groups = [0; NGROUPS];
@@ -316,6 +321,6 @@ mod tests {
         assert!(c.has_capabilities());
         c.drop_capabilities();
         assert!(!c.has_capabilities());
-        assert!(c.is_root(), "uid 0 keeps its file permissions; only the reported capabilities go");
+        assert!(c.is_root(), "the uid remains 0 after capabilities are dropped");
     }
 }

@@ -230,6 +230,15 @@ impl NetMachine for Amd64Net {
     fn rng_fill(buf: &mut [u8]) {
         rng_fill(buf);
     }
+    /// The same gate the tick's preemption uses (`lib.rs`): a ring task with a slot, after init's thread
+    /// is published. Before that (the DHCP wait at boot) and for the NO_SLOT boot image there is nothing
+    /// to switch to or from, and the lap halts.
+    fn can_park() -> bool {
+        let slot = crate::exec_twin::current_slot();
+        slot != crate::exec_twin::NO_SLOT
+            && slot < crate::child::NSLOTS
+            && crate::PREEMPT_ARMED.load(core::sync::atomic::Ordering::Acquire)
+    }
 }
 
 /// One lap of the stack: the tick and the idle thread call it.

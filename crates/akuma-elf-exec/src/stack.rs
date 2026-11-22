@@ -37,8 +37,9 @@ pub const AT_RANDOM: u64 = 25;
 pub const AT_EXECFN: u64 = 31;
 /// `AT_BASE` — the interpreter's base (none: static).
 pub const AT_BASE: u64 = 7;
-/// `AT_SYSINFO_EHDR` — the kernel-provided fast-path code page (denver's PHASE-2-VDSO,
-/// D21/D25): the legacy x86-64 vsyscall page's neighbour, a valid exports-free vDSO ELF
+/// `AT_SYSINFO_EHDR` — the kernel-provided fast-path code page.
+///
+/// Denver's PHASE-2-VDSO (D21/D25): the legacy x86-64 vsyscall page's neighbour, a valid exports-free vDSO ELF
 /// mapped user-RO one page below the ABI stubs and inherited by every task through the
 /// shared kernel upper half. The value is the page's real address. Off by default: this
 /// const and the auxv entry that carries it exist only under the `vsyscall` feature (R6).

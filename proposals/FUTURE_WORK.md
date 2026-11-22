@@ -1,6 +1,6 @@
 # Future work and unresolved items
 
-*2026-11-16, branch `ouch`. A single place to collect what the tree, its documents and its comments say is left
+*2026-11-16 (curated section last pruned 2026-11-19, branch `box0-followup`). A single place to collect what the tree, its documents and its comments say is left
 undone. **Nothing here is verified**: an entry is a claim somebody made, and it stays until someone reproduces the problem
 or finds the commit that fixed it. Then it is deleted from the curated list below, or (for the generated inventory) simply
 disappears when the sentence is edited or removed.*
@@ -51,24 +51,36 @@ passed from the stack); `process_tests.rs` 69 and `sync_tests.rs` 49 uses are mo
 running the suite with a user address space active has not been tried here; the kernel's own identity map is shared into every
 user space on aarch64, which is why it is expected to work. **Closes when** `grep -rn BYPASS_VALIDATION crates src` is empty.
 
-### Problems met while doing the above (existing before it, not caused by it)
+### Kernel convergence (`docs/archive/KERNEL_CONVERGENCE.md`)
 
-| # | Problem | Evidence | What closes it |
+The main and tokio kernel families share most crates and duplicate the rest; the gate keeps finding the same bug twice.
+Read the document for the inventory and the order. Open items that came out of this branch:
+
+| # | Item | Why it matters | What closes it |
 |---|---|---|---|
-| E1 | `scripts/check_addr_params.py` fails on the tree: `akuma-cpu` 11 vs budget 10, `akuma-exec` 51 vs 50, `akuma-mmu-raw` 14 vs 11, `akuma-stack` 5 vs 1. All four predate the type-system work (checked against `60cc784b` in a worktree); this branch's own addition (`PageRange::from_user`) was renamed to clear it | the ratchet has been red on this branch since before this work | each budget justified in review (`--update`) or the parameters typed |
-| E2 | `scripts/check_budgets.py` fails with 50 errors, the same 50 at `60cc784b` (copying calls in `akuma-kvm-amd64`/`akuma-tokio-*`, and `mut` keywords: `akuma-drivers-amd64` 437 vs 0, `akuma-exec` 241 vs 211, ...). This branch adds to components that were already over: `akuma-user-access` +6 `mut`, `akuma-primitives` +2, `akuma-mmap` +1; the new `akuma-irq-lock` crate (3) now has a budget entry | the ratchet is not being enforced; raising an over-budget component's number would absorb other people's overage | read each component's growth and either reduce it or `--update` with a reason |
-| E3 | `akuma-mmu` (and so `akuma-exec`, `akuma-fpcache`, `akuma-vfs-glue`, `akuma-user-access`, `akuma-pmm`, `akuma-threading`, `akuma-syscalls-glue`) did not build for the host: a cfg mismatch around `write_cr3`. **Fixed 2026-11-17** (host no-op). That exposed two failing tests that fail identically on `60cc784b` with only that fix: `akuma-exec` `ryzen_2026_10_16_zombie_tid_tests::{a_zombies_tid_is_not_reissued_until_it_is_reaped, the_reap_releases_by_pid_even_with_thread_id_cleared}` panic with "page-table frame is not page-aligned" in `akuma-pagetable` (the test builds a real `UserAddressSpace`; calling `ensure_test_pmm()` first did not help, because `init_root` also reads a kernel root from `CR3`, which means nothing on the host, so this needs the host x86 mmu emulation fixed, not the test). `akuma-exceptions` and `akuma-gic` still do not build for the host (aarch64 `asm!` register modifiers) | host unit tests were silently unrunnable for these crates | the two tests given an aligned frame (or skipped on the host with a reason); `akuma-gic`/`akuma-exceptions` host stubs or documentation |
-| E4 | `cargo check -p akuma-kernel-tests-aarch64` on its own fails | `akuma-entry` needs `akuma-boot-aarch64/secondary` and `akuma-gic` `gic_per_core`, which only the full kernel build turns on | the crate's own features made to enable what it uses, or documented |
-| E5 | The workspace-wide `cargo check --workspace` fails | `akuma-tokio-kernel-amd64` needs `std`; `akuma-kernel-amd64` is `compile_error!` off x86_64 | a workspace default that skips target-specific crates, or documentation |
-| E6 | Two dev-environment gaps hit when booting locally | `rust-objcopy` on `PATH` fails to load `libLLVM`; `rust-readobj` missing so `amd64/run.sh` aborts; `mkdisk.sh` gets a 404 for a busybox download; QEMU hostfwd needs `INSTANCE=10` because ports 44/144 are privileged | the runner and scripts find the active toolchain's tools and pick unprivileged ports |
-| E7 | `Cargo.lock` under `userspace/` and `userspace/tcc/` shows modified after ordinary builds | left uncommitted on purpose | a decision: commit or ignore |
-| E8 | `userspace` and `overlays/ryzen/goose-codex` untracked | not part of this work | owner decides |
+| C5 | Denver's boxes (`docs/archive/DENVER_BOX_WIRING.md`): a writable `MAP_SHARED` of a boxed file is `ENODEV`, and seccomp and private namespaces in a Denver box are untested (Taoxichuan and Shanghai have no boxes on purpose: `current_box_id` is 0 and stays so) | the ecosystem demo and nested boxes on Denver need them | implement and gate-test them on Denver, or run the demo on the main kernel |
+| C6 | The gate boots amd64 only | aarch64 kernels are built, not booted (taoxichuan/aarch64 was booted by hand under QEMU TCG for C2, at SMP=1 and SMP=2, not by the gate) | an aarch64 rig that runs under the budget (the Mac, or KVM on an aarch64 host) |
+
+### Ecosystem demo, stage 1 (`docs/archive/AKUMA_ECOSYSTEM_DEMO.md`)
+
+Found while building and verifying the three images on the main amd64 kernel (2026-11-19). Not fixed on this branch.
+
+| # | Item | Why it matters | What closes it |
+|---|---|---|---|
+| E1 | **`box run` / `box use` / `box open` child output never reaches an ssh exec session** (not with `-tt` either, not through a pipe or a file redirect of `box` itself, not on the serial console). The container runs and its files appear in `containers/<id>/upper`; only its stdout/stderr is lost. `box`'s own `print()` lines do arrive. `scripts/box_amd64_suite.py` expects the output, so this is a regression or an environment difference, not bisected | an agent's launcher or a harness cannot read what a boxed command printed; `eco-box` works around it by writing to a file in the box and reading it from the host | bisect against the suite on `headless` (the `sshd` pty change `53e06880` is the first suspect), then delete `eco-box`'s file capture |
+| E2 | A path **through a relative directory symlink inside an overlay box** does not resolve (`cd /opt/scala/bin` ENOENT where `/opt/scala -> scala3-3.3.6`; the real path works). Plain-filesystem symlinks were not tested | scala's launcher scripts `cd "$(dirname $0)/.."`; any image built from a tarball with such links breaks silently | a box probe in `scripts/box_amd64_suite.py`, then the overlay resolver; the image build avoids the link |
+| E3 | Firecracker guests have no outbound route (QEMU guests use SLIRP since 2026-11-19) | agents need model APIs | wire Firecracker (tap + MMDS) in stage 3 |
+| E4 | The guest disk image is **not byte-reproducible** (the root layers are): `mkfs.ext2 -d` copies each file's host ctime/atime into the inode. `scripts/gate`-style identity is the layer digest | "rebuilt twice, same digest" holds for the roots only | build the ext2 image with `debugfs` and fixed times, or declare the layer digest the image identity |
+| E6 | The kernel logs `peak live user threads` only at high-water steps; the capacity number in the demo doc is a lower bound | the 448-thread headroom claim is unmeasured at the top | a `/proc` or syscall counter for peak threads |
+| E7b | **Linux-style `execve` from a thread** (`de_thread` + leader transfer): kill the other threads and the leader, the caller takes over the leader's pid, `Process` and wait identity, the new program keeps the pid a parent waits on | the detach fix (`docs/archive/EXEC_FROM_THREAD_DETACH.md`) changes pids and wait semantics | `stop_siblings` for a non-leader (everyone but the caller, the leader included); leader transfer across the identity caches (`THREAD_IDENTITY`, `THREAD_PID_MAP`, child channels); gate probe from `execthread`; check the AArch64 exec path's `stop_siblings` too |
+| E8 | The kernel's `uname` sysname is `Akuma`, so the JVM reports `os.name=Akuma` and coursier's directories library (scala-cli) throws `UnsupportedOperatingSystemException`. Worked around in the image with `-Dos.name=Linux` in the scala-cli launcher | any JVM tool that switches on `os.name` fails the same way | decide whether sysname should be `Linux` for ABI-compat (musl/glibc ignore it; JVM tools do not) |
+| E9 | **Intermittent `cargo build` failure: a rlib rustc just wrote is not found** (`error: extern location for gitserver_http does not exist: .../deps/libgitserver_http-....rlib`) in a box on the main amd64 kernel. 2 of 6 stage-2 runs, retry succeeds; same `cargo build --release --locked` otherwise passes in ~5 min | an agent's first build can fail for no reason in its code | a file-visibility probe (create, rename, hard-link, stat across threads/processes in an overlay box) |
 
 ## Inventory
 
 <!-- BEGIN GENERATED -->
 
-Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outside `docs/archive`, 1459 inside; 371 also say fixed/done/resolved and are flagged `maybe resolved`). All **unverified**.
+Generated by `scripts/future_work_scan.py`: **1794 hits in 554 files** (303 outside `docs/archive`, 1491 inside; 379 also say fixed/done/resolved and are flagged `maybe resolved`). All **unverified**.
 
 ## Inventory: Live docs, runbooks, scripts and code comments
 
@@ -219,48 +231,49 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 - L3: Session 16, 2026-11-14. Phase 2 is exhausted (G1/G6/G7/G9/G8/G4/G3/G2 GREEN, G5 deferred);
 
-### docs/README.md (40)
+### docs/README.md (41)
 
-- L51: / **amd64 boot suite under TCG at SMP=4 stops in 'sigregs'**: the log ends with ~8 '[sig!] ... sig=11 ... addr=0x0 -&gt; handler' / '[MM] fault REFUSED ... why=no-region…
-- L71: / **amd64:** 'strace_err' shows 'nr=285 … -&gt; -38' (82 per headless-Chromium run); 'fallocate' answers 'ENOSYS' / x86_64 'fallocate' had no row, though glue had the ar…  _(maybe resolved)_
-- L81: / **amd64:** 'goose' prints 'locking protocol' (SQLite code 15), 'goose --version' (or any Rust program that runs 'main' on a spawned thread, or 'nca run') prints its ou…  _(maybe resolved)_
-- L100: / **amd64:** 'herd stop &lt;svc&gt;' (or 'herd disable') logs 'Stop requested' but the process keeps running; a following 'herd start' would launch a second copy / **Aku…  _(maybe resolved)_
-- L101: / **amd64 bare metal:** the box answers ping but port 2222 is refused after boot; 'herd start sshd' at the console works and gives a *high* pid / **OPEN (2026-10-08); pa…  _(maybe resolved)_
-- L102: / **amd64:** 'kami' (or any CDP client) over '--remote-debugging-pipe' gets a 'Page.screencastFrame' that is **all '(0,0,0,0)'** (a black screen on '/dev/fb0'), while 'P…
-- L120: / **Taoxichuan:** a process dies with '[Fault] ring3 PageFault ... -- task killed' where it installed a SIGSEGV handler (a guard-page probe, a GC barrier) / Expected on …
-- L125: / A kernel panic that contradicts its own message — 'Process table full (256 slots, 246 reclaimable RETIRED)' / The collector is starved, not the table exhausted. 'regis…  _(maybe resolved)_
-- L129: / **amd64:** a stalled network peer (e.g. a backend HTTP response that never completes) wedges the whole box — '[BKL] stuck: owner=N' for tens of seconds straight, ssh t…  _(maybe resolved)_
-- L131: / **Firecracker (AArch64):** vCPUs pegged at ~91% for hours, console silent, last lines a few '[bkls&gt;]' samples and no '[BKL] stuck' / **Open; leading hypothesis foun…  _(maybe resolved)_
-- L132: / **ryzen host (Akuma 'smp=8', 'kvm0' guest running real work):** ssh dies, then the box resets itself to Pop after ~60 s; host console a growing '[bkls&gt;] core=N ... …
-- L157: / **amd64:** a file reads back with **some 4 KiB blocks holding stale old data** (a rewritten config showing log text; a pushed kernel image whose md5 changes minutes af…  _(maybe resolved)_
-- L161: / **ryzen, Akuma on wifi:** the box is not reachable for several minutes after the one-shot boots (ARP for the station MAC finds nothing, then it appears) / **OPEN, meas…
-- L167: / **amd64:** Claude Code's '/login' code prompt ignores paste, Esc and Enter after ~45 s idle there (plain typing worked before); claude's main thread spins in 'epoll_pw…
-- L171: / **amd64:** a thread that dies by fault or group-fatal signal leaves per-slot state standing — a leaked 'Process' and a 'ps' row that never goes away, '[TRAMP-MISMATCH]…
-- L193: / A long-running campaign of repeated in-guest builds dies around the 9th trial: '[OOM] allocation of N bytes failed (heap ~755MB / ~796MB used)', rustc exits **137**, t…  _(maybe resolved)_
-- L198: / '/bin/sh: can't fork: Out of memory' after a few SSH sessions on a 4–4.5 MB box, no '[OOM]' line (contrast: the execve-leak class always prints '[OOM]') / **OPEN.** Fi…
-- L203: / 'SCM_RIGHTS' fd passing does nothing ('recvmsg' returns no ancillary data), or 'SO_PEERCRED' reports **uid 0** for every peer / **Both are known gaps, not bugs.** Anci…
-- L205: / 'scripts/build_devbox.sh' (the rump-only devbox) fails with dozens of 'unresolved module or unlinked crate \'smoltcp\'' errors / A '#[cfg(feature = "smoltcp")]' has dr…  _(maybe resolved)_
-- L210: / A multi-threaded CPU workload collapses when adding threads (llama.cpp '-t 1' fast, '-t 2+' 10-100x slower, all cores burning) while separate processes scale fine / Th…  _(maybe resolved)_
-- L222: / 'box run &lt;official image&gt;' prints 'failed to spawn …/docker-entrypoint.sh', or starts and then does nothing at all / Two different things. 'failed to spawn' = 's…  _(maybe resolved)_
-- L225: / 'e2fsck' after a 'cargo clean' reports inode and block **bitmap differences** ('-NNNN'): the deleted files have 'Links: 0' and a 'dtime' but still hold their blocks, a…  _(maybe resolved)_
-- L226: / 'rm' of a file that was mapped or open does not free its space: 'df' does not move after the 'unlink', after 'munmap'/'close', or even after the process exits, until s…  _(maybe resolved)_
-- L242: / '[SGI] POOL contended, skipped N ticks' climbing without bound; console still printing but ssh dead; onset during '[Cleanup] Thread N recycled' churn / **OPEN.** Not a…
-- L266: / A process is SIGSEGV'd for OOM (or tcc/meow fails at the 'extreme-size' 4 MB floor) while the box plainly has free memory moments later / Candidate: the user-page esca…
-- L275: / 'git clone' hangs or wedges / ['runbooks/debug-devbox.md'](runbooks/debug-devbox.md) / ['runbooks/debug-network.md'](runbooks/debug-network.md). Original pipe-deadlock…
-- L277: / 'box grab &lt;name&gt;' does not reattach — no output, an error, or the wrong process / **OPEN, reported 2026-09-07, not reproduced.** A regression: this worked before…
-- L286: / The terminal **stutters** — a TUI (nca) redraws in visible steps, output arrives in bursts, and it gets worse while the network is busy / **FIXED 2026-08-18.** Not net…  _(maybe resolved)_
-- L324: / ext2 writes feel slow — a build's 'create'/'unlink' churn, 'rm -rf' of a tree, 'tar -x' — even on a **healthy** image (distinct from the damaged-image slowdown at the …
-- L327: / **Every** syscall feels expensive, not just one subsystem — and you want the investigation, not just the numbers / ['archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md'](archi…  _(maybe resolved)_
-- L330: / A file written by multiple threads of one process (shared fd, 'CLONE_FILES') comes out with corrupted/torn content but the right total size — no crash, no error / Was …  _(maybe resolved)_
-- L333: / 'free'/'uptime'/'df'/native-'ifconfig' broken, or want a read-only rootfs and the minimal busybox applet set for dev / Clustered gap inventory (procfs '/proc/{meminfo,…  _(maybe resolved)_
-- L344: / A '-j4' build stalls with waiters parked in untimed 'FUTEX_WAIT' for hundreds of seconds, ~3 % CPU, but **no** '[FUTEX-ORPHAN]' and correct key namespaces / Usually **…
-- L357: / A multi-threaded process 'fork's and dies 'EXIT=139' writing one of its **own globals**, '[WPF] cow_ref=0 lazy_self=NONE eager=NONE ap_rw=true' / **FIXED 2026-08-08, r…  _(maybe resolved)_
-- L383: / 'cargo build' of a big third-party workspace fails on the first registry deps with 'could not execute process \'rustc …\' (never executed) / Bad address (os error 14)'…
-- L385: / A guest TCP client hangs forever reading a response whose **first byte is delayed** &gt;~5 s (e.g. nca↔Ollama with a slow-prefill model), while instant responses on th…
-- L439: / A kernel change builds '--release' but not 'extreme-size', or 'cargo build' left a stale 'akuma.bin', or a wall-clock A/B looks too good / ['archive/EXT2_WRITEBACK_FOL…
-- L443: / Work on the **amd64 bare-metal** path — PCI enumeration, the USB keyboard, machine reset / 'crates/akuma-kernel-amd64/src/pci.rs' + 'crates/akuma-pci' enumerate config…
-- L444: / Understand why a program that runs on Linux misbehaves after a syscall on amd64 — a value it had before the call comes back wrong / The kernel's 'syscall_entry' used t…  _(maybe resolved)_
-- L509: **Still undocumented (deferred gap list):** audio ('src/audio.rs'), Tier C /
+- L53: / **amd64 boot suite under TCG at SMP=4 stops in 'sigregs'**: the log ends with ~8 '[sig!] ... sig=11 ... addr=0x0 -&gt; handler' / '[MM] fault REFUSED ... why=no-region…
+- L68: / **Taoxichuan / Shanghai / Denver:** a program with one thread blocked in 'accept'/'connect'/'recv' and another that should wake from 'sleep' (or connect) makes no prog…  _(maybe resolved)_
+- L74: / **amd64:** 'strace_err' shows 'nr=285 … -&gt; -38' (82 per headless-Chromium run); 'fallocate' answers 'ENOSYS' / x86_64 'fallocate' had no row, though glue had the ar…  _(maybe resolved)_
+- L84: / **amd64:** 'goose' prints 'locking protocol' (SQLite code 15), 'goose --version' (or any Rust program that runs 'main' on a spawned thread, or 'nca run') prints its ou…  _(maybe resolved)_
+- L103: / **amd64:** 'herd stop &lt;svc&gt;' (or 'herd disable') logs 'Stop requested' but the process keeps running; a following 'herd start' would launch a second copy / **Aku…  _(maybe resolved)_
+- L104: / **amd64 bare metal:** the box answers ping but port 2222 is refused after boot; 'herd start sshd' at the console works and gives a *high* pid / **OPEN (2026-10-08); pa…  _(maybe resolved)_
+- L105: / **amd64:** 'kami' (or any CDP client) over '--remote-debugging-pipe' gets a 'Page.screencastFrame' that is **all '(0,0,0,0)'** (a black screen on '/dev/fb0'), while 'P…
+- L123: / **Taoxichuan:** a process dies with '[Fault] ring3 PageFault ... -- task killed' where it installed a SIGSEGV handler (a guard-page probe, a GC barrier) / Expected on …
+- L128: / A kernel panic that contradicts its own message — 'Process table full (256 slots, 246 reclaimable RETIRED)' / The collector is starved, not the table exhausted. 'regis…  _(maybe resolved)_
+- L132: / **amd64:** a stalled network peer (e.g. a backend HTTP response that never completes) wedges the whole box — '[BKL] stuck: owner=N' for tens of seconds straight, ssh t…  _(maybe resolved)_
+- L134: / **Firecracker (AArch64):** vCPUs pegged at ~91% for hours, console silent, last lines a few '[bkls&gt;]' samples and no '[BKL] stuck' / **Open; leading hypothesis foun…  _(maybe resolved)_
+- L135: / **ryzen host (Akuma 'smp=8', 'kvm0' guest running real work):** ssh dies, then the box resets itself to Pop after ~60 s; host console a growing '[bkls&gt;] core=N ... …
+- L160: / **amd64:** a file reads back with **some 4 KiB blocks holding stale old data** (a rewritten config showing log text; a pushed kernel image whose md5 changes minutes af…  _(maybe resolved)_
+- L164: / **ryzen, Akuma on wifi:** the box is not reachable for several minutes after the one-shot boots (ARP for the station MAC finds nothing, then it appears) / **OPEN, meas…
+- L170: / **amd64:** Claude Code's '/login' code prompt ignores paste, Esc and Enter after ~45 s idle there (plain typing worked before); claude's main thread spins in 'epoll_pw…
+- L174: / **amd64:** a thread that dies by fault or group-fatal signal leaves per-slot state standing — a leaked 'Process' and a 'ps' row that never goes away, '[TRAMP-MISMATCH]…
+- L196: / A long-running campaign of repeated in-guest builds dies around the 9th trial: '[OOM] allocation of N bytes failed (heap ~755MB / ~796MB used)', rustc exits **137**, t…  _(maybe resolved)_
+- L201: / '/bin/sh: can't fork: Out of memory' after a few SSH sessions on a 4–4.5 MB box, no '[OOM]' line (contrast: the execve-leak class always prints '[OOM]') / **OPEN.** Fi…
+- L206: / 'SCM_RIGHTS' fd passing does nothing ('recvmsg' returns no ancillary data), or 'SO_PEERCRED' reports **uid 0** for every peer / **Both are known gaps, not bugs.** Anci…
+- L208: / 'scripts/build_devbox.sh' (the rump-only devbox) fails with dozens of 'unresolved module or unlinked crate \'smoltcp\'' errors / A '#[cfg(feature = "smoltcp")]' has dr…  _(maybe resolved)_
+- L213: / A multi-threaded CPU workload collapses when adding threads (llama.cpp '-t 1' fast, '-t 2+' 10-100x slower, all cores burning) while separate processes scale fine / Th…  _(maybe resolved)_
+- L225: / 'box run &lt;official image&gt;' prints 'failed to spawn …/docker-entrypoint.sh', or starts and then does nothing at all / Two different things. 'failed to spawn' = 's…  _(maybe resolved)_
+- L228: / 'e2fsck' after a 'cargo clean' reports inode and block **bitmap differences** ('-NNNN'): the deleted files have 'Links: 0' and a 'dtime' but still hold their blocks, a…  _(maybe resolved)_
+- L229: / 'rm' of a file that was mapped or open does not free its space: 'df' does not move after the 'unlink', after 'munmap'/'close', or even after the process exits, until s…  _(maybe resolved)_
+- L245: / '[SGI] POOL contended, skipped N ticks' climbing without bound; console still printing but ssh dead; onset during '[Cleanup] Thread N recycled' churn / **OPEN.** Not a…
+- L269: / A process is SIGSEGV'd for OOM (or tcc/meow fails at the 'extreme-size' 4 MB floor) while the box plainly has free memory moments later / Candidate: the user-page esca…
+- L278: / 'git clone' hangs or wedges / ['runbooks/debug-devbox.md'](runbooks/debug-devbox.md) / ['runbooks/debug-network.md'](runbooks/debug-network.md). Original pipe-deadlock…
+- L280: / 'box grab &lt;name&gt;' does not reattach — no output, an error, or the wrong process / **OPEN, reported 2026-09-07, not reproduced.** A regression: this worked before…
+- L289: / The terminal **stutters** — a TUI (nca) redraws in visible steps, output arrives in bursts, and it gets worse while the network is busy / **FIXED 2026-08-18.** Not net…  _(maybe resolved)_
+- L327: / ext2 writes feel slow — a build's 'create'/'unlink' churn, 'rm -rf' of a tree, 'tar -x' — even on a **healthy** image (distinct from the damaged-image slowdown at the …
+- L330: / **Every** syscall feels expensive, not just one subsystem — and you want the investigation, not just the numbers / ['archive/AKUMA_SYSCALL_PERFORMANCE_AUDIT.md'](archi…  _(maybe resolved)_
+- L333: / A file written by multiple threads of one process (shared fd, 'CLONE_FILES') comes out with corrupted/torn content but the right total size — no crash, no error / Was …  _(maybe resolved)_
+- L336: / 'free'/'uptime'/'df'/native-'ifconfig' broken, or want a read-only rootfs and the minimal busybox applet set for dev / Clustered gap inventory (procfs '/proc/{meminfo,…  _(maybe resolved)_
+- L347: / A '-j4' build stalls with waiters parked in untimed 'FUTEX_WAIT' for hundreds of seconds, ~3 % CPU, but **no** '[FUTEX-ORPHAN]' and correct key namespaces / Usually **…
+- L360: / A multi-threaded process 'fork's and dies 'EXIT=139' writing one of its **own globals**, '[WPF] cow_ref=0 lazy_self=NONE eager=NONE ap_rw=true' / **FIXED 2026-08-08, r…  _(maybe resolved)_
+- L386: / 'cargo build' of a big third-party workspace fails on the first registry deps with 'could not execute process \'rustc …\' (never executed) / Bad address (os error 14)'…
+- L388: / A guest TCP client hangs forever reading a response whose **first byte is delayed** &gt;~5 s (e.g. nca↔Ollama with a slow-prefill model), while instant responses on th…
+- L442: / A kernel change builds '--release' but not 'extreme-size', or 'cargo build' left a stale 'akuma.bin', or a wall-clock A/B looks too good / ['archive/EXT2_WRITEBACK_FOL…
+- L446: / Work on the **amd64 bare-metal** path — PCI enumeration, the USB keyboard, machine reset / 'crates/akuma-kernel-amd64/src/pci.rs' + 'crates/akuma-pci' enumerate config…
+- L447: / Understand why a program that runs on Linux misbehaves after a syscall on amd64 — a value it had before the call comes back wrong / The kernel's 'syscall_entry' used t…  _(maybe resolved)_
+- L513: **Still undocumented (deferred gap list):** audio ('src/audio.rs'), Tier C /
 
 ### docs/handoff-kernel-chromium-support.md (5)
 
@@ -281,7 +294,7 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 - L24: / **devbox-smoltcp** (default devbox) / 'release' / 'scripts/build_devbox_smoltcp.sh' / 'overlays/devbox/run-smoltcp.sh' / smoltcp (native) + userspace '/bin/sshd' / The…
 - L117: shell**. Rather than leave it gated behind a cfg, the follow-up commit
 - L239: - **Working inside Akuma as a Unix box (self-hosted toolchain, editor, daily use)** → 'devbox-smoltcp' (the default devbox: native smoltcp + real SMP; 'overlays/devbox/r…
-- L316: - 'overlays/devbox/README.md' — devbox design rationale; 'devbox-smoltcp' (default) vs. the deferred rump 'devbox'.
+- L317: - 'overlays/devbox/README.md' — devbox design rationale; 'devbox-smoltcp' (default) vs. the deferred rump 'devbox'.
 
 ### docs/reference/build-system.md (1)
 
@@ -317,9 +330,9 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 ### docs/reference/subsystems/containers.md (3)
 
-- L246: state, nothing guards starting in it. Deferred fix:
-- L316: deferred rather than "obviously fine".
-- L461: '/proc/self' each cost, and which one is still open.
+- L277: state, nothing guards starting in it. Deferred fix:
+- L364: deferred rather than "obviously fine".
+- L511: '/proc/self' each cost, and which one is still open.
 
 ### docs/reference/subsystems/drivers/block.md (1)
 
@@ -358,7 +371,7 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 ### docs/reference/subsystems/networking.md (2)
 
 - L64: &gt; **Deferred (2026-07-19):** the default devbox is now **devbox-smoltcp** (box 0
-- L324: reaped — and process teardown is deferred, so by then the freed slot may belong
+- L328: reaped — and process teardown is deferred, so by then the freed slot may belong
 
 ### docs/reference/subsystems/power.md (2)
 
@@ -438,10 +451,15 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 - L73: 'ProcessChannel'. Making sessions eager is the next step (it would let '^C'/'^\' share one path
 
-### docs/reference/subsystems/vfs.md (2)
+### docs/reference/subsystems/vfat.md (1)
+
+- L96: ## Not done  _(maybe resolved)_
+
+### docs/reference/subsystems/vfs.md (3)
 
 - L129: it means "not pinned". Answering 'true' there kept unlinks deferred forever
 - L130: ('archive/INODE_PIN_CONGESTED_WINDOW.md'). A deferred free finishes at the
+- L391: ## Future work
 
 ### docs/reference/subsystems/wifi.md (3)
 
@@ -451,7 +469,7 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 ### docs/runbooks/README.md (1)
 
-- L47: / '[SGI] POOL contended, skipped N ticks' climbing forever; console still printing but ssh dead / **OPEN.** The box is *unscheduled*, not hung — 'POOL' gates all preempt…
+- L49: / '[SGI] POOL contended, skipped N ticks' climbing forever; console still printing but ssh dead / **OPEN.** The box is *unscheduled*, not hung — 'POOL' gates all preempt…
 
 ### docs/runbooks/amd64-bare-metal-loop.md (2)
 
@@ -570,6 +588,10 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 - L3: **Status: proposal, not started.** Deferred to the big merge on purpose: the merge decides the
 
+### proposals/PREVENTING_BROKEN_MAIN.md (1)
+
+- L12: / 4 / (skipped by decision) CI (GitHub Actions) running 'premerge_build.sh --fast' on every push to a branch and the full set on PRs to main; branch protection requires …
+
 ### proposals/WAKEUP_LATENCY_UNDER_LOAD.md (1)
 
 - L3: **Status: proposal, not started.** Deferred to after the big merge. The measurements below are
@@ -627,9 +649,11 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 - L101: ## A kernel divergence found on the way (not fixed here)  _(maybe resolved)_
 
-### userspace/herd/README.md (1)
+### userspace/herd/README.md (3)
 
 - L239: - **'start'** refuses while such a pid is outstanding (a second copy beside a
+- L315: - Open: **'args = --listen grpc://127.0.0.1:47200' reportedly lost its first flag at spawn**
+- L320: - Open: 'herd status' showed 'restart-pending ... last_exit=2' after a good start (2026-11-17). Not reproduced;
 
 ### userspace/herd/docs/SIGNAL_EXIT_HANDLING.md (2)
 
@@ -1209,6 +1233,16 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 </details>
 
+<details><summary>docs/archive/AKUMA_ECOSYSTEM_DEMO.md (5)</summary>
+
+- L193: rerun from step 2; the dry run is not done until step 3 needs no environment fixes).  _(maybe resolved)_
+- L258: / box child stdout not delivered to an ssh exec session / none (no errno; output lost) / **open**, E1 in 'proposals/FUTURE_WORK.md'; 'eco-box' captures via a file /
+- L259: / path through a relative directory symlink inside an overlay box fails / 'ENOENT' / **open**, E2; the scala root has no such link /
+- L260: / no outbound route / NAT for the bridge / n/a / **open**, E3 /
+- L336: / **guest 1 kernel panic** during 'scala-cli run' of the board / 'execve' from a non-leader thread replaced the group's address space under its siblings ('[execve] from …  _(maybe resolved)_
+
+</details>
+
 <details><summary>docs/archive/AKUMA_EXEC_AUDIT.md (3)</summary>
 
 - L260: ## 5. Not fixed: six '&self' → '&mut' field casts  _(maybe resolved)_
@@ -1753,6 +1787,12 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 </details>
 
+<details><summary>docs/archive/AMD64_SOCKET_WAIT_STARVATION.md (1)</summary>
+
+- L35: Still open (not this fix): 'time' failed in 7 of those 40 boots with 'wall clock 5s is before 2020', i.e. the guest read
+
+</details>
+
 <details><summary>docs/archive/AMD64_SPAWN_SELFTEST_SMP_RACE.md (1)</summary>
 
 - L3: **Status: ROOT-CAUSED 2026-09-25, not yet fixed.** The kernel is fine; the  _(maybe resolved)_
@@ -1984,6 +2024,14 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 </details>
 
+<details><summary>docs/archive/BOX0_ONLY_AUDIT.md (3)</summary>
+
+- L9: Follow-up: items 1–3, 5, 7 and 11 were addressed. Kernel log reads, clears and
+- L58: This section records the original audit findings. The follow-up status at the top of this document and the containers
+- L120: * Not done: a runtime probe of any candidate; fuzzing the box rule; the AArch64-only paths.  _(maybe resolved)_
+
+</details>
+
 <details><summary>docs/archive/BOX_BUILD.md (8)</summary>
 
 - L99: re-export them (open question 1).
@@ -2029,61 +2077,63 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 </details>
 
-<details><summary>docs/archive/BUG_FIX_LIST.md (53)</summary>
+<details><summary>docs/archive/BUG_FIX_LIST.md (55)</summary>
 
-- L193: - The syscall epilogue re-used the prologue's process identity across the whole dispatch (Finding A of 'IDENTITY_CACHE_SMP_REVIEW.md', left open there), reachable when '…  _(maybe resolved)_
-- L196: - 'poll'/'select''s finite timeout was a lap counter ("200 laps per millisecond, capped at two million") on a target whose lap cost is not fixed; the wait machine reads …  _(maybe resolved)_
-- L294: - glue's stdout 'write' applied ONLCR whenever the session's stdin was still open, without asking whether the channel was a terminal, so an ssh exec session raced the cl…  _(maybe resolved)_
-- L428: - Follow-up: fork 'code_start' SIGSEGV
-- L429: - Follow-up: vfork signal-interrupted wait
-- L430: - Follow-up EL1 crash Bug 1: 'fork_process' missing THREAD_PID_MAP entry
-- L431: - Follow-up EL1 crash Bug 2: 'clone_thread' plain EL1 store to a CoW-RO page
-- L461: - 'realloc' calling 'munmap' directly hung the kernel; worked around via a deferred free queue
-- L494: - 'test_mmap_file_oom_survives' halted the whole boot suite at its PMM-conservation assert because the deferred process-teardown chain (thread-slot recycle → 'unregister…  _(maybe resolved)_
-- L544: (Fixes finding F-1 of 'EXT2_WRITEBACK_DESIGN.md' plus the keying half of D-9. D-9's capacity half is still open, and the doc's "a defect found and left alone" is by its …  _(maybe resolved)_
-- L563: - 'drain_pending_ttbr_frees' 'swap_remove'd 'PendingAsFree' entries into a local 'Vec' and only then freed them, on a deferred-reclaim path documented as running on an a…  _(maybe resolved)_
-- L745: - Go Build SIGSEGV four-bug follow-up (2026-03-26), incl. 'alloc_mmap' straddle bug
-- L767: (Bug 5, NULL pointer deref, was still open at time of writing — not counted)
-- L819: - 'write_stdin' ('process/channel.rs') used the same drop-oldest FIFO semantics as the (already-fixed) stdout side, so stdin past 'MAX_BUFFER_SIZE' (1 MiB) was silently …  _(maybe resolved)_
-- L831: - 'exit_group' paid its full 2 s kill-grace per multithreaded process: a thread parked in an untimed 'FUTEX_WAIT' (or any yarn-driven blocking wait) was woken by the def…  _(maybe resolved)_
-- L891: - the reap was not a reclaim drain site, so a **parent** collecting a child left a whole image outstanding — the child's own drain ran before the retire, the idle loop d…
-- L991: stale-core-id BKL wedge, and deferred-pending-kill fixes are counted there,
-- L994: - 'process_tests.rs''s 'test_kill_thread_group_reaps_futex_blocked_sibling' fabricated a futex-parked sibling from a bare claimed thread slot forced into WAITING — a sta…  _(maybe resolved)_
-- L1005: - BKL fair-FIFO ticket leak — self-healing acquire added (root mechanism still open, but the deadlock itself is resolved)  _(maybe resolved)_
-- L1012: - Terminated-thread lock leak — hard-terminated siblings stranded locks held mid-EL1 (fixed via deferred pending-kill)  _(maybe resolved)_
-- L1056: - 'cleanup_process_fds''s 'strong_count == 1' gate never fired for externally-killed multithreaded groups (deferred reclaim), stranding pipes/sockets
-- L1255: - 'sys_pselect6' had no 'should_interrupt_blocking_syscall()' check, which 'epoll_pwait' and 'ppoll' both had: a process blocked in 'select()' could not be interrupted b…
-- L1360: - scrolling the framebuffer console redrew a near-full screen per printed line, which on a television reads as a tear sweeping down the picture; mitigated by scrolling 8…
-- L1479: - Allocator leak — userspace deferred free queue too small during 'realloc'-heavy operations
-- L1627: ### docs/archive/EXT2_WRITEBACK_FOLLOWUP_FIXES.md
-- L1738: - Unauthenticated remote crash: 'process_unencrypted_packet'/'process_encrypted_packet' computed 'packet_len - padding_len - 1' from client-controlled bytes with no chec…  _(maybe resolved)_
-- L1841: - Two threads sharing a fd ('CLONE_FILES' — any pair of 'pthread_create'd siblings) calling 'write()' close together could corrupt each other's output: 'sys_write' read …  _(maybe resolved)_
-- L1871: (2026-08-26 follow-up only. Fixes A, B and D-lite of that section are write-deferral/zero-fill optimizations with no defect attached and are not counted; these two are t…
-- L1883: - One lost pin set a single global overflow flag, which made 'is_pinned' conservative for every inode at once; overflow is now accounted per hash region, so a lost pin c…
-- L2033: - 'inode_pin::is_pinned' still answered 'true' when it walked a full 32-slot window without finding the key, though 'acquire' only ever records a pin inside that window …
-- L2036: - ext2 finished an unlink deferred by a pin only at the next unlink, rename or inode allocation, though the pin itself goes at an 'munmap', a 'close' or a reap, none of …
-- L2064: - §3.7 'SCTLR_EL1.SA0' — KVM's reset value enables EL0 SP-alignment checking where QEMU's does not, killing every userspace binary deterministically at the same instruct…
-- L2337: - 'suspend_until_signal' ('pause', 'rt_sigsuspend') never read the deferred kill request a group exit posts, so a sleeper outlived its group in a freed address space; it…
-- L2371: (The 'akuma-exec' crate split itself is a refactor and is not counted; these are the defects it surfaced and fixed along the way. The 'akuma-bkl' dead-'RawRwSpinlock' de…  _(maybe resolved)_
-- L2422: (Harness fixes only. Of the doc's two identity-cache findings, **Finding A — the syscall epilogue reusing the prologue's 'Process' across an open-ended dispatch — was fi…  _(maybe resolved)_
-- L2650: - 'validate_nested_root' used a bare 'starts_with', accepting a sibling subtree ('/containers/box10' as a "child" of '/containers/box1') as well as unresolved '..' and r…
-- L2685: - 'spawn_ext' loading a binary over 'HEAP_SLURP_MAX' took the deferred path, which needs lazy-region faults that amd64's '#PF' handler does not serve, and reset the mach…
-- L2736: Also scanned 2026-10-20 (the amd64 metal, signal-return and '/proc' work, 16 archive docs added or edited). Counted above: AARCH64_SMP_HOOKS_RACE, AMD64_TLB_STUCK_MMAP_R…
-- L2740: Also scanned 2026-09-30 (the 'even-more-cats' branch, 12 archive docs touched, ahead of closing it). Issues in the kot agent and the teahouse litter are out of scope for…  _(maybe resolved)_
-- L2742: Also scanned 2026-09-24 (55 commits, 19 archive docs touched — the litter on the metal, the kot mesh and the teahouse — ahead of merging). Seven of those docs carry no c…  _(maybe resolved)_
-- L2748: Also scanned 2026-09-02 (the 'oof-part-2' branch — 'akuma-exec' -&gt; '#![forbid(unsafe_code)]', ahead of merging it). AKUMA_EXEC_FORBID_UNSAFE is the campaign's complet…  _(maybe resolved)_
-- L2754: Also scanned 2026-08-27 (the 'obviously-more-fixes' branch, ahead of closing it for the syscalls-refactor branch): AKUMA_SYSCALL_PERFORMANCE_AUDIT (the 'getpid' floor ta…  _(maybe resolved)_
-- L2756: Also re-scanned 2026-08-25 (the 'more-fixes' branch, ahead of merging it): BENCHMARK_PERFOMANCE_ATTEMPT_1 (a benchmark record; its one actionable finding — nginx's lost …  _(maybe resolved)_
-- L2764: Also re-scanned 2026-08-15 (the whole branch's unaudited archive docs, ahead of closing it): CARGO_HEAP_NULL_RC (the task brief for the cargo-null-'Rc' hunt; explicitly …  _(maybe resolved)_
-- L2766: Also re-scanned 2026-08-12: CARGO_CRATES_IO_CONNECT_FAIL (root cause isolated, "fix not yet chosen" — five options, none landed; **fixed 2026-08-20, now counted under Ne…  _(maybe resolved)_
-- L2768: Also re-scanned 2026-08-21 (the 'improve-portability' branch's archive docs, ahead of closing it — the list had not been touched in the branch's 19 commits): PORTING_POS…  _(maybe resolved)_
-- L2770: docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_P…  _(maybe resolved)_
-- L2780: Also scanned 2026-10-22 (the 'kvm-linux-rung' branch — the Linux guest under the SVM hypervisor, phases 5 through 8). Counted above: AKUMA_KVM_LINUX_GUEST, five fixes (t…
-- L2782: Also scanned 2026-10-23 (the 'kvm-part-1' branch — the SVM hypervisor, 'kvm0' guests under herd, the '/dev/kvm' node, affinity, '/dev/net/tun', the goose-glm dev cycle, …
-- L2786: Also scanned 2026-11-02 (closing 'rust-org-il-experiment', 536 commits and about 70 archive docs, most of them the Taoxichuan experiment and its cleanup). Counted above:…  _(maybe resolved)_
-- L2788: Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). Counted above: EXT2_DIRENT_TYPE_WITHOUT_FILETYPE, KVM_GUEST_4GIB_PVH_HANDOFF, UNIX_SOCKET…
-- L2790: Also scanned 2026-11-08 (closing 'post-release-improvements', 136 commits, the Shanghai middleware work, the unsafe-reduction rounds and the ETXTBSY and signal fixes). C…  _(maybe resolved)_
-- L2792: Also scanned 2026-11-16 (closing 'ouch', 29 commits ahead of main, 27 of them not merges: the pre-AMI security audit and its fixes, the userspace review of sshd, box and…  _(maybe resolved)_
+- L199: - The syscall epilogue re-used the prologue's process identity across the whole dispatch (Finding A of 'IDENTITY_CACHE_SMP_REVIEW.md', left open there), reachable when '…  _(maybe resolved)_
+- L202: - 'poll'/'select''s finite timeout was a lap counter ("200 laps per millisecond, capped at two million") on a target whose lap cost is not fixed; the wait machine reads …  _(maybe resolved)_
+- L300: - glue's stdout 'write' applied ONLCR whenever the session's stdin was still open, without asking whether the channel was a terminal, so an ssh exec session raced the cl…  _(maybe resolved)_
+- L440: - Follow-up: fork 'code_start' SIGSEGV
+- L441: - Follow-up: vfork signal-interrupted wait
+- L442: - Follow-up EL1 crash Bug 1: 'fork_process' missing THREAD_PID_MAP entry
+- L443: - Follow-up EL1 crash Bug 2: 'clone_thread' plain EL1 store to a CoW-RO page
+- L473: - 'realloc' calling 'munmap' directly hung the kernel; worked around via a deferred free queue
+- L506: - 'test_mmap_file_oom_survives' halted the whole boot suite at its PMM-conservation assert because the deferred process-teardown chain (thread-slot recycle → 'unregister…  _(maybe resolved)_
+- L556: (Fixes finding F-1 of 'EXT2_WRITEBACK_DESIGN.md' plus the keying half of D-9. D-9's capacity half is still open, and the doc's "a defect found and left alone" is by its …  _(maybe resolved)_
+- L575: - 'drain_pending_ttbr_frees' 'swap_remove'd 'PendingAsFree' entries into a local 'Vec' and only then freed them, on a deferred-reclaim path documented as running on an a…  _(maybe resolved)_
+- L763: - Go Build SIGSEGV four-bug follow-up (2026-03-26), incl. 'alloc_mmap' straddle bug
+- L785: (Bug 5, NULL pointer deref, was still open at time of writing — not counted)
+- L837: - 'write_stdin' ('process/channel.rs') used the same drop-oldest FIFO semantics as the (already-fixed) stdout side, so stdin past 'MAX_BUFFER_SIZE' (1 MiB) was silently …  _(maybe resolved)_
+- L849: - 'exit_group' paid its full 2 s kill-grace per multithreaded process: a thread parked in an untimed 'FUTEX_WAIT' (or any yarn-driven blocking wait) was woken by the def…  _(maybe resolved)_
+- L909: - the reap was not a reclaim drain site, so a **parent** collecting a child left a whole image outstanding — the child's own drain ran before the retire, the idle loop d…
+- L1024: stale-core-id BKL wedge, and deferred-pending-kill fixes are counted there,
+- L1027: - 'process_tests.rs''s 'test_kill_thread_group_reaps_futex_blocked_sibling' fabricated a futex-parked sibling from a bare claimed thread slot forced into WAITING — a sta…  _(maybe resolved)_
+- L1038: - BKL fair-FIFO ticket leak — self-healing acquire added (root mechanism still open, but the deadlock itself is resolved)  _(maybe resolved)_
+- L1045: - Terminated-thread lock leak — hard-terminated siblings stranded locks held mid-EL1 (fixed via deferred pending-kill)  _(maybe resolved)_
+- L1089: - 'cleanup_process_fds''s 'strong_count == 1' gate never fired for externally-killed multithreaded groups (deferred reclaim), stranding pipes/sockets
+- L1291: - 'sys_pselect6' had no 'should_interrupt_blocking_syscall()' check, which 'epoll_pwait' and 'ppoll' both had: a process blocked in 'select()' could not be interrupted b…
+- L1396: - scrolling the framebuffer console redrew a near-full screen per printed line, which on a television reads as a tear sweeping down the picture; mitigated by scrolling 8…
+- L1518: - Allocator leak — userspace deferred free queue too small during 'realloc'-heavy operations
+- L1666: ### docs/archive/EXT2_WRITEBACK_FOLLOWUP_FIXES.md
+- L1777: - Unauthenticated remote crash: 'process_unencrypted_packet'/'process_encrypted_packet' computed 'packet_len - padding_len - 1' from client-controlled bytes with no chec…  _(maybe resolved)_
+- L1880: - Two threads sharing a fd ('CLONE_FILES' — any pair of 'pthread_create'd siblings) calling 'write()' close together could corrupt each other's output: 'sys_write' read …  _(maybe resolved)_
+- L1910: (2026-08-26 follow-up only. Fixes A, B and D-lite of that section are write-deferral/zero-fill optimizations with no defect attached and are not counted; these two are t…
+- L1922: - One lost pin set a single global overflow flag, which made 'is_pinned' conservative for every inode at once; overflow is now accounted per hash region, so a lost pin c…
+- L2072: - 'inode_pin::is_pinned' still answered 'true' when it walked a full 32-slot window without finding the key, though 'acquire' only ever records a pin inside that window …
+- L2075: - ext2 finished an unlink deferred by a pin only at the next unlink, rename or inode allocation, though the pin itself goes at an 'munmap', a 'close' or a reap, none of …
+- L2109: - §3.7 'SCTLR_EL1.SA0' — KVM's reset value enables EL0 SP-alignment checking where QEMU's does not, killing every userspace binary deterministically at the same instruct…
+- L2382: - 'suspend_until_signal' ('pause', 'rt_sigsuspend') never read the deferred kill request a group exit posts, so a sleeper outlived its group in a freed address space; it…
+- L2419: (The 'akuma-exec' crate split itself is a refactor and is not counted; these are the defects it surfaced and fixed along the way. The 'akuma-bkl' dead-'RawRwSpinlock' de…  _(maybe resolved)_
+- L2470: (Harness fixes only. Of the doc's two identity-cache findings, **Finding A — the syscall epilogue reusing the prologue's 'Process' across an open-ended dispatch — was fi…  _(maybe resolved)_
+- L2703: - 'validate_nested_root' used a bare 'starts_with', accepting a sibling subtree ('/containers/box10' as a "child" of '/containers/box1') as well as unresolved '..' and r…
+- L2748: - 'spawn_ext' loading a binary over 'HEAP_SLURP_MAX' took the deferred path, which needs lazy-region faults that amd64's '#PF' handler does not serve, and reset the mach…
+- L2803: Also scanned 2026-10-20 (the amd64 metal, signal-return and '/proc' work, 16 archive docs added or edited). Counted above: AARCH64_SMP_HOOKS_RACE, AMD64_TLB_STUCK_MMAP_R…
+- L2807: Also scanned 2026-09-30 (the 'even-more-cats' branch, 12 archive docs touched, ahead of closing it). Issues in the kot agent and the teahouse litter are out of scope for…  _(maybe resolved)_
+- L2809: Also scanned 2026-09-24 (55 commits, 19 archive docs touched — the litter on the metal, the kot mesh and the teahouse — ahead of merging). Seven of those docs carry no c…  _(maybe resolved)_
+- L2815: Also scanned 2026-09-02 (the 'oof-part-2' branch — 'akuma-exec' -&gt; '#![forbid(unsafe_code)]', ahead of merging it). AKUMA_EXEC_FORBID_UNSAFE is the campaign's complet…  _(maybe resolved)_
+- L2821: Also scanned 2026-08-27 (the 'obviously-more-fixes' branch, ahead of closing it for the syscalls-refactor branch): AKUMA_SYSCALL_PERFORMANCE_AUDIT (the 'getpid' floor ta…  _(maybe resolved)_
+- L2823: Also re-scanned 2026-08-25 (the 'more-fixes' branch, ahead of merging it): BENCHMARK_PERFOMANCE_ATTEMPT_1 (a benchmark record; its one actionable finding — nginx's lost …  _(maybe resolved)_
+- L2831: Also re-scanned 2026-08-15 (the whole branch's unaudited archive docs, ahead of closing it): CARGO_HEAP_NULL_RC (the task brief for the cargo-null-'Rc' hunt; explicitly …  _(maybe resolved)_
+- L2833: Also re-scanned 2026-08-12: CARGO_CRATES_IO_CONNECT_FAIL (root cause isolated, "fix not yet chosen" — five options, none landed; **fixed 2026-08-20, now counted under Ne…  _(maybe resolved)_
+- L2835: Also re-scanned 2026-08-21 (the 'improve-portability' branch's archive docs, ahead of closing it — the list had not been touched in the branch's 19 commits): PORTING_POS…  _(maybe resolved)_
+- L2837: docs/archive: 4MB_STABLE_AGENT, AI_DEBUGGING, ARCHITECTURE, BKL_DRIVERS_CARVE_OUT, BKL_PHASE7B_PPOLL_CARVE_OUT (piece 2 reverted after A/B caught real corruption), BKL_P…  _(maybe resolved)_
+- L2847: Also scanned 2026-10-22 (the 'kvm-linux-rung' branch — the Linux guest under the SVM hypervisor, phases 5 through 8). Counted above: AKUMA_KVM_LINUX_GUEST, five fixes (t…
+- L2849: Also scanned 2026-10-23 (the 'kvm-part-1' branch — the SVM hypervisor, 'kvm0' guests under herd, the '/dev/kvm' node, affinity, '/dev/net/tun', the goose-glm dev cycle, …
+- L2853: Also scanned 2026-11-02 (closing 'rust-org-il-experiment', 536 commits and about 70 archive docs, most of them the Taoxichuan experiment and its cleanup). Counted above:…  _(maybe resolved)_
+- L2855: Also scanned 2026-11-03 (the Infinity run on Taoxichuan and what it left open). Counted above: EXT2_DIRENT_TYPE_WITHOUT_FILETYPE, KVM_GUEST_4GIB_PVH_HANDOFF, UNIX_SOCKET…
+- L2857: Also scanned 2026-11-08 (closing 'post-release-improvements', 136 commits, the Shanghai middleware work, the unsafe-reduction rounds and the ETXTBSY and signal fixes). C…  _(maybe resolved)_
+- L2859: Also scanned 2026-11-16 (closing 'ouch', 29 commits ahead of main, 27 of them not merges: the pre-AMI security audit and its fixes, the userspace review of sshd, box and…  _(maybe resolved)_
+- L2863: Also scanned 2026-11-18 ('more-improvements': real bubblewrap and codex's sandbox on private mount namespaces, the three platform kernels building again, herd, the secco…
+- L2865: Also scanned 2026-11-20 ('ecosystem-demo-stage1', 39 commits: the box-0 policy follow-up, the merge gate, the ecosystem demo stages 1-2, Denver box wiring). Counted abov…
 
 </details>
 
@@ -2174,6 +2224,13 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 - L69: Not fixed by this and still visible: the **first minute** after start is slow (first key 0.3-3.8 s, median up to  _(maybe resolved)_
 - L73: Still open: the unit test 'reaping_a_buffered_child_keeps_its_output_but_not_the_child'
+
+</details>
+
+<details><summary>docs/archive/CLOCK_GETTIME_EINTR_ON_SIGNAL.md (2)</summary>
+
+- L44: - **Not yet boot-verified.** The box this was found on was running the unfixed kernel, and there was
+- L48: ## Still open
 
 </details>
 
@@ -2297,6 +2354,35 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 </details>
 
+<details><summary>docs/archive/DENVER_BOX_WIRING.md (2)</summary>
+
+- L11: ## Evidence and remaining work
+- L78: **Still open.** scala-cli *compile* with Maven Central, 'cargo' with the network and seccomp/private namespaces inside a Denver box are
+
+</details>
+
+<details><summary>docs/archive/DENVER_BUILD_BREAKAGE.md (1)</summary>
+
+- L45: ## Still open
+
+</details>
+
+<details><summary>docs/archive/DENVER_CODEX_TOOLS.md (1)</summary>
+
+- L28: ## Remaining work
+
+</details>
+
+<details><summary>docs/archive/DENVER_SCALA_CLI_CRASHES.md (5)</summary>
+
+- L64: A silent triple fault is now a named panic. That is the fix for the *silence*; the bad root itself is not fixed.  _(maybe resolved)_
+- L131: Next steps, in order: watch for the first write of '0x246' into JVM memory (a user-memory watch under TCG, or log every
+- L149: to completion in 33 s. **Still open:** 'scala-cli run' then does not bring the board up within the harness's 600 s
+- L155: 'slot 4 killed (SIGSEGV)'. This is the 'clone'/'execve' window the Defect B section lists as open: closing it needs the two to
+- L192: ## Still open
+
+</details>
+
 <details><summary>docs/archive/DEVBOX_ISSUES.md (19)</summary>
 
 - L28: ### ⚠️ Issue 3 is not fixed — cross-core console interleaving still tears lines  _(maybe resolved)_
@@ -2327,6 +2413,12 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 </details>
 
+<details><summary>docs/archive/DEVFS_KVM_NODES_NOT_LISTED.md (1)</summary>
+
+- L37: ## Still open
+
+</details>
+
 <details><summary>docs/archive/DEVFS_MISSING.md (1)</summary>
 
 - L227: not as a follow-up — leaving both versions alive at once is exactly the
@@ -2354,6 +2446,12 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 <details><summary>docs/archive/ETXTBSY_TEXT_BUSY.md (1)</summary>
 
 - L94: offset 0 -&gt; 1 on a write that failed with 'ETXTBSY'. Linux leaves the offset alone on error. Pre-existing, general, not fixed here.  _(maybe resolved)_
+
+</details>
+
+<details><summary>docs/archive/EXEC_FROM_THREAD_DETACH.md (1)</summary>
+
+- L89: ## Future work: the Linux-style handler ('proposals/FUTURE_WORK.md' E7b)
 
 </details>
 
@@ -2437,6 +2535,13 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 <details><summary>docs/archive/EXT2_WRITEBACK_FOLLOWUP_FIXES.md (1)</summary>
 
 - L1: # ext2 write-back follow-up: defects found and fixed (2026-08-26)  _(maybe resolved)_
+
+</details>
+
+<details><summary>docs/archive/EXT3_EXT4_IMPLEMENTATION.md (2)</summary>
+
+- L113: The deferred-free slot array lives on the heap. An inline 16 KiB array was
+- L118: ## Verification and remaining work
 
 </details>
 
@@ -2541,6 +2646,13 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 <details><summary>docs/archive/FUTEX_REQUEUE_LOST_WAKEUP.md (1)</summary>
 
 - L175: ## Unprobed sharp edge (flagged, not fixed)  _(maybe resolved)_
+
+</details>
+
+<details><summary>docs/archive/GETPPID_RETURNED_THREAD_PID.md (2)</summary>
+
+- L37: 'ls /tmp / head -3' returned 'exit_code 0' with the listing; the unfixed kernel returned 143 with none. Host unit tests
+- L40: ## Still open
 
 </details>
 
@@ -2686,6 +2798,12 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 <details><summary>docs/archive/HOST_TESTS_AUDIT.md (1)</summary>
 
 - L132: / 'test_term_state_lock_bounded_acquire_does_not_starve_peers' / 'process_tests.rs:2142' / Registration commented out at ':213' — "the test harness itself has an unresol…
+
+</details>
+
+<details><summary>docs/archive/HOW_MAIN_BROKE_2026_11.md (1)</summary>
+
+- L36: ## Still open (recommendations, not done)  _(maybe resolved)_
 
 </details>
 
@@ -2985,6 +3103,12 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 - L4: 10/10 green). One rarer sibling route left open, with a standing tripwire.**
 - L166: ## Residual, deliberately left open
+
+</details>
+
+<details><summary>docs/archive/MERGE_GATE_FIRST_RUN.md (1)</summary>
+
+- L4: branch 'box0-followup' (x86_64 dev box, KVM), found the following. Nothing here is fixed by the gate; each is a line in  _(maybe resolved)_
 
 </details>
 
@@ -3779,11 +3903,11 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 <details><summary>docs/archive/TAOXICHUAN_BUG_FIX_LIST.md (5)</summary>
 
-- L302: - 'UNLINKED_FILE_SPACE_RETURNED_LATE.md': ext2 finished a deferred free only at the next unlink or create, so a file unlinked
-- L324: - **Open by their own text:** TAOXICHUAN_J4_BKL_CONVOY (the in-guest '-j4' BKL convoy; its p3 repair is a rig change);
-- L336: - **Scanned 2026-11-03** (the Infinity run and the three items it left open): INFINITY_ON_TAOXICHUAN's other six bugs are
-- L338: fix, and sshd-as-init's orphan miscount was retired by running herd as init, not fixed. TAOXICHUAN_LAZY_MMAP's prefault  _(maybe resolved)_
-- L344: is a measurement. Fault-signal delivery is still open. A third pass: the measurement did not finish (the disk ran out before the final link) and the
+- L323: - 'UNLINKED_FILE_SPACE_RETURNED_LATE.md': ext2 finished a deferred free only at the next unlink or create, so a file unlinked
+- L346: - **Open by their own text:** TAOXICHUAN_J4_BKL_CONVOY (the in-guest '-j4' BKL convoy; its p3 repair is a rig change);
+- L358: - **Scanned 2026-11-03** (the Infinity run and the three items it left open): INFINITY_ON_TAOXICHUAN's other six bugs are
+- L360: fix, and sshd-as-init's orphan miscount was retired by running herd as init, not fixed. TAOXICHUAN_LAZY_MMAP's prefault  _(maybe resolved)_
+- L366: is a measurement. Fault-signal delivery is still open. A third pass: the measurement did not finish (the disk ran out before the final link) and the
 
 </details>
 
@@ -4003,6 +4127,12 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 </details>
 
+<details><summary>docs/archive/TOKIO_KERNELS_LOOPBACK_STARVATION.md (1)</summary>
+
+- L32: ## Still open
+
+</details>
+
 <details><summary>docs/archive/TOKIO_PIPE_EPOLL_HANG.md (1)</summary>
 
 - L151: ## Still open: the terminal half
@@ -4128,6 +4258,12 @@ Generated by `scripts/future_work_scan.py`: **1756 hits in 536 files** (297 outs
 
 - L191: reader source not set'. That panic, plus the round-2 diff's own unresolved
 - L241: ### Follow-up: 'FIONREAD' (fixed)  _(maybe resolved)_
+
+</details>
+
+<details><summary>docs/archive/TYPE_SAFETY_DEFECTS_2026_11_17.md (1)</summary>
+
+- L12: 2. **ELF 'PT_LOAD' segments were not validated.** 'vaddr + memsz' was unchecked in 'segment_span', the deferred path's
 
 </details>
 

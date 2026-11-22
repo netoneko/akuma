@@ -62,6 +62,19 @@ CASES = [
      ["null-ok", "4"], []),
     ("codex's flag set (user/pid/ipc/net namespaces, cap-drop ALL) runs",
      f"{CODEX_SHAPE} /bin/busybox sh -c 'echo codex-flags-ok'", ["codex-flags-ok"], ["bwrap:"]),
+    ("dropped capabilities preserve owner access and deny overrides after exec",
+     "echo own > /tmp/box0-own; echo secret > /tmp/box0-other; "
+     "chown 123:123 /tmp/box0-other; chmod 600 /tmp/box0-own /tmp/box0-other; "
+     f"{BW} --bind / / --dev /dev --proc /proc --cap-drop ALL -- /bin/busybox sh -c "
+     "'cat /tmp/box0-own; cat /tmp/box0-other; chmod 777 /tmp/box0-other'; "
+     "cat /tmp/box0-other; rm -f /tmp/box0-own /tmp/box0-other",
+     ["own", "Permission denied", "Operation not permitted", "secret"], ["bwrap:"]),
+    ("private namespace cannot connect to a host loopback listener",
+     "nc -l -p 27891 > /tmp/box0-loopback & sleep 1; "
+     f"{BW} --bind / / --dev /dev --proc /proc --cap-drop ALL -- /bin/busybox sh -c "
+     "'nc -w 1 127.0.0.1 27891 </dev/null; echo sandbox=$?'; "
+     "echo host-delivered | nc -w 2 127.0.0.1 27891; cat /tmp/box0-loopback; rm -f /tmp/box0-loopback",
+     ["sandbox=1", "host-delivered"], ["sandbox=0", "bwrap:"]),
     ("the host's mounts are untouched afterwards",
      "cat /proc/self/mountinfo", [" / rw", "/proc"], ["/newroot", "/oldroot", "/dev/null", " ro,"]),
     ("the host sees what the sandbox wrote",

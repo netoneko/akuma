@@ -1,0 +1,45 @@
+#!/bin/sh
+# eco-bootstrap: fetch the bootstrap script from the metadata service, check it against a
+# sha256 delivered on a DIFFERENT metadata path, and only then run it (as root, once per boot).
+#
+# Why two requests: the script is served at /latest/user-data and its expected digest at
+# /latest/meta-data/bootstrap-sha256. A script swapped in transit or at rest on the server
+# without also swapping the digest is refused. The two come from the same service, so this
+# does not defend against a compromised metadata service itself; the launcher is the root of
+# trust (docs/archive/AKUMA_ECOSYSTEM_DEMO.md). There is no /proc/cmdline on this kernel, so
+# the boot line cannot carry the digest.
+#
+# Never prints a secret: it only fetches the script and runs it.
+MD="${METADATA_URL:-http://169.254.169.254}"
+TRIES="${BOOTSTRAP_TRIES:-60}"
+say() { echo "[eco-bootstrap] $*"; }
+
+token=""
+n=0
+while [ "$n" -lt "$TRIES" ]; do
+    token=$(curl -sf -m 3 -X PUT "$MD/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 300" 2>/dev/null)
+    [ -n "$token" ] && break
+    n=$((n + 1)); sleep 1
+done
+[ -n "$token" ] || { say "no metadata token from $MD"; exit 1; }
+
+md_get() { curl -sf -m 10 -H "X-aws-ec2-metadata-token: $token" "$MD/latest/$1"; }
+
+umask 077
+mkdir -p /run/eco
+md_get user-data > /run/eco/bootstrap.sh || { say "no user-data"; exit 1; }
+want=$(md_get meta-data/bootstrap-sha256 | tr -d '\r\n ')
+got=$(sha256sum /run/eco/bootstrap.sh | cut -d' ' -f1)
+if [ -z "$want" ] || [ "$want" != "$got" ]; then
+    say "REFUSED: bootstrap script sha256 $got != expected '$want'"
+    rm -f /run/eco/bootstrap.sh
+    exit 1
+fi
+say "bootstrap script verified ($got)"
+export MD token
+sh /run/eco/bootstrap.sh
+rc=$?
+rm -f /run/eco/bootstrap.sh
+echo "$rc" > /run/eco/bootstrap.rc
+say "bootstrap finished rc=$rc"
+exit $rc

@@ -953,6 +953,13 @@ pub fn host_root() -> Option<akuma_primitives::HostRoot> {
         .then(akuma_primitives::HostRoot::vouch_checked)
 }
 
+/// Whether the caller's box reaches the target process's box.
+#[must_use]
+pub fn caller_can_see_process(target: &super::Process) -> bool {
+    let caller_box = current_process_shared().map_or(0, |p| p.box_id);
+    akuma_isolation::box_registry::box_reaches(caller_box, target.box_id)
+}
+
 /// The caller as the **builder of its own private mount namespace**: it is in a box a `clone(CLONE_NEWNS)` made and
 /// that box has not been locked by its final `pivot_root`. The token lets the mount effects act on that box's namespace only
 /// (`akuma_primitives::NsCreator`); a process anywhere else gets `None`, so box 0's checks are unchanged.
