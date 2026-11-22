@@ -14,6 +14,8 @@ copies, wakers, the table lock), `akuma-exec`'s `ProcessChannel`, `crates/akuma-
 | `session` | `TerminalState`: a session's termios words, winsize, foreground group, raw-mode request, and a lazily allocated `LineDiscipline` (shared by every process of a session behind `Arc<Spinlock<_>>`) | glue `read(stdin)`, `TCGETS/TCSETS`, `SET_TERMINAL_ATTRIBUTES`; `akuma-exec::write_to_process_stdin`; amd64 console |
 | `pty` | `PtyPair`: one Unix98 master/slave pair = a `LineDiscipline` + refcounts, hangup rules, waiters | glue `pty.rs` |
 
+PTY master and slave descriptors are reference counted across `dup`, `fork`, exec cleanup and process exit. Every kernel's `ExecRuntime` must wire both PTY reference hooks to the glue table; hangup is published only after the last reference to the opposite side closes. See [the Tokio PTY reference incident](../../archive/TOKIO_PTY_REFERENCE_HANG.md).
+
 ## Who owns each mode bit
 
 | bit | session terminal | pty slave |

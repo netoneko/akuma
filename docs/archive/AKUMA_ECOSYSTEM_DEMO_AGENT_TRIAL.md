@@ -148,7 +148,7 @@ is unsupported in the busybox `ps` (agents work around it); `ps` shows `etime` f
 ### Round 2 follow-up: `scala-cli run` on Denver, narrowed (2026-11-22)
 
 `scalarun.py` (plain or under a Codex exec session), `scalahang.py`, `reaperprobe.py` and `execthread-probe.py` against the Denver
-kernel from this branch (`containers,codex`) and the main amd64 kernel, same images, no agent unless stated.
+kernel from this branch (`containers,codex`) and the main amd64 kernel, same images, no agent unless stated. These results predate the two fixes below.
 
 | test | main kernel | Denver |
 |---|---|---|
@@ -174,10 +174,16 @@ kernel from this branch (`containers,codex`) and the main amd64 kernel, same ima
   test loop (`scala-cli run` of anything that exits, a compile error under Codex) stalls it. Until fixed, rerun C with the brief
   telling it to run the board only in the background with output to a file, or run C's box on the main kernel.
 
+### Follow-up: two separate causes
+
+The static `execpost` probe exposed leader-slot reuse after a non-leader `execve`: before the fix the new image completed but its parent never received the status; after the fix libc exit and raw `exit_group` each returned 7 in two runs. Plain JDK-only and `ujson` hellos completed. See [TOKIO_EXEC_LEADER_SLOT_REUSE.md](TOKIO_EXEC_LEADER_SLOT_REUSE.md).
+
+A remaining Codex-session stall was traced separately to missing Tokio PTY reference hooks, which could report hangup while the slave was still open and stop output draining. See [TOKIO_PTY_REFERENCE_HANG.md](TOKIO_PTY_REFERENCE_HANG.md). After the fix, the JDK hello returned 0 and the broken C project returned 1 for compile errors under Codex; the full agent trial has not been rerun.
+
 ## Next
 
 * Decide whether the contract spells out the error-precedence rule (400 vs 404).
-* Find why a terminating `scala-cli run` never completes on Denver (follow-up above), then rerun C on Denver.
+* Rerun C on Denver after validating the two fixes above.
 * The `apply_patch` symlink, the Scala brief's `--server=false`, and a probe for the `curl` `000` failures.
 
 ## Background

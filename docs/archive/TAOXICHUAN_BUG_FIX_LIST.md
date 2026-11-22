@@ -16,21 +16,21 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ## Statistics
 
-- **Total distinct fixes counted:** 140
-- **Docs contributing at least one fix:** 48
+- **Total distinct fixes counted:** 142
+- **Docs contributing at least one fix:** 50
 - **Subsystem categories:** 8
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscalls, Files & Pipes | 40 | 28.6% | 7 |
-| Exec & ELF Loading | 12 | 8.6% | 5 |
-| Processes, Fork, Threads & Scheduling | 36 | 25.7% | 11 |
-| Memory & Copy-on-Write | 20 | 14.3% | 8 |
-| Signals | 6 | 4.3% | 3 |
-| Networking & Readiness | 6 | 4.3% | 4 |
-| SMP, Time & Boot | 12 | 8.6% | 6 |
-| Build & Integration | 8 | 5.7% | 4 |
-| **Total** | **140** | **100.0%** | **48** |
+| Syscalls, Files & Pipes | 42 | 29.6% | 9 |
+| Exec & ELF Loading | 12 | 8.5% | 5 |
+| Processes, Fork, Threads & Scheduling | 36 | 25.4% | 11 |
+| Memory & Copy-on-Write | 20 | 14.1% | 8 |
+| Signals | 6 | 4.2% | 3 |
+| Networking & Readiness | 6 | 4.2% | 4 |
+| SMP, Time & Boot | 12 | 8.5% | 6 |
+| Build & Integration | 8 | 5.6% | 4 |
+| **Total** | **142** | **100.0%** | **50** |
 
 **Largest single write-ups:**
 
@@ -41,7 +41,10 @@ Subsystem tags are per file, except the experiment's agent log, whose bullets ar
 
 ---
 
-## Syscalls, Files & Pipes (40 fixes, 7 docs)
+## Syscalls, Files & Pipes (42 fixes, 9 docs)
+
+### docs/archive/TOKIO_PTY_REFERENCE_HANG.md
+- the Tokio runtimes left PTY clone and close hooks unwired, so closing an uncounted duplicate produced a false slave hangup and stalled Codex PTY output
 
 ### docs/archive/MINIMAL_SELF_HOSTING_EXPERIMENT_AGENT_LOG.md
 - `SyscallFrame` listed r10/r8/r9 in push order where the stack holds r9/r8/r10, so arguments 4 and 6 were swapped for every call with more than three; latent until the first `mmap`, where musl's flags arrived in the offset slot and `echo` ran out of memory (stage 3)

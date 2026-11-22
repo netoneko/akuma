@@ -12,6 +12,8 @@ workspace = true
 akuma-jvm-kernel = { path = "../crates/akuma-jvm-kernel", features = ["no-tests"] }
 
 [features]
+# Report the running CPU in Denver by default on both architectures.
+default = ["getcpu"]
 # Experimental until the Denver box acceptance probe passes.
 containers = ["akuma-jvm-kernel/containers"]
 large-virtual-reservations = ["akuma-jvm-kernel/large-virtual-reservations"]
@@ -59,8 +61,8 @@ sysinfo = ["akuma-jvm-kernel/sysinfo"]
 # getcpu(2) (PHASE-2-GETCPU, G2): the raw-syscall gap — musl's `sched_getcpu`
 # performs nr 168 and got ENOSYS (`GETCPU RED ENOSYS` since PHASE-1; the vsyscall
 # stub's -38 only softened HotSpot's own path). Served with the caller's core.
-# Off by default (R6); the gate kernel is
-# `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep,sysinfo,getcpu`
+# Enabled by default for Denver; `--no-default-features` can opt out.
+# The historical gate kernel is `--features wx-relaxed,vsyscall,procfs-diag,trace-err,fold-regpreserve,lazy-release-sweep,sysinfo,getcpu`
 # (rig: denver-getcpu).
 getcpu = ["akuma-jvm-kernel/getcpu"]
 # The fault->signal delivery (PHASE-3-JAVAC, G13) relayed 1:1: a ring-3 page fault

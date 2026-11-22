@@ -56,9 +56,7 @@ whose caller is not the group leader.
 
 ## Still open
 
-* **Under Codex's exec session (a pty) `scala-cli run` still hangs about half the time** (JDK-only hello 1 of 2, `ujson` hello 2 of 3
-  without a variant; `TERM=dumb`, `</dev/null` and a piped stdout each finished the runs that were tried). Before this fix every such run hung. The
-  stalled tree is a running app JVM with all threads idle at 0 CPU. Not diagnosed; probably a second race on the exec/exit path.
+* **The separate Codex PTY hang** was traced to unwired PTY reference hooks; see [TOKIO_PTY_REFERENCE_HANG.md](TOKIO_PTY_REFERENCE_HANG.md).
 * **A raw `exit` (not `exit_group`) of the last remaining thread** of an exec'd image still never ends the process
   (`execpost raw_exit`); `task_exit_thread` publishes no group status. musl's `pthread_exit` of the last thread calls `exit`, so JVMs
   and Rust do not reach it.

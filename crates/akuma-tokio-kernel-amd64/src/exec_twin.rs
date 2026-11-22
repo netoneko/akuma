@@ -314,7 +314,7 @@ fn exec_runtime() -> ExecRuntime {
         exec_bkl_drop_enabled: || false,
         // No process table: nothing `akuma-exec` knows about can exit.
         on_process_exit: |_pid| {},
-        // No itimers, audio or ptys on this target yet — each arm's
+        // No itimers or audio on this target yet — each arm's
         // subsystem has no table here to release from, and the first one that
         // arrives wires its row (amd64 wired each exactly when its syscall
         // landed). The futex table is glue's, the one `futex` serves.
@@ -327,8 +327,8 @@ fn exec_runtime() -> ExecRuntime {
         epoll_destroy: akuma_syscalls_glue::poll::epoll_destroy,
         pidfd_close: akuma_runtime_tokio::PIDFD_CLOSE,
         dsp_close: || {},
-        pty_clone_ref: |_, _| {},
-        pty_close: |_, _| {},
+        pty_clone_ref: akuma_syscalls_glue::pty::pty_clone_ref,
+        pty_close: akuma_syscalls_glue::pty::pty_close,
         flock_release: akuma_syscalls_glue::flock::flock_release,
         // The lean build has no box namespace. The optional profile shares
         // the VFS registry and per-thread spawn override with the main kernel.

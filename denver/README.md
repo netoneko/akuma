@@ -30,8 +30,8 @@ on — is [`docs/archive/AUTORESEARCH_EXPERIMENT_RESULTS.md`](docs/archive/AUTOR
 
 Denver is not a kernel written from scratch. It is a manifest: one binary crate and one
 front crate that pick, by name, which existing Akuma crates make up the kernel. The whole
-`Cargo.toml` of the binary is a list of features, each relayed 1:1 to the front crate and
-off by default, so the default build stays what it was (rule R6):
+`Cargo.toml` of the binary is a list of features, each relayed 1:1 to the front crate.
+Denver enables `getcpu` by default on both architectures; the other opt-in features remain off:
 
 ```toml
 [package]
@@ -41,6 +41,8 @@ name = "denver"
 akuma-jvm-kernel = { path = "../crates/akuma-jvm-kernel", features = ["no-tests"] }
 
 [features]
+default          = ["getcpu"]
+getcpu           = ["akuma-jvm-kernel/getcpu"]           # report the caller's CPU
 wx-relaxed       = ["akuma-jvm-kernel/wx-relaxed"]        # JIT code cache: RWX, RW -> R+X
 vsyscall         = ["akuma-jvm-kernel/vsyscall"]          # the legacy page HotSpot hardcodes
 fold-regpreserve = ["akuma-jvm-kernel/fold-regpreserve"]  # keep the caller's six arg registers
