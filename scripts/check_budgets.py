@@ -44,10 +44,16 @@ MEASURES = {
 
 def measure():
     """`{component: {measure: production sites}}` for the tree."""
-    out = subprocess.run(
-        [sys.executable, os.path.join(ROOT, "scripts", "cloc_akuma.py"), "--json", *PATHS],
-        capture_output=True, text=True, cwd=ROOT, check=True,
-    ).stdout
+    # `scripts/gate.py` runs the (minutes-long, single-core) lexer once and hands both ratchets the JSON.
+    cached = os.environ.get("CLOC_JSON")
+    if cached and os.path.exists(cached):
+        with open(cached) as fh:
+            out = fh.read()
+    else:
+        out = subprocess.run(
+            [sys.executable, os.path.join(ROOT, "scripts", "cloc_akuma.py"), "--json", *PATHS],
+            capture_output=True, text=True, cwd=ROOT, check=True,
+        ).stdout
     comps = json.loads(out)["by_component"]
     return {name: {m: c[field] for m, (field, _, _) in MEASURES.items()} for name, c in comps.items()}
 
