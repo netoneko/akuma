@@ -221,34 +221,6 @@
     <a class="btn" href="demo.html">Open the streaming demo &rarr;</a>
   </section>
 
-  <!-- timeline: ecosystem demo agent trial -->
-  <section class="slide">
-    <h2>Three agents, one weekend: <span class="k">the trial timeline</span></h2>
-    <table class="ladder">
-      <tr><th>When</th><th>What happened</th></tr>
-      <tr><td>round 1 &middot; main kernel</td><td>Rust Git service (B), Scala task board (C), Python tests (D), each with its own brief. B and C finish; D's 40 tests are valid against the reference board.</td></tr>
-      <tr><td>rework</td><td>C gets D's failure list. Seven defects, <b>one cause</b> (validation order): fixed in 6 added / 2 removed lines. Reference suite passes.</td></tr>
-      <tr><td>round 2 &middot; Denver</td><td>Rust and cargo are fine (B: 327 s). C stalls for 40 minutes in <span class="mono">scala-cli run</span>.</td></tr>
-      <tr><td>bisect</td><td>Every commit back to the one that "worked" hangs too: no earlier test ever ran a program that <i>exits</i>.</td></tr>
-      <tr><td>repro</td><td>A 100-line static probe, no JVM: <span class="mono">execve</span> from a non-leader thread, then exit. The new image runs to the end; the parent never hears.</td></tr>
-      <tr><td>fix 1</td><td>One call: hold the leader's slot before stopping it.</td></tr>
-      <tr><td>fix 2</td><td>Codex's pty: dup/fork reference hooks were no-ops, so a live pty reported hangup.</td></tr>
-      <tr><td>round 3 &middot; Denver</td><td>C finishes in <b>1178 s</b>; the reference suite passes against it from the other VM.</td></tr>
-    </table>
-  </section>
-
-  <!-- the bug -->
-  <section class="slide center">
-    <div class="pill">found by the trial &middot; 40 minutes of agent time</div>
-    <h2>A threaded <span class="mono">exec</span> target never finished</h2>
-    <pre class="box">leader (pid 68)   slot 4   stopped by execve  ->  TERMINATED
-new image's first clone   ->  claims slot 4
-exit_group()  ->  no thread owns pid 68  ->  status published to pid 75
-real parent waits on pid 68  ...  forever</pre>
-    <p class="quote" style="margin:.6em auto 0;text-align:center">concurrency? i hardly knew her</p>
-    <p class="note">The fix is one line, copied from the code that already did it right for <span class="mono">exit_group</span>.</p>
-  </section>
-
   <!-- 14 close -->
   <section class="slide center">
     <h1>measure &rarr; trade-off &rarr; tooling</h1>
@@ -259,7 +231,7 @@ real parent waits on pid 68  ...  forever</pre>
 
 </div>
 
-<div id="hud">1 / 15</div>
+<div id="hud">1 / 13</div>
 <div id="hint">← → / space &nbsp;·&nbsp; f fullscreen</div>
 
 <script>
