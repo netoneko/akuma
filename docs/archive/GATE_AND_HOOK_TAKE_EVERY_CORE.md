@@ -44,6 +44,25 @@ Parallelism multiplied at three levels, none of which knew about the others:
 - `prep:cloc` runs the lexer **once** and writes `$GATE_DIR/cloc.json`; the two ratchets read it through
   `CLOC_JSON` and still compute it themselves when run by hand.
 
+## The slow tests were unoptimized crypto, not too many fuzz tests
+
+Per-test times (`cargo test -- -Z unstable-options --report-time`, 3 threads, 6 pinned cores, `dev` profile):
+
+| test | before |
+|---|---|
+| `akuma-wpa` `key_parse_and_supplicant_survive_mutated_messages` | 1190 s |
+| `akuma-wpa` `key_unwrap_survives_every_length_and_random_bytes` | 267 s |
+| `akuma-wpa` `spoofed_message_1s_are_harmless`, `rekeys_converge_on_a_lossy_link` | 179 s, 175 s |
+| `akuma-wpa` `the_handshake_converges_under_loss_duplication_reordering_and_corruption`, `a_long_bad_day` | 103 s, 65 s |
+| `akuma-ext2` pin/unlink and rename tests (correctness, not fuzz) | 69-79 s each |
+
+`akuma-wpa` alone was ~33 minutes of the hook. Its tests run SHA-1, PBKDF2 and AES 100,000 times per test in an
+unoptimized build. `[profile.dev.package.akuma-wpa] opt-level = 3` in the root `Cargo.toml` (debug assertions and
+overflow checks stay on) brings the crate to **~50 s** (the fuzz test 36 s, the next 9 s) with all 29 tests passing and
+none disabled. Repo-wide there are 40 test functions named fuzz/survives/mutated/random_bytes in 24 crates and only 5
+`#[ignore]`s (nvme, fbcon image writers); a per-test opt-in is the next step only if a crate is still slow after this.
+Still open: the `akuma-ext2` tests at ~70 s each under load.
+
 ## Verified
 
 - `pin_to_cores("12-13")` on the box: affinity `[12, 13]`, niceness 19 (inherited from the shell), 2 cargo jobs,
