@@ -17,7 +17,7 @@
   .topbar { min-height:76px; display:flex; align-items:center; justify-content:space-between; gap:1rem; border-bottom:1px solid var(--line); }
   .brand { display:flex; align-items:center; gap:.7rem; text-decoration:none; font-weight:800; letter-spacing:.15em; }
   .brand-mark { color:var(--pink); font-size:1.8rem; line-height:1; }
-  .top-links { display:flex; gap:1.5rem; align-items:center; font-size:.72rem; text-transform:uppercase; letter-spacing:.1em; }
+  .top-links { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:1.5rem; align-items:center; font-size:.72rem; text-transform:uppercase; letter-spacing:.1em; }
   .top-links a { text-decoration:none; color:#c8c9cb; }
   .top-links a:hover { color:var(--cyan); }
   .hero { display:grid; grid-template-columns:1.1fr .9fr; gap:4rem; align-items:center; padding:clamp(5rem,10vw,9rem) 0 5rem; }
@@ -40,10 +40,20 @@
   .terminal-code { color:#b8b9bd; border-top:1px solid var(--line); padding-top:1.25rem; font-size:.72rem; line-height:2; }
   .terminal-code b { color:var(--cyan); font-weight:normal; }
   .terminal-code .dim { color:#777d85; }
-  .about { border-top:1px solid var(--line); padding:4rem 0; max-width:52rem; }
+  .about { border-top:1px solid var(--line); padding:4rem 0; display:grid; grid-template-columns:minmax(0,1.4fr) minmax(0,1fr); gap:clamp(2rem,5vw,5rem); align-items:start; }
   .about h2 { font:700 clamp(2rem,4vw,3.5rem)/1 Arial,Helvetica,sans-serif; letter-spacing:-.05em; margin:0 0 1.8rem; }
   .about p { color:#c2c4c7; font-size:clamp(.9rem,1.2vw,1rem); line-height:1.75; margin:0 0 1.2rem; }
   .about p:last-child { margin-bottom:0; }
+  .at-work { border:1px solid var(--line); background:var(--panel); padding:1.5rem; }
+  .at-work h3 { font:700 1.7rem/1 Arial,Helvetica,sans-serif; letter-spacing:-.04em; margin:0 0 1.5rem; }
+  .at-work ul { list-style:none; padding:0; margin:0; }
+  .at-work li { color:var(--muted); font-size:.75rem; line-height:1.65; padding:1rem 0; border-top:1px solid var(--line); }
+  .at-work li:last-child { padding-bottom:0; }
+  .at-work strong { color:var(--ink); }
+  .about-me { border:1px solid #99415f; background:#291522; padding:1.5rem; margin-top:1.5rem; }
+  .about-me h3 { color:#ff8caf; font:700 1.7rem/1 Arial,Helvetica,sans-serif; letter-spacing:-.04em; margin:0 0 1.5rem; }
+  .about .about-me p { color:#e0c6d0; font-size:.75rem; line-height:1.65; }
+  .about-me a { color:var(--cyan); }
   .capabilities { border-top:1px solid var(--line); padding:5rem 0 0; }
   .kernel-tiles { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); margin-top:2.5rem; }
   .kernel-tile { min-width:0; background:var(--panel); padding:1.5rem; }
@@ -85,14 +95,14 @@
   .footer-inner { display:flex; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
   footer a { color:var(--ink); text-decoration:none; }
   footer a:hover { color:var(--cyan); }
-  @media (max-width:800px) { .hero { grid-template-columns:1fr; gap:3rem; padding-top:4rem; } .terminal { max-width:35rem; } .akuma-logo { font-size:clamp(.45rem,1.25vw,.7rem); } .talks,.more,.kernel-tiles { grid-template-columns:1fr; } .stats-grid { grid-template-columns:repeat(2,1fr); } .talk { min-height:340px; } .talk-banner { font-size:clamp(.36rem, 1.5vw, .65rem); } .section-head { align-items:start; flex-direction:column; } }
+  @media (max-width:800px) { .hero { grid-template-columns:1fr; gap:3rem; padding-top:4rem; } .terminal { max-width:35rem; } .akuma-logo { font-size:clamp(.45rem,1.25vw,.7rem); } .about,.talks,.more,.kernel-tiles { grid-template-columns:1fr; } .stats-grid { grid-template-columns:repeat(2,1fr); } .talk { min-height:340px; } .talk-banner { font-size:clamp(.36rem, 1.5vw, .65rem); } .section-head { align-items:start; flex-direction:column; } }
   @media (max-width:480px) { .wrap { width:calc(100% - 2rem); } .top-links { gap:.8rem; font-size:.63rem; } h1 { font-size:clamp(2.8rem,12.8vw,4rem); } .section { padding:4rem 0; } .terminal-inner { padding:1.5rem 1rem; } }
 </style>
 </head>
 <body>
 <header class="wrap topbar">
   <a class="brand" href="/" aria-label="Akuma home"><span class="brand-mark" aria-hidden="true">悪</span> AKUMA</a>
-  <nav class="top-links" aria-label="Main navigation"><a href="#talks">Talks</a><a href="https://github.com/netoneko/akuma">GitHub ↗</a></nav>
+  <nav class="top-links" aria-label="Main navigation"><a href="#talks">Talks</a><a href="https://tokyorider.bandcamp.com/album/omegashima">Soundtrack ↗</a><a href="https://www.linkedin.com/in/netoneko/">LinkedIn ↗</a><a href="https://github.com/netoneko/akuma">GitHub ↗</a></nav>
 </header>
 <main class="wrap">
   <section class="hero" aria-labelledby="hero-title">
@@ -139,11 +149,29 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
     </div>
   </section>
   <div class="about">
+    <div>
     <h2>A computer you can understand.</h2>
     <p>Akuma is a small, hackable operating system written in Rust. It runs in the cloud, under KVM, and on bare-metal personal computers. It has enough of a development environment to build itself—and a stack a single engineer can explore, understand, extend, and adjust for their own needs.</p>
     <p>Akuma is built from crates, so you can compose a kernel for the job and leave out what you don’t need. At roughly 140,000 lines of production Rust, it offers a more approachable codebase to study and audit than a general-purpose system built over decades. It provides an easy path to building custom kernels for the workloads you want to run—whether that’s Scala, Rust, Go, Python, or something more fun and niche like Clojure—with a kernel ELF of just a couple of megabytes.</p>
-    <p>You don’t have to abandon your favorite tools: thanks to Linux ABI compatibility on aarch64 and amd64, you can run familiar Alpine packages and Docker images. If you like source-based distros, try it with Gentoo.</p>
+    <p>You don’t have to abandon your favorite tools: thanks to <a href="https://github.com/netoneko/akuma/blob/main/docs/reference/abi/linux-compat.md">Linux ABI compatibility</a> on aarch64 and amd64, you can run familiar <a href="https://github.com/netoneko/akuma/blob/main/docs/runbooks/add-apk-package.md">Alpine packages</a> and <a href="https://github.com/netoneko/akuma/blob/main/docs/runbooks/run-docker-image.md">Docker images</a>. If you like source-based distros, try it with <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/AKUMA_GENTOO.md">Gentoo</a>.</p>
     <p>Linux is a mature and vastly more capable operating system. Akuma is an experiment in a different direction: how much of a useful computer can we build, understand, and maintain ourselves?</p>
+    </div>
+    <div>
+    <aside class="at-work" aria-labelledby="at-work-title">
+      <h3 id="at-work-title">Akuma in your home lab</h3>
+      <ul>
+        <li><strong>Run it on your own metal.</strong> Use amd64 or aarch64, or port it somewhere else. A unified kernel build and a small codebase make it easier to bootstrap your own stack. Want a kernel for Raspberry Pi to understand OS basics? Go for it!</li>
+        <li><strong>Build your own distro.</strong> Linux compatibility lets you take a minimalist approach without losing your favorite tools, or build your own userspace. A basic init system and sshd are included.</li>
+        <li><strong>Experiment with systems programming.</strong> Write your own syscalls, subsystems, drivers, or kernel middleware as safe Rust crates. SSH into your new setup and go nuts! <strong>All you need is Rust.</strong></li>
+        <li><strong>Run your own agents.</strong> Give them a controlled and isolated environment with <a href="https://github.com/netoneko/akuma/blob/main/docs/runbooks/run-firecracker-on-akuma.md">Firecracker</a>, <a href="https://github.com/netoneko/akuma/blob/main/docs/userspace/box.md">Akuma containers</a>, or <a href="https://github.com/netoneko/akuma/blob/main/docs/runbooks/kvm-dev-loop-on-akuma.md">KVM guests</a>. <a href="https://claude.com/product/claude-code">Claude Code</a>, <a href="https://openai.com/codex/">Codex</a>, <a href="https://github.com/block/goose">Goose</a>, and <a href="https://github.com/hydro-project/infinity">AWS Infinity</a> are supported.</li>
+      </ul>
+    </aside>
+    <aside class="about-me" aria-labelledby="about-me-title">
+      <h3 id="about-me-title">About me</h3>
+      <p>Hi. My name is Kirill and I’ve been coding and building stuff professionally since 2004 and using Linux since 2001. This project is my love letter to the simplicity of Linux and BSD in the early 2000s, with an unreasonable amount of cat jokes. I use it every day because I think it’s fun.</p>
+      <p>You can hire me to build things for you or with you. <a href="mailto:netoneko@gmail.com">Contact me here ↗</a>.</p>
+    </aside>
+    </div>
   </div>
   <section class="capabilities" aria-labelledby="capabilities-title">
     <div class="section-head"><div><span class="label">00 / the kernel family</span><h2 id="capabilities-title">Shared roots.<br>Different missions.</h2></div><p>A family of kernels composed from shared foundations, each built to run a specific runtime.</p></div>
@@ -250,8 +278,8 @@ _/                                    \_     Beans System Debauchery:
   <section class="section" aria-labelledby="stats-title">
     <div class="section-head"><div><span class="label">02 / by the numbers</span><h2 id="stats-title">Stats</h2></div><p>A snapshot of the code and the bugs we have found along the way.</p></div>
     <div class="stats-grid">
-      <div class="stat"><strong>136,052</strong><p>production Rust code lines in <code>src/</code>, <code>crates/</code> and <code>taoxichuan/src/</code>. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
-      <div class="stat"><strong>73,840</strong><p>test Rust code lines in the same source scope, counted separately from production. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong>136,200</strong><p>production Rust code lines in <code>src/</code>, <code>crates/</code> and <code>taoxichuan/src/</code>. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
+      <div class="stat"><strong>73,890</strong><p>test Rust code lines in the same source scope, counted separately from production. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
       <div class="stat"><strong class="open-models">99.25%</strong><p>of production Rust code lines are outside <code>unsafe</code> blocks in that scope. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
       <div class="stat"><strong>330</strong><p>production <code>unsafe</code> sites counted across the same Rust source scope. <a href="https://github.com/netoneko/akuma/blob/main/scripts/cloc_akuma.py">Line counter ↗</a></p></div>
       <div class="stat"><strong class="open-models">3 / 4</strong><p>kernels initially built with mostly <span class="open-models">open models</span>: Denver, Taoxichuan and Shanghai.</p></div>
@@ -261,6 +289,6 @@ _/                                    \_     Beans System Debauchery:
     </div>
   </section>
 </main>
-<footer><div class="wrap footer-inner"><span>悪魔 / AKUMA &nbsp;·&nbsp; BSD 2-Clause</span><a href="https://github.com/netoneko/akuma">SOURCE CODE ↗</a></div></footer>
+<footer><div class="wrap footer-inner"><span>悪魔 / AKUMA &nbsp;·&nbsp; BSD 2-Clause &nbsp;·&nbsp; by <a href="https://www.linkedin.com/in/netoneko/">Kirill Maksimov ↗</a></span><a href="https://github.com/netoneko/akuma">SOURCE CODE ↗</a></div></footer>
 </body>
 </html>
