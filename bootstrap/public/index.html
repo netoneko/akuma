@@ -47,7 +47,7 @@
   .at-work { border:1px solid var(--line); background:var(--panel); padding:1.5rem; }
   .at-work h3 { font:700 1.7rem/1 Arial,Helvetica,sans-serif; letter-spacing:-.04em; margin:0 0 1.5rem; }
   .at-work ul { list-style:none; padding:0; margin:0; }
-  .at-work li { color:var(--muted); font-size:.75rem; line-height:1.65; padding:1rem 0; border-top:1px solid var(--line); }
+  .at-work li { color:var(--muted); font-size:.75rem; line-height:1.65; padding:0 0 1rem; }
   .at-work li:last-child { padding-bottom:0; }
   .at-work strong { color:var(--ink); }
   .about-me { border:1px solid #99415f; background:#291522; padding:1.5rem; margin-top:1.5rem; }
@@ -154,7 +154,7 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
     <p>Akuma is a small, hackable operating system written in Rust. It runs in the cloud, under KVM, and on bare-metal personal computers. It has enough of a development environment to build itself—and a stack a single engineer can explore, understand, extend, and adjust for their own needs.</p>
     <p>Akuma is built from crates, so you can compose a kernel for the job and leave out what you don’t need. At roughly 140,000 lines of production Rust, it offers a more approachable codebase to study and audit than a general-purpose system built over decades. It provides an easy path to building custom kernels for the workloads you want to run—whether that’s Scala, Rust, Go, Python, or something more fun and niche like Clojure—with a kernel ELF of just a couple of megabytes.</p>
     <p>You don’t have to abandon your favorite tools: thanks to <a href="https://github.com/netoneko/akuma/blob/main/docs/reference/abi/linux-compat.md">Linux ABI compatibility</a> on aarch64 and amd64, you can run familiar <a href="https://github.com/netoneko/akuma/blob/main/docs/runbooks/add-apk-package.md">Alpine packages</a> and <a href="https://github.com/netoneko/akuma/blob/main/docs/runbooks/run-docker-image.md">Docker images</a>. If you like source-based distros, try it with <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/AKUMA_GENTOO.md">Gentoo</a>.</p>
-    <p>Linux is a mature and vastly more capable operating system. Akuma is an experiment in a different direction: how much of a useful computer can we build, understand, and maintain ourselves?</p>
+    <p>Linux is a mature and vastly more capable operating system. Akuma is an experiment in a different direction: <strong>how much of a useful computer can we build, understand, and maintain ourselves?</strong></p>
     </div>
     <div>
     <aside class="at-work" aria-labelledby="at-work-title">
@@ -285,7 +285,7 @@ _/                                    \_     Beans System Debauchery:
       <div class="stat"><strong class="open-models">3 / 4</strong><p>kernels initially built with mostly <span class="open-models">open models</span>: Denver, Taoxichuan and Shanghai.</p></div>
       <div class="stat"><strong>1,695</strong><p>distinct fixes recorded in the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
       <div class="stat"><strong>142</strong><p>distinct Taoxichuan fixes recorded in its separate audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/TAOXICHUAN_BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
-      <div class="stat"><strong>500</strong><p>investigation documents contribute fixes to the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
+      <div class="stat"><strong>500+</strong><p>investigation documents contribute fixes to the Akuma bug-fix audit. <a href="https://github.com/netoneko/akuma/blob/main/docs/archive/BUG_FIX_LIST.md">Bug-fix list ↗</a></p></div>
     </div>
   </section>
 </main>
