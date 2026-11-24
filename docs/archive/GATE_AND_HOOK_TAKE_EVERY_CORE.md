@@ -75,6 +75,12 @@ second and later kernels of an architecture build in the time of their own LTO l
 (the first run after this change, or a new toolchain) still pay once per architecture. Also: the amd64 boot timeouts
 went from 150 s to 420 s, because the self-test boot takes ~250 s on the pinned slice.
 
+The `--with-jvm` gate (`overlays/denver/check.sh`) failed with "no answer in 600s" on the pinned slice because
+`overlays/denver/run.sh` passed no `-accel`, so QEMU emulated the amd64 kernel and the JVM in software (TCG). With
+`-accel kvm` the same check passes in 43 s. `run.sh`, `amd64/run-fs-full.sh` and `scripts/codex/denver-tool-probe.sh`
+now use KVM when `/dev/kvm` is writable on an x86_64 Linux host (`NO_KVM=1` forces TCG). `amd64/run.sh` is left as
+it was (it takes `$CPU` from the caller).
+
 ## Verified
 
 - `pin_to_cores("12-13")` on the box: affinity `[12, 13]`, niceness 19 (inherited from the shell), 2 cargo jobs,

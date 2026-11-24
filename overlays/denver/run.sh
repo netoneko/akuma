@@ -34,10 +34,13 @@ MEMORY=${MEMORY:-3072}
 SMP=${SMP:-1}
 PORT=${HTTP_PORT:-8080}
 
+# KVM when this is an x86_64 Linux host that lets us use it (TCG runs the JVM ~50x slower); NO_KVM=1 forces TCG.
+ACCEL="-cpu max"
+if [ -z "${NO_KVM:-}" ] && [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] && [ -w /dev/kvm ]; then ACCEL="-accel kvm -cpu max"; fi
 case "$ARCH" in
 amd64)
     exec qemu-system-x86_64 \
-        -M microvm -cpu max -global virtio-mmio.force-legacy=false \
+        -M microvm $ACCEL -global virtio-mmio.force-legacy=false \
         -m "$MEMORY" -smp "$SMP" -kernel "$KERNEL" \
         -drive id=d0,file="$DISK",format=raw,if=none,snapshot=on \
         -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0 \
