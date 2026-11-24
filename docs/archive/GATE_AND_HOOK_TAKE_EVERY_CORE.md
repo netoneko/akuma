@@ -63,12 +63,24 @@ none disabled. Repo-wide there are 40 test functions named fuzz/survives/mutated
 `#[ignore]`s (nvme, fbcon image writers); a per-test opt-in is the next step only if a crate is still slow after this.
 Still open: the `akuma-ext2` tests at ~70 s each under load.
 
+## Why the sixteen builds were slow (2026-11-24)
+
+Each kernel build had its own `CARGO_TARGET_DIR` (`$GATE/target/<step>`), so the ~150 workspace crates every kernel
+depends on were compiled sixteen times, at `opt-level=3` with thin LTO, on six pinned cores at nice 15, one build at
+a time: 180-350 s per kernel on a cold directory. Builds now share **one target dir per target triple**
+(`shared_target_dir` in `scripts/gate.py`); cargo keys artifacts by feature set, so kernels with identical dependency
+features reuse each other's compiles. A shared dir holds only the last variant of a package built into it, so each
+build's kernel is copied to `$GATE/kernels/<step>` and the boots read that copy. Expected, **not yet measured**: the
+second and later kernels of an architecture build in the time of their own LTO link, not a full compile. Cold runs
+(the first run after this change, or a new toolchain) still pay once per architecture. Also: the amd64 boot timeouts
+went from 150 s to 420 s, because the self-test boot takes ~250 s on the pinned slice.
+
 ## Verified
 
 - `pin_to_cores("12-13")` on the box: affinity `[12, 13]`, niceness 19 (inherited from the shell), 2 cargo jobs,
   2 test threads. `gate.py --list` runs. A full pinned gate run was started after the change; see its result in the
   commit that merged this.
-- Not changed: the hook. It still runs clippy and the tests on every crate and is not pinned; run the commit under
+- The hook now exits at once when no Rust-affecting path is staged (2026-11-24). For a Rust commit it still runs clippy and the tests on every crate and is not pinned; run the commit under
   `taskset`/`nice` for now. It repeating the gate's host tests is open (`proposals/FUTURE_WORK.md`).
 
 ## Lessons
