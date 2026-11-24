@@ -13,8 +13,8 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1696
-- **Docs contributing at least one fix:** 501
+- **Total distinct fixes counted:** 1699
+- **Docs contributing at least one fix:** 502
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
@@ -26,15 +26,15 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 | Networking | 105 | 6.2% | 39 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.5% | 6 |
-| Toolchain & Self-Hosting | 94 | 5.5% | 14 |
+| Toolchain & Self-Hosting | 97 | 5.7% | 15 |
 | SSH | 56 | 3.3% | 23 |
 | VFS & Filesystem | 150 | 8.8% | 49 |
 | Boot & Drivers | 145 | 8.5% | 26 |
 | Signals & Exceptions | 51 | 3.0% | 21 |
 | Misc / Cross-cutting | 98 | 5.8% | 28 |
 | Console & Terminal | 63 | 3.7% | 22 |
-| Containers | 79 | 4.7% | 15 |
-| **Total** | **1696** | **100.0%** | **501** |
+| Containers | 79 | 4.6% | 15 |
+| **Total** | **1699** | **100.0%** | **502** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -1616,7 +1616,12 @@ aren't recorded anywhere else.)
 - On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
-## Toolchain & Self-Hosting (94 fixes, 14 docs)
+## Toolchain & Self-Hosting (97 fixes, 15 docs)
+
+### docs/archive/GATE_AND_HOOK_TAKE_EVERY_CORE.md
+- `scripts/gate.py` pinned itself to a fixed core set at low priority, capped cargo/test threads, and ran the cloc lexer once (it took every core and drove the load to 42)
+- `akuma-wpa` tests built at `opt-level=3` in the dev profile (33 minutes of unoptimized crypto to ~50 s)
+- The Denver JVM gate and two other QEMU runners boot under KVM when `/dev/kvm` is usable (software emulation timed out at 600 s; KVM answers in 43 s)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -2872,4 +2877,4 @@ Also scanned 2026-11-20 (`ecosystem-demo-stage1`, 39 commits: the box-0 policy f
 
 Also scanned 2026-11-22 (the ecosystem demo's agent trials, `demo-trial-run`): counted TOKIO_EXEC_LEADER_SLOT_REUSE (Scheduler & Process Management, 1). AKUMA_ECOSYSTEM_DEMO_AGENT_TRIAL is a findings write-up and AKUMA_ECOSYSTEM_DEMO's stage-3 section a status note: no counted fix. The trial's rig changes (`ECO_HEADROOM_MB`, the apk relock, `agents.py`, `rework.py`, `judge.py`, `scalarun.py`) are not fixes.
 
-Also scanned 2026-11-23 (`investigate-codex-code-mode-host`): counted CODEX_CODE_MODE_HOST_KEEPALIVE (Syscall / ABI, 1: the `getrandom` zero-length `EFAULT`). The doc's main subject, the HTTP/2 keep-alive loss of code-mode sessions on the main kernel, is open and uncounted. `6fc768ca` (copy for the bootstrap page) is not a fix.
+Also scanned 2026-11-23 (`investigate-codex-code-mode-host`): counted GATE_AND_HOOK_TAKE_EVERY_CORE (Toolchain & Self-Hosting, 3: gate pinning, wpa dev opt-level, KVM for the Denver JVM gate); counted CODEX_CODE_MODE_HOST_KEEPALIVE (Syscall / ABI, 1: the `getrandom` zero-length `EFAULT`). The doc's main subject, the HTTP/2 keep-alive loss of code-mode sessions on the main kernel, is open and uncounted. `6fc768ca` (copy for the bootstrap page) is not a fix.
