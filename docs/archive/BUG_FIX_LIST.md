@@ -13,28 +13,28 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ## Statistics
 
-- **Total distinct fixes counted:** 1695
-- **Docs contributing at least one fix:** 500
+- **Total distinct fixes counted:** 1699
+- **Docs contributing at least one fix:** 502
 - **Subsystem categories:** 15
 
 | Subsystem | Fixes | % | Docs |
 |---|---:|---:|---:|
-| Syscall / ABI Compatibility Audits | 261 | 15.4% | 43 |
+| Syscall / ABI Compatibility Audits | 262 | 15.4% | 44 |
 | Memory & Virtual Memory | 205 | 12.1% | 73 |
 | Scheduler & Process Management | 161 | 9.5% | 55 |
 | SMP & Locking | 142 | 8.4% | 61 |
 | Networking | 105 | 6.2% | 39 |
 | Userspace Apps & Libraries | 59 | 3.5% | 25 |
 | Rump Kernel & Syscall Proxy | 26 | 1.5% | 6 |
-| Toolchain & Self-Hosting | 94 | 5.5% | 14 |
+| Toolchain & Self-Hosting | 97 | 5.7% | 15 |
 | SSH | 56 | 3.3% | 23 |
-| VFS & Filesystem | 150 | 8.9% | 49 |
-| Boot & Drivers | 145 | 8.6% | 26 |
+| VFS & Filesystem | 150 | 8.8% | 49 |
+| Boot & Drivers | 145 | 8.5% | 26 |
 | Signals & Exceptions | 51 | 3.0% | 21 |
 | Misc / Cross-cutting | 98 | 5.8% | 28 |
 | Console & Terminal | 63 | 3.7% | 22 |
-| Containers | 79 | 4.7% | 15 |
-| **Total** | **1694** | **100.0%** | **499** |
+| Containers | 79 | 4.6% | 15 |
+| **Total** | **1699** | **100.0%** | **502** |
 
 **Largest single write-ups** (most distinct fixes documented in one file):
 
@@ -55,7 +55,7 @@ also run (glue, a shared crate) is counted here, once, and that list points at i
 
 ---
 
-## Syscall / ABI Compatibility Audits (261 fixes, 43 docs)
+## Syscall / ABI Compatibility Audits (262 fixes, 44 docs)
 
 ### docs/archive/TOKIO_KERNEL_GATES_RERUN.md
 - `read_user_cstr` prefaulted a page-aligned string start on aarch64 only (`9cc41207`); on the tokio kernels, whose ring-0 fault handler fills only zero pages, `open` of a lazily mapped `.rodata` path returned `EFAULT` and tokioprobe's DNS lookup failed with `Invalid flags`; the prefault runs on every architecture again (found through Taoxichuan)
@@ -366,6 +366,9 @@ Same shape as the `*_MISSING_SYSCALLS` docs above — "make one Linux program wo
 
 ### docs/archive/AKUMA_ECOSYSTEM_DEMO.md
 - `getcpu` (x86_64 nr 309) was unserved on the main amd64 kernel, so HotSpot fell back to the unmapped legacy vsyscall page and the JVM died before `main` with `SIGSEGV at pc=0xffffffffff600800`; the kernel serves it, and the gate probe has a `getcpu` check
+
+### docs/archive/CODEX_CODE_MODE_HOST_KEEPALIVE.md
+- `getrandom(buf, 0)` returned `EFAULT` for the dangling pointer (address 1) Rust passes for an empty slice, because `sys_getrandom` validated `buf` before looking at `len`; Linux answers 0, so a zero-length request now returns 0 first (codex-code-mode-host's runtime process hit it)
 
 ## Memory & Virtual Memory (205 fixes, 73 docs)
 
@@ -1613,7 +1616,12 @@ aren't recorded anywhere else.)
 - On the rump devbox, every ssh session reset at kex (`kex_exchange_identification: Connection reset by peer`): `RumpSocket` was the one fd family `clone_deep_for_fork` did not refcount, so a forked sshd session's parent `drop(stream)` closed the socket out from under its own still-running child; fixed by refcounting `RumpSocket` the same way every other fd family already was (superseded the wrong DHCP-path diagnosis in `DEVBOX_ISSUES.md` Issue 10)
 
 
-## Toolchain & Self-Hosting (94 fixes, 14 docs)
+## Toolchain & Self-Hosting (97 fixes, 15 docs)
+
+### docs/archive/GATE_AND_HOOK_TAKE_EVERY_CORE.md
+- `scripts/gate.py` pinned itself to a fixed core set at low priority, capped cargo/test threads, and ran the cloc lexer once (it took every core and drove the load to 42)
+- `akuma-wpa` tests built at `opt-level=3` in the dev profile (33 minutes of unoptimized crypto to ~50 s)
+- The Denver JVM gate and two other QEMU runners boot under KVM when `/dev/kvm` is usable (software emulation timed out at 600 s; KVM answers in 43 s)
 
 ### docs/archive/AKUMA_SELF_HOSTING.md
 - §3: boot self-test VA collision causing MEMORY≥8G `map_user_page` crash
@@ -2868,3 +2876,5 @@ Also scanned 2026-11-18 (`more-improvements`: real bubblewrap and codex's sandbo
 Also scanned 2026-11-20 (`ecosystem-demo-stage1`, 39 commits: the box-0 policy follow-up, the merge gate, the ecosystem demo stages 1-2, Denver box wiring). Counted above: BOX0_ONLY_AUDIT's follow-up (Containers, 8 bullets), AKUMA_ECOSYSTEM_DEMO (the `getcpu` arm; Syscall / ABI) and EXEC_FROM_THREAD_DETACH (Scheduler). The tokio kernels' fixes (TOKIO_KERNELS_LOOPBACK_STARVATION, DENVER_BOX_WIRING) are in `TAOXICHUAN_BUG_FIX_LIST.md`. No counted fix: AKUMA_NESTED_BOXES, KERNEL_CONVERGENCE (proposals), DENVER_CODEX_TOOLS (a feature), MERGE_GATE_FIRST_RUN (findings; its fixes are the two tokio docs and the budget ratchet, `7ffa9165`, stale numbers rather than a defect). Fix-shaped commits with no archive doc, uncounted: `97b60eae` (sshd spun at ~3700 syscalls/s when idle in the cooperative loop; it blocks in `poll`; recorded as E5 in `proposals/FUTURE_WORK.md`), the demo image builder's JKS `cacerts` generation (a rig change), and the clippy rot fixes of `aadd4a76`/`4b508eb1`/`99300fe0` (the hook had never been installed; recorded in MERGE_GATE_FIRST_RUN). Also: DENVER_SCALA_CLI_CRASHES (2026-11-20, Scheduler & Process Management 3, Signals & Exceptions 1): the tokio kernels' execve from a non-leader thread, the first-run guard, the caller's stale root, and the fault-signal sigreturn's `rcx`/`r11`. Also scanned 2026-11-22 (the merge of C2, C3, C4, C7): counted AMD64_SOCKET_WAIT_STARVATION (Networking, 1) and AMD64_BOOT_EPOCH (Boot & Drivers, 1); AARCH64_TOKIO_SOCKET_PARK is in `TAOXICHUAN_BUG_FIX_LIST.md`. Uncounted: the C3 spawn-ring change (48 to 256 slots, a capacity limit with no archive doc; `2b6c71d3`) and the gateprobe stage/sent/served/echoed counters (a rig change).
 
 Also scanned 2026-11-22 (the ecosystem demo's agent trials, `demo-trial-run`): counted TOKIO_EXEC_LEADER_SLOT_REUSE (Scheduler & Process Management, 1). AKUMA_ECOSYSTEM_DEMO_AGENT_TRIAL is a findings write-up and AKUMA_ECOSYSTEM_DEMO's stage-3 section a status note: no counted fix. The trial's rig changes (`ECO_HEADROOM_MB`, the apk relock, `agents.py`, `rework.py`, `judge.py`, `scalarun.py`) are not fixes.
+
+Also scanned 2026-11-23 (`investigate-codex-code-mode-host`): counted GATE_AND_HOOK_TAKE_EVERY_CORE (Toolchain & Self-Hosting, 3: gate pinning, wpa dev opt-level, KVM for the Denver JVM gate); counted CODEX_CODE_MODE_HOST_KEEPALIVE (Syscall / ABI, 1: the `getrandom` zero-length `EFAULT`). The doc's main subject, the HTTP/2 keep-alive loss of code-mode sessions on the main kernel, is open and uncounted. `6fc768ca` (copy for the bootstrap page) is not a fix.

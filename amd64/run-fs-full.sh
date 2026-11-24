@@ -21,9 +21,12 @@ debugfs -w -R "mkdir /mnt" "$W/root.img" >/dev/null 2>&1
 debugfs -w -R "write $U/vfatprobe /bin/vfatprobe" "$W/root.img" >/dev/null 2>&1
 debugfs -w -R "write $U/ext-ro-probe /bin/ext-ro-probe" "$W/root.img" >/dev/null 2>&1
 
+# KVM when this is an x86_64 Linux host that lets us use it (TCG runs the JVM ~50x slower); NO_KVM=1 forces TCG.
+ACCEL="-cpu max"
+if [ -z "${NO_KVM:-}" ] && [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] && [ -w /dev/kvm ]; then ACCEL="-accel kvm -cpu max"; fi
 boot() { # name image args
     st=0
-    timeout "$TIMEOUT" qemu-system-x86_64 -M microvm -cpu max -global virtio-mmio.force-legacy=false \
+    timeout "$TIMEOUT" qemu-system-x86_64 -M microvm $ACCEL -global virtio-mmio.force-legacy=false \
         -kernel "$KERNEL" -m 2048 -smp 1 \
         -drive id=d0,file="$W/root.img",format=raw,if=none -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0 \
         -drive id=d1,file="$2",format=raw,if=none -device virtio-blk-device,drive=d1,bus=virtio-mmio-bus.1 \

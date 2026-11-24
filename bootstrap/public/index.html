@@ -40,6 +40,10 @@
   .terminal-code { color:#b8b9bd; border-top:1px solid var(--line); padding-top:1.25rem; font-size:.72rem; line-height:2; }
   .terminal-code b { color:var(--cyan); font-weight:normal; }
   .terminal-code .dim { color:#777d85; }
+  .about { border-top:1px solid var(--line); padding:4rem 0; max-width:52rem; }
+  .about h2 { font:700 clamp(2rem,4vw,3.5rem)/1 Arial,Helvetica,sans-serif; letter-spacing:-.05em; margin:0 0 1.8rem; }
+  .about p { color:#c2c4c7; font-size:clamp(.9rem,1.2vw,1rem); line-height:1.75; margin:0 0 1.2rem; }
+  .about p:last-child { margin-bottom:0; }
   .capabilities { border-top:1px solid var(--line); padding:5rem 0 0; }
   .kernel-tiles { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:1px; background:var(--line); border:1px solid var(--line); margin-top:2.5rem; }
   .kernel-tile { min-width:0; background:var(--panel); padding:1.5rem; }
@@ -134,6 +138,13 @@ fn main(kernel: akuma_tokio_kernel::Kernel) -&gt; ! {
       </div>
     </div>
   </section>
+  <div class="about">
+    <h2>A computer you can understand.</h2>
+    <p>Akuma is a small, hackable operating system written in Rust. It runs in the cloud, under KVM, and on bare-metal personal computers. It has enough of a development environment to build itself—and a stack a single engineer can explore, understand, extend, and adjust for their own needs.</p>
+    <p>Akuma is built from crates, so you can compose a kernel for the job and leave out what you don’t need. At roughly 140,000 lines of production Rust, it offers a more approachable codebase to study and audit than a general-purpose system built over decades. It provides an easy path to building custom kernels for the workloads you want to run—whether that’s Scala, Rust, Go, Python, or something more fun and niche like Clojure—with a kernel ELF of just a couple of megabytes.</p>
+    <p>You don’t have to abandon your favorite tools: thanks to Linux ABI compatibility on aarch64 and amd64, you can run familiar Alpine packages and Docker images. If you like source-based distros, try it with Gentoo.</p>
+    <p>Linux is a mature and vastly more capable operating system. Akuma is an experiment in a different direction: how much of a useful computer can we build, understand, and maintain ourselves?</p>
+  </div>
   <section class="capabilities" aria-labelledby="capabilities-title">
     <div class="section-head"><div><span class="label">00 / the kernel family</span><h2 id="capabilities-title">Shared roots.<br>Different missions.</h2></div><p>A family of kernels composed from shared foundations, each built to run a specific runtime.</p></div>
     <div class="kernel-tiles" aria-label="Kernel capabilities as tiles">

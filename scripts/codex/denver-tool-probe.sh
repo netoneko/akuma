@@ -42,8 +42,11 @@ for pair in "$CODEX:/bin/codex" "$CODEX_HOST:/bin/codex-code-mode-host" "$BUSYBO
 done
 for path in /bin/codex /bin/codex-code-mode-host /bin/busybox; do debugfs -w -R "set_inode_field $path mode 0100755" "$D/root.img" >/dev/null 2>&1; done
 debugfs -w -R 'ln /bin/busybox /bin/sh' "$D/root.img" >/dev/null 2>&1
+# KVM when this is an x86_64 Linux host that lets us use it (TCG runs the JVM ~50x slower); NO_KVM=1 forces TCG.
+ACCEL="-cpu max"
+if [ -z "${NO_KVM:-}" ] && [ "$(uname -s)" = Linux ] && [ "$(uname -m)" = x86_64 ] && [ -w /dev/kvm ]; then ACCEL="-accel kvm -cpu max"; fi
 python3 scripts/codex/fakemodel.py "$PORT" "$D/model.log" 'printf DENVER_TOOL_PROBE > /work/proof; read v < /work/proof; printf "%s" "$v"' & server=$!
-qemu-system-x86_64 -M microvm -cpu max -global virtio-mmio.force-legacy=false -m 3072 -smp 1 \
+qemu-system-x86_64 -M microvm $ACCEL -global virtio-mmio.force-legacy=false -m 3072 -smp 1 \
     -kernel "$KERNEL" -drive "id=d0,file=$D/root.img,format=raw,if=none,snapshot=on" \
     -device virtio-blk-device,drive=d0,bus=virtio-mmio-bus.0 \
     -netdev user,id=n0 -device virtio-net-device,netdev=n0,bus=virtio-mmio-bus.1 \

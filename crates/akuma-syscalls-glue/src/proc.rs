@@ -1595,6 +1595,10 @@ pub(super) fn sys_capget(hdr_ptr: UserAddr, data_ptr: UserAddr) -> u64 {
 /// sources below always answer.
 pub(super) fn sys_getrandom(ptr: UserAddr, len: usize) -> u64 {
     let ptr = ptr.get();
+    // Linux answers 0 for an empty request without looking at `buf`. Rust passes a
+    // dangling `NonNull` (address 1) for an empty slice, which `validate_user_ptr`
+    // rejects as the null page: the code-mode host's V8 runtime hit this.
+    if len == 0 { return 0; }
     if !validate_user_ptr(ptr, len) { return EFAULT; }
     let _drv_bkl = super::fs::DriverBklGuard::new();
     let mut remaining = len;

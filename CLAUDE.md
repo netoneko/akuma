@@ -772,6 +772,7 @@ Then:
   branch fixed, add what it opened, regenerate the inventory. Same discipline as `BUG_FIX_LIST.md`.
 - **Never rewrite history**: no `reset`, `rebase`, `commit --amend` or force-push, in this repo or any submodule. A
   mistake is fixed by a new commit.
+- **A commit with no Rust-affecting path skips the hook by itself** (2026-11-24): the hook exits at once unless a staged path is `*.rs`, `*.toml`, `*.lock`, `*.ld`, `*.s`/`*.S`, `build.rs`, `rust-toolchain*` or under `.cargo/`; scripts, shell, Python, Markdown and the like pay nothing. `FORCE_HOOK=1` runs it anyway. The gate still checks them.
 - **Docs-only commits use `git commit --no-verify`.** A commit whose every path is Markdown or under `docs/` or
   `proposals/` cannot change what clippy or the tests see, and the hook's run costs minutes. Anything that also
   touches code, a script, a manifest or a lockfile runs the hook. `--no-verify` also skips the hook's secret scan of

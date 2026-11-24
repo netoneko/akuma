@@ -190,6 +190,12 @@ name = "akuma"
 bench = false
 test = false
 
+# Host tests build `dev` (unoptimized). akuma-wpa's fuzz and lossy-link tests run SHA-1/PBKDF2/AES hundreds of
+# thousands of times: unoptimized they took ~33 minutes in the pre-commit hook (one test alone 1190 s). Optimize
+# just this crate; debug assertions and overflow checks stay on. docs/archive/GATE_AND_HOOK_TAKE_EVERY_CORE.md
+[profile.dev.package.akuma-wpa]
+opt-level = 3
+
 [profile.release]
 panic = "abort"
 # ThinLTO across the whole graph, not just within each crate. Without it a call

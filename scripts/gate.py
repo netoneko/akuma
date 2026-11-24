@@ -12,7 +12,7 @@ from scratch and is slower; every later run only rebuilds what changed). Everyth
 
   prep    gateprobe (a static musl program, std only) -> a tiny ext2 root; the main kernel's own root image
   static  the ratchets (`scripts/check_*.py`), host tests of the extracted crates
-  build   the sixteen kernel builds `scripts/premerge_build.sh` names, each in its own target dir
+  build   the sixteen kernel builds `scripts/premerge_build.sh` names, one shared target dir per architecture
   boot    amd64 only, under QEMU microvm + KVM, each on a snapshot of a shared read-only image:
             akuma amd64        the in-kernel boot suite (`Akuma/amd64 self-test: N passed`), SMP 1 and 2, and gateprobe
             taoxichuan, shanghai, denver   gateprobe as `init=` (they boot straight into it)
@@ -156,7 +156,7 @@ def boot_gateprobe(job, kernel_of, disk, smp=2, extra=""):
         k = kernel_of()
         log = logpath(job.name)
         text = qemu_boot(k, disk, log, f"{CMDLINE_DEVICES} epoch={int(time.time())} init=/bin/gateprobe {extra}",
-                         smp=smp, mem=1024, done=r"(?m)^GATE RESULT", timeout=150, stall=40)
+                         smp=smp, mem=1024, done=r"(?m)^GATE RESULT", timeout=420, stall=90)
         caps = read_gate_lines(text)
         for name in probe_names():
             if name not in caps:
@@ -177,7 +177,7 @@ def boot_selftests(job, kernel_of, smp):
         k = kernel_of()
         log = logpath(job.name)
         text = qemu_boot(k, AKUMA_ROOT, log, f"{CMDLINE_DEVICES} init=/bin/herd", smp=smp, mem=1024,
-                         done=r"(?m)self-tests passed|SELF-TESTS FAILED", timeout=150)
+                         done=r"(?m)self-tests passed|SELF-TESTS FAILED", timeout=420)
         with open(log, "ab") as f:
             f.write(("\n--- console ---\n" + text).encode())
         m = re.search(r"self-test: (\d+) passed, (\d+) (?:FAILED|failed)", text)
@@ -200,9 +200,21 @@ def boot_akuma_gateprobe(job, kernel_of):
 # ---- the job set -----------------------------------------------------------------------------------------
 
 def step_artifact(step_name, args):
+    """Where a build's kernel is kept: a copy in $GATE/kernels (the shared target dir holds only the last
+    variant of a package built into it); the older per-step target dir is the fallback for a `--no-build` rerun."""
     pkg = re.search(r"-p (\S+)", args).group(1)
     target = re.search(r"--target (\S+)", args).group(1)
-    return os.path.join(GATE, "target", step_name, target, "release", pkg)
+    kept = os.path.join(GATE, "kernels", step_name)
+    if os.path.exists(kept):
+        return kept
+    old = os.path.join(GATE, "target", step_name, target, "release", pkg)
+    return old if os.path.exists(old) else kept
+
+
+def shared_target_dir(args):
+    """One cargo target dir per target triple, so the ~150 workspace crates are compiled once per
+    architecture and every kernel's build reuses them (it was one dir per kernel: sixteen full compiles)."""
+    return os.path.join(GATE, "target", "shared-" + re.search(r"--target (\S+)", args).group(1))
 
 
 def build_jobs():
@@ -257,10 +269,25 @@ def make_jobs(no_build, with_jvm=False):
     add("prep:akuma-root", "prep", "akuma-root", "light", mkakuma, needs=["prep:gateprobe"], timeout=700)
 
     # static
+    # `check_unsafe_budget` and `check_budgets` both need `cloc_akuma.py --json` over the whole tree (minutes, one
+    # core): run it once and give both the file, instead of each lexing the tree on its own.
+    CLOC_JSON = os.path.join(GATE, "cloc.json")
+
+    def cloc_once():
+        log = logpath("prep:cloc")
+        with open(CLOC_JSON + ".tmp", "wb") as out:
+            out.write(subprocess.run([sys.executable, "scripts/cloc_akuma.py", "--json", "src", "crates",
+                                      os.path.join("taoxichuan", "src")], cwd=REPO, capture_output=True, check=True).stdout)
+        os.replace(CLOC_JSON + ".tmp", CLOC_JSON)
+        open(log, "ab").write(b"cloc.json written\n")
+
+    add("prep:cloc", "prep", "cloc", "light", cloc_once, timeout=900)
     for script in ("check_addr_params", "check_user_ptr_params", "check_unsafe_budget", "check_feature_parity",
                    "check_budgets", "check_no_cloud_secrets"):
+        uses = script in ("check_unsafe_budget", "check_budgets")
         add(f"static:{script}", "repo", script.replace("check_", ""), "light",
-            (lambda s=script: run([sys.executable, f"scripts/{s}.py"], logpath(f"static:{s}"))), timeout=300)
+            (lambda s=script: run([sys.executable, f"scripts/{s}.py"], logpath(f"static:{s}"),
+                                  env={"CLOC_JSON": CLOC_JSON})), needs=["prep:cloc"] if uses else [], timeout=300)
 
     host = subprocess.run(["rustc", "-vV"], capture_output=True, text=True).stdout
     host = re.search(r"host: (\S+)", host).group(1)
@@ -287,8 +314,13 @@ def make_jobs(no_build, with_jvm=False):
     built = {}
     for name, args in build_jobs():
         def mk(name=name, args=args):
+            tdir = shared_target_dir(args)
             run(["cargo", "build", "--release"] + shlex.split(args), logpath(f"build:{name}"),
-                env={"CARGO_TARGET_DIR": os.path.join(GATE, "target", name)}, timeout=1500)
+                env={"CARGO_TARGET_DIR": tdir}, timeout=1500)
+            pkg = re.search(r"-p (\S+)", args).group(1)
+            triple = re.search(r"--target (\S+)", args).group(1)
+            os.makedirs(os.path.join(GATE, "kernels"), exist_ok=True)
+            shutil.copy2(os.path.join(tdir, triple, "release", pkg), os.path.join(GATE, "kernels", name))
         kernel = re.search(r"-p (\S+)", args).group(1)
         arch = "aarch64" if A64 in args else "amd64"
         if not no_build:
@@ -453,6 +485,34 @@ def report(jobs, xfail):
     return not bad and not unexpected
 
 
+def pin_to_cores(spec):
+    """Confine the gate, and so every child it starts, to a fixed set of cores at low priority; return how many.
+
+    A gate that sizes itself from the whole machine and lets each cargo/rustc/test binary spawn one thread per core
+    takes every core (slots x cargo jobs x test threads). Children inherit the affinity mask, so pinning this
+    process bounds the lot. `GATE_CORES=10-15` (or `0,2,4`) picks the cores; the default is the upper half of the
+    cores this process may use. Priority is lowered too, so the desktop keeps its share of the pinned cores.
+    """
+    allowed = sorted(os.sched_getaffinity(0))
+    if spec:
+        want = set()
+        for part in spec.split(","):
+            lo, _, hi = part.partition("-")
+            want.update(range(int(lo), int(hi or lo) + 1))
+        cores = [c for c in allowed if c in want] or allowed
+    else:
+        cores = allowed[len(allowed) // 2:] if len(allowed) > 2 else allowed
+    os.sched_setaffinity(0, cores)
+    try:
+        os.nice(15)
+    except OSError:
+        pass
+    # Thread counts follow the cores we own, not the machine's: cargo and the test harness default to all of them.
+    os.environ.setdefault("CARGO_BUILD_JOBS", str(max(2, len(cores) // 2)))
+    os.environ.setdefault("RUST_TEST_THREADS", str(max(2, len(cores) // 2)))
+    return len(cores)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--list", action="store_true")
@@ -462,7 +522,7 @@ def main():
     ap.add_argument("--with-jvm", action="store_true", help="also run the Denver Clojure/JDK gate (needs its image; minutes)")
     a = ap.parse_args()
     os.makedirs(LOGS, exist_ok=True)
-    cpus = os.cpu_count() or 4
+    cpus = pin_to_cores(os.environ.get("GATE_CORES", ""))
     mem_gb = 8
     try:
         mem_gb = int(re.search(r"MemTotal:\s+(\d+)", open("/proc/meminfo").read()).group(1)) // 1048576

@@ -2,6 +2,14 @@
 # Run clippy and tests on all extracted crates before committing.
 # Uses the host target so tests/clippy work outside QEMU.
 
+# Only what cargo compiles needs clippy and the tests. A commit whose staged paths contain no Rust source,
+# manifest, lockfile, build script, toolchain/cargo config, linker script or assembly (docs, scripts, shell, Python,
+# images, userspace C...) cannot change what they see: skip the run. FORCE_HOOK=1 runs it anyway.
+if [ -z "$FORCE_HOOK" ] && ! git diff --cached --name-only | grep -qE '\.(rs|toml|lock|ld|s|S)$|(^|/)build\.rs$|(^|/)rust-toolchain|(^|/)\.cargo/'; then
+    echo "pre-commit: no Rust-affecting paths staged, skipping clippy and tests"
+    exit 0
+fi
+
 HOST_TARGET="$(rustc -vV | grep '^host:' | cut -d' ' -f2)"
 
 # Console-print rule (CLAUDE.md § "Kernel conventions", docs/reference/subsystems/
